@@ -1,0 +1,57 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: sudo apt-get install -y sqlite3
+
+    - name: Setup development database
+      run: sqlite3 apt-cacher-rs.db < db.sqlite
+
+    - name: Build
+      run: cargo build --verbose
+
+    - name: Format
+      run: cargo fmt --all --check
+
+    - name: Clippy
+      run: cargo clippy --all-targets --all-features -- -W clippy::pedantic
+
+    - name: Run tests
+      run: cargo test --verbose
+
+  spaces-check:
+    name: Spaces Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Spaces check
+        run: git diff-tree --check $(git hash-object -t tree /dev/null) HEAD
+
+  spellings:
+    name: Codespell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install codespell
+        run: sudo apt-get install -y codespell
+
+      - name: Run codespell
+        run: codespell -L crate src/ apt-cacher-rs.conf apt-cacher-rs.init apt-cacher-rs.service README.md
