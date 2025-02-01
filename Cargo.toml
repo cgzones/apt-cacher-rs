@@ -35,7 +35,7 @@ log = "0.4.20"
 memfd = "0.6.4"
 nix = { version = "0.29.0", features = [ "user" ] }
 pin-project = "1.1.4"
-rand = "0.8.5"
+rand = "0.9.0"
 scopeguard = "1.2.0"
 serde = "1.0.197"
 simplelog = "0.12.1"
