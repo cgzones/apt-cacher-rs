@@ -21,7 +21,7 @@ exclude = [
 [dependencies]
 anyhow = "1.0.81"
 async-compression = { version = "0.4.6", features = [ "tokio", "xz", "gzip" ] }
-build_html = "2.4.0"
+build_html = "2.6.0"
 bytes = "1.6.0"
 clap = { version = "4.5.1", features = [ "derive" ] }
 futures-util = "0.3.30"
