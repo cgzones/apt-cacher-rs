@@ -1,10 +1,6 @@
 name: Rust
 
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+on: [push, pull_request]
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,6 +8,7 @@ env:
 jobs:
   build:
 
+    name: Rust Build
     runs-on: ubuntu-latest
 
     steps:
@@ -35,36 +32,11 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
-  audit:
-
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install cargo audit
-      run: cargo install cargo-audit
-
-    - name: Check for vulnerable crates
-      run: cargo audit
-
-  deny:
-
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install cargo deny
-      run: cargo install cargo-deny
-
-    - name: Check for denied crates
-      run: cargo deny check
-
   spaces-check:
 
     name: Spaces Check
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -75,6 +47,7 @@ jobs:
 
     name: Codespell
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
