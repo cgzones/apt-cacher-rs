@@ -24,7 +24,7 @@ use std::error::Error;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZero;
 use std::num::NonZeroU16;
 use std::num::NonZeroU64;
@@ -2705,12 +2705,24 @@ fn is_timeout(err: &hyper::Error) -> bool {
 async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = global_config();
 
-    let addr = SocketAddr::from((config.bind_addr, config.bind_port.get()));
+    let mut addr = SocketAddr::from((config.bind_addr, config.bind_port.get()));
 
-    let listener = TcpListener::bind(addr).await.map_err(|err| {
-        error!("Error binding on {addr}:  {err}");
-        err
-    })?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(x) => x,
+        Err(err) => {
+            if config.bind_addr != Ipv6Addr::UNSPECIFIED {
+                error!("Error binding on {addr}:  {err}");
+                Err(err)?;
+            }
+
+            // Fallback to IPv4 to avoid errors when IPv6 is not available and the default configuration is used.
+            addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.bind_port.get()));
+            TcpListener::bind(addr).await.map_err(|err| {
+                error!("Error binding fallback on {addr}:  {err}");
+                err
+            })?
+        }
+    };
     info!("Listening on http://{addr}");
 
     #[cfg(all(feature = "tls_default", not(feature = "tls_rustls")))]
