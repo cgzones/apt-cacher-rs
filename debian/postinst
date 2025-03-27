@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+PACKAGE_NAME="apt-cacher-rs"
+
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
+  adduser --quiet --system --group --comment "$PACKAGE_NAME daemon" --no-create-home "$PACKAGE_NAME"
+fi
+
+#DEBHELPER#
