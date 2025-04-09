@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+PACKAGE_NAME="apt-cacher-rs"
+
+#DEBHELPER#
+
+if [ "$1" = "purge" ]; then
+  deluser --quiet --system "$PACKAGE_NAME"
+  rm -rf "/var/cache/$PACKAGE_NAME" "/var/lib/$PACKAGE_NAME"
+fi
