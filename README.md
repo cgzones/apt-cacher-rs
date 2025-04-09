@@ -6,11 +6,24 @@
 `apt-cacher-rs` is a simple caching proxy daemon for Debian style repositories.
 It is inspired by and an alternative to [`apt-cacher`](https://salsa.debian.org/LeePen/apt-cacher) and [`apt-cacher-ng`](https://www.unix-ag.uni-kl.de/~bloch/acng/).
 
+## Build the Debian package
+
+Before you can compile apt-cacher-rs or create a Debian package, the following commands must be run once:
+
+```
+apt-get -y install dpkg-dev liblzma-dev
+cargo install cargo-deb
+```
+
+Then run the following command to build the Debian package in `target/debian/apt-cacher-rs.deb`:
+
+```
+cargo deb
+```
+
 ## How to use
 
-First install `apt-cacher-rs` on a network local system.
-To automatically manage the daemon via systemd an example [service file](apt-cacher-rs.service) is included.
-Then add the following configuration file on every client system that should utilize the proxy:
+Install the Debian package via dpkg on a local network server and add the following configuration file on every client system that should utilize the proxy:
 
 */etc/apt/apt.conf.d/30proxy*
 ```

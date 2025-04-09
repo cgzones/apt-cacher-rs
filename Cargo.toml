@@ -167,3 +167,13 @@ strip = false
 debug-assertions = false
 overflow-checks = false
 lto = true
+
+[package.metadata.deb]
+assets = [
+   ["debian/apt-cacher-rs.conf", "/etc/apt-cacher-rs/apt-cacher-rs.conf", "644"],
+   ["target/release/apt-cacher-rs", "/usr/sbin/apt-cacher-rs", "755"],
+]
+conflicts = "apt-cacher-ng"
+extended-description = "A caching proxy for Debian style package repositories"
+maintainer-scripts = "debian/"
+systemd-units = { enable = true, start = true }

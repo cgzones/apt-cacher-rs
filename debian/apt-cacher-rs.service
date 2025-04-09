@@ -5,9 +5,7 @@ After=network.target
 [Service]
 Type=simple
 Restart=on-abnormal
-ExecStart=/usr/local/bin/apt-cacher-rs --skip-log-timestamp
-# create user via:
-#   adduser --system --group --quiet --gecos "apt-cacher-rs daemon" --no-create-home --home /var/lib/apt-cacher-rs apt-cacher-rs
+ExecStart=/usr/sbin/apt-cacher-rs --skip-log-timestamp
 User=apt-cacher-rs
 
 # Hardening
