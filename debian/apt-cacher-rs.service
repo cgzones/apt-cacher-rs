@@ -1,6 +1,6 @@
 [Unit]
 Description=apt repository cache
-After=network.target
+After=network.target nss-lookup.target
 
 [Service]
 Type=simple
