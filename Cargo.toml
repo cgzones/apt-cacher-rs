@@ -52,7 +52,7 @@ serde = "1.0.197"
 simplelog = "0.12.1"
 sqlx = { version = "0.8", default-features = false, features = [ "macros", "runtime-tokio", "sqlite" ] }
 time = { version = "0.3.34", features = [ "parsing" ] }
-tokio = { version = "1.36.0", features = [ "full" ] }
+tokio = { version = "1.47.0", features = [ "full" ] }
 tokio-util = "0.7.10"
 toml = "0.8.12"
 urlencoding = "2.1.3"
