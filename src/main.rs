@@ -4029,8 +4029,13 @@ fn global_config() -> &'static Config {
         .config
 }
 
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[expect(clippy::print_stderr)]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _profiler = dhat::Profiler::new_heap();
+
     let args = Cli::parse();
 
     let (config, cgf_fallback) = Config::new(&args.config_path)?;
