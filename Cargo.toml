@@ -29,6 +29,7 @@ build_html = "2.4.0"
 bytes = "1.6.0"
 clap = { version = "4.5.60", features = ["derive"] }
 coarsetime = "0.1.36"
+dhat = "0.3.3"
 futures-util = "0.3.30"
 hashbrown = "0.17.0"
 http = "1.4.0"

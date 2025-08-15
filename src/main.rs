@@ -10,9 +10,8 @@ compile_error!("Either feature \"tls_hyper\" or \"tls_rustls\" must be enabled f
 #[cfg(all(feature = "tls_hyper", feature = "tls_rustls"))]
 compile_error!("Feature \"tls_hyper\" and \"tls_rustls\" are mutually exclusive.");
 
-#[cfg(target_env = "musl")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 mod cache_quota;
 mod channel_body;
@@ -4612,6 +4611,8 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _profiler = dhat::Profiler::new_heap();
+
     let args = Cli::parse();
 
     let is_run_as_root = nix::unistd::geteuid().is_root();
