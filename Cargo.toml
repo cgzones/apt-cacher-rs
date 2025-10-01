@@ -45,7 +45,7 @@ pin-project = "1.1.4"
 rand = "0.9"
 rustls = { version = "0.23", optional = true }
 scopeguard = "1.2.0"
-serde = "1.0.197"
+serde = "1.0.228"
 simplelog = "0.12.1"
 sqlx = { version = "0.8", default-features = false, features = [
     "macros",
