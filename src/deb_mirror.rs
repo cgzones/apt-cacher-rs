@@ -123,17 +123,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         let mut parts = pool_path.rsplit('/');
 
         let filename = parts.next()?;
-
-        let package = parts.next()?;
-
-        let prefix = parts.next()?;
-        if !package.starts_with(prefix) {
-            return None;
-        }
-
-        let _component = parts.next()?;
-
-        if parts.next().is_some() {
+        if filename.is_empty() {
             return None;
         }
 
@@ -428,10 +418,7 @@ mod tests {
          * failures
          */
 
-        assert_eq!(
-            parse_request_path("debian/pool/main/g/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
-            None
-        );
+        assert_eq!(parse_request_path("debian/pool/"), None);
 
         assert_eq!(
             parse_request_path("debian/loop/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
