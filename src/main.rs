@@ -1631,7 +1631,7 @@ async fn serve_downloading_file(
     database: Database,
     status: Arc<tokio::sync::Mutex<ActiveDownloadStatus>>,
 ) -> Response<ProxyCacheBody> {
-    let mut slept_once = false;
+    let mut slept_count = 0;
     let mut not_found_once = false;
 
     loop {
@@ -1644,7 +1644,7 @@ async fn serve_downloading_file(
             }
             ActiveDownloadStatus::Init => {
                 drop(st);
-                if slept_once {
+                if slept_count > 50 {
                     // TODO: fix on slow upstream connection; mayge store an Instant in Init?
                     error!("Download did not leave Init state");
                     return quick_response(
@@ -1652,8 +1652,8 @@ async fn serve_downloading_file(
                         "Download not started",
                     );
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                slept_once = true;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                slept_count += 1;
             }
             ActiveDownloadStatus::Finished(path) => {
                 let file = match tokio::fs::File::open(&path).await {
@@ -1980,6 +1980,8 @@ async fn serve_new_file(
             state
                 .active_downloads
                 .remove(&conn_details.mirror, &conn_details.debname);
+
+            *status.lock().await = ActiveDownloadStatus::Finished(file_path.to_path_buf());
 
             let Some(client_modified_since) = client_modified_since else {
                 return serve_cached_file(conn_details, req, state.database, file, file_path).await;
