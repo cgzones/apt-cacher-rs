@@ -162,7 +162,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             }
 
             return Some(ResourceFile::Dists(mirror_path, distribution, filename));
-        } else if filename == "Packages.gz" {
+        } else if filename == "Packages.gz" || filename == "Packages.xz" {
             let architecture = parts.next()?;
             let component = parts.next()?;
             let distribution = parts.next()?;
@@ -391,6 +391,19 @@ mod tests {
                 "main",
                 "binary-amd64",
                 "Packages.gz"
+            ))
+        );
+
+        assert_eq!(
+            parse_request_path(
+                "debian-security/dists/bookworm-security/main/binary-amd64/Packages.xz"
+            ),
+            Some(ResourceFile::Package(
+                "debian-security",
+                "bookworm-security",
+                "main",
+                "binary-amd64",
+                "Packages.xz"
             ))
         );
 
