@@ -112,6 +112,8 @@ pub(crate) enum ResourceFile<'a> {
     Dists(&'a str, &'a str, &'a str),
     /// A package file consisting of the mirror path, the distribution, the component, the architecture, and the filename
     Package(&'a str, &'a str, &'a str, &'a str, &'a str),
+    /// A file named and acquired by its hash value consisting of the mirror path and the filename
+    ByHash(&'a str, &'a str),
 }
 
 /// Parses a request path into the mirror path and the filename.
@@ -153,6 +155,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
     /*
      * debian/dists/sid/InRelease
      * debs/dists/vscodium/main/binary-amd64/Packages.gz
+     * debian/dists/trixie/main/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba
      */
     if let Some((mirror_path, dists_path)) = path.rsplit_once("/dists/") {
         let mut parts = dists_path.rsplit('/');
@@ -182,6 +185,19 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 architecture,
                 filename,
             ));
+        } else if filename.len() >= 64 && filename.chars().all(|c| c.is_ascii_hexdigit()) {
+            let hash_algorithm = parts.next()?;
+
+            // The filename length >= 64 characters ensures that only SHA >= SHA256 is supported
+            if !hash_algorithm.starts_with("SHA") {
+                return None;
+            }
+
+            if parts.next()? != "by-hash" {
+                return None;
+            }
+
+            return Some(ResourceFile::ByHash(mirror_path, filename));
         }
 
         return None;
@@ -434,27 +450,43 @@ mod tests {
             ))
         );
 
+        assert_eq!(
+            parse_request_path(
+                "debian/dists/sid/main/binary-amd64/Packages.diff/by-hash/SHA256/491ddac17f4b86d771a457e6b084c499dfeb9ee29004b92d5d05fe79f1f0dede"
+            ),
+            Some(ResourceFile::ByHash(
+                "debian",
+                "491ddac17f4b86d771a457e6b084c499dfeb9ee29004b92d5d05fe79f1f0dede"
+            ))
+        );
+
+        assert_eq!(
+            parse_request_path(
+                "debian/dists/sid/main/dep11/by-hash/SHA256/cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482"
+            ),
+            Some(ResourceFile::ByHash(
+                "debian",
+                "cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482"
+            ))
+        );
+
+        assert_eq!(
+            parse_request_path(
+                "debian/dists/trixie/main/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            Some(ResourceFile::ByHash(
+                "debian",
+                "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ))
+        );
+
         /*
          * TODO: support those?
          */
 
         assert_eq!(
             parse_request_path(
-                "debian/dists/sid/main/binary-amd64/Packages.diff/by-hash/SHA256/491ddac17f4b86d771a457e6b084c499dfeb9ee29004b92d5d05fe79f1f0dede"
-            ),
-            None
-        );
-
-        assert_eq!(
-            parse_request_path(
                 "debian/dists/sid/main/binary-amd64/Packages.diff/T-2024-04-16-1405.22-F-2024-04-15-2018.42.gz"
-            ),
-            None
-        );
-
-        assert_eq!(
-            parse_request_path(
-                "debian/dists/sid/main/dep11/by-hash/SHA256/cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482"
             ),
             None
         );
@@ -490,6 +522,16 @@ mod tests {
         assert_eq!(parse_request_path("debian/bar/sid/InRelease"), None);
 
         assert_eq!(parse_request_path("debian/dists/a/b/InRelease"), None);
+
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/by-hash/SHA256/Packages"),
+            None
+        );
+
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/by-hash/SHA256/cf31e359ca5"),
+            None
+        );
     }
 
     #[test]
