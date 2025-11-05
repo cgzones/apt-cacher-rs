@@ -11,6 +11,7 @@ User=apt-cacher-rs
 # Hardening
 CacheDirectory=apt-cacher-rs
 CapabilityBoundingSet=
+LimitNOFILE=16384
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 NoNewPrivileges=yes
