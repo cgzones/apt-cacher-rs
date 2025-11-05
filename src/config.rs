@@ -42,6 +42,7 @@ pub(crate) const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzer
 pub(crate) const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 pub(crate) const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
 pub(crate) const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
+pub(crate) const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
 pub(crate) const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
 pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> =
@@ -247,6 +248,10 @@ pub(crate) struct Config {
         deserialize_with = "from_nonzero_u64_with_magnitude"
     )]
     pub(crate) disk_quota: Option<NonZero<u64>>,
+
+    /// Retention time for files acquired "by-hash".
+    #[serde(default = "default_byhash_retention_days")]
+    pub(crate) byhash_retention_days: u64,
 
     /// Retention time for usage logs.
     #[serde(default = "default_usage_retention_days")]
@@ -526,6 +531,10 @@ const fn default_https_tunnel_allowed_mirrors() -> Vec<String> {
     Vec::new()
 }
 
+const fn default_byhash_retention_days() -> u64 {
+    DEFAULT_BYHASH_RETENTION_DAYS
+}
+
 const fn default_usage_retention_days() -> u64 {
     DEFAULT_USAGE_RETENTION_DAYS
 }
@@ -665,6 +674,7 @@ impl Config {
             https_tunnel_enabled: true,
             https_tunnel_allowed_ports: DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS.to_vec(),
             https_tunnel_allowed_mirrors: Vec::new(),
+            byhash_retention_days: DEFAULT_BYHASH_RETENTION_DAYS,
             usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
             logstore_capacity: DEFAULT_LOGSTORE_CAPACITY,
             min_download_rate: DEFAULT_MIN_DOWNLOAD_RATE,

@@ -16,7 +16,8 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
     ActiveDownloads, Client, ProxyCacheError, RETENTION_TIME, RUNTIMEDETAILS,
-    database::{Database, MirrorEntry},
+    config::DomainName,
+    database::Database,
     deb_mirror::{Mirror, UriFormat},
     global_config,
     humanfmt::HumanFmt,
@@ -251,9 +252,17 @@ async fn task_cleanup_impl(
 
     let mut tasks = Vec::with_capacity(mirrors.len());
     for mirror in mirrors {
-        let db = database.clone();
-        let client = https_client.clone();
-        tasks.push(tokio::task::spawn(cleanup_mirror(mirror, db, client)));
+        tasks.push(tokio::task::spawn(cleanup_mirror_deb_files(
+            mirror.host.clone(),
+            mirror.path.clone(),
+            database.clone(),
+            https_client.clone(),
+        )));
+
+        tasks.push(tokio::task::spawn(cleanup_mirror_byhash_files(
+            mirror.host,
+            mirror.path,
+        )));
     }
 
     let mut files_retained = 0;
@@ -352,13 +361,14 @@ struct CleanupDone {
     bytes_removed: u64,
 }
 
-async fn cleanup_mirror(
-    mirror: MirrorEntry,
+async fn cleanup_mirror_deb_files(
+    host: DomainName,
+    path: String,
     database: Database,
     https_client: Client,
 ) -> Result<CleanupDone, ProxyCacheError> {
     let origins = database
-        .get_origins_by_mirror(&mirror.host, &mirror.path)
+        .get_origins_by_mirror(&host, &path)
         .await
         .map_err(|err| {
             error!("Error looking up origins:  {err}");
@@ -389,8 +399,8 @@ async fn cleanup_mirror(
 
     let mirror_path: PathBuf = [
         &global_config().cache_directory,
-        Path::new(&mirror.host),
-        Path::new(&mirror.path),
+        Path::new(&host),
+        Path::new(&path),
     ]
     .iter()
     .collect();
@@ -405,19 +415,16 @@ async fn cleanup_mirror(
     trace!("Cached files ({}): {cached_files:?}", cached_files.len());
 
     info!(
-        "Found {} active origins and {} cached files for mirror {}/{}",
+        "Found {} active origins and {} cached deb files for mirror {}/{}",
         active_origins.len(),
         cached_files.len(),
-        mirror.host,
-        mirror.path
+        host,
+        path
     );
 
     if cached_files.is_empty() {
         return Ok(CleanupDone {
-            mirror: Mirror {
-                host: mirror.host,
-                path: mirror.path,
-            },
+            mirror: Mirror { host, path },
             files_retained: num_total_files,
             files_removed: 0,
             bytes_removed: 0,
@@ -431,22 +438,17 @@ async fn cleanup_mirror(
             Ok(r) => r,
             Err(GetPackageError::Http(status)) if status == StatusCode::NOT_FOUND => {
                 warn!(
-                    "Could not find package file for {origin:?}; continuing cleanup for mirror {}/{}...",
-                    mirror.host, mirror.path
+                    "Could not find package file for {origin:?}; continuing cleanup for mirror {host}/{path}..."
                 );
                 continue;
             }
             Err(GetPackageError::Http(status)) => {
                 warn!(
-                    "Could not find package file for {origin:?} ({status}); skipping cleanup for mirror {}/{}",
-                    mirror.host, mirror.path
+                    "Could not find package file for {origin:?} ({status}); skipping cleanup for mirror {host}/{path}"
                 );
 
                 return Ok(CleanupDone {
-                    mirror: Mirror {
-                        host: mirror.host,
-                        path: mirror.path,
-                    },
+                    mirror: Mirror { host, path },
                     files_retained: num_total_files,
                     files_removed: 0,
                     bytes_removed: 0,
@@ -492,10 +494,7 @@ async fn cleanup_mirror(
 
         if cached_files.is_empty() {
             return Ok(CleanupDone {
-                mirror: Mirror {
-                    host: mirror.host,
-                    path: mirror.path,
-                },
+                mirror: Mirror { host, path },
                 files_retained: num_total_files,
                 files_removed: 0,
                 bytes_removed: 0,
@@ -579,18 +578,134 @@ async fn cleanup_mirror(
     }
 
     info!(
-        "Removed {files_removed} unreferenced files for mirror {}/{} ({})",
-        mirror.host,
-        mirror.path,
+        "Removed {files_removed} unreferenced deb files for mirror {host}/{path} ({})",
         HumanFmt::Size(bytes_removed)
     );
 
     Ok(CleanupDone {
-        mirror: Mirror {
-            host: mirror.host,
-            path: mirror.path,
-        },
+        mirror: Mirror { host, path },
         files_retained: num_total_files - files_removed,
+        files_removed,
+        bytes_removed,
+    })
+}
+
+async fn cleanup_mirror_byhash_files(
+    host: DomainName,
+    path: String,
+) -> Result<CleanupDone, ProxyCacheError> {
+    let mut bytes_removed = 0;
+    let mut files_removed = 0;
+    let mut files_retained = 0;
+    let now = SystemTime::now();
+    let keep_span = Duration::from_secs(24 * 60 * 60 * global_config().byhash_retention_days);
+
+    let mirror_byhash_path: PathBuf = [
+        &global_config().cache_directory,
+        Path::new(&host),
+        Path::new(&path),
+        Path::new("dists/by-hash"),
+    ]
+    .iter()
+    .collect();
+
+    let mut byhash_dir = match tokio::fs::read_dir(&mirror_byhash_path).await {
+        Ok(d) => d,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            debug!(
+                "Directory {} not found. Cleanup skipped.",
+                mirror_byhash_path.to_string_lossy()
+            );
+            return Ok(CleanupDone {
+                mirror: Mirror { host, path },
+                files_retained,
+                files_removed,
+                bytes_removed,
+            });
+        }
+        Err(err) => {
+            error!(
+                "Error traversing directory {}: {}",
+                mirror_byhash_path.to_string_lossy(),
+                err
+            );
+            return Err(ProxyCacheError::Io(err));
+        }
+    };
+
+    while let Some(entry) = byhash_dir.next_entry().await? {
+        let path = entry.path();
+
+        if path.file_name().is_none() {
+            continue;
+        }
+
+        files_retained += 1;
+
+        let metadata = match entry.metadata().await {
+            Ok(d) => d,
+            Err(err) => {
+                error!("Error inspecting file `{}`:  {err}", path.display());
+                return Err(ProxyCacheError::Io(err));
+            }
+        };
+
+        let modified = match metadata.modified() {
+            Ok(m) => m,
+            Err(err) => {
+                error!("Failed to get mtime of file `{}`:  {err}", path.display());
+                return Err(ProxyCacheError::Io(err));
+            }
+        };
+
+        let file_age = match now.duration_since(modified) {
+            Ok(x) => x,
+            Err(err) => {
+                warn!(
+                    "Failed to compute modification timespan for file `{}`: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        if file_age <= keep_span {
+            debug!(
+                "Keeping file `{}` since it is to new ({}s, threshold={}s)",
+                path.display(),
+                file_age.as_secs(),
+                keep_span.as_secs()
+            );
+            continue;
+        }
+
+        debug!(
+            "Removing file `{}` since it is to old ({}s, threshold={}s)",
+            path.display(),
+            file_age.as_secs(),
+            keep_span.as_secs()
+        );
+
+        if let Err(err) = tokio::fs::remove_file(&path).await {
+            error!("Error removing file `{}`: {err}", path.display());
+            continue;
+        }
+
+        bytes_removed += metadata.len();
+        files_removed += 1;
+        files_retained -= 1;
+    }
+
+    info!(
+        "Removed {files_removed} files acquired by-hash for mirror {}/{} ({})",
+        host,
+        path,
+        HumanFmt::Size(bytes_removed)
+    );
+
+    Ok(CleanupDone {
+        mirror: Mirror { host, path },
+        files_retained,
         files_removed,
         bytes_removed,
     })
