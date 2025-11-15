@@ -54,6 +54,8 @@ use channel_body::ChannelBodyError;
 use clap::Parser;
 #[cfg(not(feature = "mmap"))]
 use futures_util::TryStreamExt;
+use http::Uri;
+use http::uri::Scheme;
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use http_range::http_parse_range;
 use hyper::body::Frame;
@@ -196,6 +198,7 @@ async fn tokio_mkstemp(
 pub(crate) async fn request_with_retry(
     client: &Client,
     request: Request<Empty<bytes::Bytes>>,
+    downgrade_https: bool,
 ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
     const MAX_RETRIES: u32 = 5;
 
@@ -205,7 +208,13 @@ pub(crate) async fn request_with_retry(
         "Invariant of Empty"
     );
 
-    let (parts, _body) = request.into_parts();
+    let (parts, body) = request.into_parts();
+    debug_assert_eq!(body.size_hint().exact(), Some(0));
+
+    let is_https = parts
+        .uri
+        .scheme()
+        .is_some_and(|scheme| *scheme == Scheme::HTTPS);
 
     let mut tries = 0;
     let mut sleep_prev = 1;
@@ -222,6 +231,38 @@ pub(crate) async fn request_with_retry(
                     parts.uri
                 );
                 return Err(err);
+            }
+            Err(_err) if downgrade_https && is_https => {
+                let mut downgrade_parts = parts.clone();
+
+                let mut uri_parts = downgrade_parts.uri.into_parts();
+                uri_parts.scheme = Some(Scheme::HTTP);
+                downgrade_parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
+
+                let req_clone = Request::from_parts(downgrade_parts, Empty::new());
+
+                match client.request(req_clone).await {
+                    Ok(response) => return Ok(response),
+                    Err(err) if !err.is_connect() => {
+                        warn_once_or_info!(
+                            "Request of internal client to {} failed:  {err}  --  {err:?}",
+                            parts.uri
+                        );
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        if tries >= MAX_RETRIES {
+                            return Err(err);
+                        }
+
+                        tries += 1;
+
+                        tokio::time::sleep(Duration::from_secs(sleep_curr)).await;
+                        (sleep_curr, sleep_prev) = (sleep_curr + sleep_prev, sleep_curr);
+
+                        continue;
+                    }
+                }
             }
             Err(err) => {
                 if tries >= MAX_RETRIES {
@@ -1039,6 +1080,7 @@ struct ConnectionDetails {
     client: SocketAddr,
     mirror: Mirror,
     aliased_host: Option<&'static DomainName>,
+    downgrade_https: bool,
     debname: String,
     subdir: Option<&'static Path>,
 }
@@ -1768,6 +1810,14 @@ fn is_host_allowed(requested_host: &str) -> bool {
         .any(|host| host.permits(requested_host))
 }
 
+#[must_use]
+pub(crate) fn is_host_https_downgrade_permitted(requested_host: &str) -> bool {
+    global_config()
+        .https_downgrading_mirrors
+        .iter()
+        .any(|host| host.permits(requested_host))
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ContentLength {
     /// An exact size
@@ -1935,7 +1985,13 @@ async fn serve_new_file(
 
     trace!("Forwarded request: {fwd_request:?}");
 
-    let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
+    let mut fwd_response = match request_with_retry(
+        &appstate.https_client,
+        fwd_request,
+        conn_details.downgrade_https,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(err) => {
             warn!(
@@ -1990,22 +2046,24 @@ async fn serve_new_file(
 
             trace!("Forwarded redirected request: {redirected_request:?}");
 
-            let redirected_response =
-                match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok(r) => r,
-                    Err(err) => {
-                        warn!("Proxy redirected request to host {fwd_host:?} failed:  {err}");
-                        *status.write().await =
-                            ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
-                        appstate
-                            .active_downloads
-                            .remove(&conn_details.mirror, &conn_details.debname);
-                        return quick_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Proxy request failed",
-                        );
-                    }
-                };
+            let redirected_response = match request_with_retry(
+                &appstate.https_client,
+                redirected_request,
+                conn_details.downgrade_https,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    warn!("Proxy redirected request to host {fwd_host:?} failed:  {err}");
+                    *status.write().await =
+                        ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
+                    appstate
+                        .active_downloads
+                        .remove(&conn_details.mirror, &conn_details.debname);
+                    return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+                }
+            };
 
             trace!("Forwarded redirected response: {redirected_response:?}");
 
@@ -2715,6 +2773,7 @@ async fn pre_process_client_request(
 
                     let conn_details = ConnectionDetails {
                         client,
+                        downgrade_https: is_host_https_downgrade_permitted(&requested_host),
                         mirror: Mirror {
                             host: requested_host,
                             path: mirrorname.into_owned(),
@@ -2778,6 +2837,7 @@ async fn pre_process_client_request(
 
                 let conn_details = ConnectionDetails {
                     client,
+                    downgrade_https: is_host_https_downgrade_permitted(&requested_host),
                     mirror: Mirror {
                         host: requested_host,
                         path: mirrorname.into_owned(),
@@ -2821,6 +2881,7 @@ async fn pre_process_client_request(
 
                 let conn_details = ConnectionDetails {
                     client,
+                    downgrade_https: is_host_https_downgrade_permitted(&requested_host),
                     mirror: Mirror {
                         host: requested_host,
                         path: mirrorname.into_owned(),
@@ -2912,6 +2973,7 @@ async fn pre_process_client_request(
 
                 let conn_details = ConnectionDetails {
                     client,
+                    downgrade_https: is_host_https_downgrade_permitted(&requested_host),
                     mirror: Mirror {
                         host: requested_host,
                         path: mirrorname.into_owned(),
@@ -2993,7 +3055,7 @@ async fn pre_process_client_request(
 
     trace!("Forwarded request: {fwd_request:?}");
 
-    let fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
+    let fwd_response = match request_with_retry(&appstate.https_client, fwd_request, false).await {
         Ok(r) => r,
         Err(err) => {
             warn!("Proxy request to host {requested_host} failed:  {err}");
@@ -3038,7 +3100,7 @@ async fn pre_process_client_request(
             trace!("Redirected request: {redirected_request:?}");
 
             let redirected_response =
-                match request_with_retry(&appstate.https_client, redirected_request).await {
+                match request_with_retry(&appstate.https_client, redirected_request, false).await {
                     Ok(r) => r,
                     Err(err) => {
                         warn!("Redirected proxy request to host {requested_host} failed:  {err}");
