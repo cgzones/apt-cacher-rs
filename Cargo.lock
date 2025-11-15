@@ -91,6 +91,7 @@ dependencies = [
  "coarsetime",
  "console-subscriber",
  "futures-util",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-rustls",

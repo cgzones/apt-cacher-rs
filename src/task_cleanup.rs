@@ -22,7 +22,7 @@ use crate::{
     deb_mirror::{Mirror, UriFormat},
     global_config,
     humanfmt::HumanFmt,
-    info_once, process_cache_request, task_cache_scan,
+    info_once, is_host_https_downgrade_permitted, process_cache_request, task_cache_scan,
 };
 
 async fn body_to_file(
@@ -169,6 +169,7 @@ async fn get_package_file(
         let conn_details = ConnectionDetails {
             client: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             mirror: mirror.clone(),
+            downgrade_https: is_host_https_downgrade_permitted(&mirror.host),
             aliased_host: None,
             debname: format!(
                 "{distribution}_{component}_{architecture}_Packages{}",
