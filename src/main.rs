@@ -10,6 +10,7 @@ compile_error!("Feature \"tls_hyper\" and \"tls_rustls\" are mutually exclusive.
 mod channel_body;
 mod config;
 mod database;
+mod database_task;
 mod deb_mirror;
 mod error;
 mod http_range;
@@ -117,9 +118,13 @@ use tokio::signal::unix::SignalKind;
 use crate::config::Config;
 use crate::config::DomainName;
 use crate::database::Database;
+use crate::database_task::DatabaseCommand;
+use crate::database_task::DbCmdDelivery;
+use crate::database_task::DbCmdDownload;
+use crate::database_task::DbCmdOrigin;
+use crate::database_task::db_loop;
 use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
-use crate::deb_mirror::OriginRef;
 use crate::deb_mirror::ResourceFile;
 use crate::deb_mirror::parse_request_path;
 use crate::deb_mirror::valid_architecture;
@@ -262,7 +267,7 @@ struct DeliveryStreamBody<S> {
     size: u64,
     partial: bool,
     transferred_bytes: u64,
-    database: Option<Database>,
+    database_tx: Option<tokio::sync::mpsc::Sender<DatabaseCommand>>,
     conn_details: Option<ConnectionDetails>,
     error: Option<String>,
 }
@@ -274,7 +279,7 @@ impl<S> DeliveryStreamBody<S> {
         stream: S,
         size: u64,
         partial: bool,
-        database: Database,
+        database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
         conn_details: ConnectionDetails,
     ) -> Self {
         Self {
@@ -283,7 +288,7 @@ impl<S> DeliveryStreamBody<S> {
             size,
             partial,
             transferred_bytes: 0,
-            database: Some(database),
+            database_tx: Some(database_tx),
             conn_details: Some(conn_details),
             error: None,
         }
@@ -337,7 +342,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
         let duration = self.start.elapsed();
         let transferred_bytes = self.transferred_bytes;
         let project = self.project();
-        let db = project.database.take().expect("Option is set in new()");
+        let db_tx = project.database_tx.take().expect("Option is set in new()");
         let cd = project.conn_details.take().expect("Option is set in new()");
         let error = project.error.take();
         tokio::task::spawn(async move {
@@ -357,19 +362,15 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                     HumanFmt::Rate(size, duration)
                 );
 
-                if let Err(err) = db
-                    .register_deliviery(
-                        &cd.mirror,
-                        &cd.debname,
-                        size,
-                        duration,
-                        partial,
-                        cd.client.ip().to_canonical(),
-                    )
-                    .await
-                {
-                    error!("Failed to register delivery:  {err}");
-                }
+                let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+                    mirror: cd.mirror,
+                    debname: cd.debname,
+                    size,
+                    elapsed: duration,
+                    partial,
+                    client_ip: cd.client.ip(),
+                });
+                db_tx.send(cmd).await.expect("database task should not die");
             } else if transferred_bytes == 0 && duration < Duration::from_secs(1) {
                 info!(
                     "Aborted serving cached file {} from mirror {}{} for client {} after {}:  {}",
@@ -518,7 +519,7 @@ struct MmapBody {
     length: usize,
     partial: bool,
     start: Instant,
-    database: Option<Database>,
+    database_tx: Option<tokio::sync::mpsc::Sender<DatabaseCommand>>,
     conn_details: Option<ConnectionDetails>,
 }
 
@@ -529,7 +530,7 @@ impl MmapBody {
         mapping: Mmap,
         length: usize,
         partial: bool,
-        database: Database,
+        database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
         conn_details: ConnectionDetails,
     ) -> Self {
         Self {
@@ -538,7 +539,7 @@ impl MmapBody {
             length,
             partial,
             start: Instant::now(),
-            database: Some(database),
+            database_tx: Some(database_tx),
             conn_details: Some(conn_details),
         }
     }
@@ -549,9 +550,9 @@ impl Drop for MmapBody {
     fn drop(&mut self) {
         let size = self.length as u64;
         let partial = self.partial;
-        let duration = self.start.elapsed();
+        let elapsed = self.start.elapsed();
         let transferred_bytes = self.position as u64;
-        let db = self.database.take().expect("set in new()");
+        let db_tx = self.database_tx.take().expect("set in new()");
         let cd = self.conn_details.take().expect("set in new()");
         tokio::task::spawn(async move {
             let aliased = match cd.aliased_host {
@@ -565,32 +566,28 @@ impl Drop for MmapBody {
                     cd.mirror,
                     aliased,
                     cd.client.ip().to_canonical(),
-                    HumanFmt::Time(duration),
+                    HumanFmt::Time(elapsed),
                     HumanFmt::Size(size),
-                    HumanFmt::Rate(size, duration)
+                    HumanFmt::Rate(size, elapsed)
                 );
 
-                if let Err(err) = db
-                    .register_deliviery(
-                        &cd.mirror,
-                        &cd.debname,
-                        size,
-                        duration,
-                        partial,
-                        cd.client.ip().to_canonical(),
-                    )
-                    .await
-                {
-                    error!("Failed to register delivery:  {err}");
-                }
-            } else if transferred_bytes == 0 && duration < Duration::from_secs(1) {
+                let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+                    mirror: cd.mirror,
+                    debname: cd.debname,
+                    size,
+                    elapsed,
+                    partial,
+                    client_ip: cd.client.ip(),
+                });
+                db_tx.send(cmd).await.expect("database task should not die");
+            } else if transferred_bytes == 0 && elapsed < Duration::from_secs(1) {
                 info!(
                     "Aborted serving cached file {} from mirror {}{} for client {} after {}",
                     cd.debname,
                     cd.mirror,
                     aliased,
                     cd.client.ip().to_canonical(),
-                    HumanFmt::Time(duration),
+                    HumanFmt::Time(elapsed),
                 );
             } else {
                 warn!(
@@ -599,10 +596,10 @@ impl Drop for MmapBody {
                     cd.mirror,
                     aliased,
                     cd.client.ip().to_canonical(),
-                    HumanFmt::Time(duration),
+                    HumanFmt::Time(elapsed),
                     HumanFmt::Size(size),
                     HumanFmt::Size(transferred_bytes),
-                    HumanFmt::Rate(transferred_bytes, duration),
+                    HumanFmt::Rate(transferred_bytes, elapsed),
                 );
             }
         });
@@ -677,7 +674,7 @@ impl Body for MmapBody {
 async fn serve_cached_file(
     conn_details: ConnectionDetails,
     req: Request<Empty<()>>,
-    database: Database,
+    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
     file_path: &Path,
 ) -> Response<ProxyCacheBody> {
@@ -749,7 +746,7 @@ async fn serve_cached_file(
     #[cfg(feature = "mmap")]
     let response = serve_cached_file_mmap(
         conn_details,
-        database,
+        database_tx,
         file,
         file_path,
         modification_date,
@@ -763,7 +760,7 @@ async fn serve_cached_file(
     #[cfg(not(feature = "mmap"))]
     let response = serve_cached_file_buf(
         conn_details,
-        database,
+        database_tx,
         file,
         file_path,
         file_size,
@@ -783,7 +780,7 @@ async fn serve_cached_file(
 #[expect(clippy::too_many_arguments)]
 async fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
-    database: Database,
+    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
     file_path: &Path,
     modification_date: SystemTime,
@@ -832,7 +829,7 @@ async fn serve_cached_file_mmap(
         }
 
         let memory_body =
-            MmapBody::new(memory_map, content_length, partial, database, conn_details);
+            MmapBody::new(memory_map, content_length, partial, database_tx, conn_details);
 
         let body = match global_config().min_download_rate {
             Some(rate) => ProxyCacheBody::MmapRateChecked(
@@ -865,7 +862,7 @@ async fn serve_cached_file_mmap(
 #[expect(clippy::too_many_arguments)]
 async fn serve_cached_file_buf(
     conn_details: ConnectionDetails,
-    database: Database,
+    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     mut file: tokio::fs::File,
     file_path: &Path,
     file_size: u64,
@@ -890,7 +887,7 @@ async fn serve_cached_file_buf(
         reader_stream.map_ok(Frame::data),
         content_length,
         partial,
-        database,
+        database_tx,
         conn_details,
     );
     let body = ProxyCacheBody::Boxed(delivery_body.map_err(ProxyCacheError::Io).boxed());
@@ -970,6 +967,7 @@ fn serve_cached_file_response(
 #[derive(Clone)]
 struct AppState {
     database: Database,
+    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     https_client: Client,
     active_downloads: ActiveDownloads,
 }
@@ -993,7 +991,7 @@ async fn serve_volatile_file(
             conn_details.mirror,
             conn_details.client.ip().to_canonical()
         );
-        return serve_downloading_file(conn_details, req, appstate.database, status).await;
+        return serve_downloading_file(conn_details, req, appstate.database_tx, status).await;
     };
 
     let local_modification_time = match file.metadata().await {
@@ -1206,7 +1204,7 @@ impl ActiveDownloads {
 }
 
 async fn download_file(
-    database: Database,
+    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     conn_details: &ConnectionDetails,
     warn_on_override: bool,
     status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
@@ -1427,24 +1425,23 @@ async fn download_file(
         HumanFmt::Rate(bytes, elapsed)
     );
 
-    if let Err(err) = database
-        .register_download(
-            &conn_details.mirror,
-            &conn_details.debname,
-            bytes,
-            elapsed,
-            conn_details.client.ip().to_canonical(),
-        )
+    let cmd = DatabaseCommand::Download(DbCmdDownload {
+        mirror: conn_details.mirror.clone(),
+        debname: conn_details.debname.clone(),
+        size: bytes,
+        elapsed,
+        client_ip: conn_details.client.ip(),
+    });
+    database_tx
+        .send(cmd)
         .await
-    {
-        error!("Failed to register download:  {err}");
-    }
+        .expect("database task should not die");
 }
 
 #[must_use]
 async fn serve_unfinished_file(
     conn_details: ConnectionDetails,
-    database: Database,
+    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     mut file: tokio::fs::File,
     file_path: PathBuf,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
@@ -1586,19 +1583,18 @@ async fn serve_unfinished_file(
             HumanFmt::Rate(bytes, elapsed)
         );
 
-        if let Err(err) = database
-            .register_deliviery(
-                &conn_details.mirror,
-                &conn_details.debname,
-                bytes,
-                elapsed,
-                false,
-                conn_details.client.ip().to_canonical(),
-            )
+        let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            mirror: conn_details.mirror,
+            debname: conn_details.debname,
+            size: bytes,
+            elapsed,
+            partial: false,
+            client_ip: conn_details.client.ip(),
+        });
+        database_tx
+            .send(cmd)
             .await
-        {
-            error!("Failed to register delivery:  {err}");
-        }
+            .expect("database task should not die");
     });
 
     let mut response_builder = Response::builder()
@@ -1660,7 +1656,7 @@ async fn serve_unfinished_file(
 async fn serve_downloading_file(
     conn_details: ConnectionDetails,
     req: Request<Empty<()>>,
-    database: Database,
+    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> Response<ProxyCacheBody> {
     let mut not_found_once = false;
@@ -1705,7 +1701,7 @@ async fn serve_downloading_file(
                 let path_clone = path.clone();
                 drop(st);
 
-                return serve_cached_file(conn_details, req, database, file, &path_clone).await;
+                return serve_cached_file(conn_details, req, database_tx, file, &path_clone).await;
             }
             ActiveDownloadStatus::Download(path, content_length, receiver) => {
                 /* Cannot use mmap(2) since the file is not yet completely written */
@@ -1741,7 +1737,7 @@ async fn serve_downloading_file(
 
                 return serve_unfinished_file(
                     conn_details,
-                    database,
+                    database_tx,
                     file,
                     path_clone,
                     status,
@@ -2024,7 +2020,7 @@ async fn serve_new_file(
                 .remove(&conn_details.mirror, &conn_details.debname);
 
             let Some(client_modified_since) = client_modified_since else {
-                return serve_cached_file(conn_details, req, appstate.database, file, file_path)
+                return serve_cached_file(conn_details, req, appstate.database_tx, file, file_path)
                     .await;
             };
 
@@ -2101,7 +2097,8 @@ async fn serve_new_file(
                 conn_details.client.ip().to_canonical()
             );
 
-            return serve_cached_file(conn_details, req, appstate.database, file, file_path).await;
+            return serve_cached_file(conn_details, req, appstate.database_tx, file, file_path)
+                .await;
         }
 
         debug!(
@@ -2273,11 +2270,11 @@ async fn serve_new_file(
 
     let cd = conn_details.clone();
     let st = Arc::clone(&status);
-    let db = appstate.database.clone();
+    let db_tx = appstate.database_tx.clone();
     let curr_downloads = appstate.active_downloads.download_count();
     tokio::task::spawn(async move {
         download_file(
-            db,
+            db_tx,
             &cd,
             warn_on_override,
             &st,
@@ -2360,7 +2357,7 @@ async fn serve_new_file(
         }
     }
 
-    serve_downloading_file(conn_details, req, appstate.database, status).await
+    serve_downloading_file(conn_details, req, appstate.database_tx, status).await
 }
 
 /// Create a TCP connection to host:port, build a tunnel between the connection and
@@ -2420,7 +2417,7 @@ pub(crate) async fn process_cache_request(
             if volatile {
                 serve_volatile_file(conn_details, req, file, &cache_path, appstate).await
             } else {
-                serve_cached_file(conn_details, req, appstate.database, file, &cache_path).await
+                serve_cached_file(conn_details, req, appstate.database_tx, file, &cache_path).await
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -2443,7 +2440,7 @@ pub(crate) async fn process_cache_request(
                     conn_details.mirror,
                     conn_details.client.ip().to_canonical()
                 );
-                serve_downloading_file(conn_details, req, appstate.database, status).await
+                serve_downloading_file(conn_details, req, appstate.database_tx, status).await
             }
         }
         Err(err) => {
@@ -2925,15 +2922,18 @@ async fn pre_process_client_request(
                     // TODO: cache some of them?
                     "dep11" | "i18n" | "source" => (),
                     _ => {
-                        let orig = OriginRef {
-                            mirror: &conn_details.mirror,
-                            distribution: distribution.as_ref(),
-                            component: component.as_ref(),
-                            architecture: architecture.as_ref(),
+                        let origin = Origin {
+                            mirror: conn_details.mirror.clone(),
+                            distribution: distribution.into_owned(),
+                            component: component.into_owned(),
+                            architecture: architecture.into_owned(),
                         };
-                        if let Err(err) = appstate.database.add_origin(&orig).await {
-                            error!("Error registering origin {orig:?}:  {err}");
-                        }
+                        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+                        appstate
+                            .database_tx
+                            .send(cmd)
+                            .await
+                            .expect("database task should not die");
                     }
                 }
 
@@ -3012,9 +3012,12 @@ async fn pre_process_client_request(
             // TODO: cache some of them?
             "dep11" | "i18n" | "source" => (),
             _ => {
-                if let Err(err) = appstate.database.add_origin(&origin.as_ref()).await {
-                    error!("Error registering origin {origin:?}:  {err}");
-                }
+                let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+                appstate
+                    .database_tx
+                    .send(cmd)
+                    .await
+                    .expect("database task should not die");
             }
         }
     }
@@ -3193,45 +3196,53 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         err
     })?;
 
-    let db_task_clone = database.clone();
-    tokio::task::spawn(async move {
-        if let Ok(cache_size) = task_cache_scan(&db_task_clone).await {
-            let rd = RUNTIMEDETAILS.get().expect("global set in main()");
+    let (db_task_tx, db_task_rx) = tokio::sync::mpsc::channel(64);
+    {
+        let database = database.clone();
+        tokio::spawn(db_loop(database, db_task_rx));
+    }
 
-            {
-                *rd.cache_size.lock() = cache_size;
-            }
+    {
+        let database = database.clone();
+        tokio::task::spawn(async move {
+            if let Ok(cache_size) = task_cache_scan(&database).await {
+                let rd = RUNTIMEDETAILS.get().expect("global set in main()");
 
-            let disk_quota = rd.config.disk_quota;
+                {
+                    *rd.cache_size.lock() = cache_size;
+                }
 
-            match disk_quota {
-                Some(val) => {
-                    let val = val.get();
-                    if cache_size > val {
-                        warn!(
-                            "Startup cache size of {} exceeds quota {}",
-                            HumanFmt::Size(cache_size),
-                            HumanFmt::Size(val)
-                        );
-                    } else {
+                let disk_quota = rd.config.disk_quota;
+
+                match disk_quota {
+                    Some(val) => {
+                        let val = val.get();
+                        if cache_size > val {
+                            warn!(
+                                "Startup cache size of {} exceeds quota {}",
+                                HumanFmt::Size(cache_size),
+                                HumanFmt::Size(val)
+                            );
+                        } else {
+                            info!(
+                                "Startup cache size: {} (quota={})",
+                                HumanFmt::Size(cache_size),
+                                HumanFmt::Size(val)
+                            );
+                        }
+                    }
+                    None => {
                         info!(
-                            "Startup cache size: {} (quota={})",
-                            HumanFmt::Size(cache_size),
-                            HumanFmt::Size(val)
+                            "Startup cache size: {} (quota=unlimited)",
+                            HumanFmt::Size(cache_size)
                         );
                     }
                 }
-                None => {
-                    info!(
-                        "Startup cache size: {} (quota=unlimited)",
-                        HumanFmt::Size(cache_size)
-                    );
-                }
+            } else {
+                warn!("Startup cache size unset");
             }
-        } else {
-            warn!("Startup cache size unset");
-        }
-    });
+        });
+    }
 
     let active_downloads = ActiveDownloads::new();
 
@@ -3244,6 +3255,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let appstate = AppState {
         database,
+        database_tx: db_task_tx,
         https_client,
         active_downloads,
     };

@@ -142,7 +142,7 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn add_mirror(&self, mirror: &Mirror) -> Result<(), Error> {
+    async fn add_mirror(&self, mirror: &Mirror) -> Result<(), Error> {
         query!(
             r"
                 INSERT INTO mirrors
