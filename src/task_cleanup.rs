@@ -175,9 +175,10 @@ async fn get_package_file(
                 pkgfmt.extension()
             ),
             subdir: Some(Path::new("dists")),
+            volatile: true,
         };
 
-        let response = process_cache_request(conn_details, req, true, appstate.clone()).await;
+        let response = process_cache_request(conn_details, req, appstate.clone()).await;
 
         if response.status() == StatusCode::NOT_FOUND {
             debug!("Cleanup request {uri} not found");
