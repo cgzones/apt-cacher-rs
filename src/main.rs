@@ -1055,8 +1055,8 @@ async fn serve_volatile_file(
         .insert(conn_details.mirror.clone(), conn_details.debname.clone());
 
     let Some(init_tx) = init_tx else {
-        info!(
-            "Serving file {} already in download from mirror {} for client {}...",
+        debug!(
+            "Serving file {} already in cache / download from mirror {} for client {}...",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client.ip().to_canonical()
