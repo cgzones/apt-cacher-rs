@@ -2078,8 +2078,8 @@ async fn serve_new_file(
     if let CacheFileStat::Volatile((file, file_path, local_modification_time)) = cfstate {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
             *status.write().await = ActiveDownloadStatus::Finished(file_path.to_path_buf());
-            // ignore if there are no receivers
-            init_tx.send_replace(());
+            // notify receivers
+            drop(init_tx);
 
             let mirror_clone = conn_details.mirror.clone();
             let debname_clone = conn_details.debname.clone();
@@ -2290,8 +2290,8 @@ async fn serve_new_file(
     let (tx, rx) = tokio::sync::watch::channel(());
 
     *status.write().await = ActiveDownloadStatus::Download(outpath.clone(), content_length, rx);
-    // ignore if there are no receivers
-    init_tx.send_replace(());
+    // notify receivers
+    drop(init_tx);
 
     let cd = conn_details.clone();
     let st = Arc::clone(&status);
