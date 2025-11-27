@@ -256,6 +256,60 @@ fn quick_response<T: Into<bytes::Bytes>>(
         .expect("Response is valid")
 }
 
+#[must_use]
+fn not_modified_response(
+    client_modified_since: &HeaderValue,
+    file_modified_time: SystemTime,
+) -> Option<Response<ProxyCacheBody>> {
+    if let Some(client_modified_time) = client_modified_since
+        .to_str()
+        .ok()
+        .and_then(http_datetime_to_systemtime)
+        && client_modified_time >= file_modified_time
+    {
+        /*
+         * Response {
+         *     status: 304,
+         *     version: HTTP/1.1,
+         *     headers: {
+         *         "connection": "keep-alive",
+         *         "date": "Sat, 08 Jun 2024 12:50:39 GMT",
+         *         "via": "1.1 varnish",
+         *         "etag": "\"306ed-61a5ca11810f3\"",
+         *         "age": "104",
+         *         "x-served-by": "cache-fra-eddf8230031-FRA",
+         *         "x-cache": "HIT",
+         *         "x-cache-hits": "1",
+         *         "x-timer": "S1717851040.758717,VS0,VE1"
+         *     },
+         *     body: Body(Empty)
+         * }
+         */
+
+        let response = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(CONNECTION, HeaderValue::from_static("keep-alive"))
+            .header(SERVER, HeaderValue::from_static(APP_NAME))
+            .header(
+                AGE,
+                HeaderValue::try_from(format!(
+                    "{}",
+                    file_modified_time.elapsed().map_or(0, |dur| dur.as_secs())
+                ))
+                .expect("string is valid"),
+            )
+            .header(DATE, systemtime_to_http_datetime(SystemTime::now()))
+            .body(ProxyCacheBody::Empty(Empty::new()))
+            .expect("HTTP response is valid");
+
+        trace!("Outgoing response of up-to-date cached file: {response:?}");
+
+        return Some(response);
+    }
+
+    None
+}
+
 #[cfg(not(feature = "mmap"))]
 /* Adopted from http_body_util::StreamBody */
 #[pin_project(PinnedDrop)]
@@ -2016,16 +2070,15 @@ async fn serve_new_file(
                 .remove(&conn_details.mirror, &conn_details.debname);
 
             let Some(client_modified_since) = client_modified_since else {
+                // If the client is not checking the modification timestamp, send the whole file
                 return serve_cached_file(conn_details, req, appstate.database_tx, file, file_path)
                     .await;
             };
 
-            if let Some(client_modified_time) = client_modified_since
-                .to_str()
-                .ok()
-                .and_then(http_datetime_to_systemtime)
-                && client_modified_time >= local_modification_time
+            if let Some(response) =
+                not_modified_response(client_modified_since, local_modification_time)
             {
+                // If the client-file is up to date, send a NOT_MODIFIED (304) response
                 info!(
                     "Serving info about up-to-date cached file {} from mirror {} for client {}",
                     conn_details.debname,
@@ -2033,58 +2086,10 @@ async fn serve_new_file(
                     conn_details.client.ip().to_canonical()
                 );
 
-                /*
-                 * Response {
-                 *     status: 304,
-                 *     version: HTTP/1.1,
-                 *     headers: {
-                 *         "connection": "keep-alive",
-                 *         "date": "Sat, 08 Jun 2024 12:50:39 GMT",
-                 *         "via": "1.1 varnish",
-                 *         "cache-control": "public, max-age=120",
-                 *         "etag": "\"306ed-61a5ca11810f3\"",
-                 *         "age": "104",
-                 *         "x-served-by": "cache-fra-eddf8230031-FRA",
-                 *         "x-cache": "HIT",
-                 *         "x-cache-hits": "1",
-                 *         "x-timer": "S1717851040.758717,VS0,VE1"
-                 *     },
-                 *     body: Body(Empty)
-                 * }
-                 */
-
-                let mut response = Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(CONNECTION, HeaderValue::from_static("keep-alive"))
-                    .header(SERVER, HeaderValue::from_static(APP_NAME))
-                    .header(
-                        CACHE_CONTROL,
-                        HeaderValue::try_from(format!("public, max-age={max_age}"))
-                            .expect("string is valid"),
-                    ) // TODO: send CACHE_CONTROL in other branches as well
-                    .header(
-                        AGE,
-                        HeaderValue::try_from(format!(
-                            "{}",
-                            local_modification_time
-                                .elapsed()
-                                .map_or(0, |dur| dur.as_secs())
-                        ))
-                        .expect("string is valid"),
-                    ) // TODO: send AGE in other branches as well
-                    .body(ProxyCacheBody::Empty(Empty::new()))
-                    .expect("HTTP response is valid");
-
-                if let Some(date) = fwd_response.headers_mut().remove(DATE) {
-                    let r = response.headers_mut().append(DATE, date);
-                    assert!(!r);
-                }
-
-                trace!("Outgoing response of up-to-date cached file: {response:?}");
-
                 return response;
             }
 
+            // If the client-file is outdated, send the whole file
             info!(
                 "File {} from mirror {} is up-to-date in cache, serving to client {} with older version",
                 conn_details.debname,
