@@ -256,6 +256,60 @@ fn quick_response<T: Into<bytes::Bytes>>(
         .expect("Response is valid")
 }
 
+#[must_use]
+fn not_modified_response(
+    client_modified_since: &HeaderValue,
+    file_modified_time: SystemTime,
+) -> Option<Response<ProxyCacheBody>> {
+    if let Some(client_modified_time) = client_modified_since
+        .to_str()
+        .ok()
+        .and_then(http_datetime_to_systemtime)
+        && client_modified_time >= file_modified_time
+    {
+        /*
+         * Response {
+         *     status: 304,
+         *     version: HTTP/1.1,
+         *     headers: {
+         *         "connection": "keep-alive",
+         *         "date": "Sat, 08 Jun 2024 12:50:39 GMT",
+         *         "via": "1.1 varnish",
+         *         "etag": "\"306ed-61a5ca11810f3\"",
+         *         "age": "104",
+         *         "x-served-by": "cache-fra-eddf8230031-FRA",
+         *         "x-cache": "HIT",
+         *         "x-cache-hits": "1",
+         *         "x-timer": "S1717851040.758717,VS0,VE1"
+         *     },
+         *     body: Body(Empty)
+         * }
+         */
+
+        let response = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(CONNECTION, HeaderValue::from_static("keep-alive"))
+            .header(SERVER, HeaderValue::from_static(APP_NAME))
+            .header(
+                AGE,
+                HeaderValue::try_from(format!(
+                    "{}",
+                    file_modified_time.elapsed().map_or(0, |dur| dur.as_secs())
+                ))
+                .expect("string is valid"),
+            )
+            .header(DATE, systemtime_to_http_datetime(SystemTime::now()))
+            .body(ProxyCacheBody::Empty(Empty::new()))
+            .expect("HTTP response is valid");
+
+        trace!("Outgoing response of up-to-date cached file: {response:?}");
+
+        return Some(response);
+    }
+
+    None
+}
+
 #[cfg(not(feature = "mmap"))]
 /* Adopted from http_body_util::StreamBody */
 #[pin_project(PinnedDrop)]
@@ -678,18 +732,6 @@ async fn serve_cached_file(
     file: tokio::fs::File,
     file_path: &Path,
 ) -> Response<ProxyCacheBody> {
-    let aliased = match conn_details.aliased_host {
-        Some(alias) => format!(" aliased to host {alias}"),
-        None => String::new(),
-    };
-    info!(
-        "Serving cached file {} from mirror {}{} for client {}...",
-        conn_details.debname,
-        conn_details.mirror,
-        aliased,
-        conn_details.client.ip().to_canonical()
-    );
-
     let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(err) => {
@@ -702,9 +744,35 @@ async fn serve_cached_file(
     };
 
     let file_size = metadata.len();
-    let modification_date = metadata
+    let local_modification_time = metadata
         .modified()
         .expect("platform should support modification time");
+
+    if let Some(client_modified_since) = req.headers().get(IF_MODIFIED_SINCE)
+        && let Some(response) =
+            not_modified_response(client_modified_since, local_modification_time)
+    {
+        info!(
+            "Serving info about up-to-date cached file {} from mirror {} for client {}",
+            conn_details.debname,
+            conn_details.mirror,
+            conn_details.client.ip().to_canonical()
+        );
+
+        return response;
+    }
+
+    let aliased = match conn_details.aliased_host {
+        Some(alias) => format!(" aliased to host {alias}"),
+        None => String::new(),
+    };
+    info!(
+        "Serving cached file {} from mirror {}{} for client {}...",
+        conn_details.debname,
+        conn_details.mirror,
+        aliased,
+        conn_details.client.ip().to_canonical()
+    );
 
     let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
         req.headers().get(RANGE).and_then(|val| val.to_str().ok())
@@ -714,7 +782,7 @@ async fn serve_cached_file(
                 .get(IF_RANGE)
                 .and_then(|val| val.to_str().ok()),
             file_size,
-            modification_date,
+            local_modification_time,
         ) {
         (
             StatusCode::PARTIAL_CONTENT,
@@ -749,7 +817,7 @@ async fn serve_cached_file(
         database_tx,
         file,
         file_path,
-        modification_date,
+        local_modification_time,
         http_status,
         content_length,
         content_start,
@@ -764,7 +832,7 @@ async fn serve_cached_file(
         file,
         file_path,
         file_size,
-        modification_date,
+        local_modification_time,
         http_status,
         content_length,
         content_start,
@@ -982,6 +1050,20 @@ async fn serve_volatile_file(
     file_path: &Path,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
+    let (init_tx, status) = appstate
+        .active_downloads
+        .insert(conn_details.mirror.clone(), conn_details.debname.clone());
+
+    let Some(init_tx) = init_tx else {
+        debug!(
+            "Serving file {} already in cache / download from mirror {} for client {}...",
+            conn_details.debname,
+            conn_details.mirror,
+            conn_details.client.ip().to_canonical()
+        );
+        return serve_downloading_file(conn_details, req, appstate.database_tx, status).await;
+    };
+
     let local_modification_time = match file.metadata().await {
         Ok(data) => data
             .modified()
@@ -993,32 +1075,6 @@ async fn serve_volatile_file(
             );
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
-    };
-
-    // Cache volatile files for short periods to reduce up-to-date requests
-    if let Ok(elapsed) = local_modification_time.elapsed()
-        && elapsed < Duration::from_secs(30)
-    {
-        debug!(
-            "Volatile file `{}` is just {} old, serving cached version...",
-            file_path.display(),
-            HumanFmt::Time(elapsed)
-        );
-        return serve_cached_file(conn_details, req, appstate.database_tx, file, file_path).await;
-    }
-
-    let (init_tx, status) = appstate
-        .active_downloads
-        .insert(conn_details.mirror.clone(), conn_details.debname.clone());
-
-    let Some(init_tx) = init_tx else {
-        info!(
-            "Serving file {} already in download from mirror {} for client {}...",
-            conn_details.debname,
-            conn_details.mirror,
-            conn_details.client.ip().to_canonical()
-        );
-        return serve_downloading_file(conn_details, req, appstate.database_tx, status).await;
     };
 
     serve_new_file(
@@ -1039,6 +1095,7 @@ struct ConnectionDetails {
     aliased_host: Option<&'static DomainName>,
     debname: String,
     subdir: Option<&'static Path>,
+    volatile: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1799,6 +1856,7 @@ async fn serve_new_file(
 ) -> Response<ProxyCacheBody> {
     // TODO: upstream constant
     const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
+    const KEEP_FINISHED_STATE_SECONDS: Duration = Duration::from_secs(30);
 
     let (volatile_file, warn_on_override, prev_file_size) = match &cfstate {
         CacheFileStat::Volatile((file, file_path, _local_modification_time)) => {
@@ -2019,41 +2077,31 @@ async fn serve_new_file(
 
     if let CacheFileStat::Volatile((file, file_path, local_modification_time)) = cfstate {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
-            // Refactor when https://github.com/tokio-rs/tokio/issues/6368 is resolved
-            let std_file = file.into_std().await;
-            let std_file_path = file_path.to_path_buf();
-            let file = tokio::task::spawn_blocking(move || {
-                if let Err(err) = std_file.set_modified(SystemTime::now()) {
-                    error!(
-                        "Failed to update modification time of file `{}`:  {}",
-                        std_file_path.display(),
-                        err
-                    );
-                }
-                tokio::fs::File::from_std(std_file)
-            })
-            .await
-            .expect("task should not panic");
-
             *status.write().await = ActiveDownloadStatus::Finished(file_path.to_path_buf());
-            // ignore if there are no receivers
-            init_tx.send_replace(());
+            // notify receivers
+            drop(init_tx);
 
-            appstate
-                .active_downloads
-                .remove(&conn_details.mirror, &conn_details.debname);
+            let mirror_clone = conn_details.mirror.clone();
+            let debname_clone = conn_details.debname.clone();
+            tokio::task::spawn(async move {
+                // Keep ActiveDownloadStatus::Finished of volatile files in the hashmap for a short
+                // time to avoid unnecessary "IF_MODIFIED_SINCE" recheck requests to the mirror.
+                tokio::time::sleep(KEEP_FINISHED_STATE_SECONDS).await;
+                appstate
+                    .active_downloads
+                    .remove(&mirror_clone, &debname_clone);
+            });
 
             let Some(client_modified_since) = client_modified_since else {
+                // If the client is not checking the modification timestamp, send the whole file
                 return serve_cached_file(conn_details, req, appstate.database_tx, file, file_path)
                     .await;
             };
 
-            if let Some(client_modified_time) = client_modified_since
-                .to_str()
-                .ok()
-                .and_then(http_datetime_to_systemtime)
-                && client_modified_time >= local_modification_time
+            if let Some(response) =
+                not_modified_response(client_modified_since, local_modification_time)
             {
+                // If the client-file is up to date, send a NOT_MODIFIED (304) response
                 info!(
                     "Serving info about up-to-date cached file {} from mirror {} for client {}",
                     conn_details.debname,
@@ -2061,58 +2109,10 @@ async fn serve_new_file(
                     conn_details.client.ip().to_canonical()
                 );
 
-                /*
-                 * Response {
-                 *     status: 304,
-                 *     version: HTTP/1.1,
-                 *     headers: {
-                 *         "connection": "keep-alive",
-                 *         "date": "Sat, 08 Jun 2024 12:50:39 GMT",
-                 *         "via": "1.1 varnish",
-                 *         "cache-control": "public, max-age=120",
-                 *         "etag": "\"306ed-61a5ca11810f3\"",
-                 *         "age": "104",
-                 *         "x-served-by": "cache-fra-eddf8230031-FRA",
-                 *         "x-cache": "HIT",
-                 *         "x-cache-hits": "1",
-                 *         "x-timer": "S1717851040.758717,VS0,VE1"
-                 *     },
-                 *     body: Body(Empty)
-                 * }
-                 */
-
-                let mut response = Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(CONNECTION, HeaderValue::from_static("keep-alive"))
-                    .header(SERVER, HeaderValue::from_static(APP_NAME))
-                    .header(
-                        CACHE_CONTROL,
-                        HeaderValue::try_from(format!("public, max-age={max_age}"))
-                            .expect("string is valid"),
-                    ) // TODO: send CACHE_CONTROL in other branches as well
-                    .header(
-                        AGE,
-                        HeaderValue::try_from(format!(
-                            "{}",
-                            local_modification_time
-                                .elapsed()
-                                .map_or(0, |dur| dur.as_secs())
-                        ))
-                        .expect("string is valid"),
-                    ) // TODO: send AGE in other branches as well
-                    .body(ProxyCacheBody::Empty(Empty::new()))
-                    .expect("HTTP response is valid");
-
-                if let Some(date) = fwd_response.headers_mut().remove(DATE) {
-                    let r = response.headers_mut().append(DATE, date);
-                    assert!(!r);
-                }
-
-                trace!("Outgoing response of up-to-date cached file: {response:?}");
-
                 return response;
             }
 
+            // If the client-file is outdated, send the whole file
             info!(
                 "File {} from mirror {} is up-to-date in cache, serving to client {} with older version",
                 conn_details.debname,
@@ -2290,14 +2290,16 @@ async fn serve_new_file(
     let (tx, rx) = tokio::sync::watch::channel(());
 
     *status.write().await = ActiveDownloadStatus::Download(outpath.clone(), content_length, rx);
-    // ignore if there are no receivers
-    init_tx.send_replace(());
+    // notify receivers
+    drop(init_tx);
 
     let cd = conn_details.clone();
     let st = Arc::clone(&status);
     let db_tx = appstate.database_tx.clone();
     let curr_downloads = appstate.active_downloads.download_count();
     tokio::task::spawn(async move {
+        let mut delay_finished_state_removal = cd.volatile;
+
         download_file(
             db_tx,
             &cd,
@@ -2319,6 +2321,8 @@ async fn serve_new_file(
                     content_length.upper().get()
                 );
 
+                delay_finished_state_removal = false;
+
                 let mut mg_cache_size = RUNTIMEDETAILS
                     .get()
                     .expect("global is set in main()")
@@ -2333,6 +2337,11 @@ async fn serve_new_file(
             }
         }
 
+        if delay_finished_state_removal {
+            // Keep ActiveDownloadStatus::Finished of volatile files in the hashmap for a short
+            // time to avoid unnecessary "IF_MODIFIED_SINCE" recheck requests to the mirror.
+            tokio::time::sleep(KEEP_FINISHED_STATE_SECONDS).await;
+        }
         appstate.active_downloads.remove(&cd.mirror, &cd.debname);
     });
 
@@ -2420,7 +2429,6 @@ async fn tunnel(
 pub(crate) async fn process_cache_request(
     conn_details: ConnectionDetails,
     req: Request<Empty<()>>,
-    volatile: bool,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     let cache_path: PathBuf = [
@@ -2442,9 +2450,13 @@ pub(crate) async fn process_cache_request(
             trace!(
                 "File {} found, serving {} version...",
                 cache_path.display(),
-                if volatile { "volatile" } else { "cached" }
+                if conn_details.volatile {
+                    "volatile"
+                } else {
+                    "cached"
+                }
             );
-            if volatile {
+            if conn_details.volatile {
                 serve_volatile_file(conn_details, req, file, &cache_path, appstate).await
             } else {
                 serve_cached_file(conn_details, req, appstate.database_tx, file, &cache_path).await
@@ -2466,7 +2478,7 @@ pub(crate) async fn process_cache_request(
             );
 
             if let Some(init_tx) = init_tx {
-                let cfstate = if volatile {
+                let cfstate = if conn_details.volatile {
                     CacheFileStat::NewVolatile
                 } else {
                     CacheFileStat::NewDefault
@@ -2759,9 +2771,10 @@ async fn pre_process_client_request(
                         aliased_host,
                         debname: debname.into_owned(),
                         subdir: None,
+                        volatile: false,
                     };
 
-                    return process_cache_request(conn_details, req, false, appstate).await;
+                    return process_cache_request(conn_details, req, appstate).await;
                 }
 
                 warn_once_or_info!("Unsupported pool file extension in filename `{filename}`");
@@ -2822,9 +2835,10 @@ async fn pre_process_client_request(
                     aliased_host,
                     debname: format!("{distribution}_{filename}"),
                     subdir: Some(Path::new("dists")),
+                    volatile: true,
                 };
 
-                return process_cache_request(conn_details, req, true, appstate).await;
+                return process_cache_request(conn_details, req, appstate).await;
             }
             ResourceFile::ByHash(mirror_path, filename) => {
                 let mirrorname = match urlencoding::decode(mirror_path) {
@@ -2865,10 +2879,11 @@ async fn pre_process_client_request(
                     aliased_host,
                     debname: filename.to_string(),
                     subdir: Some(Path::new("dists/by-hash")),
+                    volatile: false,
                 };
 
                 // files requested by hash shouldn't be volatile
-                return process_cache_request(conn_details, req, false, appstate).await;
+                return process_cache_request(conn_details, req, appstate).await;
             }
             ResourceFile::Package(mirror_path, distribution, component, architecture, filename) => {
                 let mirrorname = match urlencoding::decode(mirror_path) {
@@ -2956,6 +2971,7 @@ async fn pre_process_client_request(
                     aliased_host,
                     debname: format!("{distribution}_{component}_{architecture}_{filename}"),
                     subdir: Some(Path::new("dists")),
+                    volatile: true,
                 };
 
                 match architecture.as_ref() {
@@ -2977,7 +2993,7 @@ async fn pre_process_client_request(
                     }
                 }
 
-                return process_cache_request(conn_details, req, true, appstate).await;
+                return process_cache_request(conn_details, req, appstate).await;
             }
         }
     }
