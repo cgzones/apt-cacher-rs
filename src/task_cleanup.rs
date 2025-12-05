@@ -18,8 +18,7 @@ use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use crate::{
     AppState, CachedFlavor, ConnectionDetails, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
     RUNTIMEDETAILS,
-    config::DomainName,
-    database::OriginEntry,
+    database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, UriFormat as _},
     global_config,
     humanfmt::HumanFmt,
@@ -254,15 +253,11 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let mut tasks = Vec::with_capacity(mirrors.len());
     for mirror in mirrors {
         tasks.push(tokio::task::spawn(cleanup_mirror_deb_files(
-            mirror.host.clone(),
-            mirror.path.clone(),
+            mirror.clone(),
             appstate.clone(),
         )));
 
-        tasks.push(tokio::task::spawn(cleanup_mirror_byhash_files(
-            mirror.host,
-            mirror.path,
-        )));
+        tasks.push(tokio::task::spawn(cleanup_mirror_byhash_files(mirror)));
     }
 
     let mut files_retained = 0;
@@ -361,13 +356,12 @@ struct CleanupDone {
 }
 
 async fn cleanup_mirror_deb_files(
-    host: DomainName,
-    path: String,
+    mirror: MirrorEntry,
     appstate: AppState,
 ) -> Result<CleanupDone, ProxyCacheError> {
     let origins = appstate
         .database
-        .get_origins_by_mirror(&host, &path)
+        .get_origins_by_mirror(&mirror.host, mirror.port(), &mirror.path)
         .await
         .map_err(|err| {
             error!("Error looking up origins:  {err}");
@@ -396,13 +390,9 @@ async fn cleanup_mirror_deb_files(
         })
         .collect::<Vec<_>>();
 
-    let mirror_path: PathBuf = [
-        &global_config().cache_directory,
-        Path::new(&host),
-        Path::new(&path),
-    ]
-    .iter()
-    .collect();
+    let mirror_path: PathBuf = [&global_config().cache_directory, &mirror.cache_path()]
+        .iter()
+        .collect();
 
     let mut cached_files = collect_cached_files(&mirror_path).await.map_err(|err| {
         error!("Error listing files in `{}`:  {err}", mirror_path.display());
@@ -414,21 +404,21 @@ async fn cleanup_mirror_deb_files(
     trace!("Cached files ({}): {cached_files:?}", cached_files.len());
 
     info!(
-        "Found {} active origins and {} cached deb files for mirror {}/{}",
+        "Found {} active origins and {} cached deb files for mirror {}",
         active_origins.len(),
         cached_files.len(),
-        host,
-        path
+        mirror.cache_path().display(),
     );
 
     let mirror = Mirror {
-        host: host.clone(),
-        path: path.clone(),
+        port: mirror.port(),
+        host: mirror.host,
+        path: mirror.path,
     };
 
     if cached_files.is_empty() {
         return Ok(CleanupDone {
-            mirror: Mirror { host, path },
+            mirror,
             files_retained: num_total_files,
             files_removed: 0,
             bytes_removed: 0,
@@ -440,17 +430,17 @@ async fn cleanup_mirror_deb_files(
             Ok(r) => r,
             Err(StatusCode::NOT_FOUND) => {
                 warn!(
-                    "Could not find package file for {origin:?}; continuing cleanup for mirror {host}/{path}..."
+                    "Could not find package file for {origin:?}; continuing cleanup for mirror {mirror}..."
                 );
                 continue;
             }
             Err(status) => {
                 warn!(
-                    "Could not find package file for {origin:?} ({status}); skipping cleanup for mirror {host}/{path}"
+                    "Could not find package file for {origin:?} ({status}); skipping cleanup for mirror {mirror}"
                 );
 
                 return Ok(CleanupDone {
-                    mirror: Mirror { host, path },
+                    mirror,
                     files_retained: num_total_files,
                     files_removed: 0,
                     bytes_removed: 0,
@@ -501,7 +491,7 @@ async fn cleanup_mirror_deb_files(
 
         if cached_files.is_empty() {
             return Ok(CleanupDone {
-                mirror: Mirror { host, path },
+                mirror,
                 files_retained: num_total_files,
                 files_removed: 0,
                 bytes_removed: 0,
@@ -585,22 +575,19 @@ async fn cleanup_mirror_deb_files(
     }
 
     info!(
-        "Removed {files_removed} unreferenced deb files for mirror {host}/{path} ({})",
+        "Removed {files_removed} unreferenced deb files for mirror {mirror} ({})",
         HumanFmt::Size(bytes_removed)
     );
 
     Ok(CleanupDone {
-        mirror: Mirror { host, path },
+        mirror,
         files_retained: num_total_files - files_removed,
         files_removed,
         bytes_removed,
     })
 }
 
-async fn cleanup_mirror_byhash_files(
-    host: DomainName,
-    path: String,
-) -> Result<CleanupDone, ProxyCacheError> {
+async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone, ProxyCacheError> {
     let mut bytes_removed = 0;
     let mut files_removed = 0;
     let mut files_retained = 0;
@@ -609,12 +596,17 @@ async fn cleanup_mirror_byhash_files(
 
     let mirror_byhash_path: PathBuf = [
         &global_config().cache_directory,
-        Path::new(&host),
-        Path::new(&path),
+        &mirror.cache_path(),
         Path::new("dists/by-hash"),
     ]
     .iter()
     .collect();
+
+    let mirror = Mirror {
+        port: mirror.port(),
+        host: mirror.host,
+        path: mirror.path,
+    };
 
     let mut byhash_dir = match tokio::fs::read_dir(&mirror_byhash_path).await {
         Ok(d) => d,
@@ -624,7 +616,7 @@ async fn cleanup_mirror_byhash_files(
                 mirror_byhash_path.display()
             );
             return Ok(CleanupDone {
-                mirror: Mirror { host, path },
+                mirror,
                 files_retained,
                 files_removed,
                 bytes_removed,
@@ -704,14 +696,12 @@ async fn cleanup_mirror_byhash_files(
     }
 
     info!(
-        "Removed {files_removed} files acquired by-hash for mirror {}/{} ({})",
-        host,
-        path,
+        "Removed {files_removed} files acquired by-hash for mirror {mirror} ({})",
         HumanFmt::Size(bytes_removed)
     );
 
     Ok(CleanupDone {
-        mirror: Mirror { host, path },
+        mirror,
         files_retained,
         files_removed,
         bytes_removed,

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                mirrors_v2.host,\n                mirrors_v2.port AS \"port: u16\",\n                mirrors_v2.path,\n                mirrors_v2.first_seen,\n                mirrors_v2.last_seen,\n                mirrors_v2.last_cleanup,\n                COALESCE(downloads.total_size, 0) AS \"total_download_size: i64\",\n                COALESCE(deliveries.total_size, 0) AS \"total_delivery_size: i64\"\n            FROM mirrors_v2\n            LEFT JOIN\n                (SELECT mirror_id, SUM(size) AS total_size FROM downloads GROUP BY mirror_id) AS downloads\n            ON mirrors_v2.id == downloads.mirror_id\n            LEFT JOIN\n                (SELECT mirror_id, SUM(size) AS total_size FROM deliveries GROUP BY mirror_id) AS deliveries\n            ON mirrors_v2.id == deliveries.mirror_id\n            ;\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "host",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "port: u16",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "path",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "first_seen",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_seen",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_cleanup",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_download_size: i64",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_delivery_size: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d023fa35b5d0a09fd6fc5ac50af160fe52b21d9f456852e2d942b4b8e05c71ac"
+}

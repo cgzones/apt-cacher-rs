@@ -1,0 +1,2 @@
+[advisories]
+ignore = ["RUSTSEC-2023-0071"] # unfixed, but rsa crate is only used by mysql backend

@@ -63,7 +63,11 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         let mut scanned = false;
 
         for mirror in &mirrors {
-            if Path::new(&mirror.host) != filename {
+            if let Some(port) = mirror.port() {
+                if Path::new(&format!("{}:{port}", mirror.host)) != filename {
+                    continue;
+                }
+            } else if Path::new(&mirror.host) != filename {
                 continue;
             }
 
@@ -96,7 +100,13 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
 
 #[must_use]
 async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
-    let mirror_dir = host.path().join(mirror.path.as_str());
+    let mirror_dir = {
+        let mut p = host.path();
+        let mpath = Path::new(&mirror.path);
+        assert!(mpath.is_relative());
+        p.push(mpath);
+        p
+    };
 
     trace!("Scanning mirror directory `{}`...", mirror_dir.display());
 

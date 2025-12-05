@@ -50,6 +50,7 @@ serde = "1.0.197"
 simplelog = "0.12.1"
 sqlx = { version = "0.8", default-features = false, features = [
     "macros",
+    "migrate",
     "runtime-tokio",
     "sqlite",
 ] }
