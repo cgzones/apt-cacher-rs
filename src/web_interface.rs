@@ -139,9 +139,8 @@ async fn build_mirror_table(database: &Database) -> Result<(Table, usize), Proxy
             )
         );
 
-        let mirror_path: PathBuf = [cache_path, Path::new(&mirror.host), Path::new(&mirror.path)]
-            .iter()
-            .collect();
+        let mirror_path: PathBuf = [cache_path, &mirror.cache_path()].iter().collect();
+
         let (file_count_fmt, dir_size_fmt) = if mirror_path.exists() {
             match flat_directory_size(&mirror_path).await {
                 Ok((count, size)) => (format!("{count}"), format!("{}", HumanFmt::Size(size))),
@@ -168,7 +167,7 @@ async fn build_mirror_table(database: &Database) -> Result<(Table, usize), Proxy
         };
 
         html_table_mirrors.add_body_row(&[
-            format!("{}/{}", mirror.host, mirror.path),
+            mirror.uri(),
             last_seen_fmt,
             first_seen_fmt,
             last_cleanup_fmt,
@@ -211,7 +210,7 @@ async fn build_origin_table(database: &Database) -> Result<(Table, usize), Proxy
             .expect("timestamp should be formattable");
 
         html_table_origins.add_body_row(&[
-            format!("{}/{}", origin.host, origin.mirror_path),
+            origin.mirror_uri(),
             origin.distribution,
             origin.component,
             origin.architecture,

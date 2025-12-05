@@ -1,15 +1,43 @@
+use std::{
+    num::NonZero,
+    path::{Path, PathBuf},
+};
+
 use crate::config::DomainName;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Mirror {
     pub(crate) host: DomainName,
+    pub(crate) port: Option<NonZero<u16>>,
     pub(crate) path: String,
 }
 
 impl std::fmt::Display for Mirror {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.host, self.path)
+        if let Some(port) = self.port {
+            write!(f, "{}:{port}/{}", self.host, self.path)
+        } else {
+            write!(f, "{}/{}", self.host, self.path)
+        }
     }
+}
+
+pub(crate) fn mirror_cache_path_impl(
+    host: &str,
+    port: Option<NonZero<u16>>,
+    path: &str,
+) -> PathBuf {
+    let cache_path: PathBuf = if let Some(port) = port {
+        let mut p = PathBuf::from(format!("{host}:{port}"));
+        p.push(path);
+        p
+    } else {
+        [Path::new(host), Path::new(path)].iter().collect()
+    };
+
+    assert!(cache_path.is_relative());
+
+    cache_path
 }
 
 #[derive(Debug, PartialEq)]
@@ -30,7 +58,11 @@ pub(crate) struct OriginRef<'a> {
 
 impl Origin {
     #[must_use]
-    pub(crate) fn from_path(path: &str, host: DomainName) -> Option<Self> {
+    pub(crate) fn from_path(
+        path: &str,
+        host: DomainName,
+        port: Option<NonZero<u16>>,
+    ) -> Option<Self> {
         /* /debian/dists/sid/main/binary-amd64/Packages{,.diff,.gz,.xz} */
 
         let path = path.trim_start_matches('/');
@@ -53,6 +85,7 @@ impl Origin {
         Some(Self {
             mirror: Mirror {
                 host,
+                port,
                 path: mirror_path.to_owned(),
             },
             distribution: distribution.to_owned(),
@@ -82,14 +115,26 @@ impl UriFormat for Origin {
     #[inline]
     fn uri(&self) -> String {
         /* deb.debian.org/debian/dists/sid/main/binary-amd64/Packages */
-        format!(
-            "http://{}/{}/dists/{}/{}/{}/Packages",
-            self.mirror.host,
-            self.mirror.path,
-            self.distribution,
-            self.component,
-            self.architecture
-        )
+
+        if let Some(port) = self.mirror.port {
+            format!(
+                "http://{}:{port}/{}/dists/{}/{}/{}/Packages",
+                self.mirror.host,
+                self.mirror.path,
+                self.distribution,
+                self.component,
+                self.architecture
+            )
+        } else {
+            format!(
+                "http://{}/{}/dists/{}/{}/{}/Packages",
+                self.mirror.host,
+                self.mirror.path,
+                self.distribution,
+                self.component,
+                self.architecture
+            )
+        }
     }
 }
 
@@ -97,10 +142,18 @@ impl UriFormat for &crate::database::OriginEntry {
     #[inline]
     fn uri(&self) -> String {
         /* deb.debian.org/debian/dists/sid/main/binary-amd64/Packages */
-        format!(
-            "http://{}/{}/dists/{}/{}/{}/Packages",
-            self.host, self.mirror_path, self.distribution, self.component, self.architecture
-        )
+
+        if let Some(port) = self.port() {
+            format!(
+                "http://{}:{port}/{}/dists/{}/{}/{}/Packages",
+                self.host, self.mirror_path, self.distribution, self.component, self.architecture
+            )
+        } else {
+            format!(
+                "http://{}/{}/dists/{}/{}/{}/Packages",
+                self.host, self.mirror_path, self.distribution, self.component, self.architecture
+            )
+        }
     }
 }
 
@@ -340,7 +393,7 @@ pub(crate) fn valid_architecture(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::DomainName;
+    use crate::{config::DomainName, nonzero};
 
     use super::*;
 
@@ -349,6 +402,7 @@ mod tests {
         let result = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/Packages/",
             DomainName::new("deb.debian.org".to_string()).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -356,6 +410,7 @@ mod tests {
             Origin {
                 mirror: Mirror {
                     host: DomainName::new("deb.debian.org".to_string()).unwrap(),
+                    port: None,
                     path: "debian".to_string(),
                 },
                 distribution: "sid".to_string(),
@@ -375,6 +430,7 @@ mod tests {
             "/private/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
         84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
             DomainName::new("site.example.com".to_string()).unwrap(),
+            Some(nonzero!(80)),
         )
         .unwrap();
         assert_eq!(
@@ -382,6 +438,7 @@ mod tests {
             Origin {
                 mirror: Mirror {
                     host: DomainName::new("site.example.com".to_string()).unwrap(),
+                    port: Some(nonzero!(80)),
                     path: "private/debian".to_string(),
                 },
                 distribution: "sid".to_string(),
@@ -391,7 +448,7 @@ mod tests {
         );
         assert_eq!(
             result.uri(),
-            "http://site.example.com/private/debian/dists/sid/main/binary-amd64/Packages"
+            "http://site.example.com:80/private/debian/dists/sid/main/binary-amd64/Packages"
         );
     }
 
@@ -400,6 +457,7 @@ mod tests {
         let result = Origin::from_path(
             "/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages.gz",
             DomainName::new("apt.llvm.org".to_string()).unwrap(),
+            Some(nonzero!(443)),
         )
         .unwrap();
         assert_eq!(
@@ -407,6 +465,7 @@ mod tests {
             Origin {
                 mirror: Mirror {
                     host: DomainName::new("apt.llvm.org".to_string()).unwrap(),
+                    port: Some(nonzero!(443)),
                     path: "unstable".to_string(),
                 },
                 distribution: "llvm-toolchain-19".to_string(),
@@ -416,7 +475,7 @@ mod tests {
         );
         assert_eq!(
             result.uri(),
-            "http://apt.llvm.org/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages"
+            "http://apt.llvm.org:443/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages"
         );
     }
 

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                UPDATE mirrors_v2\n                SET last_cleanup = unixepoch(CURRENT_TIMESTAMP)\n                WHERE host = ? AND port = ? AND path = ?;\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "b7a7754be78a39f04f1b8d285b26795adfc284e6c07a836aba38807e9d62a69a"
+}

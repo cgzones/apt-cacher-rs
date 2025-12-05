@@ -1,18 +1,20 @@
 use std::{
     net::{IpAddr, Ipv6Addr},
+    num::NonZero,
+    path::PathBuf,
     str::FromStr as _,
     time::Duration,
 };
 
 use log::{LevelFilter, debug, info, trace};
 use sqlx::{
-    ConnectOptions as _, Error, Executor as _, Pool, Sqlite, SqlitePool, Transaction, query,
-    query_as, sqlite::SqliteConnectOptions,
+    ConnectOptions as _, Error, Executor as _, Pool, Sqlite, SqlitePool, query, query_as,
+    sqlite::SqliteConnectOptions,
 };
 
 use crate::{
     config::DomainName,
-    deb_mirror::{Mirror, OriginRef},
+    deb_mirror::{Mirror, OriginRef, mirror_cache_path_impl},
 };
 
 #[derive(Debug, Clone)]
@@ -20,9 +22,10 @@ pub(crate) struct Database {
     conn: Pool<Sqlite>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct MirrorEntry {
     pub(crate) host: DomainName,
+    port: u16,
     pub(crate) path: String,
     #[expect(unused)]
     pub(crate) first_seen: i64,
@@ -32,9 +35,22 @@ pub(crate) struct MirrorEntry {
     pub(crate) last_cleanup: i64,
 }
 
+impl MirrorEntry {
+    #[must_use]
+    pub(crate) const fn port(&self) -> Option<NonZero<u16>> {
+        NonZero::new(self.port)
+    }
+
+    #[must_use]
+    pub(crate) fn cache_path(&self) -> PathBuf {
+        mirror_cache_path_impl(&self.host, self.port(), &self.path)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MirrorStatEntry {
     pub(crate) host: DomainName,
+    port: u16,
     pub(crate) path: String,
     pub(crate) first_seen: i64,
     pub(crate) last_seen: i64,
@@ -43,14 +59,52 @@ pub(crate) struct MirrorStatEntry {
     pub(crate) total_delivery_size: i64,
 }
 
+impl MirrorStatEntry {
+    #[must_use]
+    pub(crate) const fn port(&self) -> Option<NonZero<u16>> {
+        NonZero::new(self.port)
+    }
+
+    #[must_use]
+    pub(crate) fn uri(&self) -> String {
+        if self.port == 0 {
+            format!("{}/{}", self.host, self.path)
+        } else {
+            format!("{}:{}/{}", self.host, self.port, self.path)
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn cache_path(&self) -> PathBuf {
+        mirror_cache_path_impl(&self.host, self.port(), &self.path)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct OriginEntry {
     pub(crate) host: DomainName,
+    port: u16,
     pub(crate) mirror_path: String,
     pub(crate) distribution: String,
     pub(crate) component: String,
     pub(crate) architecture: String,
     pub(crate) last_seen: i64,
+}
+
+impl OriginEntry {
+    #[must_use]
+    pub(crate) const fn port(&self) -> Option<NonZero<u16>> {
+        NonZero::new(self.port)
+    }
+
+    #[must_use]
+    pub(crate) fn mirror_uri(&self) -> String {
+        if self.port == 0 {
+            format!("{}/{}", self.host, self.mirror_path)
+        } else {
+            format!("{}:{}/{}", self.host, self.port, self.mirror_path)
+        }
+    }
 }
 
 impl Database {
@@ -139,54 +193,44 @@ impl Database {
             )
             .await?;
 
-        Ok(())
-    }
+        trace!("Performing database migrations...");
 
-    #[inline]
-    async fn add_mirror(mirror: &Mirror, tx: &mut Transaction<'_, Sqlite>) -> Result<(), Error>
-where {
-        query!(
-            r"
-                INSERT INTO mirrors
-                (host, path)
-                VALUES
-                (?, ?)
-                ON CONFLICT
-                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
-        ",
-            mirror.host,
-            mirror.path
-        )
-        .execute(&mut **tx)
-        .await?;
+        sqlx::migrate!().run(&self.conn).await?;
 
         Ok(())
     }
 
     pub(crate) async fn add_origin(&self, origin: &OriginRef<'_>) -> Result<(), Error> {
-        let mut tx = self.conn.begin().await?;
-
-        Self::add_mirror(origin.mirror, &mut tx).await?;
+        let port = origin.mirror.port.map_or(0, std::num::NonZero::get);
 
         query!(
             r"
+                INSERT INTO mirrors_v2
+                (host, port, path)
+                VALUES
+                (?, ?, ?)
+                ON CONFLICT
+                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
+
                 INSERT INTO origins
                 (mirror_id, distribution, component, architecture)
                 VALUES
-                ((SELECT id FROM mirrors WHERE host = ? AND path = ?), ?, ?, ?)
+                ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?)
                 ON CONFLICT (mirror_id, distribution, component, architecture)
                 DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
         ",
             origin.mirror.host,
+            port,
+            origin.mirror.path,
+            origin.mirror.host,
+            port,
             origin.mirror.path,
             origin.distribution,
             origin.component,
             origin.architecture
         )
-        .execute(&mut *tx)
+        .execute(&self.conn)
         .await?;
-
-        tx.commit().await?;
 
         Ok(())
     }
@@ -194,9 +238,10 @@ where {
     pub(crate) async fn get_mirrors(&self) -> Result<Vec<MirrorEntry>, Error> {
         query_as!(
             MirrorEntry,
-            r"
-              SELECT host, path, first_seen, last_seen, last_cleanup FROM mirrors;
-        ",
+            r#"
+              SELECT host, port AS "port: u16", path, first_seen, last_seen, last_cleanup
+              FROM mirrors_v2;
+        "#,
         )
         .fetch_all(&self.conn)
         .await
@@ -206,20 +251,21 @@ where {
         query_as!(MirrorStatEntry,
             r#"
             SELECT
-                mirrors.host,
-                mirrors.path,
-                mirrors.first_seen,
-                mirrors.last_seen,
-                mirrors.last_cleanup,
+                mirrors_v2.host,
+                mirrors_v2.port AS "port: u16",
+                mirrors_v2.path,
+                mirrors_v2.first_seen,
+                mirrors_v2.last_seen,
+                mirrors_v2.last_cleanup,
                 COALESCE(downloads.total_size, 0) AS "total_download_size: i64",
                 COALESCE(deliveries.total_size, 0) AS "total_delivery_size: i64"
-            FROM mirrors
+            FROM mirrors_v2
             LEFT JOIN
                 (SELECT mirror_id, SUM(size) AS total_size FROM downloads GROUP BY mirror_id) AS downloads
-            ON mirrors.id == downloads.mirror_id
+            ON mirrors_v2.id == downloads.mirror_id
             LEFT JOIN
                 (SELECT mirror_id, SUM(size) AS total_size FROM deliveries GROUP BY mirror_id) AS deliveries
-            ON mirrors.id == deliveries.mirror_id
+            ON mirrors_v2.id == deliveries.mirror_id
             ;
         "#).fetch_all(&self.conn).await
     }
@@ -227,12 +273,19 @@ where {
     pub(crate) async fn get_origins(&self) -> Result<Vec<OriginEntry>, Error> {
         query_as!(
             OriginEntry,
-            r"
-              SELECT mirrors.host, mirrors.path AS mirror_path, origins.distribution, origins.component, origins.architecture, origins.last_seen
+            r#"
+              SELECT
+                mirrors_v2.host,
+                mirrors_v2.port AS "port: u16",
+                mirrors_v2.path AS mirror_path,
+                origins.distribution,
+                origins.component,
+                origins.architecture,
+                origins.last_seen
               FROM origins
-              JOIN mirrors
-              WHERE mirrors.id = origins.mirror_id;
-        ",
+              JOIN mirrors_v2
+              WHERE mirrors_v2.id = origins.mirror_id;
+        "#,
         )
         .fetch_all(&self.conn)
         .await
@@ -241,27 +294,40 @@ where {
     pub(crate) async fn get_origins_by_mirror(
         &self,
         host: &str,
+        port: Option<NonZero<u16>>,
         path: &str,
     ) -> Result<Vec<OriginEntry>, Error> {
+        let port = port.map_or(0, std::num::NonZero::get);
+
         query_as!(OriginEntry,
-            r"
-              SELECT mirrors.host, mirrors.path AS mirror_path, origins.distribution, origins.component, origins.architecture, origins.last_seen
+            r#"
+              SELECT
+                mirrors_v2.host,
+                mirrors_v2.port AS "port: u16",
+                mirrors_v2.path AS mirror_path,
+                origins.distribution,
+                origins.component,
+                origins.architecture,
+                origins.last_seen
               FROM origins
-              JOIN mirrors
-              WHERE mirrors.host = ? AND mirrors.path = ? AND mirrors.id = origins.mirror_id;
-        ", host, path
+              JOIN mirrors_v2
+              WHERE mirrors_v2.host = ? AND mirrors_v2.port = ? AND mirrors_v2.path = ? AND mirrors_v2.id = origins.mirror_id;
+        "#, host, port, path
         )
         .fetch_all(&self.conn).await
     }
 
     pub(crate) async fn mirror_cleanup(&self, mirror: &Mirror) -> Result<(), Error> {
+        let port = mirror.port.map_or(0, std::num::NonZero::get);
+
         query!(
             r"
-                UPDATE mirrors
+                UPDATE mirrors_v2
                 SET last_cleanup = unixepoch(CURRENT_TIMESTAMP)
-                WHERE host = ? AND path = ?;
+                WHERE host = ? AND port = ? AND path = ?;
         ",
             mirror.host,
+            port,
             mirror.path
         )
         .execute(&self.conn)
@@ -315,28 +381,35 @@ where {
         };
         let client: &[u8] = &client.octets();
 
-        let mut tx = self.conn.begin().await?;
-
-        Self::add_mirror(mirror, &mut tx).await?;
+        let port = mirror.port.map_or(0, std::num::NonZero::get);
 
         query!(
             r"
+                INSERT INTO mirrors_v2
+                (host, port, path)
+                VALUES
+                (?, ?, ?)
+                ON CONFLICT
+                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
+
                 INSERT INTO downloads
                 (mirror_id, debname, size, duration, client_ip)
                 VALUES
-                ((SELECT id FROM mirrors WHERE host = ? AND path = ?), ?, ?, ?, ?);
+                ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?, ?);
         ",
             mirror.host,
+            port,
+            mirror.path,
+            mirror.host,
+            port,
             mirror.path,
             debname,
             size,
             duration,
             client
         )
-        .execute(&mut *tx)
+        .execute(&self.conn)
         .await?;
-
-        tx.commit().await?;
 
         Ok(())
     }
@@ -363,18 +436,27 @@ where {
         };
         let client: &[u8] = &client.octets();
 
-        let mut tx = self.conn.begin().await?;
-
-        Self::add_mirror(mirror, &mut tx).await?;
+        let port = mirror.port.map_or(0, std::num::NonZero::get);
 
         query!(
             r"
+                INSERT INTO mirrors_v2
+                (host, port, path)
+                VALUES
+                (?, ?, ?)
+                ON CONFLICT
+                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
+
                 INSERT INTO deliveries
                 (mirror_id, debname, size, duration, partial, client_ip)
                 VALUES
-                ((SELECT id FROM mirrors WHERE host = ? AND path = ?), ?, ?, ?, ?, ?);
+                ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?, ?, ?);
             ",
             mirror.host,
+            port,
+            mirror.path,
+            mirror.host,
+            port,
             mirror.path,
             debname,
             size,
@@ -382,10 +464,8 @@ where {
             partial,
             client
         )
-        .execute(&mut *tx)
+        .execute(&self.conn)
         .await?;
-
-        tx.commit().await?;
 
         Ok(())
     }
