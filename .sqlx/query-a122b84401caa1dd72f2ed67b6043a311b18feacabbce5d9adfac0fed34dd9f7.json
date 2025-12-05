@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n              SELECT host, path, first_seen, last_seen, last_cleanup FROM mirrors;\n        ",
+  "query": "\n              SELECT host, port AS \"port: u16\", path, first_seen, last_seen, last_cleanup\n              FROM mirrors_v2;\n        ",
   "describe": {
     "columns": [
       {
@@ -9,23 +9,28 @@
         "type_info": "Text"
       },
       {
-        "name": "path",
+        "name": "port: u16",
         "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "path",
+        "ordinal": 2,
         "type_info": "Text"
       },
       {
         "name": "first_seen",
-        "ordinal": 2,
-        "type_info": "Integer"
-      },
-      {
-        "name": "last_seen",
         "ordinal": 3,
         "type_info": "Integer"
       },
       {
-        "name": "last_cleanup",
+        "name": "last_seen",
         "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_cleanup",
+        "ordinal": 5,
         "type_info": "Integer"
       }
     ],
@@ -37,8 +42,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "e251dfce4664ee432bd30286ee108ad5fa6d806c5ac3878ddb93206d398b8ea3"
+  "hash": "a122b84401caa1dd72f2ed67b6043a311b18feacabbce5d9adfac0fed34dd9f7"
 }

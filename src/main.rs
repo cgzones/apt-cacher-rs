@@ -1291,6 +1291,29 @@ struct ConnectionDetails {
     subdir: Option<&'static Path>,
 }
 
+impl ConnectionDetails {
+    #[must_use]
+    fn cache_dir_path(&self) -> PathBuf {
+        let root = &global_config().cache_directory;
+
+        let host = self.aliased_host.unwrap_or(&self.mirror.host);
+        let host: PathBuf = if let Some(port) = self.mirror.port {
+            PathBuf::from(format!("{host}:{port}"))
+        } else {
+            PathBuf::from(host)
+        };
+        assert!(host.is_relative());
+
+        let uri_path = Path::new(&self.mirror.path);
+        assert!(uri_path.is_relative());
+
+        let subdir = self.subdir.unwrap_or_else(|| Path::new(""));
+        assert!(subdir.is_relative());
+
+        [root, &host, uri_path, subdir].iter().collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ActiveDownloadKeyRef<'a> {
     mirror: &'a Mirror,
@@ -1623,46 +1646,27 @@ async fn download_file(
     }
     drop(writer);
 
-    let cache_dir = &global_config().cache_directory;
+    let dest_dir_path = conn_details.cache_dir_path();
 
-    let dest_dir: PathBuf = [
-        cache_dir,
-        Path::new(
-            &conn_details
-                .aliased_host
-                .unwrap_or(&conn_details.mirror.host),
-        ),
-        Path::new(&conn_details.mirror.path),
-        conn_details.subdir.unwrap_or_else(|| Path::new("")),
-    ]
-    .iter()
-    .collect();
-
-    if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await
+    if let Err(err) = tokio::fs::create_dir_all(&dest_dir_path).await
         && err.kind() != tokio::io::ErrorKind::AlreadyExists
     {
         error!(
             "Failed to create destination directory `{}`:  {err}",
-            dest_dir.display()
+            dest_dir_path.display()
         );
         return;
     }
 
-    let dest_path: PathBuf = [
-        cache_dir,
-        Path::new(
-            &conn_details
-                .aliased_host
-                .unwrap_or(&conn_details.mirror.host),
-        ),
-        Path::new(&conn_details.mirror.path),
-        conn_details.subdir.unwrap_or_else(|| Path::new("")),
-        Path::new(&conn_details.debname),
-    ]
-    .iter()
-    .collect();
+    let dest_file_path = {
+        let mut p = dest_dir_path;
+        let filename = Path::new(&conn_details.debname);
+        assert!(filename.is_relative());
+        p.push(filename);
+        p
+    };
 
-    debug!("Saving downloaded file to `{}`", dest_path.display());
+    debug!("Saving downloaded file to `{}`", dest_file_path.display());
 
     {
         // Lock to block all downloading tasks, since the file from the
@@ -1670,15 +1674,19 @@ async fn download_file(
         let locked_status = status.write().await;
 
         /* Should only happen for concurrent downloads from aliased mirrors */
-        if warn_on_override && tokio::fs::try_exists(&dest_path).await.unwrap_or(false) {
+        if warn_on_override
+            && tokio::fs::try_exists(&dest_file_path)
+                .await
+                .unwrap_or(false)
+        {
             warn!(
                 "Target file `{}` already exists, overriding... (aliased={})",
-                dest_path.display(),
+                dest_file_path.display(),
                 conn_details.aliased_host.is_some()
             );
         }
 
-        match tokio::fs::rename(&output.1, &dest_path).await {
+        match tokio::fs::rename(&output.1, &dest_file_path).await {
             Ok(()) => {
                 {
                     let diff =
@@ -1688,7 +1696,7 @@ async fn download_file(
                     if diff != 0 {
                         trace!(
                             "Adjusting cache size by {diff} for downloaded file `{}`",
-                            dest_path.display()
+                            dest_file_path.display()
                         );
 
                         let mut mg_cache_size = RUNTIMEDETAILS
@@ -1702,7 +1710,7 @@ async fn download_file(
                     }
                 }
 
-                dbarrier.release(locked_status, dest_path);
+                dbarrier.release(locked_status, dest_file_path);
             }
             Err(err) => {
                 drop(locked_status);
@@ -1710,7 +1718,7 @@ async fn download_file(
                 error!(
                     "Failed to rename file `{}` to `{}`:  {err}",
                     output.1.display(),
-                    dest_path.display()
+                    dest_file_path.display()
                 );
                 if let Err(err) = tokio::fs::remove_file(&output.1).await {
                     error!(
@@ -2620,13 +2628,11 @@ async fn serve_new_file(
 
     let (_parts, body) = fwd_response.into_parts();
 
-    let tmppath: PathBuf = [
-        &global_config().cache_directory,
-        Path::new("tmp"),
-        Path::new(&conn_details.debname),
-    ]
-    .iter()
-    .collect();
+    let filename = Path::new(&conn_details.debname);
+    assert!(filename.is_relative());
+    let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
+        .iter()
+        .collect();
 
     let (outfile, outpath) = match tokio_mkstemp(&tmppath, 0o640).await {
         Ok((f, p)) => (f, p),
@@ -2802,19 +2808,13 @@ pub(crate) async fn process_cache_request(
     req: Request<Empty<()>>,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
-    let cache_path: PathBuf = [
-        &global_config().cache_directory,
-        Path::new(
-            &conn_details
-                .aliased_host
-                .unwrap_or(&conn_details.mirror.host),
-        ),
-        Path::new(&conn_details.mirror.path),
-        conn_details.subdir.unwrap_or_else(|| Path::new("")),
-        Path::new(&conn_details.debname),
-    ]
-    .iter()
-    .collect();
+    let cache_path = {
+        let mut p = conn_details.cache_dir_path();
+        let filename = Path::new(&conn_details.debname);
+        assert!(filename.is_relative());
+        p.push(filename);
+        p
+    };
 
     match tokio::fs::File::open(&cache_path).await {
         Ok(file) => {
@@ -3048,6 +3048,17 @@ async fn pre_process_client_request(
             return serve_web_interface(req, &appstate).await;
         };
 
+    let requested_port = match req.uri().port_u16() {
+        Some(port) => {
+            let Some(port) = NonZero::new(port) else {
+                warn_once_or_info!("Unsupported request port 0");
+                return quick_response(hyper::StatusCode::BAD_REQUEST, "Invalid port");
+            };
+            Some(port)
+        }
+        None => None,
+    };
+
     {
         let allowed_proxy_clients = gc.allowed_proxy_clients.as_slice();
         if !allowed_proxy_clients.is_empty()
@@ -3164,6 +3175,7 @@ async fn pre_process_client_request(
                         client,
                         mirror: Mirror {
                             host: requested_host,
+                            port: requested_port,
                             path: mirror_path.into_owned(),
                         },
                         aliased_host,
@@ -3194,6 +3206,7 @@ async fn pre_process_client_request(
                     client,
                     mirror: Mirror {
                         host: requested_host,
+                        port: requested_port,
                         path: mirror_path.into_owned(),
                     },
                     aliased_host,
@@ -3217,6 +3230,7 @@ async fn pre_process_client_request(
                     client,
                     mirror: Mirror {
                         host: requested_host,
+                        port: requested_port,
                         path: mirror_path.into_owned(),
                     },
                     aliased_host,
@@ -3253,6 +3267,7 @@ async fn pre_process_client_request(
                     client,
                     mirror: Mirror {
                         host: requested_host,
+                        port: requested_port,
                         path: mirror_path.into_owned(),
                     },
                     aliased_host,
@@ -3284,6 +3299,7 @@ async fn pre_process_client_request(
                     client,
                     mirror: Mirror {
                         host: requested_host,
+                        port: requested_port,
                         path: mirror_path.into_owned(),
                     },
                     aliased_host,
@@ -3378,7 +3394,11 @@ async fn pre_process_client_request(
     trace!("Forwarded response: {fwd_response:?}");
 
     if (fwd_response.status().is_success() || fwd_response.status().is_redirection())
-        && let Some(origin) = Origin::from_path(parts_cloned.uri.path(), requested_host.clone())
+        && let Some(origin) = Origin::from_path(
+            parts_cloned.uri.path(),
+            requested_host.clone(),
+            requested_port,
+        )
     {
         debug!("Extracted origin: {origin:?}");
 
