@@ -208,7 +208,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 distribution,
                 filename,
             });
-        } else if filename == "Packages.gz" || filename == "Packages.xz" {
+        } else if filename == "Packages.gz" || filename == "Packages.xz" || filename == "Packages" {
             let architecture = parts.next()?;
             let component = parts.next()?;
             let distribution = parts.next()?;
