@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use log::debug;
+use log::{debug, info};
 
 use crate::global_config;
 
@@ -22,10 +22,14 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
     /* Check for creation and modification timestamp support */
     let mdata = std::fs::metadata(cache_path)
         .with_context(|| format!("Failed to inspect directory `{}`", cache_path.display()))?;
-    mdata.created().context("No creation timestamp support")?;
     mdata
         .modified()
-        .context("No modification timestamp support")?;
+        .context("No file modification timestamp (mtime) support")?;
+    if let Err(err) = mdata.created() {
+        info!(
+            "No file creation timestamp (btime) support, volatile file caching is limited:  {err}"
+        );
+    }
 
     let cache_tmp_path: std::path::PathBuf =
         [cache_path, std::path::Path::new("tmp")].iter().collect();

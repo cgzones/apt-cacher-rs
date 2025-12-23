@@ -909,11 +909,14 @@ async fn serve_cached_file(
     };
 
     let file_size = metadata.len();
-    // Cache entries are replaced on update not overridden so the birth time is the time the file was last modified.
-    // The modified file timestamp is used to store the last up-to-date check against the upstream mirror.
-    let last_modified = metadata
-        .created()
-        .expect("Platform should support creation timestamps via setup check");
+
+    // Cache entries are replaced on update, not overridden, so the creation time is the time the file was last modified.
+    // The modified file timestamp is used to store the last up-to-date check against the upstream mirror, if creation timestamps are supported.
+    let last_modified = metadata.created().unwrap_or_else(|_err| {
+        metadata
+            .modified()
+            .expect("Platform should support modification timestamps via setup check")
+    });
 
     let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
         req.headers().get(RANGE).and_then(|val| val.to_str().ok())
@@ -1195,8 +1198,7 @@ async fn serve_volatile_file(
 
     let (local_creation_time, local_modification_time) = match file.metadata().await {
         Ok(data) => (
-            data.created()
-                .expect("Platform should support creation timestamps via setup check"),
+            data.created().ok(),
             data.modified()
                 .expect("Platform should support modification timestamps via setup check"),
         ),
@@ -1225,7 +1227,7 @@ async fn serve_volatile_file(
             appstate.database_tx,
             file,
             file_path,
-            local_creation_time,
+            local_creation_time.unwrap_or(local_modification_time),
             client_modified_since,
         )
         .await;
@@ -1735,11 +1737,12 @@ async fn serve_unfinished_file(
         }
     };
 
-    // Cache entries are replaced on update not overridden so the birth time is the time the file was last modified.
-    // The modified file timestamp is used to store the last up-to-date check against the upstream mirror.
-    let last_modified = md
-        .created()
-        .expect("Platform should support creation timestamps via setup check");
+    // Cache entries are replaced on update, not overridden, so the creation time is the time the file was last modified.
+    // The modified file timestamp is used to store the last up-to-date check against the upstream mirror, if creation timestamps are supported.
+    let last_modified = md.created().unwrap_or_else(|_err| {
+        md.modified()
+            .expect("Platform should support modification timestamps via setup check")
+    });
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -2018,7 +2021,7 @@ enum CacheFileStat<'a> {
     Volatile {
         file: tokio::fs::File,
         file_path: &'a Path,
-        local_creation_time: SystemTime,
+        local_creation_time: Option<SystemTime>,
         local_modification_time: SystemTime,
     },
     New,
@@ -2441,30 +2444,35 @@ async fn serve_new_file(
     }
 
     if let CacheFileStat::Volatile {
-        file,
+        mut file,
         file_path,
         local_creation_time,
-        local_modification_time: _,
+        local_modification_time,
     } = cfstate
     {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
-            // Refactor when https://github.com/tokio-rs/tokio/issues/6368 is resolved
-            let file = {
-                let std_file = file.into_std().await;
-                let std_file_path = file_path.to_path_buf();
-                tokio::task::spawn_blocking(move || {
-                    if let Err(err) = std_file.set_modified(SystemTime::now()) {
-                        error!(
-                            "Failed to update modification time of file `{}`:  {}",
-                            std_file_path.display(),
-                            err
-                        );
-                    }
-                    tokio::fs::File::from_std(std_file)
-                })
-                .await
-                .expect("task should not panic")
-            };
+            // Cache entries are replaced on update, not overridden, so the creation time is the time the file was last modified.
+            // The modified file timestamp is used to store the last up-to-date check against the upstream mirror, if creation timestamps are supported.
+            // Thus only update mtime if btime is supported.
+            if local_creation_time.is_some() {
+                // Refactor when https://github.com/tokio-rs/tokio/issues/6368 is resolved
+                file = {
+                    let std_file = file.into_std().await;
+                    let std_file_path = file_path.to_path_buf();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(err) = std_file.set_modified(SystemTime::now()) {
+                            error!(
+                                "Failed to update modification time of file `{}`:  {}",
+                                std_file_path.display(),
+                                err
+                            );
+                        }
+                        tokio::fs::File::from_std(std_file)
+                    })
+                    .await
+                    .expect("task should not panic")
+                };
+            }
 
             ibarrier.finished(file_path.to_path_buf()).await;
 
@@ -2474,7 +2482,7 @@ async fn serve_new_file(
                 appstate.database_tx,
                 file,
                 file_path,
-                local_creation_time,
+                local_creation_time.unwrap_or(local_modification_time),
                 client_modified_since,
             )
             .await;
