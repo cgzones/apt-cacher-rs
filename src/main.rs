@@ -335,140 +335,176 @@ pub(crate) async fn request_with_retry(
         https_upgrade_test = true;
     }
 
-    let mut attempt = 1;
-    let mut sleep_prev = 0;
-    let mut sleep_curr = 500;
+    #[expect(clippy::items_after_statements)]
+    async fn inner_loop(
+        client: &Client,
+        mut parts: http::request::Parts,
+        orig_scheme: Option<http::uri::Scheme>,
+        cached_scheme: Option<Scheme>,
+        mut https_upgrade_test: bool,
+    ) -> Result<Response<Incoming>, (hyper_util::client::legacy::Error, Uri)> {
+        let mut attempt = 1;
+        let mut sleep_prev = 0;
+        let mut sleep_curr = 500;
 
-    loop {
-        let req_clone = Request::from_parts(parts.clone(), Empty::new());
+        loop {
+            let req_clone = Request::from_parts(parts.clone(), Empty::new());
 
-        match client.request(req_clone).await {
-            Ok(response) => {
-                if cached_scheme.is_none()
-                    && let Some(host) = parts.uri.host()
-                {
-                    match parts.uri.scheme() {
-                        Some(s) if *s == http::uri::Scheme::HTTP => {
-                            let key = SchemeKeyRef {
-                                host,
-                                port: parts.uri.port_u16(),
-                            };
-                            match SCHEME_CACHE
-                                .get()
-                                .expect("Initialized in main()")
-                                .write()
-                                .entry_ref(&key)
-                            {
-                                EntryRef::Occupied(_oentry) => (),
-                                EntryRef::Vacant(ventry) => {
-                                    ventry.insert(Scheme::Http);
-                                    debug!(
-                                        "Added cached http scheme for host {host}{}, original scheme was {orig_scheme:?}",
-                                        PortFormatter::new(parts.uri.port())
-                                    );
+            match client.request(req_clone).await {
+                Ok(response) => {
+                    if cached_scheme.is_none()
+                        && let Some(host) = parts.uri.host()
+                    {
+                        match parts.uri.scheme() {
+                            Some(s) if *s == http::uri::Scheme::HTTP => {
+                                let key = SchemeKeyRef {
+                                    host,
+                                    port: parts.uri.port_u16(),
+                                };
+                                match SCHEME_CACHE
+                                    .get()
+                                    .expect("Initialized in main()")
+                                    .write()
+                                    .entry_ref(&key)
+                                {
+                                    EntryRef::Occupied(_oentry) => (),
+                                    EntryRef::Vacant(ventry) => {
+                                        ventry.insert(Scheme::Http);
+                                        debug!(
+                                            "Added cached http scheme for host {host}{}, original scheme was {orig_scheme:?}",
+                                            PortFormatter::new(parts.uri.port())
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Some(s) if *s == http::uri::Scheme::HTTPS => {
-                            let key = SchemeKeyRef {
-                                host,
-                                port: parts.uri.port_u16(),
-                            };
-                            match SCHEME_CACHE
-                                .get()
-                                .expect("Initialized in main()")
-                                .write()
-                                .entry_ref(&key)
-                            {
-                                EntryRef::Occupied(_oentry) => (),
-                                EntryRef::Vacant(ventry) => {
-                                    ventry.insert(Scheme::Https);
-                                    debug!(
-                                        "Added cached https scheme for host {host}{}, original scheme was {orig_scheme:?}",
-                                        PortFormatter::new(parts.uri.port())
-                                    );
+                            Some(s) if *s == http::uri::Scheme::HTTPS => {
+                                let key = SchemeKeyRef {
+                                    host,
+                                    port: parts.uri.port_u16(),
+                                };
+                                match SCHEME_CACHE
+                                    .get()
+                                    .expect("Initialized in main()")
+                                    .write()
+                                    .entry_ref(&key)
+                                {
+                                    EntryRef::Occupied(_oentry) => (),
+                                    EntryRef::Vacant(ventry) => {
+                                        ventry.insert(Scheme::Https);
+                                        debug!(
+                                            "Added cached https scheme for host {host}{}, original scheme was {orig_scheme:?}",
+                                            PortFormatter::new(parts.uri.port())
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        s => {
-                            debug!(
-                                "Not caching unsupported scheme {s:?} for host {host}{}",
-                                PortFormatter::new(parts.uri.port())
-                            );
+                            s => {
+                                debug!(
+                                    "Not caching unsupported scheme {s:?} for host {host}{}",
+                                    PortFormatter::new(parts.uri.port())
+                                );
+                            }
                         }
                     }
+                    return Ok(response);
                 }
-                return Ok(response);
-            }
-            Err(err) if !err.is_connect() => {
-                warn_once_or_info!(
-                    "Request of internal client to {} failed:  {err}  --  {err:?}",
-                    parts.uri
-                );
-                return Err(err);
-            }
-            Err(err) => {
-                if attempt > 2 && https_upgrade_test {
-                    assert_eq!(
-                        cached_scheme, None,
-                        "https upgrade is only tried when no cached scheme exists"
+                Err(err) if !err.is_connect() => {
+                    warn_once_or_info!(
+                        "Request of internal client to {} failed:  {err}  --  {err:?}",
+                        parts.uri
                     );
+                    return Err((err, parts.uri));
+                }
+                Err(err) => {
+                    if attempt > 2 && https_upgrade_test {
+                        assert_eq!(
+                            cached_scheme, None,
+                            "https upgrade is only tried when no cached scheme exists"
+                        );
+
+                        debug!(
+                            "Https upgrade failed for host {}{} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
+                            parts
+                                .uri
+                                .host()
+                                .expect("host must exist for a https upgrade"),
+                            PortFormatter::new(parts.uri.port())
+                        );
+
+                        // reset https upgrade
+                        let mut uri_parts = parts.uri.into_parts();
+                        uri_parts.scheme.clone_from(&orig_scheme);
+                        parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
+                        https_upgrade_test = false;
+                        sleep_prev = 0;
+                        sleep_curr = 500;
+                        continue;
+                    }
+
+                    if attempt > MAX_ATTEMPTS {
+                        if let Some(host) = parts.uri.host() {
+                            let key = SchemeKeyRef {
+                                host,
+                                port: parts.uri.port_u16(),
+                            };
+
+                            let value = SCHEME_CACHE
+                                .get()
+                                .expect("Initialized in main()")
+                                .write()
+                                .remove(&key);
+                            if let Some(scheme) = value {
+                                debug!(
+                                    "Removed cached scheme {scheme} for host {host}{} after {attempt} connection attempts, original scheme was {orig_scheme:?}",
+                                    PortFormatter::new(parts.uri.port())
+                                );
+                            }
+                        }
+
+                        return Err((err, parts.uri));
+                    }
 
                     debug!(
-                        "Https upgrade failed for host {}{} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
-                        parts
-                            .uri
-                            .host()
-                            .expect("host must exist for a https upgrade"),
-                        PortFormatter::new(parts.uri.port())
+                        "Failed to connect to {} after {attempt} connection attempts, will retry in {sleep_curr} ms:  {err}",
+                        parts.uri
                     );
 
-                    // reset https upgrade
-                    let mut uri_parts = parts.uri.into_parts();
-                    uri_parts.scheme.clone_from(&orig_scheme);
-                    parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
-                    https_upgrade_test = false;
-                    sleep_prev = 0;
-                    sleep_curr = 500;
+                    attempt += 1;
+
+                    tokio::time::sleep(Duration::from_millis(sleep_curr)).await;
+                    (sleep_curr, sleep_prev) = (sleep_curr + sleep_prev, sleep_curr);
+
                     continue;
                 }
-
-                if attempt > MAX_ATTEMPTS {
-                    if let Some(host) = parts.uri.host() {
-                        let key = SchemeKeyRef {
-                            host,
-                            port: parts.uri.port_u16(),
-                        };
-
-                        let value = SCHEME_CACHE
-                            .get()
-                            .expect("Initialized in main()")
-                            .write()
-                            .remove(&key);
-                        if let Some(scheme) = value {
-                            debug!(
-                                "Removed cached scheme {scheme} for host {host}{} after {attempt} connection attempts, original scheme was {orig_scheme:?}",
-                                PortFormatter::new(parts.uri.port())
-                            );
-                        }
-                    }
-
-                    return Err(err);
-                }
-
-                debug!(
-                    "Failed to connect to {} after {attempt} connection attempts, will retry in {sleep_curr} ms:  {err}",
-                    parts.uri
-                );
-
-                attempt += 1;
-
-                tokio::time::sleep(Duration::from_millis(sleep_curr)).await;
-                (sleep_curr, sleep_prev) = (sleep_curr + sleep_prev, sleep_curr);
-
-                continue;
             }
         }
+    }
+
+    if https_upgrade_test {
+        debug_assert_eq!(cached_scheme, None);
+        let client = client.clone();
+
+        // Spawn a new task such that even if the client disconnects,
+        // the task will continue to run and initialize the scheme cache.
+        tokio::task::spawn(async move {
+            let result = inner_loop(&client, parts, orig_scheme, None, true).await;
+            if let Err(ref err) = result {
+                warn!(
+                    "Failed to initialize scheme cache for host {} in background task:  {}",
+                    err.1
+                        .host()
+                        .expect("host exists in case of https upgrade test"),
+                    err.0
+                );
+            }
+            result.map_err(|err| err.0)
+        })
+        .await
+        .expect("task should not panic")
+    } else {
+        inner_loop(client, parts, orig_scheme, cached_scheme, false)
+            .await
+            .map_err(|err| err.0)
     }
 }
 
