@@ -117,6 +117,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::signal::unix::SignalKind;
+use tokio::task::JoinSet;
 
 use crate::config::Config;
 use crate::config::DomainName;
@@ -3603,12 +3604,14 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         err
     })?;
 
+    // Database background task
     let (db_task_tx, db_task_rx) = tokio::sync::mpsc::channel(64);
     {
         let database = database.clone();
         tokio::task::spawn(db_loop(database, db_task_rx));
     }
 
+    // Initial cache scan task
     {
         let database = database.clone();
         tokio::task::spawn(async move {
@@ -3648,6 +3651,79 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } else {
                 warn!("Startup cache size unset");
             }
+        });
+    }
+
+    // Scheme cache initialization task
+    {
+        let database = database.clone();
+        let client = https_client.clone();
+
+        tokio::task::spawn(async move {
+            debug!("Scheme cache initialization task started");
+
+            let mut mirrors = match database.get_mirrors().await {
+                Ok(m) => m,
+                Err(err) => {
+                    error!("Failed to get list of mirrors to initialize scheme cache:  {err}");
+                    return;
+                }
+            };
+
+            mirrors
+                .sort_unstable_by(|a, b| a.host.cmp(&b.host).then_with(|| a.port().cmp(&b.port())));
+            mirrors.dedup_by(|a, b| a.host == b.host && a.port() == b.port());
+
+            let mut set = JoinSet::new();
+
+            for mirror in mirrors {
+                let client = client.clone();
+
+                set.spawn(async move {
+                    let host = &mirror.host;
+
+                    let authority = if let Some(port) = mirror.port() {
+                        format!("{host}:{port}")
+                    } else {
+                        host.to_string()
+                    };
+
+                    let uri = Uri::builder()
+                        .scheme("http")
+                        .authority(authority)
+                        .path_and_query("/")
+                        .build()
+                        .expect("Valid URI");
+
+                    let request = Request::builder()
+                        .method(Method::HEAD)
+                        .uri(uri)
+                        .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
+                        .body(Empty::new())
+                        .expect("Valid request");
+
+                    match request_with_retry(&client, request).await {
+                        Ok(response) => {
+                            // ignore response, we just care about connection success
+                            trace!(
+                                "Response for host {host} of initial scheme cache request:  {response:?}"
+                            );
+                        }
+                        Err(err) => {
+                            warn!("Failed to query host {host} to initialize scheme cache:  {err}");
+                        }
+                    }
+                });
+            }
+
+            set.join_all().await;
+
+            trace!(
+                "Scheme cache:  {:?}",
+                &*SCHEME_CACHE.get().expect("initialized in main()").read()
+            );
+
+            debug!("Scheme cache initialization task finished");
         });
     }
 
