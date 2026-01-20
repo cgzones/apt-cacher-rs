@@ -54,6 +54,7 @@ use channel_body::ChannelBody;
 use channel_body::ChannelBodyError;
 use clap::Parser;
 use coarsetime::Instant;
+use futures_util::StreamExt as _;
 #[cfg(not(feature = "mmap"))]
 use futures_util::TryStreamExt as _;
 use hashbrown::Equivalent;
@@ -117,7 +118,6 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::signal::unix::SignalKind;
-use tokio::task::JoinSet;
 
 use crate::config::Config;
 use crate::config::DomainName;
@@ -3660,6 +3660,9 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = https_client.clone();
 
         tokio::task::spawn(async move {
+            // Use buffer_unordered to limit concurrent requests and avoid thundering herd
+            const MAX_CONCURRENT_REQUESTS: usize = 10;
+
             debug!("Scheme cache initialization task started");
 
             let mut mirrors = match database.get_mirrors().await {
@@ -3673,50 +3676,49 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             mirrors
                 .sort_unstable_by(|a, b| a.host.cmp(&b.host).then_with(|| a.port().cmp(&b.port())));
             mirrors.dedup_by(|a, b| a.host == b.host && a.port() == b.port());
+            
+            futures_util::stream::iter(mirrors)
+                .map(|mirror| {
+                    let client = client.clone();
+                    async move {
+                        let host = &mirror.host;
 
-            let mut set = JoinSet::new();
+                        let authority = if let Some(port) = mirror.port() {
+                            format!("{host}:{port}")
+                        } else {
+                            host.to_string()
+                        };
 
-            for mirror in mirrors {
-                let client = client.clone();
+                        let uri = Uri::builder()
+                            .scheme("http")
+                            .authority(authority)
+                            .path_and_query("/")
+                            .build()
+                            .expect("Valid URI");
 
-                set.spawn(async move {
-                    let host = &mirror.host;
+                        let request = Request::builder()
+                            .method(Method::HEAD)
+                            .uri(uri)
+                            .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
+                            .body(Empty::new())
+                            .expect("Valid request");
 
-                    let authority = if let Some(port) = mirror.port() {
-                        format!("{host}:{port}")
-                    } else {
-                        host.to_string()
-                    };
-
-                    let uri = Uri::builder()
-                        .scheme("http")
-                        .authority(authority)
-                        .path_and_query("/")
-                        .build()
-                        .expect("Valid URI");
-
-                    let request = Request::builder()
-                        .method(Method::HEAD)
-                        .uri(uri)
-                        .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
-                        .body(Empty::new())
-                        .expect("Valid request");
-
-                    match request_with_retry(&client, request).await {
-                        Ok(response) => {
-                            // ignore response, we just care about connection success
-                            trace!(
-                                "Response for host {host} of initial scheme cache request:  {response:?}"
-                            );
-                        }
-                        Err(err) => {
-                            warn!("Failed to query host {host} to initialize scheme cache:  {err}");
+                        match request_with_retry(&client, request).await {
+                            Ok(response) => {
+                                // ignore response, we just care about connection success
+                                trace!(
+                                    "Response for host {host} of initial scheme cache request:  {response:?}"
+                                );
+                            }
+                            Err(err) => {
+                                warn!("Failed to query host {host} to initialize scheme cache:  {err}");
+                            }
                         }
                     }
-                });
-            }
-
-            set.join_all().await;
+                })
+                .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+                .collect::<Vec<_>>()
+                .await;
 
             trace!(
                 "Scheme cache:  {:?}",
