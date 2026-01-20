@@ -13,8 +13,11 @@ use http_body_util::{BodyExt as _, Empty};
 use hyper::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
 use log::{debug, error, info, trace, warn};
 use memfd::MemfdOptions;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter};
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter},
+    task::JoinSet,
+};
 
 use crate::{
     AppState, CachedFlavor, ConnectionDetails, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
@@ -251,22 +254,20 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
 
-    let mut tasks = Vec::with_capacity(mirrors.len());
-    for mirror in mirrors {
-        tasks.push(tokio::task::spawn(cleanup_mirror_deb_files(
-            mirror.clone(),
-            appstate.clone(),
-        )));
+    let mut set = JoinSet::new();
 
-        tasks.push(tokio::task::spawn(cleanup_mirror_byhash_files(mirror)));
+    for mirror in mirrors {
+        set.spawn(cleanup_mirror_deb_files(mirror.clone(), appstate.clone()));
+
+        set.spawn(cleanup_mirror_byhash_files(mirror));
     }
 
     let mut files_retained = 0;
     let mut files_removed = 0;
     let mut bytes_removed = 0;
 
-    for task in tasks {
-        let task_result = match task.await {
+    while let Some(res) = set.join_next().await {
+        let task_result = match res {
             Ok(tr) => tr,
             Err(err) => {
                 error!("Error joining cleanup task:  {err}");
