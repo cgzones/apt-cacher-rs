@@ -2519,7 +2519,7 @@ async fn serve_new_file(
 
     if fwd_response.status() != StatusCode::OK {
         let log_level = if fwd_response.status() == StatusCode::NOT_FOUND {
-            Level::Info
+            Level::Debug
         } else {
             Level::Warn
         };
