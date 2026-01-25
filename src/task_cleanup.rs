@@ -259,7 +259,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let cleanup_tasks = mirrors.into_iter().flat_map(|mirror| {
         let mirror_clone = mirror.clone();
         let appstate_clone = appstate.clone();
-        
+
         [
             tokio::task::spawn(cleanup_mirror_deb_files(mirror_clone, appstate_clone)),
             tokio::task::spawn(cleanup_mirror_byhash_files(mirror)),
