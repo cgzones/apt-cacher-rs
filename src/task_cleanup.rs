@@ -8,16 +8,14 @@ use std::{
 };
 
 use coarsetime::Instant;
+use futures_util::StreamExt as _;
 use hashbrown::HashMap;
 use http_body_util::{BodyExt as _, Empty};
 use hyper::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
 use log::{debug, error, info, trace, warn};
 use memfd::MemfdOptions;
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter},
-    task::JoinSet,
-};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter};
 
 use crate::{
     AppState, CachedFlavor, ConnectionDetails, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
@@ -230,6 +228,9 @@ pub(crate) async fn task_cleanup(appstate: &AppState) -> Result<(), ProxyCacheEr
 }
 
 async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
+    // Use buffer_unordered to limit concurrent cleanup tasks and avoid thundering herd
+    const MAX_CONCURRENT_CLEANUP_TASKS: usize = 10;
+
     let start = Instant::now();
 
     let usage_retention_days = global_config().usage_retention_days;
@@ -254,19 +255,27 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
 
-    let mut set = JoinSet::new();
+    // Create a stream of futures for both deb files and byhash files cleanup
+    let cleanup_tasks = mirrors.into_iter().flat_map(|mirror| {
+        let mirror_clone = mirror.clone();
+        let appstate_clone = appstate.clone();
+        
+        [
+            tokio::task::spawn(cleanup_mirror_deb_files(mirror_clone, appstate_clone)),
+            tokio::task::spawn(cleanup_mirror_byhash_files(mirror)),
+        ]
+    });
 
-    for mirror in mirrors {
-        set.spawn(cleanup_mirror_deb_files(mirror.clone(), appstate.clone()));
-
-        set.spawn(cleanup_mirror_byhash_files(mirror));
-    }
+    let results = futures_util::stream::iter(cleanup_tasks)
+        .buffer_unordered(MAX_CONCURRENT_CLEANUP_TASKS)
+        .collect::<Vec<_>>()
+        .await;
 
     let mut files_retained = 0;
     let mut files_removed = 0;
     let mut bytes_removed = 0;
 
-    while let Some(res) = set.join_next().await {
+    for res in results {
         let task_result = match res {
             Ok(tr) => tr,
             Err(err) => {
