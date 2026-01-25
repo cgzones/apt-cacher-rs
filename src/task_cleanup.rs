@@ -522,7 +522,7 @@ async fn cleanup_mirror_deb_files(
          * For example if `apt update` was run un-proxied.
          */
         if let Some(data) = &data {
-            const KEEP_SPAN: Duration = Duration::from_secs(3 * 24 * 60 * 60); // 3 days
+            const KEEP_SPAN: Duration = Duration::from_hours(3 * 24); // 3 days
 
             let created = match data.created() {
                 Ok(d) => d,

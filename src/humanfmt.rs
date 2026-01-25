@@ -210,7 +210,7 @@ mod tests {
             "1d1s"
         );
         assert_eq!(
-            format!("{}", HumanFmt::Time(Duration::from_secs(86460))),
+            format!("{}", HumanFmt::Time(Duration::from_mins(1441))),
             "1d1m"
         );
         assert_eq!(

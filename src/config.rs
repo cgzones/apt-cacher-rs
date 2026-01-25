@@ -712,14 +712,14 @@ impl Config {
     fn validate(&mut self) -> anyhow::Result<()> {
         // TODO: check bind_addr.is_documentation() once stable: https://github.com/rust-lang/rust/issues/27709
 
-        if self.database_slow_timeout > Duration::from_secs(60) {
+        if self.database_slow_timeout > Duration::from_mins(1) {
             bail!(
                 "Invalid database_slow_timeout value of {}: must be less or equal to 60s",
                 self.database_slow_timeout.as_secs_f32()
             );
         }
 
-        if self.http_timeout > Duration::from_secs(360) {
+        if self.http_timeout > Duration::from_mins(6) {
             bail!(
                 "Invalid http_timeout value of {}: must be less or equal to 360s",
                 self.http_timeout.as_secs_f32()

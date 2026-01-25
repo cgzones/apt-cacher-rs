@@ -159,7 +159,7 @@ const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
-const RETENTION_TIME: Duration = Duration::from_secs(8 * 7 * 24 * 60 * 60); /* 8 weeks */
+const RETENTION_TIME: Duration = Duration::from_hours(8 * 7 * 24); /* 8 weeks */
 
 const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(1024 * 1024); /* 1MiB */
 
@@ -3734,9 +3734,8 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut term_signal = tokio::signal::unix::signal(SignalKind::terminate())?;
     let mut usr1_signal = tokio::signal::unix::signal(SignalKind::user_defined1())?;
 
-    let first_cleanup = tokio::time::Instant::now() + Duration::from_secs(60 * 60); /* 1h */
-    let mut cleanup_interval =
-        tokio::time::interval_at(first_cleanup, Duration::from_secs(24 * 60 * 60)); /* every 24h */
+    let first_cleanup = tokio::time::Instant::now() + Duration::from_hours(1);
+    let mut cleanup_interval = tokio::time::interval_at(first_cleanup, Duration::from_hours(24));
 
     let appstate = AppState {
         database,
