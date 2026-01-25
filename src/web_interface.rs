@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use build_html::Html as _;
 use build_html::HtmlContainer as _;
@@ -300,6 +301,9 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
 
     let active_downloads = appstate.active_downloads.len();
 
+    let now = OffsetDateTime::now_utc();
+    let memory_stats = memory_stats::memory_stats();
+
     let html: String = HtmlPage::new()
         .with_title("apt-cacher-rs web interface")
         .with_header(1, "Statistics")
@@ -307,17 +311,20 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
             Container::new(ContainerType::Div)
                 .with_header(2, "Program Details")
                 .with_paragraph(format!(
-                    "Version: {}<br>Start Time: {}<br>Current Time: {}<br>Bind Address: {}<br>Bind Port: {}<br>Database Size: {}<br>Active Downloads: {}",
+                    "Version: {}<br>Start Time: {}<br>Current Time: {}<br>Uptime: {}<br>Bind Address: {}<br>Bind Port: {}<br>Database Size: {}<br>Memory Usage: {} ({})<br>Active Downloads: {}",
                     APP_VERSION,
                     rd.start_time
                         .format(WEBUI_DATE_FORMAT)
                         .expect("timestamp should be formattable"),
-                    OffsetDateTime::now_utc()
+                    now
                         .format(WEBUI_DATE_FORMAT)
                         .expect("timestamp should be formattable"),
+                    HumanFmt::Time(Duration::from_secs_f32((now - rd.start_time).as_seconds_f32())),
                     rd.config.bind_addr,
                     rd.config.bind_port,
                     database_size_fmt,
+                    memory_stats.map_or_else(|| String::from("???"), |ms| HumanFmt::Size(ms.physical_mem as u64).to_string()),
+                    memory_stats.map_or_else(|| String::from("???"), |ms| HumanFmt::Size(ms.virtual_mem as u64).to_string()),
                     active_downloads
                 )).with_link("/logs", "Logs"),
         )
