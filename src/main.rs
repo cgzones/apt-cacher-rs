@@ -1747,12 +1747,12 @@ async fn download_file(
                             *mg_cache_size = new_cache_size;
                         } else {
                             error!(
-                                "Cache size would underflow: {} - {} for file {}",
+                                "Cache size underflow: {} - {} for file {}. Keeping current value.",
                                 mg_cache_size, diff, dest_file_path.display()
                             );
-                            // Reset cache size to 0 as it's clearly incorrect
-                            *mg_cache_size = 0;
+                            // Keep current cache_size value as is rather than corrupting it further
                         }
+                        drop(mg_cache_size);
                     }
                 }
 
@@ -2724,11 +2724,11 @@ async fn serve_new_file(
                     Some(val) => val,
                     None => {
                         error!(
-                            "Cache size overflow when restoring after failed download: {} + {}",
+                            "Cache size overflow when adding back previous file size after failed download: {} + {}. Keeping current value.",
                             csize, prev_file_size
                         );
-                        // Reset cache size to 0 as it's clearly incorrect
-                        0
+                        // Keep current cache_size value as is rather than corrupting it further
+                        csize
                     }
                 };
                 *mg_cache_size = csize;
@@ -2787,11 +2787,11 @@ async fn serve_new_file(
                     Some(val) => val,
                     None => {
                         error!(
-                            "Cache size overflow when restoring after aborted download: {} + {}",
+                            "Cache size overflow when adding back previous file size after aborted download: {} + {}. Keeping current value.",
                             csize, prev_file_size
                         );
-                        // Reset cache size to 0 as it's clearly incorrect
-                        0
+                        // Keep current cache_size value as is rather than corrupting it further
+                        csize
                     }
                 };
                 *mg_cache_size = csize;
