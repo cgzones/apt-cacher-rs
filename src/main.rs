@@ -2656,9 +2656,21 @@ async fn serve_new_file(
                     content_length.upper().get()
                 );
 
-                csize = csize
-                    .checked_add(content_length.upper().get())
-                    .expect("should not overflow by previous check");
+                csize = match csize.checked_add(content_length.upper().get()) {
+                    Some(val) => val,
+                    None => {
+                        drop(mg_cache_size);
+                        error!(
+                            "Cache size overflow when adding download size: {} + {}",
+                            csize,
+                            content_length.upper().get()
+                        );
+                        return quick_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Cache size overflow",
+                        );
+                    }
+                };
                 match csize.checked_sub(prev_file_size) {
                     Some(val) => csize = val,
                     None => {
@@ -2708,9 +2720,17 @@ async fn serve_new_file(
                     .lock();
                 let mut csize = *mg_cache_size;
                 csize = csize.saturating_sub(content_length.upper().get());
-                csize = csize
-                    .checked_add(prev_file_size)
-                    .expect("size should not overflow");
+                csize = match csize.checked_add(prev_file_size) {
+                    Some(val) => val,
+                    None => {
+                        error!(
+                            "Cache size overflow when restoring after failed download: {} + {}",
+                            csize, prev_file_size
+                        );
+                        // Reset cache size to 0 as it's clearly incorrect
+                        0
+                    }
+                };
                 *mg_cache_size = csize;
             }
 
@@ -2763,9 +2783,17 @@ async fn serve_new_file(
                     .lock();
                 let mut csize = *mg_cache_size;
                 csize = csize.saturating_sub(content_length.upper().get());
-                csize = csize
-                    .checked_add(prev_file_size)
-                    .expect("size should not overflow");
+                csize = match csize.checked_add(prev_file_size) {
+                    Some(val) => val,
+                    None => {
+                        error!(
+                            "Cache size overflow when restoring after aborted download: {} + {}",
+                            csize, prev_file_size
+                        );
+                        // Reset cache size to 0 as it's clearly incorrect
+                        0
+                    }
+                };
                 *mg_cache_size = csize;
             }
         }
