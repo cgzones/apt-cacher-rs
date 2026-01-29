@@ -1655,8 +1655,21 @@ async fn download_file(
     }
 
     match content_length {
-        ContentLength::Exact(size) => assert_eq!(bytes, size.get()),
-        ContentLength::Unknown(size) => assert!(bytes <= size.get()),
+        ContentLength::Exact(size) if bytes != size.get() => {
+            error!(
+                "Content length mismatch for file {} from mirror {}: expected {} but got {} bytes",
+                conn_details.debname, conn_details.mirror, size.get(), bytes
+            );
+            return;
+        }
+        ContentLength::Unknown(size) if bytes > size.get() => {
+            error!(
+                "Content exceeded unknown limit for file {} from mirror {}: got {} but limit is {} bytes",
+                conn_details.debname, conn_details.mirror, bytes, size.get()
+            );
+            return;
+        }
+        ContentLength::Exact(_) | ContentLength::Unknown(_) => {}
     }
 
     if let Err(err) = writer.flush().await {
@@ -1708,10 +1721,17 @@ async fn download_file(
         match tokio::fs::rename(&output.1, &dest_file_path).await {
             Ok(()) => {
                 {
-                    let diff =
-                        content_length.upper().get().checked_sub(bytes).expect(
-                            "should not download more bytes than announced via ContentLength",
+                    let Some(diff) = content_length.upper().get().checked_sub(bytes) else {
+                        error!(
+                            "Downloaded more bytes than announced for file {}: {} > {} bytes",
+                            conn_details.debname,
+                            bytes,
+                            content_length.upper().get()
                         );
+                        // Continue with rename, but don't adjust cache size
+                        dbarrier.release(locked_status, dest_file_path);
+                        return;
+                    };
                     if diff != 0 {
                         trace!(
                             "Adjusting cache size by {diff} for downloaded file `{}`",
@@ -1723,9 +1743,16 @@ async fn download_file(
                             .expect("global is set in main()")
                             .cache_size
                             .lock();
-                        *mg_cache_size = mg_cache_size
-                            .checked_sub(diff)
-                            .expect("cache size should not underflow");
+                        if let Some(new_cache_size) = mg_cache_size.checked_sub(diff) {
+                            *mg_cache_size = new_cache_size;
+                        } else {
+                            error!(
+                                "Cache size would underflow: {} - {} for file {}",
+                                mg_cache_size, diff, dest_file_path.display()
+                            );
+                            // Reset cache size to 0 as it's clearly incorrect
+                            *mg_cache_size = 0;
+                        }
                     }
                 }
 
