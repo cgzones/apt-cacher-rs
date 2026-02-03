@@ -24,7 +24,7 @@ tokio_console = ["dep:console-subscriber"]
 anyhow = "1.0.81"
 async-compression = { version = "0.4.6", features = ["tokio", "xz", "gzip"] }
 build_html = "2.4.0"
-bytes = "1.6.0"
+bytes = "1.11.1"
 clap = { version = "4.5.1", features = ["derive"] }
 coarsetime = "0.1.36"
 console-subscriber = { version = "0.5", optional = true }
