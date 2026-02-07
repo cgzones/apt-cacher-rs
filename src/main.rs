@@ -57,8 +57,10 @@ use coarsetime::Instant;
 use futures_util::StreamExt as _;
 #[cfg(not(feature = "mmap"))]
 use futures_util::TryStreamExt as _;
-use hashbrown::Equivalent;
-use hashbrown::{HashMap, hash_map::EntryRef};
+use hashbrown::{
+    Equivalent, HashMap,
+    hash_map::{Entry, EntryRef},
+};
 use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
 use http_range::http_parse_range;
 use hyper::Uri;
@@ -1385,16 +1387,6 @@ impl Equivalent<ActiveDownloadKey> for ActiveDownloadKeyRef<'_> {
     }
 }
 
-#[expect(clippy::from_over_into)]
-impl Into<ActiveDownloadKey> for &ActiveDownloadKeyRef<'_> {
-    fn into(self) -> ActiveDownloadKey {
-        ActiveDownloadKey {
-            mirror: self.mirror.to_owned(),
-            debname: self.debname.to_owned(),
-        }
-    }
-}
-
 #[derive(Debug)]
 enum AbortReason {
     MirrorDownloadRate(MirrorDownloadRate),
@@ -1440,11 +1432,17 @@ impl ActiveDownloads {
         Option<tokio::sync::watch::Sender<()>>,
         Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     ) {
-        let key = ActiveDownloadKeyRef { mirror, debname };
+        // Assuming concurrent requests of resources in-download are rare,
+        // pre-allocate the `ActiveDownloadKey` to avoid the likely
+        // allocation while holding the write-lock.
+        let key = ActiveDownloadKey {
+            mirror: mirror.to_owned(),
+            debname: debname.to_owned(),
+        };
 
-        match self.inner.write().entry_ref(&key) {
-            EntryRef::Occupied(oentry) => (None, Arc::clone(oentry.get())),
-            EntryRef::Vacant(ventry) => {
+        match self.inner.write().entry(key) {
+            Entry::Occupied(oentry) => (None, Arc::clone(oentry.get())),
+            Entry::Vacant(ventry) => {
                 let (tx, rx) = tokio::sync::watch::channel(());
                 let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
                 ventry.insert(Arc::clone(&status));
