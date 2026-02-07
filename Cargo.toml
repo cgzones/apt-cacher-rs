@@ -17,6 +17,7 @@ default = ["mmap", "tls_rustls"]
 mmap = ["dep:memmap2"]
 tls_hyper = ["dep:hyper-tls"]
 tls_rustls = ["dep:hyper-rustls", "dep:rustls"]
+tokio_console = ["dep:console-subscriber"]
 
 
 [dependencies]
@@ -26,6 +27,7 @@ build_html = "2.4.0"
 bytes = "1.6.0"
 clap = { version = "4.5.1", features = ["derive"] }
 coarsetime = "0.1.36"
+console-subscriber = { version = "0.5", optional = true }
 futures-util = "0.3.30"
 hashbrown = "0.16.1"
 http = "1.4.0"
