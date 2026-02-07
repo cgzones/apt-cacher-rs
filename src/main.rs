@@ -4092,6 +4092,9 @@ mod tunnel_limiter {
 async fn main_loop(
     https_client: HttpClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    console_subscriber::init();
+    warn!("Using console_subscriber for tokio-console...");
+
     let config = global_config();
 
     let database = Database::connect(&config.database_path, config.database_slow_timeout)
