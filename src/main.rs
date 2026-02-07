@@ -1409,7 +1409,7 @@ enum ActiveDownloadStatus {
     Aborted(AbortReason),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ActiveDownloads {
     inner: Arc<
         parking_lot::RwLock<
