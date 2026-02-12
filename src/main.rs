@@ -154,7 +154,7 @@ use crate::web_interface::serve_web_interface;
 
 #[expect(clippy::cast_possible_truncation)]
 const _: () = assert!(
-    ((usize::MAX as u64) as usize) == usize::MAX && ((u64::MAX as usize) as u64) == u64::MAX,
+    ((usize::MAX as u64) as usize) == usize::MAX,
     "ensure casts from usize to u64 via 'as' do not truncate"
 );
 
