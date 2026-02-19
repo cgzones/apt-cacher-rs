@@ -3808,7 +3808,8 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 );
                             }
                             Err(err) => {
-                                warn!("Failed to query host {host} to initialize scheme cache:  {err}");
+                                // request_with_retry() has already logged the error
+                                debug!("Failed to query host {host} to initialize scheme cache:  {err}");
                             }
                         }
                     }
