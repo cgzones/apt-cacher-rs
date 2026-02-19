@@ -276,6 +276,10 @@ pub(crate) struct Config {
     #[serde(default = "default_allowed_mirrors")]
     pub(crate) allowed_mirrors: Vec<ConfigDomainName>,
 
+    /// List of mirrors supporting only http.
+    #[serde(default = "default_http_only_mirrors")]
+    pub(crate) http_only_mirrors: Vec<ConfigDomainName>,
+
     /// List of clients permitted to use the proxy.
     /// Empty means all clients are allowed.
     #[serde(default = "default_allowed_proxy_clients")]
@@ -530,6 +534,10 @@ const fn default_allowed_mirrors() -> Vec<ConfigDomainName> {
     Vec::new()
 }
 
+const fn default_http_only_mirrors() -> Vec<ConfigDomainName> {
+    Vec::new()
+}
+
 const fn default_disk_quota() -> Option<NonZero<u64>> {
     DEFAULT_DISK_QUOTA
 }
@@ -684,6 +692,7 @@ impl Config {
             buffer_size: DEFAULT_BUF_SIZE,
             aliases: Vec::new(),
             allowed_mirrors: Vec::new(),
+            http_only_mirrors: Vec::new(),
             disk_quota: None,
             allowed_proxy_clients: Vec::new(),
             allowed_webif_clients: None,

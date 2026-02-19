@@ -316,18 +316,24 @@ pub(crate) async fn request_with_retry(
         let mut uri_parts = parts.uri.into_parts();
         uri_parts.scheme = Some(scheme.into());
         parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
-    } else if https_upgrade_mode != HttpsUpgradeMode::Never
-        && let Some(auth) = parts.uri.authority()
-    {
-        debug!(
-            "No cached scheme for host {auth}, trying https upgrade from original scheme {orig_scheme:?}..."
-        );
+    } else if let Some(auth) = parts.uri.authority() {
+        if global_config()
+            .http_only_mirrors
+            .iter()
+            .any(|mirror| mirror.permits(auth.host()))
+        {
+            debug!("Not altering {orig_scheme:?} scheme for http-only host {auth}");
+        } else if https_upgrade_mode != HttpsUpgradeMode::Never {
+            debug!(
+                "No cached scheme for host {auth}, trying https upgrade from original scheme {orig_scheme:?}..."
+            );
 
-        // try https upgrade
-        let mut uri_parts = parts.uri.into_parts();
-        uri_parts.scheme = Some(http::uri::Scheme::HTTPS);
-        parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
-        https_upgrade_test = true;
+            // try https upgrade
+            let mut uri_parts = parts.uri.into_parts();
+            uri_parts.scheme = Some(http::uri::Scheme::HTTPS);
+            parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
+            https_upgrade_test = true;
+        }
     }
 
     #[expect(clippy::items_after_statements)]
