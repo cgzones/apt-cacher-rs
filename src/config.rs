@@ -28,31 +28,38 @@ macro_rules! nonzero {
     };
 }
 
-pub(crate) const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
-pub(crate) const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
-pub(crate) const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 MiB
-pub(crate) const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
+const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
+const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 MiB
+const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
 pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = "/etc/apt-cacher-rs/apt-cacher-rs.conf";
-pub(crate) const DEFAULT_DATABASE_PATH: &str = "/var/lib/apt-cacher-rs/apt-cacher-rs.db";
-pub(crate) const DEFAULT_DATABASE_SLOW_TIMEOUT: Duration = Duration::from_secs(2);
-pub(crate) const DEFAULT_DISK_QUOTA: Option<NonZero<u64>> = None;
-pub(crate) const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
-pub(crate) const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
-pub(crate) const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
-pub(crate) const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
-pub(crate) const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
-pub(crate) const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
-pub(crate) const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
-pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
-pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> =
-    Some(nonzero!(3));
-pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: hyper::StatusCode =
+const DEFAULT_DATABASE_PATH: &str = "/var/lib/apt-cacher-rs/apt-cacher-rs.db";
+const DEFAULT_DATABASE_SLOW_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_DISK_QUOTA: Option<NonZero<u64>> = None;
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HTTPS_UPGRADE_MODE: HttpsUpgradeMode = HttpsUpgradeMode::Auto;
+const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
+const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
+const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
+const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
+const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
+const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
+const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
+const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
+const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
+const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: hyper::StatusCode =
     hyper::StatusCode::TOO_MANY_REQUESTS;
-pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_RETRYAFTER: u16 = 5;
-pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_FACTOR: f64 = 0.2;
-pub(crate) const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MINSIZE: Option<NonZero<u64>> =
+const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_RETRYAFTER: u16 = 5;
+const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_FACTOR: f64 = 0.2;
+const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MINSIZE: Option<NonZero<u64>> =
     Some(nonzero!(10 * 1024 * 1024)); // 10 MiB
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) enum HttpsUpgradeMode {
+    Auto,
+    Always,
+    Never,
+}
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ConfigDomainName {
@@ -230,6 +237,10 @@ pub(crate) struct Config {
     /// Timeout for http operations.
     #[serde(default = "default_http_timeout", deserialize_with = "from_secs_f32")]
     pub(crate) http_timeout: Duration,
+
+    /// HTTPS upgrade mode.
+    #[serde(default = "default_https_upgrade_mode")]
+    pub(crate) https_upgrade_mode: HttpsUpgradeMode,
 
     /// Size of buffer used for internal data transfer.
     #[serde(
@@ -495,6 +506,10 @@ const fn default_http_timeout() -> Duration {
     DEFAULT_HTTP_TIMEOUT
 }
 
+const fn default_https_upgrade_mode() -> HttpsUpgradeMode {
+    DEFAULT_HTTPS_UPGRADE_MODE
+}
+
 const fn default_buffer_size() -> usize {
     DEFAULT_BUF_SIZE
 }
@@ -665,6 +680,7 @@ impl Config {
             cache_directory: PathBuf::from(DEFAULT_CACHE_DIR),
             database_slow_timeout: DEFAULT_DATABASE_SLOW_TIMEOUT,
             http_timeout: DEFAULT_HTTP_TIMEOUT,
+            https_upgrade_mode: DEFAULT_HTTPS_UPGRADE_MODE,
             buffer_size: DEFAULT_BUF_SIZE,
             aliases: Vec::new(),
             allowed_mirrors: Vec::new(),

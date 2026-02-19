@@ -123,6 +123,7 @@ use tokio::signal::unix::SignalKind;
 
 use crate::config::Config;
 use crate::config::DomainName;
+use crate::config::HttpsUpgradeMode;
 use crate::database::Database;
 use crate::database_task::DatabaseCommand;
 use crate::database_task::DbCmdDelivery;
@@ -300,6 +301,8 @@ pub(crate) async fn request_with_retry(
 
     let (mut parts, _body) = request.into_parts();
 
+    let https_upgrade_mode = global_config().https_upgrade_mode;
+
     let orig_scheme = parts.uri.scheme().cloned();
 
     let cached_scheme = parts.uri.host().and_then(|host| {
@@ -331,7 +334,9 @@ pub(crate) async fn request_with_retry(
         let mut uri_parts = parts.uri.into_parts();
         uri_parts.scheme = Some(scheme.into());
         parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
-    } else if let Some(host) = parts.uri.host() {
+    } else if https_upgrade_mode != HttpsUpgradeMode::Never
+        && let Some(host) = parts.uri.host()
+    {
         debug!(
             "No cached scheme for host {host}{}, trying https upgrade from original scheme {orig_scheme:?}...",
             PortFormatter::new(parts.uri.port())
@@ -350,6 +355,7 @@ pub(crate) async fn request_with_retry(
         mut parts: http::request::Parts,
         orig_scheme: Option<http::uri::Scheme>,
         cached_scheme: Option<Scheme>,
+        https_upgrade_mode: HttpsUpgradeMode,
         mut https_upgrade_test: bool,
     ) -> Result<Response<Incoming>, (hyper_util::client::legacy::Error, Uri)> {
         let mut attempt = 1;
@@ -425,11 +431,15 @@ pub(crate) async fn request_with_retry(
                     return Err((err, parts.uri));
                 }
                 Err(err) => {
-                    if attempt > 2 && https_upgrade_test {
+                    if attempt > 2
+                        && https_upgrade_test
+                        && https_upgrade_mode != HttpsUpgradeMode::Always
+                    {
                         assert_eq!(
                             cached_scheme, None,
                             "https upgrade is only tried when no cached scheme exists"
                         );
+                        assert_eq!(https_upgrade_mode, HttpsUpgradeMode::Auto);
 
                         debug!(
                             "Https upgrade failed for host {}{} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
@@ -490,13 +500,18 @@ pub(crate) async fn request_with_retry(
     }
 
     if https_upgrade_test {
-        debug_assert_eq!(cached_scheme, None);
+        assert_eq!(
+            cached_scheme, None,
+            "https upgrade is only tried when no cached scheme exists"
+        );
+
         let client = client.clone();
 
         // Spawn a new task such that even if the client disconnects,
         // the task will continue to run and initialize the scheme cache.
         tokio::task::spawn(async move {
-            let result = inner_loop(&client, parts, orig_scheme, None, true).await;
+            let result =
+                inner_loop(&client, parts, orig_scheme, None, https_upgrade_mode, true).await;
             if let Err(ref err) = result {
                 warn!(
                     "Failed to initialize scheme cache for host {} in background task:  {}",
@@ -511,9 +526,16 @@ pub(crate) async fn request_with_retry(
         .await
         .expect("task should not panic")
     } else {
-        inner_loop(client, parts, orig_scheme, cached_scheme, false)
-            .await
-            .map_err(|err| err.0)
+        inner_loop(
+            client,
+            parts,
+            orig_scheme,
+            cached_scheme,
+            https_upgrade_mode,
+            false,
+        )
+        .await
+        .map_err(|err| err.0)
     }
 }
 
