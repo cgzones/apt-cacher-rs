@@ -32,12 +32,12 @@ curl -i -L --http1.1 -H "user-agent: apt-cacher-rs/0.1.0" -H "host: apt.llvm.org
 
    1.  check open GitHub issues
    2.  check open GitHub pull-requests
-   3.  run `cargo update`
+   3.  run `cargo update --verbose`
    4.  run `cargo outdated`
    5.  run `cargo deny check`
    6.  run `cargo audit`
    7.  run `typos`
-   8.  run `codespell -L crate src/ apt-cacher-rs.conf apt-cacher-rs.init apt-cacher-rs.service README.md`
+   8.  run `codespell -L crate src/ debian/ deny.toml apt-cacher-rs.init README.md TODO`
   10.  run `cargo clippy`
   11.  run `cargo +nightly clippy`
   12.  update version in *Cargo.toml*
