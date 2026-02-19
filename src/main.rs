@@ -273,26 +273,6 @@ pub(crate) async fn request_with_retry(
 ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
     const MAX_ATTEMPTS: u32 = 10;
 
-    #[must_use]
-    struct PortFormatter<'a> {
-        port: Option<http::uri::Port<&'a str>>,
-    }
-
-    impl<'a> PortFormatter<'a> {
-        const fn new(port: Option<http::uri::Port<&'a str>>) -> Self {
-            Self { port }
-        }
-    }
-
-    impl Display for PortFormatter<'_> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match &self.port {
-                Some(port) => write!(f, ":{port}"),
-                None => Ok(()),
-            }
-        }
-    }
-
     debug_assert_eq!(
         request.body().size_hint().exact(),
         Some(0),
@@ -305,10 +285,10 @@ pub(crate) async fn request_with_retry(
 
     let orig_scheme = parts.uri.scheme().cloned();
 
-    let cached_scheme = parts.uri.host().and_then(|host| {
+    let cached_scheme = parts.uri.authority().and_then(|auth| {
         let key = SchemeKeyRef {
-            host,
-            port: parts.uri.port_u16(),
+            host: auth.host(),
+            port: auth.port_u16(),
         };
         SCHEME_CACHE
             .get()
@@ -326,20 +306,21 @@ pub(crate) async fn request_with_retry(
         debug!("Not altering {os} scheme for request {}", parts.uri);
     } else if let Some(scheme) = cached_scheme {
         debug!(
-            "Using cached scheme {scheme} for host {}{}, original scheme is {orig_scheme:?}",
-            parts.uri.host().expect("host must exist for a cache entry"),
-            PortFormatter::new(parts.uri.port())
+            "Using cached scheme {scheme} for host {}, original scheme is {orig_scheme:?}",
+            parts
+                .uri
+                .authority()
+                .expect("authority must exist for a cache entry")
         );
 
         let mut uri_parts = parts.uri.into_parts();
         uri_parts.scheme = Some(scheme.into());
         parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
     } else if https_upgrade_mode != HttpsUpgradeMode::Never
-        && let Some(host) = parts.uri.host()
+        && let Some(auth) = parts.uri.authority()
     {
         debug!(
-            "No cached scheme for host {host}{}, trying https upgrade from original scheme {orig_scheme:?}...",
-            PortFormatter::new(parts.uri.port())
+            "No cached scheme for host {auth}, trying https upgrade from original scheme {orig_scheme:?}..."
         );
 
         // try https upgrade
@@ -368,13 +349,13 @@ pub(crate) async fn request_with_retry(
             match client.request(req_clone).await {
                 Ok(response) => {
                     if cached_scheme.is_none()
-                        && let Some(host) = parts.uri.host()
+                        && let Some(auth) = parts.uri.authority()
                     {
                         match parts.uri.scheme() {
                             Some(s) if *s == http::uri::Scheme::HTTP => {
                                 let key = SchemeKeyRef {
-                                    host,
-                                    port: parts.uri.port_u16(),
+                                    host: auth.host(),
+                                    port: auth.port_u16(),
                                 };
                                 match SCHEME_CACHE
                                     .get()
@@ -386,16 +367,15 @@ pub(crate) async fn request_with_retry(
                                     EntryRef::Vacant(ventry) => {
                                         ventry.insert(Scheme::Http);
                                         debug!(
-                                            "Added cached http scheme for host {host}{}, original scheme was {orig_scheme:?}",
-                                            PortFormatter::new(parts.uri.port())
+                                            "Added cached http scheme for host {auth}, original scheme was {orig_scheme:?}"
                                         );
                                     }
                                 }
                             }
                             Some(s) if *s == http::uri::Scheme::HTTPS => {
                                 let key = SchemeKeyRef {
-                                    host,
-                                    port: parts.uri.port_u16(),
+                                    host: auth.host(),
+                                    port: auth.port_u16(),
                                 };
                                 match SCHEME_CACHE
                                     .get()
@@ -407,17 +387,13 @@ pub(crate) async fn request_with_retry(
                                     EntryRef::Vacant(ventry) => {
                                         ventry.insert(Scheme::Https);
                                         debug!(
-                                            "Added cached https scheme for host {host}{}, original scheme was {orig_scheme:?}",
-                                            PortFormatter::new(parts.uri.port())
+                                            "Added cached https scheme for host {auth}, original scheme was {orig_scheme:?}"
                                         );
                                     }
                                 }
                             }
                             s => {
-                                debug!(
-                                    "Not caching unsupported scheme {s:?} for host {host}{}",
-                                    PortFormatter::new(parts.uri.port())
-                                );
+                                debug!("Not caching unsupported scheme {s:?} for host {auth}");
                             }
                         }
                     }
@@ -442,12 +418,11 @@ pub(crate) async fn request_with_retry(
                         assert_eq!(https_upgrade_mode, HttpsUpgradeMode::Auto);
 
                         debug!(
-                            "Https upgrade failed for host {}{} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
+                            "Https upgrade failed for host {} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
                             parts
                                 .uri
-                                .host()
-                                .expect("host must exist for a https upgrade"),
-                            PortFormatter::new(parts.uri.port())
+                                .authority()
+                                .expect("authority must exist for a https upgrade")
                         );
 
                         // reset https upgrade
@@ -461,10 +436,10 @@ pub(crate) async fn request_with_retry(
                     }
 
                     if attempt > MAX_ATTEMPTS {
-                        if let Some(host) = parts.uri.host() {
+                        if let Some(auth) = parts.uri.authority() {
                             let key = SchemeKeyRef {
-                                host,
-                                port: parts.uri.port_u16(),
+                                host: auth.host(),
+                                port: auth.port_u16(),
                             };
 
                             let value = SCHEME_CACHE
@@ -474,8 +449,7 @@ pub(crate) async fn request_with_retry(
                                 .remove(&key);
                             if let Some(scheme) = value {
                                 debug!(
-                                    "Removed cached scheme {scheme} for host {host}{} after {attempt} connection attempts, original scheme was {orig_scheme:?}",
-                                    PortFormatter::new(parts.uri.port())
+                                    "Removed cached scheme {scheme} for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}"
                                 );
                             }
                         }
@@ -516,8 +490,8 @@ pub(crate) async fn request_with_retry(
                 warn!(
                     "Failed to initialize scheme cache for host {} in background task:  {}",
                     err.1
-                        .host()
-                        .expect("host exists in case of https upgrade test"),
+                        .authority()
+                        .expect("authority exists in case of https upgrade test"),
                     err.0
                 );
             }
