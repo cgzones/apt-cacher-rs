@@ -3788,7 +3788,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let uri = Uri::builder()
                             .scheme("http")
-                            .authority(authority)
+                            .authority(authority.as_str())
                             .path_and_query("/")
                             .build()
                             .expect("Valid URI");
@@ -3802,14 +3802,19 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         match request_with_retry(&client, request).await {
                             Ok(response) => {
-                                // ignore response, we just care about connection success
-                                trace!(
-                                    "Response for host {host} of initial scheme cache request:  {response:?}"
+                                let severity = if response.status().is_server_error() {
+                                    Level::Warn
+                                } else {
+                                    // ignore response, we just care about connection success
+                                    Level::Trace
+                                };
+                                log!(severity,
+                                    "Response for host {authority} of initial scheme cache request:  {response:?}"
                                 );
                             }
                             Err(err) => {
                                 // request_with_retry() has already logged the error
-                                debug!("Failed to query host {host} to initialize scheme cache:  {err}");
+                                debug!("Failed to query host {authority} to initialize scheme cache:  {err}");
                             }
                         }
                     }
