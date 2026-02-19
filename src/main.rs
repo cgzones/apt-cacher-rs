@@ -101,8 +101,7 @@ use memmap2::{Advice, Mmap, MmapOptions};
 use pin_project::pin_project;
 #[cfg(not(feature = "mmap"))]
 use pin_project::pinned_drop;
-use rand::Rng as _;
-use rand::SeedableRng as _;
+use rand::RngExt as _;
 use rand::distr::Alphanumeric;
 use rand::distr::Bernoulli;
 use rand::prelude::Distribution as _;
@@ -176,7 +175,7 @@ async fn tokio_mkstemp(
     path: &Path,
     mode: u32,
 ) -> Result<(tokio::fs::File, PathBuf), tokio::io::Error> {
-    let mut rng = SmallRng::from_os_rng();
+    let mut rng: SmallRng = rand::make_rng();
 
     let mut buf = path.to_path_buf();
 
