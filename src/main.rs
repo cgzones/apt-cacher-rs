@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "mmap"), forbid(unsafe_code))]
-#![allow(clippy::too_many_lines)]
+#![allow(clippy::needless_continue, clippy::too_many_lines)]
 
 #[cfg(not(any(feature = "tls_hyper", feature = "tls_rustls")))]
 compile_error!("Either feature \"tls_hyper\" or \"tls_rustls\" must be enabled for this crate.");
@@ -356,49 +356,32 @@ pub(crate) async fn request_with_retry(
                     if cached_scheme.is_none()
                         && let Some(auth) = parts.uri.authority()
                     {
-                        match parts.uri.scheme() {
-                            Some(s) if *s == http::uri::Scheme::HTTP => {
-                                let key = SchemeKeyRef {
-                                    host: auth.host(),
-                                    port: auth.port_u16(),
-                                };
-                                match SCHEME_CACHE
-                                    .get()
-                                    .expect("Initialized in main()")
-                                    .write()
-                                    .entry_ref(&key)
-                                {
-                                    EntryRef::Occupied(_oentry) => (),
-                                    EntryRef::Vacant(ventry) => {
-                                        ventry.insert(Scheme::Http);
-                                        debug!(
-                                            "Added cached http scheme for host {auth}, original scheme was {orig_scheme:?}"
-                                        );
-                                    }
-                                }
-                            }
-                            Some(s) if *s == http::uri::Scheme::HTTPS => {
-                                let key = SchemeKeyRef {
-                                    host: auth.host(),
-                                    port: auth.port_u16(),
-                                };
-                                match SCHEME_CACHE
-                                    .get()
-                                    .expect("Initialized in main()")
-                                    .write()
-                                    .entry_ref(&key)
-                                {
-                                    EntryRef::Occupied(_oentry) => (),
-                                    EntryRef::Vacant(ventry) => {
-                                        ventry.insert(Scheme::Https);
-                                        debug!(
-                                            "Added cached https scheme for host {auth}, original scheme was {orig_scheme:?}"
-                                        );
-                                    }
-                                }
-                            }
+                        let scheme = match parts.uri.scheme() {
+                            Some(s) if *s == http::uri::Scheme::HTTP => Some(Scheme::Http),
+                            Some(s) if *s == http::uri::Scheme::HTTPS => Some(Scheme::Https),
                             s => {
                                 debug!("Not caching unsupported scheme {s:?} for host {auth}");
+                                None
+                            }
+                        };
+                        if let Some(scheme) = scheme {
+                            let key = SchemeKeyRef {
+                                host: auth.host(),
+                                port: auth.port_u16(),
+                            };
+                            match SCHEME_CACHE
+                                .get()
+                                .expect("Initialized in main()")
+                                .write()
+                                .entry_ref(&key)
+                            {
+                                EntryRef::Occupied(_oentry) => (),
+                                EntryRef::Vacant(ventry) => {
+                                    ventry.insert(scheme);
+                                    debug!(
+                                        "Added cached {scheme} scheme for host {auth}, original scheme was {orig_scheme:?}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2284,11 +2267,7 @@ async fn serve_cached_file_modified_since(
             // ) // TODO: send CACHE_CONTROL in other branches as well
             .header(
                 AGE,
-                HeaderValue::try_from(format!(
-                    "{}",
-                    local_creation_time.elapsed().map_or(0, |dur| dur.as_secs())
-                ))
-                .expect("string is valid"),
+                HeaderValue::from(local_creation_time.elapsed().map_or(0, |dur| dur.as_secs())),
             ) // TODO: send AGE in other branches as well
             .body(ProxyCacheBody::Empty(Empty::new()))
             .expect("HTTP response is valid");

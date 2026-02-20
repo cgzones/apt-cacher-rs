@@ -30,7 +30,7 @@ macro_rules! nonzero {
 
 const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
-const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 MiB
+const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 KiB
 const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
 pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = "/etc/apt-cacher-rs/apt-cacher-rs.conf";
 const DEFAULT_DATABASE_PATH: &str = "/var/lib/apt-cacher-rs/apt-cacher-rs.db";
@@ -366,44 +366,51 @@ where
     parse_usize_with_magnitude(&s).map_err(D::Error::custom)
 }
 
-fn parse_usize_with_magnitude(s: &str) -> anyhow::Result<usize> {
-    debug_assert_eq!(s, s.trim(), "Should be trimmed by deserializer");
+macro_rules! impl_parse_with_magnitude {
+    ($name:ident, $T:ty) => {
+        fn $name(s: &str) -> anyhow::Result<$T> {
+            debug_assert_eq!(s, s.trim(), "Should be trimmed by deserializer");
 
-    if let Ok(val) = s.parse::<usize>() {
-        return Ok(val);
-    }
+            if let Ok(val) = s.parse::<$T>() {
+                return Ok(val);
+            }
 
-    let Some(x) = s.find(|c| !char::is_ascii_digit(&c)) else {
-        bail!("Could not split input");
+            let Some(x) = s.find(|c| !char::is_ascii_digit(&c)) else {
+                bail!("Could not split input");
+            };
+
+            let (val, mag) = s.split_at(x);
+
+            let val = val.parse::<$T>()?;
+            let mag = mag.trim();
+
+            match mag {
+                "k" => val
+                    .checked_mul(1000)
+                    .ok_or_else(|| anyhow!("Multiplication overflow")),
+                "Ki" => val
+                    .checked_mul(1024)
+                    .ok_or_else(|| anyhow!("Multiplication overflow")),
+                "M" => val
+                    .checked_mul(1000 * 1000)
+                    .ok_or_else(|| anyhow!("Multiplication overflow")),
+                "Mi" => val
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| anyhow!("Multiplication overflow")),
+                "G" => val
+                    .checked_mul(1000 * 1000 * 1000)
+                    .ok_or_else(|| anyhow!("Multiplication overflow")),
+                "Gi" => val
+                    .checked_mul(1024 * 1024 * 1024)
+                    .ok_or_else(|| anyhow!("Multiplication overflow")),
+                _ => bail!("Invalid magnitude `{mag}`, expected `k`, `Ki`, `M`, `Mi`, `G` or `Gi`"),
+            }
+        }
     };
-
-    let (val, mag) = s.split_at(x);
-
-    let val = val.parse::<usize>()?;
-    let mag = mag.trim();
-
-    match mag {
-        "k" => val
-            .checked_mul(1000)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "Ki" => val
-            .checked_mul(1024)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "M" => val
-            .checked_mul(1000 * 1000)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "Mi" => val
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "G" => val
-            .checked_mul(1000 * 1000 * 1000)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "Gi" => val
-            .checked_mul(1024 * 1024 * 1024)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        _ => bail!("Invalid magnitude `{mag}`, expected `k`, `Ki`, `M`, `Mi`, `G` or `Gi`"),
-    }
 }
+
+impl_parse_with_magnitude!(parse_usize_with_magnitude, usize);
+impl_parse_with_magnitude!(parse_u64_with_magnitude, u64);
 
 fn from_nonzero_usize_with_magnitude<'de, D>(
     deserializer: D,
@@ -431,45 +438,6 @@ where
     parse_u64_with_magnitude(&s)
         .map(NonZero::new)
         .map_err(D::Error::custom)
-}
-
-fn parse_u64_with_magnitude(s: &str) -> anyhow::Result<u64> {
-    debug_assert_eq!(s, s.trim(), "Should be trimmed by deserializer");
-
-    if let Ok(val) = s.parse::<u64>() {
-        return Ok(val);
-    }
-
-    let Some(x) = s.find(|c| !char::is_ascii_digit(&c)) else {
-        bail!("Could not split input");
-    };
-
-    let (val, mag) = s.split_at(x);
-
-    let val = val.parse::<u64>()?;
-    let mag = mag.trim();
-
-    match mag {
-        "k" => val
-            .checked_mul(1000)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "Ki" => val
-            .checked_mul(1024)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "M" => val
-            .checked_mul(1000 * 1000)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "Mi" => val
-            .checked_mul(1024 * 1024)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "G" => val
-            .checked_mul(1000 * 1000 * 1000)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        "Gi" => val
-            .checked_mul(1024 * 1024 * 1024)
-            .ok_or_else(|| anyhow!("Multiplication overflow")),
-        _ => bail!("Invalid magnitude `{mag}`, expected `k`, `Ki`, `M`, `Mi`, `G` or `Gi`"),
-    }
 }
 
 fn statuscode_from_u32<'de, D>(deserializer: D) -> Result<hyper::StatusCode, D::Error>
@@ -835,6 +803,29 @@ mod test {
         assert!(parse_usize_with_magnitude("-9M").is_err());
 
         assert!(parse_usize_with_magnitude("-7 y").is_err());
+    }
+
+    #[test]
+    fn test_parse_u64_with_magnitude() {
+        assert_eq!(0, parse_u64_with_magnitude("0").unwrap());
+
+        assert_eq!(1024, parse_u64_with_magnitude("1024").unwrap());
+
+        assert_eq!(1000, parse_u64_with_magnitude("1k").unwrap());
+
+        assert_eq!(1024, parse_u64_with_magnitude("1Ki").unwrap());
+
+        assert_eq!(1_000_000, parse_u64_with_magnitude("1M").unwrap());
+
+        assert_eq!(0x0010_0000, parse_u64_with_magnitude("1Mi").unwrap());
+
+        assert_eq!(42_000_000_000, parse_u64_with_magnitude("42 G").unwrap());
+
+        assert_eq!(45_097_156_608, parse_u64_with_magnitude("42 Gi").unwrap());
+
+        assert!(parse_u64_with_magnitude("1K").is_err());
+
+        assert!(parse_u64_with_magnitude("-9M").is_err());
     }
 
     #[test]
