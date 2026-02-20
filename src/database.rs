@@ -414,7 +414,7 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn register_deliviery(
+    pub(crate) async fn register_delivery(
         &self,
         mirror: &Mirror,
         debname: &str,

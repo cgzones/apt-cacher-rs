@@ -394,7 +394,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
         )
         .with_container(
             Container::new(ContainerType::Div)
-                .with_header_attr(3, "Uncacheables", [("id", "clients-head")])
+                .with_header_attr(3, "Uncacheables", [("id", "uncacheables-head")])
                 .with_paragraph(format!(
                     "List of most recent files unable to cache [{uncacheable_rows}]{}",
                     if uncacheable_rows == 0 { '.' } else { ':' }

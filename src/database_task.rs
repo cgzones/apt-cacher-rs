@@ -45,7 +45,7 @@ pub(crate) async fn db_loop(
         match cmd {
             DatabaseCommand::Delivery(cmd) => {
                 if let Err(err) = database
-                    .register_deliviery(
+                    .register_delivery(
                         &cmd.mirror,
                         &cmd.debname,
                         cmd.size,

@@ -558,7 +558,7 @@ async fn cleanup_mirror_deb_files(
                 && existing_for < KEEP_SPAN
             {
                 debug!(
-                    "Keeping unreferenced file `{}` since it is to new ({}, threshold={})",
+                    "Keeping unreferenced file `{}` since it is too new ({}, threshold={})",
                     path.display(),
                     HumanFmt::Time(existing_for),
                     HumanFmt::Time(KEEP_SPAN)
@@ -682,7 +682,7 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
 
         if file_age <= keep_span {
             debug!(
-                "Keeping file `{}` since it is to new ({}s, threshold={}s)",
+                "Keeping file `{}` since it is too new ({}s, threshold={}s)",
                 path.display(),
                 file_age.as_secs(),
                 keep_span.as_secs()
@@ -691,7 +691,7 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
         }
 
         debug!(
-            "Removing file `{}` since it is to old ({}s, threshold={}s)",
+            "Removing file `{}` since it is too old ({}s, threshold={}s)",
             path.display(),
             file_age.as_secs(),
             keep_span.as_secs()
