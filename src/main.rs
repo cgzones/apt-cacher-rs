@@ -1581,6 +1581,16 @@ async fn download_file(
     let buf_size = global_config().buffer_size;
 
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
+    let outpath = scopeguard::guard(output.1, |path| {
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = std::fs::remove_file(&path) {
+                error!(
+                    "Failed to remove temporary file `{}`:  {err}",
+                    path.display()
+                );
+            }
+        });
+    });
 
     let mut body = match global_config().min_download_rate {
         Some(rate) => BoxBody::new(RateCheckedBody::new(
@@ -1636,7 +1646,7 @@ async fn download_file(
             }
 
             if let Err(err) = writer.write_all_buf(&mut chunk).await {
-                error!("Error writing to file `{}`:  {err}", output.1.display());
+                error!("Error writing to file `{}`:  {err}", outpath.display());
                 return;
             }
 
@@ -1685,7 +1695,7 @@ async fn download_file(
     };
 
     if let Err(err) = writer.flush().await {
-        error!("Error writing to file `{}`:  {err}", output.1.display());
+        error!("Error writing to file `{}`:  {err}", outpath.display());
         return;
     }
     drop(writer);
@@ -1730,7 +1740,7 @@ async fn download_file(
             );
         }
 
-        match tokio::fs::rename(&output.1, &dest_file_path).await {
+        match tokio::fs::rename(&*outpath, &dest_file_path).await {
             Ok(()) => {
                 {
                     if size_diff != 0 {
@@ -1759,6 +1769,8 @@ async fn download_file(
                     }
                 }
 
+                // Defuse the scopeguard — the file has been successfully renamed
+                scopeguard::ScopeGuard::into_inner(outpath);
                 dbarrier.release(locked_status, dest_file_path);
             }
             Err(err) => {
@@ -1766,15 +1778,10 @@ async fn download_file(
 
                 error!(
                     "Failed to rename file `{}` to `{}`:  {err}",
-                    output.1.display(),
+                    outpath.display(),
                     dest_file_path.display()
                 );
-                if let Err(err) = tokio::fs::remove_file(&output.1).await {
-                    error!(
-                        "Failed to delete temporary file `{}`:  {err}",
-                        output.1.display(),
-                    );
-                }
+                // The scopeguard will remove the temp file on drop
 
                 return;
             }
