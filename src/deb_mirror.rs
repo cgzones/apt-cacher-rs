@@ -111,49 +111,48 @@ pub(crate) trait UriFormat {
     fn uri(&self) -> String;
 }
 
+fn format_origin_uri(
+    host: &str,
+    port: Option<NonZero<u16>>,
+    mirror_path: &str,
+    dist: &str,
+    comp: &str,
+    arch: &str,
+) -> String {
+    // deb.debian.org/debian/dists/sid/main/binary-amd64/Packages
+
+    if let Some(port) = port {
+        format!("http://{host}:{port}/{mirror_path}/dists/{dist}/{comp}/{arch}/Packages")
+    } else {
+        format!("http://{host}/{mirror_path}/dists/{dist}/{comp}/{arch}/Packages")
+    }
+}
+
 impl UriFormat for Origin {
     #[inline]
     fn uri(&self) -> String {
-        /* deb.debian.org/debian/dists/sid/main/binary-amd64/Packages */
-
-        if let Some(port) = self.mirror.port {
-            format!(
-                "http://{}:{port}/{}/dists/{}/{}/{}/Packages",
-                self.mirror.host,
-                self.mirror.path,
-                self.distribution,
-                self.component,
-                self.architecture
-            )
-        } else {
-            format!(
-                "http://{}/{}/dists/{}/{}/{}/Packages",
-                self.mirror.host,
-                self.mirror.path,
-                self.distribution,
-                self.component,
-                self.architecture
-            )
-        }
+        format_origin_uri(
+            &self.mirror.host,
+            self.mirror.port,
+            &self.mirror.path,
+            &self.distribution,
+            &self.component,
+            &self.architecture,
+        )
     }
 }
 
 impl UriFormat for &crate::database::OriginEntry {
     #[inline]
     fn uri(&self) -> String {
-        /* deb.debian.org/debian/dists/sid/main/binary-amd64/Packages */
-
-        if let Some(port) = self.port() {
-            format!(
-                "http://{}:{port}/{}/dists/{}/{}/{}/Packages",
-                self.host, self.mirror_path, self.distribution, self.component, self.architecture
-            )
-        } else {
-            format!(
-                "http://{}/{}/dists/{}/{}/{}/Packages",
-                self.host, self.mirror_path, self.distribution, self.component, self.architecture
-            )
-        }
+        format_origin_uri(
+            &self.host,
+            self.port(),
+            &self.mirror_path,
+            &self.distribution,
+            &self.component,
+            &self.architecture,
+        )
     }
 }
 
@@ -367,6 +366,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
 #[must_use]
 pub(crate) fn valid_filename(name: &str) -> bool {
     name.len() >= 4
+        && name.len() <= 255
         && name.chars().enumerate().all(|(i, c)| {
             (i > 0 || c.is_ascii_alphanumeric())
                 && c.is_ascii()
@@ -392,30 +392,28 @@ pub(crate) fn valid_mirrorname(name: &str) -> bool {
 }
 
 #[must_use]
-pub(crate) fn valid_distribution(name: &str) -> bool {
+fn valid_path_segment(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= 128
         && name
             .chars()
             .enumerate()
             .all(|(i, c)| c.is_ascii_alphanumeric() || (i > 0 && c == '-'))
+}
+
+#[must_use]
+pub(crate) fn valid_distribution(name: &str) -> bool {
+    valid_path_segment(name)
 }
 
 #[must_use]
 pub(crate) fn valid_component(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .enumerate()
-            .all(|(i, c)| c.is_ascii_alphanumeric() || (i > 0 && c == '-'))
+    valid_path_segment(name)
 }
 
 #[must_use]
 pub(crate) fn valid_architecture(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .enumerate()
-            .all(|(i, c)| c.is_ascii_alphanumeric() || (i > 0 && c == '-'))
+    valid_path_segment(name)
 }
 
 #[cfg(test)]
