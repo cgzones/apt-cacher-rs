@@ -1271,14 +1271,22 @@ async fn serve_volatile_file(
         );
 
         let client_modified_since = req.headers().get(IF_MODIFIED_SINCE);
-        let Some(client_modified_time) = client_modified_since
-            .map(|val| val.to_str().ok().and_then(http_datetime_to_systemtime))
-        else {
-            warn_once_or_info!(
-                "Rejecting invalid If-Modified-Since header from client {}",
-                conn_details.client.ip().to_canonical()
-            );
-            return quick_response(StatusCode::BAD_REQUEST, "Invalid If-Modified-Since header");
+        let client_modified_time = match client_modified_since {
+            Some(val) => {
+                let Some(time) = val.to_str().ok().and_then(http_datetime_to_systemtime) else {
+                    warn_once_or_info!(
+                        "Rejecting invalid If-Modified-Since header from client {}",
+                        conn_details.client.ip().to_canonical()
+                    );
+                    return quick_response(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid If-Modified-Since header",
+                    );
+                };
+
+                Some(time)
+            }
+            None => None,
         };
 
         return serve_cached_file_modified_since(
