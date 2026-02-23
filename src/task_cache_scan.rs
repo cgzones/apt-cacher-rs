@@ -1,4 +1,7 @@
-use std::{ffi::OsStr, path::Path};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use log::{error, trace, warn};
 use tokio::fs::DirEntry;
@@ -37,6 +40,19 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
 
     let aliases = global_config().aliases.as_slice();
 
+    // Pre-compute formatted directory names for each mirror to avoid repeated allocations
+    let mirrors_with_names: Vec<_> = mirrors
+        .iter()
+        .map(|mirror| {
+            let dir_name: Cow<'_, Path> = if let Some(port) = mirror.port() {
+                Cow::Owned(PathBuf::from(format!("{}:{port}", mirror.host)))
+            } else {
+                Cow::Borrowed(Path::new(&mirror.host))
+            };
+            (mirror, dir_name)
+        })
+        .collect();
+
     let mut cache_size = 0;
 
     while let Some(entry) = match cache_dir.next_entry().await {
@@ -62,12 +78,8 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
 
         let mut scanned = false;
 
-        for mirror in &mirrors {
-            if let Some(port) = mirror.port() {
-                if Path::new(&format!("{}:{port}", mirror.host)) != filename {
-                    continue;
-                }
-            } else if Path::new(&mirror.host) != filename {
+        for (mirror, dir_name) in &mirrors_with_names {
+            if filename != *dir_name {
                 continue;
             }
 
@@ -100,7 +112,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
 
 #[must_use]
 async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
-    let mirror_dir = {
+    let mirror_path = {
         let mut p = host.path();
         let mpath = Path::new(&mirror.path);
         assert!(mpath.is_relative());
@@ -108,14 +120,14 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
         p
     };
 
-    trace!("Scanning mirror directory `{}`...", mirror_dir.display());
+    trace!("Scanning mirror directory `{}`...", mirror_path.display());
 
-    let mut host_dir = match tokio::fs::read_dir(&mirror_dir).await {
+    let mut mirror_dir = match tokio::fs::read_dir(&mirror_path).await {
         Ok(d) => d,
         Err(err) => {
             error!(
                 "Error listing mirror directory `{}`:  {err}",
-                mirror_dir.display()
+                mirror_path.display()
             );
             return 0;
         }
@@ -123,24 +135,22 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
 
     let mut dir_size = 0;
 
-    while let Some(entry) = match host_dir.next_entry().await {
+    while let Some(entry) = match mirror_dir.next_entry().await {
         Ok(e) => e,
         Err(err) => {
             error!(
                 "Error iterating mirror directory `{}`:  {err}",
-                mirror_dir.display()
+                mirror_path.display()
             );
             return dir_size;
         }
     } {
-        let file_path = entry.path();
-
         let mdata = match entry.metadata().await {
             Ok(d) => d,
             Err(err) => {
                 error!(
                     "Error getting file meta data of `{}`:  {err}",
-                    file_path.display()
+                    entry.path().display()
                 );
                 continue;
             }
@@ -148,12 +158,17 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
 
         let file_type = mdata.file_type();
 
-        if !file_type.is_dir() {
+        if file_type.is_file() {
             dir_size += mdata.len();
-        }
 
-        if file_type.is_file() && file_path.extension() == Some(OsStr::new("deb")) {
-            continue;
+            #[expect(clippy::case_sensitive_file_extension_comparisons)]
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|fname| fname.ends_with(".deb"))
+            {
+                continue;
+            }
         }
 
         if file_type.is_dir() && entry.file_name() == "dists" {
@@ -163,13 +178,13 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
 
         warn!(
             "Unrecognized entry in host directory: `{}`",
-            file_path.display()
+            entry.path().display()
         );
     }
 
     trace!(
         "Size of mirror directory `{}`: {}",
-        mirror_dir.display(),
+        mirror_path.display(),
         dir_size
     );
 
@@ -178,19 +193,19 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
 
 #[must_use]
 async fn scan_sub_dir(entry: DirEntry) -> u64 {
-    let entry_path = entry.path();
+    let subdir_path = entry.path();
 
     trace!(
         "Scanning mirror sub directory `{}`...",
-        entry_path.display()
+        subdir_path.display()
     );
 
-    let mut dir = match tokio::fs::read_dir(&entry_path).await {
+    let mut subdir_dir = match tokio::fs::read_dir(&subdir_path).await {
         Ok(d) => d,
         Err(err) => {
             error!(
                 "Error listing mirror sub directory `{}`:  {err}",
-                entry_path.display()
+                subdir_path.display()
             );
             return 0;
         }
@@ -198,24 +213,22 @@ async fn scan_sub_dir(entry: DirEntry) -> u64 {
 
     let mut dir_size = 0;
 
-    while let Some(entry) = match dir.next_entry().await {
+    while let Some(entry) = match subdir_dir.next_entry().await {
         Ok(e) => e,
         Err(err) => {
             error!(
                 "Error iterating mirror sub directory `{}`:  {err}",
-                entry_path.display()
+                subdir_path.display()
             );
             return dir_size;
         }
     } {
-        let file_path = entry.path();
-
         let mdata = match entry.metadata().await {
             Ok(d) => d,
             Err(err) => {
                 error!(
                     "Error getting file meta data of `{}`:  {err}",
-                    file_path.display()
+                    entry.path().display()
                 );
                 continue;
             }
@@ -223,29 +236,26 @@ async fn scan_sub_dir(entry: DirEntry) -> u64 {
 
         let file_type = mdata.file_type();
 
-        if !file_type.is_dir() {
-            dir_size += mdata.len();
-        }
-
         if file_type.is_file() {
+            dir_size += mdata.len();
             continue;
         }
 
         if file_type.is_dir() && entry.file_name() == "by-hash" {
-            dir_size += scan_sub2_dir(entry).await;
+            dir_size += scan_by_hash_dir(entry).await;
             continue;
         }
 
         warn!(
             "Unrecognized entry in mirror sub directory `{}`: `{}`",
-            entry_path.display(),
-            file_path.display()
+            subdir_path.display(),
+            entry.path().display()
         );
     }
 
     trace!(
         "Size of mirror sub directory `{}`: {}",
-        entry_path.display(),
+        subdir_path.display(),
         dir_size
     );
 
@@ -253,20 +263,20 @@ async fn scan_sub_dir(entry: DirEntry) -> u64 {
 }
 
 #[must_use]
-async fn scan_sub2_dir(entry: DirEntry) -> u64 {
-    let entry_path = entry.path();
+async fn scan_by_hash_dir(entry: DirEntry) -> u64 {
+    let hashdir_path = entry.path();
 
     trace!(
-        "Scanning mirror sub^2 directory `{}`...",
-        entry_path.display()
+        "Scanning mirror by-hash directory `{}`...",
+        hashdir_path.display()
     );
 
-    let mut dir = match tokio::fs::read_dir(&entry_path).await {
+    let mut hashdir_dir = match tokio::fs::read_dir(&hashdir_path).await {
         Ok(d) => d,
         Err(err) => {
             error!(
-                "Error listing mirror sub^2 directory `{}`:  {err}",
-                entry_path.display()
+                "Error listing mirror by-hash directory `{}`:  {err}",
+                hashdir_path.display()
             );
             return 0;
         }
@@ -274,24 +284,22 @@ async fn scan_sub2_dir(entry: DirEntry) -> u64 {
 
     let mut dir_size = 0;
 
-    while let Some(entry) = match dir.next_entry().await {
+    while let Some(entry) = match hashdir_dir.next_entry().await {
         Ok(e) => e,
         Err(err) => {
             error!(
-                "Error iterating mirror sub^2 directory `{}`:  {err}",
-                entry_path.display()
+                "Error iterating mirror by-hash directory `{}`:  {err}",
+                hashdir_path.display()
             );
             return dir_size;
         }
     } {
-        let file_path = entry.path();
-
         let mdata = match entry.metadata().await {
             Ok(d) => d,
             Err(err) => {
                 error!(
                     "Error getting file meta data of `{}`:  {err}",
-                    file_path.display()
+                    entry.path().display()
                 );
                 continue;
             }
@@ -299,24 +307,21 @@ async fn scan_sub2_dir(entry: DirEntry) -> u64 {
 
         let file_type = mdata.file_type();
 
-        if !file_type.is_dir() {
-            dir_size += mdata.len();
-        }
-
         if file_type.is_file() {
+            dir_size += mdata.len();
             continue;
         }
 
         warn!(
-            "Unrecognized entry in mirror sub^2 directory `{}`: `{}`",
-            entry_path.display(),
-            file_path.display()
+            "Unrecognized entry in mirror by-hash directory `{}`: `{}`",
+            hashdir_path.display(),
+            entry.path().display()
         );
     }
 
     trace!(
-        "Size of mirror sub^2 directory `{}`: {}",
-        entry_path.display(),
+        "Size of mirror by-hash directory `{}`: {}",
+        hashdir_path.display(),
         dir_size
     );
 
