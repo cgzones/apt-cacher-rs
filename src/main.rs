@@ -1269,7 +1269,18 @@ async fn serve_volatile_file(
             file_path.display(),
             HumanFmt::Time(elapsed)
         );
+
         let client_modified_since = req.headers().get(IF_MODIFIED_SINCE);
+        let Some(client_modified_time) = client_modified_since
+            .map(|val| val.to_str().ok().and_then(http_datetime_to_systemtime))
+        else {
+            warn_once_or_info!(
+                "Rejecting invalid If-Modified-Since header from client {}",
+                conn_details.client.ip().to_canonical()
+            );
+            return quick_response(StatusCode::BAD_REQUEST, "Invalid If-Modified-Since header");
+        };
+
         return serve_cached_file_modified_since(
             conn_details,
             &req,
@@ -1277,7 +1288,7 @@ async fn serve_volatile_file(
             file,
             file_path,
             local_creation_time.unwrap_or(local_modification_time),
-            client_modified_since,
+            client_modified_time,
         )
         .await;
     }
@@ -2217,18 +2228,13 @@ async fn serve_cached_file_modified_since(
     file: tokio::fs::File,
     file_path: &Path,
     local_creation_time: SystemTime,
-    client_modified_since: Option<&HeaderValue>,
+    client_modified_time: Option<SystemTime>,
 ) -> Response<ProxyCacheBody> {
-    let Some(client_modified_since) = client_modified_since else {
+    let Some(client_modified_time) = client_modified_time else {
         return serve_cached_file(conn_details, req, database_tx, file, file_path).await;
     };
 
-    if let Some(client_modified_time) = client_modified_since
-        .to_str()
-        .ok()
-        .and_then(http_datetime_to_systemtime)
-        && client_modified_time >= local_creation_time
-    {
+    if client_modified_time >= local_creation_time {
         info!(
             "Serving info about up-to-date cached file {} from mirror {} for client {}",
             conn_details.debname,
@@ -2415,7 +2421,7 @@ async fn serve_new_file(
         CacheFileStat::New => (true, 0),
     };
 
-    let mut client_modified_since = None;
+    let mut client_modified_time = None;
     let mut max_age = 300;
     let mut host = None;
 
@@ -2442,7 +2448,20 @@ async fn serve_new_file(
                     }
                 }
             }
-            &IF_MODIFIED_SINCE => client_modified_since = Some(value),
+            &IF_MODIFIED_SINCE => {
+                if let Some(time) = value.to_str().ok().and_then(http_datetime_to_systemtime) {
+                    client_modified_time = Some(time);
+                } else {
+                    warn_once_or_info!(
+                        "Rejecting invalid If-Modified-Since header from client {}",
+                        conn_details.client.ip().to_canonical()
+                    );
+                    return quick_response(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid If-Modified-Since header",
+                    );
+                }
+            }
             _ => warn_once_or_info!(
                 "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}",
                 conn_details.client.ip().to_canonical()
@@ -2450,7 +2469,7 @@ async fn serve_new_file(
         }
     }
     // mark immutable
-    let client_modified_since = client_modified_since;
+    let client_modified_time = client_modified_time;
     let max_age = max_age;
     let host = match host {
         Some(h) => h,
@@ -2557,7 +2576,7 @@ async fn serve_new_file(
                 file,
                 file_path,
                 local_creation_time.unwrap_or(local_modification_time),
-                client_modified_since,
+                client_modified_time,
             )
             .await;
         }
