@@ -150,6 +150,8 @@ impl AsRef<std::ffi::OsStr> for DomainName {
     }
 }
 
+/// Used by sqlx to convert database rows into `DomainName`.
+/// Data stored in the DB was validated before insertion.
 impl From<std::string::String> for DomainName {
     fn from(value: std::string::String) -> Self {
         Self::new(value).expect("Caller must ensure value is a valid domain")
