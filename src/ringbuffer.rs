@@ -10,7 +10,6 @@ pub(crate) struct RingBuffer<T> {
     capacity: NonZero<usize>,
 }
 
-#[expect(unused)]
 impl<T> RingBuffer<T> {
     #[must_use]
     pub(crate) fn new(capacity: NonZero<usize>) -> Self {
@@ -30,10 +29,12 @@ impl<T> RingBuffer<T> {
         debug_assert!(self.inner.len() <= self.capacity.get());
     }
 
+    #[expect(unused)]
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.inner.pop_front()
     }
 
+    #[expect(unused)]
     #[must_use]
     pub(crate) fn back_mut(&mut self) -> Option<&mut T> {
         self.inner.back_mut()
@@ -54,11 +55,13 @@ impl<T> RingBuffer<T> {
         self.inner.iter()
     }
 
+    #[expect(unused)]
     #[must_use]
     pub(crate) const fn capacity(&self) -> NonZero<usize> {
         self.capacity
     }
 
+    #[expect(unused)]
     pub(crate) fn retain(&mut self, f: impl FnMut(&T) -> bool) {
         self.inner.retain(f);
     }
