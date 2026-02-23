@@ -301,7 +301,7 @@ pub(crate) struct Config {
 
     /// Allowed mirrors for https tunneling.
     #[serde(default = "default_https_tunnel_allowed_mirrors")]
-    pub(crate) https_tunnel_allowed_mirrors: Vec<String>,
+    pub(crate) https_tunnel_allowed_mirrors: Vec<DomainName>,
 
     /// Minimum transfer rate for downloads and uploads.
     /// Connections that fail to fulfill this limit are cancelled.
@@ -518,7 +518,7 @@ fn default_https_tunnel_allowed_ports() -> Vec<NonZero<u16>> {
     DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS.to_vec()
 }
 
-const fn default_https_tunnel_allowed_mirrors() -> Vec<String> {
+const fn default_https_tunnel_allowed_mirrors() -> Vec<DomainName> {
     Vec::new()
 }
 
@@ -600,6 +600,10 @@ fn intersect<T: Ord>(a: &[T], b: &[T]) -> bool {
 pub(crate) fn is_valid_domain(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
+    if domain.is_empty() {
+        return false;
+    }
+
     for part in domain.split('.') {
         if part.is_empty() || part.len() > 64 {
             return false;
@@ -623,12 +627,22 @@ pub(crate) fn is_valid_domain(domain: &str) -> bool {
 pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
+    if domain.is_empty() {
+        return false;
+    }
+
+    let mut is_wildcard = false;
+    let mut part_count: u32 = 0;
+
     for (pos, part) in domain.split('.').enumerate() {
         if part.is_empty() || part.len() > 64 {
             return false;
         }
 
+        part_count += 1;
+
         if pos == 0 && part == "*" {
+            is_wildcard = true;
             continue;
         }
 
@@ -641,6 +655,10 @@ pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
                 return false;
             }
         }
+    }
+
+    if is_wildcard && part_count < 3 {
+        return false;
     }
 
     true
@@ -836,6 +854,9 @@ mod test {
 
         assert!(is_valid_domain("metadata.ftp-master.debian.org"));
 
+        // empty
+        assert!(!is_valid_domain(""));
+
         // double dots
         assert!(!is_valid_domain("debian..org"));
 
@@ -888,6 +909,9 @@ mod test {
 
         assert!(is_valid_config_domain("metadata.ftp-master.debian.org"));
 
+        // empty
+        assert!(!is_valid_config_domain(""));
+
         // double dots
         assert!(!is_valid_config_domain("debian..org"));
 
@@ -930,5 +954,11 @@ mod test {
         assert!(!is_valid_config_domain("*e.debian.org"));
         assert!(!is_valid_config_domain("deb.*.debian.org"));
         assert!(!is_valid_config_domain("debian.*"));
+
+        // wildcard minimum depth (must have at least 3 parts)
+        assert!(!is_valid_config_domain("*.org"));
+        assert!(!is_valid_config_domain("*.com"));
+        assert!(is_valid_config_domain("*.debian.org"));
+        assert!(is_valid_config_domain("*.ftp.debian.org"));
     }
 }

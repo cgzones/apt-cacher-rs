@@ -2992,7 +2992,7 @@ fn connect_response(
     if !cfg.https_tunnel_allowed_mirrors.is_empty()
         && cfg
             .https_tunnel_allowed_mirrors
-            .binary_search(&host)
+            .binary_search_by(|d| str::cmp(d, host.as_str()))
             .is_err()
     {
         info!(
