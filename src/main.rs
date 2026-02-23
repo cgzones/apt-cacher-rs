@@ -1037,6 +1037,7 @@ async fn serve_cached_file(
 
 #[cfg(feature = "mmap")]
 #[expect(clippy::too_many_arguments)]
+#[inline]
 async fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
@@ -1121,6 +1122,7 @@ async fn serve_cached_file_mmap(
 
 #[cfg(not(feature = "mmap"))]
 #[expect(clippy::too_many_arguments)]
+#[inline]
 async fn serve_cached_file_buf(
     conn_details: ConnectionDetails,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
