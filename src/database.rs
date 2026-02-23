@@ -25,14 +25,9 @@ pub(crate) struct Database {
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorEntry {
     pub(crate) host: DomainName,
+    /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) path: String,
-    #[expect(unused)]
-    pub(crate) first_seen: i64,
-    #[expect(unused)]
-    pub(crate) last_seen: i64,
-    #[expect(unused)]
-    pub(crate) last_cleanup: i64,
 }
 
 impl MirrorEntry {
@@ -50,6 +45,7 @@ impl MirrorEntry {
 #[derive(Debug)]
 pub(crate) struct MirrorStatEntry {
     pub(crate) host: DomainName,
+    /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) path: String,
     pub(crate) first_seen: i64,
@@ -83,6 +79,7 @@ impl MirrorStatEntry {
 #[derive(Debug)]
 pub(crate) struct OriginEntry {
     pub(crate) host: DomainName,
+    /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) mirror_path: String,
     pub(crate) distribution: String,
@@ -239,7 +236,7 @@ impl Database {
         query_as!(
             MirrorEntry,
             r#"
-              SELECT host, port AS "port: u16", path, first_seen, last_seen, last_cleanup
+              SELECT host, port AS "port: u16", path
               FROM mirrors_v2;
         "#,
         )
