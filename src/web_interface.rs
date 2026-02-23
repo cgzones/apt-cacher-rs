@@ -11,7 +11,7 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{
     Request, Response, StatusCode,
-    header::{HeaderValue, SERVER},
+    header::{CONTENT_TYPE, HeaderValue, SERVER},
 };
 use log::{debug, error, trace};
 use time::OffsetDateTime;
@@ -30,6 +30,13 @@ use crate::{APP_NAME, LOGSTORE, database::Database, error::ProxyCacheError, quic
 
 const WEBUI_DATE_FORMAT: &[FormatItem<'_>] =
     format_description!("[day] [month repr:short] [year] [hour]:[minute]:[second]");
+
+fn format_unix_timestamp(epoch: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(epoch)
+        .ok()
+        .and_then(|ts| ts.format(WEBUI_DATE_FORMAT).ok())
+        .unwrap_or_else(|| String::from("N/A"))
+}
 
 #[must_use]
 pub(crate) async fn serve_web_interface(
@@ -108,26 +115,13 @@ async fn build_mirror_table(database: &Database) -> Result<(Table, usize), Proxy
     let cache_path = &global_config().cache_directory;
 
     for mirror in mirrors {
-        let last_seen = time::OffsetDateTime::from_unix_timestamp(mirror.last_seen)
-            .expect("timestamp should be valid");
-        let last_seen_fmt = last_seen
-            .format(WEBUI_DATE_FORMAT)
-            .expect("timestamp should be formattable");
-
-        let first_seen = time::OffsetDateTime::from_unix_timestamp(mirror.first_seen)
-            .expect("timestamp should be valid");
-        let first_seen_fmt = first_seen
-            .format(WEBUI_DATE_FORMAT)
-            .expect("timestamp should be formattable");
+        let last_seen_fmt = format_unix_timestamp(mirror.last_seen);
+        let first_seen_fmt = format_unix_timestamp(mirror.first_seen);
 
         let last_cleanup_fmt = if mirror.last_cleanup == 0 {
             "never".to_string()
         } else {
-            let last_cleanup = time::OffsetDateTime::from_unix_timestamp(mirror.last_cleanup)
-                .expect("timestamp should be valid");
-            last_cleanup
-                .format(WEBUI_DATE_FORMAT)
-                .expect("timestamp should be formattable")
+            format_unix_timestamp(mirror.last_cleanup)
         };
 
         let total_download_size_fmt = format!(
@@ -215,11 +209,7 @@ async fn build_origin_table(database: &Database) -> Result<(Table, usize), Proxy
     origins.sort_unstable_by_key(|origin| -origin.last_seen);
 
     for origin in origins {
-        let last_seen = time::OffsetDateTime::from_unix_timestamp(origin.last_seen)
-            .expect("timestamp should be valid");
-        let last_seen_fmt = last_seen
-            .format(WEBUI_DATE_FORMAT)
-            .expect("timestamp should be formattable");
+        let last_seen_fmt = format_unix_timestamp(origin.last_seen);
 
         html_table_origins.add_body_row(&[
             origin.mirror_uri(),
@@ -270,7 +260,7 @@ fn build_uncacheable_table() -> (Table, usize) {
     }
 
     for (host, path) in uncacheables.iter() {
-        html_table_uncacheables.add_body_row([host.to_string(), path.to_owned()]);
+        html_table_uncacheables.add_body_row([&**host, path]);
         rows += 1;
     }
 
@@ -414,6 +404,12 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(SERVER, HeaderValue::from_static(APP_NAME))
+        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        .header("X-Content-Type-Options", "nosniff")
         .body(body)
         .expect("HTTP response is valid");
 
@@ -437,6 +433,12 @@ fn serve_logs() -> Response<ProxyCacheBody> {
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(SERVER, HeaderValue::from_static(APP_NAME))
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        .header("X-Content-Type-Options", "nosniff")
         .body(body)
         .expect("HTTP response is valid");
 
