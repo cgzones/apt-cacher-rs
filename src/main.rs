@@ -1273,18 +1273,14 @@ async fn serve_volatile_file(
         let client_modified_since = req.headers().get(IF_MODIFIED_SINCE);
         let client_modified_time = match client_modified_since {
             Some(val) => {
-                let Some(time) = val.to_str().ok().and_then(http_datetime_to_systemtime) else {
-                    warn_once_or_info!(
-                        "Rejecting invalid If-Modified-Since header from client {}",
+                let time = val.to_str().ok().and_then(http_datetime_to_systemtime);
+                if time.is_none() {
+                    debug!(
+                        "Ignoring invalid If-Modified-Since header from client {}",
                         conn_details.client.ip().to_canonical()
                     );
-                    return quick_response(
-                        StatusCode::BAD_REQUEST,
-                        "Invalid If-Modified-Since header",
-                    );
-                };
-
-                Some(time)
+                }
+                time
             }
             None => None,
         };
@@ -2467,13 +2463,9 @@ async fn serve_new_file(
                 if let Some(time) = value.to_str().ok().and_then(http_datetime_to_systemtime) {
                     client_modified_time = Some(time);
                 } else {
-                    warn_once_or_info!(
-                        "Rejecting invalid If-Modified-Since header from client {}",
+                    debug!(
+                        "Ignoring invalid If-Modified-Since header from client {}",
                         conn_details.client.ip().to_canonical()
-                    );
-                    return quick_response(
-                        StatusCode::BAD_REQUEST,
-                        "Invalid If-Modified-Since header",
                     );
                 }
             }
