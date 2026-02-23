@@ -1420,11 +1420,13 @@ impl ActiveDownloads {
             debname: debname.to_owned(),
         };
 
+        // Create channel and status before acquiring write lock to minimize lock scope
+        let (tx, rx) = tokio::sync::watch::channel(());
+        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
+
         match self.inner.write().entry(key) {
             Entry::Occupied(oentry) => (None, Arc::clone(oentry.get())),
             Entry::Vacant(ventry) => {
-                let (tx, rx) = tokio::sync::watch::channel(());
-                let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
                 ventry.insert(Arc::clone(&status));
                 (Some(tx), status)
             }
