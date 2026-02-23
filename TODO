@@ -21,6 +21,7 @@
 * RFC2612 requires bailout for HTTP/1.1 if no Host
 * test encoded newlines in URL
 * use std::hint::likely once stable
+* reject schemes not one of http or https?
 
 # Utils
 
