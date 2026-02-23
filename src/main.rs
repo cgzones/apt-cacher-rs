@@ -369,19 +369,15 @@ pub(crate) async fn request_with_retry(
                                 host: auth.host(),
                                 port: auth.port_u16(),
                             };
-                            match SCHEME_CACHE
-                                .get()
-                                .expect("Initialized in main()")
-                                .write()
-                                .entry_ref(&key)
+                            let scheme_cache = SCHEME_CACHE.get().expect("Initialized in main()");
+                            if !scheme_cache.read().contains_key(&key)
+                                && let EntryRef::Vacant(ventry) =
+                                    scheme_cache.write().entry_ref(&key)
                             {
-                                EntryRef::Occupied(_oentry) => (),
-                                EntryRef::Vacant(ventry) => {
-                                    ventry.insert(scheme);
-                                    debug!(
-                                        "Added cached {scheme} scheme for host {auth}, original scheme was {orig_scheme:?}"
-                                    );
-                                }
+                                ventry.insert(scheme);
+                                debug!(
+                                    "Added cached {scheme} scheme for host {auth}, original scheme was {orig_scheme:?}"
+                                );
                             }
                         }
                     }
