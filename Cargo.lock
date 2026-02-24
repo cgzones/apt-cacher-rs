@@ -84,6 +84,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-rustls",
  "hyper-timeout",
