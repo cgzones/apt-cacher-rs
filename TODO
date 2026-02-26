@@ -9,6 +9,7 @@
   - https://github.com/rust-lang/rust/pull/83652/files
 
 
+* support IPv6 addresses as DomainName
 * cache whether a mirror is https only and avoid initial http request?
 * proxy without caching on quota hit?
 * auto upgrade connections to https if supported by upstream repository?
