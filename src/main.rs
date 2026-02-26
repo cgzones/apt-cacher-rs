@@ -3381,7 +3381,11 @@ async fn pre_process_client_request(
                 validate!(filename, ValidateKind::Filename);
 
                 trace!(
-                    "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded architecture: `{architecture}`; Decoded filename: `{filename}`"
+                    "Decoded mirror path: `{mirror_path}`; \
+                    Decoded distribution: `{distribution}`; \
+                    Decoded component: `{component}`; \
+                    Decoded architecture: `{architecture}`; \
+                    Decoded filename: `{filename}`"
                 );
 
                 let conn_details = ConnectionDetails {
