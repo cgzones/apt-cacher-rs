@@ -25,6 +25,7 @@ use crate::ProxyCacheBody;
 use crate::RUNTIMEDETAILS;
 use crate::UNCACHEABLES;
 use crate::client_counter::connected_clients;
+use crate::get_features;
 use crate::global_config;
 use crate::{APP_NAME, LOGSTORE, database::Database, error::ProxyCacheError, quick_response};
 
@@ -320,6 +321,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
                 .with_header(3, "Program Details")
                 .with_paragraph(format!(
                     "Version:&nbsp;&nbsp;{} \
+                     <br>Features:&nbsp;&nbsp;{} \
                      <br>Start Time:&nbsp;&nbsp;{} \
                      <br>Current Time:&nbsp;&nbsp;{} \
                      <br>Uptime:&nbsp;&nbsp;{} \
@@ -330,6 +332,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
                      <br>Connected Clients:&nbsp;&nbsp;{} \
                      <br>Active Downloads:&nbsp;&nbsp;{}",
                     APP_VERSION,
+                    get_features(false).replace('\n', " "),
                     rd.start_time
                         .format(WEBUI_DATE_FORMAT)
                         .expect("timestamp should be formattable"),

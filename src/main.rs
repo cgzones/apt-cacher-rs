@@ -3962,7 +3962,9 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
-const fn get_long_version() -> &'static str {
+#[must_use]
+#[inline]
+pub(crate) const fn get_features(version: bool) -> &'static str {
     #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
     macro_rules! feature_tls {
         () => {
@@ -3991,19 +3993,23 @@ const fn get_long_version() -> &'static str {
         };
     }
 
-    concat!(
-        env!("CARGO_PKG_VERSION"),
-        "\n",
-        "TLS: ",
-        feature_tls!(),
-        "\n",
-        "MMAP: ",
-        feature_mmap!()
-    )
+    if version {
+        concat!(
+            env!("CARGO_PKG_VERSION"),
+            "\n",
+            "TLS=",
+            feature_tls!(),
+            "\n",
+            "mmap=",
+            feature_mmap!(),
+        )
+    } else {
+        concat!("TLS=", feature_tls!(), "\n", "mmap=", feature_mmap!())
+    }
 }
 
 #[derive(Parser)]
-#[command(author, version, long_version(get_long_version()), about)]
+#[command(author, version, long_version(get_features(true)), about)]
 struct Cli {
     /// Logging level
     #[arg(short, long, value_name = "SEVERITY")]
