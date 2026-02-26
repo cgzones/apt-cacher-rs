@@ -2971,6 +2971,18 @@ fn connect_response(
 ) -> Response<ProxyCacheBody> {
     let cfg = global_config();
 
+    {
+        let allowed_proxy_clients = cfg.allowed_proxy_clients.as_slice();
+        if !allowed_proxy_clients.is_empty()
+            && !allowed_proxy_clients
+                .iter()
+                .any(|ac| ac.contains(&client.ip().to_canonical()))
+        {
+            warn_once_or_info!("Unauthorized proxy client {}", client.ip().to_canonical());
+            return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
+        }
+    }
+
     if !cfg.https_tunnel_enabled {
         info!(
             "Rejecting https tunnel request for client {}",
@@ -3066,6 +3078,38 @@ fn connect_response(
     Response::new(ProxyCacheBody::Empty(Empty::new()))
 }
 
+pub(crate) fn authorize_cache_access(
+    client: &SocketAddr,
+    requested_host: String,
+) -> Result<DomainName, (http::StatusCode, &'static str)> {
+    let cfg = global_config();
+
+    let allowed_proxy_clients = cfg.allowed_proxy_clients.as_slice();
+    if !allowed_proxy_clients.is_empty()
+        && !allowed_proxy_clients
+            .iter()
+            .any(|ac| ac.contains(&client.ip().to_canonical()))
+    {
+        warn_once_or_info!("Unauthorized proxy client {}", client.ip().to_canonical());
+        return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
+    }
+
+    let requested_host = match DomainName::new(requested_host) {
+        Ok(d) => d,
+        Err(rh) => {
+            warn_once_or_info!("Unsupported host `{}`", rh.escape_debug());
+            return Err((StatusCode::BAD_REQUEST, "Unsupported host"));
+        }
+    };
+
+    if !is_host_allowed(&requested_host) {
+        warn_once_or_info!("Unauthorized host {requested_host}");
+        return Err((StatusCode::BAD_REQUEST, "Unauthorized host"));
+    }
+
+    Ok(requested_host)
+}
+
 #[inline]
 async fn pre_process_client_request_wrapper(
     client: SocketAddr,
@@ -3083,27 +3127,15 @@ async fn pre_process_client_request(
 ) -> Response<ProxyCacheBody> {
     trace!("Incoming request: {req:?}");
 
-    let gc = global_config();
+    let cfg = global_config();
 
-    if Method::CONNECT == req.method() {
-        {
-            let allowed_proxy_clients = gc.allowed_proxy_clients.as_slice();
-            if !allowed_proxy_clients.is_empty()
-                && !allowed_proxy_clients
-                    .iter()
-                    .any(|ac| ac.contains(&client.ip().to_canonical()))
-            {
-                warn_once_or_info!("Unauthorized proxy client {}", client.ip().to_canonical());
-                return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
-            }
+    match req.method() {
+        &Method::CONNECT => return connect_response(client, req),
+        &Method::GET => {}
+        m => {
+            warn_once_or_info!("Unsupported request method {m}");
+            return quick_response(hyper::StatusCode::BAD_REQUEST, "Method not supported");
         }
-
-        return connect_response(client, req);
-    }
-
-    if Method::GET != req.method() {
-        warn_once_or_info!("Unsupported request method {}", req.method());
-        return quick_response(hyper::StatusCode::BAD_REQUEST, "Method not supported");
     }
 
     let requested_host =
@@ -3111,10 +3143,10 @@ async fn pre_process_client_request(
             h.to_owned()
         } else {
             {
-                let allowed_webif_clients = gc
+                let allowed_webif_clients = cfg
                     .allowed_webif_clients
                     .as_ref()
-                    .unwrap_or(&gc.allowed_proxy_clients);
+                    .unwrap_or(&cfg.allowed_proxy_clients);
                 if !allowed_webif_clients.is_empty()
                     && !allowed_webif_clients
                         .iter()
@@ -3142,32 +3174,12 @@ async fn pre_process_client_request(
         None => None,
     };
 
-    {
-        let allowed_proxy_clients = gc.allowed_proxy_clients.as_slice();
-        if !allowed_proxy_clients.is_empty()
-            && !allowed_proxy_clients
-                .iter()
-                .any(|ac| ac.contains(&client.ip().to_canonical()))
-        {
-            warn_once_or_info!("Unauthorized proxy client {}", client.ip().to_canonical());
-            return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
-        }
-    }
-
-    let requested_host = match DomainName::new(requested_host) {
-        Ok(d) => d,
-        Err(rh) => {
-            warn_once_or_info!("Unsupported host {rh}");
-            return quick_response(hyper::StatusCode::BAD_REQUEST, "Unsupported host");
-        }
+    let requested_host = match authorize_cache_access(&client, requested_host) {
+        Ok(rh) => rh,
+        Err((status, msg)) => return quick_response(status, msg),
     };
 
-    if !is_host_allowed(&requested_host) {
-        warn_once_or_info!("Unauthorized host {requested_host}");
-        return quick_response(hyper::StatusCode::BAD_REQUEST, "Unauthorized host");
-    }
-
-    let aliased_host = gc
+    let aliased_host = cfg
         .aliases
         .iter()
         .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())
