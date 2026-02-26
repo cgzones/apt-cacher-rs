@@ -3573,46 +3573,6 @@ async fn pre_process_client_request(
     response
 }
 
-#[must_use]
-fn is_iokind(err: &hyper::Error, kind: std::io::ErrorKind) -> bool {
-    if let Some(err) = std::error::Error::source(&err)
-        && let Some(ioerr) = err.downcast_ref::<std::io::Error>()
-        && ioerr.kind() == kind
-    {
-        return true;
-    }
-
-    false
-}
-
-#[must_use]
-fn is_connection_reset(err: &hyper::Error) -> bool {
-    is_iokind(err, std::io::ErrorKind::ConnectionReset)
-}
-
-#[must_use]
-fn is_shutdown_disconnect(err: &hyper::Error) -> bool {
-    is_iokind(err, std::io::ErrorKind::NotConnected)
-}
-
-#[must_use]
-fn is_broken_pipe(err: &hyper::Error) -> bool {
-    is_iokind(err, std::io::ErrorKind::BrokenPipe)
-}
-
-#[must_use]
-fn is_timeout(err: &hyper::Error) -> Option<&ProxyCacheError> {
-    let pe = err.source()?.downcast_ref::<ProxyCacheError>()?;
-
-    if matches!(pe, ProxyCacheError::ClientDownloadRate(_))
-        || matches!(pe, ProxyCacheError::MirrorDownloadRate(_))
-    {
-        Some(pe)
-    } else {
-        None
-    }
-}
-
 mod client_counter {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3917,51 +3877,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let appstate = appstate.clone();
         tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |req| {
-                        pre_process_client_request_wrapper(client, req, appstate.clone())
-                    }),
-                )
-                .with_upgrades()
-                .await
-            {
-                if err.is_incomplete_message() || is_connection_reset(&err) {
-                    info!(
-                        "Connection to client {} cancelled",
-                        client.ip().to_canonical()
-                    );
-                } else if is_shutdown_disconnect(&err) {
-                    info!(
-                        "Improper connection shutdown for client {}:  {err}",
-                        client.ip().to_canonical()
-                    );
-                } else if is_broken_pipe(&err) {
-                    info!(
-                        "Broken pipe for client {}:  {err}",
-                        client.ip().to_canonical()
-                    );
-                } else if let Some(perr) = is_timeout(&err) {
-                    info!("{perr}");
-                } else {
-                    error!(
-                        "Error serving connection for client {}:  {err} -- {err:?}",
-                        client.ip().to_canonical()
-                    );
-                    let mut lerr: &dyn Error = &err;
-                    loop {
-                        lerr = match lerr.source() {
-                            Some(e) => e,
-                            None => break,
-                        };
-                        error!(
-                            "Error serving connection for client {}:  {lerr} -- {lerr:?}",
-                            client.ip().to_canonical()
-                        );
-                    }
-                }
-            }
+            handle_hyper_connection(stream, client, appstate).await;
 
             drop(client_counter);
 
@@ -4017,6 +3933,101 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
         )
     } else {
         concat!("TLS=", feature_tls!(), "\n", "mmap=", feature_mmap!())
+    }
+}
+
+pub(crate) async fn handle_hyper_connection<T>(stream: T, client: SocketAddr, appstate: AppState)
+where
+    T: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + std::marker::Unpin
+        + std::marker::Send
+        + 'static,
+{
+    #[must_use]
+    fn is_iokind(err: &hyper::Error, kind: std::io::ErrorKind) -> bool {
+        if let Some(err) = std::error::Error::source(&err)
+            && let Some(ioerr) = err.downcast_ref::<std::io::Error>()
+            && ioerr.kind() == kind
+        {
+            return true;
+        }
+
+        false
+    }
+
+    #[must_use]
+    fn is_connection_reset(err: &hyper::Error) -> bool {
+        is_iokind(err, std::io::ErrorKind::ConnectionReset)
+    }
+
+    #[must_use]
+    fn is_shutdown_disconnect(err: &hyper::Error) -> bool {
+        is_iokind(err, std::io::ErrorKind::NotConnected)
+    }
+
+    #[must_use]
+    fn is_broken_pipe(err: &hyper::Error) -> bool {
+        is_iokind(err, std::io::ErrorKind::BrokenPipe)
+    }
+
+    #[must_use]
+    fn is_timeout(err: &hyper::Error) -> Option<&ProxyCacheError> {
+        let pe = err.source()?.downcast_ref::<ProxyCacheError>()?;
+
+        if matches!(pe, ProxyCacheError::ClientDownloadRate(_))
+            || matches!(pe, ProxyCacheError::MirrorDownloadRate(_))
+        {
+            Some(pe)
+        } else {
+            None
+        }
+    }
+
+    if let Err(err) = http1::Builder::new()
+        .serve_connection(
+            TokioIo::new(stream),
+            service_fn(move |req| {
+                pre_process_client_request_wrapper(client, req, appstate.clone())
+            }),
+        )
+        .with_upgrades()
+        .await
+    {
+        if err.is_incomplete_message() || is_connection_reset(&err) {
+            info!(
+                "Connection to client {} cancelled",
+                client.ip().to_canonical()
+            );
+        } else if is_shutdown_disconnect(&err) {
+            info!(
+                "Improper connection shutdown for client {}:  {err}",
+                client.ip().to_canonical()
+            );
+        } else if is_broken_pipe(&err) {
+            info!(
+                "Broken pipe for client {}:  {err}",
+                client.ip().to_canonical()
+            );
+        } else if let Some(perr) = is_timeout(&err) {
+            info!("{perr}");
+        } else {
+            error!(
+                "Error serving connection for client {}:  {err} -- {err:?}",
+                client.ip().to_canonical()
+            );
+            let mut lerr: &dyn Error = &err;
+            loop {
+                lerr = match lerr.source() {
+                    Some(e) => e,
+                    None => break,
+                };
+                error!(
+                    "Error serving connection for client {}:  {lerr} -- {lerr:?}",
+                    client.ip().to_canonical()
+                );
+            }
+        }
     }
 }
 
