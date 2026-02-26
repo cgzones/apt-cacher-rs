@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "mmap"), forbid(unsafe_code))]
-#![allow(clippy::needless_continue, clippy::too_many_lines)]
+#![allow(clippy::too_many_lines)]
 
 #[cfg(not(any(feature = "tls_hyper", feature = "tls_rustls")))]
 compile_error!("Either feature \"tls_hyper\" or \"tls_rustls\" must be enabled for this crate.");
@@ -152,6 +152,9 @@ use crate::task_cleanup::task_cleanup;
 use crate::task_setup::task_setup;
 use crate::web_interface::serve_web_interface;
 
+// TODO: replace usages with ! once stable
+enum Never {}
+
 #[expect(clippy::cast_possible_truncation)]
 const _: () = assert!(
     ((usize::MAX as u64) as usize) == usize::MAX,
@@ -191,7 +194,7 @@ async fn tokio_mkstemp(
 
         assert!(buf.set_extension(s));
 
-        match tokio::fs::File::options()
+        let _: Never = match tokio::fs::File::options()
             .create_new(true)
             .write(true)
             .mode(mode)
@@ -208,7 +211,7 @@ async fn tokio_mkstemp(
                 continue;
             }
             Err(err) => return Err(err),
-        }
+        };
     }
 }
 
@@ -351,7 +354,7 @@ pub(crate) async fn request_with_retry(
         loop {
             let req_clone = Request::from_parts(parts.clone(), Empty::new());
 
-            match client.request(req_clone).await {
+            let _: Never = match client.request(req_clone).await {
                 Ok(response) => {
                     if cached_scheme.is_none()
                         && let Some(auth) = parts.uri.authority()
@@ -453,7 +456,7 @@ pub(crate) async fn request_with_retry(
 
                     continue;
                 }
-            }
+            };
         }
     }
 
@@ -1891,7 +1894,7 @@ async fn serve_unfinished_file(
             if let Err(_err) = receiver.changed().await {
                 /* sender closed, either download finished or aborted */
                 let st = status.read().await;
-                match *st {
+                let _: Never = match *st {
                     ActiveDownloadStatus::Finished(_) => {
                         finished = true;
                         continue;
@@ -1927,7 +1930,7 @@ async fn serve_unfinished_file(
 
                         return;
                     }
-                }
+                };
             }
         }
 
