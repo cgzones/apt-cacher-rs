@@ -769,7 +769,7 @@ impl Config {
         /* Alias validation */
         {
             for alias in &mut self.aliases {
-                alias.aliases.sort();
+                alias.aliases.sort_unstable();
             }
 
             for (pos, alias) in self.aliases.iter().enumerate() {
@@ -786,9 +786,9 @@ impl Config {
             }
         }
 
-        self.allowed_mirrors.sort();
-        self.https_tunnel_allowed_ports.sort();
-        self.https_tunnel_allowed_mirrors.sort();
+        self.allowed_mirrors.sort_unstable();
+        self.https_tunnel_allowed_ports.sort_unstable();
+        self.https_tunnel_allowed_mirrors.sort_unstable();
 
         Ok(())
     }

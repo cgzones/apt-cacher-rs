@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -111,7 +112,7 @@ async fn build_mirror_table(database: &Database) -> Result<(Table, usize), Proxy
         return Ok((Table::new(), 0));
     }
 
-    mirrors.sort_unstable_by_key(|mirror| -mirror.last_seen);
+    mirrors.sort_unstable_by_key(|mirror| Reverse(mirror.last_seen));
 
     let cache_path = &global_config().cache_directory;
 
@@ -207,7 +208,7 @@ async fn build_origin_table(database: &Database) -> Result<(Table, usize), Proxy
         return Ok((Table::new(), 0));
     }
 
-    origins.sort_unstable_by_key(|origin| -origin.last_seen);
+    origins.sort_unstable_by_key(|origin| Reverse(origin.last_seen));
 
     for origin in origins {
         let last_seen_fmt = format_unix_timestamp(origin.last_seen);
