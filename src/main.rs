@@ -1214,6 +1214,10 @@ fn serve_cached_file_response(
         )
         .header(ACCEPT_RANGES, HeaderValue::from_static("bytes"))
         .header(SERVER, HeaderValue::from_static(APP_NAME))
+        .header(
+            AGE,
+            HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
+        )
         .body(body)
         .expect("HTTP response is valid");
 
@@ -2288,7 +2292,7 @@ async fn serve_cached_file_modified_since(
             .header(
                 AGE,
                 HeaderValue::from(local_creation_time.elapsed().map_or(0, |dur| dur.as_secs())),
-            ) // TODO: send AGE in other branches as well
+            )
             .body(ProxyCacheBody::Empty(Empty::new()))
             .expect("HTTP response is valid");
 
