@@ -968,6 +968,36 @@ async fn serve_cached_file(
             .expect("Platform should support modification timestamps via setup check")
     });
 
+    // Handle If-Modified-Since
+    if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE)
+        && let Some(ims_str) = ims.to_str().ok()
+        && let Some(ims_time) = http_datetime_to_systemtime(ims_str)
+        && last_modified <= ims_time
+    {
+        info!(
+            "Serving 304 Not Modified for cached file {} from mirror {}{} for client {}",
+            conn_details.debname,
+            conn_details.mirror,
+            aliased,
+            conn_details.client.ip().to_canonical()
+        );
+
+        let response = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(SERVER, APP_NAME)
+            .header(CONNECTION, "keep-alive")
+            .header(
+                AGE,
+                HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
+            )
+            .body(ProxyCacheBody::Empty(Empty::new()))
+            .expect("HTTP response is valid");
+
+        trace!("Outgoing response: {response:?}");
+
+        return response;
+    }
+
     let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
         req.headers().get(RANGE).and_then(|val| val.to_str().ok())
         && let Some((content_range, start, content_length)) = http_parse_range(
