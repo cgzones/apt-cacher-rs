@@ -25,6 +25,7 @@ use crate::HumanFmt;
 use crate::ProxyCacheBody;
 use crate::RUNTIMEDETAILS;
 use crate::UNCACHEABLES;
+use crate::client_counter::active_client_downloads;
 use crate::client_counter::connected_clients;
 use crate::get_features;
 use crate::global_config;
@@ -310,7 +311,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
         }
     };
 
-    let active_downloads = appstate.active_downloads.len();
+    let active_mirror_downloads = appstate.active_downloads.len();
 
     let now = OffsetDateTime::now_utc();
     let memory_stats = memory_stats::memory_stats();
@@ -331,7 +332,8 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
                      <br>Database Size:&nbsp;&nbsp;{} \
                      <br>Memory Usage:&nbsp;&nbsp;{}&nbsp;&nbsp;({}) \
                      <br>Connected Clients:&nbsp;&nbsp;{} \
-                     <br>Active Downloads:&nbsp;&nbsp;{}",
+                     <br>Active Mirror Downloads:&nbsp;&nbsp;{} \
+                     <br>Active Client Downloads:&nbsp;&nbsp;{}",
                     APP_VERSION,
                     get_features(false).replace('\n', " "),
                     rd.start_time
@@ -352,7 +354,8 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
                         |ms| HumanFmt::Size(ms.virtual_mem as u64).to_string()
                     ),
                     connected_clients(),
-                    active_downloads
+                    active_mirror_downloads,
+                    active_client_downloads()
                 ))
                 .with_link(
                     "/logs",

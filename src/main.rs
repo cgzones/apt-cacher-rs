@@ -528,6 +528,7 @@ struct DeliveryStreamBody<S> {
     database_tx: Option<tokio::sync::mpsc::Sender<DatabaseCommand>>,
     conn_details: Option<ConnectionDetails>,
     error: Option<String>,
+    _counter: client_counter::ClientDownload,
 }
 
 #[cfg(not(feature = "mmap"))]
@@ -549,6 +550,7 @@ impl<S> DeliveryStreamBody<S> {
             database_tx: Some(database_tx),
             conn_details: Some(conn_details),
             error: None,
+            _counter: client_counter::ClientDownload::new(),
         }
     }
 }
@@ -779,6 +781,7 @@ struct MmapBody {
     start: Instant,
     database_tx: Option<tokio::sync::mpsc::Sender<DatabaseCommand>>,
     conn_details: Option<ConnectionDetails>,
+    _counter: client_counter::ClientDownload,
 }
 
 #[cfg(feature = "mmap")]
@@ -799,6 +802,7 @@ impl MmapBody {
             start: Instant::now(),
             database_tx: Some(database_tx),
             conn_details: Some(conn_details),
+            _counter: client_counter::ClientDownload::new(),
         }
     }
 }
@@ -1890,6 +1894,8 @@ async fn serve_unfinished_file(
             conn_details.client.ip().to_canonical()
         );
 
+        let counter = client_counter::ClientDownload::new();
+
         let mut finished = false;
         let mut bytes = 0;
         let buf_size = global_config().buffer_size;
@@ -1971,6 +1977,7 @@ async fn serve_unfinished_file(
         drop(receiver);
         drop(status);
         drop(tx);
+        drop(counter);
 
         let elapsed = start.elapsed();
         info!(
@@ -3614,6 +3621,7 @@ mod client_counter {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+    static CLIENT_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
 
     #[must_use]
     pub(crate) fn connected_clients() -> usize {
@@ -3634,6 +3642,29 @@ mod client_counter {
     impl Drop for ClientCounter {
         fn drop(&mut self) {
             CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn active_client_downloads() -> usize {
+        CLIENT_DOWNLOADS.load(Ordering::Relaxed)
+    }
+
+    #[derive(Debug)]
+    pub(super) struct ClientDownload {
+        _private: (),
+    }
+
+    impl ClientDownload {
+        pub(super) fn new() -> Self {
+            CLIENT_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+            Self { _private: () }
+        }
+    }
+
+    impl Drop for ClientDownload {
+        fn drop(&mut self) {
+            CLIENT_DOWNLOADS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
