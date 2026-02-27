@@ -12,7 +12,7 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{
     Request, Response, StatusCode,
-    header::{CONTENT_TYPE, HeaderValue, SERVER},
+    header::{CONNECTION, CONTENT_TYPE, SERVER},
 };
 use log::{debug, error, trace};
 use time::OffsetDateTime;
@@ -410,7 +410,8 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
 
     let response = Response::builder()
         .status(StatusCode::OK)
-        .header(SERVER, HeaderValue::from_static(APP_NAME))
+        .header(SERVER, APP_NAME)
+        .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
         .header(
             "Content-Security-Policy",
@@ -439,7 +440,8 @@ fn serve_logs() -> Response<ProxyCacheBody> {
 
     let response = Response::builder()
         .status(StatusCode::OK)
-        .header(SERVER, HeaderValue::from_static(APP_NAME))
+        .header(SERVER, APP_NAME)
+        .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(
             "Content-Security-Policy",
