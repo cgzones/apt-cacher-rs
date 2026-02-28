@@ -507,8 +507,9 @@ fn quick_response<T: Into<bytes::Bytes>>(
 ) -> Response<ProxyCacheBody> {
     Response::builder()
         .status(status)
-        .header(SERVER, HeaderValue::from_static(APP_NAME))
-        .header(CONNECTION, HeaderValue::from_static("keep-alive"))
+        .header(SERVER, APP_NAME)
+        .header(CONNECTION, "keep-alive")
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(ProxyCacheBody::Full(Full::new(message.into())))
         .expect("Response is valid")
 }
@@ -1231,19 +1232,16 @@ fn serve_cached_file_response(
 
     let mut response = Response::builder()
         .status(http_status)
-        .header(CONNECTION, HeaderValue::from_static("keep-alive"))
+        .header(SERVER, APP_NAME)
+        .header(CONNECTION, "keep-alive")
         .header(CONTENT_LENGTH, HeaderValue::from(content_length))
-        .header(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.debian.binary-package"),
-        )
+        .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
         .header(
             LAST_MODIFIED,
             HeaderValue::try_from(systemtime_to_http_datetime(last_modified))
                 .expect("date string is valid"),
         )
-        .header(ACCEPT_RANGES, HeaderValue::from_static("bytes"))
-        .header(SERVER, HeaderValue::from_static(APP_NAME))
+        .header(ACCEPT_RANGES, "bytes")
         .header(
             AGE,
             HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
@@ -2001,17 +1999,18 @@ async fn serve_unfinished_file(
 
     let mut response_builder = Response::builder()
         .status(StatusCode::OK)
-        .header(CONNECTION, HeaderValue::from_static("keep-alive"))
-        .header(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.debian.binary-package"),
-        )
-        .header(ACCEPT_RANGES, HeaderValue::from_static("bytes"))
-        .header(SERVER, HeaderValue::from_static(APP_NAME))
+        .header(SERVER, APP_NAME)
+        .header(CONNECTION, "keep-alive")
+        .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
+        .header(ACCEPT_RANGES, "bytes")
         .header(
             LAST_MODIFIED,
             HeaderValue::try_from(systemtime_to_http_datetime(last_modified))
                 .expect("Http datetime is valid"),
+        )
+        .header(
+            AGE,
+            HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
         );
     if let ContentLength::Exact(size) = content_length {
         let r = response_builder
@@ -2312,13 +2311,8 @@ async fn serve_cached_file_modified_since(
 
         let response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
-            .header(CONNECTION, HeaderValue::from_static("keep-alive"))
-            .header(SERVER, HeaderValue::from_static(APP_NAME))
-            // .header(
-            //     CACHE_CONTROL,
-            //     HeaderValue::try_from(format!("public, max-age={max_age}"))
-            //         .expect("string is valid"),
-            // ) // TODO: send CACHE_CONTROL in other branches as well
+            .header(SERVER, APP_NAME)
+            .header(CONNECTION, "keep-alive")
             .header(
                 AGE,
                 HeaderValue::from(local_creation_time.elapsed().map_or(0, |dur| dur.as_secs())),
@@ -2408,7 +2402,7 @@ async fn serve_new_file(
         let mut request = Request::builder()
             .method(Method::GET)
             .uri(uri)
-            .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
+            .header(USER_AGENT, APP_USER_AGENT)
             .header(HOST, host)
             .body(Empty::new())
             .expect("request should be valid");
@@ -2870,8 +2864,8 @@ async fn serve_new_file(
 
             let mut response = Response::builder()
                 .status(gcfg.experimental_parallel_hack_statuscode)
-                .header(SERVER, HeaderValue::from_static(APP_NAME))
-                .header(CONNECTION, HeaderValue::from_static("keep-alive"))
+                .header(SERVER, APP_NAME)
+                .header(CONNECTION, "keep-alive")
                 .body(ProxyCacheBody::Empty(Empty::new()))
                 .expect("Response is valid");
 
@@ -3112,7 +3106,14 @@ fn connect_response(
         }
     });
 
-    Response::new(ProxyCacheBody::Empty(Empty::new()))
+    let response = Response::builder()
+        .header(SERVER, APP_NAME)
+        .body(ProxyCacheBody::Empty(Empty::new()))
+        .expect("HTTP response is valid");
+
+    trace!("Outgoing response: {response:?}");
+
+    response
 }
 
 pub(crate) fn authorize_cache_access(
@@ -3792,7 +3793,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let request = Request::builder()
                             .method(Method::HEAD)
                             .uri(uri)
-                            .header(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT))
+                            .header(USER_AGENT, APP_USER_AGENT)
                             .body(Empty::new())
                             .expect("Valid request");
 
