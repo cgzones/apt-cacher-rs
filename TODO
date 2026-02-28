@@ -1,8 +1,10 @@
 # TODO
 
-* Use sendfile(2) to deliver cached files.
-  Requires either a hyper overhaul, since the behavior of sendfile(2) does not
-  work with the trait Body used everywhere, or writing the HTTP server by hand.
+* ~~Use sendfile(2) to deliver cached files.~~ (Implemented as the `sendfile` feature.)
+  Enable with `--features sendfile`. When enabled, permanently cached .deb files
+  are served using sendfile(2), bypassing hyper's Body abstraction entirely.
+  Requests not applicable for sendfile (volatile files, active downloads,
+  web interface, proxy pass-through) fall back to the standard hyper-based handler.
 
 * ipnet parser updates:
   - https://github.com/krisprice/ipnet/issues/32

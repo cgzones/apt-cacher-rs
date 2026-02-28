@@ -1,4 +1,4 @@
-#![cfg_attr(not(feature = "mmap"), forbid(unsafe_code))]
+#![cfg_attr(not(any(feature = "mmap", feature = "sendfile")), forbid(unsafe_code))]
 #![allow(clippy::too_many_lines)]
 
 #[cfg(not(any(feature = "tls_hyper", feature = "tls_rustls")))]
@@ -23,6 +23,8 @@ mod log_once;
 mod logstore;
 mod rate_checked_body;
 mod ringbuffer;
+#[cfg(feature = "sendfile")]
+mod sendfile_conn;
 mod task_cache_scan;
 mod task_cleanup;
 mod task_setup;
@@ -166,7 +168,7 @@ type Client = hyper_util::client::legacy::Client<
     Empty<bytes::Bytes>,
 >;
 
-const APP_NAME: &str = env!("CARGO_PKG_NAME");
+pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
@@ -1267,11 +1269,11 @@ fn serve_cached_file_response(
 }
 
 #[derive(Clone)]
-struct AppState {
-    database: Database,
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
-    https_client: Client,
-    active_downloads: ActiveDownloads,
+pub(crate) struct AppState {
+    pub(crate) database: Database,
+    pub(crate) database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
+    pub(crate) https_client: Client,
+    pub(crate) active_downloads: ActiveDownloads,
 }
 
 #[must_use]
@@ -1367,24 +1369,24 @@ async fn serve_volatile_file(
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum CachedFlavor {
+pub(crate) enum CachedFlavor {
     Permanent,
     Volatile,
 }
 
 #[derive(Clone, Debug)]
-struct ConnectionDetails {
-    client: SocketAddr,
-    mirror: Mirror,
-    aliased_host: Option<&'static DomainName>,
-    debname: String,
-    cached_flavor: CachedFlavor,
-    subdir: Option<&'static Path>,
+pub(crate) struct ConnectionDetails {
+    pub(crate) client: SocketAddr,
+    pub(crate) mirror: Mirror,
+    pub(crate) aliased_host: Option<&'static DomainName>,
+    pub(crate) debname: String,
+    pub(crate) cached_flavor: CachedFlavor,
+    pub(crate) subdir: Option<&'static Path>,
 }
 
 impl ConnectionDetails {
     #[must_use]
-    fn cache_dir_path(&self) -> PathBuf {
+    pub(crate) fn cache_dir_path(&self) -> PathBuf {
         let root = &global_config().cache_directory;
 
         let host = self.aliased_host.unwrap_or(&self.mirror.host);
@@ -1438,7 +1440,7 @@ enum ActiveDownloadStatus {
 }
 
 #[derive(Clone)]
-struct ActiveDownloads {
+pub(crate) struct ActiveDownloads {
     inner: Arc<
         parking_lot::RwLock<
             HashMap<ActiveDownloadKey, Arc<tokio::sync::RwLock<ActiveDownloadStatus>>>,
@@ -1493,6 +1495,14 @@ impl ActiveDownloads {
         let key = ActiveDownloadKeyRef { mirror, debname };
         let was_present = self.inner.write().remove(&key);
         assert!(was_present.is_some());
+    }
+
+    /// Check if a download for the given mirror and debname is active.
+    #[cfg(feature = "sendfile")]
+    #[must_use]
+    pub(crate) fn contains(&self, mirror: &Mirror, debname: &str) -> bool {
+        let key = ActiveDownloadKeyRef { mirror, debname };
+        self.inner.read().contains_key(&key)
     }
 
     #[must_use]
@@ -3945,6 +3955,10 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let appstate = appstate.clone();
         tokio::task::spawn(async move {
+            #[cfg(feature = "sendfile")]
+            sendfile_conn::handle_sendfile_connection(stream, client, appstate).await;
+
+            #[cfg(not(feature = "sendfile"))]
             handle_hyper_connection(stream, client, appstate).await;
 
             drop(client_counter);
@@ -3989,6 +4003,20 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
         };
     }
 
+    #[cfg(feature = "sendfile")]
+    macro_rules! feature_sendfile {
+        () => {
+            "true"
+        };
+    }
+
+    #[cfg(not(feature = "sendfile"))]
+    macro_rules! feature_sendfile {
+        () => {
+            "false"
+        };
+    }
+
     if version {
         concat!(
             env!("CARGO_PKG_VERSION"),
@@ -3998,9 +4026,21 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
             "\n",
             "mmap=",
             feature_mmap!(),
+            "\n",
+            "sendfile=",
+            feature_sendfile!(),
         )
     } else {
-        concat!("TLS=", feature_tls!(), "\n", "mmap=", feature_mmap!())
+        concat!(
+            "TLS=",
+            feature_tls!(),
+            "\n",
+            "mmap=",
+            feature_mmap!(),
+            "\n",
+            "sendfile=",
+            feature_sendfile!(),
+        )
     }
 }
 
@@ -4135,7 +4175,7 @@ static UNCACHEABLES: OnceLock<parking_lot::RwLock<RingBuffer<(DomainName, String
 
 #[must_use]
 #[inline]
-fn global_config() -> &'static Config {
+pub(crate) fn global_config() -> &'static Config {
     &RUNTIMEDETAILS
         .get()
         .expect("Global was initialized in main()")

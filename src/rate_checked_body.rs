@@ -7,7 +7,7 @@ use log::debug;
 use crate::{HumanFmt, ProxyCacheError, nonzero, ringbuffer::SumRingBuffer};
 
 #[derive(Debug)]
-struct RateChecker {
+pub(crate) struct RateChecker {
     buf: SumRingBuffer<usize>,
     last: Instant,
     min_download_rate: NonZero<usize>,
@@ -17,7 +17,7 @@ impl RateChecker {
     const RATE_CHECK_TIME_SLOTS: NonZero<usize> = nonzero!(30); /* 30 seconds */
 
     #[must_use]
-    fn new(min_download_rate: NonZero<usize>) -> Self {
+    pub(crate) fn new(min_download_rate: NonZero<usize>) -> Self {
         Self {
             buf: SumRingBuffer::new(Self::RATE_CHECK_TIME_SLOTS),
             last: Instant::now(),
@@ -25,7 +25,7 @@ impl RateChecker {
         }
     }
 
-    fn add(&mut self, len: usize) {
+    pub(crate) fn add(&mut self, len: usize) {
         let elapsed = self.last.elapsed();
         let elapsed_secs = elapsed.as_secs();
         if elapsed_secs >= 1 {
@@ -51,7 +51,7 @@ impl RateChecker {
     }
 
     #[must_use]
-    fn check_fail(&self) -> Option<DownloadRateError> {
+    pub(crate) fn check_fail(&self) -> Option<DownloadRateError> {
         if self.buf.is_full() {
             let total = self.buf.sum();
             if total / Self::RATE_CHECK_TIME_SLOTS < self.min_download_rate.get() {
