@@ -3293,14 +3293,13 @@ async fn pre_process_client_request(
                 mirror_path,
                 filename,
             } => {
+                validate!(mirror_path, ValidateKind::MirrorPath);
+                validate!(filename, ValidateKind::Filename);
+
                 // TODO: cache .dsc?
-                #[expect(clippy::case_sensitive_file_extension_comparisons)]
                 let is_deb = filename.ends_with(".deb");
 
                 if is_deb {
-                    validate!(mirror_path, ValidateKind::MirrorPath);
-                    validate!(filename, ValidateKind::Filename);
-
                     trace!("Decoded mirror path: `{mirror_path}`; Decoded filename: `{filename}`");
 
                     let conn_details = ConnectionDetails {
