@@ -2582,7 +2582,9 @@ async fn serve_new_file(
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
-        if let Some(moved_host) = moved_uri.host()
+        if moved_uri.scheme().is_some_and(|scheme| {
+            *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
+        }) && let Some(moved_host) = moved_uri.host()
             && is_host_allowed(moved_host)
         {
             req_uri = std::borrow::Cow::Owned(moved_uri);
@@ -3202,6 +3204,15 @@ async fn pre_process_client_request(
         }
     }
 
+    // Proxy GET requests always use http://, HTTPS goes through CONNECT.
+    // Reject any other scheme (e.g. ftp://, file://).
+    if let Some(scheme) = req.uri().scheme()
+        && *scheme != http::uri::Scheme::HTTP
+    {
+        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}");
+        return quick_response(hyper::StatusCode::BAD_REQUEST, "Unsupported URI scheme");
+    }
+
     let requested_host =
         if let Some(h) = req.uri().authority().map(hyper::http::uri::Authority::host) {
             h.to_owned()
@@ -3603,7 +3614,10 @@ async fn pre_process_client_request(
             parts_cloned.uri
         );
 
-        if moved_uri.host().is_some_and(is_host_allowed) {
+        if moved_uri.scheme().is_some_and(|scheme| {
+            *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
+        }) && moved_uri.host().is_some_and(is_host_allowed)
+        {
             parts_cloned.uri = moved_uri;
             let redirected_request = Request::from_parts(parts_cloned, Empty::new());
 
