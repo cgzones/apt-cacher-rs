@@ -42,7 +42,7 @@ impl ChannelBody {
 
 impl Body for ChannelBody {
     type Data = bytes::Bytes;
-    type Error = ProxyCacheError;
+    type Error = Box<ProxyCacheError>;
 
     fn size_hint(&self) -> hyper::body::SizeHint {
         // TODO: derive Copy for hyper::body::SizeHint
@@ -74,10 +74,10 @@ impl Body for ChannelBody {
 
                     match (self.remaining.exact(), self.remaining.upper()) {
                         (Some(size), _) => match size.overflowing_sub(datalen) {
-                            (_, true) => Err(ProxyCacheError::ContentTooLarge(
+                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge(
                                 self.content_length,
                                 self.received + datalen,
-                            )),
+                            ))),
                             (val, false) => {
                                 self.received += datalen;
                                 self.remaining.set_exact(val);
@@ -85,10 +85,10 @@ impl Body for ChannelBody {
                             }
                         },
                         (None, Some(size)) => match size.overflowing_sub(datalen) {
-                            (_, true) => Err(ProxyCacheError::ContentTooLarge(
+                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge(
                                 self.content_length,
                                 self.received + datalen,
-                            )),
+                            ))),
                             (val, false) => {
                                 self.received += datalen;
                                 self.remaining.set_upper(val);
@@ -100,7 +100,7 @@ impl Body for ChannelBody {
                         }
                     }
                 }
-                Err(err) => Err(err.into()),
+                Err(err) => Err(Box::new(err.into())),
             })
         })
     }

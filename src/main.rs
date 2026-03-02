@@ -666,7 +666,7 @@ enum ProxyCacheBody {
     Mmap(#[pin] MmapBody),
     #[cfg(feature = "mmap")]
     MmapRateChecked(#[pin] RateCheckedBody<MmapData>, IpAddr),
-    Boxed(#[pin] BoxBody<bytes::Bytes, ProxyCacheError>),
+    Boxed(#[pin] BoxBody<bytes::Bytes, Box<ProxyCacheError>>),
     Full(#[pin] Full<bytes::Bytes>),
     Empty(#[pin] Empty<bytes::Bytes>),
 }
@@ -674,7 +674,7 @@ enum ProxyCacheBody {
 impl Body for ProxyCacheBody {
     type Data = ProxyCacheBodyData;
 
-    type Error = ProxyCacheError;
+    type Error = Box<ProxyCacheError>;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -690,15 +690,18 @@ impl Body for ProxyCacheBody {
             EnumProj::MmapRateChecked(memory_map, client_ip) => memory_map
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
-                .map_err(|rerr| match rerr {
-                    RateCheckedBodyErr::DownloadRate(download_rate_err) => {
-                        ProxyCacheError::ClientDownloadRate(error::ClientDownloadRate {
-                            download_rate_err,
-                            client_ip: *client_ip,
-                        })
-                    }
-                    RateCheckedBodyErr::Hyper(herr) => ProxyCacheError::Hyper(herr),
-                    RateCheckedBodyErr::ProxyCache(perr) => perr,
+                .map_err(|rerr| {
+                    let e = match *rerr {
+                        RateCheckedBodyErr::DownloadRate(download_rate_err) => {
+                            ProxyCacheError::ClientDownloadRate(error::ClientDownloadRate {
+                                download_rate_err,
+                                client_ip: *client_ip,
+                            })
+                        }
+                        RateCheckedBodyErr::Hyper(herr) => ProxyCacheError::Hyper(herr),
+                        RateCheckedBodyErr::ProxyCache(perr) => perr,
+                    };
+                    Box::new(e)
                 }),
             EnumProj::Boxed(bytes) => bytes
                 .poll_frame(cx)
@@ -1191,7 +1194,11 @@ async fn serve_cached_file_buf(
         database_tx,
         conn_details,
     );
-    let body = ProxyCacheBody::Boxed(delivery_body.map_err(ProxyCacheError::Io).boxed());
+    let body = ProxyCacheBody::Boxed(
+        delivery_body
+            .map_err(|err| Box::new(ProxyCacheError::Io(err)))
+            .boxed(),
+    );
 
     serve_cached_file_response(
         http_status,
@@ -1634,17 +1641,17 @@ async fn download_file(
 
     let mut body = match global_config().min_download_rate {
         Some(rate) => BoxBody::new(RateCheckedBody::new(
-            body.map_err(RateCheckedBodyErr::Hyper),
+            body.map_err(|err| Box::new(RateCheckedBodyErr::Hyper(err))),
             rate,
         )),
-        None => BoxBody::new(body.map_err(RateCheckedBodyErr::Hyper)),
+        None => BoxBody::new(body.map_err(|err| Box::new(RateCheckedBodyErr::Hyper(err)))),
     };
 
     while let Some(next) = body.frame().await {
         let frame = match next {
             Ok(f) => f,
             Err(err) => {
-                match err {
+                match *err {
                     RateCheckedBodyErr::DownloadRate(download_rate_err) => {
                         dbarrier
                             .abort(AbortReason::MirrorDownloadRate(error::MirrorDownloadRate {
@@ -2029,20 +2036,23 @@ async fn serve_unfinished_file(
     let response = match global_config().min_download_rate {
         Some(min_download_rate) => {
             let checked_channel_body = RateCheckedBody::new(
-                channel_body.map_err(RateCheckedBodyErr::ProxyCache),
+                channel_body.map_err(|err| Box::new(RateCheckedBodyErr::ProxyCache(*err))),
                 min_download_rate,
             );
             response_builder
                 .body(ProxyCacheBody::Boxed(BoxBody::new(
-                    checked_channel_body.map_err(move |rerr| match rerr {
-                        RateCheckedBodyErr::DownloadRate(download_rate_err) => {
-                            ProxyCacheError::ClientDownloadRate(error::ClientDownloadRate {
-                                download_rate_err,
-                                client_ip: conn_details.client.ip(),
-                            })
-                        }
-                        RateCheckedBodyErr::Hyper(herr) => ProxyCacheError::Hyper(herr),
-                        RateCheckedBodyErr::ProxyCache(perr) => perr,
+                    checked_channel_body.map_err(move |rerr| {
+                        let e = match *rerr {
+                            RateCheckedBodyErr::DownloadRate(download_rate_err) => {
+                                ProxyCacheError::ClientDownloadRate(error::ClientDownloadRate {
+                                    download_rate_err,
+                                    client_ip: conn_details.client.ip(),
+                                })
+                            }
+                            RateCheckedBodyErr::Hyper(herr) => ProxyCacheError::Hyper(herr),
+                            RateCheckedBodyErr::ProxyCache(perr) => perr,
+                        };
+                        Box::new(e)
                     }),
                 )))
                 .expect("HTTP response is valid")
@@ -2650,7 +2660,9 @@ async fn serve_new_file(
 
         let (parts, body) = fwd_response.into_parts();
 
-        let body = ProxyCacheBody::Boxed(BoxBody::new(body.map_err(ProxyCacheError::Hyper)));
+        let body = ProxyCacheBody::Boxed(BoxBody::new(
+            body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
+        ));
 
         let response = Response::from_parts(parts, body);
 
@@ -3608,7 +3620,9 @@ async fn pre_process_client_request(
 
             let (parts, body) = redirected_response.into_parts();
 
-            let body = ProxyCacheBody::Boxed(BoxBody::new(body.map_err(ProxyCacheError::Hyper)));
+            let body = ProxyCacheBody::Boxed(BoxBody::new(
+                body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
+            ));
 
             let response = Response::from_parts(parts, body);
 
@@ -3618,8 +3632,11 @@ async fn pre_process_client_request(
         }
     }
 
-    let response = fwd_response
-        .map(|body| ProxyCacheBody::Boxed(BoxBody::new(body.map_err(ProxyCacheError::Hyper))));
+    let response = fwd_response.map(|body| {
+        ProxyCacheBody::Boxed(BoxBody::new(
+            body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
+        ))
+    });
 
     trace!("Outgoing response: {response:?}");
 
