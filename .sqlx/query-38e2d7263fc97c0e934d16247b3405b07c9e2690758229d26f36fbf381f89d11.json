@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM deliveries WHERE mirror_id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "38e2d7263fc97c0e934d16247b3405b07c9e2690758229d26f36fbf381f89d11"
+}

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use log::{LevelFilter, debug, info, trace};
+use log::{LevelFilter, debug, info, trace, warn};
 use sqlx::{
     ConnectOptions as _, Error, Executor as _, Pool, Sqlite, SqlitePool, query, query_as,
     sqlite::SqliteConnectOptions,
@@ -343,7 +343,6 @@ impl Database {
         .fetch_all(&self.conn)
         .await?;
 
-        // TODO: check during cleanup that all client_ip BLOB entries are valid?
         Ok(ips
             .into_iter()
             .filter_map(|s| {
@@ -459,6 +458,71 @@ impl Database {
         )
         .execute(&self.conn)
         .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn cleanup_invalid_rows(&self) -> Result<(), Error> {
+        // Remove downloads/deliveries with invalid client_ip (not exactly 16 bytes)
+        let downloads_deleted = query!(r"DELETE FROM downloads WHERE length(client_ip) != 16;")
+            .execute(&self.conn)
+            .await?;
+
+        if downloads_deleted.rows_affected() > 0 {
+            warn!(
+                "Removed {} download rows with invalid client_ip",
+                downloads_deleted.rows_affected()
+            );
+        }
+
+        let deliveries_deleted = query!(r"DELETE FROM deliveries WHERE length(client_ip) != 16;")
+            .execute(&self.conn)
+            .await?;
+
+        if deliveries_deleted.rows_affected() > 0 {
+            warn!(
+                "Removed {} delivery rows with invalid client_ip",
+                deliveries_deleted.rows_affected()
+            );
+        }
+
+        // Remove mirrors with invalid host names (and cascade to their origins/downloads/deliveries)
+        #[expect(clippy::items_after_statements)]
+        struct MirrorRow {
+            id: i64,
+            host: String,
+        }
+
+        let mirrors = query_as!(
+            MirrorRow,
+            r#"SELECT id AS "id!: i64", host FROM mirrors_v2;"#
+        )
+        .fetch_all(&self.conn)
+        .await?;
+
+        for mirror in mirrors {
+            if DomainName::new(mirror.host.clone()).is_ok() {
+                continue;
+            }
+
+            warn!(
+                "Removing mirror id={} with invalid host `{}`",
+                mirror.id, mirror.host
+            );
+
+            query!(r"DELETE FROM origins WHERE mirror_id = ?;", mirror.id)
+                .execute(&self.conn)
+                .await?;
+            query!(r"DELETE FROM downloads WHERE mirror_id = ?;", mirror.id)
+                .execute(&self.conn)
+                .await?;
+            query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", mirror.id)
+                .execute(&self.conn)
+                .await?;
+            query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", mirror.id)
+                .execute(&self.conn)
+                .await?;
+        }
 
         Ok(())
     }

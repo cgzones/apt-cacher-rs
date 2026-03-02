@@ -3756,6 +3756,11 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         err
     })?;
 
+    database.cleanup_invalid_rows().await.map_err(|err| {
+        error!("Failed to clean up invalid database rows:  {err}");
+        err
+    })?;
+
     // Database background task
     let (db_task_tx, db_task_rx) = tokio::sync::mpsc::channel(64);
     {

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM mirrors_v2 WHERE id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "593c62d8d7e16694384cc8d4f94915c23c8f696cf40604c981cc6e208bd19cdc"
+}

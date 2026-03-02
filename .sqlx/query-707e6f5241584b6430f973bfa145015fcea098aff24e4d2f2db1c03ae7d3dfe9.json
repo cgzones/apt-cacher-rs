@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM downloads WHERE length(client_ip) != 16;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "707e6f5241584b6430f973bfa145015fcea098aff24e4d2f2db1c03ae7d3dfe9"
+}

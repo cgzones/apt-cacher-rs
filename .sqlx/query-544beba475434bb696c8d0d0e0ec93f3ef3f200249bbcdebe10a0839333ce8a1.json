@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM deliveries WHERE length(client_ip) != 16;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "544beba475434bb696c8d0d0e0ec93f3ef3f200249bbcdebe10a0839333ce8a1"
+}

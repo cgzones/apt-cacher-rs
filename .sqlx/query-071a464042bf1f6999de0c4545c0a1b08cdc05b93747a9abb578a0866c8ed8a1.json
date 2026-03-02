@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM origins WHERE mirror_id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "071a464042bf1f6999de0c4545c0a1b08cdc05b93747a9abb578a0866c8ed8a1"
+}

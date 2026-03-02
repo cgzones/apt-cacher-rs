@@ -233,6 +233,10 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
 
     let start = Instant::now();
 
+    if let Err(err) = appstate.database.cleanup_invalid_rows().await {
+        error!("Failed to clean up invalid database rows:  {err}");
+    }
+
     let usage_retention_days = global_config().usage_retention_days;
     if usage_retention_days != 0 {
         let keep_date = SystemTime::now()
