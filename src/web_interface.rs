@@ -127,27 +127,23 @@ async fn build_mirror_table(database: &Database) -> Result<(Table, usize), Proxy
             format_unix_timestamp(mirror.last_cleanup)
         };
 
-        let total_download_size_fmt = format!(
-            "{}",
-            HumanFmt::Size(
-                u64::try_from(mirror.total_download_size)
-                    .expect("Database should never store negative size")
-            )
-        );
+        let total_download_size_fmt = HumanFmt::Size(
+            u64::try_from(mirror.total_download_size)
+                .expect("Database should never store negative size"),
+        )
+        .to_string();
 
-        let total_delivery_size_fmt = format!(
-            "{}",
-            HumanFmt::Size(
-                u64::try_from(mirror.total_delivery_size)
-                    .expect("Database should never store negative size")
-            )
-        );
+        let total_delivery_size_fmt = HumanFmt::Size(
+            u64::try_from(mirror.total_delivery_size)
+                .expect("Database should never store negative size"),
+        )
+        .to_string();
 
         let mirror_path: PathBuf = [cache_path, &mirror.cache_path()].iter().collect();
 
         let (file_count_fmt, dir_size_fmt) = if mirror_path.exists() {
             match flat_directory_size(&mirror_path).await {
-                Ok((count, size)) => (format!("{count}"), format!("{}", HumanFmt::Size(size))),
+                Ok((count, size)) => (count.to_string(), HumanFmt::Size(size).to_string()),
                 Err(err) => {
                     error!(
                         "Failed to gather size of directory `{}`:  {err}",
@@ -301,7 +297,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
 
     let rd = RUNTIMEDETAILS.get().expect("Should be set");
     let database_size_fmt = match tokio::fs::metadata(&rd.config.database_path).await {
-        Ok(data) => format!("{}", HumanFmt::Size(data.len())),
+        Ok(data) => HumanFmt::Size(data.len()).to_string(),
         Err(err) => {
             error!(
                 "Failed to access database file `{}`:  {err}",

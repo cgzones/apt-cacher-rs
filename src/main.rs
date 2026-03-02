@@ -28,6 +28,7 @@ mod task_cleanup;
 mod task_setup;
 mod web_interface;
 
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::Debug;
@@ -606,9 +607,9 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
         let cd = project.conn_details.take().expect("Option is set in new()");
         let error = project.error.take();
         tokio::task::spawn(async move {
-            let aliased = match cd.aliased_host {
-                Some(alias) => format!(" aliased to host {alias}"),
-                None => String::new(),
+            let aliased: Cow<'static, str> = match cd.aliased_host {
+                Some(alias) => format!(" aliased to host {alias}").into(),
+                None => Cow::Borrowed(""),
             };
             if transferred_bytes == size {
                 info!(
@@ -820,9 +821,9 @@ impl Drop for MmapBody {
         let db_tx = self.database_tx.take().expect("set in new()");
         let cd = self.conn_details.take().expect("set in new()");
         tokio::task::spawn(async move {
-            let aliased = match cd.aliased_host {
-                Some(alias) => format!(" aliased to host {alias}"),
-                None => String::new(),
+            let aliased: Cow<'static, str> = match cd.aliased_host {
+                Some(alias) => format!(" aliased to host {alias}").into(),
+                None => Cow::Borrowed(""),
             };
             if transferred_bytes == size {
                 info!(
@@ -943,9 +944,9 @@ async fn serve_cached_file(
     file: tokio::fs::File,
     file_path: &Path,
 ) -> Response<ProxyCacheBody> {
-    let aliased = match conn_details.aliased_host {
-        Some(alias) => format!(" aliased to host {alias}"),
-        None => String::new(),
+    let aliased: Cow<'static, str> = match conn_details.aliased_host {
+        Some(alias) => format!(" aliased to host {alias}").into(),
+        None => Cow::Borrowed(""),
     };
     info!(
         "Serving cached file {} from mirror {}{} for client {}...",
@@ -3838,7 +3839,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let uri = Uri::builder()
                             .scheme("http")
-                            .authority(authority.to_string())
+                            .authority(authority.as_ref())
                             .path_and_query("/")
                             .build()
                             .expect("Valid URI");
