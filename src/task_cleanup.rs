@@ -18,8 +18,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter};
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{
-    AppState, CachedFlavor, ConnectionDetails, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
-    RUNTIMEDETAILS,
+    AppState, CachedFlavor, ClientInfo, ConnectionDetails, ProxyCacheBody, ProxyCacheError,
+    RETENTION_TIME, RUNTIMEDETAILS,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, UriFormat as _},
     global_config,
@@ -169,7 +169,7 @@ async fn get_package_file(
             .expect("Request should be valid");
 
         let conn_details = ConnectionDetails {
-            client: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            client: ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
             mirror: mirror.clone(),
             aliased_host: None,
             debname: format!(

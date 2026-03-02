@@ -1,6 +1,5 @@
 use std::fmt::Display;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
 use std::num::NonZero;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 use std::path::Path;
@@ -28,7 +27,7 @@ use crate::http_range::{
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::RateChecker;
 use crate::{
-    APP_NAME, AppState, CachedFlavor, ConnectionDetails, Never, authorize_cache_access,
+    APP_NAME, AppState, CachedFlavor, ClientInfo, ConnectionDetails, Never, authorize_cache_access,
     client_counter, global_config, handle_hyper_connection, warn_once, warn_once_or_info,
 };
 
@@ -89,15 +88,12 @@ enum SendfileResult {
 /// - Otherwise, fall back to the standard hyper-based handler
 pub(crate) async fn handle_sendfile_connection(
     stream: TcpStream,
-    client: SocketAddr,
+    client: ClientInfo,
     appstate: AppState,
 ) {
     let mut buf = BytesMut::with_capacity(MAX_HEADER_SIZE);
 
-    trace!(
-        "Using sendfile(2) backend to handle request from client {} ...",
-        client.ip().to_canonical()
-    );
+    trace!("Using sendfile(2) backend to handle request from client {client} ...");
 
     let mut req_num = 0;
     let mut conn_version = ConnectionVersion::Http11; // assume more recent version 1.1 if not yet parsed from any request
@@ -106,16 +102,12 @@ pub(crate) async fn handle_sendfile_connection(
         // Try to peek and parse the next request to determine if sendfile is applicable
         let next_header_index = match read_request_headers(&stream, &mut buf).await {
             Ok(None) if req_num == 0 => {
-                info!(
-                    "Connection from client {} closed before sending request",
-                    client.ip().to_canonical()
-                );
+                info!("Connection from client {client} closed before sending request");
                 return;
             }
             Ok(None) => {
                 trace!(
-                    "No more requests from client {}, ending connection after {req_num} requests",
-                    client.ip().to_canonical()
+                    "No more requests from client {client}, ending connection after {req_num} requests"
                 );
                 return;
             }
@@ -124,17 +116,11 @@ pub(crate) async fn handle_sendfile_connection(
                 index
             }
             Err(err) if err.kind() == ErrorKind::TimedOut => {
-                info!(
-                    "Timeout while reading request headers from client {}",
-                    client.ip().to_canonical()
-                );
+                info!("Timeout while reading request headers from client {client}");
                 return;
             }
             Err(err) => {
-                warn_once_or_info!(
-                    "Failed to read request from client {}:  {err}",
-                    client.ip().to_canonical()
-                );
+                warn_once_or_info!("Failed to read request from client {client}:  {err}");
                 let _ignore = write_invalid_response(
                     &stream,
                     conn_version,
@@ -162,8 +148,7 @@ pub(crate) async fn handle_sendfile_connection(
                 SendfileResult::NotApplicable => {
                     // Fall back to hyper for this and all subsequent requests
                     debug!(
-                        "Falling back to hyper for client {} ({} bytes buffered)",
-                        client.ip().to_canonical(),
+                        "Falling back to hyper for client {client} ({} bytes buffered)",
                         buf.len()
                     );
 
@@ -182,10 +167,7 @@ pub(crate) async fn handle_sendfile_connection(
                     if let Err(err) =
                         write_invalid_response(&stream, conn_version, status, msg).await
                     {
-                        info!(
-                            "Failed to write error response to client {}:  {err}",
-                            client.ip().to_canonical()
-                        );
+                        info!("Failed to write error response to client {client}:  {err}");
                     }
                     return;
                 }
@@ -202,7 +184,7 @@ pub(crate) async fn handle_sendfile_connection(
 fn compute_conn_action(
     req: &Request<'_, '_>,
     version: ConnectionVersion,
-    client: &SocketAddr,
+    client: &ClientInfo,
 ) -> ConnectionAction {
     // If the clients sends a body, just close the connection afterwards
     // too avoid computing the length of the body
@@ -214,8 +196,7 @@ fn compute_conn_action(
             || h.name.eq_ignore_ascii_case("Transfer-Encoding")
     }) {
         debug!(
-            "Request with body detected from client {}, closing connection after response",
-            client.ip().to_canonical()
+            "Request with body detected from client {client}, closing connection after response"
         );
         return ConnectionAction::Close;
     }
@@ -245,7 +226,7 @@ fn compute_conn_action(
 async fn try_sendfile_request(
     buf: &[u8],
     stream: &TcpStream,
-    client: SocketAddr,
+    client: ClientInfo,
     appstate: &AppState,
     conn_version: &mut ConnectionVersion,
 ) -> SendfileResult {
@@ -257,10 +238,7 @@ async fn try_sendfile_request(
             1 => *conn_version = ConnectionVersion::Http11,
             v => {
                 if v != 0 {
-                    warn_once!(
-                        "Unsupported HTTP 1 subversion `{v}` from client {}",
-                        client.ip().to_canonical()
-                    );
+                    warn_once!("Unsupported HTTP 1 subversion `{v}` from client {client}");
                 }
 
                 *conn_version = ConnectionVersion::Http10;
@@ -273,20 +251,14 @@ async fn try_sendfile_request(
                 _ => {}
             }
 
-            warn_once_or_info!(
-                "Incomplete HTTP request from client {}",
-                client.ip().to_canonical()
-            );
+            warn_once_or_info!("Incomplete HTTP request from client {client}");
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Incomplete request header",
             };
         }
         Err(err) => {
-            warn_once_or_info!(
-                "Failed to parse HTTP request from client {}:  {err}",
-                client.ip().to_canonical()
-            );
+            warn_once_or_info!("Failed to parse HTTP request from client {client}:  {err}");
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Invalid request header",
@@ -301,9 +273,8 @@ async fn try_sendfile_request(
         "CONNECT" => return SendfileResult::NotApplicable,
         m => {
             warn_once_or_info!(
-                "Unsupported request method `{}` from client {}",
+                "Unsupported request method `{}` from client {client}",
                 m.escape_debug(),
-                client.ip().to_canonical()
             );
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
@@ -319,10 +290,7 @@ async fn try_sendfile_request(
     {
         Ok(uri) => uri,
         Err(err) => {
-            info!(
-                "Failed to parse URI from client {}:  {err}",
-                client.ip().to_canonical()
-            );
+            info!("Failed to parse URI from client {client}:  {err}");
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Invalid URI",
@@ -354,10 +322,7 @@ async fn try_sendfile_request(
     let mirror_path = match urlencoding::decode(mirror_path) {
         Ok(s) if valid_mirrorname(&s) => s,
         Ok(s) => {
-            warn_once_or_info!(
-                "Unsupported mirror path `{s}` from client {}",
-                client.ip().to_canonical()
-            );
+            warn_once_or_info!("Unsupported mirror path `{s}` from client {client}");
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Unsupported request",
@@ -365,9 +330,8 @@ async fn try_sendfile_request(
         }
         Err(err) => {
             warn!(
-                "Failed to decode mirror path `{}` from client {}:  {err}",
-                mirror_path.escape_debug(),
-                client.ip().to_canonical()
+                "Failed to decode mirror path `{}` from client {client}:  {err}",
+                mirror_path.escape_debug()
             );
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
@@ -378,10 +342,7 @@ async fn try_sendfile_request(
     let filename = match urlencoding::decode(filename) {
         Ok(s) if valid_filename(&s) => s,
         Ok(s) => {
-            warn_once_or_info!(
-                "Unsupported filename `{s}` from client {}",
-                client.ip().to_canonical()
-            );
+            warn_once_or_info!("Unsupported filename `{s}` from client {client}");
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Unsupported request",
@@ -389,9 +350,8 @@ async fn try_sendfile_request(
         }
         Err(err) => {
             warn!(
-                "Failed to decode filename `{}` from client {}:  {err}",
-                filename.escape_debug(),
-                client.ip().to_canonical()
+                "Failed to decode filename `{}` from client {client}:  {err}",
+                filename.escape_debug()
             );
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
@@ -448,9 +408,8 @@ async fn try_sendfile_request(
         }
         Err(err) => {
             error!(
-                "Failed to open cached file `{}` for client {}:  {err}",
-                cache_path.display(),
-                client.ip().to_canonical()
+                "Failed to open cached file `{}` for client {client}:  {err}",
+                cache_path.display()
             );
             return SendfileResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -463,9 +422,8 @@ async fn try_sendfile_request(
         Ok(m) => m,
         Err(err) => {
             error!(
-                "Failed to get metadata of cached file `{}` for client {}:  {err}",
-                cache_path.display(),
-                client.ip().to_canonical()
+                "Failed to get metadata of cached file `{}` for client {client}:  {err}",
+                cache_path.display()
             );
             return SendfileResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -494,10 +452,7 @@ async fn try_sendfile_request(
         if let Err(err) =
             write_304_response(stream, *conn_version, conn_action, &last_modified).await
         {
-            warn!(
-                "Failed to write 304 response to client {}:  {err}",
-                client.ip().to_canonical()
-            );
+            warn!("Failed to write 304 response to client {client}:  {err}");
             return SendfileResult::Error;
         }
 
@@ -529,11 +484,8 @@ async fn try_sendfile_request(
         None => String::new(),
     };
     info!(
-        "Serving cached file {} from mirror {}{} for client {} via sendfile...",
-        conn_details.debname,
-        conn_details.mirror,
-        aliased,
-        client.ip().to_canonical()
+        "Serving cached file {} from mirror {}{} for client {client} via sendfile...",
+        conn_details.debname, conn_details.mirror, aliased
     );
 
     // Write HTTP response headers
@@ -548,10 +500,7 @@ async fn try_sendfile_request(
     )
     .await
     {
-        warn!(
-            "Failed to write response headers to client {}:  {err}",
-            client.ip().to_canonical()
-        );
+        warn!("Failed to write response headers to client {client}:  {err}");
         return SendfileResult::Error;
     }
 
@@ -562,11 +511,10 @@ async fn try_sendfile_request(
         Ok(()) => {
             let elapsed = start.elapsed();
             info!(
-                "Served cached file {} from mirror {}{} for client {} in {} via sendfile (size={}, rate={})",
+                "Served cached file {} from mirror {}{} for client {client} in {} via sendfile (size={}, rate={})",
                 conn_details.debname,
                 conn_details.mirror,
                 aliased,
-                client.ip().to_canonical(),
                 HumanFmt::Time(elapsed.into()),
                 HumanFmt::Size(content_length),
                 HumanFmt::Rate(content_length, elapsed)
@@ -591,9 +539,8 @@ async fn try_sendfile_request(
         }
         Err(err) => {
             error!(
-                "sendfile error serving `{}` to client {}:  {err}",
-                cache_path.display(),
-                client.ip().to_canonical()
+                "sendfile error serving `{}` to client {client}:  {err}",
+                cache_path.display()
             );
             // Response already sent, just close the connection
             SendfileResult::Error

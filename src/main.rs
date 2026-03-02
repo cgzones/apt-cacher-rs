@@ -36,9 +36,7 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::io::ErrorKind;
-#[cfg(feature = "mmap")]
-use std::net::IpAddr;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZero;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
@@ -163,7 +161,7 @@ const _: () = assert!(
     "ensure casts from usize to u64 via 'as' do not truncate"
 );
 
-type Client = hyper_util::client::legacy::Client<
+type HttpClient = hyper_util::client::legacy::Client<
     hyper_timeout::TimeoutConnector<HttpsConnector<HttpConnector>>,
     Empty<bytes::Bytes>,
 >;
@@ -175,6 +173,31 @@ const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PK
 const RETENTION_TIME: Duration = Duration::from_hours(8 * 7 * 24); /* 8 weeks */
 
 const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(1024 * 1024); /* 1MiB */
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ClientInfo {
+    addr: SocketAddr,
+}
+
+impl ClientInfo {
+    #[must_use]
+    pub(crate) fn new(addr: SocketAddr) -> Self {
+        Self { addr }
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) fn ip(&self) -> IpAddr {
+        self.addr.ip().to_canonical()
+    }
+}
+
+impl Display for ClientInfo {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.ip())
+    }
+}
 
 async fn tokio_mkstemp(
     path: &Path,
@@ -272,7 +295,7 @@ impl Into<SchemeKey> for &SchemeKeyRef<'_> {
 static SCHEME_CACHE: OnceLock<parking_lot::RwLock<HashMap<SchemeKey, Scheme>>> = OnceLock::new();
 
 pub(crate) async fn request_with_retry(
-    client: &Client,
+    client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
 ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
     const MAX_ATTEMPTS: u32 = 10;
@@ -342,7 +365,7 @@ pub(crate) async fn request_with_retry(
 
     #[expect(clippy::items_after_statements)]
     async fn inner_loop(
-        client: &Client,
+        client: &HttpClient,
         mut parts: http::request::Parts,
         orig_scheme: Option<http::uri::Scheme>,
         cached_scheme: Option<Scheme>,
@@ -618,7 +641,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                     cd.debname,
                     cd.mirror,
                     aliased,
-                    cd.client.ip().to_canonical(),
+                    cd.client,
                     HumanFmt::Time(duration.into()),
                     HumanFmt::Size(size),
                     HumanFmt::Rate(size, duration)
@@ -639,7 +662,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                     cd.debname,
                     cd.mirror,
                     aliased,
-                    cd.client.ip().to_canonical(),
+                    cd.client,
                     HumanFmt::Time(duration.into()),
                     error.unwrap_or_else(|| String::from("unknown reason")),
                 );
@@ -649,7 +672,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                     cd.debname,
                     cd.mirror,
                     aliased,
-                    cd.client.ip().to_canonical(),
+                    cd.client,
                     HumanFmt::Time(duration.into()),
                     HumanFmt::Size(size),
                     HumanFmt::Size(transferred_bytes),
@@ -832,7 +855,7 @@ impl Drop for MmapBody {
                     cd.debname,
                     cd.mirror,
                     aliased,
-                    cd.client.ip().to_canonical(),
+                    cd.client,
                     HumanFmt::Time(elapsed.into()),
                     HumanFmt::Size(size),
                     HumanFmt::Rate(size, elapsed)
@@ -853,7 +876,7 @@ impl Drop for MmapBody {
                     cd.debname,
                     cd.mirror,
                     aliased,
-                    cd.client.ip().to_canonical(),
+                    cd.client,
                     HumanFmt::Time(elapsed.into()),
                 );
             } else {
@@ -862,7 +885,7 @@ impl Drop for MmapBody {
                     cd.debname,
                     cd.mirror,
                     aliased,
-                    cd.client.ip().to_canonical(),
+                    cd.client,
                     HumanFmt::Time(elapsed.into()),
                     HumanFmt::Size(size),
                     HumanFmt::Size(transferred_bytes),
@@ -951,10 +974,7 @@ async fn serve_cached_file(
     };
     info!(
         "Serving cached file {} from mirror {}{} for client {}...",
-        conn_details.debname,
-        conn_details.mirror,
-        aliased,
-        conn_details.client.ip().to_canonical()
+        conn_details.debname, conn_details.mirror, aliased, conn_details.client
     );
 
     let metadata = match file.metadata().await {
@@ -986,10 +1006,7 @@ async fn serve_cached_file(
     {
         info!(
             "Serving 304 Not Modified for cached file {} from mirror {}{} for client {}",
-            conn_details.debname,
-            conn_details.mirror,
-            aliased,
-            conn_details.client.ip().to_canonical()
+            conn_details.debname, conn_details.mirror, aliased, conn_details.client
         );
 
         let response = Response::builder()
@@ -1039,7 +1056,7 @@ async fn serve_cached_file(
                 file_path.display(),
                 conn_details.mirror,
                 aliased,
-                conn_details.client.ip().to_canonical()
+                conn_details.client
             );
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
@@ -1279,7 +1296,7 @@ fn serve_cached_file_response(
 pub(crate) struct AppState {
     pub(crate) database: Database,
     pub(crate) database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
-    pub(crate) https_client: Client,
+    pub(crate) https_client: HttpClient,
     pub(crate) active_downloads: ActiveDownloads,
 }
 
@@ -1325,7 +1342,7 @@ async fn serve_volatile_file(
                 if time.is_none() {
                     debug!(
                         "Ignoring invalid If-Modified-Since header from client {}",
-                        conn_details.client.ip().to_canonical()
+                        conn_details.client
                     );
                 }
                 time
@@ -1352,9 +1369,7 @@ async fn serve_volatile_file(
     let Some(init_tx) = init_tx else {
         debug!(
             "Serving file {} already in cache / download from mirror {} for client {}...",
-            conn_details.debname,
-            conn_details.mirror,
-            conn_details.client.ip().to_canonical()
+            conn_details.debname, conn_details.mirror, conn_details.client
         );
         return serve_downloading_file(conn_details, req, appstate.database_tx, status).await;
     };
@@ -1383,7 +1398,7 @@ pub(crate) enum CachedFlavor {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionDetails {
-    pub(crate) client: SocketAddr,
+    pub(crate) client: ClientInfo,
     pub(crate) mirror: Mirror,
     pub(crate) aliased_host: Option<&'static DomainName>,
     pub(crate) debname: String,
@@ -1622,9 +1637,7 @@ async fn download_file(
 ) {
     trace!(
         "Starting download of file {} from mirror {} for client {}...",
-        conn_details.debname,
-        conn_details.mirror,
-        conn_details.client.ip().to_canonical()
+        conn_details.debname, conn_details.mirror, conn_details.client
     );
     let start = Instant::now();
     let dbarrier = DownloadBarrier::new(tx, status);
@@ -1850,7 +1863,7 @@ async fn download_file(
         "Finished download of file {} from mirror {} for client {} in {} (size={}, rate={})",
         conn_details.debname,
         conn_details.mirror,
-        conn_details.client.ip().to_canonical(),
+        conn_details.client,
         HumanFmt::Time(elapsed.into()),
         HumanFmt::Size(bytes),
         HumanFmt::Rate(bytes, elapsed)
@@ -1905,7 +1918,7 @@ async fn serve_unfinished_file(
             "Starting stream task for downloading file `{}` from mirror {} with length {content_length:?} for client {}...",
             file_path.display(),
             conn_details.mirror,
-            conn_details.client.ip().to_canonical()
+            conn_details.client
         );
 
         let counter = client_counter::ClientDownload::new();
@@ -1998,7 +2011,7 @@ async fn serve_unfinished_file(
             "Served new file {} from mirror {} for client {} in {} (size={}, rate={})",
             conn_details.debname,
             conn_details.mirror,
-            conn_details.client.ip().to_canonical(),
+            conn_details.client,
             HumanFmt::Time(elapsed.into()),
             HumanFmt::Size(bytes),
             HumanFmt::Rate(bytes, elapsed)
@@ -2308,9 +2321,7 @@ async fn serve_cached_file_modified_since(
     if client_modified_time >= local_creation_time {
         info!(
             "Serving info about up-to-date cached file {} from mirror {} for client {}",
-            conn_details.debname,
-            conn_details.mirror,
-            conn_details.client.ip().to_canonical()
+            conn_details.debname, conn_details.mirror, conn_details.client
         );
 
         /*
@@ -2351,9 +2362,7 @@ async fn serve_cached_file_modified_since(
 
     info!(
         "File {} from mirror {} is up-to-date in cache, serving to client {} with older version",
-        conn_details.debname,
-        conn_details.mirror,
-        conn_details.client.ip().to_canonical()
+        conn_details.debname, conn_details.mirror, conn_details.client
     );
 
     serve_cached_file(conn_details, req, database_tx, file, file_path).await
@@ -2520,13 +2529,13 @@ async fn serve_new_file(
                 } else {
                     debug!(
                         "Ignoring invalid If-Modified-Since header from client {}",
-                        conn_details.client.ip().to_canonical()
+                        conn_details.client
                     );
                 }
             }
             _ => warn_once_or_info!(
                 "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}",
-                conn_details.client.ip().to_canonical()
+                conn_details.client
             ),
         }
     }
@@ -2802,9 +2811,7 @@ async fn serve_new_file(
 
     info!(
         "Downloading and serving new file {} from mirror {} for client {}...",
-        conn_details.debname,
-        conn_details.mirror,
-        conn_details.client.ip().to_canonical()
+        conn_details.debname, conn_details.mirror, conn_details.client
     );
 
     let (tx, rx) = tokio::sync::watch::channel(());
@@ -2885,7 +2892,7 @@ async fn serve_new_file(
         if v {
             debug!(
                 "Trying parallel download hack for client {} and file {} with code {} and retry after value {}",
-                conn_details.client.ip().to_canonical(),
+                conn_details.client,
                 conn_details.debname,
                 gcfg.experimental_parallel_hack_statuscode,
                 gcfg.experimental_parallel_hack_retryafter
@@ -2917,7 +2924,7 @@ async fn serve_new_file(
 /// Create a TCP connection to host:port, build a tunnel between the connection and
 /// the upgraded connection
 async fn tunnel(
-    client: SocketAddr,
+    client: ClientInfo,
     upgraded: hyper::upgrade::Upgraded,
     host: &str,
     port: NonZero<u16>,
@@ -2935,8 +2942,7 @@ async fn tunnel(
             .await?;
 
     info!(
-        "Tunneled client {} wrote {} and received {} from {host}:{port} in {}",
-        client.ip().to_canonical(),
+        "Tunneled client {client} wrote {} and received {} from {host}:{port} in {}",
         HumanFmt::Size(from_client),
         HumanFmt::Size(from_server),
         HumanFmt::Time(start.elapsed().into())
@@ -3007,9 +3013,7 @@ pub(crate) async fn process_cache_request(
             } else {
                 info!(
                     "Serving file {} already in download from mirror {} for client {}...",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    conn_details.client.ip().to_canonical()
+                    conn_details.debname, conn_details.mirror, conn_details.client
                 );
                 serve_downloading_file(conn_details, req, appstate.database_tx, status).await
             }
@@ -3026,28 +3030,26 @@ pub(crate) async fn process_cache_request(
 
 #[must_use]
 fn connect_response(
-    client: SocketAddr,
+    client: ClientInfo,
     req: Request<hyper::body::Incoming>,
 ) -> Response<ProxyCacheBody> {
     let cfg = global_config();
 
     {
         let allowed_proxy_clients = cfg.allowed_proxy_clients.as_slice();
+        let client_ip = client.ip();
         if !allowed_proxy_clients.is_empty()
             && !allowed_proxy_clients
                 .iter()
-                .any(|ac| ac.contains(&client.ip().to_canonical()))
+                .any(|ac| ac.contains(&client_ip))
         {
-            warn_once_or_info!("Unauthorized proxy client {}", client.ip().to_canonical());
+            warn_once_or_info!("Unauthorized proxy client {client}");
             return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
         }
     }
 
     if !cfg.https_tunnel_enabled {
-        info!(
-            "Rejecting https tunnel request for client {}",
-            client.ip().to_canonical()
-        );
+        info!("Rejecting https tunnel request for client {client}");
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
@@ -3072,18 +3074,17 @@ fn connect_response(
             .and_then(NonZero::new)
             .map(|p| (a.host().to_string(), p))
     }) else {
-        warn_once_or_info!("Invalid CONNECT address: {}", req.uri());
+        warn_once_or_info!(
+            "Invalid CONNECT address from client {client}: {}",
+            req.uri()
+        );
         return quick_response(StatusCode::BAD_REQUEST, "Invalid CONNECT address");
     };
 
     if !cfg.https_tunnel_allowed_ports.is_empty()
         && cfg.https_tunnel_allowed_ports.binary_search(&port).is_err()
     {
-        info!(
-            "Rejecting https tunnel request for client {} to not permitted port {}",
-            client.ip().to_canonical(),
-            port
-        );
+        info!("Rejecting https tunnel request for client {client} to not permitted port {port}");
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
@@ -3094,17 +3095,12 @@ fn connect_response(
             .is_err()
     {
         info!(
-            "Rejecting https tunnel request for client {} due to not permitted host {}",
-            client.ip().to_canonical(),
-            host
+            "Rejecting https tunnel request for client {client} due to not permitted host {host}"
         );
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
-    info!(
-        "Using un-cached tunnel for client {} to {host}:{port}",
-        client.ip().to_canonical()
-    );
+    info!("Using un-cached tunnel for client {client} to {host}:{port}");
 
     tokio::task::spawn(async move {
         match hyper::upgrade::on(req).await {
@@ -3112,26 +3108,22 @@ fn connect_response(
                 if let Err(err) = tunnel(client, upgraded, &host, port).await {
                     if err.kind() == ErrorKind::NotConnected {
                         info!(
-                            "Error tunneling connection for client {} to {host}:{port}:  {err}",
-                            client.ip().to_canonical()
+                            "Error tunneling connection for client {client} to {host}:{port}:  {err}"
                         );
                     } else if err.kind() == ErrorKind::ConnectionReset {
                         warn!(
-                            "Error tunneling connection for client {} to {host}:{port}:  {err}",
-                            client.ip().to_canonical()
+                            "Error tunneling connection for client {client} to {host}:{port}:  {err}"
                         );
                     } else {
                         error!(
-                            "Error tunneling connection for client {} to {host}:{port}:  {err}",
-                            client.ip().to_canonical()
+                            "Error tunneling connection for client {client} to {host}:{port}:  {err}"
                         );
                     }
                 }
             }
-            Err(err) => error!(
-                "Error upgrading connection for client {} to {host}:{port}:  {err}",
-                client.ip().to_canonical()
-            ),
+            Err(err) => {
+                error!("Error upgrading connection for client {client} to {host}:{port}:  {err}");
+            }
         }
     });
 
@@ -3146,18 +3138,19 @@ fn connect_response(
 }
 
 pub(crate) fn authorize_cache_access(
-    client: &SocketAddr,
+    client: &ClientInfo,
     requested_host: String,
 ) -> Result<DomainName, (http::StatusCode, &'static str)> {
     let cfg = global_config();
 
     let allowed_proxy_clients = cfg.allowed_proxy_clients.as_slice();
+    let client_ip = client.ip();
     if !allowed_proxy_clients.is_empty()
         && !allowed_proxy_clients
             .iter()
-            .any(|ac| ac.contains(&client.ip().to_canonical()))
+            .any(|ac| ac.contains(&client_ip))
     {
-        warn_once_or_info!("Unauthorized proxy client {}", client.ip().to_canonical());
+        warn_once_or_info!("Unauthorized proxy client {client}");
         return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
     }
 
@@ -3179,7 +3172,7 @@ pub(crate) fn authorize_cache_access(
 
 #[inline]
 async fn pre_process_client_request_wrapper(
-    client: SocketAddr,
+    client: ClientInfo,
     req: Request<hyper::body::Incoming>,
     appstate: AppState,
 ) -> Result<Response<ProxyCacheBody>, Infallible> {
@@ -3188,7 +3181,7 @@ async fn pre_process_client_request_wrapper(
 
 #[must_use]
 async fn pre_process_client_request(
-    client: SocketAddr,
+    client: ClientInfo,
     req: Request<hyper::body::Incoming>,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
@@ -3223,15 +3216,13 @@ async fn pre_process_client_request(
                     .allowed_webif_clients
                     .as_ref()
                     .unwrap_or(&cfg.allowed_proxy_clients);
+                let client_ip = client.ip();
                 if !allowed_webif_clients.is_empty()
                     && !allowed_webif_clients
                         .iter()
-                        .any(|ac| ac.contains(&client.ip().to_canonical()))
+                        .any(|ac| ac.contains(&client_ip))
                 {
-                    warn_once_or_info!(
-                        "Unauthorized web-interface client {}",
-                        client.ip().to_canonical()
-                    );
+                    warn_once_or_info!("Unauthorized web-interface client {client}");
                     return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
                 }
             }
@@ -3965,14 +3956,16 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             n = listener.accept() => n
         };
 
-        let (stream, client) = next.map_err(|err| {
-            error!("Error accepting connection:  {err}");
-            err
-        })?;
+        let (stream, client) = next
+            .map(|(stream, client)| (stream, ClientInfo::new(client)))
+            .map_err(|err| {
+                error!("Error accepting connection:  {err}");
+                err
+            })?;
 
         let client_counter = client_counter::ClientCounter::new();
 
-        info!("New client connection from {}", client.ip().to_canonical());
+        info!("New client connection from {client}");
         let client_start = Instant::now();
 
         let appstate = appstate.clone();
@@ -3983,13 +3976,12 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             #[cfg(not(feature = "sendfile"))]
             handle_hyper_connection(stream, client, appstate).await;
 
-            drop(client_counter);
-
             info!(
-                "Closed connection to {} after {}",
-                client.ip().to_canonical(),
+                "Closed connection to client {client} after {}",
                 HumanFmt::Time(client_start.elapsed().into())
             );
+
+            drop(client_counter);
         });
     }
 }
@@ -4066,7 +4058,7 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
     }
 }
 
-pub(crate) async fn handle_hyper_connection<T>(stream: T, client: SocketAddr, appstate: AppState)
+pub(crate) async fn handle_hyper_connection<T>(stream: T, client: ClientInfo, appstate: AppState)
 where
     T: tokio::io::AsyncRead
         + tokio::io::AsyncWrite
@@ -4125,37 +4117,22 @@ where
         .await
     {
         if err.is_incomplete_message() || is_connection_reset(&err) {
-            info!(
-                "Connection to client {} cancelled",
-                client.ip().to_canonical()
-            );
+            info!("Connection to client {client} cancelled");
         } else if is_shutdown_disconnect(&err) {
-            info!(
-                "Improper connection shutdown for client {}:  {err}",
-                client.ip().to_canonical()
-            );
+            info!("Improper connection shutdown for client {client}:  {err}");
         } else if is_broken_pipe(&err) {
-            info!(
-                "Broken pipe for client {}:  {err}",
-                client.ip().to_canonical()
-            );
+            info!("Broken pipe for client {client}:  {err}");
         } else if let Some(perr) = is_timeout(&err) {
             info!("{perr}");
         } else {
-            error!(
-                "Error serving connection for client {}:  {err} -- {err:?}",
-                client.ip().to_canonical()
-            );
+            error!("Error serving connection for client {client}:  {err} -- {err:?}");
             let mut lerr: &dyn Error = &err;
             loop {
                 lerr = match lerr.source() {
                     Some(e) => e,
                     None => break,
                 };
-                error!(
-                    "Error serving connection for client {}:  {lerr} -- {lerr:?}",
-                    client.ip().to_canonical()
-                );
+                error!("Error serving connection for client {client}:  {lerr} -- {lerr:?}");
             }
         }
     }
