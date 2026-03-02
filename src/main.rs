@@ -2518,8 +2518,11 @@ async fn serve_new_file(
     let max_age = max_age;
     let host = match host {
         Some(h) => h,
-        None => &HeaderValue::from_str(&conn_details.mirror.host)
-            .expect("connection host should be valid"),
+        None => {
+            // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers
+            &HeaderValue::from_str(&conn_details.mirror.host.format_authority(None))
+                .expect("connection host should be valid")
+        }
     };
 
     let mut req_uri = std::borrow::Cow::Borrowed(req.uri());
@@ -3817,15 +3820,11 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     async move {
                         let host = &mirror.host;
 
-                        let authority = if let Some(port) = mirror.port() {
-                            format!("{host}:{port}")
-                        } else {
-                            host.to_string()
-                        };
+                        let authority = host.format_authority(mirror.port());
 
                         let uri = Uri::builder()
                             .scheme("http")
-                            .authority(authority.as_str())
+                            .authority(authority.to_string())
                             .path_and_query("/")
                             .build()
                             .expect("Valid URI");

@@ -14,11 +14,7 @@ pub(crate) struct Mirror {
 
 impl std::fmt::Display for Mirror {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(port) = self.port {
-            write!(f, "{}:{port}/{}", self.host, self.path)
-        } else {
-            write!(f, "{}/{}", self.host, self.path)
-        }
+        write!(f, "{}/{}", self.host.format_authority(self.port), self.path)
     }
 }
 
@@ -112,7 +108,7 @@ pub(crate) trait UriFormat {
 }
 
 fn format_origin_uri(
-    host: &str,
+    host: &DomainName,
     port: Option<NonZero<u16>>,
     mirror_path: &str,
     dist: &str,
@@ -121,11 +117,8 @@ fn format_origin_uri(
 ) -> String {
     // deb.debian.org/debian/dists/sid/main/binary-amd64/Packages
 
-    if let Some(port) = port {
-        format!("http://{host}:{port}/{mirror_path}/dists/{dist}/{comp}/{arch}/Packages")
-    } else {
-        format!("http://{host}/{mirror_path}/dists/{dist}/{comp}/{arch}/Packages")
-    }
+    let authority = host.format_authority(port);
+    format!("http://{authority}/{mirror_path}/dists/{dist}/{comp}/{arch}/Packages")
 }
 
 impl UriFormat for Origin {
@@ -501,6 +494,45 @@ mod tests {
         assert_eq!(
             result.uri(),
             "http://apt.llvm.org:443/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages"
+        );
+    }
+
+    #[test]
+    fn test_parse_ipv6() {
+        let result = Origin::from_path(
+            "/debian/dists/sid/main/binary-amd64/Packages/",
+            DomainName::new("2001:db8::1".to_string()).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Origin {
+                mirror: Mirror {
+                    host: DomainName::new("2001:db8::1".to_string()).unwrap(),
+                    port: None,
+                    path: "debian".to_string(),
+                },
+                distribution: "sid".to_string(),
+                component: "main".to_string(),
+                architecture: "binary-amd64".to_string()
+            }
+        );
+        assert_eq!(
+            result.uri(),
+            "http://[2001:db8::1]/debian/dists/sid/main/binary-amd64/Packages"
+        );
+
+        // IPv6 with port
+        let result = Origin::from_path(
+            "/debian/dists/sid/main/binary-amd64/Packages/",
+            DomainName::new("::1".to_string()).unwrap(),
+            Some(nonzero!(8080)),
+        )
+        .unwrap();
+        assert_eq!(
+            result.uri(),
+            "http://[::1]:8080/debian/dists/sid/main/binary-amd64/Packages"
         );
     }
 
