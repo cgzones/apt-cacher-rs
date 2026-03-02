@@ -89,7 +89,8 @@ impl<B: Body + Debug, E, F: FnMut(<B as hyper::body::Body>::Error) -> E> DebugBo
 
 #[derive(Debug)]
 pub(crate) struct RateCheckedBody<D> {
-    inner: Pin<Box<dyn DebugBody<Data = D, Error = RateCheckedBodyErr> + Send + Sync + 'static>>,
+    inner:
+        Pin<Box<dyn DebugBody<Data = D, Error = Box<RateCheckedBodyErr>> + Send + Sync + 'static>>,
     rchecker: RateChecker,
 }
 
@@ -97,7 +98,7 @@ impl<D: bytes::Buf> RateCheckedBody<D> {
     #[must_use]
     pub(crate) fn new<B>(body: B, min_download_rate: NonZero<usize>) -> Self
     where
-        B: DebugBody<Data = D, Error = RateCheckedBodyErr> + Send + Sync + 'static,
+        B: DebugBody<Data = D, Error = Box<RateCheckedBodyErr>> + Send + Sync + 'static,
         D: bytes::Buf,
     {
         Self {
@@ -109,7 +110,7 @@ impl<D: bytes::Buf> RateCheckedBody<D> {
 
 impl<D: bytes::Buf> Body for RateCheckedBody<D> {
     type Data = D;
-    type Error = RateCheckedBodyErr;
+    type Error = Box<RateCheckedBodyErr>;
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
@@ -124,9 +125,9 @@ impl<D: bytes::Buf> Body for RateCheckedBody<D> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         if let Some(download_rate_err) = self.rchecker.check_fail() {
-            return std::task::Poll::Ready(Some(Err(RateCheckedBodyErr::DownloadRate(
+            return std::task::Poll::Ready(Some(Err(Box::new(RateCheckedBodyErr::DownloadRate(
                 download_rate_err,
-            ))));
+            )))));
         }
 
         let msg = self.inner.as_mut().poll_frame(cx);

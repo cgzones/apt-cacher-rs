@@ -34,7 +34,7 @@ async fn body_to_file(
     let mut writer = BufWriter::with_capacity(global_config().buffer_size, file);
 
     while let Some(next) = body.frame().await {
-        let frame = next?;
+        let frame = next.map_err(|err| *err)?;
         if let Ok(mut chunk) = frame.into_data() {
             writer.write_all_buf(&mut chunk).await?;
         }
