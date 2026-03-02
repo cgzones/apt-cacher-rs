@@ -28,23 +28,16 @@ impl LogStoreImpl {
 impl std::io::Write for LogStoreImpl {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer.extend_from_slice(buf);
-
-        let mut buf_slice = self.buffer.as_mut_slice();
-
-        while let Some(pos) = buf_slice.iter().position(|&x| x == b'\n') {
-            let buf_len = buf_slice.len();
-
-            let (line, _rest) = buf_slice.split_at(pos);
-
+        let mut start = 0;
+        while let Some(pos) = self.buffer[start..].iter().position(|&x| x == b'\n') {
+            let line = &self.buffer[start..start + pos];
             let s = String::from_utf8_lossy(line);
             self.entries.push(s.trim().to_string());
-
-            buf_slice.copy_within((pos + 1).., 0);
-            self.buffer.truncate(buf_len - (pos + 1));
-
-            buf_slice = self.buffer.as_mut_slice();
+            start += pos + 1;
         }
-
+        if start > 0 {
+            self.buffer.drain(..start);
+        }
         Ok(buf.len())
     }
 
