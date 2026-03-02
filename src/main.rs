@@ -3199,7 +3199,7 @@ async fn pre_process_client_request(
         &Method::CONNECT => return connect_response(client, req),
         &Method::GET => {}
         m => {
-            warn_once_or_info!("Unsupported request method {m}");
+            warn_once_or_info!("Unsupported request method {m} from client {client}");
             return quick_response(hyper::StatusCode::BAD_REQUEST, "Method not supported");
         }
     }
@@ -3237,7 +3237,7 @@ async fn pre_process_client_request(
                         .iter()
                         .any(|ac| ac.contains(&client_ip))
                 {
-                    warn_once_or_info!("Unauthorized web-interface client {client}");
+                    warn_once_or_info!("Unauthorized web-interface access by client {client}");
                     return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
                 }
             }
@@ -3248,7 +3248,7 @@ async fn pre_process_client_request(
     let requested_port = match req.uri().port_u16() {
         Some(port) => {
             let Some(port) = NonZero::new(port) else {
-                warn_once_or_info!("Unsupported request port 0");
+                warn_once_or_info!("Unsupported request port 0 from client {client}");
                 return quick_response(hyper::StatusCode::BAD_REQUEST, "Invalid port");
             };
             Some(port)
@@ -3268,7 +3268,9 @@ async fn pre_process_client_request(
         .map(|alias| &alias.main);
 
     if req.body().size_hint().exact() != Some(0) {
-        warn_once_or_info!("Request has non empty body, not forwarding body: {req:?}");
+        warn_once_or_info!(
+            "Request from client {client} has non empty body, not forwarding body: {req:?}"
+        );
     }
     let (parts, _body) = req.into_parts();
     let req = Request::from_parts(parts, Empty::new());
@@ -3363,7 +3365,9 @@ async fn pre_process_client_request(
                     return process_cache_request(conn_details, req, appstate).await;
                 }
 
-                warn_once_or_info!("Unsupported pool file extension in filename `{filename}`");
+                warn_once_or_info!(
+                    "Unsupported pool file extension in filename `{filename}` from client {client}"
+                );
             }
             ResourceFile::Release {
                 mirror_path,
@@ -3535,9 +3539,15 @@ async fn pre_process_client_request(
     }
 
     if ignore_uncached_path(requested_path) {
-        info!("Proxying (without caching) request {}", req.uri());
+        info!(
+            "Proxying (without caching) request {} for client {client}",
+            req.uri()
+        );
     } else {
-        warn_once_or_info!("Proxying (without caching) request {}", req.uri());
+        warn_once_or_info!(
+            "Proxying (without caching) request {} for client {client}",
+            req.uri()
+        );
 
         let mut uncacheables = UNCACHEABLES.get().expect("Initialized in main()").write();
 
@@ -3572,7 +3582,7 @@ async fn pre_process_client_request(
     let fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
         Err(err) => {
-            warn!("Proxy request to host {requested_host} failed:  {err}");
+            warn!("Proxy request to host {requested_host} failed for client {client}:  {err}");
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
         }
     };
@@ -3623,17 +3633,20 @@ async fn pre_process_client_request(
 
             trace!("Redirected request: {redirected_request:?}");
 
-            let redirected_response =
-                match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok(r) => r,
-                    Err(err) => {
-                        warn!("Redirected proxy request to host {requested_host} failed:  {err}");
-                        return quick_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Proxy request failed",
-                        );
-                    }
-                };
+            let redirected_response = match request_with_retry(
+                &appstate.https_client,
+                redirected_request,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    warn!(
+                        "Redirected proxy request to host {requested_host} failed for client {client}:  {err}"
+                    );
+                    return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+                }
+            };
 
             trace!("Redirected response: {redirected_response:?}");
 
