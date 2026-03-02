@@ -1843,7 +1843,7 @@ async fn download_file(
                     }
                 }
 
-                // Defuse the scopeguard — the file has been successfully renamed
+                // Defuse the scopeguard - the file has been successfully renamed
                 scopeguard::ScopeGuard::into_inner(outpath);
                 dbarrier.release(locked_status, dest_file_path);
             }
