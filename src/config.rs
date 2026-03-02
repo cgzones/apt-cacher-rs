@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -174,6 +175,18 @@ impl DomainName {
             (true, None) => Cow::Owned(format!("[{self}]")),
             (false, Some(port)) => Cow::Owned(format!("{self}:{port}")),
             (false, None) => Cow::Borrowed(self.as_str()),
+        }
+    }
+
+    /// Format as a cache directory name component.
+    ///
+    /// Unlike [`format_authority`](Self::format_authority), IPv6 addresses
+    /// are **not** bracketed — the bare address is used as a directory name.
+    #[must_use]
+    pub(crate) fn format_cache_dir(&self, port: Option<NonZero<u16>>) -> Cow<'_, str> {
+        match port {
+            Some(port) => Cow::Owned(format!("{self}:{port}")),
+            None => Cow::Borrowed(self.as_str()),
         }
     }
 }

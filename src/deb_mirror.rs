@@ -19,17 +19,14 @@ impl std::fmt::Display for Mirror {
 }
 
 pub(crate) fn mirror_cache_path_impl(
-    host: &str,
+    host: &DomainName,
     port: Option<NonZero<u16>>,
     path: &str,
 ) -> PathBuf {
-    let cache_path: PathBuf = if let Some(port) = port {
-        let mut p = PathBuf::from(format!("{host}:{port}"));
-        p.push(path);
-        p
-    } else {
-        [Path::new(host), Path::new(path)].iter().collect()
-    };
+    let host_dir = host.format_cache_dir(port);
+    let cache_path: PathBuf = [Path::new(host_dir.as_ref()), Path::new(path)]
+        .iter()
+        .collect();
 
     assert!(cache_path.is_relative());
 
