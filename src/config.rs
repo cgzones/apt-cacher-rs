@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::num::NonZero;
-use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr as _;
@@ -63,27 +63,43 @@ pub(crate) enum HttpsUpgradeMode {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ConfigDomainName {
+    Dns(String),
+    Ipv4(String, Ipv4Addr),
+    Ipv6(String, Ipv6Addr),
     Wildcard(String),
-    Full(String),
 }
 
 impl ConfigDomainName {
     pub(crate) fn new(domain: String) -> Result<Self, String> {
-        if is_valid_config_domain(&domain) {
-            match domain.strip_prefix('*') {
-                Some(d) => Ok(Self::Wildcard(d.to_string())),
-                None => Ok(Self::Full(domain)),
-            }
-        } else {
-            Err(domain)
+        if !is_valid_config_domain(&domain) {
+            return Err(domain);
         }
+
+        if let Some(d) = domain.strip_prefix('*') {
+            return Ok(Self::Wildcard(d.to_string()));
+        }
+
+        if domain.contains(':') {
+            return domain
+                .parse::<Ipv6Addr>()
+                .map(|addr| Self::Ipv6(addr.to_string(), addr))
+                .map_err(|_parse_err| domain);
+        }
+
+        if let Ok(addr) = domain.parse::<Ipv4Addr>() {
+            return Ok(Self::Ipv4(addr.to_string(), addr));
+        }
+
+        Ok(Self::Dns(domain))
     }
 
     #[must_use]
     pub(crate) fn permits(&self, domain: &str) -> bool {
         match self {
             Self::Wildcard(d) => domain.ends_with(d),
-            Self::Full(d) => domain == d,
+            Self::Dns(d) => domain == d,
+            Self::Ipv4(s, a) => domain == s || domain.parse::<Ipv4Addr>().is_ok_and(|d| d == *a),
+            Self::Ipv6(s, a) => domain == s || domain.parse::<Ipv6Addr>().is_ok_and(|d| d == *a),
         }
     }
 }
@@ -102,31 +118,89 @@ impl<'de> Deserialize<'de> for ConfigDomainName {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
-#[sqlx(transparent)]
-pub(crate) struct DomainName(String);
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum DomainName {
+    Dns(String),
+    Ipv4(String, Ipv4Addr),
+    Ipv6(String, Ipv6Addr),
+}
 
 impl DomainName {
     pub(crate) fn new(domain: String) -> Result<Self, String> {
+        if domain.contains(':') {
+            return domain
+                .parse::<Ipv6Addr>()
+                .map(|addr| Self::Ipv6(addr.to_string(), addr))
+                .map_err(|_parse_err| domain);
+        }
+
+        if let Ok(addr) = domain.parse::<Ipv4Addr>() {
+            return Ok(Self::Ipv4(addr.to_string(), addr));
+        }
+
         if is_valid_domain(&domain) {
-            Ok(Self(domain))
+            Ok(Self::Dns(domain))
         } else {
             Err(domain)
         }
     }
+
+    /// Return `true` if this domain name is an IPv6 address.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn is_ipv6(&self) -> bool {
+        match self {
+            Self::Dns(_) | Self::Ipv4(..) => false,
+            Self::Ipv6(..) => true,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Dns(s) | Self::Ipv4(s, _) | Self::Ipv6(s, _) => s,
+        }
+    }
+
+    /// Format as a URI authority component (RFC 3986 §3.2).
+    ///
+    /// IPv6 addresses are bracketed per §3.2.2.
+    /// A port is appended with `:` when present.
+    #[must_use]
+    pub(crate) fn format_authority(&self, port: Option<NonZero<u16>>) -> Cow<'_, str> {
+        match (self.is_ipv6(), port) {
+            (true, Some(port)) => Cow::Owned(format!("[{self}]:{port}")),
+            (true, None) => Cow::Owned(format!("[{self}]")),
+            (false, Some(port)) => Cow::Owned(format!("{self}:{port}")),
+            (false, None) => Cow::Borrowed(self.as_str()),
+        }
+    }
 }
 
-impl Deref for DomainName {
+impl std::ops::Deref for DomainName {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.as_str()
+    }
+}
+
+impl Ord for DomainName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for DomainName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
 impl std::fmt::Display for DomainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.as_str().fmt(f)
     }
 }
 
@@ -146,21 +220,59 @@ impl<'de> Deserialize<'de> for DomainName {
 
 impl AsRef<std::ffi::OsStr> for DomainName {
     fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.as_ref()
+        self.as_str().as_ref()
     }
 }
 
 /// Used by sqlx to convert database rows into `DomainName`.
 /// Data stored in the DB was validated before insertion.
-impl From<std::string::String> for DomainName {
-    fn from(value: std::string::String) -> Self {
+impl From<String> for DomainName {
+    fn from(value: String) -> Self {
         Self::new(value).expect("Caller must ensure value is a valid domain")
     }
 }
 
-impl From<DomainName> for std::string::String {
+impl From<DomainName> for String {
     fn from(val: DomainName) -> Self {
-        val.0
+        match val {
+            DomainName::Dns(s) | DomainName::Ipv4(s, _) | DomainName::Ipv6(s, _) => s,
+        }
+    }
+}
+
+impl<'a> From<&'a DomainName> for &'a String {
+    fn from(val: &'a DomainName) -> Self {
+        match val {
+            DomainName::Dns(s) | DomainName::Ipv4(s, _) | DomainName::Ipv6(s, _) => s,
+        }
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for DomainName {
+    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
+        <String as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+
+    fn compatible(ty: &<sqlx::Sqlite as sqlx::Database>::TypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for DomainName {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <String as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(self.into(), buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
+    fn decode(
+        value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let s = <String as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value)?;
+        Self::new(s).map_err(|s| format!("Invalid domain in database: {s}").into())
     }
 }
 
@@ -606,6 +718,11 @@ pub(crate) fn is_valid_domain(domain: &str) -> bool {
         return false;
     }
 
+    // IPv6 addresses contain colons
+    if domain.contains(':') {
+        return domain.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+
     for part in domain.split('.') {
         if part.is_empty() || part.len() > 64 {
             return false;
@@ -631,6 +748,11 @@ pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
 
     if domain.is_empty() {
         return false;
+    }
+
+    // IPv6 addresses contain colons; wildcards don't apply to them
+    if domain.contains(':') {
+        return domain.parse::<std::net::Ipv6Addr>().is_ok();
     }
 
     let mut is_wildcard = false;
@@ -661,6 +783,14 @@ pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
 
     if is_wildcard && part_count < 3 {
         return false;
+    }
+
+    // Reject wildcards that look like partial IPv4 addresses (e.g. "*.1.1")
+    if is_wildcard {
+        let suffix = domain.strip_prefix("*.").unwrap_or(domain);
+        if suffix.split('.').all(|p| p.parse::<u8>().is_ok()) {
+            return false;
+        }
     }
 
     true
@@ -901,6 +1031,24 @@ mod test {
         assert!(!is_valid_domain("*e.debian.org"));
         assert!(!is_valid_domain("deb.*.debian.org"));
         assert!(!is_valid_domain("debian.*"));
+
+        // IPv4 addresses
+        assert!(is_valid_domain("192.168.1.1"));
+        assert!(is_valid_domain("10.0.0.1"));
+        assert!(is_valid_domain("127.0.0.1"));
+        assert!(is_valid_domain("255.255.255.255"));
+
+        // IPv6 addresses
+        assert!(is_valid_domain("::1"));
+        assert!(is_valid_domain("2001:db8::1"));
+        assert!(is_valid_domain("fe80::1"));
+        assert!(is_valid_domain("::ffff:192.168.1.1"));
+        assert!(is_valid_domain("2001:0db8:0000:0000:0000:0000:0000:0001"));
+
+        // invalid IPv6
+        assert!(!is_valid_domain(":::1"));
+        assert!(!is_valid_domain("2001:db8::xyz"));
+        assert!(!is_valid_domain("2001:db8::1::2"));
     }
 
     #[test]
@@ -962,5 +1110,30 @@ mod test {
         assert!(!is_valid_config_domain("*.com"));
         assert!(is_valid_config_domain("*.debian.org"));
         assert!(is_valid_config_domain("*.ftp.debian.org"));
+
+        // IPv4 addresses
+        assert!(is_valid_config_domain("192.168.1.1"));
+        assert!(is_valid_config_domain("10.0.0.1"));
+        assert!(is_valid_config_domain("127.0.0.1"));
+        assert!(is_valid_config_domain("255.255.255.255"));
+
+        // IPv6 addresses
+        assert!(is_valid_config_domain("::1"));
+        assert!(is_valid_config_domain("2001:db8::1"));
+        assert!(is_valid_config_domain("fe80::1"));
+        assert!(is_valid_config_domain("::ffff:192.168.1.1"));
+        assert!(is_valid_config_domain(
+            "2001:0db8:0000:0000:0000:0000:0000:0001"
+        ));
+
+        // invalid IPv6
+        assert!(!is_valid_config_domain(":::1"));
+        assert!(!is_valid_config_domain("2001:db8::xyz"));
+        assert!(!is_valid_config_domain("2001:db8::1::2"));
+
+        // Wildcards that look like partial IPv4 addresses
+        assert!(!is_valid_config_domain("*.1.1"));
+        assert!(!is_valid_config_domain("*.168.1.1"));
+        assert!(!is_valid_config_domain("*.0.0.1"));
     }
 }

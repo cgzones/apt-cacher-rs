@@ -63,11 +63,7 @@ impl MirrorStatEntry {
 
     #[must_use]
     pub(crate) fn uri(&self) -> String {
-        if self.port == 0 {
-            format!("{}/{}", self.host, self.path)
-        } else {
-            format!("{}:{}/{}", self.host, self.port, self.path)
-        }
+        format!("{}/{}", self.host.format_authority(self.port()), self.path)
     }
 
     #[must_use]
@@ -96,11 +92,11 @@ impl OriginEntry {
 
     #[must_use]
     pub(crate) fn mirror_uri(&self) -> String {
-        if self.port == 0 {
-            format!("{}/{}", self.host, self.mirror_path)
-        } else {
-            format!("{}:{}/{}", self.host, self.port, self.mirror_path)
-        }
+        format!(
+            "{}/{}",
+            self.host.format_authority(self.port()),
+            self.mirror_path
+        )
     }
 }
 
