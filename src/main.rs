@@ -3187,6 +3187,15 @@ async fn pre_process_client_request(
         if let Some(h) = req.uri().authority().map(hyper::http::uri::Authority::host) {
             h.to_owned()
         } else {
+            // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
+            // HTTP/1.1 request that lacks a Host header field.
+            // HTTP/1.0 did not require Host, so only enforce for 1.1+.
+            if req.version() == hyper::Version::HTTP_11
+                && !req.headers().contains_key(hyper::header::HOST)
+            {
+                return quick_response(hyper::StatusCode::BAD_REQUEST, "Missing Host header");
+            }
+
             {
                 let allowed_webif_clients = cfg
                     .allowed_webif_clients
