@@ -1,7 +1,4 @@
-use std::{
-    borrow::Cow,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
 use log::{error, trace, warn};
 use tokio::fs::DirEntry;
@@ -44,11 +41,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
     let mirrors_with_names: Vec<_> = mirrors
         .iter()
         .map(|mirror| {
-            let dir_name: Cow<'_, Path> = if let Some(port) = mirror.port() {
-                Cow::Owned(PathBuf::from(format!("{}:{port}", mirror.host)))
-            } else {
-                Cow::Borrowed(Path::new(&mirror.host))
-            };
+            let dir_name = mirror.host.format_cache_dir(mirror.port());
             (mirror, dir_name)
         })
         .collect();
@@ -79,7 +72,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         let mut scanned = false;
 
         for (mirror, dir_name) in &mirrors_with_names {
-            if filename != *dir_name {
+            if filename != dir_name.as_ref() {
                 continue;
             }
 

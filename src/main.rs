@@ -1388,11 +1388,8 @@ impl ConnectionDetails {
         let root = &global_config().cache_directory;
 
         let host = self.aliased_host.unwrap_or(&self.mirror.host);
-        let host: PathBuf = if let Some(port) = self.mirror.port {
-            PathBuf::from(format!("{host}:{port}"))
-        } else {
-            PathBuf::from(host)
-        };
+        let host = host.format_cache_dir(self.mirror.port);
+        let host = Path::new(host.as_ref());
         assert!(host.is_relative());
 
         let uri_path = Path::new(&self.mirror.path);
@@ -1401,7 +1398,7 @@ impl ConnectionDetails {
         let subdir = self.subdir.unwrap_or_else(|| Path::new(""));
         assert!(subdir.is_relative());
 
-        [root, &host, uri_path, subdir].iter().collect()
+        [root.as_path(), host, uri_path, subdir].iter().collect()
     }
 }
 
