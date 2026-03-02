@@ -800,9 +800,12 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
 }
 
 #[cfg(feature = "mmap")]
+const MMAP_FRAME_SIZE: usize = 2 * 1024 * 1024; // 2MiB
+
+#[cfg(feature = "mmap")]
 #[derive(Debug)]
 struct MmapBody {
-    mapping: Option<Mmap>,
+    mapping: Arc<Mmap>,
     position: usize,
     length: usize,
     partial: bool,
@@ -823,7 +826,7 @@ impl MmapBody {
         conn_details: ConnectionDetails,
     ) -> Self {
         Self {
-            mapping: Some(mapping),
+            mapping: Arc::new(mapping),
             position: 0,
             length,
             partial,
@@ -899,7 +902,7 @@ impl Drop for MmapBody {
 #[cfg(feature = "mmap")]
 #[derive(Debug)]
 struct MmapData {
-    mapping: Mmap,
+    mapping: Arc<Mmap>,
     position: usize,
     remaining: usize,
 }
@@ -940,21 +943,22 @@ impl Body for MmapBody {
         mut self: Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if self.is_end_stream() {
+        // same logic as in Self::is_end_stream()
+        debug_assert!(self.position <= self.length);
+        let remaining_total = self.length - self.position;
+        if remaining_total == 0 {
             return Ready(None);
         }
 
-        // TODO: split frames?
+        let chunk_size = remaining_total.min(MMAP_FRAME_SIZE);
+
         let frame = Frame::data(MmapData {
-            mapping: self
-                .mapping
-                .take()
-                .expect("initialized in new() and only one frame is created"),
+            mapping: Arc::clone(&self.mapping),
             position: self.position,
-            remaining: self.length,
+            remaining: chunk_size,
         });
 
-        self.as_mut().position = self.length;
+        self.as_mut().position += chunk_size;
 
         Ready(Some(Ok(frame)))
     }
