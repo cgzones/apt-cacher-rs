@@ -2557,6 +2557,20 @@ async fn serve_new_file(
 
     let mut req_uri = std::borrow::Cow::Borrowed(req.uri());
 
+    if let Some(max) = global_config().max_upstream_downloads
+        && appstate.active_downloads.len() > max.get()
+    {
+        warn_once_or_info!(
+            "Max upstream downloads ({max}) exceeded, rejecting request for {} from client {}",
+            conn_details.debname,
+            conn_details.client
+        );
+        return quick_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many concurrent upstream downloads",
+        );
+    }
+
     let fwd_request = build_fwd_request(&req_uri, max_age, host, &cfstate);
     trace!("Forwarded request: {fwd_request:?}");
 

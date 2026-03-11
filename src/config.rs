@@ -44,6 +44,7 @@ const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
 const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
+const DEFAULT_MAX_UPSTREAM_DOWNLOADS: Option<NonZero<usize>> = Some(nonzero!(20));
 const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
 const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
@@ -438,6 +439,11 @@ pub(crate) struct Config {
     )]
     pub(crate) min_download_rate: Option<NonZero<usize>>,
 
+    /// Maximum number of concurrent upstream downloads.
+    /// `None` means unlimited.
+    #[serde(default = "default_max_upstream_downloads")]
+    pub(crate) max_upstream_downloads: Option<NonZero<usize>>,
+
     #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
@@ -665,6 +671,10 @@ const fn default_min_download_rate() -> Option<NonZero<usize>> {
     DEFAULT_MIN_DOWNLOAD_RATE
 }
 
+const fn default_max_upstream_downloads() -> Option<NonZero<usize>> {
+    DEFAULT_MAX_UPSTREAM_DOWNLOADS
+}
+
 const fn default_experimental_parallel_hack_enabled() -> bool {
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED
 }
@@ -834,6 +844,7 @@ impl Config {
             usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
             logstore_capacity: DEFAULT_LOGSTORE_CAPACITY,
             min_download_rate: DEFAULT_MIN_DOWNLOAD_RATE,
+            max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
             experimental_parallel_hack_enabled: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED,
             experimental_parallel_hack_maxparallel: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL,
             experimental_parallel_hack_statuscode: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE,
