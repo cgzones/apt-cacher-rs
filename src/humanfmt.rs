@@ -69,20 +69,25 @@ impl std::fmt::Display for HumanFmt {
                 if time < 1000 {
                     return f.write_fmt(format_args!("{time}ns"));
                 }
+
                 let time = time as f64 / 1000.0;
                 if time < 1000.0 {
                     return f.write_fmt(format_args!("{time:.0$}us", precision(time)));
                 }
+
                 let time = time / 1000.0;
                 if time < 1000.0 {
                     return f.write_fmt(format_args!("{time:.0$}ms", precision(time)));
                 }
+
                 let time = time / 1000.0;
                 if time < 600.0 {
                     return f.write_fmt(format_args!("{time:.0$}s", precision(time)));
                 }
+
                 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let time = time as u64;
+
                 let secs = time % 60;
                 let time = time / 60;
                 let mins = time % 60;
@@ -98,19 +103,26 @@ impl std::fmt::Display for HumanFmt {
                 };
 
                 let hours_fmt = if hours != 0 {
-                    format_args!("{hours}h")
+                    format_args!("{}{hours}h", if days != 0 { " " } else { "" })
                 } else {
                     format_args!("")
                 };
 
                 let mins_fmt = if mins != 0 {
-                    format_args!("{mins}m")
+                    format_args!("{}{mins}m", if hours == 0 && days == 0 { "" } else { " " })
                 } else {
                     format_args!("")
                 };
 
                 let secs_fmt = if secs != 0 {
-                    format_args!("{secs}s")
+                    format_args!(
+                        "{}{secs}s",
+                        if mins == 0 && hours == 0 && days == 0 {
+                            ""
+                        } else {
+                            " "
+                        }
+                    )
                 } else {
                     format_args!("")
                 };
@@ -203,19 +215,19 @@ mod tests {
         );
         assert_eq!(
             format!("{}", HumanFmt::Time(Duration::from_secs(601))),
-            "10m1s"
+            "10m 1s"
         );
         assert_eq!(
             format!("{}", HumanFmt::Time(Duration::from_secs(86401))),
-            "1d1s"
+            "1d 1s"
         );
         assert_eq!(
             format!("{}", HumanFmt::Time(Duration::from_mins(1441))),
-            "1d1m"
+            "1d 1m"
         );
         assert_eq!(
             format!("{}", HumanFmt::Time(Duration::from_nanos(u64::MAX))),
-            "213503d23h34m33s"
+            "213503d 23h 34m 33s"
         );
     }
 }
