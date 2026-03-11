@@ -873,7 +873,7 @@ impl Drop for MmapBody {
                     client_ip: cd.client.ip(),
                 });
                 db_tx.send(cmd).await.expect("database task should not die");
-            } else if transferred_bytes == 0 && elapsed < coarsetime::Duration::from_secs(1) {
+            } else if transferred_bytes == 0 {
                 info!(
                     "Aborted serving cached file {} from mirror {}{} for client {} after {}",
                     cd.debname,
