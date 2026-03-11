@@ -700,7 +700,9 @@ async fn read_request_headers(
 #[must_use]
 #[inline]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    buf.array_windows()
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
 }
 
 /// Find a header value by name (case-insensitive).
