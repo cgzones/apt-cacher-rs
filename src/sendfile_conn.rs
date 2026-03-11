@@ -66,7 +66,6 @@ impl Display for ConnectionVersion {
     }
 }
 
-#[derive(Copy, Clone)]
 enum SendfileResult {
     /// Request was served via sendfile
     Served(ConnectionAction),
