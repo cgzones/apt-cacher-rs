@@ -235,12 +235,13 @@ async fn try_sendfile_request(
     match req.parse(buf) {
         Ok(httparse::Status::Complete(_)) => match req.version.expect("complete header parsed") {
             1 => *conn_version = ConnectionVersion::Http11,
+            0 => *conn_version = ConnectionVersion::Http10,
             v => {
-                if v != 0 {
-                    warn_once!("Unsupported HTTP 1 subversion `{v}` from client {client}");
-                }
-
-                *conn_version = ConnectionVersion::Http10;
+                warn_once!("Unsupported HTTP/1.{v} from client {client}");
+                return SendfileResult::Invalid {
+                    status: StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+                    msg: "HTTP version not supported",
+                };
             }
         },
         Ok(httparse::Status::Partial) => {
@@ -254,6 +255,13 @@ async fn try_sendfile_request(
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Incomplete request header",
+            };
+        }
+        Err(httparse::Error::Version) => {
+            warn_once_or_info!("Unsupported HTTP version from client {client}");
+            return SendfileResult::Invalid {
+                status: StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+                msg: "HTTP version not supported",
             };
         }
         Err(err) => {
