@@ -298,6 +298,18 @@ async fn try_sendfile_request(
         }
     };
 
+    // Proxy GET requests always use http://, HTTPS goes through CONNECT.
+    // Reject any other scheme (e.g. ftp://, file://).
+    if let Some(scheme) = uri.scheme()
+        && *scheme != http::uri::Scheme::HTTP
+    {
+        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}");
+        return SendfileResult::Invalid {
+            status: StatusCode::BAD_REQUEST,
+            msg: "Unsupported URI scheme",
+        };
+    }
+
     let Some(authority) = uri.authority() else {
         // No authority means it's likely a direct request (web interface) - fall back
         return SendfileResult::NotApplicable;
