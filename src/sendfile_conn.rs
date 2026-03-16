@@ -28,7 +28,8 @@ use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::RateChecker;
 use crate::{
     APP_NAME, AppState, CachedFlavor, ClientInfo, ConnectionDetails, Never, authorize_cache_access,
-    client_counter, global_config, handle_hyper_connection, warn_once, warn_once_or_info,
+    client_counter, global_config, handle_hyper_connection, static_assert, warn_once,
+    warn_once_or_info,
 };
 
 /// Maximum size for HTTP request headers buffer.
@@ -607,8 +608,7 @@ async fn async_sendfile(
 
         // Limit each sendfile call to avoid exceeding system limits.
         // 0x7fff_f000 is always within usize range since it fits in 31 bits.
-        #[expect(clippy::items_after_statements)]
-        const _: () = assert!(0x7fff_f000 < usize::MAX);
+        static_assert!(0x7fff_f000 < usize::MAX);
         #[expect(clippy::cast_possible_truncation)]
         let chunk_size = std::cmp::min(remaining, 0x7fff_f000) as usize;
 
