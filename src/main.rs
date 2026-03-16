@@ -48,7 +48,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-#[cfg(not(feature = "mmap"))]
 use std::task::Poll::Pending;
 use std::task::Poll::Ready;
 use std::time::Duration;
@@ -59,12 +58,9 @@ use channel_body::ChannelBodyError;
 use clap::Parser;
 use coarsetime::Instant;
 use futures_util::StreamExt as _;
-#[cfg(not(feature = "mmap"))]
 use futures_util::TryStreamExt as _;
-use hashbrown::{
-    Equivalent, HashMap,
-    hash_map::{Entry, EntryRef},
-};
+use hashbrown::hash_map::Entry;
+use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
 use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
 use http_range::http_parse_range;
 use hyper::Uri;
@@ -103,7 +99,6 @@ use log::{Level, LevelFilter, debug, error, info, log, trace, warn};
 #[cfg(feature = "mmap")]
 use memmap2::{Advice, Mmap, MmapOptions};
 use pin_project::pin_project;
-#[cfg(not(feature = "mmap"))]
 use pin_project::pinned_drop;
 use rand::RngExt as _;
 use rand::distr::Alphanumeric;
@@ -117,7 +112,6 @@ use simplelog::ConfigBuilder;
 use simplelog::WriteLogger;
 use simplelog::{ColorChoice, TermLogger, TerminalMode};
 use tokio::io::AsyncReadExt as _;
-#[cfg(not(feature = "mmap"))]
 use tokio::io::AsyncSeekExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
@@ -562,7 +556,6 @@ fn quick_response<T: Into<bytes::Bytes>>(
         .expect("Response is valid")
 }
 
-#[cfg(not(feature = "mmap"))]
 /* Adopted from http_body_util::StreamBody */
 #[pin_project(PinnedDrop)]
 #[derive(Debug)]
@@ -579,7 +572,6 @@ struct DeliveryStreamBody<S> {
     _counter: client_counter::ClientDownload,
 }
 
-#[cfg(not(feature = "mmap"))]
 impl<S> DeliveryStreamBody<S> {
     #[must_use]
     fn new(
@@ -603,7 +595,6 @@ impl<S> DeliveryStreamBody<S> {
     }
 }
 
-#[cfg(not(feature = "mmap"))]
 impl<S, D, E: ToString> Body for DeliveryStreamBody<S>
 where
     S: futures_util::Stream<Item = Result<Frame<D>, E>>,
@@ -641,7 +632,6 @@ where
     }
 }
 
-#[cfg(not(feature = "mmap"))]
 #[pinned_drop]
 impl<S> PinnedDrop for DeliveryStreamBody<S> {
     fn drop(self: std::pin::Pin<&mut Self>) {
@@ -1083,37 +1073,38 @@ async fn serve_cached_file(
     };
 
     #[cfg(feature = "mmap")]
-    let content_length: usize = match content_length.try_into() {
-        Ok(c) => c,
-        Err(_err) => {
-            error!(
-                "Content length of {} for file `{}` from mirror {}{} for client {} is too large",
-                content_length,
-                file_path.display(),
-                conn_details.mirror,
-                aliased,
-                conn_details.client
-            );
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
-        }
-    };
+    if content_length >= global_config().mmap_threshold.get() {
+        let mmap_content_length: usize = match content_length.try_into() {
+            Ok(c) => c,
+            Err(_err) => {
+                error!(
+                    "Content length of {} for file `{}` from mirror {}{} for client {} is too large",
+                    content_length,
+                    file_path.display(),
+                    conn_details.mirror,
+                    aliased,
+                    conn_details.client
+                );
+                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            }
+        };
 
-    #[cfg(feature = "mmap")]
-    let response = serve_cached_file_mmap(
-        conn_details,
-        database_tx,
-        file,
-        file_path,
-        last_modified,
-        http_status,
-        content_length,
-        content_start,
-        content_range,
-        partial,
-    )
-    .await;
-    #[cfg(not(feature = "mmap"))]
-    let response = serve_cached_file_buf(
+        return serve_cached_file_mmap(
+            conn_details,
+            database_tx,
+            file,
+            file_path,
+            last_modified,
+            http_status,
+            mmap_content_length,
+            content_start,
+            content_range,
+            partial,
+        )
+        .await;
+    }
+
+    serve_cached_file_buf(
         conn_details,
         database_tx,
         file,
@@ -1126,9 +1117,7 @@ async fn serve_cached_file(
         content_range,
         partial,
     )
-    .await;
-
-    response
+    .await
 }
 
 #[cfg(feature = "mmap")]
@@ -1220,7 +1209,6 @@ async fn serve_cached_file_mmap(
     )
 }
 
-#[cfg(not(feature = "mmap"))]
 #[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 #[inline]
 async fn serve_cached_file_buf(

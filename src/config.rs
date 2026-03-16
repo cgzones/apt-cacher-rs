@@ -48,6 +48,7 @@ const DEFAULT_MAX_UPSTREAM_DOWNLOADS: Option<NonZero<usize>> = Some(nonzero!(20)
 const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
 const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
+const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: hyper::StatusCode =
@@ -449,6 +450,14 @@ pub(crate) struct Config {
     #[serde(default = "default_db_channel_capacity")]
     pub(crate) db_channel_capacity: NonZero<usize>,
 
+    /// Threshold for using memory-mapped files for large downloads.
+    #[cfg_attr(
+        not(feature = "mmap"),
+        expect(dead_code, reason = "only used with mmap feature")
+    )]
+    #[serde(default = "default_mmap_threshold")]
+    pub(crate) mmap_threshold: NonZero<u64>,
+
     #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
@@ -684,6 +693,10 @@ const fn default_db_channel_capacity() -> NonZero<usize> {
     DEFAULT_DB_CHANNEL_CAPACITY
 }
 
+const fn default_mmap_threshold() -> NonZero<u64> {
+    DEFAULT_MMAP_THRESHOLD
+}
+
 const fn default_experimental_parallel_hack_enabled() -> bool {
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED
 }
@@ -861,6 +874,7 @@ impl Config {
             min_download_rate: DEFAULT_MIN_DOWNLOAD_RATE,
             max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
             db_channel_capacity: DEFAULT_DB_CHANNEL_CAPACITY,
+            mmap_threshold: DEFAULT_MMAP_THRESHOLD,
             experimental_parallel_hack_enabled: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED,
             experimental_parallel_hack_maxparallel: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL,
             experimental_parallel_hack_statuscode: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE,
