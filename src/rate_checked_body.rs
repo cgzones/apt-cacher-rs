@@ -31,7 +31,7 @@ impl RateChecker {
         if elapsed_secs >= 1 {
             if elapsed_secs > 1 {
                 debug!(
-                    "RateChecker: more than 1 second ({:.2}s) elapsed since last poll receiving {} ({})",
+                    "RateChecker: {:.2}s elapsed since last poll receiving {} ({})",
                     elapsed.as_f64(),
                     HumanFmt::Size(len as u64),
                     HumanFmt::Rate(len as u64, elapsed)

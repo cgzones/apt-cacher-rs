@@ -1731,14 +1731,22 @@ async fn download_file(
                     }
                     RateCheckedBodyErr::Hyper(herr) => {
                         error!(
-                            "Error extracting frame from body for file {} from mirror {}:  {herr}",
-                            conn_details.debname, conn_details.mirror
+                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {herr}",
+                            conn_details.debname,
+                            conn_details.mirror,
+                            HumanFmt::Time(start.elapsed().into()),
+                            HumanFmt::Size(bytes),
+                            HumanFmt::Rate(bytes, start.elapsed()),
                         );
                     }
                     RateCheckedBodyErr::ProxyCache(perr) => {
                         error!(
-                            "Error extracting frame from body for file {} from mirror {}:  {perr}",
-                            conn_details.debname, conn_details.mirror
+                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {perr}",
+                            conn_details.debname,
+                            conn_details.mirror,
+                            HumanFmt::Time(start.elapsed().into()),
+                            HumanFmt::Size(bytes),
+                            HumanFmt::Rate(bytes, start.elapsed()),
                         );
                     }
                 }
