@@ -74,10 +74,10 @@ impl Body for ChannelBody {
 
                     match (self.remaining.exact(), self.remaining.upper()) {
                         (Some(size), _) => match size.overflowing_sub(datalen) {
-                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge(
-                                self.content_length,
-                                self.received + datalen,
-                            ))),
+                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge {
+                                announced: self.content_length,
+                                received: self.received + datalen,
+                            })),
                             (val, false) => {
                                 self.received += datalen;
                                 self.remaining.set_exact(val);
@@ -85,10 +85,10 @@ impl Body for ChannelBody {
                             }
                         },
                         (None, Some(size)) => match size.overflowing_sub(datalen) {
-                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge(
-                                self.content_length,
-                                self.received + datalen,
-                            ))),
+                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge {
+                                announced: self.content_length,
+                                received: self.received + datalen,
+                            })),
                             (val, false) => {
                                 self.received += datalen;
                                 self.remaining.set_upper(val);

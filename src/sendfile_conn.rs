@@ -599,7 +599,7 @@ async fn async_sendfile(
             let msg = format!(
                 "Timeout occurred after a download rate of {} for the last {} seconds",
                 HumanFmt::Rate(
-                    rate.download_size as u64,
+                    rate.transferred as u64,
                     Duration::from_secs(rate.timeframe.get() as u64)
                 ),
                 rate.timeframe,
