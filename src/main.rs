@@ -701,7 +701,7 @@ enum ProxyCacheBody {
     #[cfg(feature = "mmap")]
     Mmap(#[pin] MmapBody),
     #[cfg(feature = "mmap")]
-    MmapRateChecked(#[pin] RateCheckedBody<MmapData>, IpAddr),
+    MmapRateChecked(#[pin] RateCheckedBody<MmapBody>, IpAddr),
     Boxed(#[pin] BoxBody<bytes::Bytes, Box<ProxyCacheError>>),
     Full(#[pin] Full<bytes::Bytes>),
     Empty(#[pin] Empty<bytes::Bytes>),
@@ -736,30 +736,30 @@ impl Body for ProxyCacheBody {
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
                 .map_err(|never| match never {}),
+
             #[cfg(feature = "mmap")]
             EnumProj::MmapRateChecked(memory_map, client_ip) => memory_map
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
-                .map_err(|rerr| {
-                    let e = match *rerr {
-                        RateCheckedBodyErr::DownloadRate(download_rate_err) => {
-                            ProxyCacheError::ClientDownloadRate(error::ClientDownloadRate {
-                                download_rate_err,
-                                client_ip: *client_ip,
-                            })
-                        }
-                        RateCheckedBodyErr::Hyper(herr) => ProxyCacheError::Hyper(herr),
-                        RateCheckedBodyErr::ProxyCache(perr) => perr,
-                    };
-                    Box::new(e)
+                .map_err(|rerr| match *rerr {
+                    RateCheckedBodyErr::RateTimeout(error) => {
+                        Box::new(ProxyCacheError::ClientDownloadRate {
+                            error,
+                            client_ip: *client_ip,
+                        })
+                    }
+                    RateCheckedBodyErr::Inner(never) => match never {},
                 }),
+
             EnumProj::Boxed(bytes) => bytes
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes)),
+
             EnumProj::Full(bytes) => bytes
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes))
                 .map_err(|never| match never {}),
+
             EnumProj::Empty(bytes) => bytes
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes))
@@ -1203,10 +1203,9 @@ async fn serve_cached_file_mmap(
     );
 
     let body = match global_config().min_download_rate {
-        Some(rate) => ProxyCacheBody::MmapRateChecked(
-            RateCheckedBody::new(memory_body.map_err(|never| match never {}), rate),
-            client_ip,
-        ),
+        Some(rate) => {
+            ProxyCacheBody::MmapRateChecked(RateCheckedBody::new(memory_body, rate), client_ip)
+        }
         None => ProxyCacheBody::Mmap(memory_body),
     };
 
@@ -1717,11 +1716,8 @@ async fn download_file(
     });
 
     let mut body = match global_config().min_download_rate {
-        Some(rate) => BoxBody::new(RateCheckedBody::new(
-            body.map_err(|err| Box::new(RateCheckedBodyErr::Hyper(err))),
-            rate,
-        )),
-        None => BoxBody::new(body.map_err(|err| Box::new(RateCheckedBodyErr::Hyper(err)))),
+        Some(rate) => BoxBody::new(RateCheckedBody::new(body, rate)),
+        None => BoxBody::new(body.map_err(|err| Box::new(RateCheckedBodyErr::Inner(err)))),
     };
 
     while let Some(next) = body.frame().await {
@@ -1729,7 +1725,7 @@ async fn download_file(
             Ok(f) => f,
             Err(err) => {
                 match *err {
-                    RateCheckedBodyErr::DownloadRate(download_rate_err) => {
+                    RateCheckedBodyErr::RateTimeout(download_rate_err) => {
                         dbarrier
                             .abort(AbortReason::MirrorDownloadRate(error::MirrorDownloadRate {
                                 download_rate_err,
@@ -1739,19 +1735,9 @@ async fn download_file(
                             }))
                             .await;
                     }
-                    RateCheckedBodyErr::Hyper(herr) => {
+                    RateCheckedBodyErr::Inner(ierr) => {
                         error!(
-                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {herr}",
-                            conn_details.debname,
-                            conn_details.mirror,
-                            HumanFmt::Time(start.elapsed().into()),
-                            HumanFmt::Size(bytes),
-                            HumanFmt::Rate(bytes, start.elapsed()),
-                        );
-                    }
-                    RateCheckedBodyErr::ProxyCache(perr) => {
-                        error!(
-                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {perr}",
+                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {ierr}",
                             conn_details.debname,
                             conn_details.mirror,
                             HumanFmt::Time(start.elapsed().into()),
@@ -2123,24 +2109,17 @@ async fn serve_unfinished_file(
 
     let response = match global_config().min_download_rate {
         Some(min_download_rate) => {
-            let checked_channel_body = RateCheckedBody::new(
-                channel_body.map_err(|err| Box::new(RateCheckedBodyErr::ProxyCache(*err))),
-                min_download_rate,
-            );
+            let checked_channel_body = RateCheckedBody::new(channel_body, min_download_rate);
             response_builder
                 .body(ProxyCacheBody::Boxed(BoxBody::new(
-                    checked_channel_body.map_err(move |rerr| {
-                        let e = match *rerr {
-                            RateCheckedBodyErr::DownloadRate(download_rate_err) => {
-                                ProxyCacheError::ClientDownloadRate(error::ClientDownloadRate {
-                                    download_rate_err,
-                                    client_ip: conn_details.client.ip(),
-                                })
-                            }
-                            RateCheckedBodyErr::Hyper(herr) => ProxyCacheError::Hyper(herr),
-                            RateCheckedBodyErr::ProxyCache(perr) => perr,
-                        };
-                        Box::new(e)
+                    checked_channel_body.map_err(move |err| match *err {
+                        RateCheckedBodyErr::RateTimeout(download_rate_err) => {
+                            Box::new(ProxyCacheError::ClientDownloadRate {
+                                error: download_rate_err,
+                                client_ip: conn_details.client.ip(),
+                            })
+                        }
+                        RateCheckedBodyErr::Inner(ierr) => ierr,
                     }),
                 )))
                 .expect("HTTP response is valid")
@@ -4239,7 +4218,7 @@ where
     fn is_timeout(err: &hyper::Error) -> Option<&ProxyCacheError> {
         let pe = err.source()?.downcast_ref::<ProxyCacheError>()?;
 
-        if matches!(pe, ProxyCacheError::ClientDownloadRate(_))
+        if matches!(pe, ProxyCacheError::ClientDownloadRate { .. })
             || matches!(pe, ProxyCacheError::MirrorDownloadRate(_))
         {
             Some(pe)
