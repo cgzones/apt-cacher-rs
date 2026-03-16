@@ -1,7 +1,8 @@
 use core::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use coarsetime::Duration;
-use log::{debug, error};
+use log::{debug, error, warn};
 
 use crate::{
     database::Database,
@@ -76,6 +77,18 @@ pub(crate) async fn db_loop(
                 if let Err(err) = database.add_origin(&cmd.origin.as_ref()).await {
                     error!("Failed to register origin:  {err}");
                 }
+            }
+        }
+
+        {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+
+            if !LOGGED.load(Ordering::Relaxed) && db_thread_rx.capacity() == 0 {
+                warn!(
+                    "Database command channel full ({0}/{0})",
+                    db_thread_rx.max_capacity()
+                );
+                LOGGED.store(true, Ordering::Relaxed);
             }
         }
     }
