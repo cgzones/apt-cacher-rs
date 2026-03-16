@@ -487,7 +487,10 @@ impl Database {
         }
 
         // Remove mirrors with invalid host names (and cascade to their origins/downloads/deliveries)
-        #[expect(clippy::items_after_statements)]
+        #[expect(
+            clippy::items_after_statements,
+            reason = "define before its single use"
+        )]
         struct MirrorRow {
             id: i64,
             host: String,

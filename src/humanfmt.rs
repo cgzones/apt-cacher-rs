@@ -19,7 +19,7 @@ impl std::fmt::Display for HumanFmt {
             }
         }
 
-        #[expect(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss, reason = "only used for display purposes")]
         match *self {
             Self::Size(bytes) => {
                 if bytes < 1000 {
@@ -85,7 +85,11 @@ impl std::fmt::Display for HumanFmt {
                     return f.write_fmt(format_args!("{time:.0$}s", precision(time)));
                 }
 
-                #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "only used for display purposes"
+                )]
                 let time = time as u64;
 
                 let secs = time % 60;

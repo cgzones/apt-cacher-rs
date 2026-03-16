@@ -108,7 +108,10 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
     let mirror_path = {
         let mut p = host.path();
         let mpath = Path::new(&mirror.path);
-        assert!(mpath.is_relative());
+        assert!(
+            mpath.is_relative(),
+            "path construction must not contain absolute components"
+        );
         p.push(mpath);
         p
     };
@@ -154,7 +157,10 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
         if file_type.is_file() {
             dir_size += mdata.len();
 
-            #[expect(clippy::case_sensitive_file_extension_comparisons)]
+            #[expect(
+                clippy::case_sensitive_file_extension_comparisons,
+                reason = "debian package file extensions are case-sensitive"
+            )]
             if entry
                 .file_name()
                 .to_str()

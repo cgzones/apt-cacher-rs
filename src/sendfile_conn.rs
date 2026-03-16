@@ -133,7 +133,7 @@ pub(crate) async fn handle_sendfile_connection(
         };
 
         // Parse the request and try to handle it with sendfile
-        #[expect(clippy::match_same_arms)]
+        #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
         let _: Never =
             match try_sendfile_request(&buf, &stream, client, &appstate, &mut conn_version).await {
                 SendfileResult::Served(ConnectionAction::KeepAlive) => {
@@ -406,7 +406,10 @@ async fn try_sendfile_request(
     let cache_path = {
         let mut p = conn_details.cache_dir_path();
         let filename = Path::new(&conn_details.debname);
-        assert!(filename.is_relative());
+        assert!(
+            filename.is_relative(),
+            "path construction must not contain absolute components"
+        );
         p.push(filename);
         p
     };
@@ -609,8 +612,9 @@ async fn async_sendfile(
         // Limit each sendfile call to avoid exceeding system limits.
         // 0x7fff_f000 is always within usize range since it fits in 31 bits.
         static_assert!(0x7fff_f000 < usize::MAX);
-        #[expect(clippy::cast_possible_truncation)]
-        let chunk_size = std::cmp::min(remaining, 0x7fff_f000) as usize;
+        let chunk_size = std::cmp::min(remaining, 0x7fff_f000)
+            .try_into()
+            .expect("truncated via min()");
 
         let result = {
             // Copy file descriptors
