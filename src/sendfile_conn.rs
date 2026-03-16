@@ -616,7 +616,53 @@ async fn async_sendfile(
             return Err(std::io::Error::new(ErrorKind::TimedOut, msg));
         }
 
-        socket.writable().await?;
+        // When rate checking is enabled, periodically check for stalled writes.
+        // If the client causes TCP backpressure and the socket stays unwritable,
+        // we feed zero-byte samples into the rate checker so check_fail() can fire.
+        // The outer http_timeout ensures a fully stalled connection is killed even if
+        // rate_check_timeframe > http_timeout.
+        match tokio::time::timeout(config.http_timeout, async {
+            if let Some(ref mut rc) = rate_checker {
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        socket.writable(),
+                    )
+                    .await
+                    {
+                        Ok(result) => return result,
+                        Err(_elapsed @ tokio::time::error::Elapsed { .. }) => {
+                            rc.add(0);
+
+                            if let Some(rate) = rc.check_fail()
+                            {
+                                let msg = format!(
+                                    "Timeout occurred after a download rate of {} for the last {} seconds",
+                                    HumanFmt::Rate(
+                                        rate.transferred as u64,
+                                        Duration::from_secs(rate.timeframe.get() as u64)
+                                    ),
+                                    rate.timeframe,
+                                );
+                                return Err(std::io::Error::new(ErrorKind::TimedOut, msg));
+                            }
+                        }
+                    }
+                }
+            } else {
+                socket.writable().await
+            }
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(tokio::time::error::Elapsed { .. }) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "client write timed out",
+                ));
+            }
+        }
 
         // Limit each sendfile call to avoid exceeding system limits.
         // 0x7fff_f000 is always within usize range since it fits in 31 bits.
