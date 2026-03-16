@@ -35,7 +35,7 @@ mod utils;
 mod web_interface;
 
 use std::convert::Infallible;
-use std::error::Error;
+use std::error::Error as _;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -137,6 +137,7 @@ use crate::deb_mirror::valid_distribution;
 use crate::deb_mirror::valid_filename;
 use crate::deb_mirror::valid_mirrorname;
 use crate::download_barrier::DownloadBarrier;
+use crate::error::ErrorReport;
 use crate::error::MirrorDownloadRate;
 use crate::error::ProxyCacheError;
 use crate::http_range::http_datetime_to_systemtime;
@@ -426,8 +427,9 @@ pub(crate) async fn request_with_retry(
                 }
                 Err(err) if !err.is_connect() => {
                     warn_once_or_info!(
-                        "Request of internal client to {} failed:  {err}  --  {err:?}",
-                        parts.uri
+                        "Request of internal client to {} failed:  {}",
+                        parts.uri,
+                        ErrorReport::new(&err)
                     );
                     return Err((err, parts.uri));
                 }
@@ -487,8 +489,9 @@ pub(crate) async fn request_with_retry(
                     }
 
                     debug!(
-                        "Failed to connect to {} after {attempt} connection attempts, will retry in {sleep_curr} ms:  {err}",
-                        parts.uri
+                        "Failed to connect to {} after {attempt} connection attempts, will retry in {sleep_curr} ms:  {}",
+                        parts.uri,
+                        ErrorReport::new(&err)
                     );
 
                     attempt += 1;
@@ -521,7 +524,7 @@ pub(crate) async fn request_with_retry(
                     err.1
                         .authority()
                         .expect("authority exists in case of https upgrade test"),
-                    err.0
+                    ErrorReport::new(&err.0)
                 );
             }
             result.map_err(|err| err.0)
@@ -649,7 +652,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
             };
             if transferred_bytes == size {
                 info!(
-                    "Served cached file {} from mirror {}{} for client {} in {} (size={}, rate={})",
+                    "Served cached file {} from mirror {}{} for client {} in {} via stream (size={}, rate={})",
                     cd.debname,
                     cd.mirror,
                     aliased,
@@ -670,7 +673,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                 db_tx.send(cmd).await.expect("database task should not die");
             } else if transferred_bytes == 0 && duration < coarsetime::Duration::from_secs(1) {
                 info!(
-                    "Aborted serving cached file {} from mirror {}{} for client {} after {}:  {}",
+                    "Aborted serving cached file {} from mirror {}{} for client {} after {} via stream:  {}",
                     cd.debname,
                     cd.mirror,
                     aliased,
@@ -680,7 +683,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                 );
             } else {
                 warn!(
-                    "Failed to serve cached file {} from mirror {}{} for client {} after {} (size={}, transferred={}, rate={}):  {}",
+                    "Failed to serve cached file {} from mirror {}{} for client {} after {} via stream (size={}, transferred={}, rate={}):  {}",
                     cd.debname,
                     cd.mirror,
                     aliased,
@@ -878,7 +881,7 @@ impl Drop for MmapBody {
             };
             if transferred_bytes == size {
                 info!(
-                    "Served cached file {} from mirror {}{} for client {} in {} (size={}, rate={})",
+                    "Served cached file {} from mirror {}{} for client {} in {} via mmap (size={}, rate={})",
                     cd.debname,
                     cd.mirror,
                     aliased,
@@ -899,7 +902,7 @@ impl Drop for MmapBody {
                 db_tx.send(cmd).await.expect("database task should not die");
             } else if transferred_bytes == 0 {
                 info!(
-                    "Aborted serving cached file {} from mirror {}{} for client {} after {}",
+                    "Aborted serving cached file {} from mirror {}{} for client {} after {} via mmap",
                     cd.debname,
                     cd.mirror,
                     aliased,
@@ -908,7 +911,7 @@ impl Drop for MmapBody {
                 );
             } else {
                 warn!(
-                    "Failed to serve cached file {} from mirror {}{} for client {} after {} (size={}, transferred={}, rate={})",
+                    "Failed to serve cached file {} from mirror {}{} for client {} after {} via mmap (size={}, transferred={}, rate={})",
                     cd.debname,
                     cd.mirror,
                     aliased,
@@ -1008,10 +1011,6 @@ async fn serve_cached_file(
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
     };
-    info!(
-        "Serving cached file {} from mirror {}{} for client {}...",
-        conn_details.debname, conn_details.mirror, aliased, conn_details.client
-    );
 
     let metadata = match file.metadata().await {
         Ok(m) => m,
@@ -1099,6 +1098,11 @@ async fn serve_cached_file(
             }
         };
 
+        info!(
+            "Serving cached file {} from mirror {}{} for client {} via mmap...",
+            conn_details.debname, conn_details.mirror, aliased, conn_details.client
+        );
+
         return serve_cached_file_mmap(
             conn_details,
             database_tx,
@@ -1113,6 +1117,11 @@ async fn serve_cached_file(
         )
         .await;
     }
+
+    info!(
+        "Serving cached file {} from mirror {}{} for client {} via stream...",
+        conn_details.debname, conn_details.mirror, aliased, conn_details.client
+    );
 
     serve_cached_file_buf(
         conn_details,
@@ -1688,11 +1697,13 @@ async fn download_file(
     output: (tokio::fs::File, PathBuf),
     tx: tokio::sync::watch::Sender<()>,
 ) {
-    trace!(
+    let start = Instant::now();
+
+    debug!(
         "Starting download of file {} from mirror {} for client {}...",
         conn_details.debname, conn_details.mirror, conn_details.client
     );
-    let start = Instant::now();
+
     let dbarrier = DownloadBarrier::new(tx, status);
 
     let body = input.0;
@@ -1737,12 +1748,13 @@ async fn download_file(
                     }
                     RateCheckedBodyErr::Inner(ierr) => {
                         error!(
-                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {ierr}",
+                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {}",
                             conn_details.debname,
                             conn_details.mirror,
                             HumanFmt::Time(start.elapsed().into()),
                             HumanFmt::Size(bytes),
                             HumanFmt::Rate(bytes, start.elapsed()),
+                            ErrorReport::new(&ierr),
                         );
                     }
                 }
@@ -1965,7 +1977,7 @@ async fn serve_unfinished_file(
 
     tokio::task::spawn(async move {
         let start = Instant::now();
-        trace!(
+        debug!(
             "Starting stream task for downloading file `{}` from mirror {} with length {content_length:?} for client {}...",
             file_path.display(),
             conn_details.mirror,
@@ -2059,7 +2071,7 @@ async fn serve_unfinished_file(
 
         let elapsed = start.elapsed();
         info!(
-            "Served new file {} from mirror {} for client {} in {} (size={}, rate={})",
+            "Served new file {} from mirror {} for client {} in {} via channel (size={}, rate={})",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client,
@@ -2618,8 +2630,9 @@ async fn serve_new_file(
         Ok(r) => r,
         Err(err) => {
             warn!(
-                "Proxy request failed to mirror {}:  {err}",
-                conn_details.mirror
+                "Proxy request failed to mirror {}:  {}",
+                conn_details.mirror,
+                ErrorReport::new(&err)
             );
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
         }
@@ -2651,7 +2664,10 @@ async fn serve_new_file(
                 match request_with_retry(&appstate.https_client, redirected_request).await {
                     Ok(r) => r,
                     Err(err) => {
-                        warn!("Proxy redirected request to host {host:?} failed:  {err}");
+                        warn!(
+                            "Proxy redirected request to host {host:?} failed:  {}",
+                            ErrorReport::new(&err)
+                        );
                         return quick_response(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "Proxy request failed",
@@ -3204,7 +3220,10 @@ fn connect_response(
                 }
             }
             Err(err) => {
-                error!("Error upgrading connection for client {client} to {host}:{port}:  {err}");
+                error!(
+                    "Error upgrading connection for client {client} to {host}:{port}:  {}",
+                    ErrorReport::new(&err)
+                );
             }
         }
     });
@@ -3667,7 +3686,10 @@ async fn pre_process_client_request(
     let fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
         Err(err) => {
-            warn!("Proxy request to host {requested_host} failed for client {client}:  {err}");
+            warn!(
+                "Proxy request to host {requested_host} failed for client {client}:  {}",
+                ErrorReport::new(&err)
+            );
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
         }
     };
@@ -3727,7 +3749,8 @@ async fn pre_process_client_request(
                 Ok(r) => r,
                 Err(err) => {
                     warn!(
-                        "Redirected proxy request to host {requested_host} failed for client {client}:  {err}"
+                        "Redirected proxy request to host {requested_host} failed for client {client}:  {}",
+                        ErrorReport::new(&err)
                     );
                     return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
                 }
@@ -3986,7 +4009,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                             Err(err) => {
                                 // request_with_retry() has already logged the error
-                                debug!("Failed to query host {authority} to initialize scheme cache:  {err}");
+                                debug!("Failed to query host {authority} to initialize scheme cache:  {}", ErrorReport::new(&err));
                             }
                         }
                     }
@@ -4240,21 +4263,22 @@ where
         if err.is_incomplete_message() || is_connection_reset(&err) {
             info!("Connection to client {client} cancelled");
         } else if is_shutdown_disconnect(&err) {
-            info!("Improper connection shutdown for client {client}:  {err}");
+            info!(
+                "Improper connection shutdown for client {client}:  {}",
+                ErrorReport::new(&err)
+            );
         } else if is_broken_pipe(&err) {
-            info!("Broken pipe for client {client}:  {err}");
+            info!(
+                "Broken pipe for client {client}:  {}",
+                ErrorReport::new(&err)
+            );
         } else if let Some(perr) = is_timeout(&err) {
             info!("{perr}");
         } else {
-            error!("Error serving connection for client {client}:  {err} -- {err:?}");
-            let mut lerr: &dyn Error = &err;
-            loop {
-                lerr = match lerr.source() {
-                    Some(e) => e,
-                    None => break,
-                };
-                error!("Error serving connection for client {client}:  {lerr} -- {lerr:?}");
-            }
+            error!(
+                "Error serving connection for client {client}:  {}",
+                ErrorReport::new(&err)
+            );
         }
     }
 }

@@ -71,7 +71,7 @@ enum SendfileResult {
     /// Request was served via sendfile
     Served(ConnectionAction),
     /// Request is not applicable for sendfile, fall back to hyper
-    NotApplicable,
+    NotApplicable(&'static str),
     /// Request is invalid, reject
     Invalid {
         status: http::StatusCode,
@@ -134,49 +134,54 @@ pub(crate) async fn handle_sendfile_connection(
 
         // Parse the request and try to handle it with sendfile
         #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
-        let _: Never =
-            match try_sendfile_request(&buf, &stream, client, &appstate, &mut conn_version).await {
-                SendfileResult::Served(ConnectionAction::KeepAlive) => {
-                    // Request served via sendfile with keep-alive; continue to next request
-                    buf.advance(next_header_index);
-                    continue;
-                }
-                SendfileResult::Served(ConnectionAction::Close) => {
-                    // Request served via sendfile; close the connection as requested
-                    return;
-                }
-                SendfileResult::NotApplicable => {
-                    // Fall back to hyper for this and all subsequent requests
-                    debug!(
-                        "Falling back to hyper for client {client} ({} bytes buffered)",
-                        buf.len()
-                    );
+        let _: Never = match try_sendfile_request(
+            &buf,
+            &stream,
+            client,
+            &appstate,
+            &mut conn_version,
+        )
+        .await
+        {
+            SendfileResult::Served(ConnectionAction::KeepAlive) => {
+                // Request served via sendfile with keep-alive; continue to next request
+                buf.advance(next_header_index);
+                continue;
+            }
+            SendfileResult::Served(ConnectionAction::Close) => {
+                // Request served via sendfile; close the connection as requested
+                return;
+            }
+            SendfileResult::NotApplicable(reason) => {
+                // Fall back to hyper for this and all subsequent requests
+                debug!(
+                    "Falling back to hyper for client {client} due to: {reason} ({} bytes buffered)",
+                    buf.len()
+                );
 
-                    let stream = if buf.is_empty() {
-                        MaybePrependedStream::Raw(stream)
-                    } else {
-                        MaybePrependedStream::Prepended {
-                            prepend: buf,
-                            stream,
-                        }
-                    };
-
-                    return handle_hyper_connection(stream, client, appstate).await;
-                }
-                SendfileResult::Invalid { status, msg } => {
-                    if let Err(err) =
-                        write_invalid_response(&stream, conn_version, status, msg).await
-                    {
-                        info!("Failed to write error response to client {client}:  {err}");
+                let stream = if buf.is_empty() {
+                    MaybePrependedStream::Raw(stream)
+                } else {
+                    MaybePrependedStream::Prepended {
+                        prepend: buf,
+                        stream,
                     }
-                    return;
+                };
+
+                return handle_hyper_connection(stream, client, appstate).await;
+            }
+            SendfileResult::Invalid { status, msg } => {
+                if let Err(err) = write_invalid_response(&stream, conn_version, status, msg).await {
+                    info!("Failed to write error response to client {client}:  {err}");
                 }
-                SendfileResult::Error => {
-                    // Error occurred, should have been already logged.
-                    // The connection should be closed
-                    return;
-                }
-            };
+                return;
+            }
+            SendfileResult::Error => {
+                // Error occurred, should have been already logged.
+                // The connection should be closed
+                return;
+            }
+        };
     }
 }
 
@@ -278,7 +283,7 @@ async fn try_sendfile_request(
     // Only handle GET requests via sendfile
     match req.method.expect("complete header parsed") {
         "GET" => {}
-        "CONNECT" => return SendfileResult::NotApplicable,
+        "CONNECT" => return SendfileResult::NotApplicable("CONNECT method not supported"),
         m => {
             warn_once_or_info!(
                 "Unsupported request method `{}` from client {client}",
@@ -320,7 +325,7 @@ async fn try_sendfile_request(
 
     let Some(authority) = uri.authority() else {
         // No authority means it's likely a direct request (web interface) - fall back
-        return SendfileResult::NotApplicable;
+        return SendfileResult::NotApplicable("no authority");
     };
 
     let requested_host = match authorize_cache_access(&client, authority.host().to_string()) {
@@ -335,7 +340,7 @@ async fn try_sendfile_request(
         filename,
     }) = parse_request_path(uri.path())
     else {
-        return SendfileResult::NotApplicable;
+        return SendfileResult::NotApplicable("no pool resource");
     };
 
     // Validate mirror path and filename
@@ -380,7 +385,7 @@ async fn try_sendfile_request(
         }
     };
     if !filename.ends_with(".deb") {
-        return SendfileResult::NotApplicable;
+        return SendfileResult::NotApplicable("filename does not end with .deb");
     }
 
     let aliased_host = global_config()
@@ -419,7 +424,7 @@ async fn try_sendfile_request(
         .active_downloads
         .contains(&conn_details.mirror, &conn_details.debname)
     {
-        return SendfileResult::NotApplicable;
+        return SendfileResult::NotApplicable("file currently in download");
     }
 
     // Try to open the file
@@ -427,7 +432,7 @@ async fn try_sendfile_request(
         Ok(f) => f,
         Err(err) if err.kind() == ErrorKind::NotFound => {
             // File not in cache, fall back to hyper which will download it
-            return SendfileResult::NotApplicable;
+            return SendfileResult::NotApplicable("file not found in cache");
         }
         Err(err) => {
             error!(
