@@ -4418,5 +4418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build()
         .expect("Should succeed");
 
+    drop(args);
+
     runtime.block_on(async { main_loop().await })
 }
