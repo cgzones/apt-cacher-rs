@@ -1211,10 +1211,13 @@ async fn serve_cached_file_mmap(
         conn_details,
     );
 
-    let body = match global_config().min_download_rate {
-        Some(rate) => {
-            ProxyCacheBody::MmapRateChecked(RateCheckedBody::new(memory_body, rate), client_ip)
-        }
+    let config = global_config();
+
+    let body = match config.min_download_rate {
+        Some(rate) => ProxyCacheBody::MmapRateChecked(
+            RateCheckedBody::new(memory_body, rate, config.rate_check_timeframe),
+            client_ip,
+        ),
         None => ProxyCacheBody::Mmap(memory_body),
     };
 
@@ -1697,6 +1700,8 @@ async fn download_file(
     output: (tokio::fs::File, PathBuf),
     tx: tokio::sync::watch::Sender<()>,
 ) {
+    let config = global_config();
+
     let start = Instant::now();
 
     debug!(
@@ -1712,7 +1717,7 @@ async fn download_file(
     let mut bytes = 0;
     let mut last_send_bytes = 0;
     let mut connected = true;
-    let buf_size = global_config().buffer_size;
+    let buf_size = config.buffer_size;
 
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
     let outpath = scopeguard::guard(output.1, |path| {
@@ -1726,8 +1731,12 @@ async fn download_file(
         });
     });
 
-    let mut body = match global_config().min_download_rate {
-        Some(rate) => BoxBody::new(RateCheckedBody::new(body, rate)),
+    let mut body = match config.min_download_rate {
+        Some(rate) => BoxBody::new(RateCheckedBody::new(
+            body,
+            rate,
+            config.rate_check_timeframe,
+        )),
         None => BoxBody::new(body.map_err(|err| Box::new(RateCheckedBodyErr::Inner(err)))),
     };
 
@@ -1955,6 +1964,8 @@ async fn serve_unfinished_file(
     content_length: ContentLength,
     mut receiver: tokio::sync::watch::Receiver<()>,
 ) -> Response<ProxyCacheBody> {
+    let config = global_config();
+
     let md = match file.metadata().await {
         Ok(data) => data,
         Err(err) => {
@@ -1988,7 +1999,7 @@ async fn serve_unfinished_file(
 
         let mut finished = false;
         let mut bytes = 0;
-        let buf_size = global_config().buffer_size;
+        let buf_size = config.buffer_size;
 
         let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
 
@@ -2119,9 +2130,10 @@ async fn serve_unfinished_file(
 
     let channel_body = ChannelBody::new(rx, content_length);
 
-    let response = match global_config().min_download_rate {
+    let response = match config.min_download_rate {
         Some(min_download_rate) => {
-            let checked_channel_body = RateCheckedBody::new(channel_body, min_download_rate);
+            let checked_channel_body =
+                RateCheckedBody::new(channel_body, min_download_rate, config.rate_check_timeframe);
             response_builder
                 .body(ProxyCacheBody::Boxed(BoxBody::new(
                     checked_channel_body.map_err(move |err| match *err {
@@ -2950,20 +2962,20 @@ async fn serve_new_file(
         appstate.active_downloads.remove(&cd.mirror, &cd.debname);
     });
 
-    let gcfg = global_config();
+    let config = global_config();
 
     if conn_details.cached_flavor != CachedFlavor::Volatile
-        && gcfg.experimental_parallel_hack_enabled
-        && gcfg
+        && config.experimental_parallel_hack_enabled
+        && config
             .experimental_parallel_hack_maxparallel
             .is_none_or(|max_parallel| curr_downloads <= max_parallel.get())
-        && gcfg
+        && config
             .experimental_parallel_hack_minsize
             .is_none_or(|size| content_length.upper() > size)
     {
         #[expect(clippy::cast_precision_loss, reason = "generate probability value")]
         let p = (curr_downloads.saturating_sub(1) as f64)
-            .mul_add(-gcfg.experimental_parallel_hack_factor, 1.0)
+            .mul_add(-config.experimental_parallel_hack_factor, 1.0)
             .max(0.0);
         let d = Bernoulli::new(p).expect("p is valid");
         let v = d.sample(&mut rand::rng());
@@ -2973,21 +2985,21 @@ async fn serve_new_file(
                 "Trying parallel download hack for client {} and file {} with code {} and retry after value {}",
                 conn_details.client,
                 conn_details.debname,
-                gcfg.experimental_parallel_hack_statuscode,
-                gcfg.experimental_parallel_hack_retryafter
+                config.experimental_parallel_hack_statuscode,
+                config.experimental_parallel_hack_retryafter
             );
 
             let mut response = Response::builder()
-                .status(gcfg.experimental_parallel_hack_statuscode)
+                .status(config.experimental_parallel_hack_statuscode)
                 .header(SERVER, APP_NAME)
                 .header(CONNECTION, "keep-alive")
                 .body(ProxyCacheBody::Empty(Empty::new()))
                 .expect("Response is valid");
 
-            if gcfg.experimental_parallel_hack_retryafter != 0 {
+            if config.experimental_parallel_hack_retryafter != 0 {
                 response.headers_mut().append(
                     RETRY_AFTER,
-                    HeaderValue::from(gcfg.experimental_parallel_hack_retryafter),
+                    HeaderValue::from(config.experimental_parallel_hack_retryafter),
                 );
             }
 
@@ -3131,10 +3143,10 @@ fn connect_response(
     client: ClientInfo,
     req: Request<hyper::body::Incoming>,
 ) -> Response<ProxyCacheBody> {
-    let cfg = global_config();
+    let config = global_config();
 
     {
-        let allowed_proxy_clients = cfg.allowed_proxy_clients.as_slice();
+        let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
         let client_ip = client.ip();
         if !allowed_proxy_clients.is_empty()
             && !allowed_proxy_clients
@@ -3146,7 +3158,7 @@ fn connect_response(
         }
     }
 
-    if !cfg.https_tunnel_enabled {
+    if !config.https_tunnel_enabled {
         info!("Rejecting https tunnel request for client {client}");
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
@@ -3179,15 +3191,18 @@ fn connect_response(
         return quick_response(StatusCode::BAD_REQUEST, "Invalid CONNECT address");
     };
 
-    if !cfg.https_tunnel_allowed_ports.is_empty()
-        && cfg.https_tunnel_allowed_ports.binary_search(&port).is_err()
+    if !config.https_tunnel_allowed_ports.is_empty()
+        && config
+            .https_tunnel_allowed_ports
+            .binary_search(&port)
+            .is_err()
     {
         info!("Rejecting https tunnel request for client {client} to not permitted port {port}");
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
-    if !cfg.https_tunnel_allowed_mirrors.is_empty()
-        && cfg
+    if !config.https_tunnel_allowed_mirrors.is_empty()
+        && config
             .https_tunnel_allowed_mirrors
             .binary_search_by(|d| str::cmp(d, host.as_str()))
             .is_err()
@@ -3242,9 +3257,9 @@ pub(crate) fn authorize_cache_access(
     client: &ClientInfo,
     requested_host: String,
 ) -> Result<DomainName, (http::StatusCode, &'static str)> {
-    let cfg = global_config();
+    let config = global_config();
 
-    let allowed_proxy_clients = cfg.allowed_proxy_clients.as_slice();
+    let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
     let client_ip = client.ip();
     if !allowed_proxy_clients.is_empty()
         && !allowed_proxy_clients
@@ -3288,7 +3303,7 @@ async fn pre_process_client_request(
 ) -> Response<ProxyCacheBody> {
     trace!("Incoming request: {req:?}");
 
-    let cfg = global_config();
+    let config = global_config();
 
     match req.method() {
         &Method::CONNECT => return connect_response(client, req),
@@ -3322,10 +3337,10 @@ async fn pre_process_client_request(
             }
 
             {
-                let allowed_webif_clients = cfg
+                let allowed_webif_clients = config
                     .allowed_webif_clients
                     .as_ref()
-                    .unwrap_or(&cfg.allowed_proxy_clients);
+                    .unwrap_or(&config.allowed_proxy_clients);
                 let client_ip = client.ip();
                 if !allowed_webif_clients.is_empty()
                     && !allowed_webif_clients
@@ -3356,7 +3371,7 @@ async fn pre_process_client_request(
         Err((status, msg)) => return quick_response(status, msg),
     };
 
-    let aliased_host = cfg
+    let aliased_host = config
         .aliases
         .iter()
         .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())

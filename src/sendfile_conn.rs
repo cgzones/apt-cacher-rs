@@ -593,7 +593,11 @@ async fn async_sendfile(
         ));
     };
 
-    let mut rate_checker = global_config().min_download_rate.map(RateChecker::new);
+    let config = global_config();
+
+    let mut rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     let mut remaining = count;
 

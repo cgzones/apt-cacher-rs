@@ -44,6 +44,7 @@ const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
 const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
+const DEFAULT_RATE_CHECK_TIMEFRAME: NonZero<usize> = nonzero!(30);
 const DEFAULT_MAX_UPSTREAM_DOWNLOADS: Option<NonZero<usize>> = Some(nonzero!(20));
 const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
 const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
@@ -441,6 +442,10 @@ pub(crate) struct Config {
     )]
     pub(crate) min_download_rate: Option<NonZero<usize>>,
 
+    /// Sliding window (in seconds) over which the minimum transfer rate is measured.
+    #[serde(default = "default_rate_check_timeframe")]
+    pub(crate) rate_check_timeframe: NonZero<usize>,
+
     /// Maximum number of concurrent upstream downloads.
     /// `None` means unlimited.
     #[serde(default = "default_max_upstream_downloads")]
@@ -685,6 +690,10 @@ const fn default_min_download_rate() -> Option<NonZero<usize>> {
     DEFAULT_MIN_DOWNLOAD_RATE
 }
 
+const fn default_rate_check_timeframe() -> NonZero<usize> {
+    DEFAULT_RATE_CHECK_TIMEFRAME
+}
+
 const fn default_max_upstream_downloads() -> Option<NonZero<usize>> {
     DEFAULT_MAX_UPSTREAM_DOWNLOADS
 }
@@ -872,6 +881,7 @@ impl Config {
             usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
             logstore_capacity: DEFAULT_LOGSTORE_CAPACITY,
             min_download_rate: DEFAULT_MIN_DOWNLOAD_RATE,
+            rate_check_timeframe: DEFAULT_RATE_CHECK_TIMEFRAME,
             max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
             db_channel_capacity: DEFAULT_DB_CHANNEL_CAPACITY,
             mmap_threshold: DEFAULT_MMAP_THRESHOLD,
