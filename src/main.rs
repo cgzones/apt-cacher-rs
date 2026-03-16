@@ -558,7 +558,6 @@ fn quick_response<T: Into<bytes::Bytes>>(
 
 /* Adopted from http_body_util::StreamBody */
 #[pin_project(PinnedDrop)]
-#[derive(Debug)]
 struct DeliveryStreamBody<S> {
     #[pin]
     stream: S,
@@ -697,7 +696,6 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
     }
 }
 
-#[derive(Debug)]
 #[pin_project(project = EnumProj)]
 enum ProxyCacheBody {
     #[cfg(feature = "mmap")]
@@ -707,6 +705,20 @@ enum ProxyCacheBody {
     Boxed(#[pin] BoxBody<bytes::Bytes, Box<ProxyCacheError>>),
     Full(#[pin] Full<bytes::Bytes>),
     Empty(#[pin] Empty<bytes::Bytes>),
+}
+
+impl Debug for ProxyCacheBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "mmap")]
+            Self::Mmap(_) => f.debug_tuple("Mmap").finish(),
+            #[cfg(feature = "mmap")]
+            Self::MmapRateChecked(_, _) => f.debug_tuple("MmapRateChecked").finish(),
+            Self::Boxed(_) => f.debug_tuple("Boxed").finish(),
+            Self::Full(_) => f.debug_tuple("Full").finish(),
+            Self::Empty(_) => f.debug_tuple("Empty").finish(),
+        }
+    }
 }
 
 impl Body for ProxyCacheBody {
@@ -816,7 +828,6 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
 const MMAP_FRAME_SIZE: usize = 2 * 1024 * 1024; // 2MiB
 
 #[cfg(feature = "mmap")]
-#[derive(Debug)]
 struct MmapBody {
     mapping: Arc<Mmap>,
     position: usize,
@@ -913,7 +924,6 @@ impl Drop for MmapBody {
 }
 
 #[cfg(feature = "mmap")]
-#[derive(Debug)]
 struct MmapData {
     mapping: Arc<Mmap>,
     position: usize,
