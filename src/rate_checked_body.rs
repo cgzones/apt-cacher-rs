@@ -23,6 +23,8 @@ pub(crate) struct InsufficientRate {
     pub(crate) transferred: usize,
     /// The number of seconds over which the download was measured.
     pub(crate) timeframe: NonZero<usize>,
+    /// The minimum download rate required in bytes per second.
+    pub(crate) min_rate: NonZero<usize>,
 }
 
 impl RateChecker {
@@ -87,6 +89,7 @@ impl RateChecker {
                 Some(InsufficientRate {
                     transferred,
                     timeframe,
+                    min_rate: self.min_download_rate,
                 })
             } else {
                 None
