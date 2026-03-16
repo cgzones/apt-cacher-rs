@@ -760,7 +760,8 @@ fn intersect<T: Ord>(a: &[T], b: &[T]) -> bool {
 pub(crate) fn is_valid_domain(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
-    if domain.is_empty() {
+    let len = domain.len();
+    if len == 0 || len > 253 {
         return false;
     }
 
@@ -770,7 +771,7 @@ pub(crate) fn is_valid_domain(domain: &str) -> bool {
     }
 
     for part in domain.split('.') {
-        if part.is_empty() || part.len() > 64 {
+        if part.is_empty() || part.len() > 63 {
             return false;
         }
 
@@ -792,7 +793,8 @@ pub(crate) fn is_valid_domain(domain: &str) -> bool {
 pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
-    if domain.is_empty() {
+    let len = domain.len();
+    if len == 0 || len > 253 {
         return false;
     }
 
@@ -805,7 +807,7 @@ pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
     let mut part_count: u32 = 0;
 
     for (pos, part) in domain.split('.').enumerate() {
-        if part.is_empty() || part.len() > 64 {
+        if part.is_empty() || part.len() > 63 {
             return false;
         }
 
