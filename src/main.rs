@@ -1085,7 +1085,7 @@ async fn serve_cached_file(
     if content_length >= global_config().mmap_threshold.get() {
         let mmap_content_length: usize = match content_length.try_into() {
             Ok(c) => c,
-            Err(_err) => {
+            Err(_err @ std::num::TryFromIntError { .. }) => {
                 error!(
                     "Content length of {} for file `{}` from mirror {}{} for client {} is too large",
                     content_length,
@@ -2020,7 +2020,7 @@ async fn serve_unfinished_file(
                 bytes += ret as u64;
                 assert_eq!(buf.len(), ret, "buffer length must match read bytes");
 
-                if let Err(_err) = tx.send(Ok(buf)).await {
+                if let Err(tokio::sync::mpsc::error::SendError(_err)) = tx.send(Ok(buf)).await {
                     info!("Receiver of stream task closed; cancelling stream...");
                     return;
                 }
@@ -2030,7 +2030,7 @@ async fn serve_unfinished_file(
                 break;
             }
 
-            if let Err(_err) = receiver.changed().await {
+            if let Err(tokio::sync::watch::error::RecvError { .. }) = receiver.changed().await {
                 /* sender closed, either download finished or aborted */
                 let st = status.read().await;
                 let _: Never = match *st {
