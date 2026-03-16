@@ -12,6 +12,8 @@ use crate::{
 /// Returns the size in bytes of the entire cache.
 /// Files that cannot be accessed are not included, but logged about.
 pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCacheError> {
+    let config = global_config();
+
     let mirrors = match database.get_mirrors().await {
         Ok(m) => m,
         Err(err) => {
@@ -20,7 +22,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         }
     };
 
-    let cache_path = &global_config().cache_directory;
+    let cache_path = &config.cache_directory;
 
     trace!("Scanning directory `{}`...", cache_path.display());
 
@@ -34,8 +36,6 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
             return Err(ProxyCacheError::Io(err));
         }
     };
-
-    let aliases = global_config().aliases.as_slice();
 
     // Pre-compute formatted directory names for each mirror to avoid repeated allocations
     let mirrors_with_names: Vec<_> = mirrors
@@ -77,7 +77,9 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
             }
 
             if !scanned {
-                if let Some(alias) = aliases
+                if let Some(alias) = config
+                    .aliases
+                    .as_slice()
                     .iter()
                     .find(|alias| alias.aliases.binary_search(&mirror.host).is_ok())
                 {
