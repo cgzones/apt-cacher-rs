@@ -4344,7 +4344,7 @@ pub(crate) fn global_config() -> &'static Config {
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Cli::parse();
 
-    let (config, cgf_fallback) = Config::new(&args.config_path)?;
+    let (config, cgf_fallback, config_warnings) = Config::new(&args.config_path)?;
 
     let config_log_level = config.log_level;
     let config_logstore_capacity = config.logstore_capacity;
@@ -4415,6 +4415,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "Default configuration file `{}` not found, using defaults",
             args.config_path.display()
         );
+    }
+
+    for warning in config_warnings {
+        warn!("Configuration:  {warning}");
     }
 
     debug!("Configuration: {:?}", global_config());
