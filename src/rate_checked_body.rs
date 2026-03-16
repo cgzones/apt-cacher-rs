@@ -6,7 +6,7 @@ use hyper::body::{Body, Frame, SizeHint};
 use log::debug;
 use pin_project::pin_project;
 
-use crate::{HumanFmt, nonzero, ringbuffer::SumRingBuffer};
+use crate::{HumanFmt, ringbuffer::SumRingBuffer};
 
 /// A rate checker that tracks download speed over a sliding time window.
 #[derive(Debug)]
@@ -28,19 +28,7 @@ pub(crate) struct InsufficientRate {
 }
 
 impl RateChecker {
-    /// Creates a new `RateChecker` with the given minimum download rate in bytes per second.
-    /// Uses a default timeframe of 30 seconds.
-    #[must_use]
-    pub(crate) fn new(min_download_rate: NonZero<usize>) -> Self {
-        Self {
-            buf: SumRingBuffer::new(nonzero!(30)),
-            last: Instant::now(),
-            min_download_rate,
-        }
-    }
-
     /// Creates a new `RateChecker` with the given minimum download rate and timeframe.
-    #[expect(dead_code)]
     #[must_use]
     pub(crate) fn with_timeframe(
         min_download_rate: NonZero<usize>,
@@ -123,12 +111,16 @@ impl<B> RateCheckedBody<B>
 where
     B: Body,
 {
-    /// Creates a new `RateCheckedBody` that wraps the given `body` and checks the download rate against the given `min_download_rate`.
+    /// Creates a new `RateCheckedBody` that wraps the given `body` and checks the download rate against the given `min_download_rate` over the given `timeframe`.
     #[must_use]
-    pub(crate) fn new(body: B, min_download_rate: NonZero<usize>) -> Self {
+    pub(crate) fn new(
+        body: B,
+        min_download_rate: NonZero<usize>,
+        timeframe: NonZero<usize>,
+    ) -> Self {
         Self {
             inner: body,
-            rchecker: RateChecker::new(min_download_rate),
+            rchecker: RateChecker::with_timeframe(min_download_rate, timeframe),
         }
     }
 }
@@ -168,5 +160,75 @@ where
         }
 
         msg.map_err(|e| Box::new(RateCheckedBodyErr::Inner(e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nonzero;
+
+    #[test]
+    fn rate_checker_triggers_when_slow() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Simulate 1 byte per second for 3 seconds.
+        // Use 1050ms to ensure coarsetime registers a full second.
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(1050));
+            rc.add(1);
+        }
+
+        // Buffer should now be full with 3 bytes over 3s = 1 B/s < 100 B/s.
+        let fail = rc.check_fail();
+        assert!(fail.is_some(), "rate check should fail for slow transfer");
+        let ir = fail.unwrap();
+        assert!(ir.transferred <= 3);
+        assert_eq!(ir.min_rate, nonzero!(100));
+    }
+
+    #[test]
+    fn rate_checker_passes_when_fast() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Simulate 500 bytes per second for 3 seconds.
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(1050));
+            rc.add(500);
+        }
+
+        // ~1500 bytes over 3s = 500 B/s > 100 B/s.
+        assert!(
+            rc.check_fail().is_none(),
+            "rate check should pass for fast transfer"
+        );
+    }
+
+    #[test]
+    fn rate_checker_not_full_yet() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Only 1 second elapsed — buffer not full.
+        std::thread::sleep(std::time::Duration::from_millis(1050));
+        rc.add(1);
+
+        assert!(
+            rc.check_fail().is_none(),
+            "should not fail before buffer is full"
+        );
+    }
+
+    #[test]
+    fn rate_checker_fills_zeros_for_gaps() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Sleep 4 seconds to ensure at least 3 elapsed seconds are seen by
+        // coarsetime (which has ~1ms resolution but rounding can lose a tick).
+        std::thread::sleep(std::time::Duration::from_millis(3100));
+        rc.add(1);
+
+        // Buffer should be [0, 0, 1] — full with 1 byte over 3s = 0 B/s < 100 B/s.
+        let fail = rc.check_fail();
+        assert!(fail.is_some(), "rate check should fail after gap");
     }
 }
