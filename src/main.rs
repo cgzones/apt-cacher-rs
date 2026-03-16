@@ -3004,13 +3004,29 @@ async fn tunnel(
     port: NonZero<u16>,
 ) -> std::io::Result<()> {
     let start = Instant::now();
+    let config = global_config();
 
     /* Connect to remote server */
-    let mut server = tokio::net::TcpStream::connect((host, port.get())).await?;
+    let mut server = match tokio::time::timeout(
+        config.http_timeout,
+        tokio::net::TcpStream::connect((host, port.get())),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(tokio::time::error::Elapsed { .. }) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tunnel connect timed out",
+            ));
+        }
+    };
     let mut upgraded = TokioIo::new(upgraded);
 
     /* Proxying data */
-    let bufsize = global_config().buffer_size;
+    let bufsize = config.buffer_size;
+
+    // not rate-checked
     let (from_client, from_server) =
         tokio::io::copy_bidirectional_with_sizes(&mut upgraded, &mut server, bufsize, bufsize)
             .await?;
