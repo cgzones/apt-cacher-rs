@@ -47,6 +47,7 @@ const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000));
 const DEFAULT_MAX_UPSTREAM_DOWNLOADS: Option<NonZero<usize>> = Some(nonzero!(20));
 const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
 const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
+const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: hyper::StatusCode =
@@ -444,6 +445,10 @@ pub(crate) struct Config {
     #[serde(default = "default_max_upstream_downloads")]
     pub(crate) max_upstream_downloads: Option<NonZero<usize>>,
 
+    /// Capacity of the internal database command channel.
+    #[serde(default = "default_db_channel_capacity")]
+    pub(crate) db_channel_capacity: NonZero<usize>,
+
     #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
@@ -675,6 +680,10 @@ const fn default_max_upstream_downloads() -> Option<NonZero<usize>> {
     DEFAULT_MAX_UPSTREAM_DOWNLOADS
 }
 
+const fn default_db_channel_capacity() -> NonZero<usize> {
+    DEFAULT_DB_CHANNEL_CAPACITY
+}
+
 const fn default_experimental_parallel_hack_enabled() -> bool {
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED
 }
@@ -851,6 +860,7 @@ impl Config {
             logstore_capacity: DEFAULT_LOGSTORE_CAPACITY,
             min_download_rate: DEFAULT_MIN_DOWNLOAD_RATE,
             max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
+            db_channel_capacity: DEFAULT_DB_CHANNEL_CAPACITY,
             experimental_parallel_hack_enabled: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED,
             experimental_parallel_hack_maxparallel: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL,
             experimental_parallel_hack_statuscode: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE,
@@ -914,6 +924,13 @@ impl Config {
             bail!(
                 "Invalid usage retention days value of {}: Overflow",
                 self.usage_retention_days
+            );
+        }
+
+        if self.db_channel_capacity > nonzero!(4096) {
+            bail!(
+                "Invalid db_channel_capacity value of {}: must be between 1 and 4096",
+                self.db_channel_capacity
             );
         }
 
