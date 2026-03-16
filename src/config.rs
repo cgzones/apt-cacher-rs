@@ -17,17 +17,7 @@ use log::LevelFilter;
 use serde::Deserialize;
 use serde::Deserializer;
 
-#[macro_export]
-macro_rules! nonzero {
-    ($exp:expr) => {
-        const {
-            match NonZero::new($exp) {
-                Some(v) => v,
-                None => panic!("Value is zero"),
-            }
-        }
-    };
-}
+use crate::nonzero;
 
 const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
@@ -162,9 +152,9 @@ impl DomainName {
 
     #[must_use]
     #[inline]
-    pub(crate) fn as_str(&self) -> &str {
+    pub(crate) const fn as_str(&self) -> &str {
         match self {
-            Self::Dns(s) | Self::Ipv4(s, _) | Self::Ipv6(s, _) => s,
+            Self::Dns(s) | Self::Ipv4(s, _) | Self::Ipv6(s, _) => s.as_str(),
         }
     }
 
@@ -242,7 +232,7 @@ impl AsRef<std::ffi::OsStr> for DomainName {
 }
 
 /// Used by sqlx to convert database rows into `DomainName`.
-/// Data stored in the DB was validated before insertion.
+/// Data stored in the DB was validated before insertion and on program startup.
 impl From<String> for DomainName {
     fn from(value: String) -> Self {
         Self::new(value).expect("Caller must ensure value is a valid domain")
@@ -358,14 +348,14 @@ pub(crate) struct Config {
     #[serde(default = "default_cache_dir")]
     pub(crate) cache_directory: PathBuf,
 
-    /// Timeout of database operations after which a warning is generated.
+    /// Timeout (in seconds) of database operations after which a warning is generated.
     #[serde(
         default = "default_db_slow_timeout",
         deserialize_with = "from_secs_f32"
     )]
     pub(crate) database_slow_timeout: Duration,
 
-    /// Timeout for http operations.
+    /// Timeout (in seconds) for http operations.
     #[serde(default = "default_http_timeout", deserialize_with = "from_secs_f32")]
     pub(crate) http_timeout: Duration,
 
@@ -373,7 +363,7 @@ pub(crate) struct Config {
     #[serde(default = "default_https_upgrade_mode")]
     pub(crate) https_upgrade_mode: HttpsUpgradeMode,
 
-    /// Size of buffer used for internal data transfer.
+    /// Size (in bytes) of buffer used for internal data transfer.
     #[serde(
         default = "default_buffer_size",
         deserialize_with = "from_usize_with_magnitude"
@@ -384,18 +374,18 @@ pub(crate) struct Config {
     #[serde(default = "default_logstore_capacity")]
     pub(crate) logstore_capacity: NonZero<usize>,
 
-    /// Disk quota for cache.
+    /// Disk quota (in bytes) for cache.
     #[serde(
         default = "default_disk_quota",
         deserialize_with = "from_nonzero_u64_with_magnitude"
     )]
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
-    /// Retention time for files acquired "by-hash".
+    /// Retention time (in days) for files acquired "by-hash".
     #[serde(default = "default_byhash_retention_days")]
     pub(crate) byhash_retention_days: u64,
 
-    /// Retention time for usage logs.
+    /// Retention time (in days) for usage logs.
     #[serde(default = "default_usage_retention_days")]
     pub(crate) usage_retention_days: u64,
 
@@ -434,7 +424,7 @@ pub(crate) struct Config {
     #[serde(default = "default_https_tunnel_allowed_mirrors")]
     pub(crate) https_tunnel_allowed_mirrors: Vec<DomainName>,
 
-    /// Minimum transfer rate for downloads and uploads.
+    /// Minimum transfer rate (in bytes per second) for downloads and uploads.
     /// Connections that fail to fulfill this limit are cancelled.
     #[serde(
         default = "default_min_download_rate",
@@ -455,11 +445,7 @@ pub(crate) struct Config {
     #[serde(default = "default_db_channel_capacity")]
     pub(crate) db_channel_capacity: NonZero<usize>,
 
-    /// Threshold for using memory-mapped files for large downloads.
-    #[cfg_attr(
-        not(feature = "mmap"),
-        expect(dead_code, reason = "only used with mmap feature")
-    )]
+    /// Threshold (in bytes) for using memory-mapped files for large downloads.
     #[serde(default = "default_mmap_threshold")]
     pub(crate) mmap_threshold: NonZero<u64>,
 
@@ -521,7 +507,7 @@ where
 macro_rules! impl_parse_with_magnitude {
     ($name:ident, $T:ty) => {
         fn $name(s: &str) -> anyhow::Result<$T> {
-            debug_assert_eq!(s, s.trim(), "Should be trimmed by deserializer");
+            let s = s.trim();
 
             if let Ok(val) = s.parse::<$T>() {
                 return Ok(val);
@@ -894,14 +880,17 @@ impl Config {
         }
     }
 
-    pub(crate) fn new(file: &Path) -> anyhow::Result<(Self, bool)> {
+    /// Load the configuration from the given file.
+    /// Return the loaded configuration, a flag whether default settings were used,
+    /// and a list of validation warnings.
+    pub(crate) fn new(file: &Path) -> anyhow::Result<(Self, bool, Vec<String>)> {
         let content = match std::fs::read_to_string(file) {
             Ok(c) => c,
             Err(err)
                 if err.kind() == std::io::ErrorKind::NotFound
                     && file == Path::new(DEFAULT_CONFIGURATION_PATH) =>
             {
-                return Ok((Self::default(), true));
+                return Ok((Self::default(), true, Vec::new()));
             }
             Err(err) => {
                 return Err(err)
@@ -911,32 +900,51 @@ impl Config {
 
         let mut config: Self = toml::from_str(&content).context("Failed to parse configuration")?;
 
-        config.validate()?;
+        let warnings = config.validate()?;
 
-        Ok((config, false))
+        Ok((config, false, warnings))
     }
 
-    fn validate(&mut self) -> anyhow::Result<()> {
+    fn validate(&mut self) -> anyhow::Result<Vec<String>> {
+        let mut warnings: Vec<String> = Vec::new();
         // TODO: check bind_addr.is_documentation() once stable: https://github.com/rust-lang/rust/issues/27709
 
-        if self.database_slow_timeout > Duration::from_mins(1) {
+        if self.database_slow_timeout < Duration::from_secs(1)
+            || self.database_slow_timeout > Duration::from_mins(1)
+        {
             bail!(
-                "Invalid database_slow_timeout value of {}: must be less or equal to 60s",
+                "Invalid database_slow_timeout value of {}s: must be between 1s and 60s",
                 self.database_slow_timeout.as_secs_f32()
             );
         }
 
-        if self.http_timeout > Duration::from_mins(6) {
+        if self.http_timeout < Duration::from_secs(1) || self.http_timeout > Duration::from_mins(6)
+        {
             bail!(
-                "Invalid http_timeout value of {}: must be less or equal to 360s",
+                "Invalid http_timeout value of {}s: must be between 1s and 360s",
                 self.http_timeout.as_secs_f32()
             );
         }
 
         if self.buffer_size < 1024 || self.buffer_size > 1024 * 1024 * 1024 {
             bail!(
-                "Invalid buffer_size value of {}: must be in between 1K and 1G",
+                "Invalid buffer_size value of {}: must be in between 1k and 1G",
                 self.buffer_size
+            );
+        }
+
+        if self.byhash_retention_days == 0 {
+            bail!("Invalid byhash_retention_days value of 0: must be at least 1");
+        }
+
+        if self
+            .byhash_retention_days
+            .checked_mul(24 * 60 * 60)
+            .is_none()
+        {
+            bail!(
+                "Invalid byhash_retention_days value of {}: Overflow",
+                self.byhash_retention_days
             );
         }
 
@@ -946,7 +954,7 @@ impl Config {
             .is_none()
         {
             bail!(
-                "Invalid usage retention days value of {}: Overflow",
+                "Invalid usage_retention_days value of {}: Overflow",
                 self.usage_retention_days
             );
         }
@@ -958,16 +966,7 @@ impl Config {
             );
         }
 
-        if self.experimental_parallel_hack_factor <= 0.0
-            || self.experimental_parallel_hack_factor > 1.0
-        {
-            bail!(
-                "Invalid experimental parallel hack factor of {}: must be between 0 and 1",
-                self.experimental_parallel_hack_factor
-            );
-        }
-
-        /* Alias validation */
+        // Alias validation
         {
             for alias in &mut self.aliases {
                 alias.aliases.sort_unstable();
@@ -988,10 +987,139 @@ impl Config {
         }
 
         self.allowed_mirrors.sort_unstable();
+        self.http_only_mirrors.sort_unstable();
         self.https_tunnel_allowed_ports.sort_unstable();
         self.https_tunnel_allowed_mirrors.sort_unstable();
 
-        Ok(())
+        if !self.allowed_mirrors.is_empty() {
+            for mirror in &self.http_only_mirrors {
+                let mirror_str = match mirror {
+                    ConfigDomainName::Dns(s)
+                    | ConfigDomainName::Ipv4(s, _)
+                    | ConfigDomainName::Ipv6(s, _) => s.as_str(),
+                    ConfigDomainName::Wildcard(_) => continue,
+                };
+                if !self.allowed_mirrors.iter().any(|a| a.permits(mirror_str)) {
+                    warnings.push(format!(
+                        "http_only_mirrors entry `{mirror_str}` is not permitted by allowed_mirrors"
+                    ));
+                }
+            }
+        }
+
+        if self.https_tunnel_enabled && !self.allowed_mirrors.is_empty() {
+            for mirror in &self.https_tunnel_allowed_mirrors {
+                if !self
+                    .allowed_mirrors
+                    .iter()
+                    .any(|a| a.permits(mirror.as_str()))
+                {
+                    warnings.push(format!(
+                        "https_tunnel_allowed_mirrors entry `{mirror}` is not permitted by allowed_mirrors"
+                    ));
+                }
+            }
+        }
+
+        if !self.allowed_mirrors.is_empty() {
+            for alias in &self.aliases {
+                if !self
+                    .allowed_mirrors
+                    .iter()
+                    .any(|a| a.permits(alias.main.as_str()))
+                {
+                    warnings.push(format!(
+                        "alias target `{}` is not permitted by allowed_mirrors",
+                        alias.main
+                    ));
+                }
+            }
+        }
+
+        if !self.https_tunnel_enabled
+            && self.https_tunnel_allowed_ports != default_https_tunnel_allowed_ports()
+        {
+            warnings.push(
+                "https_tunnel_allowed_ports is set but https_tunnel_enabled is false".to_string(),
+            );
+        }
+
+        if self.min_download_rate.is_none()
+            && self.rate_check_timeframe != default_rate_check_timeframe()
+        {
+            bail!(
+                "rate_check_timeframe is set to {}s but min_download_rate is not configured",
+                self.rate_check_timeframe
+            );
+        }
+
+        if self.rate_check_timeframe > nonzero!(360) {
+            bail!(
+                "Invalid rate_check_timeframe value of {}s: must be between 1s and 360s",
+                self.rate_check_timeframe
+            );
+        }
+
+        #[cfg(not(feature = "mmap"))]
+        if self.mmap_threshold != DEFAULT_MMAP_THRESHOLD {
+            warnings.push(format!(
+                "mmap_threshold is set to {} but mmap feature is not enabled",
+                self.mmap_threshold
+            ));
+        }
+
+        #[expect(clippy::float_cmp, reason = "compare against default value")]
+        if !self.experimental_parallel_hack_enabled
+            && (self.experimental_parallel_hack_maxparallel
+                != default_experimental_parallel_hack_maxparallel()
+                || self.experimental_parallel_hack_statuscode
+                    != default_experimental_parallel_hack_statuscode()
+                || self.experimental_parallel_hack_retryafter
+                    != default_experimental_parallel_hack_retryafter()
+                || self.experimental_parallel_hack_factor
+                    != default_experimental_parallel_hack_factor()
+                || self.experimental_parallel_hack_minsize
+                    != default_experimental_parallel_minsize())
+        {
+            warnings.push(
+                "experimental_parallel_hack options are set but experimental_parallel_hack_enabled is false".to_string(),
+            );
+        }
+
+        if !self.experimental_parallel_hack_factor.is_normal()
+            || self.experimental_parallel_hack_factor <= 0.0
+            || self.experimental_parallel_hack_factor > 1.0
+        {
+            bail!(
+                "Invalid experimental_parallel_hack_factor of {}: must be between 0 and 1",
+                self.experimental_parallel_hack_factor
+            );
+        }
+
+        if self.experimental_parallel_hack_retryafter < 1
+            || self.experimental_parallel_hack_retryafter > 300
+        {
+            bail!(
+                "Invalid experimental_parallel_hack_retryafter value of {}: must be between 1 and 300",
+                self.experimental_parallel_hack_retryafter
+            );
+        }
+
+        if !self.cache_directory.is_absolute() {
+            warnings.push(format!(
+                "cache_directory `{}` is not an absolute path",
+                self.cache_directory.display()
+            ));
+        }
+
+        if !self.database_path.is_absolute() {
+            warnings.push(format!(
+                "database_path `{}` is not an absolute path",
+                self.database_path.display()
+            ));
+        }
+
+        Ok(warnings)
     }
 }
 
