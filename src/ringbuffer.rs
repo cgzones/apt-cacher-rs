@@ -26,15 +26,18 @@ impl<T> RingBuffer<T> {
 
         self.inner.push_back(item);
 
-        debug_assert!(self.inner.len() <= self.capacity.get());
+        debug_assert!(
+            self.inner.len() <= self.capacity.get(),
+            "ring buffer should not exceed capacity"
+        );
     }
 
-    #[expect(unused)]
+    #[expect(dead_code, reason = "example usage")]
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.inner.pop_front()
     }
 
-    #[expect(unused)]
+    #[expect(dead_code, reason = "example usage")]
     #[must_use]
     pub(crate) fn back_mut(&mut self) -> Option<&mut T> {
         self.inner.back_mut()
@@ -55,13 +58,13 @@ impl<T> RingBuffer<T> {
         self.inner.iter()
     }
 
-    #[expect(unused)]
+    #[expect(dead_code, reason = "example usage")]
     #[must_use]
     pub(crate) const fn capacity(&self) -> NonZero<usize> {
         self.capacity
     }
 
-    #[expect(unused)]
+    #[expect(dead_code, reason = "example usage")]
     pub(crate) fn retain(&mut self, f: impl FnMut(&T) -> bool) {
         self.inner.retain(f);
     }
@@ -102,7 +105,10 @@ where
 
         self.sum += item;
 
-        debug_assert!(self.inner.len() <= self.capacity.get());
+        debug_assert!(
+            self.inner.len() <= self.capacity.get(),
+            "ring buffer should not exceed capacity"
+        );
     }
 
     pub(crate) fn add_back(&mut self, item: T) {
@@ -114,7 +120,10 @@ where
 
             self.sum += item;
 
-            debug_assert!(self.inner.len() <= self.capacity.get());
+            debug_assert!(
+                self.inner.len() <= self.capacity.get(),
+                "ring buffer should not exceed capacity"
+            );
         }
     }
 
@@ -130,7 +139,10 @@ where
 
     #[must_use]
     pub(crate) fn sum(&self) -> T {
-        debug_assert!(self.sum == self.inner.iter().sum());
+        debug_assert!(
+            self.sum == self.inner.iter().sum(),
+            "ring buffer sum should match inner items sum"
+        );
         self.sum
     }
 }

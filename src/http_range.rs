@@ -16,14 +16,18 @@ const HTTP_DATE_FORMAT: &[FormatItem<'_>] = format_description!(
 #[must_use]
 pub(crate) fn systemtime_to_http_datetime(time: SystemTime) -> String {
     let odt = OffsetDateTime::from(time);
-    assert_eq!(odt.offset(), offset!(UTC));
+    debug_assert_eq!(odt.offset(), offset!(UTC), "offset should be UTC");
 
     /* round up to the next full second */
     let odt = match odt.nanosecond() {
         0 => odt,
         ns => odt.saturating_add(Duration::NANOSECOND * (1_000_000_000 - ns)),
     };
-    assert_eq!(odt.nanosecond(), 0);
+    assert_eq!(
+        odt.nanosecond(),
+        0,
+        "nanosecond should be 0 after rounding up"
+    );
 
     odt.format(HTTP_DATE_FORMAT).expect("date should be valid")
 }

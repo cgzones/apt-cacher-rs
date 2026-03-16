@@ -73,7 +73,10 @@ async fn flat_directory_size(path: &Path) -> Result<(usize, u64), tokio::io::Err
     while let Some(entry) = dir.next_entry().await? {
         let mdata = entry.metadata().await?;
         total_size += mdata.len();
-        #[expect(clippy::case_sensitive_file_extension_comparisons)]
+        #[expect(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "debian uses case-sensitive extensions"
+        )]
         if mdata.is_file()
             && entry
                 .file_name()
@@ -156,14 +159,12 @@ async fn build_mirror_table(database: &Database) -> Result<(Table, usize), Proxy
             ("N/A".to_string(), "N/A".to_string())
         };
 
-        #[expect(clippy::cast_precision_loss)]
         let rate_fmt = if mirror.total_download_size == 0 {
             "N/A".to_string()
         } else {
-            format!(
-                "{:.2}",
-                mirror.total_delivery_size as f32 / mirror.total_download_size as f32
-            )
+            #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
+            let rate = mirror.total_delivery_size as f32 / mirror.total_download_size as f32;
+            format!("{rate:.2}")
         };
 
         html_table_mirrors.add_body_row(&[

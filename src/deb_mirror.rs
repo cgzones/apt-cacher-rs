@@ -28,7 +28,10 @@ pub(crate) fn mirror_cache_path_impl(
         .iter()
         .collect();
 
-    assert!(cache_path.is_relative());
+    assert!(
+        cache_path.is_relative(),
+        "cache path must be relative in order to be joined with the host directory"
+    );
 
     cache_path
 }
@@ -246,7 +249,10 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         let mut parts = dists_path.rsplit('/');
 
         let filename = parts.next()?;
-        #[expect(clippy::case_sensitive_file_extension_comparisons)]
+        #[expect(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "filename is case-sensitive in Debian dists"
+        )]
         if filename == "Release" || filename == "InRelease" {
             let distribution = parts.next()?;
 

@@ -701,8 +701,14 @@ const fn default_experimental_parallel_minsize() -> Option<NonZero<u64>> {
 
 #[must_use]
 fn intersect<T: Ord>(a: &[T], b: &[T]) -> bool {
-    debug_assert!(a.is_sorted());
-    debug_assert!(b.is_sorted());
+    debug_assert!(
+        a.is_sorted(),
+        "a must be sorted for the intersection operation"
+    );
+    debug_assert!(
+        b.is_sorted(),
+        "b must be sorted for the intersection operation"
+    );
 
     let mut iter_a = a.iter();
     let mut iter_b = b.iter();

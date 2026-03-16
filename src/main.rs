@@ -1,5 +1,8 @@
 #![cfg_attr(not(any(feature = "mmap", feature = "sendfile")), forbid(unsafe_code))]
-#![allow(clippy::too_many_lines)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "prefer documented and clear structure"
+)]
 
 #[cfg(not(any(feature = "tls_hyper", feature = "tls_rustls")))]
 compile_error!("Either feature \"tls_hyper\" or \"tls_rustls\" must be enabled for this crate.");
@@ -28,6 +31,7 @@ mod sendfile_conn;
 mod task_cache_scan;
 mod task_cleanup;
 mod task_setup;
+mod utils;
 mod web_interface;
 
 use std::convert::Infallible;
@@ -155,7 +159,10 @@ use crate::web_interface::serve_web_interface;
 // TODO: replace usages with ! once stable
 enum Never {}
 
-#[expect(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "on truncation the final comparison fails"
+)]
 const _: () = assert!(
     ((usize::MAX as u64) as usize) == usize::MAX,
     "ensure casts from usize to u64 via 'as' do not truncate"
@@ -217,7 +224,10 @@ async fn tokio_mkstemp(
             .map(char::from)
             .collect();
 
-        assert!(buf.set_extension(s));
+        assert!(
+            buf.set_extension(s),
+            "buf is non-empty so adding a new extension must succeed"
+        );
 
         let _: Never = match tokio::fs::File::options()
             .create_new(true)
@@ -232,7 +242,10 @@ async fn tokio_mkstemp(
                 if tries > MAX_TRIES {
                     return Err(err);
                 }
-                assert!(buf.set_extension(""));
+                assert!(
+                    buf.set_extension(""),
+                    "buf is non-empty so removing an existing extension must succeed"
+                );
                 continue;
             }
             Err(err) => return Err(err),
@@ -282,7 +295,10 @@ impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
     }
 }
 
-#[expect(clippy::from_over_into)]
+#[expect(
+    clippy::from_over_into,
+    reason = "Into is used via entry_ref() and From is not needed"
+)]
 impl Into<SchemeKey> for &SchemeKeyRef<'_> {
     fn into(self) -> SchemeKey {
         SchemeKey {
@@ -363,7 +379,10 @@ pub(crate) async fn request_with_retry(
         }
     }
 
-    #[expect(clippy::items_after_statements)]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "keep definition before grouped call sites"
+    )]
     async fn inner_loop(
         client: &HttpClient,
         mut parts: http::request::Parts,
@@ -427,7 +446,11 @@ pub(crate) async fn request_with_retry(
                             cached_scheme, None,
                             "https upgrade is only tried when no cached scheme exists"
                         );
-                        assert_eq!(https_upgrade_mode, HttpsUpgradeMode::Auto);
+                        assert_eq!(
+                            https_upgrade_mode,
+                            HttpsUpgradeMode::Auto,
+                            "branch ensures value is not Always, and Never does not perform upgrades"
+                        );
 
                         debug!(
                             "Https upgrade failed for host {} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
@@ -918,7 +941,7 @@ impl bytes::buf::Buf for MmapData {
     }
 
     fn advance(&mut self, cnt: usize) {
-        assert!(cnt <= self.remaining);
+        assert!(cnt <= self.remaining, "suggested by trait");
         self.position += cnt;
         self.remaining -= cnt;
     }
@@ -930,12 +953,18 @@ impl Body for MmapBody {
     type Error = Infallible;
 
     fn is_end_stream(&self) -> bool {
-        debug_assert!(self.position <= self.length);
+        debug_assert!(
+            self.position <= self.length,
+            "position must not exceed length"
+        );
         self.position == self.length
     }
 
     fn size_hint(&self) -> SizeHint {
-        debug_assert!(self.position <= self.length);
+        debug_assert!(
+            self.position <= self.length,
+            "position must not exceed length"
+        );
         SizeHint::with_exact((self.length - self.position) as u64)
     }
 
@@ -944,7 +973,10 @@ impl Body for MmapBody {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // same logic as in Self::is_end_stream()
-        debug_assert!(self.position <= self.length);
+        debug_assert!(
+            self.position <= self.length,
+            "position must not exceed length"
+        );
         let remaining_total = self.length - self.position;
         if remaining_total == 0 {
             return Ready(None);
@@ -1100,7 +1132,7 @@ async fn serve_cached_file(
 }
 
 #[cfg(feature = "mmap")]
-#[expect(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 #[inline]
 async fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
@@ -1140,7 +1172,11 @@ async fn serve_cached_file_mmap(
         })
         .ok()?;
 
-        debug_assert_eq!(memory_map.len(), content_length);
+        debug_assert_eq!(
+            memory_map.len(),
+            content_length,
+            "actual mmap length must match requested length"
+        );
 
         // close file, since mapping is independent
         drop(file);
@@ -1185,7 +1221,7 @@ async fn serve_cached_file_mmap(
 }
 
 #[cfg(not(feature = "mmap"))]
-#[expect(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 #[inline]
 async fn serve_cached_file_buf(
     conn_details: ConnectionDetails,
@@ -1288,7 +1324,7 @@ fn serve_cached_file_response(
             CONTENT_RANGE,
             ct.try_into().expect("content range string is valid"),
         );
-        assert!(!r);
+        assert!(!r, "header does not exist by previous construction");
     }
 
     trace!("Outgoing response of cached file: {response:?}");
@@ -1312,7 +1348,11 @@ async fn serve_volatile_file(
     file_path: &Path,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
-    debug_assert_eq!(conn_details.cached_flavor, CachedFlavor::Volatile);
+    debug_assert_eq!(
+        conn_details.cached_flavor,
+        CachedFlavor::Volatile,
+        "serve_volatile_file() assumes volatile flavor"
+    );
 
     let (local_creation_time, local_modification_time) = match file.metadata().await {
         Ok(data) => (
@@ -1418,13 +1458,22 @@ impl ConnectionDetails {
         let host = self.aliased_host.unwrap_or(&self.mirror.host);
         let host = host.format_cache_dir(self.mirror.port);
         let host = Path::new(host.as_ref());
-        assert!(host.is_relative());
+        assert!(
+            host.is_relative(),
+            "path construction must not contain absolute components"
+        );
 
         let uri_path = Path::new(&self.mirror.path);
-        assert!(uri_path.is_relative());
+        assert!(
+            uri_path.is_relative(),
+            "path construction must not contain absolute components"
+        );
 
         let subdir = self.subdir.unwrap_or_else(|| Path::new(""));
-        assert!(subdir.is_relative());
+        assert!(
+            subdir.is_relative(),
+            "path construction must not contain absolute components"
+        );
 
         [root.as_path(), host, uri_path, subdir].iter().collect()
     }
@@ -1517,7 +1566,10 @@ impl ActiveDownloads {
     fn remove(&self, mirror: &Mirror, debname: &str) {
         let key = ActiveDownloadKeyRef { mirror, debname };
         let was_present = self.inner.write().remove(&key);
-        assert!(was_present.is_some());
+        assert!(
+            was_present.is_some(),
+            "callers must own active downloads they are removing"
+        );
     }
 
     /// Check if a download for the given mirror and debname is active.
@@ -1593,13 +1645,13 @@ mod download_barrier {
         }
 
         pub(super) fn ping(&self) -> Result<(), SendError<()>> {
-            debug_assert!(self.active);
+            debug_assert!(self.active, "ping() cannot be called after a sink");
 
             self.tx.send(())
         }
 
         pub(super) async fn abort(mut self, reason: AbortReason) {
-            debug_assert!(self.active);
+            debug_assert!(self.active, "abort() is a sink");
 
             *self.status.write().await = ActiveDownloadStatus::Aborted(reason);
             self.active = false;
@@ -1610,7 +1662,7 @@ mod download_barrier {
             mut lock: tokio::sync::RwLockWriteGuard<'_, ActiveDownloadStatus>,
             path: PathBuf,
         ) {
-            debug_assert!(self.active);
+            debug_assert!(self.active, "release() is a sink");
 
             *lock = ActiveDownloadStatus::Finished(path);
 
@@ -1789,7 +1841,10 @@ async fn download_file(
     let dest_file_path = {
         let mut p = dest_dir_path;
         let filename = Path::new(&conn_details.debname);
-        assert!(filename.is_relative());
+        assert!(
+            filename.is_relative(),
+            "path construction must not contain absolute components"
+        );
         p.push(filename);
         p
     };
@@ -1948,7 +2003,7 @@ async fn serve_unfinished_file(
                 let buf = buf.freeze();
 
                 bytes += ret as u64;
-                assert_eq!(buf.len(), ret);
+                assert_eq!(buf.len(), ret, "buffer length must match read bytes");
 
                 if let Err(_err) = tx.send(Ok(buf)).await {
                     info!("Receiver of stream task closed; cancelling stream...");
@@ -2055,7 +2110,7 @@ async fn serve_unfinished_file(
             .headers_mut()
             .expect("request should be valid")
             .append(CONTENT_LENGTH, HeaderValue::from(size.get()));
-        assert!(!r);
+        assert!(!r, "header does not exist by previous construction");
     }
 
     let channel_body = ChannelBody::new(rx, content_length);
@@ -2275,7 +2330,7 @@ mod init_barrier {
         }
 
         pub(super) async fn finished(mut self, path: PathBuf) {
-            debug_assert!(self.active);
+            debug_assert!(self.active, "finished() is a sink");
 
             *self.status.write().await = ActiveDownloadStatus::Finished(path);
             self.active_downloads.remove(self.mirror, self.debname);
@@ -2288,7 +2343,7 @@ mod init_barrier {
             content_length: ContentLength,
             receiver: tokio::sync::watch::Receiver<()>,
         ) {
-            debug_assert!(self.active);
+            debug_assert!(self.active, "download() is a sink");
 
             *self.status.write().await =
                 ActiveDownloadStatus::Download(path, content_length, receiver);
@@ -2457,13 +2512,13 @@ async fn serve_new_file(
                 IF_MODIFIED_SINCE,
                 HeaderValue::try_from(date_fmt).expect("HTTP datetime should be valid"),
             );
-            assert!(!r);
+            assert!(!r, "header does not exist by previous construction");
 
             let r = request.headers_mut().append(
                 CACHE_CONTROL,
                 HeaderValue::try_from(format!("max-age={max_age}")).expect("string is valid"),
             );
-            assert!(!r);
+            assert!(!r, "header does not exist by previous construction");
         }
 
         request
@@ -2783,7 +2838,10 @@ async fn serve_new_file(
     let (_parts, body) = fwd_response.into_parts();
 
     let filename = Path::new(&conn_details.debname);
-    assert!(filename.is_relative());
+    assert!(
+        filename.is_relative(),
+        "path construction must not contain absolute components"
+    );
     let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
         .iter()
         .collect();
@@ -2902,7 +2960,7 @@ async fn serve_new_file(
             .experimental_parallel_hack_minsize
             .is_none_or(|size| content_length.upper() > size)
     {
-        #[expect(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss, reason = "generate probability value")]
         let p = (curr_downloads.saturating_sub(1) as f64)
             .mul_add(-gcfg.experimental_parallel_hack_factor, 1.0)
             .max(0.0);
@@ -2980,7 +3038,10 @@ pub(crate) async fn process_cache_request(
     let cache_path = {
         let mut p = conn_details.cache_dir_path();
         let filename = Path::new(&conn_details.debname);
-        assert!(filename.is_relative());
+        assert!(
+            filename.is_relative(),
+            "path construction must not contain absolute components"
+        );
         p.push(filename);
         p
     };
@@ -3545,7 +3606,10 @@ async fn pre_process_client_request(
      * http://deb.debian.org/debian/dists/unstable/main/i18n/Translation-en.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz
      * http://deb.debian.org/debian/dists/sid/main/source/Sources.diff/T-2024-10-03-1409.04-F-2024-10-03-1409.04.gz
      */
-    #[expect(clippy::items_after_statements)]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "keep definition close to single use"
+    )]
     fn ignore_uncached_path(uri_path: &str) -> bool {
         uri_path.contains("/Packages.diff/T-")
             || uri_path.contains("/Translation-en.diff/T-")
@@ -3572,8 +3636,14 @@ async fn pre_process_client_request(
             .find(|(_idx, (h, p))| *h == requested_host && *p == requested_path)
         {
             let entry = uncacheables.remove(idx).expect("entry exists");
-            debug_assert_eq!(entry.0, requested_host);
-            debug_assert_eq!(entry.1, requested_path);
+            debug_assert_eq!(
+                entry.0, requested_host,
+                "requested_host was used as lookup key"
+            );
+            debug_assert_eq!(
+                entry.1, requested_path,
+                "requested_path was used as lookup key"
+            );
 
             uncacheables.push(entry);
         } else {
@@ -4231,7 +4301,6 @@ pub(crate) fn global_config() -> &'static Config {
         .config
 }
 
-#[expect(clippy::print_stderr)]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Cli::parse();
 
@@ -4333,6 +4402,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         err
     })?;
 
+    #[expect(clippy::print_stderr, reason = "print to stderr for panic hook")]
     std::panic::set_hook(Box::new(move |info| {
         error!("{info}");
         eprintln!("{info}");

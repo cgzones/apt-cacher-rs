@@ -95,7 +95,7 @@ impl PackageFormat {
         filename: &str,
         file_list: &mut HashMap<OsString, PathBuf>,
     ) -> Result<(), ProxyCacheError> {
-        debug_assert!(!file_list.is_empty());
+        debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
 
         let buffer_size = global_config().buffer_size;
 
@@ -220,7 +220,7 @@ pub(crate) async fn task_cleanup(appstate: &AppState) -> Result<(), ProxyCacheEr
 
     {
         let mut val = mutex.lock();
-        assert!(*val);
+        assert!(*val, "cleanup state must be active after completion");
         *val = false;
     }
 
@@ -482,7 +482,7 @@ async fn cleanup_mirror_deb_files(
             buffer.push_str("packages");
             buffer.push_str(pkgfmt.extension());
 
-            debug_assert_eq!(buffer.len(), total_len);
+            debug_assert_eq!(buffer.len(), total_len, "should pre-allocate correctly");
 
             buffer
         };
