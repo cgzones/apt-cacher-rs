@@ -17,7 +17,7 @@ macro_rules! warn_once_or_info {
             std::sync::OnceLock::new();
         log::log!(match FIRED.set(std::marker::PhantomData) {
             Ok(()) => log::Level::Warn,
-            Err(_) => log::Level::Info,
+            Err(std::marker::PhantomData) => log::Level::Info,
         },$($t)*);
     }};
 }

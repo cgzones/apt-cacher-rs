@@ -710,7 +710,7 @@ async fn read_request_headers(
     match tokio::time::timeout(global_config().http_timeout, inner(stream, buf)).await {
         Ok(Ok(next_index)) => Ok(next_index),
         Ok(Err(err)) => Err(err),
-        Err(_) => Err(std::io::Error::new(
+        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
             ErrorKind::TimedOut,
             "timed out waiting for request headers",
         )),
@@ -854,7 +854,7 @@ async fn write_all_to_stream(stream: &TcpStream, data: &[u8]) -> std::io::Result
     match tokio::time::timeout(global_config().http_timeout, inner(stream, data)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(err),
-        Err(_) => Err(std::io::Error::new(
+        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
             ErrorKind::TimedOut,
             "write operation timed out",
         )),
