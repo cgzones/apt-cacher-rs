@@ -20,6 +20,7 @@ mod database;
 mod database_task;
 mod deb_mirror;
 mod error;
+mod guards;
 mod http_range;
 mod humanfmt;
 mod log_once;
@@ -135,15 +136,15 @@ use crate::deb_mirror::valid_component;
 use crate::deb_mirror::valid_distribution;
 use crate::deb_mirror::valid_filename;
 use crate::deb_mirror::valid_mirrorname;
-use crate::download_barrier::DownloadBarrier;
 use crate::error::ErrorReport;
 use crate::error::MirrorDownloadRate;
 use crate::error::ProxyCacheError;
+use crate::guards::DownloadBarrier;
+use crate::guards::InitBarrier;
 use crate::http_range::format_http_date;
 use crate::http_range::http_datetime_to_systemtime;
 use crate::http_range::systemtime_to_http_datetime;
 use crate::humanfmt::HumanFmt;
-use crate::init_barrier::InitBarrier;
 use crate::logstore::LogStore;
 use crate::ringbuffer::RingBuffer;
 use crate::task_cache_scan::task_cache_scan;
@@ -1587,78 +1588,13 @@ impl ActiveDownloads {
     }
 }
 
-mod download_barrier {
-    use std::{path::PathBuf, sync::Arc};
-
-    use tokio::sync::watch::error::SendError;
-
-    use crate::{AbortReason, ActiveDownloadStatus};
-
-    #[must_use]
-    pub(super) struct DownloadBarrier<'a> {
-        tx: tokio::sync::watch::Sender<()>,
-        status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-        active: bool,
-    }
-
-    impl<'a> DownloadBarrier<'a> {
-        pub(super) const fn new(
-            tx: tokio::sync::watch::Sender<()>,
-            status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-        ) -> Self {
-            Self {
-                tx,
-                status,
-                active: true,
-            }
-        }
-
-        pub(super) fn ping(&self) -> Result<(), SendError<()>> {
-            debug_assert!(self.active, "ping() cannot be called after a sink");
-
-            self.tx.send(())
-        }
-
-        pub(super) async fn abort(mut self, reason: AbortReason) {
-            debug_assert!(self.active, "abort() is a sink");
-
-            *self.status.write().await = ActiveDownloadStatus::Aborted(reason);
-            self.active = false;
-        }
-
-        pub(super) fn release(
-            mut self,
-            mut lock: tokio::sync::RwLockWriteGuard<'_, ActiveDownloadStatus>,
-            path: PathBuf,
-        ) {
-            debug_assert!(self.active, "release() is a sink");
-
-            *lock = ActiveDownloadStatus::Finished(path);
-
-            self.active = false;
-        }
-    }
-
-    impl Drop for DownloadBarrier<'_> {
-        fn drop(&mut self) {
-            if self.active {
-                tokio::task::block_in_place(|| {
-                    *self.status.blocking_write() =
-                        ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
-                });
-            }
-        }
-    }
-}
-
 async fn download_file(
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     conn_details: &ConnectionDetails,
     warn_on_override: bool,
-    status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     input: (Incoming, ContentLength),
     output: (tokio::fs::File, TempPath),
-    tx: tokio::sync::watch::Sender<()>,
+    dbarrier: DownloadBarrier,
 ) {
     let config = global_config();
 
@@ -1668,8 +1604,6 @@ async fn download_file(
         "Starting download of file {} from mirror {} for client {}...",
         conn_details.debname, conn_details.mirror, conn_details.client
     );
-
-    let dbarrier = DownloadBarrier::new(tx, status);
 
     let body = input.0;
     let content_length = input.1;
@@ -1698,12 +1632,14 @@ async fn download_file(
                 match *err {
                     RateCheckedBodyErr::RateTimeout(download_rate_err) => {
                         dbarrier
-                            .abort(AbortReason::MirrorDownloadRate(error::MirrorDownloadRate {
-                                download_rate_err,
-                                mirror: conn_details.mirror.clone(),
-                                debname: conn_details.debname.clone(),
-                                client_ip: conn_details.client.ip(),
-                            }))
+                            .abort_with_reason(AbortReason::MirrorDownloadRate(
+                                error::MirrorDownloadRate {
+                                    download_rate_err,
+                                    mirror: conn_details.mirror.clone(),
+                                    debname: conn_details.debname.clone(),
+                                    client_ip: conn_details.client.ip(),
+                                },
+                            ))
                             .await;
                     }
                     RateCheckedBodyErr::Inner(ierr) => {
@@ -1818,7 +1754,7 @@ async fn download_file(
     {
         // Lock to block all downloading tasks, since the file from the
         // path of the downloading state is going to be moved.
-        let locked_status = status.write().await;
+        let rbarrier = dbarrier.begin_rename().await;
 
         /* Should only happen for concurrent downloads from aliased mirrors */
         if warn_on_override
@@ -1865,10 +1801,10 @@ async fn download_file(
                     }
                 }
 
-                dbarrier.release(locked_status, dest_file_path);
+                rbarrier.release(dest_file_path);
             }
             Err(err) => {
-                drop(locked_status);
+                drop(rbarrier);
 
                 error!(
                     "Failed to rename file `{}` to `{}`:  {err}",
@@ -2251,77 +2187,6 @@ impl std::fmt::Display for ContentLength {
         match self {
             Self::Exact(size) => write!(f, "exact {size} bytes"),
             Self::Unknown(limit) => write!(f, "up to {limit} bytes"),
-        }
-    }
-}
-
-mod init_barrier {
-    use std::{path::PathBuf, sync::Arc};
-
-    use crate::{
-        AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength, deb_mirror::Mirror,
-    };
-
-    #[must_use]
-    pub(super) struct InitBarrier<'a> {
-        /// Unused, receivers just needs to get notified by drop
-        _tx: tokio::sync::watch::Sender<()>,
-        status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-        active_downloads: &'a ActiveDownloads,
-        mirror: &'a Mirror,
-        debname: &'a str,
-        active: bool,
-    }
-
-    impl<'a> InitBarrier<'a> {
-        pub(super) fn new(
-            tx: tokio::sync::watch::Sender<()>,
-            status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-            active_downloads: &'a ActiveDownloads,
-            mirror: &'a Mirror,
-            debname: &'a str,
-        ) -> Self {
-            Self {
-                _tx: tx,
-                status,
-                active_downloads,
-                mirror,
-                debname,
-                active: true,
-            }
-        }
-
-        pub(super) async fn finished(mut self, path: PathBuf) {
-            debug_assert!(self.active, "finished() is a sink");
-
-            *self.status.write().await = ActiveDownloadStatus::Finished(path);
-            self.active_downloads.remove(self.mirror, self.debname);
-            self.active = false;
-        }
-
-        pub(super) async fn download(
-            mut self,
-            path: PathBuf,
-            content_length: ContentLength,
-            receiver: tokio::sync::watch::Receiver<()>,
-        ) {
-            debug_assert!(self.active, "download() is a sink");
-
-            *self.status.write().await =
-                ActiveDownloadStatus::Download(path, content_length, receiver);
-            self.active = false;
-        }
-    }
-
-    impl Drop for InitBarrier<'_> {
-        fn drop(&mut self) {
-            if self.active {
-                tokio::task::block_in_place(|| {
-                    *self.status.blocking_write() =
-                        ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
-                    self.active_downloads.remove(self.mirror, self.debname);
-                });
-            }
         }
     }
 }
@@ -2862,10 +2727,8 @@ async fn serve_new_file(
         conn_details.debname, conn_details.mirror, conn_details.client
     );
 
-    let (tx, rx) = tokio::sync::watch::channel(());
-
-    ibarrier
-        .download(outpath.to_path_buf(), content_length, rx)
+    let dbarrier = ibarrier
+        .download(outpath.to_path_buf(), content_length)
         .await;
 
     let cd = conn_details.clone();
@@ -2877,10 +2740,9 @@ async fn serve_new_file(
             db_tx,
             &cd,
             warn_on_override,
-            &st,
             (body, content_length),
             (outfile, outpath),
-            tx,
+            dbarrier,
         )
         .await;
 
@@ -2917,8 +2779,6 @@ async fn serve_new_file(
                 }
             }
         }
-
-        appstate.active_downloads.remove(&cd.mirror, &cd.debname);
     });
 
     let config = global_config();
