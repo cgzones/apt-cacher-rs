@@ -2113,6 +2113,7 @@ async fn serve_unfinished_file(
     let mut response_builder = Response::builder()
         .status(StatusCode::OK)
         .header(SERVER, APP_NAME)
+        .header(DATE, format_http_date())
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
         .header(ACCEPT_RANGES, "bytes")
@@ -2420,6 +2421,7 @@ async fn serve_cached_file_modified_since(
         let response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(SERVER, APP_NAME)
+            .header(DATE, format_http_date())
             .header(CONNECTION, "keep-alive")
             .header(
                 AGE,
@@ -2997,6 +2999,7 @@ async fn serve_new_file(
             let mut response = Response::builder()
                 .status(config.experimental_parallel_hack_statuscode)
                 .header(SERVER, APP_NAME)
+                .header(DATE, format_http_date())
                 .header(CONNECTION, "keep-alive")
                 .body(ProxyCacheBody::Empty(Empty::new()))
                 .expect("Response is valid");
@@ -3250,6 +3253,7 @@ fn connect_response(
 
     let response = Response::builder()
         .header(SERVER, APP_NAME)
+        .header(DATE, format_http_date())
         .body(ProxyCacheBody::Empty(Empty::new()))
         .expect("HTTP response is valid");
 
