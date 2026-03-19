@@ -201,7 +201,7 @@ fn compute_conn_action(
                 .is_none_or(|hval| hval.trim() != "0"))
             || h.name.eq_ignore_ascii_case("Transfer-Encoding")
     }) {
-        debug!(
+        warn_once_or_info!(
             "Request with body detected from client {client}, closing connection after response"
         );
         return ConnectionAction::Close;
