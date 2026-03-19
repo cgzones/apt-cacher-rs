@@ -3221,9 +3221,27 @@ fn connect_response(
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
+    let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
+        if let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max) {
+            Some(guard)
+        } else {
+            info!(
+                "Rejecting https tunnel request for client {client}: \
+                     concurrent connection limit ({max}) reached"
+            );
+            return quick_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many concurrent HTTPS tunnel connections",
+            );
+        }
+    } else {
+        None
+    };
+
     info!("Using un-cached tunnel for client {client} to {host}:{port}");
 
     tokio::task::spawn(async move {
+        let _tunnel_guard = tunnel_guard;
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 if let Err(err) = tunnel(client, upgraded, &host, port).await {
@@ -3855,6 +3873,46 @@ mod client_counter {
     impl Drop for ClientDownload {
         fn drop(&mut self) {
             CLIENT_DOWNLOADS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+mod tunnel_limiter {
+    use hashbrown::HashMap;
+    use parking_lot::Mutex;
+    use std::net::IpAddr;
+    use std::num::NonZero;
+
+    static TUNNEL_CONNECTIONS: std::sync::LazyLock<Mutex<HashMap<IpAddr, usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Try to acquire a tunnel slot for the given client IP.
+    /// Returns `Some(TunnelGuard)` if under the limit, `None` if at capacity.
+    pub(super) fn try_acquire(client_ip: IpAddr, max: NonZero<usize>) -> Option<TunnelGuard> {
+        let mut map = TUNNEL_CONNECTIONS.lock();
+        let count = map.entry(client_ip).or_insert(0);
+        if *count >= max.get() {
+            return None;
+        }
+        *count += 1;
+        drop(map);
+        Some(TunnelGuard { client_ip })
+    }
+
+    pub(super) struct TunnelGuard {
+        client_ip: IpAddr,
+    }
+
+    impl Drop for TunnelGuard {
+        fn drop(&mut self) {
+            let mut map = TUNNEL_CONNECTIONS.lock();
+            if let hashbrown::hash_map::Entry::Occupied(mut entry) = map.entry(self.client_ip) {
+                let count = entry.get_mut();
+                *count -= 1;
+                if *count == 0 {
+                    entry.remove();
+                }
+            }
         }
     }
 }
