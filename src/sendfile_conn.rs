@@ -291,7 +291,7 @@ async fn try_sendfile_request(
                 m.escape_debug(),
             );
             return SendfileResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
+                status: StatusCode::METHOD_NOT_ALLOWED,
                 msg: "Method not supported",
             };
         }
@@ -721,10 +721,14 @@ async fn async_sendfile(
             let mut off = file_offset;
 
             tokio::task::spawn_blocking(move || {
-                // SAFETY: socket_fd is valid for the duration of this call
-                // because the caller holds references to the TcpStream
+                // SAFETY: socket_fd and file_fd are valid for the duration of this
+                // blocking task because the caller (`async_sendfile`) holds references
+                // to the TcpStream and File, and awaits this task's completion before
+                // returning. BorrowedFd is used instead of OwnedFd (try_clone_to_owned)
+                // to avoid a dup() syscall per sendfile iteration.
                 let socket = unsafe { BorrowedFd::borrow_raw(socket_fd) };
-                // SAFETY: file_fd is valid while caller holds references to the File
+                // SAFETY: same reasoning as above — file_fd is valid for the
+                // duration of this blocking task.
                 let file = unsafe { BorrowedFd::borrow_raw(file_fd) };
                 sendfile(socket, file, Some(&mut off), chunk_size).map(|sent| (sent, off))
             })
@@ -837,10 +841,11 @@ async fn write_304_response(
         "{conn_version} 304 Not Modified\r\n\
          Date: {date}\r\n\
          Via: {APP_VIA}\r\n\
-         Age: {age}\r\n\
          Connection: {conn_action}\r\n\
+         Age: {age}\r\n\
          \r\n"
     );
+    trace!("Outgoing 304 response:\n{response}");
     write_all_to_stream(stream, response.as_bytes()).await
 }
 
@@ -864,6 +869,7 @@ async fn write_invalid_response(
          \r\n\
          {msg}"
     );
+    trace!("Outgoing error response:\n{response}");
     write_all_to_stream(stream, response.as_bytes()).await
 }
 
@@ -885,12 +891,12 @@ async fn write_response_headers(
         "{conn_version} {status}\r\n\
          Date: {date}\r\n\
          Via: {APP_VIA}\r\n\
-         Age: {age}\r\n\
          Connection: {conn_action}\r\n\
          Content-Length: {content_length}\r\n\
          Content-Type: application/vnd.debian.binary-package\r\n\
          Last-Modified: {last_modified_str}\r\n\
-         Accept-Ranges: bytes\r\n"
+         Accept-Ranges: bytes\r\n\
+         Age: {age}\r\n"
     );
 
     if let Some(cr) = content_range {
@@ -901,6 +907,7 @@ async fn write_response_headers(
 
     response.push_str("\r\n");
 
+    trace!("Outgoing file response headers:\n{response}");
     write_all_to_stream(stream, response.as_bytes()).await
 }
 
