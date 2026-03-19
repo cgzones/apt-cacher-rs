@@ -595,10 +595,24 @@ async fn try_sendfile_request(
             SendfileResult::Served(conn_action)
         }
         Err(err) => {
-            error!(
-                "sendfile error serving `{}` to client {client}:  {err}",
-                cache_path.display()
+            let is_client_disconnect = matches!(
+                err.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::TimedOut
             );
+            if is_client_disconnect {
+                info!(
+                    "sendfile transfer cancelled for `{}` to client {client}:  {err}",
+                    cache_path.display()
+                );
+            } else {
+                error!(
+                    "sendfile error serving `{}` to client {client}:  {err}",
+                    cache_path.display()
+                );
+            }
             // Response already sent, just close the connection
             SendfileResult::Error
         }
