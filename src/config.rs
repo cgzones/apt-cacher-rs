@@ -31,6 +31,7 @@ const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTPS_UPGRADE_MODE: HttpsUpgradeMode = HttpsUpgradeMode::Auto;
 const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
 const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
+const DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT: Option<NonZero<usize>> = Some(nonzero!(10));
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
 const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
@@ -424,6 +425,14 @@ pub(crate) struct Config {
     #[serde(default = "default_https_tunnel_allowed_mirrors")]
     pub(crate) https_tunnel_allowed_mirrors: Vec<DomainName>,
 
+    /// Maximum number of concurrent HTTPS tunnel connections per client IP.
+    /// `None` means unlimited.
+    #[serde(
+        default = "default_https_tunnel_max_connections_per_client",
+        deserialize_with = "from_nonzero_usize"
+    )]
+    pub(crate) https_tunnel_max_connections_per_client: Option<NonZero<usize>>,
+
     /// Minimum transfer rate (in bytes per second) for downloads and uploads.
     /// Connections that fail to fulfill this limit are cancelled.
     #[serde(
@@ -675,6 +684,10 @@ const fn default_https_tunnel_allowed_mirrors() -> Vec<DomainName> {
     Vec::new()
 }
 
+const fn default_https_tunnel_max_connections_per_client() -> Option<NonZero<usize>> {
+    DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT
+}
+
 const fn default_byhash_retention_days() -> u64 {
     DEFAULT_BYHASH_RETENTION_DAYS
 }
@@ -880,6 +893,8 @@ impl Config {
             https_tunnel_enabled: true,
             https_tunnel_allowed_ports: DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS.to_vec(),
             https_tunnel_allowed_mirrors: Vec::new(),
+            https_tunnel_max_connections_per_client:
+                DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT,
             byhash_retention_days: DEFAULT_BYHASH_RETENTION_DAYS,
             usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
             logstore_capacity: DEFAULT_LOGSTORE_CAPACITY,
@@ -1058,6 +1073,13 @@ impl Config {
         {
             warnings.push(
                 "https_tunnel_allowed_ports is set but https_tunnel_enabled is false".to_string(),
+            );
+        }
+
+        if !self.https_tunnel_enabled && self.https_tunnel_max_connections_per_client.is_some() {
+            warnings.push(
+                "https_tunnel_max_connections_per_client is set but https_tunnel_enabled is false"
+                    .to_string(),
             );
         }
 
