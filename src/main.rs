@@ -87,6 +87,7 @@ use hyper::header::RANGE;
 use hyper::header::RETRY_AFTER;
 use hyper::header::SERVER;
 use hyper::header::USER_AGENT;
+use hyper::header::VIA;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, body::Body};
@@ -173,6 +174,8 @@ type HttpClient = hyper_util::client::legacy::Client<
 pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+
+pub(crate) const APP_VIA: &str = concat!("1.1 ", env!("CARGO_PKG_NAME"));
 
 const RETENTION_TIME: Duration = Duration::from_hours(8 * 7 * 24); /* 8 weeks */
 
@@ -1049,8 +1052,8 @@ async fn serve_cached_file(
 
         let response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
-            .header(SERVER, APP_NAME)
             .header(DATE, format_http_date())
+            .header(VIA, APP_VIA)
             .header(CONNECTION, "keep-alive")
             .header(
                 AGE,
@@ -1315,8 +1318,8 @@ fn serve_cached_file_response(
 
     let mut response = Response::builder()
         .status(http_status)
-        .header(SERVER, APP_NAME)
         .header(DATE, format_http_date())
+        .header(VIA, APP_VIA)
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_LENGTH, HeaderValue::from(content_length))
         .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
@@ -2112,8 +2115,8 @@ async fn serve_unfinished_file(
 
     let mut response_builder = Response::builder()
         .status(StatusCode::OK)
-        .header(SERVER, APP_NAME)
         .header(DATE, format_http_date())
+        .header(VIA, APP_VIA)
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
         .header(ACCEPT_RANGES, "bytes")
@@ -2420,8 +2423,8 @@ async fn serve_cached_file_modified_since(
 
         let response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
-            .header(SERVER, APP_NAME)
             .header(DATE, format_http_date())
+            .header(VIA, APP_VIA)
             .header(CONNECTION, "keep-alive")
             .header(
                 AGE,
@@ -2778,7 +2781,10 @@ async fn serve_new_file(
             body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
         ));
 
-        let response = Response::from_parts(parts, body);
+        let mut response = Response::from_parts(parts, body);
+        response
+            .headers_mut()
+            .append(VIA, HeaderValue::from_static(APP_VIA));
 
         trace!("Outgoing response: {response:?}");
 
@@ -2998,8 +3004,8 @@ async fn serve_new_file(
 
             let mut response = Response::builder()
                 .status(config.experimental_parallel_hack_statuscode)
-                .header(SERVER, APP_NAME)
                 .header(DATE, format_http_date())
+                .header(VIA, APP_VIA)
                 .header(CONNECTION, "keep-alive")
                 .body(ProxyCacheBody::Empty(Empty::new()))
                 .expect("Response is valid");
@@ -3806,7 +3812,10 @@ async fn pre_process_client_request(
                 body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
             ));
 
-            let response = Response::from_parts(parts, body);
+            let mut response = Response::from_parts(parts, body);
+            response
+                .headers_mut()
+                .append(VIA, HeaderValue::from_static(APP_VIA));
 
             trace!("Outgoing response: {response:?}");
 
@@ -3814,11 +3823,14 @@ async fn pre_process_client_request(
         }
     }
 
-    let response = fwd_response.map(|body| {
+    let mut response = fwd_response.map(|body| {
         ProxyCacheBody::Boxed(BoxBody::new(
             body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
         ))
     });
+    response
+        .headers_mut()
+        .append(VIA, HeaderValue::from_static(APP_VIA));
 
     trace!("Outgoing response: {response:?}");
 

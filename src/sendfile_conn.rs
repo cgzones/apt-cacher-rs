@@ -26,9 +26,9 @@ use crate::http_range::{
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::RateChecker;
 use crate::{
-    APP_NAME, AppState, CachedFlavor, ClientInfo, ConnectionDetails, Never, authorize_cache_access,
-    client_counter, global_config, handle_hyper_connection, static_assert, warn_once,
-    warn_once_or_info,
+    APP_NAME, APP_VIA, AppState, CachedFlavor, ClientInfo, ConnectionDetails, Never,
+    authorize_cache_access, client_counter, global_config, handle_hyper_connection, static_assert,
+    warn_once, warn_once_or_info,
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -835,8 +835,8 @@ async fn write_304_response(
 
     let response = format!(
         "{conn_version} 304 Not Modified\r\n\
-         Server: {APP_NAME}\r\n\
          Date: {date}\r\n\
+         Via: {APP_VIA}\r\n\
          Age: {age}\r\n\
          Connection: {conn_action}\r\n\
          \r\n"
@@ -883,8 +883,8 @@ async fn write_response_headers(
 
     let mut response = format!(
         "{conn_version} {status}\r\n\
-         Server: {APP_NAME}\r\n\
          Date: {date}\r\n\
+         Via: {APP_VIA}\r\n\
          Age: {age}\r\n\
          Connection: {conn_action}\r\n\
          Content-Length: {content_length}\r\n\
