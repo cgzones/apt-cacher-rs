@@ -169,7 +169,10 @@ async fn get_package_file(
             .expect("Request should be valid");
 
         let conn_details = ConnectionDetails {
-            client: ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+            client: ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(127, 0, 0, 2),
+                0,
+            ))),
             mirror: mirror.clone(),
             aliased_host: None,
             debname: format!(
