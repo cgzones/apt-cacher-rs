@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     net::{IpAddr, Ipv6Addr},
     num::NonZero,
     path::PathBuf,
@@ -34,6 +35,11 @@ impl MirrorEntry {
     #[must_use]
     pub(crate) const fn port(&self) -> Option<NonZero<u16>> {
         NonZero::new(self.port)
+    }
+
+    #[must_use]
+    pub(crate) fn format_authority(&self) -> Cow<'_, str> {
+        self.host.format_authority(self.port())
     }
 
     #[must_use]

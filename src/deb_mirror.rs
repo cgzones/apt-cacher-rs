@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     num::NonZero,
     path::{Path, PathBuf},
 };
@@ -14,7 +15,14 @@ pub(crate) struct Mirror {
 
 impl std::fmt::Display for Mirror {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.host.format_authority(self.port), self.path)
+        write!(f, "{}/{}", self.format_authority(), self.path)
+    }
+}
+
+impl Mirror {
+    #[must_use]
+    pub(crate) fn format_authority(&self) -> Cow<'_, str> {
+        self.host.format_authority(self.port)
     }
 }
 
