@@ -3343,7 +3343,10 @@ async fn pre_process_client_request(
         &Method::GET => {}
         m => {
             warn_once_or_info!("Unsupported request method {m} from client {client}");
-            return quick_response(hyper::StatusCode::BAD_REQUEST, "Method not supported");
+            return quick_response(
+                hyper::StatusCode::METHOD_NOT_ALLOWED,
+                "Method not supported",
+            );
         }
     }
 
