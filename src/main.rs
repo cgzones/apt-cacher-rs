@@ -102,11 +102,8 @@ use log::{Level, LevelFilter, debug, error, info, log, trace, warn};
 use memmap2::{Advice, Mmap, MmapOptions};
 use pin_project::pin_project;
 use pin_project::pinned_drop;
-use rand::RngExt as _;
-use rand::distr::Alphanumeric;
 use rand::distr::Bernoulli;
 use rand::prelude::Distribution as _;
-use rand::rngs::SmallRng;
 use rate_checked_body::RateCheckedBody;
 use rate_checked_body::RateCheckedBodyErr;
 use simplelog::CombinedLogger;
@@ -152,6 +149,8 @@ use crate::ringbuffer::RingBuffer;
 use crate::task_cache_scan::task_cache_scan;
 use crate::task_cleanup::task_cleanup;
 use crate::task_setup::task_setup;
+use crate::utils::TempPath;
+use crate::utils::tokio_tempfile;
 use crate::web_interface::serve_web_interface;
 
 // TODO: replace usages with ! once stable
@@ -203,53 +202,6 @@ impl Display for ClientInfo {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.ip())
-    }
-}
-
-async fn tokio_mkstemp(
-    path: &Path,
-    mode: u32,
-) -> Result<(tokio::fs::File, PathBuf), tokio::io::Error> {
-    let mut rng: SmallRng = rand::make_rng();
-
-    let mut buf = path.to_path_buf();
-
-    let mut tries = 0;
-    loop {
-        const MAX_TRIES: u32 = 10;
-
-        let s: String = (&mut rng)
-            .sample_iter(Alphanumeric)
-            .take(6)
-            .map(char::from)
-            .collect();
-
-        assert!(
-            buf.set_extension(s),
-            "buf is non-empty so adding a new extension must succeed"
-        );
-
-        let _: Never = match tokio::fs::File::options()
-            .create_new(true)
-            .write(true)
-            .mode(mode)
-            .open(&buf)
-            .await
-        {
-            Ok(file) => return Ok((file, buf)),
-            Err(err) if err.kind() == tokio::io::ErrorKind::AlreadyExists => {
-                tries += 1;
-                if tries > MAX_TRIES {
-                    return Err(err);
-                }
-                assert!(
-                    buf.set_extension(""),
-                    "buf is non-empty so removing an existing extension must succeed"
-                );
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
     }
 }
 
@@ -1705,7 +1657,7 @@ async fn download_file(
     warn_on_override: bool,
     status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     input: (Incoming, ContentLength),
-    output: (tokio::fs::File, PathBuf),
+    output: (tokio::fs::File, TempPath),
     tx: tokio::sync::watch::Sender<()>,
 ) {
     let config = global_config();
@@ -1728,16 +1680,7 @@ async fn download_file(
     let buf_size = config.buffer_size;
 
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
-    let outpath = scopeguard::guard(output.1, |path| {
-        tokio::task::spawn_blocking(move || {
-            if let Err(err) = std::fs::remove_file(&path) {
-                error!(
-                    "Failed to remove temporary file `{}`:  {err}",
-                    path.display()
-                );
-            }
-        });
-    });
+    let outpath = output.1;
 
     let mut body = match config.min_download_rate {
         Some(rate) => BoxBody::new(RateCheckedBody::new(
@@ -1890,8 +1833,11 @@ async fn download_file(
             );
         }
 
-        match tokio::fs::rename(&*outpath, &dest_file_path).await {
+        match tokio::fs::rename(&outpath, &dest_file_path).await {
             Ok(()) => {
+                // Defuse the TempPath - the file has been successfully renamed
+                TempPath::into_inner(outpath);
+
                 {
                     if size_diff != 0 {
                         trace!(
@@ -1919,8 +1865,6 @@ async fn download_file(
                     }
                 }
 
-                // Defuse the scopeguard - the file has been successfully renamed
-                scopeguard::ScopeGuard::into_inner(outpath);
                 dbarrier.release(locked_status, dest_file_path);
             }
             Err(err) => {
@@ -2872,7 +2816,7 @@ async fn serve_new_file(
         .iter()
         .collect();
 
-    let (outfile, outpath) = match tokio_mkstemp(&tmppath, 0o640).await {
+    let (outfile, outpath) = match tokio_tempfile(&tmppath, 0o640).await {
         Ok((f, p)) => (f, p),
         Err(err) => {
             error!(
@@ -2920,7 +2864,9 @@ async fn serve_new_file(
 
     let (tx, rx) = tokio::sync::watch::channel(());
 
-    ibarrier.download(outpath.clone(), content_length, rx).await;
+    ibarrier
+        .download(outpath.to_path_buf(), content_length, rx)
+        .await;
 
     let cd = conn_details.clone();
     let st = Arc::clone(&status);
