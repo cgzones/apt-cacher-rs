@@ -334,7 +334,19 @@ async fn try_sendfile_request(
         Ok(rh) => rh,
         Err((status, msg)) => return SendfileResult::Invalid { status, msg },
     };
-    let requested_port = authority.port_u16().and_then(NonZero::new);
+    let requested_port = match authority.port_u16() {
+        Some(port) => {
+            let Some(port) = NonZero::new(port) else {
+                warn_once_or_info!("Unsupported request port 0 from client {client}");
+                return SendfileResult::Invalid {
+                    status: StatusCode::BAD_REQUEST,
+                    msg: "Invalid port",
+                };
+            };
+            Some(port)
+        }
+        None => None,
+    };
 
     // Only handle permanently cached pool files (e.g., .deb files) via sendfile
     let Some(ResourceFile::Pool {
