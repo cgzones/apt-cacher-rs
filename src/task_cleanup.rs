@@ -121,7 +121,7 @@ impl PackageFormat {
             match reader.read_line(&mut buffer).await {
                 Ok(0) => return Ok(()), // EOF
                 Err(err) => {
-                    error!("Error reading in-memory file `{filename}`:  {err}");
+                    error!("Failed to read in-memory file `{filename}`:  {err}");
                     return Err(err.into());
                 }
                 Ok(_bytes_read) => {
@@ -389,7 +389,7 @@ async fn cleanup_mirror_deb_files(
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|err| {
-            error!("Error getting current timestamp:  {err}");
+            error!("Failed to get current timestamp:  {err}");
             err
         })?;
 
@@ -497,7 +497,7 @@ async fn cleanup_mirror_deb_files(
         let file = body_to_file(response.body_mut(), file)
             .await
             .map_err(|err| {
-                error!("Error writing response to in-memory file `{memfdname}`:  {err}");
+                error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
                 err
             })?;
 
