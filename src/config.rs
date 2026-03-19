@@ -438,7 +438,10 @@ pub(crate) struct Config {
 
     /// Maximum number of concurrent upstream downloads.
     /// `None` means unlimited.
-    #[serde(default = "default_max_upstream_downloads")]
+    #[serde(
+        default = "default_max_upstream_downloads",
+        deserialize_with = "from_nonzero_usize"
+    )]
     pub(crate) max_upstream_downloads: Option<NonZero<usize>>,
 
     /// Capacity of the internal database command channel.
@@ -452,7 +455,10 @@ pub(crate) struct Config {
     #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
-    #[serde(default = "default_experimental_parallel_hack_maxparallel")]
+    #[serde(
+        default = "default_experimental_parallel_hack_maxparallel",
+        deserialize_with = "from_nonzero_usize"
+    )]
     pub(crate) experimental_parallel_hack_maxparallel: Option<NonZero<usize>>,
 
     #[serde(
@@ -586,6 +592,15 @@ where
     let v = Deserialize::deserialize(deserializer)?;
 
     hyper::StatusCode::from_u16(v).map_err(D::Error::custom)
+}
+
+fn from_nonzero_usize<'de, D>(deserializer: D) -> Result<Option<NonZero<usize>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let u: usize = Deserialize::deserialize(deserializer)?;
+
+    Ok(NonZero::new(u))
 }
 
 const fn default_log_level() -> LevelFilter {
