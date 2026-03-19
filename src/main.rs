@@ -3313,7 +3313,7 @@ pub(crate) fn authorize_cache_access(
 
     if !is_host_allowed(&requested_host) {
         warn_once_or_info!("Unauthorized host {requested_host}");
-        return Err((StatusCode::BAD_REQUEST, "Unauthorized host"));
+        return Err((StatusCode::FORBIDDEN, "Unauthorized host"));
     }
 
     Ok(requested_host)
