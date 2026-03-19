@@ -377,7 +377,7 @@ async fn try_sendfile_request(
             };
         }
         Err(err) => {
-            warn!(
+            warn_once_or_info!(
                 "Failed to decode mirror path `{}` from client {client}:  {err}",
                 mirror_path.escape_debug()
             );
@@ -397,7 +397,7 @@ async fn try_sendfile_request(
             };
         }
         Err(err) => {
-            warn!(
+            warn_once_or_info!(
                 "Failed to decode filename `{}` from client {client}:  {err}",
                 filename.escape_debug()
             );

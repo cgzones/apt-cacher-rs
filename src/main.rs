@@ -3437,7 +3437,7 @@ async fn pre_process_client_request(
                 let decoded = match urlencoding::decode(encoded) {
                     Ok(s) => s,
                     Err(err) => {
-                        error!("Error decoding {kind} `{encoded}`:  {err}");
+                        warn_once_or_info!("Failed to decode {kind} `{encoded}`:  {err}");
                         return quick_response(StatusCode::BAD_REQUEST, "Unsupported URL encoding");
                     }
                 };
