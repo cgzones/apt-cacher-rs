@@ -14,7 +14,6 @@ use http::StatusCode;
 use httparse::Request;
 use log::{debug, error, info, trace, warn};
 use nix::sys::sendfile::sendfile;
-use time::UtcDateTime;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -22,7 +21,7 @@ use crate::database_task::{DatabaseCommand, DbCmdDelivery};
 use crate::deb_mirror::{Mirror, ResourceFile, parse_request_path};
 use crate::deb_mirror::{valid_filename, valid_mirrorname};
 use crate::http_range::{
-    http_datetime_to_systemtime, http_parse_range, systemtime_to_http_datetime,
+    format_http_date, http_datetime_to_systemtime, http_parse_range, systemtime_to_http_datetime,
 };
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::RateChecker;
@@ -804,15 +803,6 @@ fn find_header<'a>(headers: &[httparse::Header<'a>], name: &str) -> Option<&'a s
         .and_then(|h| std::str::from_utf8(h.value).ok())
 }
 
-/// Format the current date and time as an HTTP date string.
-#[must_use]
-fn format_date() -> String {
-    let now = coarsetime::Clock::now_since_epoch();
-    let now = UtcDateTime::from_unix_timestamp_nanos(i128::from(now.as_nanos()))
-        .unwrap_or_else(|_| UtcDateTime::now());
-    systemtime_to_http_datetime(now.into())
-}
-
 /// Write a 304 Not Modified response to the stream.
 async fn write_304_response(
     stream: &TcpStream,
@@ -820,7 +810,7 @@ async fn write_304_response(
     conn_action: ConnectionAction,
     last_modified: &SystemTime,
 ) -> std::io::Result<()> {
-    let date = format_date();
+    let date = format_http_date();
     let age = last_modified.elapsed().map_or(0, |dur| dur.as_secs());
 
     let response = format!(
@@ -841,7 +831,7 @@ async fn write_invalid_response(
     status: StatusCode,
     msg: &str,
 ) -> std::io::Result<()> {
-    let date = format_date();
+    let date = format_http_date();
     let content_length = msg.len();
 
     let response = format!(
@@ -867,7 +857,7 @@ async fn write_response_headers(
     last_modified: &SystemTime,
     content_range: Option<&str>,
 ) -> std::io::Result<()> {
-    let date = format_date();
+    let date = format_http_date();
     let last_modified_str = systemtime_to_http_datetime(*last_modified);
     let age = last_modified.elapsed().map_or(0, |dur| dur.as_secs());
 
