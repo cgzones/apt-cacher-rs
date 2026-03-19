@@ -1043,7 +1043,7 @@ async fn serve_cached_file(
         && last_modified <= ims_time
     {
         info!(
-            "Serving 304 Not Modified for cached file {} from mirror {}{} for client {}",
+            "Serving 304 Not Modified for cached file {} from mirror {}{} for client {} via hyper",
             conn_details.debname, conn_details.mirror, aliased, conn_details.client
         );
 

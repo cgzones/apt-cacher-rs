@@ -495,11 +495,21 @@ async fn try_sendfile_request(
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
+    let aliased = match conn_details.aliased_host {
+        Some(alias) => format!(" aliased to host {alias}"),
+        None => String::new(),
+    };
+
     // Handle If-Modified-Since
     if let Some(ims) = find_header(req.headers, "if-modified-since")
         && let Some(ims_time) = http_datetime_to_systemtime(ims)
         && last_modified <= ims_time
     {
+        info!(
+            "Serving 304 Not Modified for cached file {} from mirror {}{} for client {client} via sendfile",
+            conn_details.debname, conn_details.mirror, aliased
+        );
+
         if let Err(err) =
             write_304_response(stream, *conn_version, conn_action, &last_modified).await
         {
@@ -530,10 +540,6 @@ async fn try_sendfile_request(
         (StatusCode::OK, 0, file_size, None, false)
     };
 
-    let aliased = match conn_details.aliased_host {
-        Some(alias) => format!(" aliased to host {alias}"),
-        None => String::new(),
-    };
     info!(
         "Serving cached file {} from mirror {}{} for client {client} via sendfile...",
         conn_details.debname, conn_details.mirror, aliased
