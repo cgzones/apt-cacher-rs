@@ -326,6 +326,16 @@ async fn try_sendfile_request(
     }
 
     let Some(authority) = uri.authority() else {
+        // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
+        // HTTP/1.1 request that lacks a Host header field.
+        if matches!(*conn_version, ConnectionVersion::Http11)
+            && find_header(req.headers, "Host").is_none()
+        {
+            return SendfileResult::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                msg: "Missing Host header",
+            };
+        }
         // No authority means it's likely a direct request (web interface) - fall back
         return SendfileResult::NotApplicable("no authority");
     };
