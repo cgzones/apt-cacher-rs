@@ -4074,9 +4074,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(|mirror| {
                     let client = client.clone();
                     async move {
-                        let host = &mirror.host;
-
-                        let authority = host.format_authority(mirror.port());
+                        let authority = mirror.format_authority();
 
                         let uri = Uri::builder()
                             .scheme("http")
