@@ -32,10 +32,12 @@ use crate::{
     warn_once_or_info,
 };
 
-/// Maximum size for HTTP request headers buffer.
-const MAX_HEADER_SIZE: usize = 4096;
-/// Maximum number of HTTP headers to parse.
-const MAX_HEADERS: usize = 32;
+/// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
+const MAX_HEADER_SIZE: usize = 8192;
+/// Initial size for HTTP request headers buffer.
+const INITIAL_HEADER_SIZE: usize = 2048;
+/// Maximum number of HTTP headers to parse (matches hyper's default of 100).
+const MAX_HEADERS: usize = 100;
 
 #[derive(Copy, Clone)]
 enum ConnectionAction {
@@ -91,7 +93,7 @@ pub(crate) async fn handle_sendfile_connection(
     client: ClientInfo,
     appstate: AppState,
 ) {
-    let mut buf = BytesMut::with_capacity(MAX_HEADER_SIZE);
+    let mut buf = BytesMut::with_capacity(INITIAL_HEADER_SIZE);
 
     trace!("Using sendfile(2) backend to handle request from client {client} ...");
 
