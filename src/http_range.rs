@@ -39,6 +39,15 @@ pub(crate) fn http_datetime_to_systemtime(time: &str) -> Option<SystemTime> {
         .map(std::convert::Into::into)
 }
 
+/// Format the current date and time as an HTTP date string.
+#[must_use]
+pub(crate) fn format_http_date() -> String {
+    let now = coarsetime::Clock::now_since_epoch();
+    let now = time::UtcDateTime::from_unix_timestamp_nanos(i128::from(now.as_nanos()))
+        .unwrap_or_else(|_| time::UtcDateTime::now());
+    systemtime_to_http_datetime(now.into())
+}
+
 /// Computes the requested bytes range.
 /// Returns a tuple of the formatted Content-Range header,
 /// the start byte, and the total number of bytes on success.

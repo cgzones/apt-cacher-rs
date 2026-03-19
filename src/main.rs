@@ -75,6 +75,7 @@ use hyper::header::CONNECTION;
 use hyper::header::CONTENT_LENGTH;
 use hyper::header::CONTENT_RANGE;
 use hyper::header::CONTENT_TYPE;
+use hyper::header::DATE;
 use hyper::header::HOST;
 use hyper::header::HeaderName;
 use hyper::header::HeaderValue;
@@ -140,6 +141,7 @@ use crate::download_barrier::DownloadBarrier;
 use crate::error::ErrorReport;
 use crate::error::MirrorDownloadRate;
 use crate::error::ProxyCacheError;
+use crate::http_range::format_http_date;
 use crate::http_range::http_datetime_to_systemtime;
 use crate::http_range::systemtime_to_http_datetime;
 use crate::humanfmt::HumanFmt;
@@ -553,6 +555,7 @@ fn quick_response<T: Into<bytes::Bytes>>(
     Response::builder()
         .status(status)
         .header(SERVER, APP_NAME)
+        .header(DATE, format_http_date())
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(ProxyCacheBody::Full(Full::new(message.into())))
@@ -1047,6 +1050,7 @@ async fn serve_cached_file(
         let response = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(SERVER, APP_NAME)
+            .header(DATE, format_http_date())
             .header(CONNECTION, "keep-alive")
             .header(
                 AGE,
@@ -1312,6 +1316,7 @@ fn serve_cached_file_response(
     let mut response = Response::builder()
         .status(http_status)
         .header(SERVER, APP_NAME)
+        .header(DATE, format_http_date())
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_LENGTH, HeaderValue::from(content_length))
         .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
