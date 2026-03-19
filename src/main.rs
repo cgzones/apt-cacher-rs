@@ -1019,7 +1019,7 @@ async fn serve_cached_file(
         Ok(m) => m,
         Err(err) => {
             error!(
-                "Error getting metadata of cached file `{}`:  {err}",
+                "Failed to get metadata of cached file `{}`:  {err}",
                 file_path.display()
             );
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
@@ -1790,7 +1790,7 @@ async fn download_file(
             }
 
             if let Err(err) = writer.write_all_buf(&mut chunk).await {
-                error!("Error writing to file `{}`:  {err}", outpath.display());
+                error!("Failed to write to file `{}`:  {err}", outpath.display());
                 return;
             }
 
@@ -1839,7 +1839,7 @@ async fn download_file(
     };
 
     if let Err(err) = writer.flush().await {
-        error!("Error writing to file `{}`:  {err}", outpath.display());
+        error!("Failed to write to file `{}`:  {err}", outpath.display());
         return;
     }
     drop(writer);
@@ -2015,7 +2015,7 @@ async fn serve_unfinished_file(
                     Ok(0) => break, // EOF
                     Ok(r) => r,
                     Err(err) => {
-                        error!("Error reading from file `{}`:  {err}", file_path.display());
+                        error!("Failed to read from file `{}`:  {err}", file_path.display());
                         return;
                     }
                 };
@@ -3134,7 +3134,7 @@ pub(crate) async fn process_cache_request(
             }
         }
         Err(err) => {
-            error!("Error opening file `{}`:  {err}", cache_path.display());
+            error!("Failed to open file `{}`:  {err}", cache_path.display());
             quick_response(
                 hyper::StatusCode::INTERNAL_SERVER_ERROR,
                 "Cache Access Failure",

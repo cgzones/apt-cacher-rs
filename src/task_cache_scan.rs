@@ -147,7 +147,7 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
             Ok(d) => d,
             Err(err) => {
                 error!(
-                    "Error getting file meta data of `{}`:  {err}",
+                    "Failed to get file meta data of `{}`:  {err}",
                     entry.path().display()
                 );
                 continue;
@@ -228,7 +228,7 @@ async fn scan_sub_dir(entry: DirEntry) -> u64 {
             Ok(d) => d,
             Err(err) => {
                 error!(
-                    "Error getting file meta data of `{}`:  {err}",
+                    "Failed to get file meta data of `{}`:  {err}",
                     entry.path().display()
                 );
                 continue;
@@ -299,7 +299,7 @@ async fn scan_by_hash_dir(entry: DirEntry) -> u64 {
             Ok(d) => d,
             Err(err) => {
                 error!(
-                    "Error getting file meta data of `{}`:  {err}",
+                    "Failed to get file meta data of `{}`:  {err}",
                     entry.path().display()
                 );
                 continue;
