@@ -12,7 +12,7 @@ use bytes::buf::Buf as _;
 use coarsetime::{Duration, Instant};
 use http::StatusCode;
 use httparse::Request;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace};
 use nix::sys::sendfile::sendfile;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -28,7 +28,7 @@ use crate::rate_checked_body::RateChecker;
 use crate::{
     APP_NAME, APP_VIA, AppState, CachedFlavor, ClientInfo, ConnectionDetails, Never,
     authorize_cache_access, client_counter, global_config, handle_hyper_connection, static_assert,
-    warn_once, warn_once_or_info,
+    warn_once_or_info,
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -103,11 +103,11 @@ pub(crate) async fn handle_sendfile_connection(
         // Try to peek and parse the next request to determine if sendfile is applicable
         let next_header_index = match read_request_headers(&stream, &mut buf).await {
             Ok(None) if req_num == 0 => {
-                info!("Connection from client {client} closed before sending request");
+                info!("Connection from client {client} closed before receiving request");
                 return;
             }
             Ok(None) => {
-                trace!(
+                debug!(
                     "No more requests from client {client}, ending connection after {req_num} requests"
                 );
                 return;
@@ -117,11 +117,17 @@ pub(crate) async fn handle_sendfile_connection(
                 index
             }
             Err(err) if err.kind() == ErrorKind::TimedOut => {
-                info!("Timeout while reading request headers from client {client}");
+                info!(
+                    "Timeout while reading request headers from client {client} for request {}",
+                    req_num + 1
+                );
                 return;
             }
             Err(err) => {
-                warn_once_or_info!("Failed to read request from client {client}:  {err}");
+                warn_once_or_info!(
+                    "Failed to read request number {} from client {client}:  {err}",
+                    req_num + 1
+                );
                 let _ignore = write_invalid_response(
                     &stream,
                     conn_version,
@@ -156,7 +162,7 @@ pub(crate) async fn handle_sendfile_connection(
             SendfileResult::NotApplicable(reason) => {
                 // Fall back to hyper for this and all subsequent requests
                 debug!(
-                    "Falling back to hyper for client {client} due to: {reason} ({} bytes buffered)",
+                    "Falling back to hyper for client {client} after {req_num} requests due to: {reason} ({} bytes buffered)",
                     buf.len()
                 );
 
@@ -228,7 +234,7 @@ fn compute_conn_action(
 }
 
 /// Try to serve a request using sendfile(2).
-/// Returns whether the request was handled.
+/// Return whether the request was handled.
 async fn try_sendfile_request(
     buf: &[u8],
     stream: &TcpStream,
@@ -237,6 +243,11 @@ async fn try_sendfile_request(
     conn_version: &mut ConnectionVersion,
 ) -> SendfileResult {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    static_assert!(
+        size_of::<httparse::Header<'_>>() <= 32 && MAX_HEADERS == 100,
+        "stack usage of at most 3200 bytes for headers"
+    );
+
     let mut req = httparse::Request::new(&mut headers);
 
     match req.parse(buf) {
@@ -244,7 +255,7 @@ async fn try_sendfile_request(
             1 => *conn_version = ConnectionVersion::Http11,
             0 => *conn_version = ConnectionVersion::Http10,
             v => {
-                warn_once!("Unsupported HTTP/1.{v} from client {client}");
+                warn_once_or_info!("Unsupported HTTP/1.{v} from client {client}");
                 return SendfileResult::Invalid {
                     status: StatusCode::HTTP_VERSION_NOT_SUPPORTED,
                     msg: "HTTP version not supported",
@@ -287,7 +298,7 @@ async fn try_sendfile_request(
         "CONNECT" => return SendfileResult::NotApplicable("CONNECT method not supported"),
         m => {
             warn_once_or_info!(
-                "Unsupported request method `{}` from client {client}",
+                "Unsupported request method from client {client}: {}",
                 m.escape_debug(),
             );
             return SendfileResult::Invalid {
@@ -317,7 +328,7 @@ async fn try_sendfile_request(
     if let Some(scheme) = uri.scheme()
         && *scheme != http::uri::Scheme::HTTP
     {
-        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}");
+        warn_once_or_info!("Unsupported URI scheme from client {client}: {scheme}");
         return SendfileResult::Invalid {
             status: StatusCode::BAD_REQUEST,
             msg: "Unsupported URI scheme",
@@ -430,6 +441,11 @@ async fn try_sendfile_request(
         subdir: None,
     };
 
+    let aliased = match conn_details.aliased_host {
+        Some(alias) => format!(" aliased to host {alias}"),
+        None => String::new(),
+    };
+
     // Check if the file exists in cache and is not being downloaded
     let cache_path = {
         let mut p = conn_details.cache_dir_path();
@@ -495,11 +511,6 @@ async fn try_sendfile_request(
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
-    let aliased = match conn_details.aliased_host {
-        Some(alias) => format!(" aliased to host {alias}"),
-        None => String::new(),
-    };
-
     // Handle If-Modified-Since
     if let Some(ims) = find_header(req.headers, "if-modified-since")
         && let Some(ims_time) = http_datetime_to_systemtime(ims)
@@ -513,7 +524,7 @@ async fn try_sendfile_request(
         if let Err(err) =
             write_304_response(stream, *conn_version, conn_action, &last_modified).await
         {
-            warn!("Failed to write 304 response to client {client}:  {err}");
+            warn_once_or_info!("Failed to write 304 response to client {client}:  {err}");
             return SendfileResult::Error;
         }
 
@@ -557,7 +568,7 @@ async fn try_sendfile_request(
     )
     .await
     {
-        warn!("Failed to write response headers to client {client}:  {err}");
+        warn_once_or_info!("Failed to write response headers to client {client}:  {err}");
         return SendfileResult::Error;
     }
 
@@ -710,9 +721,11 @@ async fn async_sendfile(
         // Limit each sendfile call to avoid exceeding system limits.
         // 0x7fff_f000 is always within usize range since it fits in 31 bits.
         static_assert!(0x7fff_f000 < usize::MAX);
-        let chunk_size = std::cmp::min(remaining, 0x7fff_f000)
-            .try_into()
-            .expect("truncated via min()");
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "no truncation since 0x7fff_f000 < usize::MAX"
+        )]
+        let chunk_size = std::cmp::min(remaining, 0x7fff_f000) as usize;
 
         let result = {
             // Copy file descriptors
