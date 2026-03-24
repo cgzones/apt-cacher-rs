@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     net::{IpAddr, Ipv6Addr},
-    num::NonZero,
+    num::{NonZero, TryFromIntError},
     path::PathBuf,
     str::FromStr as _,
     time::Duration,
@@ -241,6 +241,29 @@ impl Database {
               SELECT host, port AS "port: u16", path
               FROM mirrors_v2;
         "#,
+        )
+        .fetch_all(&self.conn)
+        .await
+    }
+
+    /// Returns mirrors whose `last_seen` is within the `active` range from the current time.
+    pub(crate) async fn get_recent_mirrors(
+        &self,
+        active: Duration,
+    ) -> Result<Vec<MirrorEntry>, Error> {
+        let max_age_secs: i64 = active
+            .as_secs()
+            .try_into()
+            .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))?;
+
+        query_as!(
+            MirrorEntry,
+            r#"
+              SELECT host, port AS "port: u16", path
+              FROM mirrors_v2
+              WHERE last_seen >= unixepoch() - ?;
+        "#,
+            max_age_secs,
         )
         .fetch_all(&self.conn)
         .await

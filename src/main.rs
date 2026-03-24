@@ -3861,10 +3861,12 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::task::spawn(async move {
             // Use buffer_unordered to limit concurrent requests and avoid thundering herd
             const MAX_CONCURRENT_REQUESTS: usize = 10;
+            // Do not initialize stale mirrors
+            const STALE_THRESHOLD: Duration = Duration::from_hours(30 * 24);
 
             debug!("Scheme cache initialization task started");
 
-            let mut mirrors = match database.get_mirrors().await {
+            let mut mirrors = match database.get_recent_mirrors(STALE_THRESHOLD).await {
                 Ok(m) => m,
                 Err(err) => {
                     error!("Failed to get list of mirrors to initialize scheme cache:  {err}");
