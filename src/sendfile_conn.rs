@@ -38,6 +38,51 @@ const INITIAL_HEADER_SIZE: usize = 2048;
 /// Maximum number of HTTP headers to parse (matches hyper's default of 100).
 const MAX_HEADERS: usize = 100;
 
+/// RAII guard that sets `TCP_CORK` on creation and clears it on drop.
+/// While corked, the kernel buffers small writes to coalesce them into
+/// full MSS-sized TCP segments (e.g. headers + sendfile body).
+pub(crate) struct CorkGuard<'a>(&'a TcpStream);
+
+fn set_tcp_cork(stream: &TcpStream, cork: bool) -> std::io::Result<()> {
+    let val: nix::libc::c_int = cork.into();
+    // SAFETY: stream.as_raw_fd() is a valid socket fd; val is a stack-local c_int.
+    let ret = unsafe {
+        nix::libc::setsockopt(
+            stream.as_raw_fd(),
+            nix::libc::IPPROTO_TCP,
+            nix::libc::TCP_CORK,
+            std::ptr::from_ref::<nix::libc::c_int>(&val).cast(),
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "size_of c_int (4) always fits in socklen_t (u32)"
+            )]
+            {
+                std::mem::size_of_val(&val) as nix::libc::socklen_t
+            },
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+impl<'a> CorkGuard<'a> {
+    pub(crate) fn new(stream: &'a TcpStream) -> std::io::Result<Self> {
+        set_tcp_cork(stream, true)?;
+        Ok(Self(stream))
+    }
+}
+
+impl Drop for CorkGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(err) = set_tcp_cork(self.0, false) {
+            debug!("Failed to uncork TCP socket:  {err}");
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 enum ConnectionAction {
     Close,
@@ -555,6 +600,15 @@ async fn try_sendfile_request(
         "Serving cached file {} from mirror {}{} for client {client} via sendfile...",
         conn_details.debname, conn_details.mirror, aliased
     );
+
+    // Cork the socket to coalesce headers + body into fewer TCP segments
+    let _cork = match CorkGuard::new(stream) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            debug!("Failed to cork TCP socket for client {client}:  {err}");
+            None
+        }
+    };
 
     // Write HTTP response headers
     if let Err(err) = write_response_headers(
