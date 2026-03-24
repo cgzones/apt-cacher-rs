@@ -28,6 +28,7 @@ use crate::UNCACHEABLES;
 use crate::client_counter::active_client_downloads;
 use crate::client_counter::connected_clients;
 use crate::get_features;
+use crate::global_cache_quota;
 use crate::global_config;
 use crate::{APP_NAME, LOGSTORE, database::Database, error::ProxyCacheError, quick_response};
 
@@ -308,6 +309,8 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
         }
     };
 
+    let cache_size = global_cache_quota().current_size();
+
     let active_mirror_downloads = appstate.active_downloads.len();
 
     let now = OffsetDateTime::now_utc();
@@ -327,6 +330,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
                      <br>Bind Address:&nbsp;&nbsp;{} \
                      <br>Bind Port:&nbsp;&nbsp;{} \
                      <br>Database Size:&nbsp;&nbsp;{} \
+                     <br>Cache Size:&nbsp;&nbsp;{} \
                      <br>Memory Usage:&nbsp;&nbsp;{}&nbsp;&nbsp;({}) \
                      <br>Connected Clients:&nbsp;&nbsp;{} \
                      <br>Active Mirror Downloads:&nbsp;&nbsp;{} \
@@ -342,6 +346,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
                     rd.config.bind_addr,
                     rd.config.bind_port,
                     database_size_fmt,
+                    HumanFmt::Size(cache_size),
                     memory_stats.map_or_else(
                         || String::from("???"),
                         |ms| HumanFmt::Size(ms.physical_mem as u64).to_string()
