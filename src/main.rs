@@ -14,6 +14,7 @@ compile_error!("Feature \"tls_hyper\" and \"tls_rustls\" are mutually exclusive.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod cache_quota;
 mod channel_body;
 mod config;
 mod database;
@@ -1689,7 +1690,7 @@ async fn download_file(
         }
     }
 
-    let size_diff = match content_length {
+    match content_length {
         ContentLength::Exact(size) => {
             if bytes != size.get() {
                 error!(
@@ -1701,8 +1702,6 @@ async fn download_file(
                 );
                 return;
             }
-
-            0
         }
         ContentLength::Unknown(size) => {
             if bytes > size.get() {
@@ -1715,10 +1714,8 @@ async fn download_file(
                 );
                 return;
             }
-
-            size.get() - bytes
         }
-    };
+    }
 
     if let Err(err) = writer.flush().await {
         error!("Failed to write to file `{}`:  {err}", outpath.display());
@@ -1774,34 +1771,7 @@ async fn download_file(
                 // Defuse the TempPath - the file has been successfully renamed
                 TempPath::into_inner(outpath);
 
-                {
-                    if size_diff != 0 {
-                        trace!(
-                            "Adjusting cache size by {size_diff} for downloaded file `{}`",
-                            dest_file_path.display()
-                        );
-
-                        let mut mg_cache_size = RUNTIMEDETAILS
-                            .get()
-                            .expect("global is set in main()")
-                            .cache_size
-                            .lock();
-                        let csize = *mg_cache_size;
-
-                        if let Some(new_cache_size) = csize.checked_sub(size_diff) {
-                            *mg_cache_size = new_cache_size;
-                            drop(mg_cache_size);
-                        } else {
-                            error!(
-                                "Cache size corruption: entry update: file={} cache_size={csize} received_bytes={bytes} content_length={content_length:?} difference={size_diff}",
-                                conn_details.debname,
-                            );
-                            // Keep current cache_size value as is rather than corrupting it further
-                        }
-                    }
-                }
-
-                rbarrier.release(dest_file_path);
+                rbarrier.release(dest_file_path, bytes);
             }
             Err(err) => {
                 drop(rbarrier);
@@ -2621,54 +2591,16 @@ async fn serve_new_file(
         }
     };
 
-    if let Some(quota) = global_config().disk_quota {
-        let fail = {
-            let mut mg_cache_size = RUNTIMEDETAILS
-                .get()
-                .expect("global is set in main()")
-                .cache_size
-                .lock();
-            let curr_csize = *mg_cache_size;
-
-            let new_csize = content_length.upper().checked_add(curr_csize);
-
-            let quota_reached = new_csize.is_none_or(|s| s > quota);
-
-            if quota_reached {
-                drop(mg_cache_size);
-                warn!(
-                    "Disk quota reached: file={} cache_size={curr_csize} content_length={content_length:?} quota={quota}",
-                    conn_details.debname
-                );
-
-                true
-            } else {
-                trace!(
-                    "Adjusting cache size for file {} to be downloaded by {content_length:?} minus previous file size {prev_file_size}",
-                    conn_details.debname
-                );
-
-                let new_csize = new_csize.expect("checked via previous if branch").get();
-                let new_csize = if let Some(val) = new_csize.checked_sub(prev_file_size) {
-                    val
-                } else {
-                    error!(
-                        "Cache size corruption: quote revert: file={} current_cache_size={curr_csize} content_length={content_length:?} previous_file_size={prev_file_size}",
-                        conn_details.debname
-                    );
-                    new_csize
-                };
-
-                *mg_cache_size = new_csize;
-
-                false
-            }
-        };
-
-        if fail {
+    let reservation = match global_cache_quota().try_acquire(
+        content_length,
+        prev_file_size,
+        &conn_details.debname,
+    ) {
+        Ok(r) => Some(r),
+        Err(cache_quota::QuotaExceeded) => {
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached");
         }
-    }
+    };
 
     let (_parts, body) = fwd_response.into_parts();
 
@@ -2688,36 +2620,7 @@ async fn serve_new_file(
                 "Error creating temporary file `{}`:  {err}",
                 tmppath.display()
             );
-
-            {
-                trace!(
-                    "Adjusting cache size for file {} failed to be downloaded by {} plus previous file size {prev_file_size}",
-                    conn_details.debname,
-                    content_length.upper().get()
-                );
-
-                let mut mg_cache_size = RUNTIMEDETAILS
-                    .get()
-                    .expect("global is set in main()")
-                    .cache_size
-                    .lock();
-                let curr_csize = *mg_cache_size;
-
-                if let Some(new_csize) = curr_csize
-                    .checked_sub(content_length.upper().get())
-                    .and_then(|csize| csize.checked_add(prev_file_size))
-                {
-                    *mg_cache_size = new_csize;
-                    drop(mg_cache_size);
-                } else {
-                    error!(
-                        "Cache size corruption: file create failure: file={} cache_size={curr_csize}, content_length={content_length:?} prev_file_size={prev_file_size}",
-                        conn_details.debname
-                    );
-                    // Keep current cache_size value as is rather than corrupting it further
-                }
-            }
-
+            // `reservation` is dropped here, auto-reverting cache_size
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
@@ -2728,11 +2631,10 @@ async fn serve_new_file(
     );
 
     let dbarrier = ibarrier
-        .download(outpath.to_path_buf(), content_length)
+        .download(outpath.to_path_buf(), content_length, reservation)
         .await;
 
     let cd = conn_details.clone();
-    let st = Arc::clone(&status);
     let db_tx = appstate.database_tx.clone();
     let curr_downloads = appstate.active_downloads.download_count();
     tokio::task::spawn(async move {
@@ -2745,40 +2647,6 @@ async fn serve_new_file(
             dbarrier,
         )
         .await;
-
-        match *st.read().await {
-            ActiveDownloadStatus::Init(_) => unreachable!("was set to download state already"),
-            ActiveDownloadStatus::Download(..) => unreachable!("download has finished"),
-            ActiveDownloadStatus::Finished(_) => (),
-            ActiveDownloadStatus::Aborted(_) => {
-                trace!(
-                    "Adjusting cache size for file {} not finished downloading by {} plus previous file size {prev_file_size}",
-                    cd.debname,
-                    content_length.upper().get()
-                );
-
-                let mut mg_cache_size = RUNTIMEDETAILS
-                    .get()
-                    .expect("global is set in main()")
-                    .cache_size
-                    .lock();
-                let curr_csize = *mg_cache_size;
-
-                if let Some(new_csize) = curr_csize
-                    .checked_sub(content_length.upper().get())
-                    .and_then(|csize| csize.checked_add(prev_file_size))
-                {
-                    *mg_cache_size = new_csize;
-                    drop(mg_cache_size);
-                } else {
-                    error!(
-                        "Cache size corruption: download abort: file={} cache_size={curr_csize}, content_length={content_length:?} prev_file_size={prev_file_size}",
-                        cd.debname
-                    );
-                    // Keep current cache_size value as is rather than corrupting it further
-                }
-            }
-        }
     });
 
     let config = global_config();
@@ -3817,9 +3685,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Ok(cache_size) = task_cache_scan(&database).await {
                 let rd = RUNTIMEDETAILS.get().expect("global set in main()");
 
-                {
-                    *rd.cache_size.lock() = cache_size;
-                }
+                rd.cache_quota.add(cache_size);
 
                 let disk_quota = rd.config.disk_quota;
 
@@ -4212,7 +4078,7 @@ struct Cli {
 struct RuntimeDetails {
     start_time: time::OffsetDateTime,
     config: Config,
-    cache_size: parking_lot::Mutex<u64>,
+    cache_quota: cache_quota::CacheQuota,
 }
 
 static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
@@ -4229,6 +4095,15 @@ pub(crate) fn global_config() -> &'static Config {
         .config
 }
 
+#[must_use]
+#[inline]
+pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
+    &RUNTIMEDETAILS
+        .get()
+        .expect("Global was initialized in main()")
+        .cache_quota
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Cli::parse();
 
@@ -4236,12 +4111,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config_log_level = config.log_level;
     let config_logstore_capacity = config.logstore_capacity;
+    let config_disk_quota = config.disk_quota;
 
     RUNTIMEDETAILS
         .set(RuntimeDetails {
             start_time: time::OffsetDateTime::now_utc(),
             config,
-            cache_size: parking_lot::Mutex::new(0),
+            cache_quota: cache_quota::CacheQuota::new(0, config_disk_quota),
         })
         .expect("Initial set in main() should succeed");
 

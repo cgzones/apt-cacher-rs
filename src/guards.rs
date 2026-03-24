@@ -1,7 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength, deb_mirror::Mirror,
+    AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength,
+    cache_quota::QuotaReservation, deb_mirror::Mirror,
 };
 
 struct InitBarrierData<'a> {
@@ -48,6 +49,7 @@ impl<'a> InitBarrier<'a> {
         mut self,
         path: PathBuf,
         content_length: ContentLength,
+        quota_reservation: Option<QuotaReservation>,
     ) -> DownloadBarrier {
         let data = self.data.take().expect("download() is a sink");
 
@@ -62,6 +64,7 @@ impl<'a> InitBarrier<'a> {
                 mirror: data.mirror.clone(),
                 debname: data.debname.to_owned(),
                 tx,
+                quota_reservation,
             }),
         }
     }
@@ -85,6 +88,7 @@ struct DownloadBarrierData {
     mirror: Mirror,
     debname: String,
     tx: tokio::sync::watch::Sender<()>,
+    quota_reservation: Option<QuotaReservation>,
 }
 
 #[must_use]
@@ -119,6 +123,7 @@ impl DownloadBarrier {
                 active_downloads: data.active_downloads,
                 mirror: data.mirror,
                 debname: data.debname,
+                quota_reservation: data.quota_reservation,
             }),
         }
     }
@@ -141,6 +146,7 @@ struct RenameBarrierData {
     active_downloads: ActiveDownloads,
     mirror: Mirror,
     debname: String,
+    quota_reservation: Option<QuotaReservation>,
 }
 
 #[must_use]
@@ -149,8 +155,12 @@ pub(crate) struct RenameBarrier {
 }
 
 impl RenameBarrier {
-    pub(crate) fn release(mut self, path: PathBuf) {
+    pub(crate) fn release(mut self, path: PathBuf, bytes_received: u64) {
         let mut data = self.data.take().expect("release() is a sink");
+
+        if let Some(reservation) = data.quota_reservation.take() {
+            reservation.finalize(bytes_received);
+        }
 
         *data.lock = ActiveDownloadStatus::Finished(path);
         drop(data.lock);

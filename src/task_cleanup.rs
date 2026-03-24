@@ -19,7 +19,7 @@ use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{
     AppState, CachedFlavor, ClientInfo, ConnectionDetails, ProxyCacheBody, ProxyCacheError,
-    RETENTION_TIME, RUNTIMEDETAILS,
+    RETENTION_TIME,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, UriFormat as _},
     global_config,
@@ -316,44 +316,19 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     if let Ok(actual_cache_size) = task_cache_scan(&appstate.database).await {
         let active_downloading_size = appstate.active_downloads.download_size();
 
-        let mut mg_cache_size = RUNTIMEDETAILS
-            .get()
-            .expect("global set in main")
-            .cache_size
-            .lock();
-        let mut csize = *mg_cache_size;
+        let quota = crate::global_cache_quota();
+        let (csize, difference) =
+            quota.subtract_and_reconcile(bytes_removed, actual_cache_size, active_downloading_size);
 
-        match csize.checked_sub(bytes_removed) {
-            Some(val) => csize = val,
-            None => {
-                error!("Cache size corruption: current={csize}, removed={bytes_removed}");
-            }
+        if difference != 0 {
+            warn!(
+                "Repaired cache size discrepancy of {difference}: actual={actual_cache_size} stored={csize} active={active_downloading_size}"
+            );
+        } else {
+            debug!(
+                "actual cache size: {actual_cache_size}; stored cache size: {csize}; active download size: {active_downloading_size}"
+            );
         }
-
-        let difference = csize.abs_diff(actual_cache_size + active_downloading_size);
-
-        // Auto-repair small abnormalities
-        {
-            const AUTO_REPAIR_THRESHOLD: u64 = 10 * 1024; // 10 KiB
-            if difference != 0 {
-                if difference < AUTO_REPAIR_THRESHOLD {
-                    csize = actual_cache_size + active_downloading_size;
-                    debug!(
-                        "Auto-repaired small cache size difference of {difference} (cache_size={csize}, actual_cache_size={actual_cache_size}, active_downloading_size={active_downloading_size}, threshold={AUTO_REPAIR_THRESHOLD})"
-                    );
-                } else {
-                    warn!(
-                        "actual cache size: {actual_cache_size}; stored cache size: {csize}; active download size: {active_downloading_size}; size difference: {difference}"
-                    );
-                }
-            } else {
-                debug!(
-                    "actual cache size: {actual_cache_size}; stored cache size: {csize}; active download size: {active_downloading_size}"
-                );
-            }
-        }
-
-        *mg_cache_size = csize;
     }
 
     info!(
