@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                DELETE FROM deliveries\n                WHERE timestamp < ?;\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "55f4b3ac15e317510512ea6688fe88bd572ee2eb1af6b21f358868b0e3c00bbc"
+}
