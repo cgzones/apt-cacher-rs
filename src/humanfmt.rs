@@ -47,7 +47,7 @@ impl std::fmt::Display for HumanFmt {
                 }
                 let rate = bytes as f64 / time;
                 if rate < 1000.0 {
-                    return f.write_fmt(format_args!("{rate}B/s"));
+                    return f.write_fmt(format_args!("{rate:.0$}B/s", precision(rate)));
                 }
                 let rate = rate / 1000.0;
                 if rate < 1000.0 {
@@ -174,7 +174,14 @@ mod tests {
                 "{}",
                 HumanFmt::Rate(0, coarsetime::Duration::from_millis(1000))
             ),
-            "0B/s"
+            "0.00B/s"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                HumanFmt::Rate(1, coarsetime::Duration::from_millis(12_345_678_987_654_321))
+            ),
+            "0.00B/s"
         );
         assert_eq!(
             format!(
