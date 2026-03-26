@@ -107,7 +107,7 @@ impl std::fmt::Display for HumanFmt {
                 };
 
                 let hours_fmt = if hours != 0 {
-                    format_args!("{}{hours}h", if days != 0 { " " } else { "" })
+                    format_args!("{}{hours}h", if days == 0 { "" } else { " " })
                 } else {
                     format_args!("")
                 };
