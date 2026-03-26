@@ -2502,19 +2502,19 @@ async fn serve_new_file(
                 // Refactor when https://github.com/tokio-rs/tokio/issues/6368 is resolved
                 file = {
                     let std_file = file.into_std().await;
-                    let std_file_path = file_path.to_path_buf();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(err) = std_file.set_modified(SystemTime::now()) {
-                            error!(
-                                "Failed to update modification time of file `{}`:  {}",
-                                std_file_path.display(),
-                                err
-                            );
-                        }
-                        tokio::fs::File::from_std(std_file)
-                    })
-                    .await
-                    .expect("task should not panic")
+                    let now = SystemTime::now();
+
+                    let result = tokio::task::block_in_place(|| std_file.set_modified(now));
+
+                    if let Err(err) = result {
+                        error!(
+                            "Failed to update modification time of file `{}`:  {}",
+                            file_path.display(),
+                            err
+                        );
+                    }
+
+                    tokio::fs::File::from_std(std_file)
                 };
             }
 
