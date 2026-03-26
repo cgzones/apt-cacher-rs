@@ -32,12 +32,12 @@ impl<T> RingBuffer<T> {
         );
     }
 
-    #[expect(dead_code, reason = "example usage")]
+    #[expect(dead_code, reason = "part of ring buffer API")]
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.inner.pop_front()
     }
 
-    #[expect(dead_code, reason = "example usage")]
+    #[expect(dead_code, reason = "part of ring buffer API")]
     #[must_use]
     pub(crate) fn back_mut(&mut self) -> Option<&mut T> {
         self.inner.back_mut()
@@ -58,13 +58,13 @@ impl<T> RingBuffer<T> {
         self.inner.iter()
     }
 
-    #[expect(dead_code, reason = "example usage")]
+    #[expect(dead_code, reason = "part of ring buffer API")]
     #[must_use]
     pub(crate) const fn capacity(&self) -> NonZero<usize> {
         self.capacity
     }
 
-    #[expect(dead_code, reason = "example usage")]
+    #[expect(dead_code, reason = "part of ring buffer API")]
     pub(crate) fn retain(&mut self, f: impl FnMut(&T) -> bool) {
         self.inner.retain(f);
     }
