@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT INTO downloads\n                (mirror_id, debname, size, duration, client_ip)\n                VALUES\n                ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?, ?);\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "35923ca571c111d3fd284d93f8a552ab940a14fcf5c49aa8148fbcb2a0bbf393"
+}

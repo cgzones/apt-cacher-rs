@@ -14,7 +14,7 @@ use sqlx::{
 };
 
 use crate::{
-    config::DomainName,
+    config::{DomainName, is_valid_domain},
     deb_mirror::{Mirror, OriginRef, mirror_cache_path_impl},
 };
 
@@ -128,69 +128,69 @@ impl Database {
     pub(crate) async fn init_tables(&self) -> Result<(), Error> {
         trace!("Initializing database tables...");
 
-        self.conn
-            .execute(
-                r"
-                CREATE TABLE IF NOT EXISTS mirrors (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    host TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    first_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
-                    last_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
-                    last_cleanup INTEGER NOT NULL DEFAULT 0,
-                    CONSTRAINT first UNIQUE (host, path)
-                ) STRICT;
-                ",
-            )
-            .await?;
+        let mut tx = self.conn.begin().await?;
 
-        self.conn
-            .execute(
-                r"
-                CREATE TABLE IF NOT EXISTS origins (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        mirror_id INTEGER NOT NULL,
-                        distribution TEXT NOT NULL,
-                        component TEXT NOT NULL,
-                        architecture TEXT NOT NULL,
-                        first_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
-                        last_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
+        tx.execute(
+            r"
+            CREATE TABLE IF NOT EXISTS mirrors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host TEXT NOT NULL,
+                path TEXT NOT NULL,
+                first_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
+                last_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
+                last_cleanup INTEGER NOT NULL DEFAULT 0,
+                CONSTRAINT first UNIQUE (host, path)
+            ) STRICT;
+            ",
+        )
+        .await?;
+
+        tx.execute(
+            r"
+            CREATE TABLE IF NOT EXISTS origins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mirror_id INTEGER NOT NULL,
+                distribution TEXT NOT NULL,
+                component TEXT NOT NULL,
+                architecture TEXT NOT NULL,
+                first_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
+                last_seen INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP)),
                 CONSTRAINT first UNIQUE (mirror_id, distribution, component, architecture)
-                ) STRICT;
-                ",
-            )
-            .await?;
+            ) STRICT;
+            ",
+        )
+        .await?;
 
-        self.conn
-            .execute(
-                r"
-                CREATE TABLE IF NOT EXISTS downloads (
-                        mirror_id INTEGER NOT NULL,
-                        debname TEXT NOT NULL,
-                        size INTEGER NOT NULL,
-                        duration INTEGER NOT NULL,
-                        client_ip BLOB NOT NULL,
-                        timestamp INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP))
-                ) STRICT;
-                ",
-            )
-            .await?;
+        tx.execute(
+            r"
+            CREATE TABLE IF NOT EXISTS downloads (
+                mirror_id INTEGER NOT NULL,
+                debname TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                duration INTEGER NOT NULL,
+                client_ip BLOB NOT NULL,
+                timestamp INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP))
+            ) STRICT;
+            ",
+        )
+        .await?;
 
-        self.conn
-            .execute(
-                r"
-                CREATE TABLE IF NOT EXISTS deliveries (
-                        mirror_id INTEGER NOT NULL,
-                        debname TEXT NOT NULL,
-                        size INTEGER NOT NULL,
-                        duration INTEGER NOT NULL,
-                        partial INTEGER NOT NULL,
-                        client_ip BLOB NOT NULL,
-                        timestamp INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP))
-                ) STRICT;
-                ",
-            )
-            .await?;
+        tx.execute(
+            r"
+            CREATE TABLE IF NOT EXISTS deliveries (
+                mirror_id INTEGER NOT NULL,
+                debname TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                duration INTEGER NOT NULL,
+                partial INTEGER NOT NULL,
+                client_ip BLOB NOT NULL,
+                timestamp INTEGER NOT NULL DEFAULT (unixepoch(CURRENT_TIMESTAMP))
+            ) STRICT;
+            ",
+        )
+        .await?;
+
+        tx.commit().await?;
 
         trace!("Performing database migrations...");
 
@@ -202,6 +202,8 @@ impl Database {
     pub(crate) async fn add_origin(&self, origin: &OriginRef<'_>) -> Result<(), Error> {
         let port = origin.mirror.port.map_or(0, std::num::NonZero::get);
 
+        let mut tx = self.conn.begin().await?;
+
         query!(
             r"
                 INSERT INTO mirrors_v2
@@ -210,7 +212,16 @@ impl Database {
                 (?, ?, ?)
                 ON CONFLICT
                 DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
+        ",
+            origin.mirror.host,
+            port,
+            origin.mirror.path,
+        )
+        .execute(&mut *tx)
+        .await?;
 
+        query!(
+            r"
                 INSERT INTO origins
                 (mirror_id, distribution, component, architecture)
                 VALUES
@@ -221,15 +232,14 @@ impl Database {
             origin.mirror.host,
             port,
             origin.mirror.path,
-            origin.mirror.host,
-            port,
-            origin.mirror.path,
             origin.distribution,
             origin.component,
             origin.architecture
         )
-        .execute(&self.conn)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -284,10 +294,10 @@ impl Database {
             FROM mirrors_v2
             LEFT JOIN
                 (SELECT mirror_id, SUM(size) AS total_size FROM downloads GROUP BY mirror_id) AS downloads
-            ON mirrors_v2.id == downloads.mirror_id
+            ON mirrors_v2.id = downloads.mirror_id
             LEFT JOIN
                 (SELECT mirror_id, SUM(size) AS total_size FROM deliveries GROUP BY mirror_id) AS deliveries
-            ON mirrors_v2.id == deliveries.mirror_id
+            ON mirrors_v2.id = deliveries.mirror_id
             ;
         "#).fetch_all(&self.conn).await
     }
@@ -404,6 +414,8 @@ impl Database {
 
         let port = mirror.port.map_or(0, std::num::NonZero::get);
 
+        let mut tx = self.conn.begin().await?;
+
         query!(
             r"
                 INSERT INTO mirrors_v2
@@ -412,7 +424,16 @@ impl Database {
                 (?, ?, ?)
                 ON CONFLICT
                 DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
+        ",
+            mirror.host,
+            port,
+            mirror.path
+        )
+        .execute(&mut *tx)
+        .await?;
 
+        query!(
+            r"
                 INSERT INTO downloads
                 (mirror_id, debname, size, duration, client_ip)
                 VALUES
@@ -421,16 +442,15 @@ impl Database {
             mirror.host,
             port,
             mirror.path,
-            mirror.host,
-            port,
-            mirror.path,
             debname,
             size,
             duration,
             client
         )
-        .execute(&self.conn)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -459,6 +479,8 @@ impl Database {
 
         let port = mirror.port.map_or(0, std::num::NonZero::get);
 
+        let mut tx = self.conn.begin().await?;
+
         query!(
             r"
                 INSERT INTO mirrors_v2
@@ -467,15 +489,21 @@ impl Database {
                 (?, ?, ?)
                 ON CONFLICT
                 DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
+            ",
+            mirror.host,
+            port,
+            mirror.path
+        )
+        .execute(&mut *tx)
+        .await?;
 
+        query!(
+            r"
                 INSERT INTO deliveries
                 (mirror_id, debname, size, duration, partial, client_ip)
                 VALUES
                 ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?, ?, ?);
             ",
-            mirror.host,
-            port,
-            mirror.path,
             mirror.host,
             port,
             mirror.path,
@@ -485,8 +513,10 @@ impl Database {
             partial,
             client
         )
-        .execute(&self.conn)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -516,44 +546,46 @@ impl Database {
         }
 
         // Remove mirrors with invalid host names (and cascade to their origins/downloads/deliveries)
-        #[expect(
-            clippy::items_after_statements,
-            reason = "define before its single use"
-        )]
-        struct MirrorRow {
-            id: i64,
-            host: String,
-        }
-
-        let mirrors = query_as!(
-            MirrorRow,
-            r#"SELECT id AS "id!: i64", host FROM mirrors_v2;"#
-        )
-        .fetch_all(&self.conn)
-        .await?;
-
-        for mirror in mirrors {
-            if DomainName::new(mirror.host.clone()).is_ok() {
-                continue;
+        {
+            struct MirrorRow {
+                id: i64,
+                host: String,
             }
 
-            warn!(
-                "Removing mirror id={} with invalid host `{}`",
-                mirror.id, mirror.host
-            );
+            let mut tx = self.conn.begin().await?;
 
-            query!(r"DELETE FROM origins WHERE mirror_id = ?;", mirror.id)
-                .execute(&self.conn)
-                .await?;
-            query!(r"DELETE FROM downloads WHERE mirror_id = ?;", mirror.id)
-                .execute(&self.conn)
-                .await?;
-            query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", mirror.id)
-                .execute(&self.conn)
-                .await?;
-            query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", mirror.id)
-                .execute(&self.conn)
-                .await?;
+            let mirrors = query_as!(
+                MirrorRow,
+                r#"SELECT id AS "id!: i64", host FROM mirrors_v2;"#
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+
+            for mirror in mirrors {
+                if is_valid_domain(&mirror.host) {
+                    continue;
+                }
+
+                warn!(
+                    "Removing mirror id={} with invalid host `{}`",
+                    mirror.id, mirror.host
+                );
+
+                query!(r"DELETE FROM origins WHERE mirror_id = ?;", mirror.id)
+                    .execute(&mut *tx)
+                    .await?;
+                query!(r"DELETE FROM downloads WHERE mirror_id = ?;", mirror.id)
+                    .execute(&mut *tx)
+                    .await?;
+                query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", mirror.id)
+                    .execute(&mut *tx)
+                    .await?;
+                query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", mirror.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            tx.commit().await?;
         }
 
         Ok(())
@@ -563,18 +595,30 @@ impl Database {
         let keep_epoch = i64::try_from(keep_date.as_secs()).map_err(|err| Error::TypeNotFound {
             type_name: err.to_string(),
         })?;
+
+        let mut tx = self.conn.begin().await?;
+
         query!(
             r"
                 DELETE FROM downloads
                 WHERE timestamp < ?;
+            ",
+            keep_epoch
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        query!(
+            r"
                 DELETE FROM deliveries
                 WHERE timestamp < ?;
             ",
-            keep_epoch,
             keep_epoch
         )
-        .execute(&self.conn)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
