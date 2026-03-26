@@ -2,7 +2,7 @@ use core::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use coarsetime::Duration;
-use log::{debug, error, warn};
+use log::{debug, error, info};
 
 use crate::{
     database::Database,
@@ -41,6 +41,8 @@ pub(crate) async fn db_loop(
     mut db_thread_rx: tokio::sync::mpsc::Receiver<DatabaseCommand>,
 ) {
     debug!("Database task started");
+
+    let max_capacity = db_thread_rx.max_capacity();
 
     while let Some(cmd) = db_thread_rx.recv().await {
         match cmd {
@@ -81,14 +83,18 @@ pub(crate) async fn db_loop(
         }
 
         {
-            static LOGGED: AtomicBool = AtomicBool::new(false);
+            static LOGGED_FULL: AtomicBool = AtomicBool::new(false);
 
-            if !LOGGED.load(Ordering::Relaxed) && db_thread_rx.capacity() == 0 {
-                warn!(
-                    "Database command channel full ({0}/{0})",
-                    db_thread_rx.max_capacity()
-                );
-                LOGGED.store(true, Ordering::Relaxed);
+            let curr_capacity = db_thread_rx.capacity();
+
+            if LOGGED_FULL.load(Ordering::Relaxed) {
+                if curr_capacity == max_capacity {
+                    info!("Database command channel empty (0/{max_capacity})");
+                    LOGGED_FULL.store(false, Ordering::Relaxed);
+                }
+            } else if curr_capacity == 0 {
+                info!("Database command channel full ({max_capacity}/{max_capacity})");
+                LOGGED_FULL.store(true, Ordering::Relaxed);
             }
         }
     }
