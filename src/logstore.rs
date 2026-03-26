@@ -19,8 +19,7 @@ impl LogStoreImpl {
         }
     }
 
-    #[must_use]
-    fn iter(&self) -> std::collections::vec_deque::Iter<'_, std::string::String> {
+    fn iter(&self) -> impl Iterator<Item = &String> {
         self.entries.iter()
     }
 }
@@ -73,7 +72,7 @@ impl std::io::Write for LogStore {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.inner.write().flush()
     }
 }
 
@@ -83,8 +82,7 @@ pub(crate) struct LogStoreEntryListGuard<'a> {
 }
 
 impl LogStoreEntryListGuard<'_> {
-    #[must_use]
-    pub(crate) fn iter(&self) -> std::collections::vec_deque::Iter<'_, std::string::String> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
         self.guard.iter()
     }
 }
