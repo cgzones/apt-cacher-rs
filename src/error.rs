@@ -16,7 +16,6 @@ pub(crate) struct MirrorDownloadRate {
 }
 
 #[derive(Debug)]
-#[non_exhaustive]
 pub(crate) enum ProxyCacheError {
     Io(std::io::Error),
     Hyper(hyper::Error),
@@ -151,14 +150,9 @@ where
 
         let mut cause: &dyn std::error::Error = self.err;
 
-        loop {
-            if let Some(c) = cause.source() {
-                write!(f, ":  {c}")?;
-                cause = c;
-                continue;
-            }
-
-            break;
+        while let Some(c) = cause.source() {
+            write!(f, ":  {c}")?;
+            cause = c;
         }
 
         Ok(())
