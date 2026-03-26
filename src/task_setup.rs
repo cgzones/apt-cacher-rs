@@ -31,8 +31,7 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
         );
     }
 
-    let cache_tmp_path: std::path::PathBuf =
-        [cache_path, std::path::Path::new("tmp")].iter().collect();
+    let cache_tmp_path = cache_path.join("tmp");
 
     std::fs::create_dir_all(&cache_tmp_path)
         .with_context(|| format!("Failed to create directory `{}`", cache_tmp_path.display()))?;
