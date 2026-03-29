@@ -20,6 +20,7 @@ use tokio::net::TcpStream;
 use crate::database_task::{DatabaseCommand, DbCmdDelivery};
 use crate::deb_mirror::{Mirror, ResourceFile, parse_request_path};
 use crate::deb_mirror::{valid_filename, valid_mirrorname};
+use crate::http_etag::{if_none_match, read_etag};
 use crate::http_range::{
     format_http_date, http_datetime_to_systemtime, http_parse_range, systemtime_to_http_datetime,
 };
@@ -546,6 +547,8 @@ async fn try_sendfile_request(
 
     let file_size = metadata.len();
 
+    let file_etag = read_etag(&file, &cache_path);
+
     // Cache entries are replaced on update, not overridden, so the creation time is the time the
     // file was last modified.
     let last_modified = metadata.created().unwrap_or_else(|_err| {
@@ -556,8 +559,37 @@ async fn try_sendfile_request(
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
-    // Handle If-Modified-Since
-    if let Some(ims) = find_header(req.headers, "if-modified-since")
+    // Handle If-None-Match (takes precedence over If-Modified-Since per RFC 9110 §13.1.2)
+    let if_none_match_header = find_header(req.headers, "if-none-match");
+
+    if let Some(inm) = if_none_match_header
+        && let Some(ref etag) = file_etag
+        && if_none_match(inm, etag)
+    {
+        info!(
+            "Serving 304 Not Modified (If-None-Match) for cached file {} from mirror {}{} for client {client} via sendfile",
+            conn_details.debname, conn_details.mirror, aliased
+        );
+
+        if let Err(err) = write_304_response(
+            stream,
+            *conn_version,
+            conn_action,
+            &last_modified,
+            file_etag.as_deref(),
+        )
+        .await
+        {
+            warn_once_or_info!("Failed to write 304 response to client {client}:  {err}");
+            return SendfileResult::Error;
+        }
+
+        return SendfileResult::Served(conn_action);
+    }
+
+    // Handle If-Modified-Since (only when If-None-Match is absent)
+    if if_none_match_header.is_none()
+        && let Some(ims) = find_header(req.headers, "if-modified-since")
         && let Some(ims_time) = http_datetime_to_systemtime(ims)
         && last_modified <= ims_time
     {
@@ -566,8 +598,14 @@ async fn try_sendfile_request(
             conn_details.debname, conn_details.mirror, aliased
         );
 
-        if let Err(err) =
-            write_304_response(stream, *conn_version, conn_action, &last_modified).await
+        if let Err(err) = write_304_response(
+            stream,
+            *conn_version,
+            conn_action,
+            &last_modified,
+            file_etag.as_deref(),
+        )
+        .await
         {
             warn_once_or_info!("Failed to write 304 response to client {client}:  {err}");
             return SendfileResult::Error;
@@ -582,9 +620,13 @@ async fn try_sendfile_request(
 
     let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
         range_header
-        && let Some((content_range, start, cl)) =
-            http_parse_range(range, if_range_header, file_size, last_modified)
-    {
+        && let Some((content_range, start, cl)) = http_parse_range(
+            range,
+            if_range_header,
+            file_size,
+            last_modified,
+            file_etag.as_deref(),
+        ) {
         (
             StatusCode::PARTIAL_CONTENT,
             start,
@@ -619,6 +661,7 @@ async fn try_sendfile_request(
         content_length,
         &last_modified,
         content_range.as_deref(),
+        file_etag.as_deref(),
     )
     .await
     {
@@ -900,15 +943,25 @@ async fn write_304_response(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     last_modified: &SystemTime,
+    etag: Option<&str>,
 ) -> std::io::Result<()> {
     let date = format_http_date();
     let age = last_modified.elapsed().map_or(0, |dur| dur.as_secs());
+
+    let etag_header = match etag {
+        Some(etag) => format!("ETag: {etag}\r\n"),
+        None => String::new(),
+    };
+
+    let last_modified_str = systemtime_to_http_datetime(*last_modified);
 
     let response = format!(
         "{conn_version} 304 Not Modified\r\n\
          Date: {date}\r\n\
          Via: {APP_VIA}\r\n\
          Connection: {conn_action}\r\n\
+         Last-Modified: {last_modified_str}\r\n\
+         {etag_header}\
          Age: {age}\r\n\
          \r\n"
     );
@@ -941,6 +994,7 @@ async fn write_invalid_response(
 }
 
 /// Write HTTP response headers for a file response.
+#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 async fn write_response_headers(
     stream: &TcpStream,
     conn_version: ConnectionVersion,
@@ -949,10 +1003,16 @@ async fn write_response_headers(
     content_length: u64,
     last_modified: &SystemTime,
     content_range: Option<&str>,
+    etag: Option<&str>,
 ) -> std::io::Result<()> {
     let date = format_http_date();
     let last_modified_str = systemtime_to_http_datetime(*last_modified);
     let age = last_modified.elapsed().map_or(0, |dur| dur.as_secs());
+
+    let etag_header = match etag {
+        Some(etag) => format!("ETag: {etag}\r\n"),
+        None => String::new(),
+    };
 
     let mut response = format!(
         "{conn_version} {status}\r\n\
@@ -962,6 +1022,7 @@ async fn write_response_headers(
          Content-Length: {content_length}\r\n\
          Content-Type: application/vnd.debian.binary-package\r\n\
          Last-Modified: {last_modified_str}\r\n\
+         {etag_header}\
          Accept-Ranges: bytes\r\n\
          Age: {age}\r\n"
     );
