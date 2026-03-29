@@ -22,6 +22,7 @@ mod database_task;
 mod deb_mirror;
 mod error;
 mod guards;
+mod http_etag;
 mod http_range;
 mod humanfmt;
 mod log_once;
@@ -79,10 +80,12 @@ use hyper::header::CONTENT_LENGTH;
 use hyper::header::CONTENT_RANGE;
 use hyper::header::CONTENT_TYPE;
 use hyper::header::DATE;
+use hyper::header::ETAG;
 use hyper::header::HOST;
 use hyper::header::HeaderName;
 use hyper::header::HeaderValue;
 use hyper::header::IF_MODIFIED_SINCE;
+use hyper::header::IF_NONE_MATCH;
 use hyper::header::IF_RANGE;
 use hyper::header::LAST_MODIFIED;
 use hyper::header::LOCATION;
@@ -143,6 +146,10 @@ use crate::error::MirrorDownloadRate;
 use crate::error::ProxyCacheError;
 use crate::guards::DownloadBarrier;
 use crate::guards::InitBarrier;
+use crate::http_etag::if_none_match;
+use crate::http_etag::is_valid_etag;
+use crate::http_etag::read_etag;
+use crate::http_etag::write_etag;
 use crate::http_range::format_http_date;
 use crate::http_range::http_datetime_to_systemtime;
 use crate::http_range::systemtime_to_http_datetime;
@@ -960,6 +967,21 @@ impl Body for MmapBody {
     }
 }
 
+enum EtagState {
+    Some(String),
+    Failure,
+    Unknown,
+}
+
+impl EtagState {
+    fn from_option(etag: Option<String>) -> Self {
+        match etag {
+            Some(etag) => Self::Some(etag),
+            None => Self::Failure,
+        }
+    }
+}
+
 #[must_use]
 async fn serve_cached_file(
     conn_details: ConnectionDetails,
@@ -967,7 +989,43 @@ async fn serve_cached_file(
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
     file_path: &Path,
+    file_etag: EtagState,
 ) -> Response<ProxyCacheBody> {
+    fn decide_serve_304(
+        req: &Request<Empty<()>>,
+        file_etag: Option<&str>,
+        local_modification_time: SystemTime,
+        conn_details: &ConnectionDetails,
+    ) -> bool {
+        // Handle If-None-Match (takes precedence over If-Modified-Since per RFC 9110 §13.1.2)
+        if let Some(inm) = req.headers().get(IF_NONE_MATCH) {
+            // If we don't have a local ETag or the header is invalid, conservatively serve the body.
+            let Some(etag) = file_etag else {
+                return false;
+            };
+
+            let Ok(inm_str) = inm.to_str() else {
+                warn_once!(
+                    "Client {} sent an invalid If-None-Match header: {inm:?}",
+                    conn_details.client
+                );
+                return false;
+            };
+
+            return if_none_match(inm_str, etag);
+        }
+
+        if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE)
+            && let Some(ims_str) = ims.to_str().ok()
+            && let Some(ims_time) = http_datetime_to_systemtime(ims_str)
+            && local_modification_time <= ims_time
+        {
+            return true;
+        }
+
+        false
+    }
+
     let aliased = match conn_details.aliased_host {
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
@@ -986,6 +1044,13 @@ async fn serve_cached_file(
 
     let file_size = metadata.len();
 
+    // Use the provided ETag or fall back to reading from the file if not provided
+    let file_etag = match file_etag {
+        EtagState::Some(etag) => Some(etag),
+        EtagState::Failure => None,
+        EtagState::Unknown => read_etag(&file, file_path),
+    };
+
     // Cache entries are replaced on update, not overridden, so the creation time is the time the file was last modified.
     // The modified file timestamp is used to store the last up-to-date check against the upstream mirror, if creation timestamps are supported.
     let last_modified = metadata.created().unwrap_or_else(|_err| {
@@ -994,26 +1059,36 @@ async fn serve_cached_file(
             .expect("Platform should support modification timestamps via setup check")
     });
 
-    // Handle If-Modified-Since
-    if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE)
-        && let Some(ims_str) = ims.to_str().ok()
-        && let Some(ims_time) = http_datetime_to_systemtime(ims_str)
-        && last_modified <= ims_time
-    {
+    // Handle If-None-Match and If-Modified-Since
+    let serve_304 = decide_serve_304(req, file_etag.as_deref(), last_modified, &conn_details);
+
+    if serve_304 {
         info!(
             "Serving 304 Not Modified for cached file {} from mirror {}{} for client {} via hyper",
             conn_details.debname, conn_details.mirror, aliased, conn_details.client
         );
 
-        let response = Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(DATE, format_http_date())
             .header(VIA, APP_VIA)
             .header(CONNECTION, "keep-alive")
             .header(
+                LAST_MODIFIED,
+                HeaderValue::try_from(systemtime_to_http_datetime(last_modified))
+                    .expect("HTTP date is valid"),
+            )
+            .header(
                 AGE,
                 HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
-            )
+            );
+        if let Some(ref etag) = file_etag {
+            builder = builder.header(
+                ETAG,
+                HeaderValue::try_from(etag.as_str()).expect("ETag is validated by read_etag"),
+            );
+        }
+        let response = builder
             .body(ProxyCacheBody::Empty(Empty::new()))
             .expect("HTTP response is valid");
 
@@ -1031,6 +1106,7 @@ async fn serve_cached_file(
                 .and_then(|val| val.to_str().ok()),
             file_size,
             last_modified,
+            file_etag.as_deref(),
         ) {
         (
             StatusCode::PARTIAL_CONTENT,
@@ -1076,6 +1152,7 @@ async fn serve_cached_file(
             content_start,
             content_range,
             partial,
+            file_etag.as_deref(),
         )
         .await;
     }
@@ -1097,6 +1174,7 @@ async fn serve_cached_file(
         content_start,
         content_range,
         partial,
+        file_etag.as_deref(),
     )
     .await
 }
@@ -1115,6 +1193,7 @@ async fn serve_cached_file_mmap(
     content_start: u64,
     content_range: Option<String>,
     partial: bool,
+    etag: Option<&str>,
 ) -> Response<ProxyCacheBody> {
     let file_pathbuf = file_path.to_path_buf();
     let client_ip = conn_details.client.ip();
@@ -1189,6 +1268,7 @@ async fn serve_cached_file_mmap(
         content_length as u64,
         body,
         content_range,
+        etag,
     )
 }
 
@@ -1206,6 +1286,7 @@ async fn serve_cached_file_buf(
     start: u64,
     content_range: Option<String>,
     partial: bool,
+    etag: Option<&str>,
 ) -> Response<ProxyCacheBody> {
     if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
         error!(
@@ -1236,6 +1317,7 @@ async fn serve_cached_file_buf(
         content_length,
         body,
         content_range,
+        etag,
     )
 }
 
@@ -1245,6 +1327,7 @@ fn serve_cached_file_response(
     content_length: u64,
     body: ProxyCacheBody,
     content_range: Option<String>,
+    etag: Option<&str>,
 ) -> Response<ProxyCacheBody> {
     /*
      * Original headers:
@@ -1299,6 +1382,14 @@ fn serve_cached_file_response(
         assert!(!r, "header does not exist by previous construction");
     }
 
+    if let Some(etag) = etag {
+        let r = response.headers_mut().append(
+            ETAG,
+            HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
+        );
+        assert!(!r, "header does not exist by previous construction");
+    }
+
     trace!("Outgoing response of cached file: {response:?}");
 
     response
@@ -1346,34 +1437,18 @@ async fn serve_volatile_file(
         && elapsed < Duration::from_secs(30)
     {
         debug!(
-            "Volatile file `{}` is just {} old, serving cached version...",
+            "Volatile file `{}` is just {} old (limit: 30s), serving cached version...",
             file_path.display(),
             HumanFmt::Time(elapsed)
         );
 
-        let client_modified_since = req.headers().get(IF_MODIFIED_SINCE);
-        let client_modified_time = match client_modified_since {
-            Some(val) => {
-                let time = val.to_str().ok().and_then(http_datetime_to_systemtime);
-                if time.is_none() {
-                    debug!(
-                        "Ignoring invalid If-Modified-Since header from client {}",
-                        conn_details.client
-                    );
-                }
-                time
-            }
-            None => None,
-        };
-
-        return serve_cached_file_modified_since(
+        return serve_cached_file(
             conn_details,
             &req,
             appstate.database_tx,
             file,
             file_path,
-            local_creation_time.unwrap_or(local_modification_time),
-            client_modified_time,
+            EtagState::Unknown,
         )
         .await;
     }
@@ -1387,7 +1462,14 @@ async fn serve_volatile_file(
             "Serving file {} already in cache / download from mirror {} for client {}...",
             conn_details.debname, conn_details.mirror, conn_details.client
         );
-        return serve_downloading_file(conn_details, req, appstate.database_tx, status).await;
+        return serve_downloading_file(
+            conn_details,
+            req,
+            appstate.database_tx,
+            status,
+            EtagState::Unknown,
+        )
+        .await;
     };
 
     serve_new_file(
@@ -1597,6 +1679,7 @@ async fn download_file(
     input: (Incoming, ContentLength),
     output: (tokio::fs::File, TempPath),
     dbarrier: DownloadBarrier,
+    upstream_etag: Option<String>,
 ) {
     let config = global_config();
 
@@ -1614,6 +1697,11 @@ async fn download_file(
     let mut last_send_bytes = 0;
     let mut connected = true;
     let buf_size = config.buffer_size;
+
+    // Write ETag xattr early so it survives partial downloads for resume
+    if let Some(ref etag) = upstream_etag {
+        write_etag(&output.0, &output.1, etag);
+    }
 
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
     let outpath = output.1;
@@ -1813,6 +1901,7 @@ async fn download_file(
         .expect("database task should not die");
 }
 
+#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 #[must_use]
 async fn serve_unfinished_file(
     conn_details: ConnectionDetails,
@@ -1822,8 +1911,16 @@ async fn serve_unfinished_file(
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     content_length: ContentLength,
     mut receiver: tokio::sync::watch::Receiver<()>,
+    upstream_etag: EtagState,
 ) -> Response<ProxyCacheBody> {
     let config = global_config();
+
+    // For joining clients, try reading from xattr as the download task may have already written it.
+    let file_etag = match upstream_etag {
+        EtagState::Some(etag) => Some(etag),
+        EtagState::Failure => None,
+        EtagState::Unknown => read_etag(&file, &file_path),
+    };
 
     let md = match file.metadata().await {
         Ok(data) => data,
@@ -1980,6 +2077,12 @@ async fn serve_unfinished_file(
             AGE,
             HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
         );
+    if let Some(ref etag) = file_etag {
+        response_builder = response_builder.header(
+            ETAG,
+            HeaderValue::try_from(etag.as_str()).expect("ETag is validated before passing"),
+        );
+    }
     if let ContentLength::Exact(size) = content_length {
         let r = response_builder
             .headers_mut()
@@ -2024,6 +2127,7 @@ async fn serve_downloading_file(
     req: Request<Empty<()>>,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    upstream_etag: EtagState,
 ) -> Response<ProxyCacheBody> {
     let mut not_found_once = false;
     let mut init_waited = false;
@@ -2069,7 +2173,15 @@ async fn serve_downloading_file(
                     }
                 };
 
-                return serve_cached_file(conn_details, &req, database_tx, file, &path_clone).await;
+                return serve_cached_file(
+                    conn_details,
+                    &req,
+                    database_tx,
+                    file,
+                    &path_clone,
+                    EtagState::Unknown,
+                )
+                .await;
             }
             ActiveDownloadStatus::Download(path, content_length, receiver) => {
                 // Cannot use mmap(2) since the file is not yet completely written
@@ -2111,6 +2223,7 @@ async fn serve_downloading_file(
                     status,
                     content_length_copy,
                     receiver_clone,
+                    upstream_etag,
                 )
                 .await;
             }
@@ -2162,70 +2275,6 @@ impl std::fmt::Display for ContentLength {
     }
 }
 
-async fn serve_cached_file_modified_since(
-    conn_details: ConnectionDetails,
-    req: &Request<Empty<()>>,
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
-    file: tokio::fs::File,
-    file_path: &Path,
-    local_creation_time: SystemTime,
-    client_modified_time: Option<SystemTime>,
-) -> Response<ProxyCacheBody> {
-    let Some(client_modified_time) = client_modified_time else {
-        return serve_cached_file(conn_details, req, database_tx, file, file_path).await;
-    };
-
-    if client_modified_time >= local_creation_time {
-        info!(
-            "Serving info about up-to-date cached file {} from mirror {} for client {}",
-            conn_details.debname, conn_details.mirror, conn_details.client
-        );
-
-        /*
-         * Response {
-         *     status: 304,
-         *     version: HTTP/1.1,
-         *     headers: {
-         *         "connection": "keep-alive",
-         *         "date": "Sat, 08 Jun 2024 12:50:39 GMT",
-         *         "via": "1.1 varnish",
-         *         "cache-control": "public, max-age=120",
-         *         "etag": "\"306ed-61a5ca11810f3\"",
-         *         "age": "104",
-         *         "x-served-by": "cache-fra-eddf8230031-FRA",
-         *         "x-cache": "HIT",
-         *         "x-cache-hits": "1",
-         *         "x-timer": "S1717851040.758717,VS0,VE1"
-         *     },
-         *     body: Body(Empty)
-         * }
-         */
-
-        let response = Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header(DATE, format_http_date())
-            .header(VIA, APP_VIA)
-            .header(CONNECTION, "keep-alive")
-            .header(
-                AGE,
-                HeaderValue::from(local_creation_time.elapsed().map_or(0, |dur| dur.as_secs())),
-            )
-            .body(ProxyCacheBody::Empty(Empty::new()))
-            .expect("HTTP response is valid");
-
-        trace!("Outgoing response of up-to-date cached file: {response:?}");
-
-        return response;
-    }
-
-    info!(
-        "File {} from mirror {} is up-to-date in cache, serving to client {} with older version",
-        conn_details.debname, conn_details.mirror, conn_details.client
-    );
-
-    serve_cached_file(conn_details, req, database_tx, file, file_path).await
-}
-
 #[must_use]
 async fn serve_new_file(
     conn_details: ConnectionDetails,
@@ -2244,6 +2293,7 @@ async fn serve_new_file(
         max_age: u32,
         host: &HeaderValue,
         cfstate: &CacheFileStat<'_>,
+        volatile_etag: &EtagState,
     ) -> Request<Empty<bytes::Bytes>> {
         /*
          * Request {
@@ -2318,6 +2368,14 @@ async fn serve_new_file(
                 HeaderValue::try_from(format!("max-age={max_age}")).expect("string is valid"),
             );
             assert!(!r, "header does not exist by previous construction");
+
+            if let EtagState::Some(etag) = volatile_etag {
+                let r = request.headers_mut().append(
+                    IF_NONE_MATCH,
+                    HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
+                );
+                assert!(!r, "header does not exist by previous construction");
+            }
         }
 
         request
@@ -2354,13 +2412,12 @@ async fn serve_new_file(
         CacheFileStat::New => (true, 0),
     };
 
-    let mut client_modified_time = None;
     let mut max_age = 300;
     let mut host = None;
 
     for (name, value) in req.headers() {
         match name {
-            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT => (),
+            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE => (),
             n if n == PROXY_CONNECTION => (),
             &HOST => host = Some(value),
             /*
@@ -2381,16 +2438,6 @@ async fn serve_new_file(
                     }
                 }
             }
-            &IF_MODIFIED_SINCE => {
-                if let Some(time) = value.to_str().ok().and_then(http_datetime_to_systemtime) {
-                    client_modified_time = Some(time);
-                } else {
-                    debug!(
-                        "Ignoring invalid If-Modified-Since header from client {}",
-                        conn_details.client
-                    );
-                }
-            }
             _ => warn_once_or_info!(
                 "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}",
                 conn_details.client
@@ -2398,7 +2445,6 @@ async fn serve_new_file(
         }
     }
     // mark immutable
-    let client_modified_time = client_modified_time;
     let max_age = max_age;
     let host = match host {
         Some(h) => h,
@@ -2425,7 +2471,14 @@ async fn serve_new_file(
         );
     }
 
-    let fwd_request = build_fwd_request(&req_uri, max_age, host, &cfstate);
+    let volatile_etag = match &cfstate {
+        CacheFileStat::Volatile {
+            file, file_path, ..
+        } => EtagState::from_option(read_etag(file, file_path)),
+        CacheFileStat::New => EtagState::Unknown,
+    };
+
+    let fwd_request = build_fwd_request(&req_uri, max_age, host, &cfstate, &volatile_etag);
     trace!("Forwarded request: {fwd_request:?}");
 
     let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
@@ -2458,7 +2511,8 @@ async fn serve_new_file(
         {
             req_uri = std::borrow::Cow::Owned(moved_uri);
 
-            let redirected_request = build_fwd_request(&req_uri, max_age, host, &cfstate);
+            let redirected_request =
+                build_fwd_request(&req_uri, max_age, host, &cfstate, &volatile_etag);
 
             trace!("Forwarded redirected request: {redirected_request:?}");
 
@@ -2492,7 +2546,7 @@ async fn serve_new_file(
         mut file,
         file_path,
         local_creation_time,
-        local_modification_time,
+        local_modification_time: _,
     } = cfstate
     {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
@@ -2521,14 +2575,13 @@ async fn serve_new_file(
 
             ibarrier.finished(file_path.to_path_buf()).await;
 
-            return serve_cached_file_modified_since(
+            return serve_cached_file(
                 conn_details,
                 &req,
                 appstate.database_tx,
                 file,
                 file_path,
-                local_creation_time.unwrap_or(local_modification_time),
-                client_modified_time,
+                volatile_etag,
             )
             .await;
         }
@@ -2603,6 +2656,24 @@ async fn serve_new_file(
         }
     };
 
+    let upstream_etag: Option<String> = fwd_response
+        .headers()
+        .get(ETAG)
+        .and_then(|hv| hv.to_str().ok())
+        .filter(|etag| {
+            if is_valid_etag(etag) {
+                true
+            } else {
+                warn_once_or_info!(
+                    "Upstream mirror {} sent invalid ETag for {}: {etag}",
+                    conn_details.mirror,
+                    conn_details.debname
+                );
+                false
+            }
+        })
+        .map(String::from);
+
     let (_parts, body) = fwd_response.into_parts();
 
     let filename = Path::new(&conn_details.debname);
@@ -2638,6 +2709,7 @@ async fn serve_new_file(
     let cd = conn_details.clone();
     let db_tx = appstate.database_tx.clone();
     let curr_downloads = appstate.active_downloads.download_count();
+    let download_etag = upstream_etag.clone();
     tokio::task::spawn(async move {
         download_file(
             db_tx,
@@ -2646,6 +2718,7 @@ async fn serve_new_file(
             (body, content_length),
             (outfile, outpath),
             dbarrier,
+            download_etag,
         )
         .await;
     });
@@ -2698,7 +2771,14 @@ async fn serve_new_file(
         }
     }
 
-    serve_downloading_file(conn_details, req, appstate.database_tx, status).await
+    serve_downloading_file(
+        conn_details,
+        req,
+        appstate.database_tx,
+        status,
+        EtagState::from_option(upstream_etag),
+    )
+    .await
 }
 
 /// Create a TCP connection to host:port, build a tunnel between the connection and
@@ -2779,8 +2859,15 @@ pub(crate) async fn process_cache_request(
                     serve_volatile_file(conn_details, req, file, &cache_path, appstate).await
                 }
                 CachedFlavor::Permanent => {
-                    serve_cached_file(conn_details, &req, appstate.database_tx, file, &cache_path)
-                        .await
+                    serve_cached_file(
+                        conn_details,
+                        &req,
+                        appstate.database_tx,
+                        file,
+                        &cache_path,
+                        EtagState::Unknown,
+                    )
+                    .await
                 }
             }
         }
@@ -2814,7 +2901,14 @@ pub(crate) async fn process_cache_request(
                     "Serving file {} already in download from mirror {} for client {}...",
                     conn_details.debname, conn_details.mirror, conn_details.client
                 );
-                serve_downloading_file(conn_details, req, appstate.database_tx, status).await
+                serve_downloading_file(
+                    conn_details,
+                    req,
+                    appstate.database_tx,
+                    status,
+                    EtagState::Unknown,
+                )
+                .await
             }
         }
         Err(err) => {
