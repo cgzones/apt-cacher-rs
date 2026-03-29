@@ -40,6 +40,7 @@ use std::convert::Infallible;
 use std::error::Error as _;
 use std::fmt::Debug;
 use std::fmt::Display;
+use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -4055,6 +4056,9 @@ where
 #[derive(Parser)]
 #[command(author, version, long_version(get_features(true)), about)]
 struct Cli {
+    /// Log file path (log to file instead of stdout [default])
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
     /// Logging level
     #[arg(short, long, value_name = "SEVERITY")]
     log_level: Option<LevelFilter>,
@@ -4157,19 +4161,40 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .set(parking_lot::RwLock::new(HashMap::new()))
         .expect("Initial set in main() should succeed");
 
-    CombinedLogger::init(vec![
-        TermLogger::new(
-            output_log_level,
-            output_log_config,
-            TerminalMode::Mixed,
-            ColorChoice::Auto,
-        ),
-        WriteLogger::new(
-            LevelFilter::Warn,
-            internal_log_config,
-            LOGSTORE.get().expect("Should be set").clone(),
-        ),
-    ])?;
+    let internal_logger = WriteLogger::new(
+        LevelFilter::Warn,
+        internal_log_config,
+        LOGSTORE.get().expect("Should be set").clone(),
+    );
+
+    if let Some(ref log_path) = args.log_file {
+        #[expect(
+            clippy::print_stderr,
+            reason = "print to stderr for log file open error"
+        )]
+        let log_file_handle = match OpenOptions::new().append(true).create(true).open(log_path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("Failed to open log file `{}`:  {err}", log_path.display());
+                std::process::exit(1);
+            }
+        };
+
+        CombinedLogger::init(vec![
+            WriteLogger::new(output_log_level, output_log_config, log_file_handle),
+            internal_logger,
+        ])?;
+    } else {
+        CombinedLogger::init(vec![
+            TermLogger::new(
+                output_log_level,
+                output_log_config,
+                TerminalMode::Mixed,
+                ColorChoice::Auto,
+            ),
+            internal_logger,
+        ])?;
+    }
 
     debug!("Logger initialized");
     trace!("Tracing enabled");
