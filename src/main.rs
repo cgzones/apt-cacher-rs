@@ -4205,7 +4205,7 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Cli::parse();
 
-    let (config, cgf_fallback, config_warnings) = Config::new(&args.config_path)?;
+    let (config, cfg_fallback, config_warnings) = Config::new(&args.config_path)?;
 
     let config_log_level = config.log_level;
     let config_logstore_capacity = config.logstore_capacity;
@@ -4293,7 +4293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("Logger initialized");
     trace!("Tracing enabled");
 
-    if cgf_fallback {
+    if cfg_fallback {
         info!(
             "Default configuration file `{}` not found, using defaults",
             args.config_path.display()
