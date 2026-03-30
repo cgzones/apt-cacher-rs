@@ -243,14 +243,14 @@ fn compute_conn_action(
     version: ConnectionVersion,
     client: &ClientInfo,
 ) -> ConnectionAction {
-    // If the clients sends a body, just close the connection afterwards
-    // too avoid computing the length of the body
+    // If the client sends a body, just close the connection afterwards
+    // to avoid computing the length of the body.
     if req.headers.iter().any(|h| {
-        (h.name.eq_ignore_ascii_case("Content-Length")
+        (h.name.eq_ignore_ascii_case("content-length")
             && str::from_utf8(h.value)
                 .ok()
                 .is_none_or(|hval| hval.trim() != "0"))
-            || h.name.eq_ignore_ascii_case("Transfer-Encoding")
+            || h.name.eq_ignore_ascii_case("transfer-encoding")
     }) {
         warn_once_or_info!(
             "Request with body detected from client {client}, closing connection after response"
@@ -258,7 +258,7 @@ fn compute_conn_action(
         return ConnectionAction::Close;
     }
 
-    if let Some(hvalue) = find_header(req.headers, "Connection") {
+    if let Some(hvalue) = find_header(req.headers, "connection") {
         for p in hvalue.split(',') {
             let p = p.trim();
 
@@ -384,7 +384,7 @@ async fn try_sendfile_request(
         // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
         // HTTP/1.1 request that lacks a Host header field.
         if matches!(*conn_version, ConnectionVersion::Http11)
-            && find_header(req.headers, "Host").is_none()
+            && find_header(req.headers, "host").is_none()
         {
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
