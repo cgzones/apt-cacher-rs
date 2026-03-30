@@ -33,6 +33,7 @@ const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
 const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
 const DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT: Option<NonZero<usize>> = Some(nonzero!(10));
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
+const DEFAULT_LOG_DESTINATION: LogDestination = LogDestination::Console;
 const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
 const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
 const DEFAULT_RATE_CHECK_TIMEFRAME: NonZero<usize> = nonzero!(30);
@@ -325,6 +326,22 @@ impl<'de> Deserialize<'de> for IpNetOrAddr {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum LogDestination {
+    Console,
+    File(PathBuf),
+}
+
+impl From<String> for LogDestination {
+    fn from(s: String) -> Self {
+        if s.eq_ignore_ascii_case("console") {
+            Self::Console
+        } else {
+            Self::File(PathBuf::from(s))
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
@@ -332,6 +349,15 @@ pub(crate) struct Config {
     /// Can be overridden via program options.
     #[serde(default = "default_log_level", deserialize_with = "from_level_name")]
     pub(crate) log_level: LevelFilter,
+
+    /// Path to log file.
+    /// The special value `console` will output to the console.
+    /// Can be overridden via program options.
+    #[serde(
+        default = "default_log_file",
+        deserialize_with = "parse_log_destination"
+    )]
+    pub(crate) log_file: LogDestination,
 
     /// Address to listen on.
     #[serde(default = "default_bind_addr")]
@@ -612,8 +638,21 @@ where
     Ok(NonZero::new(u))
 }
 
+fn parse_log_destination<'de, D>(deserializer: D) -> Result<LogDestination, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+
+    Ok(LogDestination::from(s))
+}
+
 const fn default_log_level() -> LevelFilter {
     DEFAULT_LOG_LEVEL
+}
+
+fn default_log_file() -> LogDestination {
+    DEFAULT_LOG_DESTINATION
 }
 
 const fn default_bind_addr() -> IpAddr {
@@ -876,6 +915,7 @@ impl Config {
     fn default() -> Self {
         Self {
             log_level: DEFAULT_LOG_LEVEL,
+            log_file: DEFAULT_LOG_DESTINATION,
             bind_addr: DEFAULT_BIND_ADDRESS,
             bind_port: DEFAULT_BIND_PORT,
             database_path: PathBuf::from(DEFAULT_DATABASE_PATH),
@@ -940,6 +980,12 @@ impl Config {
     fn validate(&mut self) -> anyhow::Result<Vec<String>> {
         let mut warnings: Vec<String> = Vec::new();
         // TODO: check bind_addr.is_documentation() once stable: https://github.com/rust-lang/rust/issues/27709
+
+        if let LogDestination::File(ref path) = self.log_file
+            && path.as_os_str().is_empty()
+        {
+            bail!("Invalid log_file value: must not be empty");
+        }
 
         if self.database_slow_timeout < Duration::from_secs(1)
             || self.database_slow_timeout > Duration::from_mins(1)

@@ -126,6 +126,7 @@ use tokio::signal::unix::SignalKind;
 use crate::config::Config;
 use crate::config::DomainName;
 use crate::config::HttpsUpgradeMode;
+use crate::config::LogDestination;
 use crate::database::Database;
 use crate::database_task::DatabaseCommand;
 use crate::database_task::DbCmdDelivery;
@@ -4150,9 +4151,9 @@ where
 #[derive(Parser)]
 #[command(author, version, long_version(get_features(true)), about)]
 struct Cli {
-    /// Log file path (log to file instead of stdout [default])
+    /// Log file path (log to file instead of console [default])
     #[arg(long, value_name = "PATH")]
-    log_file: Option<PathBuf>,
+    log_file: Option<LogDestination>,
     /// Logging level
     #[arg(short, long, value_name = "SEVERITY")]
     log_level: Option<LevelFilter>,
@@ -4161,9 +4162,10 @@ struct Cli {
         short = 'c',
         long,
         default_value = config::DEFAULT_CONFIGURATION_PATH,
+        alias = "config_path",
         value_name = "PATH"
     )]
-    config_path: PathBuf,
+    config_file: PathBuf,
     /// Skip timestamp in log messages
     #[arg(long, default_value = "false")]
     skip_log_timestamp: bool,
@@ -4213,21 +4215,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::process::exit(1);
     }
 
-    let (config, cfg_fallback, config_warnings) = Config::new(&args.config_path)?;
+    let (config, cfg_fallback, config_warnings) = Config::new(&args.config_file)?;
 
-    let config_log_level = config.log_level;
-    let config_logstore_capacity = config.logstore_capacity;
-    let config_disk_quota = config.disk_quota;
-
-    RUNTIMEDETAILS
-        .set(RuntimeDetails {
-            start_time: time::OffsetDateTime::now_utc(),
-            config,
-            cache_quota: cache_quota::CacheQuota::new(0, config_disk_quota),
-        })
-        .expect("Initial set in main() should succeed");
-
-    let output_log_level = args.log_level.unwrap_or(config_log_level);
+    let output_log_level = args.log_level.unwrap_or(config.log_level);
+    let output_log_file = args.log_file.as_ref().unwrap_or(&config.log_file);
 
     let output_log_config = ConfigBuilder::new()
         .set_time_level(if args.skip_log_timestamp {
@@ -4252,7 +4243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build();
 
     LOGSTORE
-        .set(LogStore::new(config_logstore_capacity))
+        .set(LogStore::new(config.logstore_capacity))
         .expect("Initial set in main() should succeed");
 
     UNCACHEABLES
@@ -4269,34 +4260,46 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         LOGSTORE.get().expect("Should be set").clone(),
     );
 
-    if let Some(ref log_path) = args.log_file {
-        #[expect(
-            clippy::print_stderr,
-            reason = "print to stderr for log file open error"
-        )]
-        let log_file_handle = match OpenOptions::new().append(true).create(true).open(log_path) {
-            Ok(file) => file,
-            Err(err) => {
-                eprintln!("Failed to open log file `{}`:  {err}", log_path.display());
-                std::process::exit(1);
-            }
-        };
+    match output_log_file {
+        LogDestination::Console => {
+            CombinedLogger::init(vec![
+                TermLogger::new(
+                    output_log_level,
+                    output_log_config,
+                    TerminalMode::Mixed,
+                    ColorChoice::Auto,
+                ),
+                internal_logger,
+            ])?;
+        }
 
-        CombinedLogger::init(vec![
-            WriteLogger::new(output_log_level, output_log_config, log_file_handle),
-            internal_logger,
-        ])?;
-    } else {
-        CombinedLogger::init(vec![
-            TermLogger::new(
-                output_log_level,
-                output_log_config,
-                TerminalMode::Mixed,
-                ColorChoice::Auto,
-            ),
-            internal_logger,
-        ])?;
+        LogDestination::File(path) => {
+            #[expect(
+                clippy::print_stderr,
+                reason = "print to stderr for log file open error"
+            )]
+            let log_file_handle = match OpenOptions::new().append(true).create(true).open(path) {
+                Ok(file) => file,
+                Err(err) => {
+                    eprintln!("Failed to open log file `{}`:  {err}", path.display());
+                    std::process::exit(1);
+                }
+            };
+
+            CombinedLogger::init(vec![
+                WriteLogger::new(output_log_level, output_log_config, log_file_handle),
+                internal_logger,
+            ])?;
+        }
     }
+
+    RUNTIMEDETAILS
+        .set(RuntimeDetails {
+            start_time: time::OffsetDateTime::now_utc(),
+            cache_quota: cache_quota::CacheQuota::new(0, config.disk_quota),
+            config,
+        })
+        .expect("Initial set in main() should succeed");
 
     debug!("Logger initialized");
     trace!("Tracing enabled");
@@ -4304,7 +4307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if cfg_fallback {
         info!(
             "Default configuration file `{}` not found, using defaults",
-            args.config_path.display()
+            args.config_file.display()
         );
     }
 
