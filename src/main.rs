@@ -4205,6 +4205,14 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Cli::parse();
 
+    let is_run_as_root = nix::unistd::geteuid().is_root();
+
+    #[expect(clippy::print_stderr, reason = "print to stderr before log setup")]
+    if is_run_as_root && !args.permit_running_daemon_as_root {
+        eprintln!("Running as root is not recommended and not permitted by default");
+        std::process::exit(1);
+    }
+
     let (config, cfg_fallback, config_warnings) = Config::new(&args.config_path)?;
 
     let config_log_level = config.log_level;
@@ -4306,13 +4314,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     debug!("Configuration: {:?}", global_config());
 
-    if nix::unistd::getuid().is_root() {
-        if args.permit_running_daemon_as_root {
-            warn!("!! Running as root is not recommended !!");
-        } else {
-            error!("Running as root is not recommended and not permitted by default");
-            std::process::exit(1);
-        }
+    if is_run_as_root {
+        assert!(
+            args.permit_running_daemon_as_root,
+            "should not reach if not permitted"
+        );
+        warn!("!! Running as root is not recommended !!");
     }
 
     if global_config().allowed_mirrors.is_empty() {
