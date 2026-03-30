@@ -1144,11 +1144,19 @@ impl Config {
             );
         }
 
+        if self.cache_directory.as_os_str().is_empty() {
+            bail!("Invalid cache_directory value: must not be empty");
+        }
+
         if !self.cache_directory.is_absolute() {
             warnings.push(format!(
                 "cache_directory `{}` is not an absolute path",
                 self.cache_directory.display()
             ));
+        }
+
+        if self.database_path.as_os_str().is_empty() {
+            bail!("Invalid database_path value: must not be empty");
         }
 
         if !self.database_path.is_absolute() {
