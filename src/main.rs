@@ -32,6 +32,7 @@ mod log_once;
 mod logstore;
 mod rate_checked_body;
 mod ringbuffer;
+mod secure_vec;
 #[cfg(feature = "sendfile")]
 mod sendfile_conn;
 mod task_cache_scan;
