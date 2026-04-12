@@ -28,13 +28,20 @@ mod http_helpers;
 mod http_last_modified;
 mod http_range;
 mod humanfmt;
+#[cfg(feature = "ktls")]
+mod ktls;
+#[cfg(feature = "ktls")]
+mod ktls_handshake;
 mod log_once;
 mod logstore;
 mod rate_checked_body;
 mod ringbuffer;
+#[cfg(feature = "ktls")]
 mod secure_vec;
 #[cfg(feature = "sendfile")]
 mod sendfile_conn;
+#[cfg(feature = "splice")]
+mod splice_conn;
 mod task_cache_scan;
 mod task_cleanup;
 mod task_setup;
@@ -295,6 +302,11 @@ impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
 
 pub(crate) static SCHEME_CACHE: OnceLock<parking_lot::RwLock<HashMap<SchemeKey, Scheme>>> =
     OnceLock::new();
+
+#[cfg(feature = "ktls")]
+pub(crate) static KTLS_BLOCKED: OnceLock<
+    parking_lot::RwLock<HashMap<SchemeKey, coarsetime::Instant>>,
+> = OnceLock::new();
 
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
@@ -4389,33 +4401,28 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
         };
     }
 
-    #[cfg(feature = "mmap")]
-    macro_rules! feature_mmap {
-        () => {
-            "true"
+    // Expand to the literal "true" when `feature` is enabled, "false" otherwise.
+    macro_rules! feature_bool {
+        ($name:ident, $feature:literal) => {
+            #[cfg(feature = $feature)]
+            macro_rules! $name {
+                () => {
+                    "true"
+                };
+            }
+            #[cfg(not(feature = $feature))]
+            macro_rules! $name {
+                () => {
+                    "false"
+                };
+            }
         };
     }
 
-    #[cfg(not(feature = "mmap"))]
-    macro_rules! feature_mmap {
-        () => {
-            "false"
-        };
-    }
-
-    #[cfg(feature = "sendfile")]
-    macro_rules! feature_sendfile {
-        () => {
-            "true"
-        };
-    }
-
-    #[cfg(not(feature = "sendfile"))]
-    macro_rules! feature_sendfile {
-        () => {
-            "false"
-        };
-    }
+    feature_bool!(feature_mmap, "mmap");
+    feature_bool!(feature_sendfile, "sendfile");
+    feature_bool!(feature_splice, "splice");
+    feature_bool!(feature_ktls, "ktls");
 
     if version {
         concat!(
@@ -4429,6 +4436,12 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
             "\n",
             "sendfile=",
             feature_sendfile!(),
+            "\n",
+            "splice=",
+            feature_splice!(),
+            "\n",
+            "ktls=",
+            feature_ktls!(),
         )
     } else {
         concat!(
@@ -4440,6 +4453,12 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
             "\n",
             "sendfile=",
             feature_sendfile!(),
+            "\n",
+            "splice=",
+            feature_splice!(),
+            "\n",
+            "ktls=",
+            feature_ktls!(),
         )
     }
 }
@@ -4622,6 +4641,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .set(parking_lot::RwLock::new(HashMap::new()))
         .expect("Initial set in main() should succeed");
 
+    #[cfg(feature = "ktls")]
+    KTLS_BLOCKED
+        .set(parking_lot::RwLock::new(HashMap::new()))
+        .expect("Initial set in main() should succeed");
+
     let internal_logger = WriteLogger::new(
         LevelFilter::Warn,
         internal_log_config,
@@ -4716,6 +4740,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     scopeguard::defer! {
         info!("Stopped.");
     }
+
+    // Warm the kTLS availability probe before the tokio runtime starts so the
+    // one-time socket(2)/bind(2)/listen(2)/connect(2)/accept(2)/setsockopt(2)
+    // round-trip never lands on a tokio worker thread.
+    #[cfg(feature = "ktls")]
+    let _ktls_available = ktls::is_available();
 
     let runtime = Builder::new_multi_thread()
         .enable_all()

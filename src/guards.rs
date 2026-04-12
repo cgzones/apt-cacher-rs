@@ -136,6 +136,38 @@ pub(crate) struct DownloadBarrier {
 }
 
 impl DownloadBarrier {
+    /// Unconditional ping — notifies all waiting receivers immediately.
+    /// Use for one-off notifications (startup prefix, kTLS extra body).
+    #[cfg(feature = "splice")]
+    pub(crate) fn ping(&mut self) {
+        let data = self
+            .data
+            .as_mut()
+            .expect("every sink consumes the instance");
+        data.internal_ping();
+    }
+
+    /// Create a new `watch::Receiver` that will observe future pings.
+    /// Used to hand off progress notifications to a spawned file-serve task.
+    #[cfg(feature = "splice")]
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        let data = self
+            .data
+            .as_ref()
+            .expect("every sink consumes the instance");
+        data.tx.subscribe()
+    }
+
+    /// Get a reference to the shared download status.
+    #[cfg(feature = "splice")]
+    pub(crate) fn status(&self) -> &Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
+        let data = self
+            .data
+            .as_ref()
+            .expect("every sink consumes the instance");
+        &data.status
+    }
+
     /// Accumulate `bytes` of newly written data and only send a notification
     /// once the total since the last ping reaches [`PING_BATCH_THRESHOLD`].
     /// This avoids excessive wake-ups for small writes.
