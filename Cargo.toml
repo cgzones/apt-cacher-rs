@@ -16,8 +16,10 @@ exclude = [".env", ".github/", ".gitignore", "dev.conf", "TODO"]
 default = ["mmap", "tls_rustls", "sendfile"]
 mmap = ["dep:memmap2"]
 sendfile = ["dep:httparse", "nix/zerocopy"]
-tls_hyper = ["dep:hyper-tls"]
-tls_rustls = ["dep:hyper-rustls", "dep:rustls"]
+splice = ["sendfile", "nix/socket"]
+ktls = ["splice", "tls_rustls", "nix/net"]
+tls_hyper = ["dep:hyper-tls", "dep:tokio-native-tls"]
+tls_rustls = ["dep:hyper-rustls", "dep:rustls", "dep:tokio-rustls"]
 
 
 [dependencies]
@@ -47,6 +49,8 @@ parking_lot = "0.12.5"
 pin-project = "1.1.11"
 rand = "0.10.1"
 rustls = { version = "0.23", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
 scopeguard = "1.2.0"
 serde = "1.0.197"
 simplelog = "0.12.1"
@@ -67,6 +71,8 @@ xattr = "1.6.1"
 mimalloc = "0.1.48"
 
 [dev-dependencies]
+nix = { version = "0.31", features = ["poll"] }
+rcgen = "0.14"
 tempfile = "3.27"
 
 
@@ -194,6 +200,14 @@ panic = 'abort'
 
 # Speed up compile time query checking
 [profile.dev.package.sqlx-macros]
+opt-level = 3
+
+# TLS crypto is unusably slow in debug mode, causing test timeouts
+[profile.dev.package.rustls]
+opt-level = 3
+[profile.dev.package.aws-lc-rs]
+opt-level = 3
+[profile.dev.package.aws-lc-sys]
 opt-level = 3
 
 [profile.profiling]

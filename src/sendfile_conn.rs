@@ -518,6 +518,67 @@ async fn try_sendfile_request(
             };
         }
 
+        #[cfg(feature = "splice")]
+        {
+            use crate::{
+                splice_conn::{SpliceProxyError, splice_simple_proxy},
+                uncacheables::record_uncacheable,
+            };
+
+            record_uncacheable(&requested_host, uri_path);
+
+            let mirror = Mirror {
+                host: requested_host,
+                port: requested_port,
+                path: String::new(),
+            };
+
+            return match splice_simple_proxy(stream, *conn_version, conn_action, &mirror, uri_path)
+                .await
+            {
+                Ok(()) => SendfileResult::Served(conn_action),
+                Err(SpliceProxyError::UpstreamError(err)) => {
+                    warn!(
+                        "simple proxy: upstream error for {uri_path} from host {}:  {err}",
+                        mirror.format_authority()
+                    );
+                    SendfileResult::Invalid {
+                        status: StatusCode::BAD_GATEWAY,
+                        msg: "Upstream Error",
+                    }
+                }
+                Err(SpliceProxyError::TransferError(err)) => {
+                    warn!(
+                        "simple proxy: transfer error for {uri_path} from host {}:  {err}",
+                        mirror.format_authority()
+                    );
+                    SendfileResult::Invalid {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        msg: "Transfer Error",
+                    }
+                }
+                Err(SpliceProxyError::ClientError(err)) => {
+                    debug!(
+                        "simple proxy: client error for {uri_path} from host {}:  {err}",
+                        mirror.format_authority()
+                    );
+                    SendfileResult::ClientError
+                }
+                Err(SpliceProxyError::AfterHeaderError(err)) => {
+                    info!(
+                        "simple proxy: after-header error for {uri_path} from host {}:  {err}",
+                        mirror.format_authority()
+                    );
+                    SendfileResult::AfterHeaderError
+                }
+                Err(err) => {
+                    warn!("simple proxy: unexpected error for {uri_path}:  {err}");
+                    SendfileResult::NotApplicable("simple proxy failed")
+                }
+            };
+        }
+
+        #[cfg(not(feature = "splice"))]
         return SendfileResult::NotApplicable("unrecognized resource path");
     };
 
@@ -809,6 +870,86 @@ async fn try_sendfile_request(
         .await;
     }
 
+    // Cache miss or stale volatile file — try splice proxy, then hyper fallback
+    #[cfg(feature = "splice")]
+    {
+        use crate::splice_conn::{ClientRangeRequest, SpliceProxyError, splice_proxy};
+
+        let client_range = ClientRangeRequest {
+            range: find_header(req.headers, &RANGE).map(String::from),
+            if_range: find_header(req.headers, &IF_RANGE).map(String::from),
+            if_none_match: find_header(req.headers, &IF_NONE_MATCH).map(String::from),
+            if_modified_since: find_header(req.headers, &IF_MODIFIED_SINCE).map(String::from),
+        };
+        match splice_proxy(
+            stream,
+            *conn_version,
+            conn_action,
+            &conn_details,
+            uri.path(),
+            appstate,
+            client_range,
+        )
+        .await
+        {
+            Ok(()) => SendfileResult::Served(conn_action),
+            Err(SpliceProxyError::NotApplicable(reason)) => {
+                warn_once_or_debug!(
+                    "splice proxy not applicable for {} from mirror {}{}: {reason}",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    aliased
+                );
+                SendfileResult::NotApplicable(reason)
+            }
+            Err(SpliceProxyError::UpstreamError(err)) => {
+                warn!(
+                    "splice proxy: upstream error for {} from mirror {}{}:  {err}",
+                    conn_details.debname, conn_details.mirror, aliased
+                );
+                SendfileResult::Invalid {
+                    status: StatusCode::BAD_GATEWAY,
+                    msg: "Upstream Error",
+                }
+            }
+            Err(SpliceProxyError::CacheError(err)) => {
+                warn!(
+                    "splice proxy: cache error for {} from mirror {}{}:  {err}",
+                    conn_details.debname, conn_details.mirror, aliased
+                );
+                SendfileResult::Invalid {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    msg: "Cache Error",
+                }
+            }
+            Err(SpliceProxyError::TransferError(err)) => {
+                warn!(
+                    "splice proxy: transfer error for {} from mirror {}{}:  {err}",
+                    conn_details.debname, conn_details.mirror, aliased
+                );
+                SendfileResult::Invalid {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    msg: "Transfer Error",
+                }
+            }
+            Err(SpliceProxyError::ClientError(err)) => {
+                debug!(
+                    "splice proxy: client error for {} from mirror {}{}:  {err}",
+                    conn_details.debname, conn_details.mirror, aliased
+                );
+                SendfileResult::ClientError
+            }
+            Err(SpliceProxyError::AfterHeaderError(err)) => {
+                info!(
+                    "splice proxy: after-header error for {} from mirror {}{}:  {err}",
+                    conn_details.debname, conn_details.mirror, aliased
+                );
+                SendfileResult::AfterHeaderError
+            }
+        }
+    }
+
+    #[cfg(not(feature = "splice"))]
     SendfileResult::NotApplicable("file not found in cache")
 }
 
