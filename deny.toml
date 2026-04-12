@@ -14,7 +14,6 @@ allow = [
 confidence-threshold = 0.99
 exceptions = [
     { allow = ["Zlib"], crate = "foldhash" },
-    { allow = ["OpenSSL"], crate = "aws-lc-sys" },
 ]
 
 [bans]
