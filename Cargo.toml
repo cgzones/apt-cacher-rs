@@ -45,7 +45,7 @@ memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
 nix = { version = "0.31", features = ["user"] }
 parking_lot = "0.12.5"
 pin-project = "1.1.11"
-rand = "0.10.0"
+rand = "0.10.1"
 rustls = { version = "0.23", optional = true }
 scopeguard = "1.2.0"
 serde = "1.0.197"
