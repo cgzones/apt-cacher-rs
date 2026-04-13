@@ -24,12 +24,13 @@ use crate::AppState;
 use crate::HumanFmt;
 use crate::ProxyCacheBody;
 use crate::RUNTIMEDETAILS;
-use crate::UNCACHEABLES;
 use crate::client_counter::active_client_downloads;
 use crate::client_counter::connected_clients;
+use crate::deb_mirror::is_deb_package;
 use crate::get_features;
 use crate::global_cache_quota;
 use crate::global_config;
+use crate::uncacheables::get_uncacheables;
 use crate::{APP_NAME, LOGSTORE, database::Database, error::ProxyCacheError, quick_response};
 
 const WEBUI_DATE_FORMAT: &[FormatItem<'_>] =
@@ -74,16 +75,7 @@ async fn flat_directory_size(path: &Path) -> Result<(usize, u64), tokio::io::Err
     while let Some(entry) = dir.next_entry().await? {
         let mdata = entry.metadata().await?;
         total_size += mdata.len();
-        #[expect(
-            clippy::case_sensitive_file_extension_comparisons,
-            reason = "debian uses case-sensitive extensions"
-        )]
-        if mdata.is_file()
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|s| s.ends_with(".deb"))
-        {
+        if mdata.is_file() && entry.file_name().to_str().is_some_and(is_deb_package) {
             total_files += 1;
         }
     }
@@ -254,18 +246,18 @@ fn build_uncacheable_table() -> (Table, usize) {
         Table::new().with_header_row(&["Requested Host", "Requested Path"]);
     let mut rows = 0;
 
-    let uncacheables = UNCACHEABLES.get().expect("Initialized in main()").read();
+    {
+        let uncacheables = get_uncacheables().read();
 
-    if uncacheables.is_empty() {
-        return (Table::new(), 0);
+        if uncacheables.is_empty() {
+            return (Table::new(), 0);
+        }
+
+        for (host, path) in uncacheables.iter() {
+            html_table_uncacheables.add_body_row([&**host, path]);
+            rows += 1;
+        }
     }
-
-    for (host, path) in uncacheables.iter() {
-        html_table_uncacheables.add_body_row([&**host, path]);
-        rows += 1;
-    }
-
-    drop(uncacheables);
 
     (html_table_uncacheables, rows)
 }

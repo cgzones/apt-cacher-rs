@@ -1,11 +1,11 @@
-use std::{io::ErrorKind, os::fd::AsRawFd, path::Path};
+use std::path::Path;
 
 use log::{info, warn};
-use nix::errno::Errno;
-use xattr::FileExt as _;
+
+use crate::xattr_helpers;
 
 /// The extended attribute name used to store `ETag` values.
-const XATTR_ETAG: &str = "user.etag";
+const XATTR_ETAG: &str = "user.apt_cacher_rs.etag";
 
 /// Return the opaque-tag portion of an `ETag`, stripping the `W/` prefix if present.
 ///
@@ -33,62 +33,26 @@ pub(crate) fn is_valid_etag(s: &str) -> bool {
             .all(|&c| c == 0x21 || (0x23..=0x7E).contains(&c) || c >= 0x80)
 }
 
-/// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
-struct XattrFile<'a>(&'a tokio::fs::File);
-
-impl AsRawFd for XattrFile<'_> {
-    #[inline]
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-impl xattr::FileExt for XattrFile<'_> {}
-
 /// Read an `ETag` from the file's extended attributes.
 ///
 /// Returns `None` on any error (graceful degradation).
 #[must_use]
 pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<String> {
-    let data = tokio::task::block_in_place(|| XattrFile(file).get_xattr(XATTR_ETAG));
+    let data = xattr_helpers::read_helper(file, display_path, XATTR_ETAG)?;
 
-    match data {
-        Ok(None) => None,
+    if !is_valid_etag(&data) {
+        warn!(
+            "Discarding malformed ETag from `{}`: {}",
+            display_path.display(),
+            data.escape_debug()
+        );
 
-        Ok(Some(val)) => {
-            let s = match String::from_utf8(val) {
-                Ok(s) => s,
-                Err(_err) => {
-                    warn!(
-                        "Discarding invalid UTF-8 ETag xattr from `{}`",
-                        display_path.display()
-                    );
-                    return None;
-                }
-            };
-            if !is_valid_etag(&s) {
-                warn!(
-                    "Discarding malformed ETag from `{}`: {}",
-                    display_path.display(),
-                    s.escape_debug()
-                );
-                return None;
-            }
-            Some(s)
-        }
+        xattr_helpers::remove_helper(file, display_path, XATTR_ETAG);
 
-        Err(err) => {
-            // Silently ignore expected "not supported" / "no data" errors
-            let kind = err.kind();
-            if kind != ErrorKind::Unsupported && err.raw_os_error() != Some(Errno::ENODATA as i32) {
-                warn!(
-                    "Unexpected error reading ETag xattr from `{}`:  {err}",
-                    display_path.display()
-                );
-            }
-            None
-        }
+        return None;
     }
+
+    Some(data)
 }
 
 /// Write an `ETag` to the file's extended attributes.
@@ -104,18 +68,7 @@ pub(crate) fn write_etag(file: &tokio::fs::File, display_path: &Path, etag: &str
         return;
     }
 
-    let data =
-        tokio::task::block_in_place(|| XattrFile(file).set_xattr(XATTR_ETAG, etag.as_bytes()));
-
-    if let Err(err) = data {
-        let kind = err.kind();
-        if kind != ErrorKind::Unsupported {
-            warn!(
-                "Failed to write ETag xattr to `{}`:  {err}",
-                display_path.display()
-            );
-        }
-    }
+    xattr_helpers::write_helper(file, display_path, XATTR_ETAG, etag.as_bytes());
 }
 
 /// Strong `ETag` comparison per RFC 9110 §8.8.3.2: both tags must be strong

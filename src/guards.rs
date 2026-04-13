@@ -65,6 +65,7 @@ impl<'a> InitBarrier<'a> {
                 debname: data.debname.to_owned(),
                 tx,
                 quota_reservation,
+                bytes_since_ping: 0,
             }),
         }
     }
@@ -89,6 +90,28 @@ struct DownloadBarrierData {
     debname: String,
     tx: tokio::sync::watch::Sender<()>,
     quota_reservation: Option<QuotaReservation>,
+    /// Bytes written since the last ping.  Single-owner (the download task
+    /// exclusively mutates via `&mut DownloadBarrier`), so a plain `u64`
+    /// suffices — no atomic is needed.
+    bytes_since_ping: u64,
+}
+
+impl DownloadBarrierData {
+    /// Send a pending batched notification if any bytes have accumulated.
+    fn flush_batched_ping(&mut self) {
+        if self.bytes_since_ping > 0 {
+            self.internal_ping();
+        }
+    }
+
+    /// Internal helper to send a ping notification and reset the bytes counter.
+    fn internal_ping(&mut self) {
+        if let Err(_err @ tokio::sync::watch::error::SendError(())) = self.tx.send(()) {
+            // ignore send error — receivers are gone
+            // Don't cache disconnected state, since send() with no receivers is just an atomic usize load.
+        }
+        self.bytes_since_ping = 0;
+    }
 }
 
 #[must_use]
@@ -97,12 +120,25 @@ pub(crate) struct DownloadBarrier {
 }
 
 impl DownloadBarrier {
-    pub(crate) fn ping(&self) -> Result<(), tokio::sync::watch::error::SendError<()>> {
-        self.data
-            .as_ref()
-            .expect("data is only extracted in a sink")
-            .tx
-            .send(())
+    /// Accumulate `bytes` of newly written data and only send a notification
+    /// once the total since the last ping reaches [`PING_BATCH_THRESHOLD`].
+    /// This avoids excessive wake-ups for small writes.
+    ///
+    /// `&mut self` enforces single-writer access at compile time.
+    pub(crate) fn ping_batched(&mut self, bytes: u64) {
+        /// Minimum bytes accumulated before `ping_batched()` sends a notification.
+        /// This avoids excessive wake-ups for small writes — receivers will be notified
+        /// once roughly 1 MiB of new data is available on disk.
+        const PING_BATCH_THRESHOLD: u64 = 1024 * 1024;
+
+        let data = self
+            .data
+            .as_mut()
+            .expect("data is only extracted in a sink");
+        data.bytes_since_ping = data.bytes_since_ping.saturating_add(bytes);
+        if data.bytes_since_ping >= PING_BATCH_THRESHOLD {
+            data.internal_ping();
+        }
     }
 
     pub(crate) async fn abort_with_reason(mut self, reason: AbortReason) {
@@ -113,7 +149,21 @@ impl DownloadBarrier {
     }
 
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
-        let data = self.data.take().expect("begin_rename() is a sink");
+        let mut data = self.data.take().expect("begin_rename() is a sink");
+
+        // Flush pending notification before dropping the sender, so
+        // receivers can read the tail of the file before seeing the
+        // channel close.
+        //
+        // Ordering invariant: we flush the final ping, then drop `tx`
+        // explicitly, then take the status write lock.  The tokio watch
+        // channel retains the last sent value even after all senders drop,
+        // so a receiver that races with the drop either (a) wakes from
+        // `.changed()` with Ok because it saw the ping, or (b) wakes with
+        // RecvError and then observes the status transitioning to Finished
+        // once `RenameBarrier::release` is called.
+        data.flush_batched_ping();
+        drop(data.tx);
 
         let lock = data.status.write_owned().await;
 

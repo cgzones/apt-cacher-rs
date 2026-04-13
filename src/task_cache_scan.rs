@@ -5,6 +5,7 @@ use tokio::fs::DirEntry;
 
 use crate::{
     database::{Database, MirrorEntry},
+    deb_mirror::is_deb_package,
     error::ProxyCacheError,
     global_config,
 };
@@ -159,22 +160,20 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
         if file_type.is_file() {
             dir_size += mdata.len();
 
-            #[expect(
-                clippy::case_sensitive_file_extension_comparisons,
-                reason = "debian package file extensions are case-sensitive"
-            )]
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|fname| fname.ends_with(".deb"))
-            {
+            if entry.file_name().to_str().is_some_and(is_deb_package) {
                 continue;
             }
         }
 
-        if file_type.is_dir() && entry.file_name() == "dists" {
-            dir_size += scan_sub_dir(entry).await;
-            continue;
+        if file_type.is_dir() {
+            if entry.file_name() == "dists" {
+                dir_size += scan_sub_dir(entry).await;
+                continue;
+            }
+
+            if entry.file_name() == "tmp" {
+                continue;
+            }
         }
 
         warn!(
