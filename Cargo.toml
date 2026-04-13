@@ -13,7 +13,7 @@ exclude = [".env", ".github/", ".gitignore", "dev.conf", "TODO"]
 
 
 [features]
-default = ["mmap", "tls_rustls"]
+default = ["mmap", "tls_rustls", "sendfile"]
 mmap = ["dep:memmap2"]
 sendfile = ["dep:httparse", "nix/zerocopy"]
 tls_hyper = ["dep:hyper-tls"]
