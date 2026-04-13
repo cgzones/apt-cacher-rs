@@ -53,6 +53,12 @@ impl<T> RingBuffer<T> {
         self.inner.len() == self.capacity.get()
     }
 
+    #[expect(dead_code, reason = "will be used soon..")]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+
     #[must_use]
     pub(crate) fn iter(&self) -> std::collections::vec_deque::Iter<'_, T> {
         self.inner.iter()
