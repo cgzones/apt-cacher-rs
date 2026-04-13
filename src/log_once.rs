@@ -5,7 +5,7 @@ macro_rules! warn_once {
 
         match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
             Ok(false) => log::warn!($($t)*),
-            Ok(true) => unreachable!("value must never change from false to true"),
+            Ok(true) => unreachable!("value must never change from true to false"),
             Err(_) => {}
         }
     }};
@@ -18,7 +18,7 @@ macro_rules! warn_once_or_info {
 
         let level = match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
             Ok(false) => log::Level::Warn,
-            Ok(true) => unreachable!("value must never change from false to true"),
+            Ok(true) => unreachable!("value must never change from true to false"),
             Err(_) => log::Level::Info,
         };
         log::log!(level, $($t)*);
@@ -32,7 +32,7 @@ macro_rules! warn_once_or_debug {
 
         let level = match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
             Ok(false) => log::Level::Warn,
-            Ok(true) => unreachable!("value must never change from false to true"),
+            Ok(true) => unreachable!("value must never change from true to false"),
             Err(_) => log::Level::Debug,
         };
         log::log!(level, $($t)*);
@@ -46,7 +46,7 @@ macro_rules! info_once {
 
         match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
             Ok(false) => log::info!($($t)*),
-            Ok(true) => unreachable!("value must never change from false to true"),
+            Ok(true) => unreachable!("value must never change from true to false"),
             Err(_) => {}
         }
     }};

@@ -105,6 +105,7 @@ dependencies = [
  "serde",
  "simplelog",
  "sqlx",
+ "tempfile",
  "time",
  "tokio",
  "tokio-util",

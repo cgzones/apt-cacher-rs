@@ -6,7 +6,7 @@ use hyper::body::{Body, Frame, SizeHint};
 use log::debug;
 use pin_project::pin_project;
 
-use crate::{HumanFmt, ringbuffer::SumRingBuffer};
+use crate::{ClientInfo, HumanFmt, ringbuffer::SumRingBuffer};
 
 /// A rate checker that tracks download speed over a sliding time window.
 #[derive(Debug)]
@@ -25,6 +25,34 @@ pub(crate) struct InsufficientRate {
     pub(crate) timeframe: NonZero<usize>,
     /// The minimum download rate required in bytes per second.
     pub(crate) min_rate: NonZero<usize>,
+    _private: (),
+}
+
+impl InsufficientRate {
+    pub(crate) fn display<'a>(&'a self, client: &'a ClientInfo) -> InsufficientRateFormatter<'a> {
+        InsufficientRateFormatter { rate: self, client }
+    }
+}
+
+pub(crate) struct InsufficientRateFormatter<'a> {
+    rate: &'a InsufficientRate,
+    client: &'a ClientInfo,
+}
+
+impl std::fmt::Display for InsufficientRateFormatter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Timeout occurred for client {} after a download rate of {} [< {}] for the last {} seconds",
+            self.client,
+            HumanFmt::Rate(
+                self.rate.transferred as u64,
+                Duration::from_secs(self.rate.timeframe.get() as u64)
+            ),
+            HumanFmt::Rate(self.rate.min_rate.get() as u64, Duration::from_secs(1)),
+            self.rate.timeframe,
+        )
+    }
 }
 
 impl RateChecker {
@@ -78,6 +106,7 @@ impl RateChecker {
                     transferred,
                     timeframe,
                     min_rate: self.min_download_rate,
+                    _private: (),
                 })
             } else {
                 None

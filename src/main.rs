@@ -23,6 +23,9 @@ mod deb_mirror;
 mod error;
 mod guards;
 mod http_etag;
+#[cfg(feature = "sendfile")]
+mod http_helpers;
+mod http_last_modified;
 mod http_range;
 mod humanfmt;
 mod log_once;
@@ -34,8 +37,12 @@ mod sendfile_conn;
 mod task_cache_scan;
 mod task_cleanup;
 mod task_setup;
+#[cfg(feature = "sendfile")]
+mod tcp_cork_guard;
+mod uncacheables;
 mod utils;
 mod web_interface;
+mod xattr_helpers;
 
 use std::convert::Infallible;
 use std::error::Error as _;
@@ -65,8 +72,9 @@ use futures_util::StreamExt as _;
 use futures_util::TryStreamExt as _;
 use hashbrown::hash_map::Entry;
 use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
+use http::header::ALLOW;
 use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
-use http_range::http_parse_range;
+use http_range::{ParsedRange, http_parse_range};
 use hyper::Uri;
 use hyper::body::Frame;
 use hyper::body::Incoming;
@@ -136,6 +144,7 @@ use crate::database_task::db_loop;
 use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
 use crate::deb_mirror::ResourceFile;
+use crate::deb_mirror::is_diff_request_path;
 use crate::deb_mirror::parse_request_path;
 use crate::deb_mirror::valid_architecture;
 use crate::deb_mirror::valid_component;
@@ -151,17 +160,22 @@ use crate::http_etag::if_none_match;
 use crate::http_etag::is_valid_etag;
 use crate::http_etag::read_etag;
 use crate::http_etag::write_etag;
+use crate::http_last_modified::read_last_modified;
+use crate::http_last_modified::write_last_modified;
+use crate::http_range::cache_file_timestamp;
+use crate::http_range::compute_age;
 use crate::http_range::format_http_date;
 use crate::http_range::http_datetime_to_systemtime;
 use crate::http_range::systemtime_to_http_datetime;
 use crate::humanfmt::HumanFmt;
 use crate::logstore::LogStore;
-use crate::ringbuffer::RingBuffer;
 use crate::task_cache_scan::task_cache_scan;
 use crate::task_cleanup::task_cleanup;
 use crate::task_setup::task_setup;
+use crate::uncacheables::record_uncacheable;
 use crate::utils::TempPath;
 use crate::utils::tokio_tempfile;
+use crate::utils::touch_volatile_mtime;
 use crate::web_interface::serve_web_interface;
 
 // TODO: replace usages with ! once stable
@@ -189,7 +203,29 @@ pub(crate) const APP_VIA: &str = concat!("1.1 ", env!("CARGO_PKG_NAME"));
 
 const RETENTION_TIME: Duration = Duration::from_hours(8 * 7 * 24); /* 8 weeks */
 
-const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(1024 * 1024); /* 1MiB */
+pub(crate) const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(1024 * 1024); /* 1MiB */
+
+/// Maximum age for volatile cache entries before they are treated as stale.
+pub(crate) const VOLATILE_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Derive the Content-Type for a cached file based on its filename extension.
+#[must_use]
+pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
+    if deb_mirror::is_deb_package(filename) {
+        return "application/vnd.debian.binary-package";
+    }
+
+    let extension = filename.rsplit_once('.').map(|(_, ext)| ext);
+
+    match extension {
+        Some("gz") => "application/gzip",
+        Some("xz") => "application/x-xz",
+        Some("bz2") => "application/x-bzip2",
+        Some("lz4") => "application/x-lz4",
+        Some("zst") => "application/zstd",
+        _ => "application/octet-stream",
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ClientInfo {
@@ -217,7 +253,7 @@ impl Display for ClientInfo {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Scheme {
+pub(crate) enum Scheme {
     Http,
     Https,
 }
@@ -241,15 +277,15 @@ impl From<Scheme> for http::uri::Scheme {
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
-struct SchemeKey {
+pub(crate) struct SchemeKey {
     host: String,
     port: Option<u16>,
 }
 
 #[derive(Hash)]
-struct SchemeKeyRef<'a> {
-    host: &'a str,
-    port: Option<u16>,
+pub(crate) struct SchemeKeyRef<'a> {
+    pub(crate) host: &'a str,
+    pub(crate) port: Option<u16>,
 }
 
 impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
@@ -258,7 +294,8 @@ impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
     }
 }
 
-static SCHEME_CACHE: OnceLock<parking_lot::RwLock<HashMap<SchemeKey, Scheme>>> = OnceLock::new();
+pub(crate) static SCHEME_CACHE: OnceLock<parking_lot::RwLock<HashMap<SchemeKey, Scheme>>> =
+    OnceLock::new();
 
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
@@ -390,7 +427,7 @@ pub(crate) async fn request_with_retry(
                     warn_once_or_info!(
                         "Request of internal client to {} failed:  {}",
                         parts.uri,
-                        ErrorReport::new(&err)
+                        ErrorReport(&err)
                     );
                     return Err((err, parts.uri));
                 }
@@ -452,7 +489,7 @@ pub(crate) async fn request_with_retry(
                     debug!(
                         "Failed to connect to {} after {attempt} connection attempts, will retry in {sleep_curr} ms:  {}",
                         parts.uri,
-                        ErrorReport::new(&err)
+                        ErrorReport(&err)
                     );
 
                     attempt += 1;
@@ -485,7 +522,7 @@ pub(crate) async fn request_with_retry(
                     err.1
                         .authority()
                         .expect("authority exists in case of https upgrade test"),
-                    ErrorReport::new(&err.0)
+                    ErrorReport(&err.0)
                 );
             }
             result.map_err(|err| err.0)
@@ -511,12 +548,18 @@ fn quick_response<T: Into<bytes::Bytes>>(
     status: hyper::StatusCode,
     message: T,
 ) -> Response<ProxyCacheBody> {
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(SERVER, APP_NAME)
         .header(DATE, format_http_date())
         .header(CONNECTION, "keep-alive")
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8");
+
+    if status == hyper::StatusCode::METHOD_NOT_ALLOWED {
+        builder = builder.header(ALLOW, "GET");
+    }
+
+    builder
         .body(ProxyCacheBody::Full(Full::new(message.into())))
         .expect("Response is valid")
 }
@@ -666,7 +709,7 @@ enum ProxyCacheBody {
     #[cfg(feature = "mmap")]
     Mmap(#[pin] MmapBody),
     #[cfg(feature = "mmap")]
-    MmapRateChecked(#[pin] RateCheckedBody<MmapBody>, IpAddr),
+    MmapRateChecked(#[pin] RateCheckedBody<MmapBody>, ClientInfo),
     Boxed(#[pin] BoxBody<bytes::Bytes, Box<ProxyCacheError>>),
     Full(#[pin] Full<bytes::Bytes>),
     Empty(#[pin] Empty<bytes::Bytes>),
@@ -703,14 +746,14 @@ impl Body for ProxyCacheBody {
                 .map_err(|never| match never {}),
 
             #[cfg(feature = "mmap")]
-            EnumProj::MmapRateChecked(memory_map, client_ip) => memory_map
+            EnumProj::MmapRateChecked(memory_map, client) => memory_map
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
                 .map_err(|rerr| match *rerr {
                     RateCheckedBodyErr::RateTimeout(error) => {
                         Box::new(ProxyCacheError::ClientDownloadRate {
                             error,
-                            client_ip: *client_ip,
+                            client: *client,
                         })
                     }
                     RateCheckedBodyErr::Inner(never) => match never {},
@@ -1045,16 +1088,23 @@ async fn serve_cached_file(
         EtagState::Unknown => read_etag(&file, file_path),
     };
 
-    // Cache entries are replaced on update, not overridden, so the creation time is the time the file was last modified.
-    // The modified file timestamp is used to store the last up-to-date check against the upstream mirror, if creation timestamps are supported.
-    let last_modified = metadata.created().unwrap_or_else(|_err| {
-        metadata
-            .modified()
-            .expect("Platform should support modification timestamps via setup check")
-    });
+    // Prefer the upstream Last-Modified persisted in xattr (RFC 9110 §10.2.2). Fall back to the
+    // cache file's birth/modification time when the xattr is unavailable.
+    let cache_ts = cache_file_timestamp(&metadata);
+    let stored_last_modified = read_last_modified(&file, file_path);
+    let (last_modified_for_ims, last_modified_str) = match stored_last_modified {
+        Some((str, time)) => (time, str),
+        None => (cache_ts, systemtime_to_http_datetime(cache_ts)),
+    };
+    let age = compute_age(&metadata);
 
     // Handle If-None-Match and If-Modified-Since
-    let serve_304 = decide_serve_304(req, file_etag.as_deref(), last_modified, &conn_details);
+    let serve_304 = decide_serve_304(
+        req,
+        file_etag.as_deref(),
+        last_modified_for_ims,
+        &conn_details,
+    );
 
     if serve_304 {
         info!(
@@ -1069,17 +1119,13 @@ async fn serve_cached_file(
             .header(CONNECTION, "keep-alive")
             .header(
                 LAST_MODIFIED,
-                HeaderValue::try_from(systemtime_to_http_datetime(last_modified))
-                    .expect("HTTP date is valid"),
+                HeaderValue::try_from(last_modified_str).expect("HTTP date is valid"),
             )
-            .header(
-                AGE,
-                HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
-            );
-        if let Some(ref etag) = file_etag {
+            .header(AGE, HeaderValue::from(age));
+        if let Some(etag) = file_etag {
             builder = builder.header(
                 ETAG,
-                HeaderValue::try_from(etag.as_str()).expect("ETag is validated by read_etag"),
+                HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
             );
         }
         let response = builder
@@ -1091,27 +1137,47 @@ async fn serve_cached_file(
         return response;
     }
 
-    let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
-        req.headers().get(RANGE).and_then(|val| val.to_str().ok())
-        && let Some((content_range, start, content_length)) = http_parse_range(
-            range,
-            req.headers()
+    let (http_status, content_start, content_length, content_range, partial) =
+        if let Some(range) = req.headers().get(RANGE).and_then(|val| val.to_str().ok()) {
+            let if_range = req
+                .headers()
                 .get(IF_RANGE)
-                .and_then(|val| val.to_str().ok()),
-            file_size,
-            last_modified,
-            file_etag.as_deref(),
-        ) {
-        (
-            StatusCode::PARTIAL_CONTENT,
-            start,
-            content_length,
-            Some(content_range),
-            true,
-        )
-    } else {
-        (StatusCode::OK, 0, file_size, None, false)
-    };
+                .and_then(|val| val.to_str().ok());
+            match http_parse_range(
+                range,
+                if_range,
+                file_size,
+                last_modified_for_ims,
+                file_etag.as_deref(),
+            ) {
+                ParsedRange::Satisfiable(content_range, start, content_length) => (
+                    StatusCode::PARTIAL_CONTENT,
+                    start,
+                    content_length,
+                    Some(content_range),
+                    true,
+                ),
+                ParsedRange::NotSatisfiable => {
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(SERVER, APP_NAME)
+                        .header(DATE, format_http_date())
+                        .header(CONNECTION, "keep-alive")
+                        .header(
+                            CONTENT_RANGE,
+                            HeaderValue::try_from(format!("bytes */{file_size}"))
+                                .expect("content range is valid"),
+                        )
+                        .body(ProxyCacheBody::Empty(Empty::new()))
+                        .expect("HTTP response is valid");
+                }
+                ParsedRange::Invalid | ParsedRange::IfRangeFailed => {
+                    (StatusCode::OK, 0, file_size, None, false)
+                }
+            }
+        } else {
+            (StatusCode::OK, 0, file_size, None, false)
+        };
 
     #[cfg(feature = "mmap")]
     if content_length >= global_config().mmap_threshold.get() {
@@ -1140,13 +1206,14 @@ async fn serve_cached_file(
             database_tx,
             file,
             file_path,
-            last_modified,
+            last_modified_str,
+            age,
             http_status,
             mmap_content_length,
             content_start,
             content_range,
             partial,
-            file_etag.as_deref(),
+            file_etag,
         )
         .await;
     }
@@ -1162,13 +1229,14 @@ async fn serve_cached_file(
         file,
         file_path,
         file_size,
-        last_modified,
+        last_modified_str,
+        age,
         http_status,
         content_length,
         content_start,
         content_range,
         partial,
-        file_etag.as_deref(),
+        file_etag,
     )
     .await
 }
@@ -1181,16 +1249,17 @@ async fn serve_cached_file_mmap(
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
     file_path: &Path,
-    last_modified: SystemTime,
+    last_modified_str: String,
+    age: u32,
     http_status: StatusCode,
     content_length: usize,
     content_start: u64,
     content_range: Option<String>,
     partial: bool,
-    etag: Option<&str>,
+    etag: Option<String>,
 ) -> Response<ProxyCacheBody> {
     let file_pathbuf = file_path.to_path_buf();
-    let client_ip = conn_details.client.ip();
+    let client = conn_details.client;
 
     trace!(
         "Using mmap(2) with start={content_start} and length={content_length} from content_range={content_range:?} for file `{}`",
@@ -1209,8 +1278,9 @@ async fn serve_cached_file_mmap(
         }
         .inspect_err(|err| {
             error!(
-                "Failed to mmap downloaded file `{}`:  {err}",
-                file_pathbuf.display()
+                "Failed to mmap downloaded file `{}`:  {}",
+                file_pathbuf.display(),
+                ErrorReport(err)
             );
         })
         .ok()?;
@@ -1226,8 +1296,9 @@ async fn serve_cached_file_mmap(
 
         if let Err(err) = memory_map.advise(Advice::Sequential) {
             warn_once_or_info!(
-                "Failed to advice memory mapping of file `{}`:  {err}",
-                file_pathbuf.display()
+                "Failed to advice memory mapping of file `{}`:  {}",
+                file_pathbuf.display(),
+                ErrorReport(&err)
             );
         }
 
@@ -1237,6 +1308,8 @@ async fn serve_cached_file_mmap(
     .expect("task should not panic") else {
         return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
     };
+
+    let content_type = content_type_for_cached_file(&conn_details.debname);
 
     let memory_body = MmapBody::new(
         memory_map,
@@ -1251,15 +1324,17 @@ async fn serve_cached_file_mmap(
     let body = match config.min_download_rate {
         Some(rate) => ProxyCacheBody::MmapRateChecked(
             RateCheckedBody::new(memory_body, rate, config.rate_check_timeframe),
-            client_ip,
+            client,
         ),
         None => ProxyCacheBody::Mmap(memory_body),
     };
 
     serve_cached_file_response(
         http_status,
-        last_modified,
+        last_modified_str,
+        age,
         content_length as u64,
+        content_type,
         body,
         content_range,
         etag,
@@ -1274,14 +1349,20 @@ async fn serve_cached_file_buf(
     mut file: tokio::fs::File,
     file_path: &Path,
     file_size: u64,
-    last_modified: SystemTime,
+    last_modified_str: String,
+    age: u32,
     http_status: StatusCode,
     content_length: u64,
     start: u64,
     content_range: Option<String>,
     partial: bool,
-    etag: Option<&str>,
+    etag: Option<String>,
 ) -> Response<ProxyCacheBody> {
+    debug_assert!(
+        start + content_length <= file_size,
+        "range {start}+{content_length} must not exceed file size {file_size}"
+    );
+
     if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
         error!(
             "Error seeking cached file `{}` to {start}/{file_size}:  {err}",
@@ -1289,6 +1370,8 @@ async fn serve_cached_file_buf(
         );
         return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
     }
+
+    let content_type = content_type_for_cached_file(&conn_details.debname);
 
     let reader_stream =
         tokio_util::io::ReaderStream::with_capacity(file, global_config().buffer_size);
@@ -1307,21 +1390,29 @@ async fn serve_cached_file_buf(
 
     serve_cached_file_response(
         http_status,
-        last_modified,
+        last_modified_str,
+        age,
         content_length,
+        content_type,
         body,
         content_range,
         etag,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared response builder for serve_cached_file_mmap and serve_cached_file_buf"
+)]
 fn serve_cached_file_response(
     http_status: StatusCode,
-    last_modified: SystemTime,
+    last_modified_str: String,
+    age: u32,
     content_length: u64,
+    content_type: &str,
     body: ProxyCacheBody,
     content_range: Option<String>,
-    etag: Option<&str>,
+    etag: Option<String>,
 ) -> Response<ProxyCacheBody> {
     /*
      * Original headers:
@@ -1354,17 +1445,13 @@ fn serve_cached_file_response(
         .header(VIA, APP_VIA)
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_LENGTH, HeaderValue::from(content_length))
-        .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
+        .header(CONTENT_TYPE, content_type)
         .header(
             LAST_MODIFIED,
-            HeaderValue::try_from(systemtime_to_http_datetime(last_modified))
-                .expect("date string is valid"),
+            HeaderValue::try_from(last_modified_str).expect("date string is valid"),
         )
         .header(ACCEPT_RANGES, "bytes")
-        .header(
-            AGE,
-            HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
-        )
+        .header(AGE, HeaderValue::from(age))
         .body(body)
         .expect("HTTP response is valid");
 
@@ -1411,12 +1498,10 @@ async fn serve_volatile_file(
         "serve_volatile_file() assumes volatile flavor"
     );
 
-    let (local_creation_time, local_modification_time) = match file.metadata().await {
-        Ok(data) => (
-            data.created().ok(),
-            data.modified()
-                .expect("Platform should support modification timestamps via setup check"),
-        ),
+    let local_modification_time = match file.metadata().await {
+        Ok(data) => data
+            .modified()
+            .expect("Platform should support modification timestamps via setup check"),
         Err(err) => {
             error!(
                 "Failed to get metadata of file `{}`:  {err}",
@@ -1428,12 +1513,13 @@ async fn serve_volatile_file(
 
     // Cache volatile files for short periods to reduce up-to-date requests
     if let Ok(elapsed) = local_modification_time.elapsed()
-        && elapsed < Duration::from_secs(30)
+        && elapsed < VOLATILE_CACHE_MAX_AGE
     {
         debug!(
-            "Volatile file `{}` is just {} old (limit: 30s), serving cached version...",
+            "Volatile file `{}` is just {} old (limit: {}s), serving cached version...",
             file_path.display(),
-            HumanFmt::Time(elapsed)
+            HumanFmt::Time(elapsed),
+            VOLATILE_CACHE_MAX_AGE.as_secs()
         );
 
         return serve_cached_file(
@@ -1474,7 +1560,6 @@ async fn serve_volatile_file(
         CacheFileStat::Volatile {
             file,
             file_path,
-            local_creation_time,
             local_modification_time,
         },
         appstate,
@@ -1546,13 +1631,13 @@ impl Equivalent<ActiveDownloadKey> for ActiveDownloadKeyRef<'_> {
 }
 
 #[derive(Debug)]
-enum AbortReason {
+pub(crate) enum AbortReason {
     MirrorDownloadRate(MirrorDownloadRate),
     AlreadyLoggedJustFail,
 }
 
 #[derive(Debug)]
-enum ActiveDownloadStatus {
+pub(crate) enum ActiveDownloadStatus {
     Init(tokio::sync::watch::Receiver<()>),
     Download(PathBuf, ContentLength, tokio::sync::watch::Receiver<()>),
     Finished(PathBuf),
@@ -1582,7 +1667,7 @@ impl ActiveDownloads {
     }
 
     #[must_use]
-    fn insert(
+    pub(crate) fn insert(
         &self,
         mirror: &Mirror,
         debname: &str,
@@ -1611,7 +1696,7 @@ impl ActiveDownloads {
         }
     }
 
-    fn remove(&self, mirror: &Mirror, debname: &str) {
+    pub(crate) fn remove(&self, mirror: &Mirror, debname: &str) {
         let key = ActiveDownloadKeyRef { mirror, debname };
         let was_present = self.inner.write().remove(&key);
         assert!(
@@ -1620,12 +1705,16 @@ impl ActiveDownloads {
         );
     }
 
-    /// Check if a download for the given mirror and debname is active.
+    /// Get the download status for an active download, if any.
     #[cfg(feature = "sendfile")]
     #[must_use]
-    pub(crate) fn contains(&self, mirror: &Mirror, debname: &str) -> bool {
+    pub(crate) fn get(
+        &self,
+        mirror: &Mirror,
+        debname: &str,
+    ) -> Option<Arc<tokio::sync::RwLock<ActiveDownloadStatus>>> {
         let key = ActiveDownloadKeyRef { mirror, debname };
-        self.inner.read().contains_key(&key)
+        self.inner.read().get(&key).cloned()
     }
 
     #[must_use]
@@ -1666,14 +1755,18 @@ impl ActiveDownloads {
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 async fn download_file(
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     conn_details: &ConnectionDetails,
     warn_on_override: bool,
     input: (Incoming, ContentLength),
     output: (tokio::fs::File, TempPath),
-    dbarrier: DownloadBarrier,
+    mut dbarrier: DownloadBarrier,
     upstream_etag: Option<String>,
+    upstream_last_modified: Option<String>,
+    resume_offset: u64,
+    total_content_length: ContentLength,
 ) {
     let config = global_config();
 
@@ -1688,13 +1781,19 @@ async fn download_file(
     let content_length = input.1;
 
     let mut bytes = 0;
-    let mut last_send_bytes = 0;
-    let mut connected = true;
     let buf_size = config.buffer_size;
 
     // Write ETag xattr early so it survives partial downloads for resume
     if let Some(ref etag) = upstream_etag {
         write_etag(&output.0, &output.1, etag);
+    }
+    // Write upstream Last-Modified xattr early so it survives partial downloads
+    if let Some(ref lm) = upstream_last_modified {
+        write_last_modified(&output.0, &output.1, lm);
+    }
+    // Write expected total size so resume can detect upstream file changes
+    if let ContentLength::Exact(total) = total_content_length {
+        xattr_helpers::write_expected_size(&output.0, &output.1, total.get());
     }
 
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
@@ -1721,7 +1820,7 @@ async fn download_file(
                                     download_rate_err,
                                     mirror: conn_details.mirror.clone(),
                                     debname: conn_details.debname.clone(),
-                                    client_ip: conn_details.client.ip(),
+                                    client: conn_details.client,
                                 },
                             ))
                             .await;
@@ -1734,16 +1833,24 @@ async fn download_file(
                             HumanFmt::Time(start.elapsed().into()),
                             HumanFmt::Size(bytes),
                             HumanFmt::Rate(bytes, start.elapsed()),
-                            ErrorReport::new(&ierr),
+                            ErrorReport(&ierr),
                         );
                     }
                 }
 
+                // Flush buffered data so partial files retain what was received
+                if let Err(err) = writer.flush().await {
+                    error!(
+                        "Failed to flush partial data to `{}`: {err}",
+                        outpath.display()
+                    );
+                }
                 return;
             }
         };
         if let Ok(mut chunk) = frame.into_data() {
-            bytes += chunk.len() as u64;
+            let chunk_len = chunk.len() as u64;
+            bytes += chunk_len;
 
             if bytes > content_length.upper().get() {
                 warn!(
@@ -1760,16 +1867,7 @@ async fn download_file(
                 return;
             }
 
-            if connected && bytes > (buf_size as u64 + last_send_bytes) {
-                if let Err(err) = dbarrier.ping() {
-                    error!(
-                        "All receivers of watch channel for file {} from mirror {} died:  {err}",
-                        conn_details.debname, conn_details.mirror
-                    );
-                    connected = false;
-                }
-                last_send_bytes = bytes;
-            }
+            dbarrier.ping_batched(chunk_len);
         }
     }
 
@@ -1854,7 +1952,8 @@ async fn download_file(
                 // Defuse the TempPath - the file has been successfully renamed
                 TempPath::into_inner(outpath);
 
-                rbarrier.release(dest_file_path, bytes);
+                let total_bytes = resume_offset + bytes;
+                rbarrier.release(dest_file_path, total_bytes);
             }
             Err(err) => {
                 drop(rbarrier);
@@ -1871,21 +1970,36 @@ async fn download_file(
         }
     }
 
+    let total_bytes = resume_offset + bytes;
     let elapsed = start.elapsed();
+    // `rate` is computed over `bytes` (newly downloaded portion) against
+    // `elapsed`, which matches when not resuming. When resuming, label it
+    // `resume_rate` so the reader does not mistake it for an average over
+    // the full `size`.
+    let rate_label = if resume_offset > 0 {
+        "resume_rate"
+    } else {
+        "rate"
+    };
     info!(
-        "Finished download of file {} from mirror {} for client {} in {} (size={}, rate={})",
+        "Finished download of file {} from mirror {} for client {} in {} (size={}, {rate_label}={}{})",
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
         HumanFmt::Time(elapsed.into()),
-        HumanFmt::Size(bytes),
-        HumanFmt::Rate(bytes, elapsed)
+        HumanFmt::Size(total_bytes),
+        HumanFmt::Rate(bytes, elapsed),
+        if resume_offset > 0 {
+            format!(", resumed from {}", HumanFmt::Size(resume_offset))
+        } else {
+            String::new()
+        }
     );
 
     let cmd = DatabaseCommand::Download(DbCmdDownload {
         mirror: conn_details.mirror.clone(),
         debname: conn_details.debname.clone(),
-        size: bytes,
+        size: total_bytes,
         elapsed,
         client_ip: conn_details.client.ip(),
     });
@@ -1927,13 +2041,17 @@ async fn serve_unfinished_file(
         }
     };
 
-    // Cache entries are replaced on update, not overridden, so the creation time is the time the file was last modified.
-    // The modified file timestamp is used to store the last up-to-date check against the upstream mirror, if creation timestamps are supported.
-    let last_modified = md.created().unwrap_or_else(|_err| {
-        md.modified()
-            .expect("Platform should support modification timestamps via setup check")
-    });
+    // Prefer the upstream Last-Modified persisted in xattr (RFC 9110 §10.2.2); fall back to the
+    // cached file's birth/modification time when the xattr is unavailable.
+    let cache_ts = cache_file_timestamp(&md);
+    let stored_last_modified = read_last_modified(&file, &file_path);
+    let last_modified_str = match stored_last_modified {
+        Some((str, _time)) => str,
+        None => systemtime_to_http_datetime(cache_ts),
+    };
+    let age = compute_age(&md);
 
+    let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn(async move {
@@ -1985,6 +2103,7 @@ async fn serve_unfinished_file(
                 let st = status.read().await;
                 let _: Never = match *st {
                     ActiveDownloadStatus::Finished(_) => {
+                        drop(st);
                         finished = true;
                         continue;
                     }
@@ -1999,6 +2118,7 @@ async fn serve_unfinished_file(
                                 }
                             }
                             AbortReason::AlreadyLoggedJustFail => {
+                                drop(st);
                                 // Reason already logged
                                 debug!(
                                     "Download of file `{}` aborted, cancelling stream",
@@ -2060,21 +2180,17 @@ async fn serve_unfinished_file(
         .header(DATE, format_http_date())
         .header(VIA, APP_VIA)
         .header(CONNECTION, "keep-alive")
-        .header(CONTENT_TYPE, "application/vnd.debian.binary-package")
+        .header(CONTENT_TYPE, content_type)
         .header(ACCEPT_RANGES, "bytes")
         .header(
             LAST_MODIFIED,
-            HeaderValue::try_from(systemtime_to_http_datetime(last_modified))
-                .expect("Http datetime is valid"),
+            HeaderValue::try_from(last_modified_str).expect("Http datetime is valid"),
         )
-        .header(
-            AGE,
-            HeaderValue::from(last_modified.elapsed().map_or(0, |dur| dur.as_secs())),
-        );
-    if let Some(ref etag) = file_etag {
+        .header(AGE, HeaderValue::from(age));
+    if let Some(etag) = file_etag {
         response_builder = response_builder.header(
             ETAG,
-            HeaderValue::try_from(etag.as_str()).expect("ETag is validated before passing"),
+            HeaderValue::try_from(etag).expect("ETag is validated before passing"),
         );
     }
     if let ContentLength::Exact(size) = content_length {
@@ -2097,7 +2213,7 @@ async fn serve_unfinished_file(
                         RateCheckedBodyErr::RateTimeout(download_rate_err) => {
                             Box::new(ProxyCacheError::ClientDownloadRate {
                                 error: download_rate_err,
-                                client_ip: conn_details.client.ip(),
+                                client: conn_details.client,
                             })
                         }
                         RateCheckedBodyErr::Inner(ierr) => ierr,
@@ -2123,7 +2239,6 @@ async fn serve_downloading_file(
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     upstream_etag: EtagState,
 ) -> Response<ProxyCacheBody> {
-    let mut not_found_once = false;
     let mut init_waited = false;
 
     loop {
@@ -2181,18 +2296,6 @@ async fn serve_downloading_file(
                 // Cannot use mmap(2) since the file is not yet completely written
                 let file = match tokio::fs::File::open(&path).await {
                     Ok(f) => f,
-                    Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
-                        if not_found_once {
-                            error!("Failed to find downloading file `{}`", path.display());
-                            return quick_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Download not found",
-                            );
-                        }
-                        warn!("Failed to find downloading file `{}`", path.display());
-                        not_found_once = true;
-                        continue;
-                    }
                     Err(err) => {
                         error!(
                             "Failed to open downloading file `{}`:  {err}",
@@ -2229,14 +2332,13 @@ enum CacheFileStat<'a> {
     Volatile {
         file: tokio::fs::File,
         file_path: &'a Path,
-        local_creation_time: Option<SystemTime>,
         local_modification_time: SystemTime,
     },
     New,
 }
 
 #[must_use]
-fn is_host_allowed(requested_host: &str) -> bool {
+pub(crate) fn is_host_allowed(requested_host: &str) -> bool {
     global_config()
         .allowed_mirrors
         .iter()
@@ -2244,7 +2346,7 @@ fn is_host_allowed(requested_host: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ContentLength {
+pub(crate) enum ContentLength {
     /// An exact size
     Exact(NonZero<u64>),
     /// A limit for an unknown size
@@ -2288,6 +2390,8 @@ async fn serve_new_file(
         host: &HeaderValue,
         cfstate: &CacheFileStat<'_>,
         volatile_etag: &EtagState,
+        resume_offset: u64,
+        resume_if_range: Option<&str>,
     ) -> Request<Empty<bytes::Bytes>> {
         /*
          * Request {
@@ -2345,7 +2449,6 @@ async fn serve_new_file(
         if let CacheFileStat::Volatile {
             file: _,
             file_path: _,
-            local_creation_time: _,
             local_modification_time,
         } = cfstate
         {
@@ -2372,6 +2475,23 @@ async fn serve_new_file(
             }
         }
 
+        if resume_offset > 0 {
+            let r = request.headers_mut().append(
+                RANGE,
+                HeaderValue::try_from(format!("bytes={resume_offset}-"))
+                    .expect("range value is valid"),
+            );
+            assert!(!r, "header does not exist by previous construction");
+
+            if let Some(if_range) = resume_if_range {
+                let r = request.headers_mut().append(
+                    IF_RANGE,
+                    HeaderValue::try_from(if_range).expect("If-Range value is valid"),
+                );
+                assert!(!r, "header does not exist by previous construction");
+            }
+        }
+
         request
     }
 
@@ -2387,7 +2507,6 @@ async fn serve_new_file(
         CacheFileStat::Volatile {
             file,
             file_path,
-            local_creation_time: _,
             local_modification_time: _,
         } => {
             let size = match file.metadata().await.map(|md| md.size()) {
@@ -2415,7 +2534,7 @@ async fn serve_new_file(
             n if n == PROXY_CONNECTION => (),
             &HOST => host = Some(value),
             /*
-             * TODO:
+             * TODO: CACHE_CONTROL handling
              * Ignore client cache settings for now.
              * For new files they are irrelevant.
              * We assume pool files never change and for dists file we set them manually.
@@ -2424,7 +2543,7 @@ async fn serve_new_file(
                 if let Ok(s) = value.to_str() {
                     for p in s.split(',') {
                         if let Some((key, val)) = p.split_once('=')
-                            && key == "max-age"
+                            && key.trim() == "max-age"
                             && let Ok(v) = val.parse::<u32>()
                         {
                             max_age = v;
@@ -2472,7 +2591,90 @@ async fn serve_new_file(
         CacheFileStat::New => EtagState::Unknown,
     };
 
-    let fwd_request = build_fwd_request(&req_uri, max_age, host, &cfstate, &volatile_etag);
+    // Check for a partial download file to resume (permanent files only).
+    // Opens the file upfront (if it exists and is non-empty) to get size + mtime
+    // from the same file descriptor, avoiding TOCTOU races between metadata() and open().
+    // The guard uses keep_on_drop: true so the partial file survives transient
+    // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
+    // Explicit guard.remove() is used only when a stale partial must be discarded
+    // (200 fallback from unsupported Range, 416, invalid Content-Range).
+    let mut resume_offset: u64 = 0;
+    let mut resume_expected_total: Option<u64> = None;
+    let mut resume_if_range: Option<String> = None;
+    let mut partial_file: Option<tokio::fs::File> = None;
+    let mut partial_file_guard = if conn_details.cached_flavor == CachedFlavor::Permanent
+        && matches!(cfstate, CacheFileStat::New)
+    {
+        let pp = utils::partial_path(
+            &global_config().cache_directory,
+            &conn_details.mirror,
+            &conn_details.debname,
+        );
+        match utils::open_partial_file(&pp, &ibarrier).await {
+            Ok((file, size, _mtime, guard)) if size > 0 => {
+                // Only attempt resume when the partial carries a strong upstream
+                // ETag.  RFC 9110 §8.8.2.2 requires a strong validator for If-Range
+                // and Last-Modified is only strong when the origin guarantees
+                // sub-second-unique change detection — Debian mirror infrastructure
+                // does not make that guarantee, and the stored total-size xattr is
+                // insufficient to detect a same-size replacement within the mtime
+                // granularity.  Discard the partial instead of risking silent
+                // concatenation of bytes from two different upstream revisions.
+                //
+                // `read_etag` rejects weak ETags, so any value returned here is a
+                // strong validator per RFC 9110 §8.8.3.
+                let upstream_identifier = read_etag(&file, &pp);
+                if let Some(if_range) = upstream_identifier {
+                    resume_offset = size;
+                    resume_expected_total = xattr_helpers::read_expected_size(&file, &pp);
+                    resume_if_range = Some(if_range);
+                    info!(
+                        "Found partial download ({} bytes) for {} from mirror {}, will attempt resume",
+                        resume_offset, conn_details.debname, conn_details.mirror
+                    );
+                    partial_file = Some(file);
+                    Some(guard)
+                } else {
+                    // No strong validator stored (no upstream ETag, filesystem
+                    // without xattr support, or only Last-Modified available) —
+                    // cannot validate resume safety, discard the partial.
+                    warn!(
+                        "Partial download for {} from mirror {} lacks a strong upstream ETag, discarding instead of resuming",
+                        conn_details.debname, conn_details.mirror
+                    );
+                    drop(file);
+                    guard.remove().await;
+                    Some(utils::TempPath::new(pp, true))
+                }
+            }
+            Ok((_file, _size, _mtime, guard)) => {
+                // Zero-byte partial — treat as no partial
+                Some(guard)
+            }
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    error!(
+                        "Failed to open partial file for {} from mirror {}:  {err}",
+                        conn_details.debname, conn_details.mirror
+                    );
+                }
+                // File doesn't exist or can't be opened — proceed without resume
+                Some(utils::TempPath::new(pp, true))
+            }
+        }
+    } else {
+        None
+    };
+
+    let fwd_request = build_fwd_request(
+        &req_uri,
+        max_age,
+        host,
+        &cfstate,
+        &volatile_etag,
+        resume_offset,
+        resume_if_range.as_deref(),
+    );
     trace!("Forwarded request: {fwd_request:?}");
 
     let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
@@ -2481,7 +2683,7 @@ async fn serve_new_file(
             warn!(
                 "Proxy request failed to mirror {}:  {}",
                 conn_details.mirror,
-                ErrorReport::new(&err)
+                ErrorReport(&err)
             );
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
         }
@@ -2505,8 +2707,15 @@ async fn serve_new_file(
         {
             req_uri = std::borrow::Cow::Owned(moved_uri);
 
-            let redirected_request =
-                build_fwd_request(&req_uri, max_age, host, &cfstate, &volatile_etag);
+            let redirected_request = build_fwd_request(
+                &req_uri,
+                max_age,
+                host,
+                &cfstate,
+                &volatile_etag,
+                resume_offset,
+                resume_if_range.as_deref(),
+            );
 
             trace!("Forwarded redirected request: {redirected_request:?}");
 
@@ -2516,7 +2725,7 @@ async fn serve_new_file(
                     Err(err) => {
                         warn!(
                             "Proxy redirected request to host {host:?} failed:  {}",
-                            ErrorReport::new(&err)
+                            ErrorReport(&err)
                         );
                         return quick_response(
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -2539,33 +2748,11 @@ async fn serve_new_file(
     if let CacheFileStat::Volatile {
         mut file,
         file_path,
-        local_creation_time,
         local_modification_time: _,
     } = cfstate
     {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
-            // Cache entries are replaced on update, not overridden, so the creation time is the time the file was last modified.
-            // The modified file timestamp is used to store the last up-to-date check against the upstream mirror, if creation timestamps are supported.
-            // Thus only update mtime if btime is supported.
-            if local_creation_time.is_some() {
-                // Refactor when https://github.com/tokio-rs/tokio/issues/6368 is resolved
-                file = {
-                    let std_file = file.into_std().await;
-                    let now = SystemTime::now();
-
-                    let result = tokio::task::block_in_place(|| std_file.set_modified(now));
-
-                    if let Err(err) = result {
-                        error!(
-                            "Failed to update modification time of file `{}`:  {}",
-                            file_path.display(),
-                            err
-                        );
-                    }
-
-                    tokio::fs::File::from_std(std_file)
-                };
-            }
+            file = touch_volatile_mtime(file, file_path).await;
 
             ibarrier.finished(file_path.to_path_buf()).await;
 
@@ -2587,60 +2774,280 @@ async fn serve_new_file(
         );
     }
 
-    if fwd_response.status() != StatusCode::OK {
-        let log_level = if fwd_response.status() == StatusCode::NOT_FOUND {
-            Level::Debug
-        } else {
-            Level::Warn
-        };
-
-        log!(
-            log_level,
-            "Request for file {} from mirror {} with URI `{req_uri}` failed with code `{}`, got response: {fwd_response:?}",
-            conn_details.debname,
-            conn_details.mirror,
-            fwd_response.status()
-        );
-
-        let (parts, body) = fwd_response.into_parts();
-
-        let body = ProxyCacheBody::Boxed(BoxBody::new(
-            body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
-        ));
-
-        let mut response = Response::from_parts(parts, body);
-        response
-            .headers_mut()
-            .append(VIA, HeaderValue::from_static(APP_VIA));
-
-        trace!("Outgoing response: {response:?}");
-
-        return response;
-    }
-
-    let content_length = match fwd_response.headers().get(CONTENT_LENGTH).and_then(|hv| {
-        hv.to_str()
-            .ok()
-            .and_then(|ct| ct.parse::<NonZero<u64>>().ok())
-    }) {
-        Some(size) => ContentLength::Exact(size),
-        None if conn_details.cached_flavor == CachedFlavor::Volatile => {
-            ContentLength::Unknown(VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER)
-        }
-        None => {
-            warn!(
-                "Could not extract content-length from header for file {} from mirror {}: {fwd_response:?}",
-                conn_details.debname, conn_details.mirror
-            );
-            return quick_response(
-                StatusCode::BAD_GATEWAY,
-                "Upstream resource has no content length",
-            );
+    // Helper: discard the stale partial file and re-create the guard so a fresh download
+    // can still be resumed if it fails mid-stream.
+    let discard_partial = |partial_file: &mut Option<tokio::fs::File>,
+                           partial_file_guard: &mut Option<utils::TempPath>,
+                           resume_offset: &mut u64,
+                           resume_expected_total: &mut Option<u64>,
+                           conn_details: &ConnectionDetails| {
+        *partial_file = None; // drop the held file handle before removing
+        let guard = partial_file_guard.take();
+        let cached_flavor = conn_details.cached_flavor;
+        let mirror = conn_details.mirror.clone();
+        let debname = conn_details.debname.clone();
+        *resume_offset = 0;
+        *resume_expected_total = None;
+        async move {
+            if let Some(guard) = guard {
+                guard.remove().await;
+            }
+            // Re-create the guard at the deterministic partial path so this fresh download
+            // can still be resumed if it fails mid-stream.
+            if cached_flavor == CachedFlavor::Permanent {
+                let pp = utils::partial_path(&global_config().cache_directory, &mirror, &debname);
+                Some(utils::TempPath::new(pp, true))
+            } else {
+                None
+            }
         }
     };
 
+    // Handle resume: if we sent Range and got 200 (server ignores Range) or 416
+    // (partial is stale), discard partial and start fresh.
+    let needs_retry = if resume_offset > 0 && fwd_response.status() == StatusCode::OK {
+        info!(
+            "Server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
+            conn_details.debname, conn_details.mirror
+        );
+        partial_file_guard = discard_partial(
+            &mut partial_file,
+            &mut partial_file_guard,
+            &mut resume_offset,
+            &mut resume_expected_total,
+            &conn_details,
+        )
+        .await;
+        false
+    } else if resume_offset > 0 && fwd_response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        warn!(
+            "Server returned 416 for resume of {} from mirror {} (partial {} bytes), discarding stale partial",
+            conn_details.debname, conn_details.mirror, resume_offset
+        );
+        partial_file_guard = discard_partial(
+            &mut partial_file,
+            &mut partial_file_guard,
+            &mut resume_offset,
+            &mut resume_expected_total,
+            &conn_details,
+        )
+        .await;
+        true
+    } else if resume_offset > 0 && fwd_response.status() == StatusCode::PARTIAL_CONTENT {
+        // Validate Content-Range before proceeding: if the server returned 206 but the
+        // Content-Range doesn't match our resume offset or the total size changed
+        // (e.g. file replaced upstream with a different size), discard the stale
+        // partial and retry fresh — same pattern as 416 handling.
+        // Only accept a 206 that delivers the full remainder (start == resume_offset
+        // AND end == total - 1). Otherwise `body_content_length` computed from
+        // `total - resume_offset` would not match the bytes on the wire and the
+        // writer would hang or truncate.
+        let content_range_valid = fwd_response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|hv| hv.to_str().ok())
+            .and_then(http_range::parse_content_range)
+            .is_some_and(|(start, end, total)| {
+                start == resume_offset
+                    && end.checked_add(1) == Some(total)
+                    && resume_expected_total.is_none_or(|expected| expected == total)
+            });
+
+        if content_range_valid {
+            false
+        } else {
+            warn!(
+                "Invalid or mismatched Content-Range in 206 for {} from mirror {}, discarding partial and retrying fresh",
+                conn_details.debname, conn_details.mirror
+            );
+            partial_file_guard = discard_partial(
+                &mut partial_file,
+                &mut partial_file_guard,
+                &mut resume_offset,
+                &mut resume_expected_total,
+                &conn_details,
+            )
+            .await;
+            true
+        }
+    } else {
+        false
+    };
+
+    if needs_retry {
+        // Deliberately pass CacheFileStat::New here rather than the original
+        // `cfstate` binding: at this point the partial file has been discarded
+        // (and any prior cached data is being superseded), so from the
+        // upstream's perspective this is a fresh unconditional fetch — no
+        // If-Modified-Since, no If-None-Match, no Range.
+        let retry_request = build_fwd_request(
+            &req_uri,
+            max_age,
+            host,
+            &CacheFileStat::New,
+            &volatile_etag,
+            0,
+            None,
+        );
+
+        fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(
+                    "Retry proxy request failed to mirror {}:  {}",
+                    conn_details.mirror,
+                    ErrorReport(&err)
+                );
+                return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+            }
+        };
+    }
+
+    // Parse total file size and body content length for resume vs fresh downloads
+    let (total_content_length, body_content_length) = if resume_offset > 0
+        && fwd_response.status() == StatusCode::PARTIAL_CONTENT
+    {
+        // Parse Content-Range header for 206 responses
+        let content_range = fwd_response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|hv| hv.to_str().ok())
+            .and_then(http_range::parse_content_range);
+
+        match content_range {
+            Some((start, end, total))
+                if start == resume_offset
+                    && end.checked_add(1) == Some(total)
+                    && resume_expected_total.is_none_or(|expected| expected == total) =>
+            {
+                let remaining = end - start + 1;
+                // Cross-check declared Content-Length (if present) matches the range span.
+                if let Some(cl) = fwd_response
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|hv| hv.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    && cl != remaining
+                {
+                    warn!(
+                        "Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}",
+                        conn_details.debname, conn_details.mirror
+                    );
+                    return quick_response(StatusCode::BAD_GATEWAY, "Inconsistent Content-Range");
+                }
+                let Some(total_nz) = NonZero::new(total) else {
+                    warn!(
+                        "Content-Range total is zero for {} from mirror {}",
+                        conn_details.debname, conn_details.mirror
+                    );
+                    return quick_response(StatusCode::BAD_GATEWAY, "Invalid Content-Range");
+                };
+                let Some(remaining_nz) = NonZero::new(remaining) else {
+                    // File is already complete — guard drops and cleans up partial
+                    info!(
+                        "Partial file is already complete for {} from mirror {}",
+                        conn_details.debname, conn_details.mirror
+                    );
+                    return quick_response(StatusCode::BAD_GATEWAY, "No remaining bytes");
+                };
+                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+                let remaining_percent = remaining as f32 / total as f32 * 100.0;
+                info!(
+                    "Resuming download of {} from mirror {} at byte {} ({} ({:.1}%) remaining of {} total)",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    resume_offset,
+                    remaining,
+                    remaining_percent,
+                    total
+                );
+                (
+                    ContentLength::Exact(total_nz),
+                    ContentLength::Exact(remaining_nz),
+                )
+            }
+            // Content-Range mismatch or missing: should be handled by the
+            // pre-check above (which discards partial and retries fresh).
+            // Defensive fallback in case of unexpected state.
+            _ => {
+                warn!(
+                    "Unexpected Content-Range state for 206 response of {} from mirror {}",
+                    conn_details.debname, conn_details.mirror
+                );
+                return quick_response(StatusCode::BAD_GATEWAY, "Unexpected Content-Range");
+            }
+        }
+    } else {
+        // Fresh download (including after fallback from failed resume)
+        resume_offset = 0;
+
+        if fwd_response.status() != StatusCode::OK {
+            let log_level = if fwd_response.status() == StatusCode::NOT_FOUND {
+                Level::Debug
+            } else {
+                Level::Warn
+            };
+
+            log!(
+                log_level,
+                "Request for file {} from mirror {} with URI `{req_uri}` failed with code `{}`, got response: {fwd_response:?}",
+                conn_details.debname,
+                conn_details.mirror,
+                fwd_response.status()
+            );
+
+            let (parts, body) = fwd_response.into_parts();
+
+            let body = ProxyCacheBody::Boxed(BoxBody::new(
+                body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
+            ));
+
+            let mut response = Response::from_parts(parts, body);
+            response
+                .headers_mut()
+                .append(VIA, HeaderValue::from_static(APP_VIA));
+
+            trace!("Outgoing response: {response:?}");
+
+            return response;
+        }
+
+        let cl = match fwd_response.headers().get(CONTENT_LENGTH).and_then(|hv| {
+            hv.to_str()
+                .ok()
+                .and_then(|ct| ct.parse::<NonZero<u64>>().ok())
+        }) {
+            Some(size) => ContentLength::Exact(size),
+            None if conn_details.cached_flavor == CachedFlavor::Volatile => {
+                ContentLength::Unknown(VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER)
+            }
+            None => {
+                warn!(
+                    "Could not extract content-length from header for file {} from mirror {}: {fwd_response:?}",
+                    conn_details.debname, conn_details.mirror
+                );
+                return quick_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream resource has no content length",
+                );
+            }
+        };
+        (cl, cl)
+    };
+    // mark immutable
+    let resume_offset = resume_offset;
+
+    debug_assert!(
+        match (total_content_length, body_content_length) {
+            (ContentLength::Exact(total), ContentLength::Exact(body)) =>
+                resume_offset + body.get() == total.get(),
+            _ => true,
+        },
+        "resume_offset ({resume_offset}) + body ({body_content_length}) must equal total ({total_content_length})"
+    );
+
     let reservation = match global_cache_quota().try_acquire(
-        content_length,
+        total_content_length,
         prev_file_size,
         &conn_details.debname,
     ) {
@@ -2668,6 +3075,35 @@ async fn serve_new_file(
         })
         .map(String::from);
 
+    let upstream_last_modified: Option<String> = fwd_response
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|hv| hv.to_str().ok())
+        .filter(|lm| {
+            if http_datetime_to_systemtime(lm).is_some() {
+                true
+            } else {
+                warn_once_or_info!(
+                    "Upstream mirror {} sent invalid Last-Modified for {}: {lm}",
+                    conn_details.mirror,
+                    conn_details.debname
+                );
+                false
+            }
+        })
+        .map(String::from);
+
+    let upstream_content_type: Option<&str> = fwd_response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|hv| hv.to_str().ok());
+    if let Some(ct) = upstream_content_type {
+        let expected = content_type_for_cached_file(&conn_details.debname);
+        if ct != expected {
+            warn_once_or_info!("Content-Type mismatch: expected {expected}, got {ct}");
+        }
+    }
+
     let (_parts, body) = fwd_response.into_parts();
 
     let filename = Path::new(&conn_details.debname);
@@ -2675,44 +3111,92 @@ async fn serve_new_file(
         filename.is_relative(),
         "path construction must not contain absolute components"
     );
-    let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
-        .iter()
-        .collect();
 
-    let (outfile, outpath) = match tokio_tempfile(&tmppath, 0o640).await {
-        Ok((f, p)) => (f, p),
-        Err(err) => {
-            error!(
-                "Error creating temporary file `{}`:  {err}",
-                tmppath.display()
-            );
-            // `reservation` is dropped here, auto-reverting cache_size
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+    // Create/open the output file: partial path for permanent files, random temp for volatile.
+    // Defuse the guard once we take ownership of the partial path — from here on, the
+    // download's own TempPath (keep_on_drop: true) manages the file lifetime.
+    let (outfile, outpath) = if resume_offset > 0 {
+        // Resume: use the file already opened during the partial-file check.
+        // The file handle has been held open since the check, so no TOCTOU race.
+        let mut file = partial_file
+            .take()
+            .expect("partial_file set when resume_offset > 0");
+        let guard = partial_file_guard
+            .take()
+            .expect("partial_file_guard set when resume_offset > 0");
+        // Verify the file size matches expectations (should always hold since
+        // we've held the fd open, but check as defense-in-depth).
+        {
+            use tokio::io::AsyncSeekExt as _;
+            let current_size = file.seek(std::io::SeekFrom::End(0)).await.unwrap_or(0);
+            if current_size != resume_offset {
+                error!(
+                    "Partial file size {current_size} != expected {resume_offset} despite held fd, aborting resume"
+                );
+                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            }
+        }
+        (file, guard)
+    } else if let Some(guard) = partial_file_guard.take() {
+        // Fresh permanent download: create at deterministic partial path
+        let pp = guard.into_inner();
+        match utils::create_partial_file(&pp, 0o640).await {
+            Ok((f, p)) => (f, p),
+            Err(err) => {
+                error!("Error creating partial file `{}`:  {err}", pp.display());
+                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            }
+        }
+    } else {
+        // Volatile file: random temp file
+        let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
+            .iter()
+            .collect();
+        match tokio_tempfile(&tmppath, 0o640).await {
+            Ok((f, p)) => (f, p),
+            Err(err) => {
+                error!(
+                    "Error creating temporary file `{}`:  {err}",
+                    tmppath.display()
+                );
+                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            }
         }
     };
 
-    info!(
-        "Downloading and serving new file {} from mirror {} for client {}...",
-        conn_details.debname, conn_details.mirror, conn_details.client
-    );
+    if resume_offset > 0 {
+        info!(
+            "Resuming and serving file {} from mirror {} for client {} at byte {}...",
+            conn_details.debname, conn_details.mirror, conn_details.client, resume_offset
+        );
+    } else {
+        info!(
+            "Downloading and serving new file {} from mirror {} for client {}...",
+            conn_details.debname, conn_details.mirror, conn_details.client
+        );
+    }
 
     let dbarrier = ibarrier
-        .download(outpath.to_path_buf(), content_length, reservation)
+        .download(outpath.to_path_buf(), total_content_length, reservation)
         .await;
 
     let cd = conn_details.clone();
     let db_tx = appstate.database_tx.clone();
     let curr_downloads = appstate.active_downloads.download_count();
     let download_etag = upstream_etag.clone();
+    let download_last_modified = upstream_last_modified.clone();
     tokio::task::spawn(async move {
         download_file(
             db_tx,
             &cd,
             warn_on_override,
-            (body, content_length),
+            (body, body_content_length),
             (outfile, outpath),
             dbarrier,
             download_etag,
+            download_last_modified,
+            resume_offset,
+            total_content_length,
         )
         .await;
     });
@@ -2726,7 +3210,7 @@ async fn serve_new_file(
             .is_none_or(|max_parallel| curr_downloads <= max_parallel.get())
         && config
             .experimental_parallel_hack_minsize
-            .is_none_or(|size| content_length.upper() > size)
+            .is_none_or(|size| total_content_length.upper() > size)
     {
         #[expect(clippy::cast_precision_loss, reason = "generate probability value")]
         let p = (curr_downloads.saturating_sub(1) as f64)
@@ -3032,7 +3516,7 @@ fn connect_response(
             Err(err) => {
                 error!(
                     "Error upgrading connection for client {client} to {host}:{port}:  {}",
-                    ErrorReport::new(&err)
+                    ErrorReport(&err)
                 );
             }
         }
@@ -3253,7 +3737,7 @@ async fn pre_process_client_request(
                 validate!(filename, ValidateKind::Filename);
 
                 // TODO: cache .dsc?
-                let is_deb = filename.ends_with(".deb");
+                let is_deb = deb_mirror::is_deb_package(&filename);
 
                 if is_deb {
                     trace!("Decoded mirror path: `{mirror_path}`; Decoded filename: `{filename}`");
@@ -3433,57 +3917,31 @@ async fn pre_process_client_request(
 
     assert_eq!(req.method(), Method::GET, "Filtered at function start");
 
-    /*
-     * Simple proxy (without any caching)
-     *
-     * http://deb.debian.org/debian-debug/dists/sid-debug/main/binary-i386/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz
-     * http://deb.debian.org/debian/dists/unstable/main/i18n/Translation-en.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz
-     * http://deb.debian.org/debian/dists/sid/main/source/Sources.diff/T-2024-10-03-1409.04-F-2024-10-03-1409.04.gz
-     */
-    #[expect(
-        clippy::items_after_statements,
-        reason = "keep definition close to single use"
-    )]
-    fn ignore_uncached_path(uri_path: &str) -> bool {
-        uri_path.contains("/Packages.diff/T-")
-            || uri_path.contains("/Translation-en.diff/T-")
-            || uri_path.contains("/Sources.diff/T-")
+    if global_config().reject_pdiff_requests && is_diff_request_path(requested_path) {
+        info!("Rejecting diff request {requested_path} for client {client}");
+
+        return quick_response(StatusCode::GONE, "Diff requests are not supported");
     }
 
-    if ignore_uncached_path(requested_path) {
-        info!(
-            "Proxying (without caching) request {} for client {client}",
-            req.uri()
-        );
-    } else {
+    //
+    // Simple proxy (without any caching)
+    //
+
+    // Reject paths with traversal sequences, control characters, or invalid encoding.
+    if deb_mirror::is_unsafe_proxy_path(requested_path) {
         warn_once_or_info!(
-            "Proxying (without caching) request {} for client {client}",
+            "Rejecting unsafe unrecognized path {} for client {client}",
             req.uri()
         );
-
-        let mut uncacheables = UNCACHEABLES.get().expect("Initialized in main()").write();
-
-        // always delete to keep recent entries fresh
-        if let Some((idx, (_h, _p))) = uncacheables
-            .iter()
-            .enumerate()
-            .find(|(_idx, (h, p))| *h == requested_host && *p == requested_path)
-        {
-            let entry = uncacheables.remove(idx).expect("entry exists");
-            debug_assert_eq!(
-                entry.0, requested_host,
-                "requested_host was used as lookup key"
-            );
-            debug_assert_eq!(
-                entry.1, requested_path,
-                "requested_path was used as lookup key"
-            );
-
-            uncacheables.push(entry);
-        } else {
-            uncacheables.push((requested_host.clone(), requested_path.to_owned()));
-        }
+        return quick_response(StatusCode::BAD_REQUEST, "Unsupported request");
     }
+
+    warn_once_or_info!(
+        "Proxying (without caching) request {} for client {client}",
+        req.uri()
+    );
+
+    record_uncacheable(&requested_host, requested_path);
 
     let (mut parts, _body) = req.into_parts();
     parts
@@ -3502,7 +3960,7 @@ async fn pre_process_client_request(
         Err(err) => {
             warn!(
                 "Proxy request to host {requested_host} failed for client {client}:  {}",
-                ErrorReport::new(&err)
+                ErrorReport(&err)
             );
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
         }
@@ -3564,7 +4022,7 @@ async fn pre_process_client_request(
                 Err(err) => {
                     warn!(
                         "Redirected proxy request to host {requested_host} failed for client {client}:  {}",
-                        ErrorReport::new(&err)
+                        ErrorReport(&err)
                     );
                     return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
                 }
@@ -3867,7 +4325,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                             Err(err) => {
                                 // request_with_retry() has already logged the error
-                                debug!("Failed to query host {authority} to initialize scheme cache:  {}", ErrorReport::new(&err));
+                                debug!("Failed to query host {authority} to initialize scheme cache:  {}", ErrorReport(&err));
                             }
                         }
                     }
@@ -4123,19 +4581,16 @@ where
         } else if is_shutdown_disconnect(&err) {
             info!(
                 "Improper connection shutdown for client {client}:  {}",
-                ErrorReport::new(&err)
+                ErrorReport(&err)
             );
         } else if is_broken_pipe(&err) {
-            info!(
-                "Broken pipe for client {client}:  {}",
-                ErrorReport::new(&err)
-            );
+            info!("Broken pipe for client {client}:  {}", ErrorReport(&err));
         } else if let Some(perr) = is_timeout(&err) {
             info!("{perr}");
         } else {
             error!(
                 "Error serving connection for client {client}:  {}",
-                ErrorReport::new(&err)
+                ErrorReport(&err)
             );
         }
     }
@@ -4176,8 +4631,6 @@ struct RuntimeDetails {
 
 static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
 static LOGSTORE: OnceLock<LogStore> = OnceLock::new();
-static UNCACHEABLES: OnceLock<parking_lot::RwLock<RingBuffer<(DomainName, String)>>> =
-    OnceLock::new();
 
 #[must_use]
 #[inline]
@@ -4237,10 +4690,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     LOGSTORE
         .set(LogStore::new(config.logstore_capacity))
-        .expect("Initial set in main() should succeed");
-
-    UNCACHEABLES
-        .set(parking_lot::RwLock::new(RingBuffer::new(nonzero!(20))))
         .expect("Initial set in main() should succeed");
 
     SCHEME_CACHE

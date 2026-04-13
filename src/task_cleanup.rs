@@ -21,8 +21,8 @@ use crate::{
     AppState, CachedFlavor, ClientInfo, ConnectionDetails, ProxyCacheBody, ProxyCacheError,
     RETENTION_TIME,
     database::{MirrorEntry, OriginEntry},
-    deb_mirror::{Mirror, UriFormat as _},
-    global_config,
+    deb_mirror::{Mirror, UriFormat as _, mirror_cache_path_impl},
+    global_cache_quota, global_config,
     humanfmt::HumanFmt,
     info_once, process_cache_request, task_cache_scan,
 };
@@ -266,6 +266,8 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
 
+    cleanup_stale_partials(&global_config().cache_directory, &mirrors).await;
+
     // Create a stream of futures for both deb files and byhash files cleanup
     let cleanup_tasks = mirrors.into_iter().flat_map(|mirror| {
         [
@@ -316,7 +318,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     if let Ok(actual_cache_size) = task_cache_scan(&appstate.database).await {
         let active_downloading_size = appstate.active_downloads.download_size();
 
-        let quota = crate::global_cache_quota();
+        let quota = global_cache_quota();
         let (csize, difference) =
             quota.subtract_and_reconcile(bytes_removed, actual_cache_size, active_downloading_size);
 
@@ -700,4 +702,96 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
         files_removed,
         bytes_removed,
     })
+}
+
+/// Remove stale `.partial` files that are older than 3 days.
+///
+/// Partial files live under `{cache_dir}/{mirror_dir}/tmp/*.partial`.
+/// Iterates known mirror directories directly instead of walking the entire cache tree.
+async fn cleanup_stale_partials(cache_dir: &Path, mirrors: &[MirrorEntry]) {
+    const MAX_AGE: Duration = Duration::from_hours(3 * 24);
+
+    let cutoff = SystemTime::now() - MAX_AGE;
+    let mut removed = 0u64;
+
+    for mirror in mirrors {
+        let mirror_dir = mirror_cache_path_impl(&mirror.host, mirror.port(), &mirror.path);
+        let tmp_dir: PathBuf = [cache_dir, mirror_dir.as_path(), Path::new("tmp")]
+            .iter()
+            .collect();
+        removed += cleanup_partials_in_dir(&tmp_dir, &cutoff).await;
+    }
+
+    if removed > 0 {
+        info!("Removed {removed} stale partial file(s)");
+    }
+}
+
+/// Remove stale `.partial` files from a single `tmp/` directory.
+async fn cleanup_partials_in_dir(tmp_dir: &Path, cutoff: &SystemTime) -> u64 {
+    let mut entries = match tokio::fs::read_dir(tmp_dir).await {
+        Ok(e) => e,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return 0;
+        }
+        Err(err) => {
+            error!(
+                "Failed to read partial directory `{}`:  {err}",
+                tmp_dir.display()
+            );
+            return 0;
+        }
+    };
+
+    let mut removed = 0u64;
+
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(err) => {
+                error!(
+                    "Failed to iterate partial directory `{}`:  {err}",
+                    tmp_dir.display()
+                );
+                break;
+            }
+        };
+
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            error!("Failed to decode name of partial file `{}`", name.display());
+            continue;
+        };
+        if !name_str.ends_with(".partial") {
+            info!("Skipping non-partial file `{name_str}`");
+            continue;
+        }
+
+        let md = match entry.metadata().await {
+            Ok(m) => m,
+            Err(err) => {
+                error!("Failed to stat partial file `{name_str}`:  {err}");
+                continue;
+            }
+        };
+
+        // Delete zero-byte partials unconditionally (no useful data to resume from)
+        // and non-zero partials that are older than the cutoff.
+        let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if md.len() == 0 || mtime < *cutoff {
+            let path = entry.path();
+            if let Err(err) = tokio::fs::remove_file(&path).await {
+                error!(
+                    "Failed to remove stale partial file `{}`:  {err}",
+                    path.display()
+                );
+            } else {
+                debug!("Removed stale partial file `{}`", path.display());
+                removed += 1;
+            }
+        }
+    }
+
+    removed
 }

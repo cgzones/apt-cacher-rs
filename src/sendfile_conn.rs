@@ -1,35 +1,44 @@
-use std::fmt::Display;
 use std::io::ErrorKind;
 use std::num::NonZero;
-use std::os::fd::{AsRawFd as _, BorrowedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
 
 use bytes::BytesMut;
 use bytes::buf::Buf as _;
-use coarsetime::{Duration, Instant};
+use coarsetime::Instant;
 use http::StatusCode;
-use httparse::Request;
-use log::{debug, error, info, trace};
+use http::header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE};
+use log::{debug, error, info, trace, warn};
 use nix::sys::sendfile::sendfile;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
-use crate::database_task::{DatabaseCommand, DbCmdDelivery};
-use crate::deb_mirror::{Mirror, ResourceFile, parse_request_path};
-use crate::deb_mirror::{valid_filename, valid_mirrorname};
+use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin};
+use crate::deb_mirror::{
+    Mirror, Origin, ResourceFile, is_deb_package, is_unsafe_proxy_path, parse_request_path,
+    valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
+};
+use crate::error::{ErrorReport, errno_to_io_error};
 use crate::http_etag::{if_none_match, read_etag};
+use crate::http_helpers::{
+    ConnectionAction, ConnectionVersion, ResponseHeaders, find_header, find_header_end,
+    write_304_response, write_416_response, write_invalid_response, write_response_headers,
+};
+use crate::http_last_modified::read_last_modified;
 use crate::http_range::{
-    format_http_date, http_datetime_to_systemtime, http_parse_range, systemtime_to_http_datetime,
+    ParsedRange, cache_file_timestamp, compute_age, http_datetime_to_systemtime, http_parse_range,
+    systemtime_to_http_datetime,
 };
 use crate::humanfmt::HumanFmt;
-use crate::rate_checked_body::RateChecker;
+use crate::rate_checked_body::{InsufficientRate, RateChecker};
+use crate::tcp_cork_guard::CorkGuard;
 use crate::{
-    APP_NAME, APP_VIA, AppState, CachedFlavor, ClientInfo, ConnectionDetails, Never,
-    authorize_cache_access, client_counter, global_config, handle_hyper_connection, static_assert,
-    warn_once_or_info,
+    ActiveDownloadStatus, AppState, CachedFlavor, ClientInfo, ConnectionDetails, ContentLength,
+    Never, VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter,
+    content_type_for_cached_file, global_config, handle_hyper_connection, is_diff_request_path,
+    static_assert, warn_once_or_debug, warn_once_or_info,
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -39,93 +48,34 @@ const INITIAL_HEADER_SIZE: usize = 2048;
 /// Maximum number of HTTP headers to parse (matches hyper's default of 100).
 const MAX_HEADERS: usize = 100;
 
-/// RAII guard that sets `TCP_CORK` on creation and clears it on drop.
-/// While corked, the kernel buffers small writes to coalesce them into
-/// full MSS-sized TCP segments (e.g. headers + sendfile body).
-pub(crate) struct CorkGuard<'a>(&'a TcpStream);
-
-fn set_tcp_cork(stream: &TcpStream, cork: bool) -> std::io::Result<()> {
-    let val: nix::libc::c_int = cork.into();
-    // SAFETY: stream.as_raw_fd() is a valid socket fd; val is a stack-local c_int.
-    let ret = unsafe {
-        nix::libc::setsockopt(
-            stream.as_raw_fd(),
-            nix::libc::IPPROTO_TCP,
-            nix::libc::TCP_CORK,
-            std::ptr::from_ref::<nix::libc::c_int>(&val).cast(),
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "size_of c_int (4) always fits in socklen_t (u32)"
-            )]
-            {
-                std::mem::size_of_val(&val) as nix::libc::socklen_t
-            },
-        )
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-impl<'a> CorkGuard<'a> {
-    pub(crate) fn new(stream: &'a TcpStream) -> std::io::Result<Self> {
-        set_tcp_cork(stream, true)?;
-        Ok(Self(stream))
-    }
-}
-
-impl Drop for CorkGuard<'_> {
-    fn drop(&mut self) {
-        if let Err(err) = set_tcp_cork(self.0, false) {
-            debug!("Failed to uncork TCP socket:  {err}");
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-enum ConnectionAction {
-    Close,
-    KeepAlive,
-}
-
-impl Display for ConnectionAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Close => "close",
-            Self::KeepAlive => "keep-alive",
-        })
-    }
-}
-
-#[derive(Copy, Clone)]
-enum ConnectionVersion {
-    Http10,
-    Http11,
-}
-
-impl Display for ConnectionVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Http10 => "HTTP/1.0",
-            Self::Http11 => "HTTP/1.1",
-        })
-    }
-}
-
-enum SendfileResult {
+/// Represents the result of a sendfile operation.
+pub(crate) enum SendfileResult {
     /// Request was served via sendfile
     Served(ConnectionAction),
+
     /// Request is not applicable for sendfile, fall back to hyper
     NotApplicable(&'static str),
-    /// Request is invalid, reject
+
+    /// Request is invalid, reject and close the connection
     Invalid {
         status: http::StatusCode,
         msg: &'static str,
     },
-    /// An error occurred, close the connection; due to the error the client cannot be informed
-    Error,
+
+    /// Request should be rejected, but the connection might be kept alive
+    Rejection {
+        status: http::StatusCode,
+        conn_action: ConnectionAction,
+        msg: &'static str,
+    },
+
+    /// Sending a message to the client failed.
+    /// Close the connection without any further action.
+    ClientError,
+
+    /// An error occurred after successfully sending the http header.
+    /// Close the connection without any further action.
+    AfterHeaderError,
 }
 
 /// Handle a client connection using sendfile(2) for cached file delivery.
@@ -146,10 +96,10 @@ pub(crate) async fn handle_sendfile_connection(
     let mut conn_version = ConnectionVersion::Http11; // assume more recent version 1.1 if not yet parsed from any request
 
     loop {
-        // Try to peek and parse the next request to determine if sendfile is applicable
+        // Try to peek and find the next request headers to determine if sendfile is applicable
         let next_header_index = match read_request_headers(&stream, &mut buf).await {
             Ok(None) if req_num == 0 => {
-                info!("Connection from client {client} closed before receiving request");
+                info!("Connection from client {client} closed before receiving any request");
                 return;
             }
             Ok(None) => {
@@ -171,14 +121,16 @@ pub(crate) async fn handle_sendfile_connection(
             }
             Err(err) => {
                 warn_once_or_info!(
-                    "Failed to read request number {} from client {client}:  {err}",
-                    req_num + 1
+                    "Failed to read request number {} from client {client}:  {}",
+                    req_num + 1,
+                    ErrorReport(&err),
                 );
                 let _ignore = write_invalid_response(
                     &stream,
                     conn_version,
+                    ConnectionAction::Close,
                     StatusCode::BAD_REQUEST,
-                    "Error reading request",
+                    "Error reading request headers",
                 )
                 .await;
                 return;
@@ -212,24 +164,46 @@ pub(crate) async fn handle_sendfile_connection(
                     buf.len()
                 );
 
-                let stream = if buf.is_empty() {
-                    MaybePrependedStream::Raw(stream)
-                } else {
-                    MaybePrependedStream::Prepended {
-                        prepend: buf,
-                        stream,
-                    }
-                };
+                let stream = MaybePrependedStream::new(buf, stream);
 
                 return handle_hyper_connection(stream, client, appstate).await;
             }
             SendfileResult::Invalid { status, msg } => {
-                if let Err(err) = write_invalid_response(&stream, conn_version, status, msg).await {
+                if let Err(err) = write_invalid_response(
+                    &stream,
+                    conn_version,
+                    ConnectionAction::Close,
+                    status,
+                    msg,
+                )
+                .await
+                {
                     info!("Failed to write error response to client {client}:  {err}");
                 }
+
                 return;
             }
-            SendfileResult::Error => {
+            SendfileResult::Rejection {
+                status,
+                conn_action,
+                msg,
+            } => {
+                if let Err(err) =
+                    write_invalid_response(&stream, conn_version, conn_action, status, msg).await
+                {
+                    info!("Failed to write rejection response to client {client}:  {err}");
+                    return;
+                }
+
+                match conn_action {
+                    ConnectionAction::KeepAlive => {
+                        buf.advance(next_header_index);
+                        continue;
+                    }
+                    ConnectionAction::Close => return,
+                }
+            }
+            SendfileResult::AfterHeaderError | SendfileResult::ClientError => {
                 // Error occurred, should have been already logged.
                 // The connection should be closed
                 return;
@@ -238,9 +212,64 @@ pub(crate) async fn handle_sendfile_connection(
     }
 }
 
+/// Read HTTP request headers from the stream into the buffer.
+/// Returns when a complete set of headers has been received (terminated by \r\n\r\n) or there is no more data to read.
+async fn read_request_headers(
+    stream: &TcpStream,
+    buf: &mut BytesMut,
+) -> std::io::Result<Option<usize>> {
+    async fn inner(stream: &TcpStream, buf: &mut BytesMut) -> std::io::Result<Option<usize>> {
+        // Check if we already have the complete headers from the previous read
+        if let Some(next_index) = find_header_end(buf) {
+            return Ok(Some(next_index));
+        }
+
+        loop {
+            stream.readable().await?;
+
+            let _: Never = match stream.try_read_buf(buf) {
+                Ok(0) => return Ok(None),
+                Ok(n) => {
+                    // Check if we have the complete headers
+                    if let Some(next_index) = find_header_end(buf) {
+                        trace!("Read {n} bytes from client, found header end at {next_index}");
+                        return Ok(Some(next_index));
+                    }
+                    if buf.len() > MAX_HEADER_SIZE {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            "request headers too large",
+                        ));
+                    }
+                    trace!("Read {n} bytes from client, did not find header end");
+                    continue;
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+        }
+    }
+
+    match tokio::time::timeout(global_config().http_timeout, inner(stream, buf)).await {
+        Ok(Ok(next_index)) => Ok(next_index),
+        Ok(Err(err)) => Err(err),
+        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "reading TCP stream request headers timed out",
+        )),
+    }
+}
+
 /// Compute the connection action based on the request headers.
+#[must_use]
 fn compute_conn_action(
-    req: &Request<'_, '_>,
+    req: &httparse::Request<'_, '_>,
     version: ConnectionVersion,
     client: &ClientInfo,
 ) -> ConnectionAction {
@@ -259,7 +288,7 @@ fn compute_conn_action(
         return ConnectionAction::Close;
     }
 
-    if let Some(hvalue) = find_header(req.headers, "connection") {
+    if let Some(hvalue) = find_header(req.headers, &CONNECTION) {
         for p in hvalue.split(',') {
             let p = p.trim();
 
@@ -269,6 +298,10 @@ fn compute_conn_action(
             if p.eq_ignore_ascii_case("keep-alive") {
                 return ConnectionAction::KeepAlive;
             }
+
+            warn_once_or_debug!(
+                "Ignoring unrecognized Connection header value `{p}` from client {client}"
+            );
         }
     }
 
@@ -277,6 +310,50 @@ fn compute_conn_action(
         ConnectionVersion::Http10 => ConnectionAction::Close,
         ConnectionVersion::Http11 => ConnectionAction::KeepAlive,
     }
+}
+
+/// URL-decode and validate a single field. On failure returns the
+/// `SendfileResult::Invalid` the caller should propagate.
+fn decode_and_validate_field<'a>(
+    raw: &'a str,
+    validator: fn(&str) -> bool,
+    field_name: &str,
+    client: &ClientInfo,
+) -> Result<std::borrow::Cow<'a, str>, SendfileResult> {
+    match urlencoding::decode(raw) {
+        Ok(s) if validator(&s) => Ok(s),
+        Ok(s) => {
+            warn_once_or_info!("Unsupported {field_name} `{s}` from client {client}");
+            Err(SendfileResult::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                msg: "Unsupported request",
+            })
+        }
+        Err(err) => {
+            warn_once_or_info!(
+                "Failed to decode {field_name} `{}` from client {client}:  {err}",
+                raw.escape_debug()
+            );
+            Err(SendfileResult::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                msg: "Unsupported URL encoding",
+            })
+        }
+    }
+}
+
+/// URL-decode a field and validate it, returning early from the caller on failure.
+///
+/// Thin wrapper over [`decode_and_validate_field`] that performs the early
+/// return; the underlying helper is exposed so it can be unit-tested and
+/// used from contexts that cannot early-return `SendfileResult`.
+macro_rules! decode_and_validate {
+    ($raw:expr, $validator:expr, $field_name:expr, $client:expr) => {{
+        match decode_and_validate_field($raw, $validator, $field_name, $client) {
+            Ok(s) => s,
+            Err(e) => return e,
+        }
+    }};
 }
 
 /// Try to serve a request using sendfile(2).
@@ -338,6 +415,8 @@ async fn try_sendfile_request(
     }
     let req = req; // mark immutable
 
+    trace!("Parsed client request:\n{req:?}");
+
     // Only handle GET requests via sendfile
     match req.method.expect("complete header parsed") {
         "GET" => {}
@@ -384,9 +463,7 @@ async fn try_sendfile_request(
     let Some(authority) = uri.authority() else {
         // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
         // HTTP/1.1 request that lacks a Host header field.
-        if matches!(*conn_version, ConnectionVersion::Http11)
-            && find_header(req.headers, "host").is_none()
-        {
+        if *conn_version == ConnectionVersion::Http11 && find_header(req.headers, &HOST).is_none() {
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Missing Host header",
@@ -414,65 +491,179 @@ async fn try_sendfile_request(
         None => None,
     };
 
-    // Only handle permanently cached pool files (e.g., .deb files) via sendfile
-    let Some(ResourceFile::Pool {
-        mirror_path,
-        filename,
-    }) = parse_request_path(uri.path())
-    else {
-        return SendfileResult::NotApplicable("no pool resource");
+    let conn_action = compute_conn_action(&req, *conn_version, &client);
+
+    // Match all cacheable resource types for sendfile/splice serving
+    let uri_path = uri.path();
+    let Some(resource) = parse_request_path(uri_path) else {
+        if global_config().reject_pdiff_requests && is_diff_request_path(uri_path) {
+            info!("Rejecting diff request {uri_path} for client {client}");
+
+            return SendfileResult::Rejection {
+                status: StatusCode::GONE,
+                conn_action,
+                msg: "Diff requests are not supported",
+            };
+        }
+
+        warn_once_or_debug!("Unrecognized resource path from client {client}: {uri_path}");
+
+        // Reject paths with traversal sequences, control characters, or invalid encoding.
+        if is_unsafe_proxy_path(uri_path) {
+            warn_once_or_info!(
+                "Rejecting unsafe unrecognized path from client {client}: {uri_path}"
+            );
+            return SendfileResult::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                msg: "Unsupported request",
+            };
+        }
+
+        return SendfileResult::NotApplicable("unrecognized resource path");
     };
 
-    // Validate mirror path and filename
-    let mirror_path = match urlencoding::decode(mirror_path) {
-        Ok(s) if valid_mirrorname(&s) => s,
-        Ok(s) => {
-            warn_once_or_info!("Unsupported mirror path `{s}` from client {client}");
-            return SendfileResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported request",
-            };
-        }
-        Err(err) => {
-            warn_once_or_info!(
-                "Failed to decode mirror path `{}` from client {client}:  {err}",
-                mirror_path.escape_debug()
-            );
-            return SendfileResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported URL encoding",
-            };
-        }
-    };
-    let filename = match urlencoding::decode(filename) {
-        Ok(s) if valid_filename(&s) => s,
-        Ok(s) => {
-            warn_once_or_info!("Unsupported filename `{s}` from client {client}");
-            return SendfileResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported request",
-            };
-        }
-        Err(err) => {
-            warn_once_or_info!(
-                "Failed to decode filename `{}` from client {client}:  {err}",
-                filename.escape_debug()
-            );
-            return SendfileResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported URL encoding",
-            };
-        }
-    };
-    if !filename.ends_with(".deb") {
-        return SendfileResult::NotApplicable("filename does not end with .deb");
+    // Per-resource origin fields for Packages (to record after ConnectionDetails is built)
+    struct PackagesOriginFields {
+        distribution: String,
+        component: String,
+        architecture: String,
     }
+
+    // Decode, validate, and build per-resource debname / cached_flavor / subdir.
+    let (debname, cached_flavor, subdir, mirror_path, origin_fields) = match resource {
+        ResourceFile::Pool {
+            mirror_path,
+            filename,
+        } => {
+            let mirror_path =
+                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
+            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
+            if !is_deb_package(&filename) {
+                return SendfileResult::NotApplicable("non Debian binary package pool file");
+            }
+
+            (
+                filename.into_owned(),
+                CachedFlavor::Permanent,
+                None,
+                mirror_path,
+                None,
+            )
+        }
+        ResourceFile::Release {
+            mirror_path,
+            distribution,
+            filename,
+        } => {
+            let mirror_path =
+                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
+            let distribution =
+                decode_and_validate!(distribution, valid_distribution, "distribution", &client);
+            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
+
+            (
+                format!("{distribution}_{filename}"),
+                CachedFlavor::Volatile,
+                Some(Path::new("dists")),
+                mirror_path,
+                None,
+            )
+        }
+        ResourceFile::ByHash {
+            mirror_path,
+            filename,
+        } => {
+            let mirror_path =
+                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
+            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
+
+            (
+                filename.into_owned(),
+                CachedFlavor::Permanent,
+                Some(Path::new("dists/by-hash")),
+                mirror_path,
+                None,
+            )
+        }
+        ResourceFile::Icon {
+            mirror_path,
+            distribution,
+            component,
+            filename,
+        }
+        | ResourceFile::Sources {
+            mirror_path,
+            distribution,
+            component,
+            filename,
+        }
+        | ResourceFile::Translation {
+            mirror_path,
+            distribution,
+            component,
+            filename,
+        } => {
+            let mirror_path =
+                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
+            let distribution =
+                decode_and_validate!(distribution, valid_distribution, "distribution", &client);
+            let component = decode_and_validate!(component, valid_component, "component", &client);
+            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
+
+            (
+                format!("{distribution}_{component}_{filename}"),
+                CachedFlavor::Volatile,
+                Some(Path::new("dists")),
+                mirror_path,
+                None,
+            )
+        }
+        ResourceFile::Packages {
+            mirror_path,
+            distribution,
+            component,
+            architecture,
+            filename,
+        } => {
+            let mirror_path =
+                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
+            let distribution =
+                decode_and_validate!(distribution, valid_distribution, "distribution", &client);
+            let component = decode_and_validate!(component, valid_component, "component", &client);
+            let architecture =
+                decode_and_validate!(architecture, valid_architecture, "architecture", &client);
+            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
+
+            let debname = format!("{distribution}_{component}_{architecture}_{filename}");
+            let origin = match architecture.as_ref() {
+                "dep11" | "i18n" | "source" => None,
+                _ => Some(PackagesOriginFields {
+                    distribution: distribution.into_owned(),
+                    component: component.into_owned(),
+                    architecture: architecture.into_owned(),
+                }),
+            };
+
+            (
+                debname,
+                CachedFlavor::Volatile,
+                Some(Path::new("dists")),
+                mirror_path,
+                origin,
+            )
+        }
+    };
 
     let aliased_host = global_config()
         .aliases
         .iter()
         .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())
         .map(|alias| &alias.main);
+
+    let aliased = match aliased_host {
+        Some(alias) => format!(" aliased to host {alias}"),
+        None => String::new(),
+    };
 
     let conn_details = ConnectionDetails {
         client,
@@ -482,15 +673,26 @@ async fn try_sendfile_request(
             path: mirror_path.into_owned(),
         },
         aliased_host,
-        debname: filename.into_owned(),
-        cached_flavor: CachedFlavor::Permanent,
-        subdir: None,
+        debname,
+        cached_flavor,
+        subdir,
     };
 
-    let aliased = match conn_details.aliased_host {
-        Some(alias) => format!(" aliased to host {alias}"),
-        None => String::new(),
-    };
+    // Record origin for Packages requests (mirrors main.rs behavior)
+    if let Some(fields) = origin_fields {
+        let origin = Origin {
+            mirror: conn_details.mirror.clone(),
+            distribution: fields.distribution,
+            component: fields.component,
+            architecture: fields.architecture,
+        };
+        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        appstate
+            .database_tx
+            .send(cmd)
+            .await
+            .expect("database task should not die");
+    }
 
     // Check if the file exists in cache and is not being downloaded
     let cache_path = {
@@ -504,39 +706,273 @@ async fn try_sendfile_request(
         p
     };
 
-    // Check active downloads - if file is being downloaded, fall back to hyper
-    if appstate
+    // Check if the file is currently being downloaded — if so, serve it via
+    // sendfile from the growing partial file instead of falling back to hyper.
+    if let Some(dl_status) = appstate
         .active_downloads
-        .contains(&conn_details.mirror, &conn_details.debname)
+        .get(&conn_details.mirror, &conn_details.debname)
     {
-        return SendfileResult::NotApplicable("file currently in download");
+        let range_header = find_header(req.headers, &RANGE);
+        let if_range_header = find_header(req.headers, &IF_RANGE);
+        let if_none_match_header = find_header(req.headers, &IF_NONE_MATCH);
+        let if_modified_since_header = find_header(req.headers, &IF_MODIFIED_SINCE);
+
+        return serve_unfinished_sendfile(
+            stream,
+            &conn_details,
+            &aliased,
+            dl_status,
+            *conn_version,
+            conn_action,
+            range_header,
+            if_range_header,
+            if_none_match_header,
+            if_modified_since_header,
+            appstate,
+        )
+        .await;
     }
 
-    // Try to open the file
-    let file = match tokio::fs::File::open(&cache_path).await {
-        Ok(f) => f,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            // File not in cache, fall back to hyper which will download it
-            return SendfileResult::NotApplicable("file not found in cache");
+    // Try to open the cached file; for volatile resources, treat stale files as cache misses.
+    let cached_file = 'cache_lookup: {
+        let file = match tokio::fs::File::open(&cache_path).await {
+            Ok(f) => f,
+            Err(err) if err.kind() == ErrorKind::NotFound => break 'cache_lookup None,
+            Err(err) => {
+                error!(
+                    "Failed to open cached file `{}` for client {client}:  {err}",
+                    cache_path.display()
+                );
+                return SendfileResult::Invalid {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    msg: "Cache Access Failure",
+                };
+            }
+        };
+
+        // Volatile staleness: if file is older than 30s, treat as cache miss
+        // so splice/hyper can fetch a fresh copy from upstream.
+        if conn_details.cached_flavor == CachedFlavor::Volatile {
+            match file.metadata().await {
+                Ok(metadata) => {
+                    let last_modified = metadata
+                        .modified()
+                        .expect("Platform should support modification timestamps via setup check");
+                    if let Ok(elapsed) = last_modified.elapsed() {
+                        if elapsed >= VOLATILE_CACHE_MAX_AGE {
+                            break 'cache_lookup None;
+                        }
+
+                        debug!(
+                            "Volatile file `{}` is just {} old (limit: {}s), serving cached version...",
+                            cache_path.display(),
+                            HumanFmt::Time(elapsed),
+                            VOLATILE_CACHE_MAX_AGE.as_secs()
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to get metadata of cached file `{}` for client {client}:  {err}",
+                        cache_path.display()
+                    );
+                    return SendfileResult::Invalid {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        msg: "Cache Access Failure",
+                    };
+                }
+            }
         }
-        Err(err) => {
-            error!(
-                "Failed to open cached file `{}` for client {client}:  {err}",
-                cache_path.display()
-            );
-            return SendfileResult::Invalid {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                msg: "Cache Access Failure",
-            };
-        }
+
+        Some(file)
     };
 
+    if let Some(file) = cached_file {
+        return serve_file_via_sendfile(
+            stream,
+            &conn_details,
+            &aliased,
+            file,
+            &cache_path,
+            *conn_version,
+            conn_action,
+            find_header(req.headers, &RANGE),
+            find_header(req.headers, &IF_RANGE),
+            find_header(req.headers, &IF_NONE_MATCH),
+            find_header(req.headers, &IF_MODIFIED_SINCE),
+            appstate,
+        )
+        .await;
+    }
+
+    SendfileResult::NotApplicable("file not found in cache")
+}
+
+/// Pre-computed cache metadata used by [`evaluate_conditional_and_range`].
+struct CacheInfo {
+    file_etag: Option<String>,
+    last_modified_for_ims: std::time::SystemTime,
+    last_modified_str: String,
+    age: u32,
+}
+
+/// Outcome of [`evaluate_conditional_and_range`].
+enum ConditionalOutcome {
+    /// Caller should send a 304 Not Modified (already written to the stream).
+    NotModified(ConnectionAction),
+    /// Caller should send a 416 Range Not Satisfiable (already written to the stream).
+    RangeNotSatisfiable(ConnectionAction),
+    /// Proceed with serving the file using these range parameters.
+    Serve {
+        http_status: StatusCode,
+        content_start: u64,
+        content_length: u64,
+        content_range: Option<String>,
+        partial: bool,
+    },
+}
+
+/// Read `ETag` / Last-Modified from xattr and file metadata.
+fn read_cache_info(
+    file: &tokio::fs::File,
+    file_path: &Path,
+    metadata: &std::fs::Metadata,
+) -> CacheInfo {
+    let file_etag = read_etag(file, file_path);
+    let cache_ts = cache_file_timestamp(metadata);
+    let stored_last_modified = read_last_modified(file, file_path);
+    let (last_modified_for_ims, last_modified_str) = match stored_last_modified {
+        Some((s, time)) => (time, s),
+        None => (cache_ts, systemtime_to_http_datetime(cache_ts)),
+    };
+    let age = compute_age(metadata);
+    CacheInfo {
+        file_etag,
+        last_modified_for_ims,
+        last_modified_str,
+        age,
+    }
+}
+
+/// Evaluate conditional request headers (If-None-Match, If-Modified-Since) and
+/// Range headers, writing 304 or 416 responses directly to the stream when
+/// appropriate.
+///
+/// Returns [`ConditionalOutcome::Serve`] with the resolved range parameters
+/// when the caller should proceed with sending the file body.
+#[expect(clippy::too_many_arguments, reason = "mirrors caller context")]
+async fn evaluate_conditional_and_range(
+    stream: &TcpStream,
+    client: &ClientInfo,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    cache_info: &CacheInfo,
+    file_size: u64,
+    range_header: Option<&str>,
+    if_range_header: Option<&str>,
+    if_none_match_header: Option<&str>,
+    if_modified_since_header: Option<&str>,
+) -> Result<ConditionalOutcome, SendfileResult> {
+    // Evaluate conditional request (RFC 9110 §13.1.2: If-None-Match takes precedence)
+    let serve_304 = if let Some(inm) = if_none_match_header {
+        cache_info
+            .file_etag
+            .as_deref()
+            .is_some_and(|etag| if_none_match(inm, etag))
+    } else if let Some(ims) = if_modified_since_header
+        && let Some(ims_time) = http_datetime_to_systemtime(ims)
+    {
+        cache_info.last_modified_for_ims <= ims_time
+    } else {
+        false
+    };
+
+    if serve_304 {
+        if let Err(err) = write_304_response(
+            stream,
+            conn_version,
+            conn_action,
+            &cache_info.last_modified_str,
+            cache_info.age,
+            cache_info.file_etag.as_deref(),
+        )
+        .await
+        {
+            info!("Failed to write 304 response to client {client}:  {err}");
+            return Err(SendfileResult::ClientError);
+        }
+
+        return Ok(ConditionalOutcome::NotModified(conn_action));
+    }
+
+    // Handle Range requests
+    if let Some(range) = range_header {
+        match http_parse_range(
+            range,
+            if_range_header,
+            file_size,
+            cache_info.last_modified_for_ims,
+            cache_info.file_etag.as_deref(),
+        ) {
+            ParsedRange::Satisfiable(content_range, start, cl) => {
+                return Ok(ConditionalOutcome::Serve {
+                    http_status: StatusCode::PARTIAL_CONTENT,
+                    content_start: start,
+                    content_length: cl,
+                    content_range: Some(content_range),
+                    partial: true,
+                });
+            }
+            ParsedRange::NotSatisfiable => {
+                if let Err(err) =
+                    write_416_response(stream, conn_version, conn_action, file_size).await
+                {
+                    info!("Failed to write 416 response to client {client}:  {err}");
+                    return Err(SendfileResult::ClientError);
+                }
+
+                return Ok(ConditionalOutcome::RangeNotSatisfiable(conn_action));
+            }
+            ParsedRange::Invalid | ParsedRange::IfRangeFailed => {}
+        }
+    }
+
+    Ok(ConditionalOutcome::Serve {
+        http_status: StatusCode::OK,
+        content_start: 0,
+        content_length: file_size,
+        content_range: None,
+        partial: false,
+    })
+}
+
+/// Serve a file via sendfile(2), handling conditional requests (304),
+/// range requests, and database delivery tracking.
+///
+/// Shared implementation used for both already-cached files and files
+/// that finished downloading while a joining client was waiting.
+#[expect(clippy::too_many_arguments, reason = "consolidates two former callers")]
+pub(crate) async fn serve_file_via_sendfile(
+    stream: &TcpStream,
+    conn_details: &ConnectionDetails,
+    aliased: &str,
+    file: tokio::fs::File,
+    file_path: &Path,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    range_header: Option<&str>,
+    if_range_header: Option<&str>,
+    if_none_match_header: Option<&str>,
+    if_modified_since_header: Option<&str>,
+    appstate: &AppState,
+) -> SendfileResult {
     let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(err) => {
             error!(
-                "Failed to get metadata of cached file `{}` for client {client}:  {err}",
-                cache_path.display()
+                "Failed to get metadata of cached file `{}` for client {}:  {err}",
+                file_path.display(),
+                conn_details.client
             );
             return SendfileResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -547,139 +983,97 @@ async fn try_sendfile_request(
 
     let file_size = metadata.len();
 
-    let file_etag = read_etag(&file, &cache_path);
+    let cache_info = read_cache_info(&file, file_path, &metadata);
 
-    // Cache entries are replaced on update, not overridden, so the creation time is the time the
-    // file was last modified.
-    let last_modified = metadata.created().unwrap_or_else(|_err| {
-        metadata
-            .modified()
-            .expect("Platform should support modification timestamps via setup check")
-    });
-
-    let conn_action = compute_conn_action(&req, *conn_version, &client);
-
-    // Handle If-None-Match (takes precedence over If-Modified-Since per RFC 9110 §13.1.2)
-    let if_none_match_header = find_header(req.headers, "if-none-match");
-
-    if let Some(inm) = if_none_match_header
-        && let Some(ref etag) = file_etag
-        && if_none_match(inm, etag)
-    {
-        info!(
-            "Serving 304 Not Modified (If-None-Match) for cached file {} from mirror {}{} for client {client} via sendfile",
-            conn_details.debname, conn_details.mirror, aliased
-        );
-
-        if let Err(err) = write_304_response(
+    let (http_status, content_start, content_length, content_range, partial) =
+        match evaluate_conditional_and_range(
             stream,
-            *conn_version,
+            &conn_details.client,
+            conn_version,
             conn_action,
-            &last_modified,
-            file_etag.as_deref(),
-        )
-        .await
-        {
-            warn_once_or_info!("Failed to write 304 response to client {client}:  {err}");
-            return SendfileResult::Error;
-        }
-
-        return SendfileResult::Served(conn_action);
-    }
-
-    // Handle If-Modified-Since (only when If-None-Match is absent)
-    if if_none_match_header.is_none()
-        && let Some(ims) = find_header(req.headers, "if-modified-since")
-        && let Some(ims_time) = http_datetime_to_systemtime(ims)
-        && last_modified <= ims_time
-    {
-        info!(
-            "Serving 304 Not Modified for cached file {} from mirror {}{} for client {client} via sendfile",
-            conn_details.debname, conn_details.mirror, aliased
-        );
-
-        if let Err(err) = write_304_response(
-            stream,
-            *conn_version,
-            conn_action,
-            &last_modified,
-            file_etag.as_deref(),
-        )
-        .await
-        {
-            warn_once_or_info!("Failed to write 304 response to client {client}:  {err}");
-            return SendfileResult::Error;
-        }
-
-        return SendfileResult::Served(conn_action);
-    }
-
-    // Handle Range requests
-    let range_header = find_header(req.headers, "range");
-    let if_range_header = find_header(req.headers, "if-range");
-
-    let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
-        range_header
-        && let Some((content_range, start, cl)) = http_parse_range(
-            range,
-            if_range_header,
+            &cache_info,
             file_size,
-            last_modified,
-            file_etag.as_deref(),
-        ) {
-        (
-            StatusCode::PARTIAL_CONTENT,
-            start,
-            cl,
-            Some(content_range),
-            true,
+            range_header,
+            if_range_header,
+            if_none_match_header,
+            if_modified_since_header,
         )
-    } else {
-        (StatusCode::OK, 0, file_size, None, false)
-    };
+        .await
+        {
+            Ok(ConditionalOutcome::NotModified(ca)) => {
+                info!(
+                    "Serving 304 Not Modified for cached file {} from mirror {}{aliased} for client {} via sendfile",
+                    conn_details.debname, conn_details.mirror, conn_details.client
+                );
+                return SendfileResult::Served(ca);
+            }
+            Ok(ConditionalOutcome::RangeNotSatisfiable(ca)) => {
+                return SendfileResult::Served(ca);
+            }
+            Ok(ConditionalOutcome::Serve {
+                http_status,
+                content_start,
+                content_length,
+                content_range,
+                partial,
+            }) => (
+                http_status,
+                content_start,
+                content_length,
+                content_range,
+                partial,
+            ),
+            Err(result) => return result,
+        };
 
     info!(
-        "Serving cached file {} from mirror {}{} for client {client} via sendfile...",
-        conn_details.debname, conn_details.mirror, aliased
+        "Serving cached file {} from mirror {}{aliased} for client {} via sendfile...",
+        conn_details.debname, conn_details.mirror, conn_details.client,
     );
 
     // Cork the socket to coalesce headers + body into fewer TCP segments
-    let _cork = match CorkGuard::new(stream) {
-        Ok(guard) => Some(guard),
-        Err(err) => {
-            debug!("Failed to cork TCP socket for client {client}:  {err}");
-            None
-        }
-    };
+    let _cork = CorkGuard::new_optional(stream);
 
     // Write HTTP response headers
-    if let Err(err) = write_response_headers(
-        stream,
-        *conn_version,
-        http_status,
+    let headers = ResponseHeaders {
+        conn_version,
+        status: http_status,
         conn_action,
         content_length,
-        &last_modified,
-        content_range.as_deref(),
-        file_etag.as_deref(),
-    )
-    .await
-    {
-        warn_once_or_info!("Failed to write response headers to client {client}:  {err}");
-        return SendfileResult::Error;
+        content_type: content_type_for_cached_file(&conn_details.debname),
+        last_modified_str: &cache_info.last_modified_str,
+        age: cache_info.age,
+        content_range: content_range.as_deref(),
+        etag: cache_info.file_etag.as_deref(),
+    };
+    if let Err(err) = write_response_headers(stream, headers).await {
+        info!(
+            "Failed to write response headers to client {}:  {err}",
+            conn_details.client
+        );
+        return SendfileResult::ClientError;
     }
 
     let start = Instant::now();
 
     // Use sendfile(2) to transfer the file body
-    match async_sendfile(stream, &file, content_start, content_length).await {
+    let transfer_result = async_sendfile(
+        stream,
+        &conn_details.client,
+        &file,
+        content_start,
+        content_length,
+    )
+    .await;
+
+    match transfer_result {
         Ok(()) => {
             let elapsed = start.elapsed();
             info!(
-                "Served cached file {} from mirror {}{} for client {client} in {} via sendfile (size={}, rate={})",
+                "Served cached file {} from mirror {}{aliased} for client {} in {} via sendfile (size={}, rate={})",
                 conn_details.debname,
                 conn_details.mirror,
-                aliased,
+                conn_details.client,
                 HumanFmt::Time(elapsed.into()),
                 HumanFmt::Size(content_length),
                 HumanFmt::Rate(content_length, elapsed)
@@ -687,12 +1081,12 @@ async fn try_sendfile_request(
 
             // Update database
             let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
-                mirror: conn_details.mirror,
-                debname: conn_details.debname,
+                mirror: conn_details.mirror.clone(),
+                debname: conn_details.debname.clone(),
                 size: content_length,
                 elapsed,
                 partial,
-                client_ip: client.ip(),
+                client_ip: conn_details.client.ip(),
             });
             appstate
                 .database_tx
@@ -712,25 +1106,165 @@ async fn try_sendfile_request(
             );
             if is_client_disconnect {
                 info!(
-                    "sendfile transfer cancelled for `{}` to client {client}:  {err}",
-                    cache_path.display()
+                    "sendfile transfer cancelled for `{}` to client {}:  {}",
+                    file_path.display(),
+                    conn_details.client,
+                    ErrorReport(&err)
                 );
             } else {
                 error!(
-                    "sendfile error serving `{}` to client {client}:  {err}",
-                    cache_path.display()
+                    "sendfile error serving `{}` to client {}:  {}",
+                    file_path.display(),
+                    conn_details.client,
+                    ErrorReport(&err)
                 );
             }
             // Response already sent, just close the connection
-            SendfileResult::Error
+            SendfileResult::AfterHeaderError
         }
     }
 }
 
+/// Format an `InsufficientRate` into a timeout `std::io::Error`.
+fn rate_timeout_error(rate: &InsufficientRate, client: &ClientInfo) -> std::io::Error {
+    let msg = rate.display(client).to_string();
+
+    std::io::Error::new(ErrorKind::TimedOut, msg)
+}
+
+/// Wait for the socket to become writable, periodically feeding zero-byte
+/// samples into the rate checker (if enabled) so that stalled writes can be
+/// detected by `check_fail()`.
+async fn wait_writable_rated(
+    socket: &TcpStream,
+    client: &ClientInfo,
+    rate_checker: &mut Option<RateChecker>,
+    http_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    match tokio::time::timeout(http_timeout, async {
+        if let Some(rc) = rate_checker {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), socket.writable())
+                    .await
+                {
+                    Ok(result) => return result,
+                    Err(_err @ tokio::time::error::Elapsed { .. }) => {
+                        rc.add(0);
+
+                        if let Some(rate) = rc.check_fail() {
+                            return Err(rate_timeout_error(&rate, client));
+                        }
+                    }
+                }
+            }
+        } else {
+            socket.writable().await
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "client write timed out",
+        )),
+    }
+}
+
+/// Transfer up to `amount` bytes from `file` at `*file_offset` to `socket`
+/// using sendfile(2), handling rate checking and writability polling.
+///
+/// Returns [`ChunkLoopOutcome::Complete`] when all `amount` bytes were
+/// transferred.  Returns [`ChunkLoopOutcome::Eof`] if sendfile(2) reported
+/// EOF (returned 0) before completion — the caller decides whether that is
+/// an error.
+enum ChunkLoopOutcome {
+    Complete,
+    Eof { transferred: u64 },
+}
+
+async fn sendfile_chunk_loop(
+    socket: &TcpStream,
+    client: &ClientInfo,
+    file: &tokio::fs::File,
+    file_offset: &mut i64,
+    amount: u64,
+    rate_checker: &mut Option<RateChecker>,
+) -> std::io::Result<ChunkLoopOutcome> {
+    let config = global_config();
+    let mut remaining = amount;
+
+    while remaining > 0 {
+        if let Some(rc) = rate_checker.as_ref()
+            && let Some(rate) = rc.check_fail()
+        {
+            return Err(rate_timeout_error(&rate, client));
+        }
+
+        wait_writable_rated(socket, client, rate_checker, config.http_timeout).await?;
+
+        // Limit each sendfile call to avoid exceeding system limits.
+        // 0x7fff_f000 is always within usize range since it fits in 31 bits.
+        static_assert!(0x7fff_f000 < usize::MAX);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "no truncation since 0x7fff_f000 < usize::MAX"
+        )]
+        let chunk_size = std::cmp::min(remaining, 0x7fff_f000) as usize;
+
+        let result = {
+            // Copy file descriptors
+            let socket_fd = socket.as_raw_fd();
+            let file_fd = file.as_raw_fd();
+            let mut off = *file_offset;
+
+            tokio::task::spawn_blocking(move || {
+                // SAFETY: socket_fd and file_fd are valid for the duration of this
+                // blocking task because the caller (`sendfile_chunk_loop`) holds
+                // references to the TcpStream and File, and awaits this task's
+                // completion before returning. BorrowedFd is used instead of OwnedFd
+                // (try_clone_to_owned) to avoid a dup() syscall per sendfile iteration.
+                let socket = unsafe { BorrowedFd::borrow_raw(socket_fd) };
+                // SAFETY: same reasoning as above — file_fd is valid for the
+                // duration of this blocking task.
+                let file = unsafe { BorrowedFd::borrow_raw(file_fd) };
+                sendfile(socket, file, Some(&mut off), chunk_size).map(|sent| (sent, off))
+            })
+            .await
+            .expect("task should not panic")
+        };
+
+        // Works on Linux, might work on FreeBSD and macOS, and is probably not supported elsewhere
+        let _: Never = match result {
+            Ok((0, _)) => {
+                warn_once_or_debug!(
+                    "sendfile returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining"
+                );
+                return Ok(ChunkLoopOutcome::Eof {
+                    transferred: amount - remaining,
+                });
+            }
+            Ok((sent, new_off)) => {
+                *file_offset = new_off;
+                remaining = remaining.saturating_sub(sent as u64);
+                if let Some(rc) = rate_checker {
+                    rc.add(sent);
+                }
+                continue;
+            }
+            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
+            Err(errno) => return Err(errno_to_io_error(errno, "sendfile failed")),
+        };
+    }
+
+    Ok(ChunkLoopOutcome::Complete)
+}
+
 /// Perform an async sendfile(2) operation, transferring `count` bytes from `file`
 /// starting at `offset` to the TCP socket.
-async fn async_sendfile(
+pub(crate) async fn async_sendfile(
     socket: &TcpStream,
+    client: &ClientInfo,
     file: &tokio::fs::File,
     offset: u64,
     count: u64,
@@ -750,341 +1284,456 @@ async fn async_sendfile(
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
-    let mut remaining = count;
+    match sendfile_chunk_loop(
+        socket,
+        client,
+        file,
+        &mut file_offset,
+        count,
+        &mut rate_checker,
+    )
+    .await?
+    {
+        ChunkLoopOutcome::Complete => Ok(()),
+        ChunkLoopOutcome::Eof { transferred } => Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("sendfile: unexpected end of file (transferred: {transferred})"),
+        )),
+    }
+}
+
+/// Like [`async_sendfile`], but for a file that is still being written to by
+/// a concurrent download task.  Waits for `watch::Receiver` pings to learn
+/// about new data.  The sender batches notifications (see
+/// [`DownloadBarrier::ping_batched`]), so each ping indicates a meaningful
+/// amount of new data on disk.
+///
+/// `content_start` / `content_length` may describe a sub-range (HTTP Range).
+async fn async_sendfile_unfinished(
+    socket: &TcpStream,
+    client: &ClientInfo,
+    file: &tokio::fs::File,
+    content_start: u64,
+    content_length: u64,
+    mut receiver: tokio::sync::watch::Receiver<()>,
+    status: std::sync::Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+) -> std::io::Result<()> {
+    let _counter = client_counter::ClientDownload::new();
+
+    let Ok(mut file_offset) = i64::try_from(content_start) else {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "sendfile: offset exceeds i64::MAX",
+        ));
+    };
+
+    let config = global_config();
+
+    let mut rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+
+    let mut remaining = content_length;
+    let mut finished = false;
 
     while remaining > 0 {
-        if let Some(ref rate_checker) = rate_checker
-            && let Some(rate) = rate_checker.check_fail()
-        {
-            let msg = format!(
-                "Timeout occurred after a download rate of {} for the last {} seconds",
-                HumanFmt::Rate(
-                    rate.transferred as u64,
-                    Duration::from_secs(rate.timeframe.get() as u64)
-                ),
-                rate.timeframe,
-            );
-            return Err(std::io::Error::new(ErrorKind::TimedOut, msg));
-        }
+        // Determine how many bytes the file currently has available past our offset.
+        let offset_u64: u64 = file_offset
+            .try_into()
+            .expect("file_offset is non-negative by construction");
 
-        // When rate checking is enabled, periodically check for stalled writes.
-        // If the client causes TCP backpressure and the socket stays unwritable,
-        // we feed zero-byte samples into the rate checker so check_fail() can fire.
-        // The outer http_timeout ensures a fully stalled connection is killed even if
-        // rate_check_timeframe > http_timeout.
-        match tokio::time::timeout(config.http_timeout, async {
-            if let Some(ref mut rc) = rate_checker {
-                loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
-                        socket.writable(),
-                    )
-                    .await
-                    {
-                        Ok(result) => return result,
-                        Err(_elapsed @ tokio::time::error::Elapsed { .. }) => {
-                            rc.add(0);
+        let file_size = match tokio::task::block_in_place(|| nix::sys::stat::fstat(file.as_fd())) {
+            Ok(stat) => stat
+                .st_size
+                .try_into()
+                .expect("file size is non-negative by construction"),
+            Err(errno) => {
+                error!("Failed to query metadata of downloading file during sendfile:  {errno}");
+                offset_u64
+            }
+        };
 
-                            if let Some(rate) = rc.check_fail()
-                            {
-                                let msg = format!(
-                                    "Timeout occurred after a download rate of {} for the last {} seconds",
-                                    HumanFmt::Rate(
-                                        rate.transferred as u64,
-                                        Duration::from_secs(rate.timeframe.get() as u64)
-                                    ),
-                                    rate.timeframe,
-                                );
-                                return Err(std::io::Error::new(ErrorKind::TimedOut, msg));
-                            }
+        let available = file_size.saturating_sub(offset_u64);
+
+        // Clamp to what is actually available on disk and to what we still need.
+        let sendable = std::cmp::min(available, remaining);
+        if sendable == 0 {
+            if finished {
+                // The download claims to be done but the file is shorter than
+                // expected — treat as unexpected EOF.
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "sendfile: file shorter than expected after download finished",
+                ));
+            }
+            // Wait for the sender to notify us of new data on disk.
+            // The sender handles timeouts, so we *should* never stall here.
+            let _: Never = match receiver.changed().await {
+                Ok(()) => continue,
+                Err(_err @ tokio::sync::watch::error::RecvError { .. }) => {
+                    // Sender dropped — download finished or aborted.
+                    let st = status.read().await;
+                    match *st {
+                        ActiveDownloadStatus::Finished(_) => {
+                            drop(st);
+                            finished = true;
+                            continue;
+                        }
+                        ActiveDownloadStatus::Aborted(_) => {
+                            drop(st);
+                            return Err(std::io::Error::other(
+                                "sendfile: upstream download aborted",
+                            ));
+                        }
+                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download(..) => {
+                            drop(st);
+                            return Err(std::io::Error::other(
+                                "sendfile: unexpected download state for demoted client file-serve",
+                            ));
                         }
                     }
                 }
-            } else {
-                socket.writable().await
-            }
-        })
-        .await
-        {
-            Ok(result) => result?,
-            Err(tokio::time::error::Elapsed { .. }) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "client write timed out",
-                ));
-            }
+            };
         }
 
-        // Limit each sendfile call to avoid exceeding system limits.
-        // 0x7fff_f000 is always within usize range since it fits in 31 bits.
-        static_assert!(0x7fff_f000 < usize::MAX);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "no truncation since 0x7fff_f000 < usize::MAX"
-        )]
-        let chunk_size = std::cmp::min(remaining, 0x7fff_f000) as usize;
-
-        let result = {
-            // Copy file descriptors
-            let socket_fd = socket.as_raw_fd();
-            let file_fd = file.as_raw_fd();
-            let mut off = file_offset;
-
-            tokio::task::spawn_blocking(move || {
-                // SAFETY: socket_fd and file_fd are valid for the duration of this
-                // blocking task because the caller (`async_sendfile`) holds references
-                // to the TcpStream and File, and awaits this task's completion before
-                // returning. BorrowedFd is used instead of OwnedFd (try_clone_to_owned)
-                // to avoid a dup() syscall per sendfile iteration.
-                let socket = unsafe { BorrowedFd::borrow_raw(socket_fd) };
-                // SAFETY: same reasoning as above — file_fd is valid for the
-                // duration of this blocking task.
-                let file = unsafe { BorrowedFd::borrow_raw(file_fd) };
-                sendfile(socket, file, Some(&mut off), chunk_size).map(|sent| (sent, off))
-            })
-            .await
-            .expect("spawn_blocking should not panic")
-        };
-
-        // Works on Linux, might work on FreeBSD and macOS, and is probably not supported elsewhere
-        let _: Never = match result {
-            Ok((0, _)) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "sendfile: unexpected end of file",
-                ));
-            }
-            Ok((sent, new_off)) => {
-                file_offset = new_off;
-                remaining = remaining.saturating_sub(sent as u64);
-                if let Some(ref mut rate_checker) = rate_checker {
-                    rate_checker.add(sent);
+        // Transfer what is currently available via the shared sendfile loop.
+        let outcome = sendfile_chunk_loop(
+            socket,
+            client,
+            file,
+            &mut file_offset,
+            sendable,
+            &mut rate_checker,
+        )
+        .await?;
+        let sent = match outcome {
+            ChunkLoopOutcome::Complete => sendable,
+            ChunkLoopOutcome::Eof { transferred } => {
+                // sendfile(2) hit EOF mid-chunk even though fstat reported the
+                // bytes as available.  Re-check the download status directly
+                // rather than relying on another fstat round-trip that could
+                // race with the writer task dropping the watch sender.
+                let st = status.read().await;
+                let is_finished = matches!(*st, ActiveDownloadStatus::Finished(_));
+                let is_aborted = matches!(*st, ActiveDownloadStatus::Aborted(_));
+                drop(st);
+                if is_aborted {
+                    return Err(std::io::Error::other("sendfile: upstream download aborted"));
                 }
-                continue;
+                if is_finished {
+                    finished = true;
+                }
+                transferred
             }
-            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
-            Err(err) => return Err(std::io::Error::from(err)),
         };
+        remaining = remaining.saturating_sub(sent);
     }
 
     Ok(())
 }
 
-/// Read HTTP request headers from the stream into the buffer.
-/// Returns when a complete set of headers has been received (terminated by \r\n\r\n) or there is no more data to read.
-async fn read_request_headers(
+/// Serve a file that is currently being downloaded by another task, using
+/// sendfile(2) for zero-copy delivery to the joining client.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors try_sendfile_request context"
+)]
+async fn serve_unfinished_sendfile(
     stream: &TcpStream,
-    buf: &mut BytesMut,
-) -> std::io::Result<Option<usize>> {
-    async fn inner(stream: &TcpStream, buf: &mut BytesMut) -> std::io::Result<Option<usize>> {
-        // Check if we already have the complete headers from the previous read
-        if let Some(next_index) = find_header_end(buf) {
-            return Ok(Some(next_index));
-        }
-
+    conn_details: &ConnectionDetails,
+    aliased: &str,
+    dl_status: std::sync::Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    range_header: Option<&str>,
+    if_range_header: Option<&str>,
+    if_none_match_header: Option<&str>,
+    if_modified_since_header: Option<&str>,
+    appstate: &AppState,
+) -> SendfileResult {
+    // Wait for the download to leave the Init state and learn the file path,
+    // content length, and notification receiver.
+    let (file, file_path, total_size, receiver) = {
+        let mut init_waited = false;
         loop {
-            stream.readable().await?;
+            let st = dl_status.read().await;
+            let _: Never = match &*st {
+                ActiveDownloadStatus::Init(init_rx) => {
+                    let mut init_rx = init_rx.clone();
+                    drop(st);
+                    if init_waited {
+                        error!(
+                            "download state still Init after waiting for {} from mirror {}{aliased}",
+                            conn_details.debname, conn_details.mirror
+                        );
+                        return SendfileResult::Invalid {
+                            status: StatusCode::INTERNAL_SERVER_ERROR,
+                            msg: "Download State Corrupted",
+                        };
+                    }
+                    let _ignore = init_rx.changed().await;
+                    init_waited = true;
 
-            let _: Never = match stream.try_read_buf(buf) {
-                Ok(0) => return Ok(None),
-                Ok(n) => {
-                    // Check if we have the complete headers
-                    if let Some(next_index) = find_header_end(buf) {
-                        trace!("Read {n} bytes from client, found header end at {next_index}");
-                        return Ok(Some(next_index));
-                    }
-                    if buf.len() > MAX_HEADER_SIZE {
-                        return Err(std::io::Error::new(
-                            ErrorKind::InvalidInput,
-                            "request headers too large",
-                        ));
-                    }
-                    trace!("Read {n} bytes from client, did not find header end");
                     continue;
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    continue;
+                ActiveDownloadStatus::Download(path, cl, rx) => {
+                    let file = match tokio::fs::File::open(path).await {
+                        Ok(f) => f,
+                        Err(err) => {
+                            error!(
+                                "Failed to open downloading file `{}` for joining client {}:  {err}",
+                                path.display(),
+                                conn_details.client
+                            );
+                            return SendfileResult::Invalid {
+                                status: StatusCode::INTERNAL_SERVER_ERROR,
+                                msg: "Cache Access Failure",
+                            };
+                        }
+                    };
+                    let r = (file, path.clone(), *cl, rx.clone());
+                    drop(st);
+                    break r;
                 }
-                Err(err) => return Err(err),
+                ActiveDownloadStatus::Finished(path) => {
+                    let finished_path = path.clone();
+                    drop(st);
+                    // Download finished before we could join — serve the
+                    // completed file directly via sendfile.
+
+                    let file = match tokio::fs::File::open(&finished_path).await {
+                        Ok(f) => f,
+                        Err(err) => {
+                            error!(
+                                "Failed to open finished file `{}` for joining client {}:  {err}",
+                                finished_path.display(),
+                                conn_details.client
+                            );
+                            return SendfileResult::Invalid {
+                                status: StatusCode::INTERNAL_SERVER_ERROR,
+                                msg: "Cache Access Failure",
+                            };
+                        }
+                    };
+
+                    return serve_file_via_sendfile(
+                        stream,
+                        conn_details,
+                        aliased,
+                        file,
+                        &finished_path,
+                        conn_version,
+                        conn_action,
+                        range_header,
+                        if_range_header,
+                        if_none_match_header,
+                        if_modified_since_header,
+                        appstate,
+                    )
+                    .await;
+                }
+                ActiveDownloadStatus::Aborted(_) => {
+                    drop(st);
+                    info!(
+                        "Download of {} from mirror {}{aliased} was aborted, cannot serve joining client {}",
+                        conn_details.debname, conn_details.mirror, conn_details.client
+                    );
+                    return SendfileResult::Invalid {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        msg: "Download Aborted",
+                    };
+                }
             };
         }
-    }
-
-    match tokio::time::timeout(global_config().http_timeout, inner(stream, buf)).await {
-        Ok(Ok(next_index)) => Ok(next_index),
-        Ok(Err(err)) => Err(err),
-        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
-            ErrorKind::TimedOut,
-            "timed out waiting for request headers",
-        )),
-    }
-}
-
-/// Check if the buffer contains the end of HTTP headers (\r\n\r\n) and return the index after the end.
-#[must_use]
-#[inline]
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    // TODO: use array_windows() once 1.94 is widely available
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// Find a header value by name (case-insensitive).
-#[must_use]
-fn find_header<'a>(headers: &[httparse::Header<'a>], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case(name))
-        .and_then(|h| std::str::from_utf8(h.value).ok())
-}
-
-/// Write a 304 Not Modified response to the stream.
-async fn write_304_response(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
-    last_modified: &SystemTime,
-    etag: Option<&str>,
-) -> std::io::Result<()> {
-    let date = format_http_date();
-    let age = last_modified.elapsed().map_or(0, |dur| dur.as_secs());
-
-    let etag_header = match etag {
-        Some(etag) => format!("ETag: {etag}\r\n"),
-        None => String::new(),
     };
 
-    let last_modified_str = systemtime_to_http_datetime(*last_modified);
-
-    let response = format!(
-        "{conn_version} 304 Not Modified\r\n\
-         Date: {date}\r\n\
-         Via: {APP_VIA}\r\n\
-         Connection: {conn_action}\r\n\
-         Last-Modified: {last_modified_str}\r\n\
-         {etag_header}\
-         Age: {age}\r\n\
-         \r\n"
-    );
-    trace!("Outgoing 304 response:\n{response}");
-    write_all_to_stream(stream, response.as_bytes()).await
-}
-
-/// Write an error response to the stream.
-async fn write_invalid_response(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    status: StatusCode,
-    msg: &str,
-) -> std::io::Result<()> {
-    let date = format_http_date();
-    let content_length = msg.len();
-
-    let response = format!(
-        "{conn_version} {status}\r\n\
-         Server: {APP_NAME}\r\n\
-         Date: {date}\r\n\
-         Connection: close\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {content_length}\r\n\
-         \r\n\
-         {msg}"
-    );
-    trace!("Outgoing error response:\n{response}");
-    write_all_to_stream(stream, response.as_bytes()).await
-}
-
-/// Write HTTP response headers for a file response.
-#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
-async fn write_response_headers(
-    stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    status: StatusCode,
-    conn_action: ConnectionAction,
-    content_length: u64,
-    last_modified: &SystemTime,
-    content_range: Option<&str>,
-    etag: Option<&str>,
-) -> std::io::Result<()> {
-    let date = format_http_date();
-    let last_modified_str = systemtime_to_http_datetime(*last_modified);
-    let age = last_modified.elapsed().map_or(0, |dur| dur.as_secs());
-
-    let etag_header = match etag {
-        Some(etag) => format!("ETag: {etag}\r\n"),
-        None => String::new(),
+    // We need an exact content length to write a Content-Length header.
+    let ContentLength::Exact(exact_size) = total_size else {
+        warn_once_or_debug!(
+            "Unknown content length for in-progress download of {} from mirror {}{aliased}",
+            conn_details.debname,
+            conn_details.mirror,
+        );
+        return SendfileResult::NotApplicable("unknown content length for in-progress download");
     };
+    let total_file_size = exact_size.get();
 
-    let mut response = format!(
-        "{conn_version} {status}\r\n\
-         Date: {date}\r\n\
-         Via: {APP_VIA}\r\n\
-         Connection: {conn_action}\r\n\
-         Content-Length: {content_length}\r\n\
-         Content-Type: application/vnd.debian.binary-package\r\n\
-         Last-Modified: {last_modified_str}\r\n\
-         {etag_header}\
-         Accept-Ranges: bytes\r\n\
-         Age: {age}\r\n"
-    );
-
-    if let Some(cr) = content_range {
-        response.push_str("Content-Range: ");
-        response.push_str(cr);
-        response.push_str("\r\n");
-    }
-
-    response.push_str("\r\n");
-
-    trace!("Outgoing file response headers:\n{response}");
-    write_all_to_stream(stream, response.as_bytes()).await
-}
-
-/// Write all bytes to the TCP stream, handling partial writes.
-async fn write_all_to_stream(stream: &TcpStream, data: &[u8]) -> std::io::Result<()> {
-    async fn inner(stream: &TcpStream, mut data: &[u8]) -> std::io::Result<()> {
-        while !data.is_empty() {
-            stream.writable().await?;
-
-            let _: Never = match stream.try_write(data) {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::WriteZero,
-                        "failed to write to stream",
-                    ));
-                }
-                Ok(n) => {
-                    data = &data[n..];
-                    continue;
-                }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(err) => return Err(err),
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(err) => {
+            error!(
+                "Failed to get metadata of downloading file `{}` for joining client {}:  {err}",
+                file_path.display(),
+                conn_details.client
+            );
+            return SendfileResult::Invalid {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                msg: "Cache Access Failure",
             };
         }
+    };
 
-        Ok(())
+    let cache_info = read_cache_info(&file, &file_path, &metadata);
+
+    // Range handling uses the total upstream size (not the current partial size on disk).
+    let (http_status, content_start, content_length, content_range, partial) =
+        match evaluate_conditional_and_range(
+            stream,
+            &conn_details.client,
+            conn_version,
+            conn_action,
+            &cache_info,
+            total_file_size,
+            range_header,
+            if_range_header,
+            if_none_match_header,
+            if_modified_since_header,
+        )
+        .await
+        {
+            Ok(ConditionalOutcome::NotModified(ca)) => {
+                info!(
+                    "Serving 304 Not Modified for downloading file {} from mirror {}{aliased} for joining client {} via sendfile",
+                    conn_details.debname, conn_details.mirror, conn_details.client
+                );
+                return SendfileResult::Served(ca);
+            }
+            Ok(ConditionalOutcome::RangeNotSatisfiable(ca)) => {
+                return SendfileResult::Served(ca);
+            }
+            Ok(ConditionalOutcome::Serve {
+                http_status,
+                content_start,
+                content_length,
+                content_range,
+                partial,
+            }) => (
+                http_status,
+                content_start,
+                content_length,
+                content_range,
+                partial,
+            ),
+            Err(result) => return result,
+        };
+
+    info!(
+        "Serving downloading file {} from mirror {}{aliased} for joining client {} via sendfile...",
+        conn_details.debname, conn_details.mirror, conn_details.client
+    );
+
+    let _cork = CorkGuard::new_optional(stream);
+
+    let headers = ResponseHeaders {
+        conn_version,
+        status: http_status,
+        conn_action,
+        content_length,
+        content_type: content_type_for_cached_file(&conn_details.debname),
+        last_modified_str: &cache_info.last_modified_str,
+        age: cache_info.age,
+        content_range: content_range.as_deref(),
+        etag: cache_info.file_etag.as_deref(),
+    };
+    if let Err(err) = write_response_headers(stream, headers).await {
+        info!(
+            "Failed to write response headers to joining client {}:  {err}",
+            conn_details.client
+        );
+        return SendfileResult::ClientError;
     }
 
-    match tokio::time::timeout(global_config().http_timeout, inner(stream, data)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
-            ErrorKind::TimedOut,
-            "write operation timed out",
-        )),
+    let start = Instant::now();
+
+    let transfer_result = async_sendfile_unfinished(
+        stream,
+        &conn_details.client,
+        &file,
+        content_start,
+        content_length,
+        receiver,
+        dl_status,
+    )
+    .await;
+
+    match transfer_result {
+        Ok(()) => {
+            let elapsed = start.elapsed();
+            info!(
+                "Served downloading file {} from mirror {}{aliased} for joining client {} in {} via sendfile (size={}, rate={})",
+                conn_details.debname,
+                conn_details.mirror,
+                conn_details.client,
+                HumanFmt::Time(elapsed.into()),
+                HumanFmt::Size(content_length),
+                HumanFmt::Rate(content_length, elapsed)
+            );
+
+            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+                mirror: conn_details.mirror.clone(),
+                debname: conn_details.debname.clone(),
+                size: content_length,
+                elapsed,
+                partial,
+                client_ip: conn_details.client.ip(),
+            });
+            appstate
+                .database_tx
+                .send(cmd)
+                .await
+                .expect("database task should not die");
+
+            SendfileResult::Served(conn_action)
+        }
+        Err(err) => {
+            let is_client_disconnect = matches!(
+                err.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::TimedOut
+            );
+
+            if is_client_disconnect {
+                info!(
+                    "Joining client {} disconnected while serving downloading file {} from mirror {}{aliased}:  {}",
+                    conn_details.client,
+                    conn_details.debname,
+                    conn_details.mirror,
+                    ErrorReport(&err)
+                );
+            } else {
+                warn!(
+                    "Failed to sendfile downloading file {} from mirror {}{aliased} to joining client {}:  {}",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    conn_details.client,
+                    ErrorReport(&err)
+                );
+            }
+            SendfileResult::AfterHeaderError
+        }
     }
 }
 
 /// A stream that may have prepended data from a previous read.
-/// When all prepended data is consumed, reads delegate to the inner TCP stream.
-#[derive(Debug)]
-enum MaybePrependedStream {
-    Raw(TcpStream),
-    Prepended {
-        prepend: BytesMut,
-        stream: TcpStream,
-    },
+/// When all prepended data is consumed, the buffer is dropped and
+/// subsequent reads go straight to the inner TCP stream.
+struct MaybePrependedStream {
+    prepend: Option<BytesMut>,
+    stream: TcpStream,
+}
+
+impl MaybePrependedStream {
+    fn new(prepend: BytesMut, stream: TcpStream) -> Self {
+        let prepend = if prepend.is_empty() {
+            None
+        } else {
+            Some(prepend)
+        };
+
+        Self { prepend, stream }
+    }
 }
 
 impl AsyncRead for MaybePrependedStream {
@@ -1094,19 +1743,17 @@ impl AsyncRead for MaybePrependedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Raw(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Prepended { prepend, stream } => {
-                if prepend.is_empty() {
-                    Pin::new(stream).poll_read(cx, buf)
-                } else {
-                    let n = std::cmp::min(prepend.len(), buf.remaining());
-                    buf.put_slice(&prepend[..n]);
-                    prepend.advance(n);
-                    Poll::Ready(Ok(()))
-                }
+        let this = self.get_mut();
+        if let Some(prepend) = &mut this.prepend {
+            let n = std::cmp::min(prepend.len(), buf.remaining());
+            buf.put_slice(&prepend[..n]);
+            prepend.advance(n);
+            if prepend.is_empty() {
+                this.prepend = None;
             }
+            return Poll::Ready(Ok(()));
         }
+        Pin::new(&mut this.stream).poll_read(cx, buf)
     }
 }
 
@@ -1117,65 +1764,16 @@ impl AsyncWrite for MaybePrependedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            Self::Raw(stream) | Self::Prepended { prepend: _, stream } => {
-                Pin::new(stream).poll_write(cx, buf)
-            }
-        }
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
     }
 
     #[inline]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Raw(stream) | Self::Prepended { prepend: _, stream } => {
-                Pin::new(stream).poll_flush(cx)
-            }
-        }
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
     }
 
     #[inline]
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Raw(stream) | Self::Prepended { prepend: _, stream } => {
-                Pin::new(stream).poll_shutdown(cx)
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_find_header_end() {
-        assert_eq!(
-            find_header_end(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
-            Some(37)
-        );
-        assert_eq!(
-            find_header_end(b"GET / HTTP/1.1\r\nHost: example.com\r\n"),
-            None
-        );
-        assert_eq!(find_header_end(b"GET /"), None);
-        assert_eq!(find_header_end(b"\r\n\r\n"), Some(4));
-    }
-
-    #[test]
-    fn test_find_header() {
-        let headers = [
-            httparse::Header {
-                name: "Host",
-                value: b"example.com",
-            },
-            httparse::Header {
-                name: "Range",
-                value: b"bytes=0-100",
-            },
-        ];
-        assert_eq!(find_header(&headers, "host"), Some("example.com"));
-        assert_eq!(find_header(&headers, "HOST"), Some("example.com"));
-        assert_eq!(find_header(&headers, "range"), Some("bytes=0-100"));
-        assert_eq!(find_header(&headers, "nonexistent"), None);
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 }

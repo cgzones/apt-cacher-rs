@@ -42,6 +42,7 @@ const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
 const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
 const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
+const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: hyper::StatusCode =
@@ -487,6 +488,12 @@ pub(crate) struct Config {
     #[serde(default = "default_mmap_threshold")]
     pub(crate) mmap_threshold: NonZero<u64>,
 
+    /// Whether to reject differential (pdiff) resource requests with 410 Gone.
+    /// When disabled, diff requests are proxied to the upstream mirror but not cached
+    /// (while full resources are always cached).
+    #[serde(default = "default_reject_pdiff_requests")]
+    pub(crate) reject_pdiff_requests: bool,
+
     #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
@@ -735,6 +742,10 @@ const fn default_usage_retention_days() -> u64 {
     DEFAULT_USAGE_RETENTION_DAYS
 }
 
+const fn default_reject_pdiff_requests() -> bool {
+    DEFAULT_REJECT_PDIFF_REQUESTS
+}
+
 const fn default_logstore_capacity() -> NonZero<usize> {
     DEFAULT_LOGSTORE_CAPACITY
 }
@@ -943,6 +954,7 @@ impl Config {
             max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
             db_channel_capacity: DEFAULT_DB_CHANNEL_CAPACITY,
             mmap_threshold: DEFAULT_MMAP_THRESHOLD,
+            reject_pdiff_requests: DEFAULT_REJECT_PDIFF_REQUESTS,
             experimental_parallel_hack_enabled: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED,
             experimental_parallel_hack_maxparallel: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL,
             experimental_parallel_hack_statuscode: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE,

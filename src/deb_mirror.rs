@@ -380,6 +380,75 @@ pub(crate) fn valid_filename(name: &str) -> bool {
         })
 }
 
+/// Check whether the given URI path is a diff request path.
+///
+/// Note: calls should be guarded by the configuration setting `reject_pdiff_requests`.
+///
+/// Example request paths:
+/// - `http://deb.debian.org/debian-debug/dists/sid-debug/main/binary-i386/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz`
+/// - `http://deb.debian.org/debian/dists/unstable/main/i18n/Translation-en.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz`
+/// - `http://deb.debian.org/debian/dists/unstable/main/i18n/Translation-de.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz`
+/// - `http://deb.debian.org/debian/dists/sid/main/source/Sources.diff/T-2024-10-03-1409.04-F-2024-10-03-1409.04.gz`
+///
+/// A regex-based implementation was considered but rejected: the linear-scan
+/// contains/find approach avoids pulling in the `regex` crate solely for this
+/// check and stays linear in the path length with no allocation.
+#[must_use]
+pub(crate) fn is_diff_request_path(uri_path: &str) -> bool {
+    const FIXED_MARKERS: &[&str] = &["/Packages.diff/T-", "/Sources.diff/T-"];
+    FIXED_MARKERS.iter().any(|m| uri_path.contains(m)) || contains_translation_diff(uri_path)
+}
+
+/// Check whether the path contains a `Translation-XX.diff/T-` segment for any language.
+#[must_use]
+fn contains_translation_diff(uri_path: &str) -> bool {
+    const PREFIX: &str = "/Translation-";
+    const SUFFIX: &str = ".diff/T-";
+
+    let mut haystack = uri_path;
+    while let Some(idx) = haystack.find(PREFIX) {
+        let rest = haystack.split_at(idx + PREFIX.len()).1;
+        if let Some(diff_idx) = rest.find(SUFFIX) {
+            let lang = rest.split_at(diff_idx).0;
+            // Language tags in Debian translations are of the form `en`, `de`,
+            // `zh_CN`, `pt_BR` — alphanumeric with optional underscore.  Reject
+            // arbitrary separator runs (e.g. `---`) that the previous matcher
+            // accepted.
+            if !lang.is_empty() && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return true;
+            }
+        }
+        haystack = rest;
+    }
+    false
+}
+
+/// Check whether a percent-decoded URI path is safe to forward upstream.
+///
+/// Rejects traversal segments (`..`, `.`) and control characters (including null bytes).
+///
+/// Returns `true` if the path is unsafe and should be rejected.
+#[must_use]
+pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
+    let decoded = match urlencoding::decode(raw_path) {
+        Ok(d) => d,
+        // Failed to decode — reject as unsafe
+        Err(_err @ std::string::FromUtf8Error { .. }) => return true,
+    };
+
+    decoded
+        .split('/')
+        .any(|seg| seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control()))
+}
+
+/// Whether the filename represents a Debian binary package (`.deb`, `.udeb`, `.ddeb`).
+#[must_use]
+pub(crate) fn is_deb_package(filename: &str) -> bool {
+    let extension = filename.rsplit_once('.').map(|(_, ext)| ext);
+
+    matches!(extension, Some("deb" | "udeb" | "ddeb"))
+}
+
 #[must_use]
 pub(crate) fn valid_mirrorname(name: &str) -> bool {
     !name.is_empty()
@@ -866,5 +935,90 @@ mod tests {
         assert!(!valid_architecture("foo//bar"));
         assert!(!valid_architecture("/"));
         assert!(!valid_architecture("/debian"));
+    }
+
+    #[test]
+    fn test_is_unsafe_proxy_path() {
+        // safe paths
+        assert!(!is_unsafe_proxy_path(
+            "/debian/pool/main/a/apt/apt_2.9.8_amd64.deb"
+        ));
+        assert!(!is_unsafe_proxy_path("/debian/dists/sid/InRelease"));
+        assert!(!is_unsafe_proxy_path("/"));
+        assert!(!is_unsafe_proxy_path(""));
+        // legitimate percent-encoded characters
+        assert!(!is_unsafe_proxy_path(
+            "/debian/pool/main/c/chromium/chromium-common_141.0.7390.65-1%7edeb12u1_amd64.deb"
+        ));
+        assert!(!is_unsafe_proxy_path(
+            "/debian/pool/main/libt/libtirpc/libtirpc3t64_1.3.4%2bds-1.2_amd64.deb"
+        ));
+        // literal '%' in path (encoded as %25) is legitimate and must not be rejected
+        assert!(!is_unsafe_proxy_path(
+            "/debian/pool/main/foo%25bar/file.deb"
+        ));
+        // double-encoded sequences must be allowed (decoded once)
+        assert!(!is_unsafe_proxy_path("/debian/foo%2520bar/file.deb"));
+
+        // traversal
+        assert!(is_unsafe_proxy_path("/debian/../etc/passwd"));
+        assert!(is_unsafe_proxy_path("/debian/./pool/file.deb"));
+        assert!(is_unsafe_proxy_path("/.."));
+        assert!(is_unsafe_proxy_path("/."));
+        // percent-encoded traversal
+        assert!(is_unsafe_proxy_path("/debian/%2e%2e/etc/passwd"));
+        assert!(is_unsafe_proxy_path("/debian/%2E%2E/etc/passwd"));
+
+        // control characters / NUL
+        assert!(is_unsafe_proxy_path("/debian/foo\nbar"));
+        assert!(is_unsafe_proxy_path("/debian/foo%00bar"));
+        assert!(is_unsafe_proxy_path("/debian/foo%0abar"));
+
+        // invalid UTF-8 in percent-encoding
+        assert!(is_unsafe_proxy_path("/debian/%ff%fe"));
+    }
+
+    #[test]
+    fn test_is_diff_request_path() {
+        // valid
+        assert!(is_diff_request_path(
+            "/debian/dists/unstable/main/i18n/Translation-en.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz"
+        ));
+        assert!(is_diff_request_path(
+            "/debian/dists/unstable/main/i18n/Translation-de.diff/T-2024-10-03-0804.49-F-2024-10-02-2011.04.gz"
+        ));
+        assert!(is_diff_request_path(
+            "/debian/dists/sid/main/source/Sources.diff/T-2024-10-03-1409.04-F-2024-10-03-1409.04.gz"
+        ));
+        assert!(is_diff_request_path(
+            "/debian/dists/sid/main/binary-i386/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz"
+        ));
+
+        // invalid — not diff paths
+        assert!(!is_diff_request_path(
+            "/debian/dists/sid/main/binary-amd64/Packages.gz"
+        ));
+        assert!(!is_diff_request_path(
+            "/debian/dists/sid/main/binary-amd64/Packages.xz"
+        ));
+        assert!(!is_diff_request_path(
+            "/debian/dists/sid/main/source/Sources.gz"
+        ));
+        assert!(!is_diff_request_path(
+            "/debian/dists/sid/main/i18n/Translation-en.gz"
+        ));
+        assert!(!is_diff_request_path("/debian/dists/sid/InRelease"));
+        assert!(!is_diff_request_path(
+            "/debian/pool/main/a/apt/apt_2.9.8_amd64.deb"
+        ));
+        assert!(!is_diff_request_path(""));
+        assert!(!is_diff_request_path("/"));
+        // Contains "diff" but not in the expected pattern
+        assert!(!is_diff_request_path(
+            "/debian/dists/sid/main/binary-amd64/Packages.diff/"
+        ));
+        assert!(!is_diff_request_path(
+            "/debian/dists/sid/main/source/Sources.diff/Index"
+        ));
     }
 }
