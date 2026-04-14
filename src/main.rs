@@ -258,19 +258,6 @@ impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
     }
 }
 
-#[expect(
-    clippy::from_over_into,
-    reason = "Into is used via entry_ref() and From is not needed"
-)]
-impl Into<SchemeKey> for &SchemeKeyRef<'_> {
-    fn into(self) -> SchemeKey {
-        SchemeKey {
-            host: self.host.to_owned(),
-            port: self.port,
-        }
-    }
-}
-
 static SCHEME_CACHE: OnceLock<parking_lot::RwLock<HashMap<SchemeKey, Scheme>>> = OnceLock::new();
 
 pub(crate) async fn request_with_retry(
@@ -384,7 +371,13 @@ pub(crate) async fn request_with_retry(
                                 && let EntryRef::Vacant(ventry) =
                                     scheme_cache.write().entry_ref(&key)
                             {
-                                ventry.insert(scheme);
+                                ventry.insert_entry_with_key(
+                                    SchemeKey {
+                                        host: key.host.to_owned(),
+                                        port: key.port,
+                                    },
+                                    scheme,
+                                );
                                 debug!(
                                     "Added cached {scheme} scheme for host {auth}, original scheme was {orig_scheme:?}"
                                 );
