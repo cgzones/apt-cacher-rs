@@ -6,3 +6,5 @@ disallowed-types = [
     { path = "std::time::Instant", reason = "prefer faster but less accurate coarse version", replacement = "coarsetime::Instant" },
 ]
 allow-unwrap-in-tests = true
+semicolon-inside-block-ignore-singleline = true
+semicolon-outside-block-ignore-multiline = true
