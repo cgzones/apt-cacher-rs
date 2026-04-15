@@ -1950,7 +1950,7 @@ async fn download_file(
         match tokio::fs::rename(&outpath, &dest_file_path).await {
             Ok(()) => {
                 // Defuse the TempPath - the file has been successfully renamed
-                TempPath::into_inner(outpath);
+                TempPath::defuse(outpath);
 
                 let total_bytes = resume_offset + bytes;
                 rbarrier.release(dest_file_path, total_bytes);
@@ -2601,16 +2601,10 @@ async fn serve_new_file(
     let mut resume_offset: u64 = 0;
     let mut resume_expected_total: Option<u64> = None;
     let mut resume_if_range: Option<String> = None;
-    let mut partial_file: Option<tokio::fs::File> = None;
-    let mut partial_file_guard = if conn_details.cached_flavor == CachedFlavor::Permanent
+    let mut partial = if conn_details.cached_flavor == CachedFlavor::Permanent
         && matches!(cfstate, CacheFileStat::New)
     {
-        let pp = utils::partial_path(
-            &global_config().cache_directory,
-            &conn_details.mirror,
-            &conn_details.debname,
-        );
-        match utils::open_partial_file(&pp, &ibarrier).await {
+        match utils::open_partial_file(&ibarrier).await {
             Ok((file, size, _mtime, guard)) if size > 0 => {
                 // Only attempt resume when the partial carries a strong upstream
                 // ETag.  RFC 9110 §8.8.2.2 requires a strong validator for If-Range
@@ -2623,17 +2617,16 @@ async fn serve_new_file(
                 //
                 // `read_etag` rejects weak ETags, so any value returned here is a
                 // strong validator per RFC 9110 §8.8.3.
-                let upstream_identifier = read_etag(&file, &pp);
+                let upstream_identifier = read_etag(&file, &guard);
                 if let Some(if_range) = upstream_identifier {
                     resume_offset = size;
-                    resume_expected_total = xattr_helpers::read_expected_size(&file, &pp);
+                    resume_expected_total = xattr_helpers::read_expected_size(&file, &guard);
                     resume_if_range = Some(if_range);
                     info!(
                         "Found partial download ({} bytes) for {} from mirror {}, will attempt resume",
                         resume_offset, conn_details.debname, conn_details.mirror
                     );
-                    partial_file = Some(file);
-                    Some(guard)
+                    utils::PartialDownload::Resumable { file, guard }
                 } else {
                     // No strong validator stored (no upstream ETag, filesystem
                     // without xattr support, or only Last-Modified available) —
@@ -2643,15 +2636,14 @@ async fn serve_new_file(
                         conn_details.debname, conn_details.mirror
                     );
                     drop(file);
-                    guard.remove().await;
-                    Some(utils::TempPath::new(pp, true))
+                    utils::PartialDownload::Fresh(guard.renew().await)
                 }
             }
             Ok((_file, _size, _mtime, guard)) => {
                 // Zero-byte partial — treat as no partial
-                Some(guard)
+                utils::PartialDownload::Fresh(guard)
             }
-            Err(err) => {
+            Err((err, guard)) => {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     error!(
                         "Failed to open partial file for {} from mirror {}:  {err}",
@@ -2659,11 +2651,11 @@ async fn serve_new_file(
                     );
                 }
                 // File doesn't exist or can't be opened — proceed without resume
-                Some(utils::TempPath::new(pp, true))
+                utils::PartialDownload::Fresh(guard)
             }
         }
     } else {
-        None
+        utils::PartialDownload::Volatile
     };
 
     let fwd_request = build_fwd_request(
@@ -2774,35 +2766,6 @@ async fn serve_new_file(
         );
     }
 
-    // Helper: discard the stale partial file and re-create the guard so a fresh download
-    // can still be resumed if it fails mid-stream.
-    let discard_partial = |partial_file: &mut Option<tokio::fs::File>,
-                           partial_file_guard: &mut Option<utils::TempPath>,
-                           resume_offset: &mut u64,
-                           resume_expected_total: &mut Option<u64>,
-                           conn_details: &ConnectionDetails| {
-        *partial_file = None; // drop the held file handle before removing
-        let guard = partial_file_guard.take();
-        let cached_flavor = conn_details.cached_flavor;
-        let mirror = conn_details.mirror.clone();
-        let debname = conn_details.debname.clone();
-        *resume_offset = 0;
-        *resume_expected_total = None;
-        async move {
-            if let Some(guard) = guard {
-                guard.remove().await;
-            }
-            // Re-create the guard at the deterministic partial path so this fresh download
-            // can still be resumed if it fails mid-stream.
-            if cached_flavor == CachedFlavor::Permanent {
-                let pp = utils::partial_path(&global_config().cache_directory, &mirror, &debname);
-                Some(utils::TempPath::new(pp, true))
-            } else {
-                None
-            }
-        }
-    };
-
     // Handle resume: if we sent Range and got 200 (server ignores Range) or 416
     // (partial is stale), discard partial and start fresh.
     let needs_retry = if resume_offset > 0 && fwd_response.status() == StatusCode::OK {
@@ -2810,28 +2773,18 @@ async fn serve_new_file(
             "Server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
             conn_details.debname, conn_details.mirror
         );
-        partial_file_guard = discard_partial(
-            &mut partial_file,
-            &mut partial_file_guard,
-            &mut resume_offset,
-            &mut resume_expected_total,
-            &conn_details,
-        )
-        .await;
+        partial.discard_resume().await;
+        resume_offset = 0;
+        resume_expected_total = None;
         false
     } else if resume_offset > 0 && fwd_response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
         warn!(
             "Server returned 416 for resume of {} from mirror {} (partial {} bytes), discarding stale partial",
             conn_details.debname, conn_details.mirror, resume_offset
         );
-        partial_file_guard = discard_partial(
-            &mut partial_file,
-            &mut partial_file_guard,
-            &mut resume_offset,
-            &mut resume_expected_total,
-            &conn_details,
-        )
-        .await;
+        partial.discard_resume().await;
+        resume_offset = 0;
+        resume_expected_total = None;
         true
     } else if resume_offset > 0 && fwd_response.status() == StatusCode::PARTIAL_CONTENT {
         // Validate Content-Range before proceeding: if the server returned 206 but the
@@ -2860,14 +2813,9 @@ async fn serve_new_file(
                 "Invalid or mismatched Content-Range in 206 for {} from mirror {}, discarding partial and retrying fresh",
                 conn_details.debname, conn_details.mirror
             );
-            partial_file_guard = discard_partial(
-                &mut partial_file,
-                &mut partial_file_guard,
-                &mut resume_offset,
-                &mut resume_expected_total,
-                &conn_details,
-            )
-            .await;
+            partial.discard_resume().await;
+            resume_offset = 0;
+            resume_expected_total = None;
             true
         }
     } else {
@@ -3115,18 +3063,12 @@ async fn serve_new_file(
     // Create/open the output file: partial path for permanent files, random temp for volatile.
     // Defuse the guard once we take ownership of the partial path — from here on, the
     // download's own TempPath (keep_on_drop: true) manages the file lifetime.
-    let (outfile, outpath) = if resume_offset > 0 {
-        // Resume: use the file already opened during the partial-file check.
-        // The file handle has been held open since the check, so no TOCTOU race.
-        let mut file = partial_file
-            .take()
-            .expect("partial_file set when resume_offset > 0");
-        let guard = partial_file_guard
-            .take()
-            .expect("partial_file_guard set when resume_offset > 0");
-        // Verify the file size matches expectations (should always hold since
-        // we've held the fd open, but check as defense-in-depth).
-        {
+    let (outfile, outpath) = match partial {
+        utils::PartialDownload::Resumable { mut file, guard } => {
+            // Resume: use the file already opened during the partial-file check.
+            // The file handle has been held open since the check, so no TOCTOU race.
+            // Verify the file size matches expectations (should always hold since
+            // we've held the fd open, but check as defense-in-depth).
             use tokio::io::AsyncSeekExt as _;
             let current_size = file.seek(std::io::SeekFrom::End(0)).await.unwrap_or(0);
             if current_size != resume_offset {
@@ -3135,31 +3077,38 @@ async fn serve_new_file(
                 );
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
             }
+            (file, guard)
         }
-        (file, guard)
-    } else if let Some(guard) = partial_file_guard.take() {
-        // Fresh permanent download: create at deterministic partial path
-        let pp = guard.into_inner();
-        match utils::create_partial_file(&pp, 0o640).await {
-            Ok((f, p)) => (f, p),
-            Err(err) => {
-                error!("Error creating partial file `{}`:  {err}", pp.display());
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+        utils::PartialDownload::Fresh(guard) => {
+            // Fresh permanent download: create at deterministic partial path
+            match utils::create_partial_file(guard, 0o640).await {
+                Ok((f, p)) => (f, p),
+                Err((err, path)) => {
+                    error!("Error creating partial file `{}`:  {err}", path.display());
+                    return quick_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Cache Access Failure",
+                    );
+                }
             }
         }
-    } else {
-        // Volatile file: random temp file
-        let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
-            .iter()
-            .collect();
-        match tokio_tempfile(&tmppath, 0o640).await {
-            Ok((f, p)) => (f, p),
-            Err(err) => {
-                error!(
-                    "Error creating temporary file `{}`:  {err}",
-                    tmppath.display()
-                );
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+        utils::PartialDownload::Volatile => {
+            // Volatile file: random temp file
+            let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
+                .iter()
+                .collect();
+            match tokio_tempfile(&tmppath, 0o640).await {
+                Ok((f, p)) => (f, p),
+                Err(err) => {
+                    error!(
+                        "Error creating temporary file `{}`:  {err}",
+                        tmppath.display()
+                    );
+                    return quick_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Cache Access Failure",
+                    );
+                }
             }
         }
     };
