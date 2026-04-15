@@ -39,7 +39,7 @@ impl<'a> InitBarrier<'a> {
     }
 
     pub(crate) async fn finished(mut self, path: PathBuf) {
-        let data = self.data.take().expect("finished() is a sink");
+        let data = self.data.take().expect("every sink consumes the instance");
 
         *data.status.write().await = ActiveDownloadStatus::Finished(path);
         data.active_downloads.remove(data.mirror, data.debname);
@@ -51,7 +51,7 @@ impl<'a> InitBarrier<'a> {
         content_length: ContentLength,
         quota_reservation: Option<QuotaReservation>,
     ) -> DownloadBarrier {
-        let data = self.data.take().expect("download() is a sink");
+        let data = self.data.take().expect("every sink consumes the instance");
 
         let (tx, rx) = tokio::sync::watch::channel(());
 
@@ -68,6 +68,22 @@ impl<'a> InitBarrier<'a> {
                 bytes_since_ping: 0,
             }),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn mirror(&self) -> &Mirror {
+        self.data
+            .as_ref()
+            .expect("every sink consumes the instance")
+            .mirror
+    }
+
+    #[must_use]
+    pub(crate) fn debname(&self) -> &str {
+        self.data
+            .as_ref()
+            .expect("every sink consumes the instance")
+            .debname
     }
 }
 
@@ -134,7 +150,7 @@ impl DownloadBarrier {
         let data = self
             .data
             .as_mut()
-            .expect("data is only extracted in a sink");
+            .expect("every sink consumes the instance");
         data.bytes_since_ping = data.bytes_since_ping.saturating_add(bytes);
         if data.bytes_since_ping >= PING_BATCH_THRESHOLD {
             data.internal_ping();
@@ -142,14 +158,14 @@ impl DownloadBarrier {
     }
 
     pub(crate) async fn abort_with_reason(mut self, reason: AbortReason) {
-        let data = self.data.take().expect("abort_with_reason() is a sink");
+        let data = self.data.take().expect("every sink consumes the instance");
 
         *data.status.write().await = ActiveDownloadStatus::Aborted(reason);
         data.active_downloads.remove(&data.mirror, &data.debname);
     }
 
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
-        let mut data = self.data.take().expect("begin_rename() is a sink");
+        let mut data = self.data.take().expect("every sink consumes the instance");
 
         // Flush pending notification before dropping the sender, so
         // receivers can read the tail of the file before seeing the
@@ -206,9 +222,9 @@ pub(crate) struct RenameBarrier {
 
 impl RenameBarrier {
     pub(crate) fn release(mut self, path: PathBuf, bytes_received: u64) {
-        let mut data = self.data.take().expect("release() is a sink");
+        let mut data = self.data.take().expect("every sink consumes the instance");
 
-        if let Some(reservation) = data.quota_reservation.take() {
+        if let Some(reservation) = data.quota_reservation {
             reservation.finalize(bytes_received);
         }
 

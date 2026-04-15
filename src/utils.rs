@@ -7,11 +7,7 @@ use std::{
 use log::{debug, error};
 use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 
-use crate::{
-    Never,
-    deb_mirror::{self, Mirror},
-    guards::InitBarrier,
-};
+use crate::{Never, deb_mirror, global_config, guards::InitBarrier};
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
 #[macro_export]
@@ -37,6 +33,39 @@ macro_rules! static_assert {
     };
 }
 
+/// Tri-state of an in-progress download's partial-file handling.
+///
+/// - `Volatile`: non-permanent cache flavor — no partial-file semantics; caller creates a
+///   random temp file for the download.
+/// - `Fresh`: permanent cache flavor with no valid existing partial; the guard reserves
+///   the deterministic partial path so a failed download can be resumed on the next attempt.
+/// - `Resumable`: permanent cache flavor with an existing valid partial whose file handle
+///   has been held open since the size/ETag check (avoiding TOCTOU); caller resumes from
+///   `file`'s current offset.
+pub(crate) enum PartialDownload {
+    Volatile,
+    Fresh(TempPath),
+    Resumable {
+        file: tokio::fs::File,
+        guard: TempPath,
+    },
+}
+
+impl PartialDownload {
+    /// Downgrade a `Resumable` state to `Fresh` by removing the stale partial file and
+    /// re-creating the guard for the same path.  No-op for `Fresh` and `Volatile`.
+    pub(crate) async fn discard_resume(&mut self) {
+        *self = match std::mem::replace(self, Self::Volatile) {
+            Self::Volatile => Self::Volatile,
+            Self::Fresh(guard) => Self::Fresh(guard),
+            Self::Resumable { file, guard } => {
+                drop(file);
+                Self::Fresh(guard.renew().await)
+            }
+        };
+    }
+}
+
 /// A temporary file-path guard that automatically deletes the underlying file when dropped.
 ///
 /// When `keep_on_drop` is set to `true`, the file is preserved on drop instead of being deleted.
@@ -47,25 +76,37 @@ pub(crate) struct TempPath {
 }
 
 impl TempPath {
-    /// Create a new `TempPath` guard for an existing file.
-    pub(crate) fn new(path: PathBuf, keep_on_drop: bool) -> Self {
-        Self {
-            path: Some(path),
-            keep_on_drop,
-        }
-    }
-
     /// Defuse the temporary path guard, returning the underlying `PathBuf`.
-    pub(crate) fn into_inner(mut self) -> PathBuf {
+    pub(crate) fn defuse(mut self) -> PathBuf {
         std::mem::take(&mut self.path).expect("path has not been destructed yet")
     }
 
     /// Force deletion of the underlying file regardless of `keep_on_drop`.
-    pub(crate) async fn remove(mut self) {
-        if let Some(path) = self.path.take()
-            && let Err(err) = tokio::fs::remove_file(&path).await
-        {
-            log::warn!("Failed to remove partial file `{}`:  {err}", path.display());
+    async fn remove(mut self) -> PathBuf {
+        let path = std::mem::take(&mut self.path).expect("path has not been destructed yet");
+
+        if let Err(err) = tokio::fs::remove_file(&path).await {
+            let level = if err.kind() == std::io::ErrorKind::NotFound {
+                log::Level::Warn
+            } else {
+                log::Level::Error
+            };
+            log::log!(
+                level,
+                "Failed to remove partial file `{}`:  {err}",
+                path.display()
+            );
+        }
+
+        path
+    }
+
+    /// Remove the underlying file and return a fresh `TempPath` guarding the same path
+    /// with `keep_on_drop = true` so a retried download can still be resumed on failure.
+    pub(crate) async fn renew(self) -> Self {
+        Self {
+            path: Some(self.remove().await),
+            keep_on_drop: true,
         }
     }
 }
@@ -168,23 +209,6 @@ pub(crate) async fn tokio_tempfile(
     }
 }
 
-/// Compute a deterministic path for storing a partial download.
-///
-/// Returns `{cache_dir}/{mirror_cache_path}/tmp/{debname}.partial`.
-/// Uses the mirror's own cache directory to avoid collisions between mirrors.
-pub(crate) fn partial_path(cache_dir: &Path, mirror: &Mirror, debname: &str) -> PathBuf {
-    let mirror_dir = deb_mirror::mirror_cache_path_impl(&mirror.host, mirror.port, &mirror.path);
-    let filename = format!("{debname}.partial");
-    let filename = Path::new(&filename);
-    assert!(
-        filename.is_relative(),
-        "path construction must not contain absolute components"
-    );
-    [cache_dir, mirror_dir.as_path(), Path::new("tmp"), filename]
-        .iter()
-        .collect()
-}
-
 /// Open an existing partial file for writing at the end, returning the file, its current size,
 /// the file's modification time, and a `TempPath` guard with `keep_on_drop: true`.
 ///
@@ -194,60 +218,88 @@ pub(crate) fn partial_path(cache_dir: &Path, mirror: &Mirror, debname: &str) -> 
 /// By opening the file and querying size + mtime from the same file handle, this avoids
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
 pub(crate) async fn open_partial_file(
-    path: &Path,
-    _ibarrier: &InitBarrier<'_>, // ensures the file is opened while the init barrier is held
-) -> Result<(tokio::fs::File, u64, SystemTime, TempPath), tokio::io::Error> {
+    ibarrier: &InitBarrier<'_>,
+) -> Result<(tokio::fs::File, u64, SystemTime, TempPath), (tokio::io::Error, TempPath)> {
     use tokio::io::AsyncSeekExt as _;
 
-    let mut file = tokio::fs::File::options()
-        .write(true)
-        .read(true)
-        .open(path)
-        .await?;
+    async fn file_ops(path: &Path) -> Result<(tokio::fs::File, u64, SystemTime), tokio::io::Error> {
+        let mut file = tokio::fs::File::options()
+            .write(true)
+            .read(true)
+            .open(path)
+            .await?;
 
-    // Seek to the end so subsequent writes append correctly.
-    let size = file.seek(std::io::SeekFrom::End(0)).await?;
+        // Seek to the end so subsequent writes append correctly.
+        let size = file.seek(std::io::SeekFrom::End(0)).await?;
 
-    let mtime = file
-        .metadata()
-        .await?
-        .modified()
-        .expect("Platform should support modification timestamps via setup check");
+        let mtime = file
+            .metadata()
+            .await?
+            .modified()
+            .expect("Platform should support modification timestamps via setup check");
 
-    Ok((
-        file,
-        size,
-        mtime,
-        TempPath {
-            path: Some(path.to_path_buf()),
-            keep_on_drop: true,
-        },
-    ))
+        Ok((file, size, mtime))
+    }
+
+    let mirror = ibarrier.mirror();
+    let mirror_dir = deb_mirror::mirror_cache_path_impl(&mirror.host, mirror.port, &mirror.path);
+    let filename = format!("{debname}.partial", debname = ibarrier.debname());
+    let filename = Path::new(&filename);
+    assert!(
+        filename.is_relative(),
+        "path construction must not contain absolute components"
+    );
+    let path: PathBuf = [
+        &global_config().cache_directory,
+        mirror_dir.as_path(),
+        Path::new("tmp"),
+        filename,
+    ]
+    .iter()
+    .collect();
+
+    let guard = TempPath {
+        path: Some(path),
+        keep_on_drop: true,
+    };
+    match file_ops(&guard).await {
+        Ok((file, size, mtime)) => Ok((file, size, mtime, guard)),
+        Err(e) => Err((e, guard)),
+    }
 }
 
 /// Create a new file at the given deterministic partial path, returning the file and a
 /// `TempPath` guard with `keep_on_drop: true`.
 pub(crate) async fn create_partial_file(
-    path: &Path,
+    guard: TempPath,
     mode: u32,
-) -> Result<(tokio::fs::File, TempPath), tokio::io::Error> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+) -> Result<(tokio::fs::File, TempPath), (tokio::io::Error, PathBuf)> {
+    async fn file_ops(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        tokio::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .mode(mode)
+            .open(path)
+            .await
     }
 
-    let file = tokio::fs::File::options()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .read(true)
-        .mode(mode)
-        .open(path)
-        .await?;
+    let path = guard.defuse();
+
+    let file = match file_ops(&path, mode).await {
+        Ok(file) => file,
+        Err(err) => return Err((err, path)),
+    };
 
     Ok((
         file,
         TempPath {
-            path: Some(path.to_path_buf()),
+            path: Some(path),
             keep_on_drop: true,
         },
     ))
