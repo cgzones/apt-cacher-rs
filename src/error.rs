@@ -19,7 +19,6 @@ pub(crate) enum ProxyCacheError {
     Io(std::io::Error),
     Hyper(hyper::Error),
     Sqlx(sqlx::Error),
-    SystemTime(std::time::SystemTimeError),
     ClientDownloadRate {
         error: InsufficientRate,
         client: ClientInfo,
@@ -38,7 +37,6 @@ impl std::fmt::Display for ProxyCacheError {
             Self::Io(e) => write!(f, "{}", ErrorReport(e)),
             Self::Hyper(e) => write!(f, "{}", ErrorReport(e)),
             Self::Sqlx(e) => e.fmt(f),
-            Self::SystemTime(e) => e.fmt(f),
             Self::ClientDownloadRate { error, client } => error.display(client).fmt(f),
             Self::MirrorDownloadRate(MirrorDownloadRate {
                 download_rate_err,
@@ -93,12 +91,6 @@ impl From<hyper::Error> for ProxyCacheError {
 impl From<sqlx::Error> for ProxyCacheError {
     fn from(value: sqlx::Error) -> Self {
         Self::Sqlx(value)
-    }
-}
-
-impl From<std::time::SystemTimeError> for ProxyCacheError {
-    fn from(value: std::time::SystemTimeError) -> Self {
-        Self::SystemTime(value)
     }
 }
 
