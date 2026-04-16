@@ -242,19 +242,13 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
 
     let usage_retention_days = global_config().usage_retention_days;
     if usage_retention_days != 0 {
-        let keep_date = SystemTime::now()
-            - Duration::from_secs(
-                usage_retention_days
-                    .checked_mul(24 * 60 * 60)
-                    .expect("overflow check during config parsing"),
-            );
-        match keep_date.duration_since(SystemTime::UNIX_EPOCH) {
-            Ok(val) => {
-                if let Err(err) = appstate.database.delete_usage_logs(val).await {
-                    error!("Failed to delete old usage logs:  {err}");
-                }
-            }
-            Err(err) => error!("Failed to compute date for usage data retention:  {err}"),
+        let retention_secs = usage_retention_days
+            .checked_mul(24 * 60 * 60)
+            .expect("overflow check during config parsing");
+        let now_secs = coarsetime::Clock::now_since_epoch().as_secs();
+        let keep_date = Duration::from_secs(now_secs.saturating_sub(retention_secs));
+        if let Err(err) = appstate.database.delete_usage_logs(keep_date).await {
+            error!("Failed to delete old usage logs:  {err}");
         }
     }
 
@@ -366,12 +360,7 @@ async fn cleanup_mirror_deb_files(
 
     trace!("Origins ({}): {origins:?}", origins.len());
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|err| {
-            error!("Failed to get current timestamp:  {err}");
-            err
-        })?;
+    let now: Duration = coarsetime::Clock::now_since_epoch().into();
 
     trace!("Now: {now:?}");
 
