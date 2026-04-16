@@ -1,13 +1,12 @@
 use std::{
     ops::Deref,
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
 use log::{debug, error};
 use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 
-use crate::{Never, deb_mirror, global_config, guards::InitBarrier};
+use crate::{Never, deb_mirror, global_config, guards::InitBarrier, http_range::HttpDate};
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
 #[macro_export]
@@ -219,10 +218,10 @@ pub(crate) async fn tokio_tempfile(
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
 pub(crate) async fn open_partial_file(
     ibarrier: &InitBarrier<'_>,
-) -> Result<(tokio::fs::File, u64, SystemTime, TempPath), (tokio::io::Error, TempPath)> {
+) -> Result<(tokio::fs::File, u64, HttpDate, TempPath), (tokio::io::Error, TempPath)> {
     use tokio::io::AsyncSeekExt as _;
 
-    async fn file_ops(path: &Path) -> Result<(tokio::fs::File, u64, SystemTime), tokio::io::Error> {
+    async fn file_ops(path: &Path) -> Result<(tokio::fs::File, u64, HttpDate), tokio::io::Error> {
         let mut file = tokio::fs::File::options()
             .write(true)
             .read(true)
@@ -238,7 +237,7 @@ pub(crate) async fn open_partial_file(
             .modified()
             .expect("Platform should support modification timestamps via setup check");
 
-        Ok((file, size, mtime))
+        Ok((file, size, HttpDate::from(mtime)))
     }
 
     let mirror = ibarrier.mirror();

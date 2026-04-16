@@ -28,8 +28,7 @@ use crate::http_helpers::{
 };
 use crate::http_last_modified::read_last_modified;
 use crate::http_range::{
-    ParsedRange, cache_file_timestamp, compute_age, http_datetime_to_systemtime, http_parse_range,
-    systemtime_to_http_datetime,
+    HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range,
 };
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::{InsufficientRate, RateChecker};
@@ -769,6 +768,11 @@ async fn try_sendfile_request(
                             HumanFmt::Time(elapsed),
                             VOLATILE_CACHE_MAX_AGE.as_secs()
                         );
+                    } else {
+                        warn!(
+                            "Volatile file `{}` was modified in the future, ignoring modification time",
+                            cache_path.display()
+                        );
                     }
                 }
                 Err(err) => {
@@ -811,7 +815,7 @@ async fn try_sendfile_request(
 /// Pre-computed cache metadata used by [`evaluate_conditional_and_range`].
 struct CacheInfo {
     file_etag: Option<String>,
-    last_modified_for_ims: std::time::SystemTime,
+    last_modified_for_ims: HttpDate,
     last_modified_str: String,
     age: u32,
 }
@@ -839,11 +843,11 @@ fn read_cache_info(
     metadata: &std::fs::Metadata,
 ) -> CacheInfo {
     let file_etag = read_etag(file, file_path);
-    let cache_ts = cache_file_timestamp(metadata);
+    let cache_ts = cache_file_http_date(metadata);
     let stored_last_modified = read_last_modified(file, file_path);
     let (last_modified_for_ims, last_modified_str) = match stored_last_modified {
         Some((s, time)) => (time, s),
-        None => (cache_ts, systemtime_to_http_datetime(cache_ts)),
+        None => (cache_ts, cache_ts.format()),
     };
     let age = compute_age(metadata);
     CacheInfo {
@@ -880,7 +884,7 @@ async fn evaluate_conditional_and_range(
             .as_deref()
             .is_some_and(|etag| if_none_match(inm, etag))
     } else if let Some(ims) = if_modified_since_header
-        && let Some(ims_time) = http_datetime_to_systemtime(ims)
+        && let Some(ims_time) = HttpDate::parse(ims)
     {
         cache_info.last_modified_for_ims <= ims_time
     } else {

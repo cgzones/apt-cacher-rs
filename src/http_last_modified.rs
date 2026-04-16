@@ -1,8 +1,8 @@
-use std::{path::Path, time::SystemTime};
+use std::path::Path;
 
 use log::warn;
 
-use crate::{http_range::http_datetime_to_systemtime, xattr_helpers};
+use crate::{http_range::HttpDate, xattr_helpers};
 
 /// The extended attribute name used to store upstream `Last-Modified` values.
 const XATTR_LAST_MODIFIED: &str = "user.apt_cacher_rs.last_modified";
@@ -10,7 +10,7 @@ const XATTR_LAST_MODIFIED: &str = "user.apt_cacher_rs.last_modified";
 /// Validate that a string is a parseable HTTP-date per RFC 9110 §5.6.7.
 #[must_use]
 fn is_valid_http_date(s: &str) -> bool {
-    http_datetime_to_systemtime(s).is_some()
+    HttpDate::parse(s).is_some()
 }
 
 /// Read a `Last-Modified` value from the file's extended attributes.
@@ -21,10 +21,10 @@ fn is_valid_http_date(s: &str) -> bool {
 pub(crate) fn read_last_modified(
     file: &tokio::fs::File,
     display_path: &Path,
-) -> Option<(String, SystemTime)> {
+) -> Option<(String, HttpDate)> {
     let data = xattr_helpers::read_helper(file, display_path, XATTR_LAST_MODIFIED)?;
 
-    let Some(time) = http_datetime_to_systemtime(&data) else {
+    let Some(time) = HttpDate::parse(&data) else {
         warn!(
             "Discarding malformed Last-Modified from `{}`: {}",
             display_path.display(),
@@ -81,10 +81,7 @@ mod tests {
         // Skip the round-trip assertion when xattrs aren't supported on the test FS.
         if let Some((got_str, got_time)) = read_last_modified(&file, &path) {
             assert_eq!(got_str, value);
-            assert_eq!(
-                got_time,
-                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(12_345_678_909)
-            );
+            assert_eq!(got_time, HttpDate::from_secs(12_345_678_909));
         }
     }
 

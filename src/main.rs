@@ -62,7 +62,6 @@ use std::sync::OnceLock;
 use std::task::Poll::Pending;
 use std::task::Poll::Ready;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use channel_body::ChannelBody;
 use channel_body::ChannelBodyError;
@@ -162,11 +161,10 @@ use crate::http_etag::read_etag;
 use crate::http_etag::write_etag;
 use crate::http_last_modified::read_last_modified;
 use crate::http_last_modified::write_last_modified;
-use crate::http_range::cache_file_timestamp;
+use crate::http_range::HttpDate;
+use crate::http_range::cache_file_http_date;
 use crate::http_range::compute_age;
 use crate::http_range::format_http_date;
-use crate::http_range::http_datetime_to_systemtime;
-use crate::http_range::systemtime_to_http_datetime;
 use crate::humanfmt::HumanFmt;
 use crate::logstore::LogStore;
 use crate::task_cache_scan::task_cache_scan;
@@ -1031,7 +1029,7 @@ async fn serve_cached_file(
     fn decide_serve_304(
         req: &Request<Empty<()>>,
         file_etag: Option<&str>,
-        local_modification_time: SystemTime,
+        local_modification_time: HttpDate,
         conn_details: &ConnectionDetails,
     ) -> bool {
         // Handle If-None-Match (takes precedence over If-Modified-Since per RFC 9110 §13.1.2)
@@ -1054,7 +1052,7 @@ async fn serve_cached_file(
 
         if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE)
             && let Some(ims_str) = ims.to_str().ok()
-            && let Some(ims_time) = http_datetime_to_systemtime(ims_str)
+            && let Some(ims_time) = HttpDate::parse(ims_str)
             && local_modification_time <= ims_time
         {
             return true;
@@ -1090,11 +1088,11 @@ async fn serve_cached_file(
 
     // Prefer the upstream Last-Modified persisted in xattr (RFC 9110 §10.2.2). Fall back to the
     // cache file's birth/modification time when the xattr is unavailable.
-    let cache_ts = cache_file_timestamp(&metadata);
+    let cache_ts = cache_file_http_date(&metadata);
     let stored_last_modified = read_last_modified(&file, file_path);
     let (last_modified_for_ims, last_modified_str) = match stored_last_modified {
         Some((str, time)) => (time, str),
-        None => (cache_ts, systemtime_to_http_datetime(cache_ts)),
+        None => (cache_ts, cache_ts.format()),
     };
     let age = compute_age(&metadata);
 
@@ -1498,7 +1496,7 @@ async fn serve_volatile_file(
         "serve_volatile_file() assumes volatile flavor"
     );
 
-    let local_modification_time = match file.metadata().await {
+    let modified_system_time = match file.metadata().await {
         Ok(data) => data
             .modified()
             .expect("Platform should support modification timestamps via setup check"),
@@ -1510,27 +1508,35 @@ async fn serve_volatile_file(
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
+    let local_modification_time = HttpDate::from(modified_system_time);
 
-    // Cache volatile files for short periods to reduce up-to-date requests
-    if let Ok(elapsed) = local_modification_time.elapsed()
-        && elapsed < VOLATILE_CACHE_MAX_AGE
-    {
-        debug!(
-            "Volatile file `{}` is just {} old (limit: {}s), serving cached version...",
-            file_path.display(),
-            HumanFmt::Time(elapsed),
-            VOLATILE_CACHE_MAX_AGE.as_secs()
+    // Cache volatile files for short periods to reduce up-to-date requests.
+    // Compute age from the raw SystemTime — HttpDate rounds sub-second mtimes
+    // up to the next whole second, which would otherwise appear to be in the future.
+    if let Ok(elapsed) = modified_system_time.elapsed() {
+        if elapsed < VOLATILE_CACHE_MAX_AGE {
+            debug!(
+                "Volatile file `{}` is just {} old (limit: {}s), serving cached version...",
+                file_path.display(),
+                HumanFmt::Time(elapsed),
+                VOLATILE_CACHE_MAX_AGE.as_secs()
+            );
+
+            return serve_cached_file(
+                conn_details,
+                &req,
+                appstate.database_tx,
+                file,
+                file_path,
+                EtagState::Unknown,
+            )
+            .await;
+        }
+    } else {
+        warn!(
+            "Volatile file `{}` was modified in the future, ignoring modification time",
+            file_path.display()
         );
-
-        return serve_cached_file(
-            conn_details,
-            &req,
-            appstate.database_tx,
-            file,
-            file_path,
-            EtagState::Unknown,
-        )
-        .await;
     }
 
     let (init_tx, status) = appstate
@@ -2043,11 +2049,11 @@ async fn serve_unfinished_file(
 
     // Prefer the upstream Last-Modified persisted in xattr (RFC 9110 §10.2.2); fall back to the
     // cached file's birth/modification time when the xattr is unavailable.
-    let cache_ts = cache_file_timestamp(&md);
+    let cache_ts = cache_file_http_date(&md);
     let stored_last_modified = read_last_modified(&file, &file_path);
     let last_modified_str = match stored_last_modified {
         Some((str, _time)) => str,
-        None => systemtime_to_http_datetime(cache_ts),
+        None => cache_ts.format(),
     };
     let age = compute_age(&md);
 
@@ -2332,7 +2338,7 @@ enum CacheFileStat<'a> {
     Volatile {
         file: tokio::fs::File,
         file_path: &'a Path,
-        local_modification_time: SystemTime,
+        local_modification_time: HttpDate,
     },
     New,
 }
@@ -2452,7 +2458,7 @@ async fn serve_new_file(
             local_modification_time,
         } = cfstate
         {
-            let date_fmt = systemtime_to_http_datetime(*local_modification_time);
+            let date_fmt = local_modification_time.format();
 
             let r = request.headers_mut().append(
                 IF_MODIFIED_SINCE,
@@ -3028,7 +3034,7 @@ async fn serve_new_file(
         .get(LAST_MODIFIED)
         .and_then(|hv| hv.to_str().ok())
         .filter(|lm| {
-            if http_datetime_to_systemtime(lm).is_some() {
+            if HttpDate::parse(lm).is_some() {
                 true
             } else {
                 warn_once_or_info!(
