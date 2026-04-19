@@ -1,15 +1,10 @@
 # TODO
 
-* ~~Use sendfile(2) to deliver cached files.~~ (Implemented as the `sendfile` feature.)
-  Enable with `--features sendfile`. When enabled, permanently cached .deb files
-  are served using sendfile(2), bypassing hyper's Body abstraction entirely.
-  Requests not applicable for sendfile (volatile files, active downloads,
-  web interface, proxy pass-through) fall back to the standard hyper-based handler.
-
 * ipnet parser updates:
   - https://github.com/krisprice/ipnet/issues/32
   - https://github.com/rust-lang/rust/pull/83652/files
 
+* on the next database scheme change add `ON DELETE CASCADE` constraints to improve cleanup
 
 * proxy without caching on quota hit?
 * verify checksums of downloaded files (on, off, lazy)
@@ -17,7 +12,7 @@
 * cache package list files and prefetch them every 30min?
 * add option to import packages locally
 * add throttling based on server loadavg?
-* use std::hint::likely once stable
+* use std::hint::likely once stable (https://github.com/rust-lang/rust/issues/151619)
 
 # Utils
 
