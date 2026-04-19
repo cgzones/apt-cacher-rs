@@ -2392,7 +2392,6 @@ async fn serve_new_file(
     #[must_use]
     fn build_fwd_request(
         uri: &Uri,
-        max_age: u32,
         host: &HeaderValue,
         cfstate: &CacheFileStat<'_>,
         volatile_etag: &EtagState,
@@ -2466,10 +2465,9 @@ async fn serve_new_file(
             );
             assert!(!r, "header does not exist by previous construction");
 
-            let r = request.headers_mut().append(
-                CACHE_CONTROL,
-                HeaderValue::try_from(format!("max-age={max_age}")).expect("string is valid"),
-            );
+            let r = request
+                .headers_mut()
+                .append(CACHE_CONTROL, HeaderValue::from_static("max-age=300"));
             assert!(!r, "header does not exist by previous construction");
 
             if let EtagState::Some(etag) = volatile_etag {
@@ -2531,32 +2529,14 @@ async fn serve_new_file(
         CacheFileStat::New => (true, 0),
     };
 
-    let mut max_age = 300;
     let mut host = None;
 
     for (name, value) in req.headers() {
         match name {
-            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE => (),
+            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE | &CACHE_CONTROL => (),
             n if n == PROXY_CONNECTION => (),
             &HOST => host = Some(value),
-            /*
-             * TODO: CACHE_CONTROL handling
-             * Ignore client cache settings for now.
-             * For new files they are irrelevant.
-             * We assume pool files never change and for dists file we set them manually.
-             */
-            &CACHE_CONTROL => {
-                if let Ok(s) = value.to_str() {
-                    for p in s.split(',') {
-                        if let Some((key, val)) = p.split_once('=')
-                            && key.trim() == "max-age"
-                            && let Ok(v) = val.parse::<u32>()
-                        {
-                            max_age = v;
-                        }
-                    }
-                }
-            }
+
             _ => warn_once_or_info!(
                 "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}",
                 conn_details.client
@@ -2564,7 +2544,6 @@ async fn serve_new_file(
         }
     }
     // mark immutable
-    let max_age = max_age;
     let host = match host {
         Some(h) => h,
         None => {
@@ -2666,7 +2645,6 @@ async fn serve_new_file(
 
     let fwd_request = build_fwd_request(
         &req_uri,
-        max_age,
         host,
         &cfstate,
         &volatile_etag,
@@ -2707,7 +2685,6 @@ async fn serve_new_file(
 
             let redirected_request = build_fwd_request(
                 &req_uri,
-                max_age,
                 host,
                 &cfstate,
                 &volatile_etag,
@@ -2834,15 +2811,8 @@ async fn serve_new_file(
         // (and any prior cached data is being superseded), so from the
         // upstream's perspective this is a fresh unconditional fetch — no
         // If-Modified-Since, no If-None-Match, no Range.
-        let retry_request = build_fwd_request(
-            &req_uri,
-            max_age,
-            host,
-            &CacheFileStat::New,
-            &volatile_etag,
-            0,
-            None,
-        );
+        let retry_request =
+            build_fwd_request(&req_uri, host, &CacheFileStat::New, &volatile_etag, 0, None);
 
         fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
             Ok(r) => r,
