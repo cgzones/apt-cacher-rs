@@ -468,10 +468,9 @@ pub(crate) fn valid_mirrorname(name: &str) -> bool {
 fn valid_path_segment(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
-        && name
-            .chars()
-            .enumerate()
-            .all(|(i, c)| c.is_ascii_alphanumeric() || (i > 0 && c == '-'))
+        && name.chars().enumerate().all(|(i, c)| {
+            c.is_ascii_alphanumeric() || (i > 0 && (c == '-' || c == '.' || c == '_'))
+        })
 }
 
 #[must_use]
@@ -854,8 +853,18 @@ mod tests {
         assert!(!valid_filename(""));
         assert!(!valid_filename("."));
         assert!(!valid_filename(".."));
-        assert!(!valid_filename("foo/bar"));
+        assert!(!valid_filename("-foo"));
+        assert!(!valid_filename(".foo"));
+        assert!(!valid_filename("_foo"));
         assert!(!valid_filename("foo\nbar"));
+        assert!(!valid_filename("foo/bar"));
+        assert!(!valid_filename("foo/./bar"));
+        assert!(!valid_filename("foo/../bar"));
+        assert!(!valid_filename("foo//bar"));
+        assert!(!valid_filename("/"));
+        assert!(!valid_filename("/debian"));
+        assert!(!valid_filename("~/foo"));
+        assert!(!valid_filename("~foo"));
     }
 
     #[test]
@@ -870,12 +879,18 @@ mod tests {
         assert!(!valid_mirrorname(""));
         assert!(!valid_mirrorname("."));
         assert!(!valid_mirrorname(".."));
+        assert!(!valid_mirrorname("-foo"));
+        assert!(!valid_mirrorname(".foo"));
+        assert!(!valid_mirrorname("_foo"));
         assert!(!valid_mirrorname("foo\nbar"));
+        assert!(!valid_mirrorname("foo/bar"));
         assert!(!valid_mirrorname("foo/./bar"));
         assert!(!valid_mirrorname("foo/../bar"));
         assert!(!valid_mirrorname("foo//bar"));
         assert!(!valid_mirrorname("/"));
         assert!(!valid_mirrorname("/debian"));
+        assert!(!valid_mirrorname("~/foo"));
+        assert!(!valid_mirrorname("~foo"));
     }
 
     #[test]
@@ -889,6 +904,8 @@ mod tests {
         assert!(!valid_distribution("."));
         assert!(!valid_distribution(".."));
         assert!(!valid_distribution("-foo"));
+        assert!(!valid_distribution(".foo"));
+        assert!(!valid_distribution("_foo"));
         assert!(!valid_distribution("foo\nbar"));
         assert!(!valid_distribution("foo/bar"));
         assert!(!valid_distribution("foo/./bar"));
@@ -896,6 +913,8 @@ mod tests {
         assert!(!valid_distribution("foo//bar"));
         assert!(!valid_distribution("/"));
         assert!(!valid_distribution("/debian"));
+        assert!(!valid_distribution("~/foo"));
+        assert!(!valid_distribution("~foo"));
     }
 
     #[test]
@@ -903,12 +922,16 @@ mod tests {
         /* valid */
         assert!(valid_component("main"));
         assert!(valid_component("non-free"));
+        assert!(valid_component("mysql-8.0"));
+        assert!(valid_component("foo_bar"));
 
         /* invalid */
         assert!(!valid_component(""));
         assert!(!valid_component("."));
         assert!(!valid_component(".."));
         assert!(!valid_component("-foo"));
+        assert!(!valid_component(".foo"));
+        assert!(!valid_component("_foo"));
         assert!(!valid_component("foo\nbar"));
         assert!(!valid_component("foo/bar"));
         assert!(!valid_component("foo/./bar"));
@@ -916,6 +939,8 @@ mod tests {
         assert!(!valid_component("foo//bar"));
         assert!(!valid_component("/"));
         assert!(!valid_component("/debian"));
+        assert!(!valid_component("~/foo"));
+        assert!(!valid_component("~foo"));
     }
 
     #[test]
@@ -928,6 +953,8 @@ mod tests {
         assert!(!valid_architecture("."));
         assert!(!valid_architecture(".."));
         assert!(!valid_architecture("-foo"));
+        assert!(!valid_architecture(".foo"));
+        assert!(!valid_architecture("_foo"));
         assert!(!valid_architecture("foo\nbar"));
         assert!(!valid_architecture("foo/bar"));
         assert!(!valid_architecture("foo/./bar"));
@@ -935,6 +962,8 @@ mod tests {
         assert!(!valid_architecture("foo//bar"));
         assert!(!valid_architecture("/"));
         assert!(!valid_architecture("/debian"));
+        assert!(!valid_architecture("~/foo"));
+        assert!(!valid_architecture("~foo"));
     }
 
     #[test]
