@@ -290,12 +290,13 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
     let (html_table_uncacheables, uncacheable_rows) = build_uncacheable_table();
 
     let rd = RUNTIMEDETAILS.get().expect("Should be set");
-    let database_size_fmt = match tokio::fs::metadata(&rd.config.database_path).await {
+    let cfg = global_config();
+    let database_size_fmt = match tokio::fs::metadata(&cfg.database_path).await {
         Ok(data) => HumanFmt::Size(data.len()).to_string(),
         Err(err) => {
             error!(
                 "Failed to access database file `{}`:  {err}",
-                rd.config.database_path.display()
+                cfg.database_path.display()
             );
             "N/A".to_string()
         }
@@ -307,6 +308,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
 
     let now = OffsetDateTime::now_utc();
     let memory_stats = memory_stats::memory_stats();
+    let start_time = *rd.start_time.read();
 
     let html: String = HtmlPage::new()
         .with_title("apt-cacher-rs web interface")
@@ -329,14 +331,14 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
                      <br>Active Client Downloads:&nbsp;&nbsp;{}",
                     APP_VERSION,
                     get_features(false).replace('\n', " "),
-                    rd.start_time
+                    start_time
                         .format(WEBUI_DATE_FORMAT)
                         .expect("timestamp should be formattable"),
                     now.format(WEBUI_DATE_FORMAT)
                         .expect("timestamp should be formattable"),
-                    HumanFmt::Time((now - rd.start_time).unsigned_abs()),
-                    rd.config.bind_addr,
-                    rd.config.bind_port,
+                    HumanFmt::Time((now - start_time).unsigned_abs()),
+                    cfg.bind_addr,
+                    cfg.bind_port,
                     database_size_fmt,
                     HumanFmt::Size(cache_size),
                     memory_stats.map_or_else(

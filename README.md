@@ -41,7 +41,11 @@ Note that connections from the client to the proxy are unencrypted (but all pack
 
 Packages in the cache that are no longer referenced by any known upstream repository are pruned every 24h, unless they have been downloaded less than 3 days ago.
 The list of known upstream repositories is gathered by inspecting proxied package list requests (i.e. by *apt update*).
-The cleanup can also be manually triggered by sending the signal `USR1` to the `apt-cacher-rs` process.
+The cleanup can also be manually triggered by sending the signal `USR2` to the `apt-cacher-rs` process.
+
+`apt-cacher-rs` also reacts to these maintenance signals:
+- `HUP`: reload configuration and reset in-memory runtime state
+- `USR1`: reopen the active log file (when logging to a file)
 
 ## TLS
 

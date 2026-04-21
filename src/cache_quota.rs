@@ -10,7 +10,7 @@ pub(crate) struct QuotaExceeded;
 #[derive(Clone)]
 pub(crate) struct CacheQuota {
     cache_size: Arc<parking_lot::Mutex<u64>>,
-    quota_config: Option<NonZero<u64>>,
+    quota_config: Arc<parking_lot::Mutex<Option<NonZero<u64>>>>,
 }
 
 impl CacheQuota {
@@ -19,7 +19,7 @@ impl CacheQuota {
     pub(crate) fn new(initial: u64, quota_config: Option<NonZero<u64>>) -> Self {
         Self {
             cache_size: Arc::new(parking_lot::Mutex::new(initial)),
-            quota_config,
+            quota_config: Arc::new(parking_lot::Mutex::new(quota_config)),
         }
     }
 
@@ -37,7 +37,8 @@ impl CacheQuota {
         let mut mg = self.cache_size.lock();
         let curr = *mg;
 
-        if let Some(quota) = self.quota_config {
+        let quota_config = *self.quota_config.lock();
+        if let Some(quota) = quota_config {
             let net_add = reserved.get().saturating_sub(prev_file_size);
             let new_size = curr.checked_add(net_add);
             if new_size.is_none_or(|s| s > quota.get()) {
@@ -123,13 +124,18 @@ impl CacheQuota {
             *mg = 0;
         }
     }
+
+    pub(crate) fn reset(&self, size: u64, quota_config: Option<NonZero<u64>>) {
+        *self.cache_size.lock() = size;
+        *self.quota_config.lock() = quota_config;
+    }
 }
 
 impl std::fmt::Debug for CacheQuota {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CacheQuota")
             .field("cache_size", &*self.cache_size.lock())
-            .field("quota_config", &self.quota_config)
+            .field("quota_config", &*self.quota_config.lock())
             .finish()
     }
 }
@@ -188,5 +194,32 @@ impl Drop for QuotaReservation {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::nonzero;
+
+    use super::CacheQuota;
+    use crate::ContentLength;
+
+    #[test]
+    fn reset_updates_size_and_quota() {
+        let quota = CacheQuota::new(100, Some(nonzero!(150)));
+        let reservation = quota.try_acquire(ContentLength::Exact(nonzero!(40)), 0, "test.deb");
+        assert!(reservation.is_ok());
+        if let Ok(reservation) = reservation {
+            reservation.finalize(40);
+        }
+        assert_eq!(quota.current_size(), 140);
+
+        quota.reset(0, Some(nonzero!(10)));
+        assert_eq!(quota.current_size(), 0);
+        assert!(
+            quota
+                .try_acquire(ContentLength::Exact(nonzero!(40)), 0, "test.deb")
+                .is_err()
+        );
     }
 }

@@ -30,3 +30,8 @@ pub(crate) fn record_uncacheable(host: &DomainName, path: &str) {
 pub(crate) fn get_uncacheables() -> &'static parking_lot::RwLock<RingBuffer<(DomainName, String)>> {
     &UNCACHEABLES
 }
+
+pub(crate) fn clear_uncacheables() {
+    let capacity = UNCACHEABLES.read().capacity();
+    *UNCACHEABLES.write() = RingBuffer::new(capacity);
+}

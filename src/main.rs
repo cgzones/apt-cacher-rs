@@ -56,6 +56,7 @@ use std::convert::Infallible;
 use std::error::Error as _;
 use std::fmt::Debug;
 use std::fmt::Display;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::io::ErrorKind;
@@ -178,6 +179,7 @@ use crate::logstore::LogStore;
 use crate::task_cache_scan::task_cache_scan;
 use crate::task_cleanup::task_cleanup;
 use crate::task_setup::task_setup;
+use crate::uncacheables::clear_uncacheables;
 use crate::uncacheables::record_uncacheable;
 use crate::utils::TempPath;
 use crate::utils::tokio_tempfile;
@@ -4172,7 +4174,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 rd.cache_quota.add(cache_size);
 
-                let disk_quota = rd.config.disk_quota;
+                let disk_quota = global_config().disk_quota;
 
                 match disk_quota {
                     Some(val) => {
@@ -4284,7 +4286,9 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let active_downloads = ActiveDownloads::new();
 
     let mut term_signal = tokio::signal::unix::signal(SignalKind::terminate())?;
+    let mut hup_signal = tokio::signal::unix::signal(SignalKind::hangup())?;
     let mut usr1_signal = tokio::signal::unix::signal(SignalKind::user_defined1())?;
+    let mut usr2_signal = tokio::signal::unix::signal(SignalKind::user_defined2())?;
 
     let first_cleanup = tokio::time::Instant::now() + Duration::from_hours(1);
     let mut cleanup_interval = tokio::time::interval_at(first_cleanup, Duration::from_hours(24));
@@ -4341,7 +4345,16 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 continue;
             },
             _ = usr1_signal.recv() => {
-                info!("SIGUSR1 received, issuing cleanup...");
+                info!("SIGUSR1 received, reopening log file...");
+                match reopen_output_log_file() {
+                    Ok(true) => info!("Log file reopened"),
+                    Ok(false) => info!("Ignoring SIGUSR1 because logging is set to console"),
+                    Err(err) => error!("Failed to reopen log file:  {err}"),
+                }
+                continue;
+            },
+            _ = usr2_signal.recv() => {
+                info!("SIGUSR2 received, issuing cleanup...");
                 cleanup_interval.reset();
                 let appstate = appstate.clone();
                 tokio::task::spawn( async move {
@@ -4349,6 +4362,19 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         error!("Error performing cleanup task:  {err}");
                     }
                 });
+                continue;
+            },
+            _ = hup_signal.recv() => {
+                info!("SIGHUP received, reloading configuration...");
+                match reload_configuration() {
+                    Ok(()) => {
+                        cleanup_interval.reset();
+                        info!("Configuration reloaded");
+                    }
+                    Err(err) => {
+                        error!("Failed to reload configuration:  {err}");
+                    }
+                }
                 continue;
             },
             n = listener.accept() => n
@@ -4569,21 +4595,58 @@ struct Cli {
 
 #[derive(Debug)]
 struct RuntimeDetails {
-    start_time: time::OffsetDateTime,
-    config: Config,
+    start_time: parking_lot::RwLock<time::OffsetDateTime>,
     cache_quota: cache_quota::CacheQuota,
+}
+
+#[derive(Clone, Debug)]
+struct ReopenableLogFile {
+    path: PathBuf,
+    file: Arc<parking_lot::Mutex<File>>,
+}
+
+impl ReopenableLogFile {
+    fn new(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new().append(true).create(true).open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Arc::new(parking_lot::Mutex::new(file)),
+        })
+    }
+
+    fn reopen(&self) -> std::io::Result<()> {
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)?;
+        *self.file.lock() = file;
+        Ok(())
+    }
+}
+
+impl std::io::Write for ReopenableLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut *self.file.lock(), buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut *self.file.lock())
+    }
 }
 
 static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
 static LOGSTORE: OnceLock<LogStore> = OnceLock::new();
+static GLOBAL_CONFIG: OnceLock<parking_lot::RwLock<&'static Config>> = OnceLock::new();
+static CONFIG_FILE_PATH: OnceLock<PathBuf> = OnceLock::new();
+static OUTPUT_LOG_FILE: OnceLock<ReopenableLogFile> = OnceLock::new();
 
 #[must_use]
 #[inline]
 pub(crate) fn global_config() -> &'static Config {
-    &RUNTIMEDETAILS
+    *GLOBAL_CONFIG
         .get()
         .expect("Global was initialized in main()")
-        .config
+        .read()
 }
 
 #[must_use]
@@ -4593,6 +4656,62 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
         .get()
         .expect("Global was initialized in main()")
         .cache_quota
+}
+
+fn reset_runtime_state(new_config: &'static Config) {
+    if let Some(cache) = SCHEME_CACHE.get() {
+        cache.write().clear();
+    }
+
+    #[cfg(feature = "ktls")]
+    if let Some(cache) = KTLS_BLOCKED.get() {
+        cache.write().clear();
+    }
+
+    clear_uncacheables();
+    global_cache_quota().reset(0, new_config.disk_quota);
+
+    let rd = RUNTIMEDETAILS
+        .get()
+        .expect("Global was initialized in main()");
+    *rd.start_time.write() = time::OffsetDateTime::now_utc();
+}
+
+fn reload_configuration() -> anyhow::Result<()> {
+    let config_path = CONFIG_FILE_PATH
+        .get()
+        .expect("Global was initialized in main()");
+    let (config, cfg_fallback, config_warnings) = Config::new(config_path)?;
+    let config = Box::leak(Box::new(config));
+
+    *GLOBAL_CONFIG
+        .get()
+        .expect("Global was initialized in main()")
+        .write() = config;
+
+    if cfg_fallback {
+        info!(
+            "Default configuration file `{}` not found during reload, using defaults",
+            config_path.display()
+        );
+    }
+
+    for warning in config_warnings {
+        warn!("Configuration reload:  {warning}");
+    }
+
+    reset_runtime_state(config);
+    Ok(())
+}
+
+fn reopen_output_log_file() -> anyhow::Result<bool> {
+    match OUTPUT_LOG_FILE.get() {
+        Some(file) => {
+            file.reopen()?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -4607,6 +4726,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let (config, cfg_fallback, config_warnings) = Config::new(&args.config_file)?;
+    let config = Box::leak(Box::new(config));
+
+    CONFIG_FILE_PATH
+        .set(args.config_file.clone())
+        .expect("Initial set in main() should succeed");
+    GLOBAL_CONFIG
+        .set(parking_lot::RwLock::new(config))
+        .expect("Initial set in main() should succeed");
 
     let output_log_level = args.log_level.unwrap_or(config.log_level);
     let output_log_file = args.log_file.as_ref().unwrap_or(&config.log_file);
@@ -4670,13 +4797,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 clippy::print_stderr,
                 reason = "print to stderr for log file open error"
             )]
-            let log_file_handle = match OpenOptions::new().append(true).create(true).open(path) {
+            let log_file_handle = match ReopenableLogFile::new(path) {
                 Ok(file) => file,
                 Err(err) => {
                     eprintln!("Failed to open log file `{}`:  {err}", path.display());
                     std::process::exit(1);
                 }
             };
+            OUTPUT_LOG_FILE
+                .set(log_file_handle.clone())
+                .expect("Initial set in main() should succeed");
 
             CombinedLogger::init(vec![
                 WriteLogger::new(output_log_level, output_log_config, log_file_handle),
@@ -4687,9 +4817,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     RUNTIMEDETAILS
         .set(RuntimeDetails {
-            start_time: time::OffsetDateTime::now_utc(),
+            start_time: parking_lot::RwLock::new(time::OffsetDateTime::now_utc()),
             cache_quota: cache_quota::CacheQuota::new(0, config.disk_quota),
-            config,
         })
         .expect("Initial set in main() should succeed");
 
