@@ -56,9 +56,7 @@ use std::convert::Infallible;
 use std::error::Error as _;
 use std::fmt::Debug;
 use std::fmt::Display;
-use std::fs::OpenOptions;
 use std::hash::Hash;
-use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZero;
 use std::os::unix::fs::MetadataExt as _;
@@ -3436,11 +3434,11 @@ fn connect_response(
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 if let Err(err) = tunnel(client, upgraded, &host, port).await {
-                    if err.kind() == ErrorKind::NotConnected {
+                    if err.kind() == std::io::ErrorKind::NotConnected {
                         info!(
                             "Error tunneling connection for client {client} to {host}:{port}:  {err}"
                         );
-                    } else if err.kind() == ErrorKind::ConnectionReset {
+                    } else if err.kind() == std::io::ErrorKind::ConnectionReset {
                         warn!(
                             "Error tunneling connection for client {client} to {host}:{port}:  {err}"
                         );
@@ -4172,9 +4170,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 rd.cache_quota.add(cache_size);
 
-                let disk_quota = rd.config.disk_quota;
-
-                match disk_quota {
+                match rd.config.disk_quota {
                     Some(val) => {
                         let val = val.get();
                         if cache_size > val {
@@ -4285,6 +4281,7 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut term_signal = tokio::signal::unix::signal(SignalKind::terminate())?;
     let mut usr1_signal = tokio::signal::unix::signal(SignalKind::user_defined1())?;
+    let mut usr2_signal = tokio::signal::unix::signal(SignalKind::user_defined2())?;
 
     let first_cleanup = tokio::time::Instant::now() + Duration::from_hours(1);
     let mut cleanup_interval = tokio::time::interval_at(first_cleanup, Duration::from_hours(24));
@@ -4341,7 +4338,23 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 continue;
             },
             _ = usr1_signal.recv() => {
-                info!("SIGUSR1 received, issuing cleanup...");
+                if let Some(output_log_file) = OUTPUT_LOG_FILE.get() {
+                    info!("SIGUSR1 received, reopening log file `{}`...", output_log_file.path.display());
+                    let res = tokio::task::block_in_place(|| output_log_file.reopen());
+                    match res {
+                        Ok(()) => info!("Log file `{}` reopened", output_log_file.path.display()),
+                        Err(err) => error!(
+                            "Failed to reopen log file `{}`:  {err}",
+                            output_log_file.path.display()
+                        ),
+                    }
+                } else {
+                    info!("Ignoring SIGUSR1 because logging is set to console");
+                }
+                continue;
+            },
+            _ = usr2_signal.recv() => {
+                info!("SIGUSR2 received, issuing cleanup...");
                 cleanup_interval.reset();
                 let appstate = appstate.clone();
                 tokio::task::spawn( async move {
@@ -4574,8 +4587,49 @@ struct RuntimeDetails {
     cache_quota: cache_quota::CacheQuota,
 }
 
+#[derive(Clone, Debug)]
+struct ReopenableLogFile {
+    path: PathBuf,
+    file: Arc<parking_lot::Mutex<std::fs::File>>,
+}
+
+impl ReopenableLogFile {
+    fn new(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Arc::new(parking_lot::Mutex::new(file)),
+        })
+    }
+
+    fn reopen(&self) -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)?;
+        *self.file.lock() = file;
+        Ok(())
+    }
+}
+
+impl std::io::Write for ReopenableLogFile {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut *self.file.lock(), buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut *self.file.lock())
+    }
+}
+
 static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
 static LOGSTORE: OnceLock<LogStore> = OnceLock::new();
+static OUTPUT_LOG_FILE: OnceLock<ReopenableLogFile> = OnceLock::new();
 
 #[must_use]
 #[inline]
@@ -4670,13 +4724,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 clippy::print_stderr,
                 reason = "print to stderr for log file open error"
             )]
-            let log_file_handle = match OpenOptions::new().append(true).create(true).open(path) {
+            let log_file_handle = match ReopenableLogFile::new(path) {
                 Ok(file) => file,
                 Err(err) => {
                     eprintln!("Failed to open log file `{}`:  {err}", path.display());
                     std::process::exit(1);
                 }
             };
+            OUTPUT_LOG_FILE
+                .set(log_file_handle.clone())
+                .expect("Initial set in main() should succeed");
 
             CombinedLogger::init(vec![
                 WriteLogger::new(output_log_level, output_log_config, log_file_handle),
