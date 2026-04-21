@@ -3,11 +3,13 @@ name: Dependency Linting
 on:
   push:
     paths:
+      - ".github/workflows/deny.yml"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - "**/deny.toml"
   pull_request:
     paths:
+      - ".github/workflows/deny.yml"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - "**/deny.toml"
