@@ -3,6 +3,9 @@
 //! Used for buffers that hold TLS key material or partially-decrypted data
 //! to reduce the window during which secrets remain in memory.
 
+use std::{num::NonZero, sync::LazyLock};
+
+use log::{debug, error};
 use nix::libc;
 
 use crate::warn_once_or_debug;
@@ -92,6 +95,45 @@ impl Drop for SecureVec {
     }
 }
 
+static PAGE_SIZE: LazyLock<Option<NonZero<usize>>> =
+    LazyLock::new(
+        || match nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE) {
+            // TODO: use `if let` guards once rust 1.95 is commonly available
+            Ok(Some(size)) => {
+                if let Ok(size) = usize::try_from(size)
+                    && let Some(size) = NonZero::new(size)
+                {
+                    debug!("Page size: {size} bytes");
+                    Some(size)
+                } else {
+                    error!("Invalid page size of {size} bytes");
+                    None
+                }
+            }
+            Ok(None) => {
+                error!("Page size is not available");
+                None
+            }
+
+            Err(errno) => {
+                error!("Failed to get page size:  {errno}");
+                None
+            }
+        },
+    );
+
+fn round_down(a: usize, b: NonZero<usize>) -> usize {
+    a - (a % b.get())
+}
+
+fn round_up(a: usize, b: NonZero<usize>) -> Option<usize> {
+    let rem = a % b.get();
+    if rem == 0 {
+        return Some(a);
+    }
+    a.checked_add(b.get() - rem)
+}
+
 /// Zeroize memory using `explicit_bzero`, which is guaranteed not to be
 /// optimized away by the compiler.
 ///
@@ -161,8 +203,28 @@ unsafe fn try_madvise_dontdump(ptr: *const u8, len: usize) {
         return;
     }
 
-    // SAFETY: ptr points to `len` bytes of a valid allocation guaranteed by the caller.
-    let rc = unsafe { libc::madvise(ptr.cast_mut().cast(), len, libc::MADV_DONTDUMP) };
+    let ptr: *mut libc::c_void = ptr.cast_mut().cast();
+
+    let (aligned_ptr, aligned_len) = if let Some(page_size) = *PAGE_SIZE {
+        let start = ptr as usize;
+        let end = start
+            .checked_add(len)
+            .expect("caller guaranteed ptr is valid for len bytes");
+        let start_aligned = round_down(start, page_size);
+        let end_aligned =
+            round_up(end, page_size).expect("caller guaranteed ptr is valid for len bytes");
+
+        (
+            start_aligned as *mut libc::c_void,
+            end_aligned - start_aligned,
+        )
+    } else {
+        (ptr, len)
+    };
+
+    // SAFETY: aligned_ptr points to `aligned_len` bytes covering the original allocation range
+    // guaranteed by the caller, expanded to page boundaries as required by `madvise`.
+    let rc = unsafe { libc::madvise(aligned_ptr, aligned_len, libc::MADV_DONTDUMP) };
     if rc != 0 {
         warn_once_or_debug!(
             "madvise(MADV_DONTDUMP, {len}) failed:  {}",
@@ -185,8 +247,28 @@ unsafe fn try_madvise_dodump(ptr: *const u8, len: usize) {
         return;
     }
 
-    // SAFETY: ptr points to `len` bytes of a valid allocation guaranteed by the caller.
-    let rc = unsafe { libc::madvise(ptr.cast_mut().cast(), len, libc::MADV_DODUMP) };
+    let ptr: *mut libc::c_void = ptr.cast_mut().cast();
+
+    let (aligned_ptr, aligned_len) = if let Some(page_size) = *PAGE_SIZE {
+        let start = ptr as usize;
+        let end = start
+            .checked_add(len)
+            .expect("caller guaranteed ptr is valid for len bytes");
+        let start_aligned = round_down(start, page_size);
+        let end_aligned =
+            round_up(end, page_size).expect("caller guaranteed ptr is valid for len bytes");
+
+        (
+            start_aligned as *mut libc::c_void,
+            end_aligned - start_aligned,
+        )
+    } else {
+        (ptr, len)
+    };
+
+    // SAFETY: aligned_ptr points to `aligned_len` bytes covering the original allocation range
+    // guaranteed by the caller, expanded to page boundaries as required by `madvise`.
+    let rc = unsafe { libc::madvise(aligned_ptr, aligned_len, libc::MADV_DODUMP) };
     if rc != 0 {
         warn_once_or_debug!(
             "madvise(MADV_DODUMP, {len}) failed:  {}",
@@ -201,7 +283,9 @@ unsafe fn try_madvise_dodump(ptr: *const u8, len: usize) {
     reason = "tests assert exact len via assert_eq! before indexing"
 )]
 mod tests {
-    use super::SecureVec;
+    use crate::nonzero;
+
+    use super::*;
 
     #[test]
     fn new_zero_size() {
@@ -388,5 +472,23 @@ mod tests {
             !s.contains("secret"),
             "raw contents must not appear in Debug output: {s}"
         );
+    }
+
+    #[test]
+    fn test_round_down() {
+        assert_eq!(round_down(10, nonzero!(12)), 0);
+        assert_eq!(round_down(10, nonzero!(7)), 7);
+        assert_eq!(round_down(10, nonzero!(3)), 9);
+        assert_eq!(round_down(10, nonzero!(2)), 10);
+        assert_eq!(round_down(10, nonzero!(1)), 10);
+    }
+
+    #[test]
+    fn test_round_up() {
+        assert_eq!(round_up(10, nonzero!(12)), Some(12));
+        assert_eq!(round_up(10, nonzero!(7)), Some(14));
+        assert_eq!(round_up(10, nonzero!(3)), Some(12));
+        assert_eq!(round_up(10, nonzero!(2)), Some(10));
+        assert_eq!(round_up(10, nonzero!(1)), Some(10));
     }
 }
