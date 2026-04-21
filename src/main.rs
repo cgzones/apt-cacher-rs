@@ -1076,7 +1076,7 @@ async fn serve_cached_file(
         false
     }
 
-    let aliased = match conn_details.aliased_host {
+    let aliased = match &conn_details.aliased_host {
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
     };
@@ -1598,7 +1598,7 @@ pub(crate) enum CachedFlavor {
 pub(crate) struct ConnectionDetails {
     pub(crate) client: ClientInfo,
     pub(crate) mirror: Mirror,
-    pub(crate) aliased_host: Option<&'static DomainName>,
+    pub(crate) aliased_host: Option<DomainName>,
     pub(crate) debname: String,
     pub(crate) cached_flavor: CachedFlavor,
     pub(crate) subdir: Option<&'static Path>,
@@ -1609,7 +1609,7 @@ impl ConnectionDetails {
     pub(crate) fn cache_dir_path(&self) -> PathBuf {
         let root = &global_config().cache_directory;
 
-        let host = self.aliased_host.unwrap_or(&self.mirror.host);
+        let host = self.aliased_host.as_ref().unwrap_or(&self.mirror.host);
         let host = host.format_cache_dir(self.mirror.port);
         let host = Path::new(host.as_ref());
         assert!(
@@ -2074,6 +2074,7 @@ async fn serve_unfinished_file(
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let buf_size = config.buffer_size;
 
     tokio::task::spawn(async move {
         let start = Instant::now();
@@ -2088,7 +2089,6 @@ async fn serve_unfinished_file(
 
         let mut finished = false;
         let mut bytes = 0;
-        let buf_size = config.buffer_size;
 
         let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
 
@@ -3598,7 +3598,7 @@ async fn pre_process_client_request(
         .aliases
         .iter()
         .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())
-        .map(|alias| &alias.main);
+        .map(|alias| alias.main.clone());
 
     if req.body().size_hint().exact() != Some(0) {
         warn_once_or_info!(
@@ -4636,17 +4636,18 @@ impl std::io::Write for ReopenableLogFile {
 
 static RUNTIMEDETAILS: OnceLock<RuntimeDetails> = OnceLock::new();
 static LOGSTORE: OnceLock<LogStore> = OnceLock::new();
-static GLOBAL_CONFIG: OnceLock<parking_lot::RwLock<&'static Config>> = OnceLock::new();
+static GLOBAL_CONFIG: OnceLock<parking_lot::RwLock<Arc<Config>>> = OnceLock::new();
 static CONFIG_FILE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static OUTPUT_LOG_FILE: OnceLock<ReopenableLogFile> = OnceLock::new();
 
 #[must_use]
 #[inline]
-pub(crate) fn global_config() -> &'static Config {
-    *GLOBAL_CONFIG
+pub(crate) fn global_config() -> Arc<Config> {
+    GLOBAL_CONFIG
         .get()
         .expect("Global was initialized in main()")
         .read()
+        .clone()
 }
 
 #[must_use]
@@ -4658,7 +4659,7 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
         .cache_quota
 }
 
-fn reset_runtime_state(new_config: &'static Config) {
+fn reset_runtime_state(new_config: &Config) {
     if let Some(cache) = SCHEME_CACHE.get() {
         cache.write().clear();
     }
@@ -4682,12 +4683,12 @@ fn reload_configuration() -> anyhow::Result<()> {
         .get()
         .expect("Global was initialized in main()");
     let (config, cfg_fallback, config_warnings) = Config::new(config_path)?;
-    let config = Box::leak(Box::new(config));
+    let config = Arc::new(config);
 
     *GLOBAL_CONFIG
         .get()
         .expect("Global was initialized in main()")
-        .write() = config;
+        .write() = Arc::clone(&config);
 
     if cfg_fallback {
         info!(
@@ -4700,7 +4701,7 @@ fn reload_configuration() -> anyhow::Result<()> {
         warn!("Configuration reload:  {warning}");
     }
 
-    reset_runtime_state(config);
+    reset_runtime_state(&config);
     Ok(())
 }
 
@@ -4726,13 +4727,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let (config, cfg_fallback, config_warnings) = Config::new(&args.config_file)?;
-    let config = Box::leak(Box::new(config));
+    let config = Arc::new(config);
 
     CONFIG_FILE_PATH
         .set(args.config_file.clone())
         .expect("Initial set in main() should succeed");
     GLOBAL_CONFIG
-        .set(parking_lot::RwLock::new(config))
+        .set(parking_lot::RwLock::new(Arc::clone(&config)))
         .expect("Initial set in main() should succeed");
 
     let output_log_level = args.log_level.unwrap_or(config.log_level);

@@ -718,9 +718,9 @@ async fn try_sendfile_request(
         .aliases
         .iter()
         .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())
-        .map(|alias| &alias.main);
+        .map(|alias| alias.main.clone());
 
-    let aliased = match aliased_host {
+    let aliased = match &aliased_host {
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
     };
