@@ -451,17 +451,7 @@ pub(crate) fn is_deb_package(filename: &str) -> bool {
 
 #[must_use]
 pub(crate) fn valid_mirrorname(name: &str) -> bool {
-    !name.is_empty()
-        && name.split('/').all(|part| {
-            !part.is_empty()
-                && part.chars().all(|c| {
-                    c.is_ascii()
-                        && !c.is_ascii_control()
-                        && c != std::path::MAIN_SEPARATOR
-                        && c != '/'
-                        && c != '.'
-                })
-        })
+    !name.is_empty() && name.len() <= 128 && name.split('/').all(valid_path_segment)
 }
 
 #[must_use]
@@ -873,7 +863,7 @@ mod tests {
         assert!(valid_mirrorname("debian"));
         assert!(valid_mirrorname("public/ubuntu"));
         assert!(valid_mirrorname("public/private/kali"));
-        assert!(valid_mirrorname("public%2Fubuntu"));
+        assert!(valid_mirrorname("foo/bar"));
 
         /* invalid */
         assert!(!valid_mirrorname(""));
@@ -883,7 +873,6 @@ mod tests {
         assert!(!valid_mirrorname(".foo"));
         assert!(!valid_mirrorname("_foo"));
         assert!(!valid_mirrorname("foo\nbar"));
-        assert!(!valid_mirrorname("foo/bar"));
         assert!(!valid_mirrorname("foo/./bar"));
         assert!(!valid_mirrorname("foo/../bar"));
         assert!(!valid_mirrorname("foo//bar"));
@@ -891,6 +880,7 @@ mod tests {
         assert!(!valid_mirrorname("/debian"));
         assert!(!valid_mirrorname("~/foo"));
         assert!(!valid_mirrorname("~foo"));
+        assert!(!valid_mirrorname("public%2Fubuntu"));
     }
 
     #[test]
