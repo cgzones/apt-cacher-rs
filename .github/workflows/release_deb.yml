@@ -1,0 +1,40 @@
+name: Release Debian Package
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-deb:
+    permissions:
+      contents: write
+
+    name: Generate Debian Package
+    runs-on: ubuntu-latest
+
+    env:
+      RUSTFLAGS: "-D warnings"
+      SQLX_OFFLINE: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486
+        with:
+          tool: cargo-deb
+
+      - name: Build Debian package
+        run: cargo deb
+
+      - name: Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
+        with:
+          files: target/debian/*.deb
+          fail_on_unmatched_files: true
