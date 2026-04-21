@@ -1,0 +1,33 @@
+name: Spelling
+
+on: [push, pull_request]
+
+jobs:
+  spaces-check:
+    permissions:
+      contents: read
+
+    name: Spaces Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Spaces check
+        run: git diff-tree --check $(git hash-object -t tree /dev/null) HEAD
+
+  spellings:
+    permissions:
+      contents: read
+
+    name: Codespell
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install codespell
+        run: sudo apt-get install -y codespell
+
+      - name: Run codespell
+        run: codespell -L crate,te debian/ src/ apt-cacher-rs.conf apt-cacher-rs.init apt-cacher-rs.service README.md TODO
