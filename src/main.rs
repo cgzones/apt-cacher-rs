@@ -4089,47 +4089,10 @@ mod tunnel_limiter {
     }
 }
 
-async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main_loop(
+    https_client: HttpClient,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = global_config();
-
-    let mut addr = SocketAddr::from((config.bind_addr, config.bind_port.get()));
-
-    #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-    let https_connector = HttpsConnector::new();
-
-    #[cfg(feature = "tls_rustls")]
-    let https_connector = {
-        /* Set a process wide default crypto provider. */
-        //let _ = rustls::crypto::ring::default_provider().install_default();
-        if rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .is_err()
-        {
-            warn!("Failed to install aws-lc as default crypto provider");
-        }
-
-        let tls_cfg = rustls::ClientConfig::builder()
-            .with_native_roots()?
-            .with_no_client_auth();
-        hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_cfg)
-            .https_or_http()
-            .enable_http1()
-            .build()
-    };
-
-    let mut timeout_connector = hyper_timeout::TimeoutConnector::new(https_connector);
-    let http_timeout = match config.http_timeout {
-        x if x.is_zero() => None,
-        x => Some(x),
-    };
-    debug!("Using http timeout of {http_timeout:?}");
-    timeout_connector.set_connect_timeout(http_timeout);
-    timeout_connector.set_read_timeout(http_timeout);
-    timeout_connector.set_write_timeout(http_timeout);
-    let https_client =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(timeout_connector);
 
     let database = Database::connect(&config.database_path, config.database_slow_timeout)
         .await
@@ -4277,8 +4240,6 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    let active_downloads = ActiveDownloads::new();
-
     let mut term_signal = tokio::signal::unix::signal(SignalKind::terminate())?;
     let mut usr1_signal = tokio::signal::unix::signal(SignalKind::user_defined1())?;
     let mut usr2_signal = tokio::signal::unix::signal(SignalKind::user_defined2())?;
@@ -4290,8 +4251,10 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         database,
         database_tx: db_task_tx,
         https_client,
-        active_downloads,
+        active_downloads: ActiveDownloads::new(),
     };
+
+    let mut addr = SocketAddr::from((config.bind_addr, config.bind_port.get()));
 
     let listener = match TcpListener::bind(addr).await {
         Ok(x) => x,
@@ -4369,9 +4332,8 @@ async fn main_loop() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let (stream, client) = next
             .map(|(stream, client)| (stream, ClientInfo::new(client)))
-            .map_err(|err| {
-                error!("Error accepting connection:  {err}");
-                err
+            .inspect_err(|err| {
+                error!("Error accepting connection:  {}", ErrorReport(err));
             })?;
 
         let client_counter = client_counter::ClientCounter::new();
@@ -4742,6 +4704,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    let config_http_timeout = config.http_timeout;
+
     RUNTIMEDETAILS
         .set(RuntimeDetails {
             start_time: time::OffsetDateTime::now_utc(),
@@ -4752,6 +4716,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     debug!("Logger initialized");
     trace!("Tracing enabled");
+
+    #[expect(clippy::print_stderr, reason = "print to stderr for panic hook")]
+    std::panic::set_hook(Box::new(move |info| {
+        error!("{info}");
+        eprintln!("{info}");
+    }));
 
     if cfg_fallback {
         info!(
@@ -4788,15 +4758,50 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         err
     })?;
 
-    #[expect(clippy::print_stderr, reason = "print to stderr for panic hook")]
-    std::panic::set_hook(Box::new(move |info| {
-        error!("{info}");
-        eprintln!("{info}");
-    }));
+    let https_client = {
+        #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
+        let https_connector = HttpsConnector::new();
 
-    scopeguard::defer! {
-        info!("Stopped.");
-    }
+        #[cfg(feature = "tls_rustls")]
+        let https_connector = {
+            /* Set a process wide default crypto provider. */
+            //let _ = rustls::crypto::ring::default_provider().install_default();
+            #[expect(
+                clippy::print_stderr,
+                reason = "print to stderr in case logging fails before exiting"
+            )]
+            if rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .is_err()
+            {
+                error!("Failed to install aws-lc as default crypto provider");
+                eprintln!("Failed to install aws-lc as default crypto provider");
+                std::process::exit(1);
+            }
+
+            let tls_cfg = rustls::ClientConfig::builder()
+                .with_native_roots()?
+                .with_no_client_auth();
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(tls_cfg)
+                .https_or_http()
+                .enable_http1()
+                .build()
+        };
+
+        let mut timeout_connector = hyper_timeout::TimeoutConnector::new(https_connector);
+        let http_timeout = match config_http_timeout {
+            x if x.is_zero() => None,
+            x => Some(x),
+        };
+        debug!("Using http timeout of {http_timeout:?}");
+        timeout_connector.set_connect_timeout(http_timeout);
+        timeout_connector.set_read_timeout(http_timeout);
+        timeout_connector.set_write_timeout(http_timeout);
+
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(timeout_connector)
+    };
 
     // Warm the kTLS availability probe before the tokio runtime starts so the
     // one-time socket(2)/bind(2)/listen(2)/connect(2)/accept(2)/setsockopt(2)
@@ -4812,5 +4817,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     drop(args);
 
-    runtime.block_on(async { main_loop().await })
+    scopeguard::defer! {
+        info!("Stopped.");
+    }
+
+    runtime.block_on(async { main_loop(https_client).await })
 }
