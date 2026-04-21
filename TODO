@@ -6,6 +6,16 @@
 
 * on the next database scheme change add `ON DELETE CASCADE` constraints to improve cleanup
 
+* AI review:
+
+  `try_madvise_dodump` now aligns the range to page boundaries, but
+  MADV_DODUMP applies at page granularity and is not reference-counted.
+  If multiple SecureVec allocations (or other sensitive allocations) share
+  a page, dropping one buffer can re-enable dumping for a page that still
+  contains live secrets. Consider avoiding MADV_DODUMP entirely, or
+  implementing page-level refcounting / using page-aligned dedicated
+  mappings so reverting doesn’t affect unrelated data.
+
 * proxy without caching on quota hit?
 * verify checksums of downloaded files (on, off, lazy)
 * add option to limit archs (default: Dpkg::Arch::get_valid_arches())
