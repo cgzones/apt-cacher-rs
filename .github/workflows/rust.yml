@@ -19,86 +19,32 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
 
-      - name: Build (default features)
-        run: cargo build --verbose
+      - name: Build
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose build --verbose
 
-      - name: Build (default+splice feature)
-        run: cargo build --verbose --features splice
+      - name: Lint via Clippy
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose clippy --all-targets -- -D warnings -D clippy::pedantic
 
-      - name: Build (default+splice+ktls features)
-        run: cargo build --verbose --features splice,ktls
+      - name: Test
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose test --verbose
 
-      - name: Build (sendfile -mmap)
-        run: cargo build --verbose --no-default-features --features tls_rustls,sendfile
-
-      - name: Build (tls_hyper feature)
-        run: cargo build --verbose --no-default-features --features tls_hyper
-
-      - name: Build (splice + tls_hyper, no ktls)
-        run: cargo build --verbose --no-default-features --features tls_hyper,splice
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings -D clippy::pedantic
-
-      - name: Clippy (default+splice feature)
-        run: cargo clippy --all-targets --features splice -- -D warnings -D clippy::pedantic
-
-      - name: Clippy (default+splice+ktls features)
-        run: cargo clippy --all-targets --features splice,ktls -- -D warnings -D clippy::pedantic
-
-      - name: Clippy (sendfile -mmap)
-        run: cargo clippy --all-targets --no-default-features --features tls_rustls,sendfile -- -D warnings -D clippy::pedantic
-
-      - name: Clippy (tls_hyper feature)
-        run: cargo clippy --all-targets --no-default-features --features tls_hyper -- -D warnings -D clippy::pedantic
-
-      - name: Clippy (splice + tls_hyper, no ktls)
-        run: cargo clippy --all-targets --no-default-features --features tls_hyper,splice -- -D warnings -D clippy::pedantic
-
-      - name: Run tests (default features)
-        run: cargo test --verbose
-
-      - name: Run tests (default+splice features)
-        run: cargo test --verbose --features splice
-
-      - name: Run tests (default+splice+ktls features)
-        run: cargo test --verbose --features splice,ktls
-
-      - name: Run tests (tls_hyper feature)
-        run: cargo test --verbose --no-default-features --features tls_hyper
-
-      - name: Run tests (splice + tls_hyper, no ktls)
-        run: cargo test --verbose --no-default-features --features tls_hyper,splice
-
-  spaces-check:
+  formatting:
     permissions:
       contents: read
 
-    name: Spaces Check
+    name: Rust source formatting
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
 
-      - name: Spaces check
-        run: git diff-tree --check $(git hash-object -t tree /dev/null) HEAD
-
-  spellings:
-    permissions:
-      contents: read
-
-    name: Codespell
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install codespell
-        run: sudo apt-get install -y codespell
-
-      - name: Run codespell
-        run: codespell -L crate,te debian/ src/ apt-cacher-rs.conf apt-cacher-rs.init apt-cacher-rs.service README.md TODO
+      - name: Rustfmt Check
+        uses: actions-rust-lang/rustfmt@v1
