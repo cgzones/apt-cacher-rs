@@ -1,24 +1,28 @@
-name: Security Audit
+name: Audit Dependencies
 
 on:
   push:
     paths:
+      - ".github/workflows/audit.yml"
+      - "**/audit.toml"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+
   pull_request:
     paths:
+      - ".github/workflows/audit.yml"
+      - "**/audit.toml"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
 
 jobs:
-  security_audit:
+  audit:
     permissions:
-      issues: write
+      contents: read
 
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions-rust-lang/audit@v1
+        name: Audit Rust Dependencies
