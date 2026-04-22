@@ -5461,14 +5461,14 @@ mod tests {
     fn test_range_slice_no_overlap_before() {
         let buf = &[10, 20, 30, 40, 50];
         // buf covers file bytes [100, 105), range is [0, 50) — no overlap
-        assert_eq!(range_slice(buf, 100, 0, 50), &[]);
+        assert_eq!(range_slice(buf, 100, 0, 50), &[] as &[u8]);
     }
 
     #[test]
     fn test_range_slice_no_overlap_after() {
         let buf = &[10, 20, 30, 40, 50];
         // buf covers [100, 105), range is [200, 50) — no overlap
-        assert_eq!(range_slice(buf, 100, 200, 50), &[]);
+        assert_eq!(range_slice(buf, 100, 200, 50), &[] as &[u8]);
     }
 
     #[test]
@@ -5517,22 +5517,22 @@ mod tests {
     fn test_range_slice_zero_length_range() {
         let buf = &[10, 20, 30, 40, 50];
         // zero-length range
-        assert_eq!(range_slice(buf, 100, 102, 0), &[]);
+        assert_eq!(range_slice(buf, 100, 102, 0), &[] as &[u8]);
     }
 
     #[test]
     fn test_range_slice_empty_buf() {
         let buf: &[u8] = &[];
-        assert_eq!(range_slice(buf, 100, 100, 50), &[]);
+        assert_eq!(range_slice(buf, 100, 100, 50), &[] as &[u8]);
     }
 
     #[test]
     fn test_range_slice_adjacent_no_overlap() {
         let buf = &[10, 20, 30];
         // buf covers [100, 103), range is [103, 5) — adjacent, no overlap
-        assert_eq!(range_slice(buf, 100, 103, 5), &[]);
+        assert_eq!(range_slice(buf, 100, 103, 5), &[] as &[u8]);
         // range is [97, 3) = [97, 100) — adjacent before, no overlap
-        assert_eq!(range_slice(buf, 100, 97, 3), &[]);
+        assert_eq!(range_slice(buf, 100, 97, 3), &[] as &[u8]);
     }
 
     #[test]
