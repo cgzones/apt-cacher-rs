@@ -236,3 +236,5 @@ conflicts = "apt-cacher-ng"
 extended-description = "A caching proxy for Debian style package repositories"
 maintainer-scripts = "debian/"
 systemd-units = { enable = true, start = true }
+default-features = false
+features = ["mmap", "tls_hyper", "sendfile"]
