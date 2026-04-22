@@ -4050,13 +4050,13 @@ mod client_counter {
 }
 
 mod tunnel_limiter {
-    use hashbrown::HashMap;
-    use parking_lot::Mutex;
     use std::net::IpAddr;
     use std::num::NonZero;
 
-    static TUNNEL_CONNECTIONS: std::sync::LazyLock<Mutex<HashMap<IpAddr, usize>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    use hashbrown::HashMap;
+
+    static TUNNEL_CONNECTIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
     /// Try to acquire a tunnel slot for the given client IP.
     /// Returns `Some(TunnelGuard)` if under the limit, `None` if at capacity.

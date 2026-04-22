@@ -1,7 +1,5 @@
 use std::{num::NonZero, sync::Arc};
 
-use parking_lot::{RwLock, RwLockReadGuard};
-
 use crate::ringbuffer::RingBuffer;
 
 #[derive(Debug)]
@@ -47,14 +45,14 @@ impl std::io::Write for LogStoreImpl {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogStore {
-    inner: Arc<RwLock<LogStoreImpl>>,
+    inner: Arc<parking_lot::RwLock<LogStoreImpl>>,
 }
 
 impl LogStore {
     #[must_use]
     pub(crate) fn new(capacity: NonZero<usize>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(LogStoreImpl::new(capacity))),
+            inner: Arc::new(parking_lot::RwLock::new(LogStoreImpl::new(capacity))),
         }
     }
 }
@@ -78,7 +76,7 @@ impl std::io::Write for LogStore {
 
 #[must_use]
 pub(crate) struct LogStoreEntryListGuard<'a> {
-    guard: RwLockReadGuard<'a, LogStoreImpl>,
+    guard: parking_lot::RwLockReadGuard<'a, LogStoreImpl>,
 }
 
 impl LogStoreEntryListGuard<'_> {
