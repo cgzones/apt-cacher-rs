@@ -4,7 +4,7 @@ use std::num::{NonZero, Saturating};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
@@ -87,36 +87,10 @@ struct SpliceRangeFilter {
     send: u64,
 }
 
-/// Returns a cached `Arc<rustls::ClientConfig>` built once on first use.
-/// Both `tls_connect` and `unbuffered_ktls_request` share this config.
+/// Pre-computed TLS client config for use with `tls_rustls`.
+/// Should only be initialized once from main.
 #[cfg(feature = "tls_rustls")]
-fn get_tls_client_config() -> Result<std::sync::Arc<rustls::ClientConfig>, std::io::Error> {
-    use std::sync::{Arc, OnceLock};
-
-    use hyper_rustls::ConfigBuilderExt as _;
-
-    static TLS_CLIENT_CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, (ErrorKind, String)>> =
-        OnceLock::new();
-
-    TLS_CLIENT_CONFIG
-        .get_or_init(|| {
-            #[cfg_attr(
-                not(feature = "ktls"),
-                expect(unused_mut, reason = "kTLS needs to extract secret")
-            )]
-            let mut config = rustls::ClientConfig::builder()
-                .with_native_roots()
-                .map_err(|e| (e.kind(), e.to_string()))?
-                .with_no_client_auth();
-            #[cfg(feature = "ktls")]
-            {
-                config.enable_secret_extraction = true;
-            }
-            Ok(Arc::new(config))
-        })
-        .clone()
-        .map_err(|(kind, msg)| std::io::Error::new(kind, msg))
-}
+pub(crate) static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 
 /// Format a rate-check timeout error message from an `InsufficientRate`.
 fn format_rate_timeout(rate: &InsufficientRate) -> String {
@@ -625,7 +599,9 @@ async fn tls_connect(
     tcp: TcpStream,
     host: &str,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let connector = tokio_rustls::TlsConnector::from(get_tls_client_config()?);
+    let connector = tokio_rustls::TlsConnector::from(Arc::clone(
+        TLS_CLIENT_CONFIG.get().expect("initialized in main()"),
+    ));
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
         .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
@@ -994,7 +970,7 @@ async fn unbuffered_ktls_request(
     use rustls::unbuffered::{ConnectionState, EncryptError};
 
     // --- Build TLS config ---
-    let tls_config = get_tls_client_config().map_err(KtlsError::TlsFailed)?;
+    let tls_config = Arc::clone(TLS_CLIENT_CONFIG.get().expect("initialized in main()"));
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
         .map_err(|err| KtlsError::TlsFailed(std::io::Error::new(ErrorKind::InvalidInput, err)))?;
