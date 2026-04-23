@@ -63,7 +63,7 @@ pub(crate) fn find_header<'a>(
 
 /// Write a 304 Not Modified response to the stream.
 ///
-/// Takes the http timeout config into account.
+/// Times out after the configured HTTP timeout.
 pub(crate) async fn write_304_response(
     stream: &TcpStream,
     conn_version: ConnectionVersion,
@@ -97,7 +97,7 @@ pub(crate) async fn write_304_response(
 
 /// Write a 416 Range Not Satisfiable response to the stream.
 ///
-/// Takes the http timeout config into account.
+/// Times out after the configured HTTP timeout.
 pub(crate) async fn write_416_response(
     stream: &TcpStream,
     conn_version: ConnectionVersion,
@@ -122,7 +122,7 @@ pub(crate) async fn write_416_response(
 
 /// Write an error response to the stream.
 ///
-/// Takes the http timeout config into account.
+/// Times out after the configured HTTP timeout.
 pub(crate) async fn write_invalid_response(
     stream: &TcpStream,
     conn_version: ConnectionVersion,
@@ -169,7 +169,7 @@ pub(crate) struct ResponseHeaders<'a> {
 
 /// Write HTTP response headers for a file response.
 ///
-/// Takes the http timeout config into account.
+/// Times out after the configured HTTP timeout.
 pub(crate) async fn write_response_headers(
     stream: &TcpStream,
     headers: ResponseHeaders<'_>,
@@ -214,7 +214,7 @@ pub(crate) async fn write_response_headers(
 
 /// Write all bytes to the TCP stream, handling partial writes.
 ///
-/// Takes the http timeout config into account.
+/// Times out after the configured HTTP timeout.
 pub(crate) async fn write_all_to_stream(stream: &TcpStream, data: &[u8]) -> std::io::Result<()> {
     async fn inner(stream: &TcpStream, mut data: &[u8]) -> std::io::Result<()> {
         while !data.is_empty() {
