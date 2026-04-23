@@ -252,9 +252,8 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         }
     }
 
-    let mirrors = appstate.database.get_mirrors().await.map_err(|err| {
+    let mirrors = appstate.database.get_mirrors().await.inspect_err(|err| {
         error!("Error looking up hosts:  {err}");
-        err
     })?;
 
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
@@ -353,9 +352,8 @@ async fn cleanup_mirror_deb_files(
         .database
         .get_origins_by_mirror(&mirror.host, mirror.port(), &mirror.path)
         .await
-        .map_err(|err| {
+        .inspect_err(|err| {
             error!("Error looking up origins:  {err}");
-            err
         })?;
 
     trace!("Origins ({}): {origins:?}", origins.len());
@@ -379,10 +377,11 @@ async fn cleanup_mirror_deb_files(
         .iter()
         .collect();
 
-    let mut cached_files = collect_cached_files(&mirror_path).await.map_err(|err| {
-        error!("Error listing files in `{}`:  {err}", mirror_path.display());
-        err
-    })?;
+    let mut cached_files = collect_cached_files(&mirror_path)
+        .await
+        .inspect_err(|err| {
+            error!("Error listing files in `{}`:  {err}", mirror_path.display());
+        })?;
 
     let num_total_files = cached_files.len() as u64;
 
@@ -465,9 +464,8 @@ async fn cleanup_mirror_deb_files(
 
         let file = body_to_file(response.body_mut(), file)
             .await
-            .map_err(|err| {
+            .inspect_err(|err| {
                 error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
-                err
             })?;
 
         pkgfmt

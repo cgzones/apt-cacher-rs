@@ -4096,25 +4096,22 @@ async fn main_loop(
 
     let database = Database::connect(&config.database_path, config.database_slow_timeout)
         .await
-        .map_err(|err| {
+        .inspect_err(|err| {
             error!(
                 "Error creating database `{}`:  {err}",
                 config.database_path.display()
             );
-            err
         })?;
 
-    database.init_tables().await.map_err(|err| {
+    database.init_tables().await.inspect_err(|err| {
         error!(
             "Error initializing database `{}`:  {err}",
             config.database_path.display()
         );
-        err
     })?;
 
-    database.cleanup_invalid_rows().await.map_err(|err| {
+    database.cleanup_invalid_rows().await.inspect_err(|err| {
         error!("Failed to clean up invalid database rows:  {err}");
-        err
     })?;
 
     // Database background task
@@ -4266,9 +4263,8 @@ async fn main_loop(
 
             // Fallback to IPv4 to avoid errors when IPv6 is not available and the default configuration is used.
             addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.bind_port.get()));
-            TcpListener::bind(addr).await.map_err(|err| {
+            TcpListener::bind(addr).await.inspect_err(|err| {
                 error!("Error binding fallback on {addr}:  {err}");
-                err
             })?
         }
     };
@@ -4753,9 +4749,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         global_config().cache_directory.display()
     );
 
-    task_setup().map_err(|err| {
+    task_setup().inspect_err(|err| {
         error!("Error during setup:  {err}");
-        err
     })?;
 
     let https_client = {
