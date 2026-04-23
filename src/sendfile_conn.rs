@@ -876,10 +876,10 @@ async fn try_sendfile_request(
         use crate::splice_conn::{ClientRangeRequest, SpliceProxyError, splice_proxy};
 
         let client_range = ClientRangeRequest {
-            range: find_header(req.headers, &RANGE).map(String::from),
-            if_range: find_header(req.headers, &IF_RANGE).map(String::from),
-            if_none_match: find_header(req.headers, &IF_NONE_MATCH).map(String::from),
-            if_modified_since: find_header(req.headers, &IF_MODIFIED_SINCE).map(String::from),
+            range: find_header(req.headers, &RANGE),
+            if_range: find_header(req.headers, &IF_RANGE),
+            if_none_match: find_header(req.headers, &IF_NONE_MATCH),
+            if_modified_since: find_header(req.headers, &IF_MODIFIED_SINCE),
         };
         match splice_proxy(
             stream,

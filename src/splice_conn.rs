@@ -66,11 +66,11 @@ static_assert!(nix::errno::Errno::EAGAIN as i32 == nix::errno::Errno::EWOULDBLOC
 
 /// Raw Range / If-Range / conditional headers from the client request, extracted before
 /// the splice proxy connects upstream (so the original request is still available).
-pub(crate) struct ClientRangeRequest {
-    pub range: Option<String>,
-    pub if_range: Option<String>,
-    pub if_none_match: Option<String>,
-    pub if_modified_since: Option<String>,
+pub(crate) struct ClientRangeRequest<'a> {
+    pub range: Option<&'a str>,
+    pub if_range: Option<&'a str>,
+    pub if_none_match: Option<&'a str>,
+    pub if_modified_since: Option<&'a str>,
 }
 
 /// Conditional headers for volatile resource revalidation.
@@ -3343,7 +3343,7 @@ pub(crate) async fn splice_proxy(
     conn_details: &ConnectionDetails,
     upstream_path: &str,
     appstate: &AppState,
-    client_range: ClientRangeRequest,
+    client_range: ClientRangeRequest<'_>,
 ) -> Result<(), SpliceProxyError> {
     // Register with active downloads to coordinate with concurrent clients.
     // If another download is already in progress, fall back to hyper.
@@ -3522,10 +3522,10 @@ pub(crate) async fn splice_proxy(
                 &cache_path,
                 conn_version,
                 conn_action,
-                client_range.range.as_deref(),
-                client_range.if_range.as_deref(),
-                client_range.if_none_match.as_deref(),
-                client_range.if_modified_since.as_deref(),
+                client_range.range,
+                client_range.if_range,
+                client_range.if_none_match,
+                client_range.if_modified_since,
                 appstate,
             )
             .await
@@ -3733,10 +3733,10 @@ pub(crate) async fn splice_proxy(
             &cache_path,
             conn_version,
             conn_action,
-            client_range.range.as_deref(),
-            client_range.if_range.as_deref(),
-            client_range.if_none_match.as_deref(),
-            client_range.if_modified_since.as_deref(),
+            client_range.range,
+            client_range.if_range,
+            client_range.if_none_match,
+            client_range.if_modified_since,
             appstate,
         )
         .await
@@ -4009,7 +4009,7 @@ pub(crate) async fn splice_proxy(
     };
 
     // Parse client Range request now that we know the total file size.
-    let client_range_result = client_range.range.as_deref().map(|range| {
+    let client_range_result = client_range.range.map(|range| {
         let cache_time = upstream_resp
             .last_modified
             .as_deref()
@@ -4017,7 +4017,7 @@ pub(crate) async fn splice_proxy(
             .unwrap_or(HttpDate::UNIX_EPOCH);
         http_parse_range(
             range,
-            client_range.if_range.as_deref(),
+            client_range.if_range,
             total_content_length.get(),
             cache_time,
             upstream_resp.etag.as_deref(),
@@ -4816,7 +4816,7 @@ async fn handle_volatile_buffered_download(
     header_end: usize,
     ibarrier: InitBarrier<'_>,
     appstate: &AppState,
-    client_range: &ClientRangeRequest,
+    client_range: &ClientRangeRequest<'_>,
     tls_label: &str,
 ) -> Result<(), SpliceProxyError> {
     let max_bytes = VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER.get();
@@ -4886,10 +4886,10 @@ async fn handle_volatile_buffered_download(
 
     // Parse client Range against the now-known total size.
     let cache_time = HttpDate::now();
-    let client_range_result = client_range.range.as_deref().map(|range| {
+    let client_range_result = client_range.range.map(|range| {
         http_parse_range(
             range,
-            client_range.if_range.as_deref(),
+            client_range.if_range,
             total_content_length.get(),
             cache_time,
             upstream_resp.etag.as_deref(),
