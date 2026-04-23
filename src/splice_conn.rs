@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::num::{NonZero, Saturating};
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -10,16 +10,19 @@ use std::task::{Context, Poll};
 use bytes::BytesMut;
 use coarsetime::Duration;
 use hashbrown::hash_map::EntryRef;
-use http::StatusCode;
-use http::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION,
-    TRANSFER_ENCODING,
+use http::{
+    StatusCode,
+    header::{
+        CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION,
+        TRANSFER_ENCODING,
+    },
 };
 use log::{debug, error, info, trace, warn};
 use nix::fcntl::{SpliceFFlags, splice, tee};
-use nix::unistd::pipe2;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf},
+    net::{TcpStream, unix::pipe},
+};
 
 use crate::cache_quota::QuotaExceeded;
 use crate::config::{DomainName, HttpsUpgradeMode};
@@ -51,10 +54,11 @@ use crate::{
     APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, CachedFlavor, ConnectionDetails,
     ContentLength, Never, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
     VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, client_counter, content_type_for_cached_file,
-    global_cache_quota, global_config, is_host_allowed, static_assert, warn_once_or_info,
+    global_cache_quota, global_config, is_host_allowed, static_assert, warn_once_or_debug,
+    warn_once_or_info,
 };
 #[cfg(feature = "ktls")]
-use crate::{KTLS_BLOCKED, warn_once, warn_once_or_debug};
+use crate::{KTLS_BLOCKED, warn_once};
 
 // On Linux, EAGAIN and EWOULDBLOCK share the same numeric value, so matching
 // one variant is equivalent to matching both. The nix crate models EWOULDBLOCK
@@ -125,7 +129,7 @@ const MAX_RESPONSE_HEADERS: usize = 32;
 const TLS_READ_BUF_SIZE: usize = 64 * 1024;
 
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
-const VOLATILE_BODY_MAX: u64 = 1024 * 1024;
+const VOLATILE_BODY_MAX: usize = 1024 * 1024;
 
 /// How long to remember kTLS setup failures before retrying.
 #[cfg(feature = "ktls")]
@@ -143,6 +147,7 @@ static KTLS_BLOCKED_LAST_GC: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 #[cfg(feature = "ktls")]
 fn ktls_blocked_should_gc(now: coarsetime::Instant) -> bool {
     use std::sync::atomic::Ordering;
+
     let now_ticks = now.as_ticks();
     let last = KTLS_BLOCKED_LAST_GC.load(Ordering::Relaxed);
     let elapsed = coarsetime::Duration::from_ticks(now_ticks.saturating_sub(last));
@@ -281,9 +286,8 @@ impl hashbrown::Equivalent<PoolKey> for PoolKeyRef<'_> {
     }
 }
 
-static UPSTREAM_POOL: std::sync::OnceLock<
-    parking_lot::Mutex<hashbrown::HashMap<PoolKey, Vec<PooledConn>>>,
-> = std::sync::OnceLock::new();
+static UPSTREAM_POOL: OnceLock<parking_lot::Mutex<hashbrown::HashMap<PoolKey, Vec<PooledConn>>>> =
+    OnceLock::new();
 
 fn upstream_pool() -> &'static parking_lot::Mutex<hashbrown::HashMap<PoolKey, Vec<PooledConn>>> {
     UPSTREAM_POOL.get_or_init(|| parking_lot::Mutex::new(hashbrown::HashMap::new()))
@@ -347,10 +351,6 @@ fn pool_return(host: &str, port: u16, is_tls: bool, conn: UpstreamConn) {
     debug!("splice proxy: returned connection to pool for {host}:{port} (tls={is_tls})");
 }
 
-// ---------------------------------------------------------------------------
-// RAII pool guard — returns connection to pool on drop
-// ---------------------------------------------------------------------------
-
 /// Wraps an `UpstreamConn` and automatically returns it to the connection pool
 /// on drop if `poolable` is true. Prevents connection leaks on early-return paths.
 struct PoolGuard {
@@ -362,6 +362,7 @@ struct PoolGuard {
 }
 
 impl PoolGuard {
+    /// Creates a new `PoolGuard` wrapping the given `UpstreamConn`.
     fn new(conn: UpstreamConn, host: String, port: u16, poolable: bool) -> Self {
         let is_tls = conn.is_tls();
         Self {
@@ -373,6 +374,7 @@ impl PoolGuard {
         }
     }
 
+    /// Marks the connection as non-poolable, preventing it from being returned to the pool on drop.
     fn unset_poolable(&mut self) {
         self.poolable = false;
     }
@@ -424,12 +426,12 @@ impl UpstreamConn {
             let mut buf = [0u8; 1];
 
             match recv(fd, &mut buf, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
-                Ok(0) => {
+                Ok(0) | Err(nix::errno::Errno::ECONNRESET) => {
                     debug!("splice proxy: pooled connection closed by peer");
                     false
                 }
                 Ok(pending) => {
-                    debug!(
+                    warn_once_or_debug!(
                         "splice proxy: pooled connection has unexpected data ({pending} bytes pending), discarding"
                     );
                     false
@@ -437,7 +439,7 @@ impl UpstreamConn {
                 // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                 Err(nix::errno::Errno::EAGAIN) => true,
                 Err(errno) => {
-                    debug!("splice proxy: pooled connection check failed:  {errno}");
+                    warn!("splice proxy: pooled connection check failed:  {errno}");
                     false
                 }
             }
@@ -456,19 +458,19 @@ impl UpstreamConn {
     }
 }
 
-/// Create a pipe with `O_CLOEXEC | O_NONBLOCK` and optionally increase its buffer size.
-fn create_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+/// Create a pipe and optionally increase its buffer size.
+fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
+    use nix::fcntl::{FcntlArg, fcntl};
 
-    let (pipe_read, pipe_write) = pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
+    let (sender, receiver) = pipe::pipe()?;
 
     // Try to increase pipe buffer size; ignore failure (non-fatal, just fewer bytes per round-trip)
     static_assert!(PIPE_BUFFER_SIZE > 0);
-    if let Err(errno) = fcntl(pipe_write.as_fd(), FcntlArg::F_SETPIPE_SZ(PIPE_BUFFER_SIZE)) {
+    if let Err(errno) = fcntl(sender.as_fd(), FcntlArg::F_SETPIPE_SZ(PIPE_BUFFER_SIZE)) {
         warn_once_or_info!("splice proxy: failed to increase pipe buffer size:  {errno}");
     }
 
-    Ok((pipe_read, pipe_write))
+    Ok((sender, receiver))
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +526,8 @@ fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
 ///
 /// When the scheme is known (from cache or config), connects directly.
 /// In Auto mode with no cached scheme, tries HTTPS first and falls back to HTTP.
+///
+/// Times out after the configured HTTP timeout.
 async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Scheme)> {
     let host = mirror.host.as_str();
 
@@ -541,6 +545,7 @@ async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Sch
         }
         None => {
             // Auto mode: try HTTPS first, fall back to HTTP
+            // TODO: retry HTTPS after small period, fall back to HTTP
             let https_port = mirror.port.map_or(443, std::num::NonZero::get);
             match tcp_connect(host, https_port).await {
                 Ok(tcp) => match tls_connect(tcp, host).await {
@@ -575,7 +580,9 @@ async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Sch
     }
 }
 
-/// Establish a TCP connection to the given host and port with timeout.
+/// Establish a TCP connection to the given host and port.
+///
+/// Times out after the configured HTTP timeout.
 async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
     tokio::time::timeout(
         global_config().http_timeout,
@@ -583,17 +590,19 @@ async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
     )
     .await
     .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
-        std::io::Error::new(ErrorKind::TimedOut, "upstream connect timed out")
+        std::io::Error::new(ErrorKind::TimedOut, "upstream TCP connect timed out")
     })?
     .map_err(|err| {
         std::io::Error::new(
             err.kind(),
-            format!("failed to connect to upstream {host}:{port}:  {err}"),
+            format!("TCP connect to upstream failed:  {err}"),
         )
     })
 }
 
 /// Perform TLS handshake over an established TCP connection.
+///
+/// Times out after the configured HTTP timeout.
 #[cfg(feature = "tls_rustls")]
 async fn tls_connect(
     tcp: TcpStream,
@@ -603,8 +612,12 @@ async fn tls_connect(
         TLS_CLIENT_CONFIG.get().expect("initialized in main()"),
     ));
 
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|err| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("failed to parse server name:  {err}"),
+        )
+    })?;
 
     debug!("splice proxy: starting TLS handshake with {host}");
     let tls_stream = tokio::time::timeout(
@@ -614,12 +627,20 @@ async fn tls_connect(
     .await
     .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
         std::io::Error::new(ErrorKind::TimedOut, "TLS handshake timed out")
-    })??;
+    })?
+    .map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!("failed to complete TLS handshake:  {err}"),
+        )
+    })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
 }
 
-/// Perform TLS handshake over an established TCP connection.
+/// Perform TLS handshake over an established TCP connection with timeout.
+///
+/// Times out after the configured HTTP timeout.
 #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
 async fn tls_connect(
     tcp: TcpStream,
@@ -687,31 +708,12 @@ enum KtlsResult {
     Failed { tls_succeeded: bool },
 }
 
-/// Read from a tokio `TcpStream` using its async readiness API.
-#[cfg(feature = "ktls")]
-async fn tcp_read(tcp: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
-    loop {
-        tcp.readable().await?;
-        let _: Never = match tcp.try_read(buf) {
-            Ok(n) => return Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-    }
-}
-
 /// Transmit any pending outgoing TLS data and mark the transmit as done.
 ///
 /// Always calls `ttd.done()` even if the write fails, so the TLS state machine
 /// advances. Returns the write result so callers can propagate or ignore errors.
 ///
-/// Takes the http timeout config into account.
+/// Times out after the configured HTTP timeout.
 #[cfg(feature = "ktls")]
 async fn transmit_tls_data(
     ttd: rustls::unbuffered::TransmitTlsData<'_, rustls::client::ClientConnectionData>,
@@ -737,6 +739,8 @@ async fn transmit_tls_data(
 ///
 /// This is the shared drain loop used by phases 4 and 4b of the unbuffered kTLS
 /// handshake, and the non-spliceable response fallback path.
+///
+/// Times out after the configured HTTP timeout.
 #[cfg(feature = "ktls")]
 async fn drain_buffered_records(
     conn: &mut rustls::client::UnbufferedClientConnection,
@@ -747,29 +751,29 @@ async fn drain_buffered_records(
     tcp: &TcpStream,
     output: &mut Vec<u8>,
 ) -> Result<(), KtlsError> {
-    use rustls::unbuffered::ConnectionState;
+    use rustls::unbuffered::{AppDataRecord, ConnectionState, UnbufferedStatus};
 
-    loop {
-        if *incoming_used == 0 {
-            break;
-        }
-        let status = conn.process_tls_records(&mut incoming[..*incoming_used]);
-        let discard = status.discard;
-        let state = status.state.map_err(|err| {
+    while *incoming_used > 0 {
+        let UnbufferedStatus { discard, state } =
+            conn.process_tls_records(&mut incoming[..*incoming_used]);
+        let state = state.map_err(|err| {
             KtlsError::KtlsSetupFailed(std::io::Error::other(format!("TLS drain error:  {err}")))
         })?;
 
         match state {
             ConnectionState::ReadTraffic(mut rt) => {
+                let mut total_discard = discard;
                 while let Some(result) = rt.next_record() {
-                    let record = result.map_err(|err| {
-                        KtlsError::KtlsSetupFailed(std::io::Error::other(format!(
-                            "TLS record error:  {err}"
-                        )))
+                    let AppDataRecord { payload, discard } = result.map_err(|err| {
+                        KtlsError::KtlsSetupFailed(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("TLS record error:  {err}"),
+                        ))
                     })?;
-                    output.extend_from_slice(record.payload);
+                    total_discard += discard;
+                    output.extend_from_slice(payload);
                 }
-                discard_incoming(incoming, incoming_used, discard);
+                discard_incoming(incoming, incoming_used, total_discard);
             }
             ConnectionState::EncodeTlsData(mut etd) => {
                 // Do NOT reset `outgoing_used` here.  The rustls state
@@ -803,6 +807,7 @@ async fn drain_buffered_records(
             }
         }
     }
+
     Ok(())
 }
 
@@ -811,6 +816,8 @@ async fn drain_buffered_records(
 /// Returns a rich result indicating success, a non-spliceable response (which
 /// can be forwarded directly without reconnecting), or failure with information
 /// about whether TLS succeeded (to avoid redundant HTTPS attempts).
+///
+/// Times out after the configured HTTP timeout.
 #[cfg(feature = "ktls")]
 async fn try_unbuffered_ktls_connect(
     mirror: &Mirror,
@@ -873,10 +880,10 @@ async fn try_unbuffered_ktls_connect(
     let host = mirror.host.as_str();
     let port = mirror.port.map_or(443, std::num::NonZero::get);
 
-    let tcp = match tcp_connect(host, port).await {
+    let mut tcp = match tcp_connect(host, port).await {
         Ok(tcp) => tcp,
         Err(err) => {
-            debug!("kTLS: TCP connect failed:  {err}");
+            warn!("kTLS: TCP connect to upstream {host}:{port} failed:  {err}");
             return KtlsResult::Failed {
                 tls_succeeded: false,
             };
@@ -886,7 +893,7 @@ async fn try_unbuffered_ktls_connect(
     match tokio::time::timeout(
         global_config().http_timeout,
         unbuffered_ktls_request(
-            &tcp,
+            &mut tcp,
             host,
             host_authority,
             upstream_path,
@@ -958,7 +965,7 @@ async fn try_unbuffered_ktls_connect(
 /// headers, drain the buffer to record alignment, and set up kTLS RX.
 #[cfg(feature = "ktls")]
 async fn unbuffered_ktls_request(
-    tcp: &TcpStream,
+    tcp: &mut TcpStream,
     host: &str,
     host_authority: &str,
     upstream_path: &str,
@@ -1009,7 +1016,7 @@ async fn unbuffered_ktls_request(
                     discard_incoming(&mut incoming, &mut incoming_used, discard);
                     // Need more data from the server
                     grow_incoming(&mut incoming, incoming_used, "handshake")?;
-                    let n = tcp_read(tcp, &mut incoming[incoming_used..]).await?;
+                    let n = tcp.read(&mut incoming[incoming_used..]).await?;
                     if n == 0 {
                         return Err(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
@@ -1134,7 +1141,8 @@ async fn unbuffered_ktls_request(
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
                 grow_incoming(&mut incoming, incoming_used, "post-handshake")
                     .map_err(KtlsError::KtlsSetupFailed)?;
-                let n = tcp_read(tcp, &mut incoming[incoming_used..])
+                let n = tcp
+                    .read(&mut incoming[incoming_used..])
                     .await
                     .map_err(KtlsError::KtlsSetupFailed)?;
                 if n == 0 {
@@ -1260,7 +1268,8 @@ async fn unbuffered_ktls_request(
         if need_more_data {
             grow_incoming(&mut incoming, incoming_used, "header read")
                 .map_err(KtlsError::KtlsSetupFailed)?;
-            let n = tcp_read(tcp, &mut incoming[incoming_used..])
+            let n = tcp
+                .read(&mut incoming[incoming_used..])
                 .await
                 .map_err(KtlsError::KtlsSetupFailed)?;
             if n == 0 {
@@ -1322,11 +1331,8 @@ async fn unbuffered_ktls_request(
             grow_incoming(&mut incoming, incoming_used, "drain")
                 .map_err(KtlsError::KtlsSetupFailed)?;
 
-            match tokio::time::timeout(
-                per_read_timeout,
-                tcp_read(tcp, &mut incoming[incoming_used..]),
-            )
-            .await
+            match tokio::time::timeout(per_read_timeout, tcp.read(&mut incoming[incoming_used..]))
+                .await
             {
                 Ok(Ok(n @ 1..)) => {
                     incoming_used += n;
@@ -1469,9 +1475,11 @@ fn cache_scheme(mirror: &Mirror, scheme: Scheme) {
         port: mirror.port.map(std::num::NonZero::get),
     };
     let scheme_cache = SCHEME_CACHE.get().expect("Initialized in main()");
-    if !scheme_cache.read().contains_key(&key)
-        && let EntryRef::Vacant(ventry) = scheme_cache.write().entry_ref(&key)
-    {
+    if scheme_cache.read().contains_key(&key) {
+        return;
+    }
+
+    if let EntryRef::Vacant(ventry) = scheme_cache.write().entry_ref(&key) {
         ventry.insert_entry_with_key(
             SchemeKey {
                 host: key.host.to_owned(),
@@ -1530,6 +1538,8 @@ fn format_http_request(
 }
 
 /// Send an HTTP GET request to the upstream stream (generic over TCP/TLS).
+///
+/// Times out after the configured HTTP timeout.
 async fn send_upstream_request(
     upstream: &mut UpstreamConn,
     host_authority: &str,
@@ -1567,21 +1577,21 @@ async fn send_upstream_request(
 
 /// Read HTTP response headers from the upstream stream (generic over TCP/TLS).
 /// Returns the byte index where the body starts.
+///
+/// Times out after the configured HTTP timeout.
 async fn read_upstream_response_headers(
     upstream: &mut UpstreamConn,
     buf: &mut BytesMut,
 ) -> std::io::Result<usize> {
     async fn inner(upstream: &mut UpstreamConn, buf: &mut BytesMut) -> std::io::Result<usize> {
-        let mut tmp = [0u8; 4096];
         loop {
-            let n = upstream.read(&mut tmp).await?;
+            let n = upstream.read_buf(buf).await?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "upstream closed before sending complete headers",
                 ));
             }
-            buf.extend_from_slice(&tmp[..n]);
 
             // Check if we have the complete headers
             if let Some(end) = buf
@@ -1721,9 +1731,8 @@ async fn splice_proxy_body(
 ) -> std::io::Result<Option<DemotedClientHandle>> {
     let _counter = client_counter::ClientDownload::new();
 
-    let (upstream_pipe_read, upstream_pipe_write) = create_pipe()?;
-    let (cache_pipe_read, cache_pipe_write) = create_pipe()?;
-    let async_upstream_pipe_read = tokio::io::unix::AsyncFd::new(upstream_pipe_read.as_fd())?;
+    let (upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
+    let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
 
     let config = global_config();
 
@@ -1763,10 +1772,9 @@ async fn splice_proxy_body(
 
         // Step 1: splice upstream → pipe_A
         // Try splice first (non-blocking); if EAGAIN, wait for readability then retry.
-        let got = {
+        let got: Result<usize, nix::errno::Errno> = {
             let upstream_fd = upstream.as_raw_fd();
-            let pipe_a_w_fd = upstream_pipe_write.as_raw_fd();
-            let size = chunk_size;
+            let pipe_a_w_fd = upstream_pipe_sender.as_raw_fd();
 
             tokio::task::spawn_blocking(move || {
                 // SAFETY: upstream_fd is valid because the caller holds a reference to the
@@ -1780,7 +1788,7 @@ async fn splice_proxy_body(
                     None,
                     dst,
                     None,
-                    size,
+                    chunk_size,
                     SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
                 )
             })
@@ -1837,6 +1845,9 @@ async fn splice_proxy_body(
                         ));
                     }
                 }
+
+                upstream_pipe_sender.writable().await?;
+
                 continue;
             }
             Err(err) => return Err(errno_to_io_error(err, "splice failed")),
@@ -1851,15 +1862,14 @@ async fn splice_proxy_body(
             || chunk_start >= client_range_end
         {
             // Chunk is entirely outside client range, or client is gone/demoted — cache only
-            splice_pipe_to_file(&upstream_pipe_read, cache_file, got, &mut file_offset).await?;
+            splice_pipe_to_file(&upstream_pipe_receiver, cache_file, got, &mut file_offset).await?;
             dbarrier.ping_batched(got as u64);
         } else if chunk_start >= client_skip && chunk_end <= client_range_end {
             // Chunk is entirely inside client range — normal tee
             client_status = tee_and_splice(
-                &upstream_pipe_read,
-                &async_upstream_pipe_read,
-                &cache_pipe_read,
-                &cache_pipe_write,
+                &upstream_pipe_receiver,
+                &cache_pipe_receiver,
+                &cache_pipe_sender,
                 client,
                 (cache_file, &mut file_offset),
                 got,
@@ -1881,7 +1891,7 @@ async fn splice_proxy_body(
             }
         } else {
             // Boundary chunk — read into userspace, slice for client, pwrite for cache
-            let buf = read_pipe_to_buf(&async_upstream_pipe_read, got).await?;
+            let mut buf = read_pipe_to_buf(&upstream_pipe_receiver, got).await?;
 
             debug_assert!(
                 matches!(client_status, ClientStatus::Active),
@@ -1894,16 +1904,9 @@ async fn splice_proxy_body(
 
             // Write full chunk to cache via pwrite first, so concurrent clients
             // see progress without being gated on the first client's send speed.
-            let offset = file_offset;
-            let cache_fd = cache_file.as_raw_fd();
-            let buf = tokio::task::spawn_blocking(move || {
-                // SAFETY: cache_fd is valid because the caller holds a reference to the
-                // tokio::fs::File, and the spawn_blocking result is awaited without cancellation
-                let fd = unsafe { BorrowedFd::borrow_raw(cache_fd) };
-                nix::sys::uio::pwrite(fd, &buf, offset).map(|_| buf)
-            })
-            .await
-            .expect("spawn_blocking should not panic")?;
+            let buf_len = buf.len();
+            pwrite_buf_to_file(cache_file, &mut buf, buf_len, file_offset).await?;
+
             #[expect(
                 clippy::cast_possible_wrap,
                 reason = "got is bounded by PIPE_BUFFER_SIZE which fits in i64"
@@ -1938,10 +1941,102 @@ async fn splice_proxy_body(
             rate_checker.add(got);
         }
 
-        remaining = remaining.saturating_sub(got as u64);
+        remaining = remaining
+            .checked_sub(got as u64)
+            .expect("splice should not return more than requested");
     }
 
     Ok(demoted_handle)
+}
+
+/// Writes the entire buffer to the cache file via pwrite at the specified offset.
+async fn pwrite_buf_to_file(
+    file: &tokio::fs::File,
+    buf: &mut Vec<u8>,
+    size: usize,
+    mut offset: i64,
+) -> std::io::Result<()> {
+    let buf_len = buf.len();
+    let mut written = 0;
+
+    let mut temp = Vec::new();
+    std::mem::swap(buf, &mut temp);
+
+    let file_fd = file.as_raw_fd();
+
+    while written < size {
+        let (pwrite_result, temp_return) = tokio::task::spawn_blocking(move || {
+            let avail = &temp[written..size];
+
+            // SAFETY: cache_fd is valid because the caller holds a reference to the
+            // tokio::fs::File, and the spawn_blocking result is awaited without cancellation
+            let fd = unsafe { BorrowedFd::borrow_raw(file_fd) };
+            let r = nix::sys::uio::pwrite(fd, avail, offset);
+            (r, temp)
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+        temp = temp_return;
+
+        match pwrite_result {
+            Ok(0) => {
+                std::mem::swap(&mut temp, buf);
+                assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
+                assert_eq!(
+                    buf.len(),
+                    buf_len,
+                    "buffer should have the same length as before"
+                );
+                assert!(
+                    written < size,
+                    "should have written less than the requested number of bytes"
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "pwrite returned 0",
+                ));
+            }
+            Ok(n) => {
+                written += n;
+                offset +=
+                    i64::try_from(n).expect("pwrite(2) does not write more than i64::MAX bytes");
+            }
+            // EAGAIN/EWOULDBLOCK: see module-level static_assert.
+            Err(nix::errno::Errno::EAGAIN) => {
+                // file is not ready, wait for it to be writable
+                tokio::task::yield_now().await;
+            }
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(errno) => {
+                std::mem::swap(&mut temp, buf);
+                assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
+                assert_eq!(
+                    buf.len(),
+                    buf_len,
+                    "buffer should have the same length as before"
+                );
+                assert!(
+                    written < size,
+                    "should have written less than the requested number of bytes"
+                );
+                return Err(errno_to_io_error(errno, "pwrite(2) failed"));
+            }
+        }
+    }
+
+    std::mem::swap(&mut temp, buf);
+    assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
+    assert_eq!(
+        buf.len(),
+        buf_len,
+        "buffer should have the same length as before"
+    );
+    assert_eq!(
+        written, size,
+        "should have written the requested number of bytes"
+    );
+
+    Ok(())
 }
 
 /// Transfer body from TLS upstream to client+cache via userspace read then tee+splice fan-out.
@@ -1964,13 +2059,8 @@ async fn splice_proxy_body_tls(
 ) -> std::io::Result<Option<DemotedClientHandle>> {
     let _counter = client_counter::ClientDownload::new();
 
-    let (upstream_pipe_read, upstream_pipe_write) = create_pipe()?;
-    let (cache_pipe_read, cache_pipe_write) = create_pipe()?;
-    let async_pipe_write = tokio::io::unix::AsyncFd::new(upstream_pipe_write.as_fd())?;
-    // Shared registration for the upstream pipe read end — owned by this
-    // function so `tee_and_splice → drain_pipe` can reuse it rather than
-    // creating a second reactor registration on the same fd.
-    let async_upstream_pipe_read = tokio::io::unix::AsyncFd::new(upstream_pipe_read.as_fd())?;
+    let (mut upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
+    let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
 
     let config = global_config();
 
@@ -1984,7 +2074,7 @@ async fn splice_proxy_body_tls(
 
     let mut remaining = content_length;
     let mut file_offset: i64 = file_start_offset;
-    let mut read_buf = vec![0u8; TLS_READ_BUF_SIZE];
+    let mut read_buf = vec![0u8; TLS_READ_BUF_SIZE]; // TODO: avoid zero initialization
     let mut client_status = ClientStatus::Active;
     let mut bytes_done: u64 = 0;
     let mut client_bytes_sent: u64 = 0;
@@ -2067,17 +2157,16 @@ async fn splice_proxy_body_tls(
             || chunk_start >= client_range_end
         {
             // Chunk is entirely outside client range, or client is gone/demoted — cache only
-            write_all_to_pipe(&async_pipe_write, &read_buf[..got]).await?;
-            splice_pipe_to_file(&upstream_pipe_read, cache_file, got, &mut file_offset).await?;
+            upstream_pipe_sender.write_all(&read_buf[..got]).await?;
+            splice_pipe_to_file(&upstream_pipe_receiver, cache_file, got, &mut file_offset).await?;
             dbarrier.ping_batched(got as u64);
         } else if chunk_start >= client_skip && chunk_end <= client_range_end {
             // Chunk is entirely inside client range — normal tee+splice path
-            write_all_to_pipe(&async_pipe_write, &read_buf[..got]).await?;
+            upstream_pipe_sender.write_all(&read_buf[..got]).await?;
             client_status = tee_and_splice(
-                &upstream_pipe_read,
-                &async_upstream_pipe_read,
-                &cache_pipe_read,
-                &cache_pipe_write,
+                &upstream_pipe_receiver,
+                &cache_pipe_receiver,
+                &cache_pipe_sender,
                 client,
                 (cache_file, &mut file_offset),
                 got,
@@ -2113,20 +2202,8 @@ async fn splice_proxy_body_tls(
             // see progress without being gated on the first client's send speed.
             // Move `read_buf` into the blocking task and take it back on return
             // to avoid allocating a fresh Vec for every boundary chunk.
-            let data = std::mem::take(&mut read_buf);
-            let offset = file_offset;
-            let cache_fd = cache_file.as_raw_fd();
-            let (pwrite_result, returned) = tokio::task::spawn_blocking(move || {
-                // SAFETY: cache_fd is valid because the caller holds a reference to the
-                // tokio::fs::File, and the spawn_blocking result is awaited without cancellation
-                let fd = unsafe { BorrowedFd::borrow_raw(cache_fd) };
-                let r = nix::sys::uio::pwrite(fd, &data[..got], offset);
-                (r, data)
-            })
-            .await
-            .expect("spawn_blocking should not panic");
-            read_buf = returned;
-            pwrite_result?;
+            pwrite_buf_to_file(cache_file, &mut read_buf, got, file_offset).await?;
+
             #[expect(
                 clippy::cast_possible_wrap,
                 reason = "got is bounded by TLS_READ_BUF_SIZE which fits in i64"
@@ -2166,7 +2243,9 @@ async fn splice_proxy_body_tls(
             rate_checker.add(got);
         }
 
-        remaining = remaining.saturating_sub(got as u64);
+        remaining = remaining
+            .checked_sub(got as u64)
+            .expect("read(2) should not return more than requested");
     }
 
     Ok(demoted_handle)
@@ -2252,16 +2331,19 @@ async fn serve_remaining_from_file(
     let mut finished = false;
     let buf_size = config.buffer_size;
     let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
+    let mut read_buf = BytesMut::with_capacity(buf_size);
+
+    // TODO: use sendfile?
 
     loop {
         // Read all currently available data from cache file
         loop {
-            let mut buf = bytes::BytesMut::with_capacity(buf_size);
-            match tokio::io::AsyncReadExt::read_buf(&mut reader, &mut buf).await {
+            read_buf.clear();
+            match reader.read_buf(&mut read_buf).await {
                 Ok(0) => break, // EOF — may need to wait for more data
                 Ok(n) => {
                     bytes_sent += n as u64;
-                    if let Err(err) = write_all_to_stream(&client, &buf[..n]).await {
+                    if let Err(err) = write_all_to_stream(&client, &read_buf[..n]).await {
                         if err.kind() == ErrorKind::BrokenPipe
                             || err.kind() == ErrorKind::ConnectionReset
                         {
@@ -2321,32 +2403,6 @@ async fn serve_remaining_from_file(
     debug!("splice proxy: demoted client file-serve complete, sent {bytes_sent} bytes");
 }
 
-/// Write all data to a non-blocking pipe fd, using async readiness instead of spinning.
-async fn write_all_to_pipe(
-    async_fd: &tokio::io::unix::AsyncFd<BorrowedFd<'_>>,
-    mut data: &[u8],
-) -> std::io::Result<()> {
-    while !data.is_empty() {
-        let mut guard = async_fd.writable().await?;
-        match nix::unistd::write(*async_fd.get_ref(), data) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    "write_all_to_pipe: write returned 0 bytes",
-                ));
-            }
-            Ok(n) => data = &data[n..],
-            // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-            Err(nix::errno::Errno::EAGAIN) => {
-                guard.clear_ready();
-            }
-            Err(nix::errno::Errno::EINTR) => {}
-            Err(err) => return Err(errno_to_io_error(err, "write failed")),
-        }
-    }
-    Ok(())
-}
-
 /// Status of the first (splice) client after a tee+splice iteration.
 enum ClientStatus {
     /// Client is still connected and receiving data at acceptable speed.
@@ -2370,10 +2426,9 @@ enum ClientStatus {
 /// client to file-serve.
 #[expect(clippy::too_many_arguments, reason = "function has only 2 callers")]
 async fn tee_and_splice(
-    upstream_pipe_read: &OwnedFd,
-    upstream_pipe_read_async: &tokio::io::unix::AsyncFd<BorrowedFd<'_>>,
-    cache_pipe_read: &OwnedFd,
-    cache_pipe_write: &OwnedFd,
+    upstream_pipe_rx: &pipe::Receiver,
+    cache_pipe_rx: &pipe::Receiver,
+    cache_pipe_tx: &pipe::Sender,
     client: &TcpStream,
     target: (&tokio::fs::File, &mut i64),
     got: usize,
@@ -2384,24 +2439,21 @@ async fn tee_and_splice(
 ) -> std::io::Result<ClientStatus> {
     let (cache_file, file_offset) = target;
     let mut status = client_status;
-    let mut to_process = got;
+    let mut remaining = got;
 
-    // AsyncFd on pipe_B's write end, used to wait for drain when tee returns
-    // EAGAIN (pipe_B full) instead of busy-yielding. Registered lazily on
-    // first need to avoid epoll overhead on the fast path.
-    let mut cache_pipe_async: Option<tokio::io::unix::AsyncFd<BorrowedFd<'_>>> = None;
-
-    while to_process > 0 {
+    while remaining > 0 {
         if matches!(status, ClientStatus::Active) {
             // Tee pipe_A → pipe_B, then splice pipe_B → cache, then splice pipe_A → client.
             // Cache is written first so concurrent clients see progress immediately
             // without being gated on a potentially slow first client.
 
+            upstream_pipe_rx.readable().await?;
+            cache_pipe_tx.writable().await?;
+
             // Step 2: tee pipe_A → pipe_B (duplicates without consuming from pipe_A)
-            let teed = {
-                let pipe_a_r_fd = upstream_pipe_read.as_raw_fd();
-                let pipe_b_w_fd = cache_pipe_write.as_raw_fd();
-                let len = to_process;
+            let teed: Result<usize, nix::errno::Errno> = {
+                let pipe_a_r_fd = upstream_pipe_rx.as_raw_fd();
+                let pipe_b_w_fd = cache_pipe_tx.as_raw_fd();
 
                 tokio::task::spawn_blocking(move || {
                     // SAFETY: pipe_a_r_fd is valid because the caller holds the OwnedFd,
@@ -2410,13 +2462,13 @@ async fn tee_and_splice(
                     // SAFETY: pipe_b_w_fd is valid because the caller holds the OwnedFd,
                     // and the spawn_blocking result is awaited without cancellation
                     let dst = unsafe { BorrowedFd::borrow_raw(pipe_b_w_fd) };
-                    tee(src, dst, len, SpliceFFlags::empty())
+                    tee(src, dst, remaining, SpliceFFlags::empty())
                 })
                 .await
                 .expect("spawn_blocking should not panic")
             };
 
-            let teed = match teed {
+            let teed: usize = match teed {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
@@ -2424,52 +2476,34 @@ async fn tee_and_splice(
                     ));
                 }
                 Ok(n) => n,
-                Err(nix::errno::Errno::EINTR) => continue,
                 // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-                Err(nix::errno::Errno::EAGAIN) => {
-                    // pipe_B is full: wait for it to become writable via AsyncFd
-                    // readiness instead of burning CPU through yield_now.
-                    let async_fd = match &cache_pipe_async {
-                        Some(fd) => fd,
-                        None => cache_pipe_async.insert(tokio::io::unix::AsyncFd::with_interest(
-                            cache_pipe_write.as_fd(),
-                            tokio::io::Interest::WRITABLE,
-                        )?),
-                    };
-                    let mut guard = async_fd.writable().await?;
-                    guard.clear_ready();
-                    continue;
-                }
+                Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => continue,
                 Err(err) => return Err(errno_to_io_error(err, "tee failed")),
             };
 
             // Step 3: splice pipe_B → cache file first (fast, local disk I/O)
-            splice_pipe_to_file(cache_pipe_read, cache_file, teed, file_offset).await?;
+            splice_pipe_to_file(cache_pipe_rx, cache_file, teed, file_offset).await?;
 
             // Notify concurrent clients that new data is on disk
             dbarrier.ping_batched(teed as u64);
 
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
             let mut client_remaining = teed;
-            let mut need_writable = true;
             while client_remaining > 0 {
-                if need_writable {
-                    match tokio::time::timeout(global_config().http_timeout, client.writable())
-                        .await
-                    {
-                        Ok(result) => result?,
-                        Err(tokio::time::error::Elapsed { .. }) => {
-                            return Err(std::io::Error::new(
-                                ErrorKind::TimedOut,
-                                "client write timed out",
-                            ));
-                        }
+                match tokio::time::timeout(global_config().http_timeout, client.writable()).await {
+                    Ok(result) => result?,
+                    Err(tokio::time::error::Elapsed { .. }) => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "client write timed out",
+                        ));
                     }
                 }
 
-                let pipe_a_r_fd = upstream_pipe_read.as_raw_fd();
+                upstream_pipe_rx.readable().await?;
+
+                let pipe_a_r_fd = upstream_pipe_rx.as_raw_fd();
                 let client_fd = client.as_raw_fd();
-                let len = client_remaining;
 
                 let result = tokio::task::spawn_blocking(move || {
                     // SAFETY: pipe_a_r_fd is valid because the caller holds the OwnedFd,
@@ -2483,20 +2517,20 @@ async fn tee_and_splice(
                         None,
                         dst,
                         None,
-                        len,
+                        client_remaining,
                         SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
                     )
                 })
                 .await
                 .expect("spawn_blocking should not panic");
 
-                need_writable = match result {
+                let _: Never = match result {
                     Ok(0) | Err(nix::errno::Errno::EPIPE | nix::errno::Errno::ECONNRESET) => {
                         // Client disconnected — drain the remaining teed bytes from pipe_A
                         // by splicing them to /dev/null (discard)
                         info!("splice proxy: client disconnected, continuing cache-only");
                         status = ClientStatus::Disconnected;
-                        drain_pipe(upstream_pipe_read_async, client_remaining).await?;
+                        drain_pipe(upstream_pipe_rx, client_remaining).await?;
                         break;
                     }
                     Ok(n) => {
@@ -2514,30 +2548,31 @@ async fn tee_and_splice(
                                 // just sent to the client), so it is exactly the count of teed
                                 // bytes still sitting in pipe_A that need to be drained before
                                 // we can stop servicing the client.
-                                if client_remaining > 0 {
-                                    drain_pipe(upstream_pipe_read_async, client_remaining).await?;
-                                }
+                                drain_pipe(upstream_pipe_rx, client_remaining).await?;
+
                                 status = ClientStatus::Demoted {
                                     client_bytes_sent: *client_bytes_sent,
                                 };
                                 break;
                             }
                         }
-                        true
+
+                        continue;
                     }
                     // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-                    Err(nix::errno::Errno::EAGAIN) => true,
-                    Err(nix::errno::Errno::EINTR) => false,
+                    Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
                     Err(err) => return Err(errno_to_io_error(err, "splice failed")),
                 };
             }
 
-            to_process -= teed;
+            remaining = remaining
+                .checked_sub(teed)
+                .expect("splice should not return more than requested");
         } else {
             // Client is gone or demoted — splice pipe_A directly to cache (no tee needed)
-            splice_pipe_to_file(upstream_pipe_read, cache_file, to_process, file_offset).await?;
-            dbarrier.ping_batched(to_process as u64);
-            to_process = 0;
+            splice_pipe_to_file(upstream_pipe_rx, cache_file, remaining, file_offset).await?;
+            dbarrier.ping_batched(remaining as u64);
+            remaining = 0;
         }
     }
     Ok(status)
@@ -2545,36 +2580,46 @@ async fn tee_and_splice(
 
 /// Read exactly `count` bytes from a pipe into a Vec (for boundary chunks
 /// that straddle a client range boundary and need userspace slicing).
-async fn read_pipe_to_buf(
-    async_fd: &tokio::io::unix::AsyncFd<BorrowedFd<'_>>,
-    count: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; count];
-    let mut filled = 0;
-    while filled < count {
-        let mut guard = async_fd.readable().await?;
-        match nix::unistd::read(*async_fd.get_ref(), &mut buf[filled..]) {
+async fn read_pipe_to_buf(rx: &pipe::Receiver, count: usize) -> std::io::Result<Vec<u8>> {
+    let mut read_buf = vec![0u8; count]; // TODO: avoid zero initialization
+    let mut read_bytes = 0;
+
+    while read_bytes < count {
+        rx.readable().await?;
+
+        let buf = &mut read_buf[read_bytes..];
+
+        match rx.try_read(buf) {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "read_pipe_to_buf: pipe closed with bytes remaining",
                 ));
             }
-            Ok(n) => filled += n,
-            // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-            Err(nix::errno::Errno::EAGAIN) => {
-                guard.clear_ready();
-            }
-            Err(nix::errno::Errno::EINTR) => {}
-            Err(err) => return Err(errno_to_io_error(err, "read failed")),
+            Ok(n) => read_bytes += n,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
         }
     }
-    Ok(buf)
+
+    debug_assert_eq!(
+        read_bytes, count,
+        "should have read the requested amount of bytes"
+    );
+    debug_assert_eq!(
+        read_buf.len(),
+        count,
+        "the result buffer should have the requested length"
+    );
+
+    Ok(read_buf)
 }
 
 /// Return the sub-slice of `buf` (which represents file bytes at
 /// `[buf_file_start, buf_file_start + buf.len())`) that overlaps the client
 /// range `[range_start, range_start + range_len)`.
+#[must_use]
 fn range_slice(buf: &[u8], buf_file_start: u64, range_start: u64, range_len: u64) -> &[u8] {
     let buf_end = buf_file_start + buf.len() as u64;
     let range_end = range_start + range_len;
@@ -2597,40 +2642,32 @@ fn range_slice(buf: &[u8], buf_file_start: u64, range_start: u64, range_len: u64
 }
 
 /// Drain `count` bytes from a pipe by reading and discarding them.
-///
-/// The pipe is `O_NONBLOCK` and the bytes being drained were just teed into it,
-/// so reads normally complete immediately. On the rare EAGAIN (tee data not yet
-/// fully committed to the pipe buffer) we park on the caller-provided
-/// `AsyncFd`.
-///
-/// The caller passes in an already-registered `AsyncFd` rather than letting us
-/// create one, because the outer read loop (`splice_proxy_body` /
-/// `splice_proxy_body_tls`) already has one registered on the same fd; creating
-/// a second would double-register the pipe with the tokio reactor.
-async fn drain_pipe(
-    async_fd: &tokio::io::unix::AsyncFd<BorrowedFd<'_>>,
-    count: usize,
-) -> std::io::Result<()> {
-    let fd = *async_fd.get_ref();
-    let mut discard = vec![0u8; std::cmp::min(count, TLS_READ_BUF_SIZE)];
+async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
+    let read_buf_size = std::cmp::min(count, 8 * 1024);
+    let mut read_buf = vec![0u8; read_buf_size]; // TODO: avoid zero initialization
     let mut remaining = count;
     while remaining > 0 {
-        let to_read = std::cmp::min(remaining, discard.len());
-        match nix::unistd::read(fd, &mut discard[..to_read]) {
+        rx.readable().await?;
+
+        let to_read = std::cmp::min(remaining, read_buf_size);
+        let buf = &mut read_buf[..to_read];
+
+        // TODO: splice(2) to /dev/null ?
+        match rx.try_read(buf) {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
                     "drain_pipe: pipe closed with bytes remaining",
                 ));
             }
-            Ok(n) => remaining -= n,
-            // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-            Err(nix::errno::Errno::EAGAIN) => {
-                let mut guard = async_fd.readable().await?;
-                guard.clear_ready();
+            Ok(n) => {
+                remaining = remaining
+                    .checked_sub(n)
+                    .expect("read should not return more than requested");
             }
-            Err(nix::errno::Errno::EINTR) => {}
-            Err(err) => return Err(errno_to_io_error(err, "read failed")),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
         }
     }
     Ok(())
@@ -2638,9 +2675,9 @@ async fn drain_pipe(
 
 /// Splice `count` bytes from a pipe into a file at the given offset.
 async fn splice_pipe_to_file(
-    pipe_read: &OwnedFd,
+    rx: &pipe::Receiver,
     file: &tokio::fs::File,
-    mut count: usize,
+    count: usize,
     file_offset: &mut i64,
 ) -> std::io::Result<()> {
     /// Maximum consecutive `EAGAIN` (yield + retry) cycles before giving up.
@@ -2650,13 +2687,18 @@ async fn splice_pipe_to_file(
     const MAX_EAGAIN_RETRIES: u32 = 1000;
     let mut eagain_retries: u32 = 0;
 
-    while count > 0 {
-        let pipe_r_fd = pipe_read.as_raw_fd();
+    let mut remaining = count;
+    while remaining > 0 {
+        rx.readable().await?;
+
+        let pipe_r_fd = rx.as_raw_fd();
         let file_fd = file.as_raw_fd();
-        let len = count;
-        let mut off = *file_offset;
+
+        let offset = *file_offset;
 
         let result = tokio::task::spawn_blocking(move || {
+            let mut off = offset;
+
             // SAFETY: pipe_r_fd is valid because the caller holds the OwnedFd,
             // and the spawn_blocking result is awaited without cancellation
             let src = unsafe { BorrowedFd::borrow_raw(pipe_r_fd) };
@@ -2668,7 +2710,7 @@ async fn splice_pipe_to_file(
                 None,
                 dst,
                 Some(&mut off),
-                len,
+                remaining,
                 SpliceFFlags::SPLICE_F_MOVE,
             )
             .map(|n| (n, off))
@@ -2685,7 +2727,9 @@ async fn splice_pipe_to_file(
             }
             Ok((n, new_off)) => {
                 *file_offset = new_off;
-                count -= n;
+                remaining = remaining
+                    .checked_sub(n)
+                    .expect("splice should not return more than requested");
                 eagain_retries = 0;
                 continue;
             }
@@ -2702,6 +2746,7 @@ async fn splice_pipe_to_file(
                         ),
                     ));
                 }
+                // probably file is not writable, yield to avoid busy loop
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -2712,6 +2757,8 @@ async fn splice_pipe_to_file(
 }
 
 /// Send request and read+parse response headers on an existing connection.
+///
+/// Times out after the configured HTTP timeout.
 async fn send_and_read_headers(
     up: &mut UpstreamConn,
     host_authority: &str,
@@ -2738,6 +2785,8 @@ async fn send_and_read_headers(
 
 /// Standard (non-kTLS) upstream connect→request→read-headers→parse pipeline.
 /// Tries a pooled connection first; falls back to a fresh connection on failure.
+///
+/// Times out after the configured HTTP timeout.
 async fn standard_upstream_connect(
     mirror: &Mirror,
     host_authority: &str,
@@ -2831,6 +2880,8 @@ async fn standard_upstream_connect(
 /// with those from the redirected request, and returns `Some(redirected_path)`.
 /// If the redirect is not followable (invalid URI, disallowed host), logs and returns `None`
 /// so the caller falls through to the non-200 forwarding path.
+///
+/// Times out after the configured HTTP timeout.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors splice_proxy's mutable state"
@@ -2943,10 +2994,11 @@ async fn follow_redirect(
 async fn forward_upstream_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
-    mut remaining: u64,
+    count: u64,
 ) -> std::io::Result<()> {
     let config = global_config();
-    let mut buf = vec![0u8; TLS_READ_BUF_SIZE];
+    let mut buf = vec![0u8; TLS_READ_BUF_SIZE]; // TODO: avoid zero initialization
+    let mut remaining = count;
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
@@ -2993,7 +3045,9 @@ async fn forward_upstream_body(
         }
 
         write_all_to_stream(client, &buf[..n]).await?;
-        remaining -= n as u64;
+        remaining = remaining
+            .checked_sub(n as u64)
+            .expect("read should not return more than requested");
     }
 
     Ok(())
@@ -3004,17 +3058,18 @@ async fn forward_upstream_body(
 async fn forward_upstream_body_until_eof(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
-    max_bytes: u64,
+    max_bytes: usize,
 ) -> std::io::Result<()> {
     let config = global_config();
-    let mut buf = vec![0u8; TLS_READ_BUF_SIZE];
-    let mut total = 0u64;
+    let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
+    let mut total = 0;
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     loop {
-        let n = match tokio::time::timeout(config.http_timeout, upstream.read(&mut buf)).await {
+        buf.clear();
+        let n = match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
@@ -3026,7 +3081,7 @@ async fn forward_upstream_body_until_eof(
             }
         };
 
-        total += n as u64;
+        total += n;
         if total > max_bytes {
             warn_once_or_info!(
                 "splice proxy: upstream error response body exceeded {} byte cap, truncating",
@@ -3061,7 +3116,7 @@ enum ChunkedState {
     /// Accumulating the hex chunk-size line (up to `\r\n`).
     ReadingSize,
     /// Forwarding chunk data bytes; `remaining` counts undecoded payload bytes.
-    ReadingData { remaining: u64 },
+    ReadingData { remaining: usize },
     /// Expecting the `\r\n` trailer after chunk data.
     ReadingTrailer { seen_cr: bool },
     /// The final `0\r\n` chunk has been received; still expecting the
@@ -3080,7 +3135,7 @@ async fn forward_upstream_chunked_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
     body_prefix: &[u8],
-    max_bytes: u64,
+    max_bytes: usize,
 ) -> std::io::Result<()> {
     let config = global_config();
     let mut rate_checker = config
@@ -3089,7 +3144,7 @@ async fn forward_upstream_chunked_body(
 
     let mut state = ChunkedState::ReadingSize;
     let mut size_buf = Vec::<u8>::with_capacity(32);
-    let mut total = Saturating(0u64);
+    let mut total = Saturating(0);
 
     // Process a slice of bytes through the state machine, forwarding them to the
     // client.  Returns `true` when the terminal chunk has been fully consumed.
@@ -3124,7 +3179,7 @@ async fn forward_upstream_chunked_body(
                                         "chunked encoding: invalid chunk-size line",
                                     )
                                 })?;
-                                let chunk_size = u64::from_str_radix(hex_str.trim(), 16).map_err(|_| {
+                                let chunk_size = usize::from_str_radix(hex_str.trim(), 16).map_err(|_| {
                                     std::io::Error::new(
                                         ErrorKind::InvalidData,
                                         "chunked encoding: invalid chunk-size hex",
@@ -3161,15 +3216,8 @@ async fn forward_upstream_chunked_body(
                     }
                     ChunkedState::ReadingData { ref mut remaining } => {
                         let avail = data.len() - i;
-                        // min(remaining, avail) ≤ avail which is usize, so
-                        // the truncation to usize is safe.
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "consume ≤ avail which is usize"
-                        )]
-                        let consume =
-                            std::cmp::min(*remaining, avail as u64) as usize;
-                        *remaining -= consume as u64;
+                        let consume = std::cmp::min(*remaining, avail);
+                        *remaining -= consume;
                         i += consume;
                         if *remaining == 0 {
                             state = ChunkedState::ReadingTrailer { seen_cr: false };
@@ -3241,9 +3289,10 @@ async fn forward_upstream_chunked_body(
         return Ok(());
     }
 
-    let mut buf = vec![0u8; TLS_READ_BUF_SIZE];
+    let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
     loop {
-        let n = match tokio::time::timeout(config.http_timeout, upstream.read(&mut buf)).await {
+        buf.clear();
+        let n = match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut buf)).await {
             Ok(Ok(0)) => {
                 return Err(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
@@ -3401,11 +3450,11 @@ pub(crate) async fn splice_proxy(
             let mtime = metadata
                 .modified()
                 .expect("Platform should support modification timestamps via setup check");
-            let ims = HttpDate::from(mtime).format();
-            let inm = read_etag(&file, &cache_path);
+            let if_modified_since = HttpDate::from(mtime).format();
+            let if_none_match = read_etag(&file, &cache_path);
             volatile_cond = Some(VolatileCondHeaders {
-                if_modified_since: ims,
-                if_none_match: inm,
+                if_modified_since,
+                if_none_match,
             });
             volatile_cache_path = Some(cache_path);
         }
@@ -4332,7 +4381,10 @@ pub(crate) async fn splice_proxy(
         }
 
         tempfile.write_all(body_prefix).await.map_err(|err| {
-            error!("splice proxy: failed to write body prefix to cache:  {err}");
+            error!(
+                "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
+                temppath.display()
+            );
             SpliceProxyError::AfterHeaderError(err)
         })?;
 
@@ -4373,7 +4425,10 @@ pub(crate) async fn splice_proxy(
         }
 
         tempfile.write_all(&ktls_extra_body).await.map_err(|err| {
-            error!("splice proxy: failed to write kTLS extra body to cache:  {err}");
+            error!(
+                "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
+                temppath.display()
+            );
             SpliceProxyError::AfterHeaderError(err)
         })?;
 
@@ -4467,7 +4522,10 @@ pub(crate) async fn splice_proxy(
 
     // Sync cache file to ensure durability
     if let Err(err) = tempfile.sync_all().await {
-        error!("splice proxy: failed to sync cache file:  {err}");
+        error!(
+            "splice proxy: failed to sync cache file `{}`:  {err}",
+            temppath.display()
+        );
     }
     drop(tempfile);
 
@@ -4580,18 +4638,20 @@ pub(crate) async fn splice_proxy(
 async fn read_body_to_vec_until_eof(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
-    max_bytes: u64,
+    max_bytes: usize,
 ) -> std::io::Result<Vec<u8>> {
     let config = global_config();
-    let mut body = Vec::with_capacity(prefix.len() + 4096);
+    let size = (prefix.len() + 4096).min(max_bytes);
+    let mut body = Vec::with_capacity(size);
     body.extend_from_slice(prefix);
-    let mut buf = vec![0u8; TLS_READ_BUF_SIZE];
+    let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE); // TODO: replace body Vec?
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     loop {
-        let n = match tokio::time::timeout(config.http_timeout, upstream.read(&mut buf)).await {
+        buf.clear();
+        let n = match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
@@ -4603,7 +4663,7 @@ async fn read_body_to_vec_until_eof(
             }
         };
 
-        if body.len() as u64 + n as u64 > max_bytes {
+        if body.len().checked_add(n).is_none_or(|sum| sum > max_bytes) {
             warn_once_or_info!(
                 "splice proxy: volatile response body exceeded {max_bytes} byte cap"
             );
@@ -4633,14 +4693,14 @@ async fn read_body_to_vec_until_eof(
 async fn read_dechunk_body_to_vec(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
-    max_bytes: u64,
+    max_bytes: usize,
 ) -> std::io::Result<Vec<u8>> {
     // State machine for chunked decoding.
     enum State {
         /// Accumulating the hex chunk-size line (up to `\r\n`).
         ReadingSize,
         /// Reading chunk data bytes; `remaining` counts undecoded payload bytes.
-        ReadingData { remaining: u64 },
+        ReadingData { remaining: usize },
         /// Expecting the `\r\n` trailer after chunk data.
         ReadingTrailer { seen_cr: bool },
         /// The final `0\r\n` chunk has been received; done.
@@ -4654,7 +4714,7 @@ async fn read_dechunk_body_to_vec(
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
     let mut state = State::ReadingSize;
     let mut size_buf = Vec::with_capacity(32);
-    let mut read_buf = vec![0u8; TLS_READ_BUF_SIZE];
+    let mut read_buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
 
     // Process the prefix first, then read from upstream.
     let pending: &[u8] = prefix;
@@ -4662,24 +4722,26 @@ async fn read_dechunk_body_to_vec(
 
     loop {
         let data = if need_read {
-            let n = match tokio::time::timeout(config.http_timeout, upstream.read(&mut read_buf))
-                .await
-            {
-                Ok(Ok(0)) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "upstream closed during chunked body buffering",
-                    ));
-                }
-                Ok(Ok(n)) => n,
-                Ok(Err(err)) => return Err(err),
-                Err(tokio::time::error::Elapsed { .. }) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        "upstream read timed out during chunked body buffering",
-                    ));
-                }
-            };
+            read_buf.clear();
+            let n =
+                match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut read_buf))
+                    .await
+                {
+                    Ok(Ok(0)) => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "upstream closed during chunked body buffering",
+                        ));
+                    }
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) => return Err(err),
+                    Err(tokio::time::error::Elapsed { .. }) => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "upstream read timed out during chunked body buffering",
+                        ));
+                    }
+                };
             if let Some(ref mut rc) = rate_checker {
                 rc.add(n);
                 if let Some(rate) = rc.check_fail() {
@@ -4712,7 +4774,7 @@ async fn read_dechunk_body_to_vec(
                             )
                         })?;
                         let chunk_size =
-                            u64::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
+                            usize::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
                                 std::io::Error::new(
                                     ErrorKind::InvalidData,
                                     "chunked encoding: invalid chunk-size hex",
@@ -4722,7 +4784,11 @@ async fn read_dechunk_body_to_vec(
                         if chunk_size == 0 {
                             state = State::Done;
                         } else {
-                            if body.len() as u64 + chunk_size > max_bytes {
+                            if body
+                                .len()
+                                .checked_add(chunk_size as usize)
+                                .is_none_or(|sum| sum > max_bytes)
+                            {
                                 warn_once_or_info!(
                                     "splice proxy: chunked volatile body exceeded {max_bytes} byte cap"
                                 );
@@ -4737,11 +4803,10 @@ async fn read_dechunk_body_to_vec(
                     }
                 }
                 State::ReadingData { ref mut remaining } => {
-                    let avail = (data.len() - i) as u64;
-                    #[expect(clippy::cast_possible_truncation, reason = "capped at 1 MiB")]
-                    let taken = avail.min(*remaining) as usize;
+                    let avail = data.len() - i;
+                    let taken = avail.min(*remaining);
                     body.extend_from_slice(&data[i..i + taken]);
-                    *remaining -= taken as u64;
+                    *remaining -= taken;
                     i += taken;
                     if *remaining == 0 {
                         state = State::ReadingTrailer { seen_cr: false };
@@ -4795,7 +4860,10 @@ async fn handle_volatile_buffered_download(
     client_range: &ClientRangeRequest<'_>,
     tls_label: &str,
 ) -> Result<(), SpliceProxyError> {
-    let max_bytes = VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER.get();
+    let max_bytes: usize = VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER
+        .get()
+        .try_into()
+        .expect("constant fits"); // TODO: const conversion once stable
     let body_prefix = &header_buf[header_end..];
 
     // Buffer the entire body into memory.
@@ -5019,7 +5087,10 @@ async fn handle_volatile_buffered_download(
 
     // Write full body to cache file.
     tempfile.write_all(&body).await.map_err(|err| {
-        error!("splice proxy: failed to write volatile body to cache file:  {err}");
+        error!(
+            "splice proxy: failed to write volatile body to cache file `{}`:  {err}",
+            temppath.display()
+        );
         SpliceProxyError::AfterHeaderError(err)
     })?;
 
@@ -5027,7 +5098,10 @@ async fn handle_volatile_buffered_download(
 
     // Sync cache file.
     if let Err(err) = tempfile.sync_all().await {
-        error!("splice proxy: failed to sync cache file:  {err}");
+        error!(
+            "splice proxy: failed to sync cache file `{}`:  {err}",
+            temppath.display()
+        );
     }
     drop(tempfile);
 
@@ -5325,6 +5399,8 @@ impl std::fmt::Display for SpliceProxyError {
 
 #[cfg(test)]
 mod tests {
+    use nix::fcntl::{FcntlArg, fcntl};
+
     use super::*;
 
     #[test]
@@ -5380,13 +5456,20 @@ mod tests {
         assert!(out.contains("Transfer-Encoding: chunked\r\n"));
     }
 
-    #[test]
-    fn test_create_pipe() {
-        let (read_fd, write_fd) = create_pipe().expect("pipe creation should succeed");
+    #[tokio::test]
+    async fn test_create_pipe() {
+        let (tx, rx) = create_pipe().expect("pipe creation should succeed");
         // Verify the fds are valid (non-negative)
-        assert!(read_fd.as_raw_fd() >= 0);
-        assert!(write_fd.as_raw_fd() >= 0);
-        assert_ne!(read_fd.as_raw_fd(), write_fd.as_raw_fd());
+        assert!(rx.as_raw_fd() >= 0);
+        assert!(tx.as_raw_fd() >= 0);
+        assert_ne!(rx.as_raw_fd(), tx.as_raw_fd());
+        // `create_pipe()` treats pipe resizing as best-effort, so do not
+        // require the kernel to honor `PIPE_BUFFER_SIZE` exactly here.
+        let size = fcntl(rx.as_fd(), FcntlArg::F_GETPIPE_SZ).unwrap();
+        assert!(
+            size >= 64 * 1024,
+            "pipe size shouldn't be too small, got {size}"
+        );
     }
 
     #[test]
