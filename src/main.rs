@@ -4766,18 +4766,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let https_connector = {
             /* Set a process wide default crypto provider. */
             //let _ = rustls::crypto::ring::default_provider().install_default();
-            #[expect(
-                clippy::print_stderr,
-                reason = "print to stderr in case logging fails before exiting"
-            )]
-            if rustls::crypto::aws_lc_rs::default_provider()
+            rustls::crypto::aws_lc_rs::default_provider()
                 .install_default()
-                .is_err()
-            {
-                error!("Failed to install aws-lc as default crypto provider");
-                eprintln!("Failed to install aws-lc as default crypto provider");
-                std::process::exit(1);
-            }
+                .expect("first and sole call should succeed");
 
             let tls_cfg = rustls::ClientConfig::builder()
                 .with_native_roots()?
