@@ -55,9 +55,7 @@ impl LogStore {
             inner: Arc::new(parking_lot::RwLock::new(LogStoreImpl::new(capacity))),
         }
     }
-}
 
-impl LogStore {
     pub(crate) fn entries(&self) -> LogStoreEntryListGuard<'_> {
         let guard = self.inner.read();
         LogStoreEntryListGuard { guard }
