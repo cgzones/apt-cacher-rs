@@ -1034,7 +1034,7 @@ async fn serve_cached_file(
     req: &Request<Empty<()>>,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
-    file_path: &Path,
+    file_path: PathBuf,
     file_etag: EtagState,
 ) -> Response<ProxyCacheBody> {
     fn decide_serve_304(
@@ -1094,13 +1094,13 @@ async fn serve_cached_file(
     let file_etag = match file_etag {
         EtagState::Some(etag) => Some(etag),
         EtagState::Failure => None,
-        EtagState::Unknown => read_etag(&file, file_path),
+        EtagState::Unknown => read_etag(&file, &file_path),
     };
 
     // Prefer the upstream Last-Modified persisted in xattr (RFC 9110 §10.2.2). Fall back to the
     // cache file's birth/modification time when the xattr is unavailable.
     let cache_ts = cache_file_http_date(&metadata);
-    let stored_last_modified = read_last_modified(&file, file_path);
+    let stored_last_modified = read_last_modified(&file, &file_path);
     let (last_modified_for_ims, last_modified_str) = match stored_last_modified {
         Some((str, time)) => (time, str),
         None => (cache_ts, cache_ts.format()),
@@ -1265,7 +1265,7 @@ async fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
-    file_path: &Path,
+    file_path: PathBuf,
     last_modified_str: String,
     age: u32,
     http_status: StatusCode,
@@ -1275,12 +1275,9 @@ async fn serve_cached_file_mmap(
     partial: bool,
     etag: Option<String>,
 ) -> Response<ProxyCacheBody> {
-    let file_pathbuf = file_path.to_path_buf();
-    let client = conn_details.client;
-
     trace!(
         "Using mmap(2) with start={content_start} and length={content_length} from content_range={content_range:?} for file `{}`",
-        file_pathbuf.display()
+        file_path.display()
     );
 
     let Some(memory_map) = tokio::task::spawn_blocking(move || {
@@ -1296,7 +1293,7 @@ async fn serve_cached_file_mmap(
         .inspect_err(|err| {
             error!(
                 "Failed to mmap downloaded file `{}`:  {}",
-                file_pathbuf.display(),
+                file_path.display(),
                 ErrorReport(err)
             );
         })
@@ -1314,7 +1311,7 @@ async fn serve_cached_file_mmap(
         if let Err(err) = memory_map.advise(Advice::Sequential) {
             warn_once_or_info!(
                 "Failed to advice memory mapping of file `{}`:  {}",
-                file_pathbuf.display(),
+                file_path.display(),
                 ErrorReport(&err)
             );
         }
@@ -1327,6 +1324,8 @@ async fn serve_cached_file_mmap(
     };
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
+
+    let client = conn_details.client;
 
     let memory_body = MmapBody::new(
         memory_map,
@@ -1369,7 +1368,7 @@ async fn serve_cached_file_buf(
     conn_details: ConnectionDetails,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     mut file: tokio::fs::File,
-    file_path: &Path,
+    file_path: PathBuf,
     file_size: u64,
     last_modified_str: String,
     age: u32,
@@ -1510,7 +1509,7 @@ async fn serve_volatile_file(
     conn_details: ConnectionDetails,
     req: Request<Empty<()>>,
     file: tokio::fs::File,
-    file_path: &Path,
+    file_path: PathBuf,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     debug_assert_eq!(
@@ -2297,7 +2296,7 @@ async fn serve_downloading_file(
                     &req,
                     database_tx,
                     file,
-                    &path_clone,
+                    path_clone,
                     EtagState::Unknown,
                 )
                 .await;
@@ -2338,10 +2337,10 @@ async fn serve_downloading_file(
     }
 }
 
-enum CacheFileStat<'a> {
+enum CacheFileStat {
     Volatile {
         file: tokio::fs::File,
-        file_path: &'a Path,
+        file_path: PathBuf,
         local_modification_time: HttpDate,
     },
     New,
@@ -2387,7 +2386,7 @@ async fn serve_new_file(
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     init_tx: tokio::sync::watch::Sender<()>,
     req: Request<Empty<()>>,
-    cfstate: CacheFileStat<'_>,
+    cfstate: CacheFileStat,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     // TODO: upstream constant
@@ -2397,7 +2396,7 @@ async fn serve_new_file(
     fn build_fwd_request(
         uri: &Uri,
         host: &HeaderValue,
-        cfstate: &CacheFileStat<'_>,
+        cfstate: &CacheFileStat,
         volatile_etag: &EtagState,
         resume_offset: u64,
         resume_if_range: Option<&str>,
@@ -2731,9 +2730,9 @@ async fn serve_new_file(
     } = cfstate
     {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
-            file = touch_volatile_mtime(file, file_path).await;
+            file = touch_volatile_mtime(file, &file_path).await;
 
-            ibarrier.finished(file_path.to_path_buf()).await;
+            ibarrier.finished(file_path.clone()).await;
 
             return serve_cached_file(
                 conn_details,
@@ -3273,7 +3272,7 @@ pub(crate) async fn process_cache_request(
             );
             match conn_details.cached_flavor {
                 CachedFlavor::Volatile => {
-                    serve_volatile_file(conn_details, req, file, &cache_path, appstate).await
+                    serve_volatile_file(conn_details, req, file, cache_path, appstate).await
                 }
                 CachedFlavor::Permanent => {
                     serve_cached_file(
@@ -3281,7 +3280,7 @@ pub(crate) async fn process_cache_request(
                         &req,
                         appstate.database_tx,
                         file,
-                        &cache_path,
+                        cache_path,
                         EtagState::Unknown,
                     )
                     .await
