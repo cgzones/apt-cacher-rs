@@ -1,0 +1,6 @@
+/.git/
+/.github/
+/apt-cacher-rs.db
+/cache/
+/debian/
+/target/

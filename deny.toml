@@ -14,6 +14,7 @@ allow = [
 confidence-threshold = 0.99
 exceptions = [
     { allow = ["Zlib"], crate = "foldhash" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" }
 ]
 
 [bans]

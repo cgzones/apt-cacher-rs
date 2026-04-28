@@ -14,6 +14,7 @@ exclude = [".env", ".github/", ".gitignore", "dev.conf", "TODO"]
 
 [features]
 default = ["mmap", "tls_rustls", "sendfile"]
+container = ["tls_rustls", "hyper-rustls/webpki-roots"]
 mmap = ["dep:memmap2"]
 sendfile = ["dep:httparse", "nix/zerocopy"]
 splice = ["sendfile", "nix/socket"]
