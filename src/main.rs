@@ -1212,6 +1212,7 @@ async fn serve_cached_file(
             conn_details.debname, conn_details.mirror, aliased, conn_details.client
         );
 
+        // TODO: use become: https://github.com/rust-lang/rust/issues/112788
         return serve_cached_file_mmap(
             conn_details,
             database_tx,
@@ -1234,6 +1235,7 @@ async fn serve_cached_file(
         conn_details.debname, conn_details.mirror, aliased, conn_details.client
     );
 
+    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_buf(
         conn_details,
         database_tx,
@@ -1253,8 +1255,12 @@ async fn serve_cached_file(
 }
 
 #[cfg(feature = "mmap")]
-#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
-#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::inline_always,
+    reason = "function has only 1 caller and is a tail call"
+)]
+#[inline(always)]
 async fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
@@ -1340,6 +1346,7 @@ async fn serve_cached_file_mmap(
         None => ProxyCacheBody::Mmap(memory_body),
     };
 
+    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(
         http_status,
         last_modified_str,
@@ -1352,8 +1359,12 @@ async fn serve_cached_file_mmap(
     )
 }
 
-#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
-#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::inline_always,
+    reason = "function has only 1 caller and is a tail call"
+)]
+#[inline(always)]
 async fn serve_cached_file_buf(
     conn_details: ConnectionDetails,
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
@@ -1399,6 +1410,7 @@ async fn serve_cached_file_buf(
             .boxed(),
     );
 
+    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(
         http_status,
         last_modified_str,
@@ -1413,7 +1425,7 @@ async fn serve_cached_file_buf(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "shared response builder for serve_cached_file_mmap and serve_cached_file_buf"
+    reason = "shared response builder for serve_cached_file_mmap and serve_cached_file_buf; is always called as a tail call"
 )]
 fn serve_cached_file_response(
     http_status: StatusCode,
