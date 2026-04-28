@@ -4767,8 +4767,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .install_default()
                 .expect("first and sole call should succeed");
 
+            #[cfg(feature = "container")]
             let tls_config = rustls::ClientConfig::builder()
-                .with_native_roots()?
+                .with_webpki_roots()
+                .with_no_client_auth();
+            #[cfg(not(feature = "container"))]
+            let tls_config = rustls::ClientConfig::builder()
+                .with_native_roots()
+                .inspect_err(|err| error!("Failed to load native roots:  {}", ErrorReport(err)))?
                 .with_no_client_auth();
 
             #[cfg(feature = "splice")]

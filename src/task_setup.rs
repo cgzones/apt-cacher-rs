@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use log::{debug, error, info, warn};
+use log::{Level, debug, error, log, warn};
 
 use crate::global_config;
 
@@ -26,7 +26,12 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
         .modified()
         .context("No file modification timestamp (mtime) support")?;
     if let Err(err) = mdata.created() {
-        info!(
+        #[cfg(feature = "container")]
+        let level = Level::Debug;
+        #[cfg(not(feature = "container"))]
+        let level = Level::Info;
+        log!(
+            level,
             "No file creation timestamp (btime) support, volatile file caching is limited:  {err}"
         );
     }

@@ -8,17 +8,35 @@ It is inspired by and an alternative to [`apt-cacher`](https://salsa.debian.org/
 
 ## Build the Debian package
 
-Before you can compile apt-cacher-rs or create a Debian package, the following commands must be run once:
+Before you can create a Debian package, the following commands must be run once to install the necessary dependencies:
 
-```
+```bash
 apt-get -y install dpkg-dev liblzma-dev
 cargo install cargo-deb
 ```
 
 Then run the following command to build the Debian package in `target/debian/apt-cacher-rs.deb`:
 
-```
+```bash
 cargo deb
+```
+
+## Build container image
+
+`apt-cacher-rs` can be easily run inside a container.
+
+Build an image with the following command based on the in-tree [Dockerfile](Dockerfile):
+
+```bash
+podman build -t apt-cacher-rs:dev -f Dockerfile .
+```
+
+The image expects a `volume` mounted at */data* to store the database and cached files.
+You should also provide a configuration file via a mount on */app/apt-cacher-rs.conf*, since the default configuration does not permit any clients.
+For example you can start a container via:
+
+```bash
+podman run -p 3142:3142/tcp --read-only --rm -v apt-cacher-rs-data:/data:nodev,noexec,nosuid -v /srv/apt-cacher-rs.conf:/app/apt-cacher-rs.conf:ro apt-cacher-rs:dev
 ```
 
 ## How to use

@@ -19,12 +19,25 @@ use serde::Deserializer;
 
 use crate::nonzero;
 
+const DEFAULT_CACHE_DIR: &str = if cfg!(feature = "container") {
+    "/data/cache"
+} else {
+    "/var/cache/apt-cacher-rs"
+};
+pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = if cfg!(feature = "container") {
+    "/app/apt-cacher-rs.conf"
+} else {
+    "/etc/apt-cacher-rs/apt-cacher-rs.conf"
+};
+pub(crate) const DEFAULT_DATABASE_PATH: &str = if cfg!(feature = "container") {
+    "/data/apt-cacher-rs.db"
+} else {
+    "/var/lib/apt-cacher-rs/apt-cacher-rs.db"
+};
+
 const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
 const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 KiB
-const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
-pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = "/etc/apt-cacher-rs/apt-cacher-rs.conf";
-const DEFAULT_DATABASE_PATH: &str = "/var/lib/apt-cacher-rs/apt-cacher-rs.db";
 const DEFAULT_DATABASE_SLOW_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_DISK_QUOTA: Option<NonZero<u64>> = None;
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
