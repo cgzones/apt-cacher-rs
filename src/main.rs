@@ -1131,12 +1131,14 @@ async fn serve_cached_file(
                 HeaderValue::try_from(last_modified_str).expect("HTTP date is valid"),
             )
             .header(AGE, HeaderValue::from(age));
+
         if let Some(etag) = file_etag {
             builder = builder.header(
                 ETAG,
                 HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
             );
         }
+
         let response = builder
             .body(ProxyCacheBody::Empty(Empty::new()))
             .expect("HTTP response is valid");
@@ -1448,7 +1450,7 @@ fn serve_cached_file_response(
      *  "x-timer":                "S1705782486.334221,VS0,VE1"
      */
 
-    let mut response = Response::builder()
+    let mut response_builder = Response::builder()
         .status(http_status)
         .header(DATE, format_http_date())
         .header(VIA, APP_VIA)
@@ -1460,25 +1462,23 @@ fn serve_cached_file_response(
             HeaderValue::try_from(last_modified_str).expect("date string is valid"),
         )
         .header(ACCEPT_RANGES, "bytes")
-        .header(AGE, HeaderValue::from(age))
-        .body(body)
-        .expect("HTTP response is valid");
+        .header(AGE, HeaderValue::from(age));
 
     if let Some(ct) = content_range {
-        let r = response.headers_mut().append(
+        response_builder = response_builder.header(
             CONTENT_RANGE,
-            ct.try_into().expect("content range string is valid"),
+            HeaderValue::try_from(ct).expect("content range string is valid"),
         );
-        assert!(!r, "header does not exist by previous construction");
     }
 
     if let Some(etag) = etag {
-        let r = response.headers_mut().append(
+        response_builder = response_builder.header(
             ETAG,
             HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
         );
-        assert!(!r, "header does not exist by previous construction");
     }
+
+    let response = response_builder.body(body).expect("HTTP response is valid");
 
     trace!("Outgoing response of cached file: {response:?}");
 
@@ -2204,18 +2204,16 @@ async fn serve_unfinished_file(
             HeaderValue::try_from(last_modified_str).expect("Http datetime is valid"),
         )
         .header(AGE, HeaderValue::from(age));
+
     if let Some(etag) = file_etag {
         response_builder = response_builder.header(
             ETAG,
             HeaderValue::try_from(etag).expect("ETag is validated before passing"),
         );
     }
+
     if let ContentLength::Exact(size) = content_length {
-        let r = response_builder
-            .headers_mut()
-            .expect("request should be valid")
-            .append(CONTENT_LENGTH, HeaderValue::from(size.get()));
-        assert!(!r, "header does not exist by previous construction");
+        response_builder = response_builder.header(CONTENT_LENGTH, HeaderValue::from(size.get()));
     }
 
     let channel_body = ChannelBody::new(rx, content_length);
@@ -3164,20 +3162,22 @@ async fn serve_new_file(
                 config.experimental_parallel_hack_retryafter
             );
 
-            let mut response = Response::builder()
+            let mut response_builder = Response::builder()
                 .status(config.experimental_parallel_hack_statuscode)
                 .header(DATE, format_http_date())
                 .header(VIA, APP_VIA)
-                .header(CONNECTION, "keep-alive")
-                .body(ProxyCacheBody::Empty(Empty::new()))
-                .expect("Response is valid");
+                .header(CONNECTION, "keep-alive");
 
             if config.experimental_parallel_hack_retryafter != 0 {
-                response.headers_mut().append(
+                response_builder = response_builder.header(
                     RETRY_AFTER,
                     HeaderValue::from(config.experimental_parallel_hack_retryafter),
                 );
             }
+
+            let response = response_builder
+                .body(ProxyCacheBody::Empty(Empty::new()))
+                .expect("Response is valid");
 
             trace!("Outgoing parallel download hack response: {response:?}");
 
