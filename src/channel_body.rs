@@ -6,7 +6,6 @@ pub(crate) enum ChannelBodyError {
     MirrorDownloadRate(error::MirrorDownloadRate),
 }
 
-#[derive(Debug)]
 pub(crate) struct ChannelBody {
     receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, ChannelBodyError>>,
     content_length: ContentLength,

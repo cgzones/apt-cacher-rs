@@ -9,7 +9,6 @@ use pin_project::pin_project;
 use crate::{ClientInfo, HumanFmt, ringbuffer::SumRingBuffer};
 
 /// A rate checker that tracks download speed over a sliding time window.
-#[derive(Debug)]
 pub(crate) struct RateChecker {
     buf: SumRingBuffer<usize>,
     last: Instant,
