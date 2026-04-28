@@ -1772,7 +1772,6 @@ impl ActiveDownloads {
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 async fn download_file(
     database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     conn_details: &ConnectionDetails,
@@ -1780,10 +1779,7 @@ async fn download_file(
     input: (Incoming, ContentLength),
     output: (tokio::fs::File, TempPath),
     mut dbarrier: DownloadBarrier,
-    upstream_etag: Option<String>,
-    upstream_last_modified: Option<String>,
     resume_offset: u64,
-    total_content_length: ContentLength,
 ) {
     let config = global_config();
 
@@ -1799,19 +1795,6 @@ async fn download_file(
 
     let mut bytes = 0;
     let buf_size = config.buffer_size;
-
-    // Write ETag xattr early so it survives partial downloads for resume
-    if let Some(ref etag) = upstream_etag {
-        write_etag(&output.0, &output.1, etag);
-    }
-    // Write upstream Last-Modified xattr early so it survives partial downloads
-    if let Some(ref lm) = upstream_last_modified {
-        write_last_modified(&output.0, &output.1, lm);
-    }
-    // Write expected total size so resume can detect upstream file changes
-    if let ContentLength::Exact(total) = total_content_length {
-        xattr_helpers::write_expected_size(&output.0, &output.1, total.get());
-    }
 
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
     let outpath = output.1;
@@ -3098,6 +3081,19 @@ async fn serve_new_file(
         }
     };
 
+    // Write ETag xattr early so it survives partial downloads for resume
+    if let Some(ref etag) = upstream_etag {
+        write_etag(&outfile, &outpath, etag);
+    }
+    // Write upstream Last-Modified xattr early so it survives partial downloads
+    if let Some(ref lm) = upstream_last_modified {
+        write_last_modified(&outfile, &outpath, lm);
+    }
+    // Write expected total size so resume can detect upstream file changes
+    if let ContentLength::Exact(total) = total_content_length {
+        xattr_helpers::write_expected_size(&outfile, &outpath, total.get());
+    }
+
     if resume_offset > 0 {
         info!(
             "Resuming and serving file {} from mirror {} for client {} at byte {}...",
@@ -3117,8 +3113,6 @@ async fn serve_new_file(
     let cd = conn_details.clone();
     let db_tx = appstate.database_tx.clone();
     let curr_downloads = appstate.active_downloads.download_count();
-    let download_etag = upstream_etag.clone();
-    let download_last_modified = upstream_last_modified.clone();
     tokio::task::spawn(async move {
         download_file(
             db_tx,
@@ -3127,10 +3121,7 @@ async fn serve_new_file(
             (body, body_content_length),
             (outfile, outpath),
             dbarrier,
-            download_etag,
-            download_last_modified,
             resume_offset,
-            total_content_length,
         )
         .await;
     });
