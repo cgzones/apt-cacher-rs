@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
+#[cfg(feature = "ktls")]
 use coarsetime::Duration;
 use hashbrown::hash_map::EntryRef;
 use http::{
@@ -91,19 +92,6 @@ struct SpliceRangeFilter {
 /// Should only be initialized once from main.
 #[cfg(feature = "tls_rustls")]
 pub(crate) static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-
-/// Format a rate-check timeout error message from an `InsufficientRate`.
-fn format_rate_timeout(rate: &InsufficientRate) -> String {
-    format!(
-        "Timeout occurred after a download rate of {} [< {}] for the last {} seconds",
-        HumanFmt::Rate(
-            rate.transferred as u64,
-            Duration::from_secs(rate.timeframe.get() as u64)
-        ),
-        HumanFmt::Rate(rate.min_rate.get() as u64, Duration::from_secs(1)),
-        rate.timeframe,
-    )
-}
 
 /// Default pipe buffer size on Linux is 16 pages (64 KiB on most systems).
 /// We increase it to 1 MiB to reduce the number of splice syscall pairs needed.
@@ -3096,10 +3084,7 @@ async fn forward_upstream_body(
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
             if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format_rate_timeout(&rate),
-                ));
+                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
             }
         }
 
@@ -3168,10 +3153,7 @@ async fn forward_upstream_body_until_eof(
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
             if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format_rate_timeout(&rate),
-                ));
+                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
             }
         }
 
@@ -3408,10 +3390,7 @@ async fn forward_upstream_chunked_body(
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
             if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format_rate_timeout(&rate),
-                ));
+                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
             }
         }
 
@@ -4854,10 +4833,7 @@ async fn read_body_to_vec_until_eof(
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
             if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format_rate_timeout(&rate),
-                ));
+                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
             }
         }
     }
@@ -4923,10 +4899,7 @@ async fn read_dechunk_body_to_vec(
             if let Some(ref mut rc) = rate_checker {
                 rc.add(n);
                 if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                    return Err(std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        format_rate_timeout(&rate),
-                    ));
+                    return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
                 }
             }
             &read_buf[..n]

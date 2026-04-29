@@ -1312,10 +1312,18 @@ pub(crate) async fn serve_file_via_sendfile(
     }
 }
 
-/// Format an `InsufficientRate` into a timeout `std::io::Error`.
+/// Format an `InsufficientRate` into a timeout `std::io::Error`, tagging
+/// which side of the proxy the slow transfer was observed on.
 #[must_use]
-pub(crate) fn rate_timeout_error(rate: &InsufficientRate) -> std::io::Error {
-    std::io::Error::new(ErrorKind::TimedOut, rate.to_string())
+pub(crate) fn rate_timeout_error(
+    rate: &InsufficientRate,
+    direction: RateCheckDirection,
+) -> std::io::Error {
+    let context = match direction {
+        RateCheckDirection::Client => " for client",
+        RateCheckDirection::Upstream => " for upstream",
+    };
+    rate.to_timeout_io_error(format_args!("{context}"))
 }
 
 /// Whether the helper waits for read-readiness or write-readiness.
@@ -1365,7 +1373,7 @@ async fn wait_socket_rated(
                         rc.add(0);
 
                         if let Some(rate) = rc.check_fail(direction) {
-                            return Err(rate_timeout_error(&rate));
+                            return Err(rate_timeout_error(&rate, direction));
                         }
                     }
                 }
@@ -1488,7 +1496,7 @@ async fn sendfile_chunk_loop(
         if let Some(rc) = rate_checker.as_ref()
             && let Some(rate) = rc.check_fail(RateCheckDirection::Client)
         {
-            return Err(rate_timeout_error(&rate));
+            return Err(rate_timeout_error(&rate, RateCheckDirection::Client));
         }
 
         wait_writable_rated(
