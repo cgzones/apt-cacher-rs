@@ -123,7 +123,7 @@ use pin_project::pin_project;
 use pin_project::pinned_drop;
 use rand::distr::Bernoulli;
 use rand::prelude::Distribution as _;
-use rate_checked_body::RateCheckedBody;
+use rate_checked_body::MaybeRated;
 use rate_checked_body::RateCheckedBodyErr;
 use simplelog::CombinedLogger;
 use simplelog::ConfigBuilder;
@@ -568,9 +568,20 @@ fn quick_response<T: Into<bytes::Bytes>>(
         builder = builder.header(ALLOW, "GET");
     }
 
-    builder
-        .body(ProxyCacheBody::Full(Full::new(message.into())))
-        .expect("Response is valid")
+    builder.body(full_body(message)).expect("Response is valid")
+}
+
+/// Box `Full<Bytes>` into [`ProxyCacheBody::Boxed`] for
+/// small, fully-buffered responses (status pages, HTML, static assets).
+pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
+    let body = Full::new(content.into()).map_err(|never| match never {});
+    ProxyCacheBody::Boxed(BoxBody::new(body))
+}
+
+/// Box `Empty` into [`ProxyCacheBody::Boxed`].
+pub(crate) fn empty_body() -> ProxyCacheBody {
+    let body = Empty::new().map_err(|never| match never {});
+    ProxyCacheBody::Boxed(BoxBody::new(body))
 }
 
 /* Adopted from http_body_util::StreamBody */
@@ -714,26 +725,26 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
 }
 
 #[pin_project(project = EnumProj)]
+#[cfg_attr(
+    feature = "mmap",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Mmap is the zero-allocation hot path; boxing it would add a heap \
+                  alloc per cached-file response which is exactly what this variant exists to avoid"
+    )
+)]
 enum ProxyCacheBody {
     #[cfg(feature = "mmap")]
-    Mmap(#[pin] MmapBody),
-    #[cfg(feature = "mmap")]
-    MmapRateChecked(#[pin] RateCheckedBody<MmapBody>, ClientInfo),
+    Mmap(#[pin] MaybeRated<MmapBody>, ClientInfo),
     Boxed(#[pin] BoxBody<bytes::Bytes, Box<ProxyCacheError>>),
-    Full(#[pin] Full<bytes::Bytes>),
-    Empty(#[pin] Empty<bytes::Bytes>),
 }
 
 impl Debug for ProxyCacheBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(feature = "mmap")]
-            Self::Mmap(_) => f.debug_tuple("Mmap").finish(),
-            #[cfg(feature = "mmap")]
-            Self::MmapRateChecked(_, _) => f.debug_tuple("MmapRateChecked").finish(),
+            Self::Mmap(_, _) => f.debug_tuple("Mmap").finish(),
             Self::Boxed(_) => f.debug_tuple("Boxed").finish(),
-            Self::Full(_) => f.debug_tuple("Full").finish(),
-            Self::Empty(_) => f.debug_tuple("Empty").finish(),
         }
     }
 }
@@ -743,19 +754,14 @@ impl Body for ProxyCacheBody {
 
     type Error = Box<ProxyCacheError>;
 
+    #[inline]
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.project() {
             #[cfg(feature = "mmap")]
-            EnumProj::Mmap(memory_map) => memory_map
-                .poll_frame(cx)
-                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
-                .map_err(|never| match never {}),
-
-            #[cfg(feature = "mmap")]
-            EnumProj::MmapRateChecked(memory_map, client) => memory_map
+            EnumProj::Mmap(memory_map, client) => memory_map
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
                 .map_err(|rerr| match *rerr {
@@ -771,40 +777,24 @@ impl Body for ProxyCacheBody {
             EnumProj::Boxed(bytes) => bytes
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes)),
-
-            EnumProj::Full(bytes) => bytes
-                .poll_frame(cx)
-                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes))
-                .map_err(|never| match never {}),
-
-            EnumProj::Empty(bytes) => bytes
-                .poll_frame(cx)
-                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes))
-                .map_err(|never| match never {}),
         }
     }
 
+    #[inline]
     fn size_hint(&self) -> SizeHint {
         match self {
             #[cfg(feature = "mmap")]
-            Self::Mmap(mmap_body) => mmap_body.size_hint(),
-            #[cfg(feature = "mmap")]
-            Self::MmapRateChecked(rate_checked_body, _ip_addr) => rate_checked_body.size_hint(),
+            Self::Mmap(mmap_body, _) => mmap_body.size_hint(),
             Self::Boxed(box_body) => box_body.size_hint(),
-            Self::Full(full_body) => full_body.size_hint(),
-            Self::Empty(empty_body) => empty_body.size_hint(),
         }
     }
 
+    #[inline]
     fn is_end_stream(&self) -> bool {
         match self {
             #[cfg(feature = "mmap")]
-            Self::Mmap(mmap_body) => mmap_body.is_end_stream(),
-            #[cfg(feature = "mmap")]
-            Self::MmapRateChecked(rate_checked_body, _ip_addr) => rate_checked_body.is_end_stream(),
+            Self::Mmap(mmap_body, _) => mmap_body.is_end_stream(),
             Self::Boxed(box_body) => box_body.is_end_stream(),
-            Self::Full(full_body) => full_body.is_end_stream(),
-            Self::Empty(empty_body) => empty_body.is_end_stream(),
         }
     }
 }
@@ -1139,9 +1129,7 @@ async fn serve_cached_file(
             );
         }
 
-        let response = builder
-            .body(ProxyCacheBody::Empty(Empty::new()))
-            .expect("HTTP response is valid");
+        let response = builder.body(empty_body()).expect("HTTP response is valid");
 
         trace!("Outgoing response: {response:?}");
 
@@ -1179,7 +1167,7 @@ async fn serve_cached_file(
                             HeaderValue::try_from(format!("bytes */{file_size}"))
                                 .expect("content range is valid"),
                         )
-                        .body(ProxyCacheBody::Empty(Empty::new()))
+                        .body(empty_body())
                         .expect("HTTP response is valid");
                 }
                 ParsedRange::Invalid | ParsedRange::IfRangeFailed => {
@@ -1337,13 +1325,14 @@ async fn serve_cached_file_mmap(
 
     let config = global_config();
 
-    let body = match config.min_download_rate {
-        Some(rate) => ProxyCacheBody::MmapRateChecked(
-            RateCheckedBody::new(memory_body, rate, config.rate_check_timeframe),
-            client,
+    let body = ProxyCacheBody::Mmap(
+        MaybeRated::new(
+            memory_body,
+            config.min_download_rate,
+            config.rate_check_timeframe,
         ),
-        None => ProxyCacheBody::Mmap(memory_body),
-    };
+        client,
+    );
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(
@@ -1384,6 +1373,9 @@ async fn serve_cached_file_buf(
         "range {start}+{content_length} must not exceed file size {file_size}"
     );
 
+    let config = global_config();
+    let client = conn_details.client;
+
     if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
         error!(
             "Error seeking cached file `{}` to {start}/{file_size}:  {err}",
@@ -1394,8 +1386,8 @@ async fn serve_cached_file_buf(
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
 
-    let reader_stream =
-        tokio_util::io::ReaderStream::with_capacity(file, global_config().buffer_size);
+    let reader_stream = tokio_util::io::ReaderStream::with_capacity(file, config.buffer_size);
+
     let delivery_body = DeliveryStreamBody::new(
         reader_stream.map_ok(Frame::data),
         content_length,
@@ -1403,11 +1395,20 @@ async fn serve_cached_file_buf(
         database_tx,
         conn_details,
     );
-    let body = ProxyCacheBody::Boxed(
-        delivery_body
-            .map_err(|err| Box::new(ProxyCacheError::Io(err)))
-            .boxed(),
-    );
+
+    let rated = MaybeRated::new(
+        delivery_body,
+        config.min_download_rate,
+        config.rate_check_timeframe,
+    )
+    .map_err(move |err| match *err {
+        RateCheckedBodyErr::RateTimeout(error) => {
+            Box::new(ProxyCacheError::ClientDownloadRate { error, client })
+        }
+        RateCheckedBodyErr::Inner(ierr) => ierr.into(),
+    });
+
+    let body = ProxyCacheBody::Boxed(BoxBody::new(rated));
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(
@@ -1810,14 +1811,7 @@ async fn download_file(
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
     let outpath = output.1;
 
-    let mut body = match config.min_download_rate {
-        Some(rate) => BoxBody::new(RateCheckedBody::new(
-            body,
-            rate,
-            config.rate_check_timeframe,
-        )),
-        None => BoxBody::new(body.map_err(|err| Box::new(RateCheckedBodyErr::Inner(err)))),
-    };
+    let mut body = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
 
     while let Some(next) = body.frame().await {
         let frame = match next {
@@ -2212,28 +2206,21 @@ async fn serve_unfinished_file(
 
     let channel_body = ChannelBody::new(rx, content_length);
 
-    let response = match config.min_download_rate {
-        Some(min_download_rate) => {
-            let checked_channel_body =
-                RateCheckedBody::new(channel_body, min_download_rate, config.rate_check_timeframe);
-            response_builder
-                .body(ProxyCacheBody::Boxed(BoxBody::new(
-                    checked_channel_body.map_err(move |err| match *err {
-                        RateCheckedBodyErr::RateTimeout(download_rate_err) => {
-                            Box::new(ProxyCacheError::ClientDownloadRate {
-                                error: download_rate_err,
-                                client: conn_details.client,
-                            })
-                        }
-                        RateCheckedBodyErr::Inner(ierr) => ierr,
-                    }),
-                )))
-                .expect("HTTP response is valid")
-        }
-        None => response_builder
-            .body(ProxyCacheBody::Boxed(BoxBody::new(channel_body)))
-            .expect("HTTP response is valid"),
-    };
+    let rated = MaybeRated::new(
+        channel_body,
+        config.min_download_rate,
+        config.rate_check_timeframe,
+    );
+
+    let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
+        RateCheckedBodyErr::RateTimeout(error) => Box::new(ProxyCacheError::ClientDownloadRate {
+            error,
+            client: conn_details.client,
+        }),
+        RateCheckedBodyErr::Inner(ierr) => ierr,
+    })));
+
+    let response = response_builder.body(body).expect("HTTP response is valid");
 
     trace!("Outgoing response: {response:?}");
 
@@ -2502,6 +2489,8 @@ async fn serve_new_file(
         request
     }
 
+    let config = global_config();
+
     let ibarrier = InitBarrier::new(
         init_tx,
         &status,
@@ -2558,7 +2547,7 @@ async fn serve_new_file(
 
     let mut req_uri = std::borrow::Cow::Borrowed(req.uri());
 
-    if let Some(max) = global_config().max_upstream_downloads
+    if let Some(max) = config.max_upstream_downloads
         && appstate.active_downloads.len() > max.get()
     {
         warn_once_or_info!(
@@ -2925,9 +2914,18 @@ async fn serve_new_file(
 
             let (parts, body) = fwd_response.into_parts();
 
-            let body = ProxyCacheBody::Boxed(BoxBody::new(
-                body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
-            ));
+            let rated =
+                MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+
+            let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
+                RateCheckedBodyErr::RateTimeout(error) => {
+                    Box::new(ProxyCacheError::ClientDownloadRate {
+                        error,
+                        client: conn_details.client,
+                    })
+                }
+                RateCheckedBodyErr::Inner(ierr) => ierr.into(),
+            })));
 
             let mut response = Response::from_parts(parts, body);
             response
@@ -3073,7 +3071,7 @@ async fn serve_new_file(
         }
         utils::PartialDownload::Volatile => {
             // Volatile file: random temp file
-            let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
+            let tmppath: PathBuf = [&config.cache_directory, Path::new("tmp"), filename]
                 .iter()
                 .collect();
             match tokio_tempfile(&tmppath, 0o640).await {
@@ -3137,8 +3135,6 @@ async fn serve_new_file(
         .await;
     });
 
-    let config = global_config();
-
     if conn_details.cached_flavor != CachedFlavor::Volatile
         && config.experimental_parallel_hack_enabled
         && config
@@ -3178,7 +3174,7 @@ async fn serve_new_file(
             }
 
             let response = response_builder
-                .body(ProxyCacheBody::Empty(Empty::new()))
+                .body(empty_body())
                 .expect("Response is valid");
 
             trace!("Outgoing parallel download hack response: {response:?}");
@@ -3463,7 +3459,7 @@ fn connect_response(
     let response = Response::builder()
         .header(SERVER, APP_NAME)
         .header(DATE, format_http_date())
-        .body(ProxyCacheBody::Empty(Empty::new()))
+        .body(empty_body())
         .expect("HTTP response is valid");
 
     trace!("Outgoing response: {response:?}");
@@ -3970,9 +3966,15 @@ async fn pre_process_client_request(
 
             let (parts, body) = redirected_response.into_parts();
 
-            let body = ProxyCacheBody::Boxed(BoxBody::new(
-                body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
-            ));
+            let rated =
+                MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+
+            let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
+                RateCheckedBodyErr::RateTimeout(error) => {
+                    Box::new(ProxyCacheError::ClientDownloadRate { error, client })
+                }
+                RateCheckedBodyErr::Inner(ierr) => ierr.into(),
+            })));
 
             let mut response = Response::from_parts(parts, body);
             response
@@ -3985,11 +3987,19 @@ async fn pre_process_client_request(
         }
     }
 
-    let mut response = fwd_response.map(|body| {
-        ProxyCacheBody::Boxed(BoxBody::new(
-            body.map_err(|err| Box::new(ProxyCacheError::Hyper(err))),
-        ))
-    });
+    let (parts, body) = fwd_response.into_parts();
+
+    let rated = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+
+    let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
+        RateCheckedBodyErr::RateTimeout(error) => {
+            Box::new(ProxyCacheError::ClientDownloadRate { error, client })
+        }
+        RateCheckedBodyErr::Inner(ierr) => ierr.into(),
+    })));
+
+    let mut response = Response::from_parts(parts, body);
+
     response
         .headers_mut()
         .append(VIA, HeaderValue::from_static(APP_VIA));

@@ -8,7 +8,6 @@ use build_html::HtmlElement;
 use build_html::Table;
 use build_html::{Container, ContainerType, HtmlPage};
 use coarsetime::Instant;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{
     Request, Response, StatusCode,
@@ -27,6 +26,7 @@ use crate::RUNTIMEDETAILS;
 use crate::client_counter::active_client_downloads;
 use crate::client_counter::connected_clients;
 use crate::deb_mirror::is_deb_package;
+use crate::full_body;
 use crate::get_features;
 use crate::global_cache_quota;
 use crate::global_config;
@@ -400,8 +400,6 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
         )
         .to_html_string();
 
-    let body = ProxyCacheBody::Full(Full::new(html.into()));
-
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(SERVER, APP_NAME)
@@ -412,7 +410,7 @@ async fn serve_root(appstate: &AppState) -> Response<ProxyCacheBody> {
             "default-src 'none'; style-src 'unsafe-inline'",
         )
         .header("X-Content-Type-Options", "nosniff")
-        .body(body)
+        .body(full_body(html))
         .expect("HTTP response is valid");
 
     trace!("Local web interface response: {response:?}");
@@ -430,8 +428,6 @@ fn serve_logs() -> Response<ProxyCacheBody> {
         buf.push(b'\n');
     }
 
-    let body = ProxyCacheBody::Full(Full::new(buf.into()));
-
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(SERVER, APP_NAME)
@@ -442,7 +438,7 @@ fn serve_logs() -> Response<ProxyCacheBody> {
             "default-src 'none'; style-src 'unsafe-inline'",
         )
         .header("X-Content-Type-Options", "nosniff")
-        .body(body)
+        .body(full_body(buf))
         .expect("HTTP response is valid");
 
     trace!("Local web interface response: {response:?}");

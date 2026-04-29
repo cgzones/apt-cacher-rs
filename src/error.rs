@@ -102,6 +102,18 @@ impl From<ChannelBodyError> for ProxyCacheError {
     }
 }
 
+impl From<std::io::Error> for Box<ProxyCacheError> {
+    fn from(value: std::io::Error) -> Self {
+        Self::new(ProxyCacheError::Io(value))
+    }
+}
+
+impl From<hyper::Error> for Box<ProxyCacheError> {
+    fn from(value: hyper::Error) -> Self {
+        Self::new(ProxyCacheError::Hyper(value))
+    }
+}
+
 #[must_use]
 pub(crate) struct ErrorReport<'a, E>(pub(crate) &'a E)
 where
