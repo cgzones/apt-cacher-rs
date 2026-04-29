@@ -1,10 +1,8 @@
 use std::fmt::Display;
 
-use coarsetime::Duration;
-
+use crate::deb_mirror::Mirror;
 use crate::rate_checked_body::InsufficientRate;
 use crate::{ChannelBodyError, ClientInfo, ContentLength};
-use crate::{deb_mirror::Mirror, humanfmt::HumanFmt};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorDownloadRate {
@@ -37,38 +35,16 @@ impl std::fmt::Display for ProxyCacheError {
             Self::Hyper(e) => write!(f, "{}", ErrorReport(e)),
             Self::Sqlx(e) => e.fmt(f),
             Self::ClientDownloadRate { error, client } => {
-                write!(
-                    f,
-                    "Timeout occurred for client {client} after a download rate of {} [< {}] for the last {} seconds",
-                    HumanFmt::Rate(
-                        error.transferred as u64,
-                        Duration::from_secs(error.timeframe.get() as u64)
-                    ),
-                    HumanFmt::Rate(error.min_rate.get() as u64, Duration::from_secs(1)),
-                    error.timeframe,
-                )
+                error.fmt_with_context(f, format_args!(" for client {client}"))
             }
             Self::MirrorDownloadRate(MirrorDownloadRate {
                 download_rate_err,
                 mirror,
                 debname,
-            }) => {
-                write!(
-                    f,
-                    "Timeout occurred for mirror {} downloading file {} after a download rate of {} [< {}] for the last {} seconds",
-                    mirror,
-                    debname,
-                    HumanFmt::Rate(
-                        download_rate_err.transferred as u64,
-                        Duration::from_secs(download_rate_err.timeframe.get() as u64)
-                    ),
-                    HumanFmt::Rate(
-                        download_rate_err.min_rate.get() as u64,
-                        Duration::from_secs(1)
-                    ),
-                    download_rate_err.timeframe,
-                )
-            }
+            }) => download_rate_err.fmt_with_context(
+                f,
+                format_args!(" for mirror {mirror} downloading file {debname}"),
+            ),
             Self::Memfd(e) => write!(f, "{}", ErrorReport(e)),
             Self::ContentTooLarge {
                 announced,

@@ -27,17 +27,40 @@ pub(crate) struct InsufficientRate {
     _private: (),
 }
 
-impl std::fmt::Display for InsufficientRate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl InsufficientRate {
+    /// Format the rate-timeout message with a required context fragment
+    /// inserted after `"Timeout occurred"` (e.g. `" for client foo"`).
+    pub(crate) fn fmt_with_context(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        context: std::fmt::Arguments<'_>,
+    ) -> std::fmt::Result {
         write!(
             f,
-            "Timeout occurred after a download rate of {} [< {}] for the last {} seconds",
+            "Timeout occurred{context} after a download rate of {} [< {}] for the last {} seconds",
             HumanFmt::Rate(
                 self.transferred as u64,
                 Duration::from_secs(self.timeframe.get() as u64)
             ),
             HumanFmt::Rate(self.min_rate.get() as u64, Duration::from_secs(1)),
             self.timeframe,
+        )
+    }
+
+    /// Build a `TimedOut` `io::Error` whose message describes the rate
+    /// breach in the supplied context (e.g. `" for upstream"`).
+    #[cfg(feature = "sendfile")]
+    #[must_use]
+    pub(crate) fn to_timeout_io_error(self, context: std::fmt::Arguments<'_>) -> std::io::Error {
+        struct Adapter<'a, 'b>(&'a InsufficientRate, std::fmt::Arguments<'b>);
+        impl std::fmt::Display for Adapter<'_, '_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt_with_context(f, self.1)
+            }
+        }
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            Adapter(&self, context).to_string(),
         )
     }
 }

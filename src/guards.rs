@@ -238,13 +238,17 @@ impl DownloadBarrier {
             .data
             .as_ref()
             .expect("every sink consumes the instance");
+        let io_err = download_rate_err.to_timeout_io_error(format_args!(
+            " for mirror {} downloading file {}",
+            data.mirror, data.debname,
+        ));
         let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {
             download_rate_err,
             mirror: data.mirror.clone(),
             debname: data.debname.clone(),
         });
         self.abort_with_reason(reason).await;
-        std::io::Error::new(std::io::ErrorKind::TimedOut, download_rate_err.to_string())
+        io_err
     }
 }
 
