@@ -14,6 +14,7 @@ compile_error!("Feature \"tls_hyper\" and \"tls_rustls\" are mutually exclusive.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod active_downloads;
 mod cache_quota;
 mod channel_body;
 mod config;
@@ -34,6 +35,7 @@ mod ktls;
 mod ktls_handshake;
 mod log_once;
 mod logstore;
+mod metrics;
 mod rate_checked_body;
 mod ringbuffer;
 #[cfg(feature = "ktls")]
@@ -69,13 +71,13 @@ use std::task::Poll::Pending;
 use std::task::Poll::Ready;
 use std::time::Duration;
 
+use bytes::Buf as _;
 use channel_body::ChannelBody;
 use channel_body::ChannelBodyError;
 use clap::Parser;
 use coarsetime::Instant;
 use futures_util::StreamExt as _;
 use futures_util::TryStreamExt as _;
-use hashbrown::hash_map::Entry;
 use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
 use http::header::ALLOW;
 use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
@@ -136,6 +138,10 @@ use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::signal::unix::SignalKind;
 
+#[cfg(feature = "splice")]
+use crate::active_downloads::OriginateOutcome;
+use crate::active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads, InsertOutcome};
+use crate::cache_quota::QuotaExceeded;
 use crate::config::Config;
 use crate::config::DomainName;
 use crate::config::HttpsUpgradeMode;
@@ -146,6 +152,7 @@ use crate::database_task::DbCmdDelivery;
 use crate::database_task::DbCmdDownload;
 use crate::database_task::DbCmdOrigin;
 use crate::database_task::db_loop;
+use crate::database_task::send_db_command;
 use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
 use crate::deb_mirror::ResourceFile;
@@ -157,7 +164,6 @@ use crate::deb_mirror::valid_distribution;
 use crate::deb_mirror::valid_filename;
 use crate::deb_mirror::valid_mirrorname;
 use crate::error::ErrorReport;
-use crate::error::MirrorDownloadRate;
 use crate::error::ProxyCacheError;
 use crate::guards::DownloadBarrier;
 use crate::guards::InitBarrier;
@@ -173,8 +179,11 @@ use crate::http_range::compute_age;
 use crate::http_range::format_http_date;
 use crate::humanfmt::HumanFmt;
 use crate::logstore::LogStore;
+use crate::rate_checked_body::RateCheckDirection;
 use crate::task_cache_scan::task_cache_scan;
-use crate::task_cleanup::task_cleanup;
+use crate::task_cleanup::{
+    CLEANUP_INTERVAL_SECS, FIRST_CLEANUP_DELAY_SECS, set_next_cleanup_epoch, task_cleanup,
+};
 use crate::task_setup::task_setup;
 use crate::uncacheables::record_uncacheable;
 use crate::utils::TempPath;
@@ -372,6 +381,7 @@ pub(crate) async fn request_with_retry(
             uri_parts.scheme = Some(http::uri::Scheme::HTTPS);
             parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
             https_upgrade_test = true;
+            metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
         }
     }
 
@@ -396,6 +406,9 @@ pub(crate) async fn request_with_retry(
 
             let _: Never = match client.request(req_clone).await {
                 Ok(response) => {
+                    if https_upgrade_test {
+                        metrics::HTTPS_UPGRADE_SUCCEEDED.increment();
+                    }
                     if cached_scheme.is_none()
                         && let Some(auth) = parts.uri.authority()
                     {
@@ -430,9 +443,11 @@ pub(crate) async fn request_with_retry(
                             }
                         }
                     }
+                    metrics::record_upstream_status(response.status());
                     return Ok(response);
                 }
                 Err(err) if !err.is_connect() => {
+                    metrics::UPSTREAM_HYPER_CONNECT_FAILED.increment();
                     warn_once_or_info!(
                         "Request of internal client to {} failed:  {}",
                         parts.uri,
@@ -463,6 +478,7 @@ pub(crate) async fn request_with_retry(
                                 .expect("authority must exist for a https upgrade")
                         );
 
+                        metrics::HTTPS_UPGRADE_FAILED.increment();
                         // reset https upgrade
                         let mut uri_parts = parts.uri.into_parts();
                         uri_parts.scheme.clone_from(&orig_scheme);
@@ -474,6 +490,7 @@ pub(crate) async fn request_with_retry(
                     }
 
                     if attempt > MAX_ATTEMPTS {
+                        metrics::UPSTREAM_HYPER_CONNECT_FAILED.increment();
                         if let Some(auth) = parts.uri.authority() {
                             let key = SchemeKeyRef {
                                 host: auth.host(),
@@ -486,6 +503,7 @@ pub(crate) async fn request_with_retry(
                                 .write()
                                 .remove(&key);
                             if let Some(scheme) = value {
+                                metrics::SCHEME_CACHE_REMOVED.increment();
                                 debug!(
                                     "Removed cached scheme {scheme} for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}"
                                 );
@@ -502,6 +520,7 @@ pub(crate) async fn request_with_retry(
                     );
 
                     attempt += 1;
+                    metrics::UPSTREAM_RETRIES.increment();
 
                     tokio::time::sleep(Duration::from_millis(sleep_curr)).await;
                     (sleep_curr, sleep_prev) = (sleep_curr + sleep_prev, sleep_curr);
@@ -593,7 +612,6 @@ struct DeliveryStreamBody<S> {
     size: u64,
     partial: bool,
     transferred_bytes: u64,
-    database_tx: Option<tokio::sync::mpsc::Sender<DatabaseCommand>>,
     conn_details: Option<ConnectionDetails>,
     error: Option<String>,
     _counter: client_counter::ClientDownload,
@@ -601,20 +619,13 @@ struct DeliveryStreamBody<S> {
 
 impl<S> DeliveryStreamBody<S> {
     #[must_use]
-    fn new(
-        stream: S,
-        size: u64,
-        partial: bool,
-        database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
-        conn_details: ConnectionDetails,
-    ) -> Self {
+    fn new(stream: S, size: u64, partial: bool, conn_details: ConnectionDetails) -> Self {
         Self {
             stream,
             start: Instant::now(),
             size,
             partial,
             transferred_bytes: 0,
-            database_tx: Some(database_tx),
             conn_details: Some(conn_details),
             error: None,
             _counter: client_counter::ClientDownload::new(),
@@ -666,8 +677,9 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
         let partial = self.partial;
         let duration = self.start.elapsed();
         let transferred_bytes = self.transferred_bytes;
+        metrics::BYTES_SERVED_COPY.increment_by(transferred_bytes);
+        metrics::REQUESTS_COPY.increment();
         let project = self.project();
-        let db_tx = project.database_tx.take().expect("Option is set in new()");
         let cd = project.conn_details.take().expect("Option is set in new()");
         let error = project.error.take();
         tokio::task::spawn(async move {
@@ -695,7 +707,7 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                     partial,
                     client_ip: cd.client.ip(),
                 });
-                db_tx.send(cmd).await.expect("database task should not die");
+                send_db_command(cmd).await;
             } else if transferred_bytes == 0 && duration < coarsetime::Duration::from_secs(1) {
                 info!(
                     "Aborted serving cached file {} from mirror {}{} for client {} after {} via stream:  {}",
@@ -831,6 +843,47 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
     }
 }
 
+/// Body wrapper for the hyper simple-proxy path: counts data bytes into
+/// [`metrics::BYTES_SERVED_PASSTHROUGH`] at poll time (hyper's body model
+/// exposes no post-write hook). Splice/sendfile count post-write directly.
+#[pin_project]
+struct PassthroughBody<B: Body> {
+    #[pin]
+    inner: B,
+}
+
+impl<B> Body for PassthroughBody<B>
+where
+    B: Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    #[inline]
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = self.project().inner.poll_frame(cx);
+        if let Ready(Some(Ok(ref frame))) = result
+            && let Some(data) = frame.data_ref()
+        {
+            metrics::BYTES_SERVED_PASSTHROUGH.increment_by(data.remaining() as u64);
+        }
+        result
+    }
+
+    #[inline]
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
 #[cfg(feature = "mmap")]
 const MMAP_FRAME_SIZE: usize = 2 * 1024 * 1024; // 2MiB
 
@@ -841,7 +894,6 @@ struct MmapBody {
     length: usize,
     partial: bool,
     start: Instant,
-    database_tx: Option<tokio::sync::mpsc::Sender<DatabaseCommand>>,
     conn_details: Option<ConnectionDetails>,
     _counter: client_counter::ClientDownload,
 }
@@ -849,20 +901,13 @@ struct MmapBody {
 #[cfg(feature = "mmap")]
 impl MmapBody {
     #[must_use]
-    fn new(
-        mapping: Mmap,
-        length: usize,
-        partial: bool,
-        database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
-        conn_details: ConnectionDetails,
-    ) -> Self {
+    fn new(mapping: Mmap, length: usize, partial: bool, conn_details: ConnectionDetails) -> Self {
         Self {
             mapping: Arc::new(mapping),
             position: 0,
             length,
             partial,
             start: Instant::now(),
-            database_tx: Some(database_tx),
             conn_details: Some(conn_details),
             _counter: client_counter::ClientDownload::new(),
         }
@@ -876,7 +921,8 @@ impl Drop for MmapBody {
         let partial = self.partial;
         let elapsed = self.start.elapsed();
         let transferred_bytes = self.position as u64;
-        let db_tx = self.database_tx.take().expect("set in new()");
+        metrics::BYTES_SERVED_MMAP.increment_by(self.position as u64);
+        metrics::REQUESTS_MMAP.increment();
         let cd = self.conn_details.take().expect("set in new()");
         tokio::task::spawn(async move {
             let aliased = match cd.aliased_host {
@@ -903,7 +949,7 @@ impl Drop for MmapBody {
                     partial,
                     client_ip: cd.client.ip(),
                 });
-                db_tx.send(cmd).await.expect("database task should not die");
+                send_db_command(cmd).await;
             } else if transferred_bytes == 0 {
                 info!(
                     "Aborted serving cached file {} from mirror {}{} for client {} after {} via mmap",
@@ -1022,7 +1068,6 @@ impl EtagState {
 async fn serve_cached_file(
     conn_details: ConnectionDetails,
     req: &Request<Empty<()>>,
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
     file_path: PathBuf,
     file_etag: EtagState,
@@ -1070,6 +1115,7 @@ async fn serve_cached_file(
     let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get metadata of cached file `{}`:  {err}",
                 file_path.display()
@@ -1203,7 +1249,6 @@ async fn serve_cached_file(
         // TODO: use become: https://github.com/rust-lang/rust/issues/112788
         return serve_cached_file_mmap(
             conn_details,
-            database_tx,
             file,
             file_path,
             last_modified_str,
@@ -1226,7 +1271,6 @@ async fn serve_cached_file(
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_buf(
         conn_details,
-        database_tx,
         file,
         file_path,
         file_size,
@@ -1251,7 +1295,6 @@ async fn serve_cached_file(
 #[inline(always)]
 async fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     file: tokio::fs::File,
     file_path: PathBuf,
     last_modified_str: String,
@@ -1315,13 +1358,7 @@ async fn serve_cached_file_mmap(
 
     let client = conn_details.client;
 
-    let memory_body = MmapBody::new(
-        memory_map,
-        content_length,
-        partial,
-        database_tx,
-        conn_details,
-    );
+    let memory_body = MmapBody::new(memory_map, content_length, partial, conn_details);
 
     let config = global_config();
 
@@ -1330,6 +1367,7 @@ async fn serve_cached_file_mmap(
             memory_body,
             config.min_download_rate,
             config.rate_check_timeframe,
+            RateCheckDirection::Client,
         ),
         client,
     );
@@ -1355,7 +1393,6 @@ async fn serve_cached_file_mmap(
 #[inline(always)]
 async fn serve_cached_file_buf(
     conn_details: ConnectionDetails,
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     mut file: tokio::fs::File,
     file_path: PathBuf,
     file_size: u64,
@@ -1392,7 +1429,6 @@ async fn serve_cached_file_buf(
         reader_stream.map_ok(Frame::data),
         content_length,
         partial,
-        database_tx,
         conn_details,
     );
 
@@ -1400,6 +1436,7 @@ async fn serve_cached_file_buf(
         delivery_body,
         config.min_download_rate,
         config.rate_check_timeframe,
+        RateCheckDirection::Client,
     )
     .map_err(move |err| match *err {
         RateCheckedBodyErr::RateTimeout(error) => {
@@ -1500,7 +1537,6 @@ fn serve_cached_file_response(
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) database: Database,
-    pub(crate) database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     pub(crate) https_client: HttpClient,
     pub(crate) active_downloads: ActiveDownloads,
 }
@@ -1524,6 +1560,7 @@ async fn serve_volatile_file(
             .modified()
             .expect("Platform should support modification timestamps via setup check"),
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get metadata of file `{}`:  {err}",
                 file_path.display()
@@ -1545,15 +1582,13 @@ async fn serve_volatile_file(
                 VOLATILE_CACHE_MAX_AGE.as_secs()
             );
 
-            return serve_cached_file(
-                conn_details,
-                &req,
-                appstate.database_tx,
-                file,
-                file_path,
-                EtagState::Unknown,
-            )
-            .await;
+            // Gated on `not(sendfile)`: when the sendfile backend is enabled,
+            // it has already bumped VOLATILE_HIT before any fallback into hyper.
+            #[cfg(not(feature = "sendfile"))]
+            metrics::VOLATILE_HIT.increment();
+
+            return serve_cached_file(conn_details, &req, file, file_path, EtagState::Unknown)
+                .await;
         }
     } else {
         warn!(
@@ -1562,38 +1597,39 @@ async fn serve_volatile_file(
         );
     }
 
-    let (init_tx, status) = appstate
+    // Gated on `not(sendfile)`: when the sendfile backend is enabled, it has
+    // already bumped VOLATILE_REFETCHED for this stale-volatile path before
+    // any fallback into hyper.
+    #[cfg(not(feature = "sendfile"))]
+    metrics::VOLATILE_REFETCHED.increment();
+
+    match appstate
         .active_downloads
-        .insert(&conn_details.mirror, &conn_details.debname);
-
-    let Some(init_tx) = init_tx else {
-        debug!(
-            "Serving file {} already in cache / download from mirror {} for client {}...",
-            conn_details.debname, conn_details.mirror, conn_details.client
-        );
-        return serve_downloading_file(
-            conn_details,
-            req,
-            appstate.database_tx,
-            status,
-            EtagState::Unknown,
-        )
-        .await;
-    };
-
-    serve_new_file(
-        conn_details,
-        status,
-        init_tx,
-        req,
-        CacheFileStat::Volatile {
-            file,
-            file_path,
-            local_modification_time,
-        },
-        appstate,
-    )
-    .await
+        .insert(&conn_details.mirror, &conn_details.debname)
+    {
+        InsertOutcome::Joined { status } => {
+            debug!(
+                "Serving file {} already in cache / download from mirror {} for client {}...",
+                conn_details.debname, conn_details.mirror, conn_details.client
+            );
+            serve_downloading_file(conn_details, req, status, EtagState::Unknown).await
+        }
+        InsertOutcome::Originator { init_tx, status } => {
+            serve_new_file(
+                conn_details,
+                status,
+                init_tx,
+                req,
+                CacheFileStat::Volatile {
+                    file,
+                    file_path,
+                    local_modification_time,
+                },
+                appstate,
+            )
+            .await
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1641,151 +1677,7 @@ impl ConnectionDetails {
     }
 }
 
-#[derive(Debug, Eq, Hash, PartialEq)]
-struct ActiveDownloadKey {
-    mirror: Mirror,
-    debname: String,
-}
-
-#[derive(Hash)]
-struct ActiveDownloadKeyRef<'a> {
-    mirror: &'a Mirror,
-    debname: &'a str,
-}
-
-impl Equivalent<ActiveDownloadKey> for ActiveDownloadKeyRef<'_> {
-    fn equivalent(&self, key: &ActiveDownloadKey) -> bool {
-        *self.mirror == key.mirror && self.debname == key.debname
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum AbortReason {
-    MirrorDownloadRate(MirrorDownloadRate),
-    AlreadyLoggedJustFail,
-}
-
-#[derive(Debug)]
-pub(crate) enum ActiveDownloadStatus {
-    Init(tokio::sync::watch::Receiver<()>),
-    Download(PathBuf, ContentLength, tokio::sync::watch::Receiver<()>),
-    Finished(PathBuf),
-    Aborted(AbortReason),
-}
-
-#[derive(Clone)]
-pub(crate) struct ActiveDownloads {
-    inner: Arc<
-        parking_lot::RwLock<
-            HashMap<ActiveDownloadKey, Arc<tokio::sync::RwLock<ActiveDownloadStatus>>>,
-        >,
-    >,
-}
-
-impl ActiveDownloads {
-    #[must_use]
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        }
-    }
-
-    #[must_use]
-    fn len(&self) -> usize {
-        self.inner.read().len()
-    }
-
-    #[must_use]
-    pub(crate) fn insert(
-        &self,
-        mirror: &Mirror,
-        debname: &str,
-    ) -> (
-        Option<tokio::sync::watch::Sender<()>>,
-        Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    ) {
-        // Assuming concurrent requests of resources in-download are rare,
-        // pre-allocate the `ActiveDownloadKey` to avoid the likely
-        // allocation while holding the write-lock.
-        let key = ActiveDownloadKey {
-            mirror: mirror.to_owned(),
-            debname: debname.to_owned(),
-        };
-
-        // Create channel and status before acquiring write lock to minimize lock scope
-        let (tx, rx) = tokio::sync::watch::channel(());
-        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
-
-        match self.inner.write().entry(key) {
-            Entry::Occupied(oentry) => (None, Arc::clone(oentry.get())),
-            Entry::Vacant(ventry) => {
-                ventry.insert(Arc::clone(&status));
-                (Some(tx), status)
-            }
-        }
-    }
-
-    pub(crate) fn remove(&self, mirror: &Mirror, debname: &str) {
-        let key = ActiveDownloadKeyRef { mirror, debname };
-        let was_present = self.inner.write().remove(&key);
-        assert!(
-            was_present.is_some(),
-            "callers must own active downloads they are removing"
-        );
-    }
-
-    /// Get the download status for an active download, if any.
-    #[cfg(feature = "sendfile")]
-    #[must_use]
-    pub(crate) fn get(
-        &self,
-        mirror: &Mirror,
-        debname: &str,
-    ) -> Option<Arc<tokio::sync::RwLock<ActiveDownloadStatus>>> {
-        let key = ActiveDownloadKeyRef { mirror, debname };
-        self.inner.read().get(&key).cloned()
-    }
-
-    #[must_use]
-    fn download_size(&self) -> u64 {
-        tokio::task::block_in_place(move || {
-            let mut sum = 0;
-
-            for download in self.inner.read().values() {
-                let d = download.blocking_read();
-                if let ActiveDownloadStatus::Download(_, size, _) = &*d {
-                    sum += size.upper().get();
-                }
-            }
-
-            sum
-        })
-    }
-
-    #[must_use]
-    fn download_count(&self) -> usize {
-        tokio::task::block_in_place(move || {
-            let mut count = 0;
-
-            for download in self.inner.read().values() {
-                let d = download.blocking_read();
-                match &*d {
-                    ActiveDownloadStatus::Init(_)
-                    | ActiveDownloadStatus::Download(_, _, _)
-                    | ActiveDownloadStatus::Aborted(_) => {
-                        count += 1;
-                    }
-                    ActiveDownloadStatus::Finished(_) => (),
-                }
-            }
-
-            count
-        })
-    }
-}
-
 async fn download_file(
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     conn_details: &ConnectionDetails,
     warn_on_override: bool,
     input: (Incoming, ContentLength),
@@ -1811,7 +1703,12 @@ async fn download_file(
     let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
     let outpath = output.1;
 
-    let mut body = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+    let mut body = MaybeRated::new(
+        body,
+        config.min_download_rate,
+        config.rate_check_timeframe,
+        RateCheckDirection::Upstream,
+    );
 
     while let Some(next) = body.frame().await {
         let frame = match next {
@@ -1831,6 +1728,7 @@ async fn download_file(
                             .await;
                     }
                     RateCheckedBodyErr::Inner(ierr) => {
+                        metrics::UPSTREAM_HYPER_BODY_ERR.increment();
                         error!(
                             "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {}",
                             conn_details.debname,
@@ -1856,8 +1754,10 @@ async fn download_file(
         if let Ok(mut chunk) = frame.into_data() {
             let chunk_len = chunk.len() as u64;
             bytes += chunk_len;
+            metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(chunk_len);
 
             if bytes > content_length.upper().get() {
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn!(
                     "More bytes received than expected for file {} from mirror {}: {bytes} vs {}",
                     conn_details.debname,
@@ -1879,7 +1779,8 @@ async fn download_file(
     match content_length {
         ContentLength::Exact(size) => {
             if bytes != size.get() {
-                error!(
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                warn!(
                     "Content length mismatch: expected {} but got {} for file {} from mirror {}",
                     size.get(),
                     bytes,
@@ -1891,7 +1792,8 @@ async fn download_file(
         }
         ContentLength::Unknown(size) => {
             if bytes > size.get() {
-                error!(
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                warn!(
                     "Content exceeded unknown limit: got {} but limit is {} for file {} from mirror {}",
                     bytes,
                     size.get(),
@@ -2008,17 +1910,12 @@ async fn download_file(
         elapsed,
         client_ip: conn_details.client.ip(),
     });
-    database_tx
-        .send(cmd)
-        .await
-        .expect("database task should not die");
+    send_db_command(cmd).await;
 }
 
-#[expect(clippy::too_many_arguments, reason = "function has only 1 caller")]
 #[must_use]
 async fn serve_unfinished_file(
     conn_details: ConnectionDetails,
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     mut file: tokio::fs::File,
     file_path: PathBuf,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
@@ -2027,6 +1924,8 @@ async fn serve_unfinished_file(
     upstream_etag: EtagState,
 ) -> Response<ProxyCacheBody> {
     let config = global_config();
+
+    metrics::REQUESTS_CHANNEL.increment();
 
     // For joining clients, try reading from xattr as the download task may have already written it.
     let file_etag = match upstream_etag {
@@ -2038,6 +1937,7 @@ async fn serve_unfinished_file(
     let md = match file.metadata().await {
         Ok(data) => data,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get metadata of file `{}`:  {err}",
                 file_path.display()
@@ -2174,10 +2074,7 @@ async fn serve_unfinished_file(
             partial: false,
             client_ip: conn_details.client.ip(),
         });
-        database_tx
-            .send(cmd)
-            .await
-            .expect("database task should not die");
+        send_db_command(cmd).await;
     });
 
     let mut response_builder = Response::builder()
@@ -2210,6 +2107,7 @@ async fn serve_unfinished_file(
         channel_body,
         config.min_download_rate,
         config.rate_check_timeframe,
+        RateCheckDirection::Client,
     );
 
     let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
@@ -2231,7 +2129,6 @@ async fn serve_unfinished_file(
 async fn serve_downloading_file(
     conn_details: ConnectionDetails,
     req: Request<Empty<()>>,
-    database_tx: tokio::sync::mpsc::Sender<DatabaseCommand>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     upstream_etag: EtagState,
 ) -> Response<ProxyCacheBody> {
@@ -2278,15 +2175,8 @@ async fn serve_downloading_file(
                     }
                 };
 
-                return serve_cached_file(
-                    conn_details,
-                    &req,
-                    database_tx,
-                    file,
-                    path_clone,
-                    EtagState::Unknown,
-                )
-                .await;
+                return serve_cached_file(conn_details, &req, file, path_clone, EtagState::Unknown)
+                    .await;
             }
             ActiveDownloadStatus::Download(path, content_length, receiver) => {
                 // Cannot use mmap(2) since the file is not yet completely written
@@ -2310,7 +2200,6 @@ async fn serve_downloading_file(
 
                 return serve_unfinished_file(
                     conn_details,
-                    database_tx,
                     file,
                     path_clone,
                     status,
@@ -2555,6 +2444,7 @@ async fn serve_new_file(
             conn_details.debname,
             conn_details.client
         );
+        metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.increment();
         return quick_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many concurrent upstream downloads",
@@ -2719,21 +2609,15 @@ async fn serve_new_file(
     } = cfstate
     {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
+            metrics::VOLATILE_REFETCHED_UPTODATE.increment();
             file = touch_volatile_mtime(file, &file_path).await;
 
             ibarrier.finished(file_path.clone()).await;
 
-            return serve_cached_file(
-                conn_details,
-                &req,
-                appstate.database_tx,
-                file,
-                file_path,
-                volatile_etag,
-            )
-            .await;
+            return serve_cached_file(conn_details, &req, file, file_path, volatile_etag).await;
         }
 
+        metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
         debug!(
             "File `{}` is outdated (status={}), downloading new version",
             file_path.display(),
@@ -2845,6 +2729,7 @@ async fn serve_new_file(
                     .and_then(|s| s.parse::<u64>().ok())
                     && cl != remaining
                 {
+                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     warn!(
                         "Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}",
                         conn_details.debname, conn_details.mirror
@@ -2852,6 +2737,7 @@ async fn serve_new_file(
                     return quick_response(StatusCode::BAD_GATEWAY, "Inconsistent Content-Range");
                 }
                 let Some(total_nz) = NonZero::new(total) else {
+                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     warn!(
                         "Content-Range total is zero for {} from mirror {}",
                         conn_details.debname, conn_details.mirror
@@ -2859,8 +2745,9 @@ async fn serve_new_file(
                     return quick_response(StatusCode::BAD_GATEWAY, "Invalid Content-Range");
                 };
                 let Some(remaining_nz) = NonZero::new(remaining) else {
+                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     // File is already complete — guard drops and cleans up partial
-                    info!(
+                    warn!(
                         "Partial file is already complete for {} from mirror {}",
                         conn_details.debname, conn_details.mirror
                     );
@@ -2886,6 +2773,7 @@ async fn serve_new_file(
             // pre-check above (which discards partial and retries fresh).
             // Defensive fallback in case of unexpected state.
             _ => {
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn!(
                     "Unexpected Content-Range state for 206 response of {} from mirror {}",
                     conn_details.debname, conn_details.mirror
@@ -2914,8 +2802,12 @@ async fn serve_new_file(
 
             let (parts, body) = fwd_response.into_parts();
 
-            let rated =
-                MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+            let rated = MaybeRated::new(
+                body,
+                config.min_download_rate,
+                config.rate_check_timeframe,
+                RateCheckDirection::Client,
+            );
 
             let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
                 RateCheckedBodyErr::RateTimeout(error) => {
@@ -2947,6 +2839,7 @@ async fn serve_new_file(
                 ContentLength::Unknown(VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER)
             }
             None => {
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn!(
                     "Could not extract content-length from header for file {} from mirror {}: {fwd_response:?}",
                     conn_details.debname, conn_details.mirror
@@ -2977,7 +2870,7 @@ async fn serve_new_file(
         &conn_details.debname,
     ) {
         Ok(r) => Some(r),
-        Err(cache_quota::QuotaExceeded) => {
+        Err(QuotaExceeded) => {
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached");
         }
     };
@@ -3120,11 +3013,9 @@ async fn serve_new_file(
         .await;
 
     let cd = conn_details.clone();
-    let db_tx = appstate.database_tx.clone();
     let curr_downloads = appstate.active_downloads.download_count();
     tokio::task::spawn(async move {
         download_file(
-            db_tx,
             &cd,
             warn_on_override,
             (body, body_content_length),
@@ -3186,7 +3077,6 @@ async fn serve_new_file(
     serve_downloading_file(
         conn_details,
         req,
-        appstate.database_tx,
         status,
         EtagState::from_option(upstream_etag),
     )
@@ -3212,7 +3102,8 @@ async fn tunnel(
     .await
     {
         Ok(result) => result?,
-        Err(tokio::time::error::Elapsed { .. }) => {
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "tunnel connect timed out",
@@ -3228,6 +3119,9 @@ async fn tunnel(
     let (from_client, from_server) =
         tokio::io::copy_bidirectional_with_sizes(&mut upgraded, &mut server, bufsize, bufsize)
             .await?;
+
+    metrics::BYTES_TUNNELED_CLIENT_TO_UPSTREAM.increment_by(from_client);
+    metrics::BYTES_TUNNELED_UPSTREAM_TO_CLIENT.increment_by(from_server);
 
     info!(
         "Tunneled client {client} wrote {} and received {} from {host}:{port} in {}",
@@ -3258,6 +3152,13 @@ pub(crate) async fn process_cache_request(
 
     match tokio::fs::File::open(&cache_path).await {
         Ok(file) => {
+            // CACHE_HITS only counts permanent-file hits; volatile hits live
+            // in VOLATILE_HIT / VOLATILE_REFETCHED.
+            #[cfg(not(feature = "sendfile"))]
+            if conn_details.cached_flavor == CachedFlavor::Permanent {
+                metrics::CACHE_HITS.increment();
+            }
+
             trace!(
                 "File {} found, serving {} version...",
                 cache_path.display(),
@@ -3271,59 +3172,52 @@ pub(crate) async fn process_cache_request(
                     serve_volatile_file(conn_details, req, file, cache_path, appstate).await
                 }
                 CachedFlavor::Permanent => {
-                    serve_cached_file(
-                        conn_details,
-                        &req,
-                        appstate.database_tx,
-                        file,
-                        cache_path,
-                        EtagState::Unknown,
-                    )
-                    .await
+                    serve_cached_file(conn_details, &req, file, cache_path, EtagState::Unknown)
+                        .await
                 }
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let (init_tx, status) = appstate
+            #[cfg(not(feature = "sendfile"))]
+            match conn_details.cached_flavor {
+                CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
+                CachedFlavor::Volatile => metrics::VOLATILE_REFETCHED.increment(),
+            }
+
+            match appstate
                 .active_downloads
-                .insert(&conn_details.mirror, &conn_details.debname);
-
-            trace!(
-                "File {} not found, serving {} version...",
-                cache_path.display(),
-                if init_tx.is_some() {
-                    "in-download"
-                } else {
-                    "new"
+                .insert(&conn_details.mirror, &conn_details.debname)
+            {
+                InsertOutcome::Originator { init_tx, status } => {
+                    trace!(
+                        "File {} not found, serving new version...",
+                        cache_path.display()
+                    );
+                    serve_new_file(
+                        conn_details,
+                        status,
+                        init_tx,
+                        req,
+                        CacheFileStat::New,
+                        appstate,
+                    )
+                    .await
                 }
-            );
-
-            if let Some(init_tx) = init_tx {
-                serve_new_file(
-                    conn_details,
-                    status,
-                    init_tx,
-                    req,
-                    CacheFileStat::New,
-                    appstate,
-                )
-                .await
-            } else {
-                info!(
-                    "Serving file {} already in download from mirror {} for client {}...",
-                    conn_details.debname, conn_details.mirror, conn_details.client
-                );
-                serve_downloading_file(
-                    conn_details,
-                    req,
-                    appstate.database_tx,
-                    status,
-                    EtagState::Unknown,
-                )
-                .await
+                InsertOutcome::Joined { status } => {
+                    trace!(
+                        "File {} not found, serving in-download version...",
+                        cache_path.display()
+                    );
+                    info!(
+                        "Serving file {} already in download from mirror {} for client {}...",
+                        conn_details.debname, conn_details.mirror, conn_details.client
+                    );
+                    serve_downloading_file(conn_details, req, status, EtagState::Unknown).await
+                }
             }
         }
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!("Failed to open file `{}`:  {err}", cache_path.display());
             quick_response(
                 hyper::StatusCode::INTERNAL_SERVER_ERROR,
@@ -3349,12 +3243,14 @@ fn connect_response(
                 .any(|ac| ac.contains(&client_ip))
         {
             warn_once_or_info!("Unauthorized proxy client {client}");
+            metrics::AUTHZ_REJECTED_CLIENT.increment();
             return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
         }
     }
 
     if !config.https_tunnel_enabled {
         info!("Rejecting https tunnel request for client {client}");
+        metrics::TUNNEL_REJECTED_POLICY.increment();
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
@@ -3393,6 +3289,7 @@ fn connect_response(
             .is_err()
     {
         info!("Rejecting https tunnel request for client {client} to not permitted port {port}");
+        metrics::TUNNEL_REJECTED_POLICY.increment();
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
@@ -3405,6 +3302,8 @@ fn connect_response(
         info!(
             "Rejecting https tunnel request for client {client} due to not permitted host {host}"
         );
+        metrics::TUNNEL_REJECTED_POLICY.increment();
+        metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
     }
 
@@ -3416,6 +3315,7 @@ fn connect_response(
                 "Rejecting https tunnel request for client {client}: \
                      concurrent connection limit ({max}) reached"
             );
+            metrics::TUNNEL_REJECTED_CAPACITY.increment();
             return quick_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many concurrent HTTPS tunnel connections",
@@ -3425,6 +3325,7 @@ fn connect_response(
         None
     };
 
+    metrics::TUNNEL_CONNECTS_TOTAL.increment();
     info!("Using un-cached tunnel for client {client} to {host}:{port}");
 
     tokio::task::spawn(async move {
@@ -3481,6 +3382,7 @@ pub(crate) fn authorize_cache_access(
             .any(|ac| ac.contains(&client_ip))
     {
         warn_once_or_info!("Unauthorized proxy client {client}");
+        metrics::AUTHZ_REJECTED_CLIENT.increment();
         return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
     }
 
@@ -3494,6 +3396,7 @@ pub(crate) fn authorize_cache_access(
 
     if !is_host_allowed(&requested_host) {
         warn_once_or_info!("Unauthorized host {requested_host}");
+        metrics::AUTHZ_REJECTED_MIRROR.increment();
         return Err((StatusCode::FORBIDDEN, "Unauthorized host"));
     }
 
@@ -3506,7 +3409,9 @@ async fn pre_process_client_request_wrapper(
     req: Request<hyper::body::Incoming>,
     appstate: AppState,
 ) -> Result<Response<ProxyCacheBody>, Infallible> {
-    Ok(pre_process_client_request(client, req, appstate).await)
+    let response = pre_process_client_request(client, req, appstate).await;
+    metrics::record_client_status(response.status());
+    Ok(response)
 }
 
 #[must_use]
@@ -3516,6 +3421,8 @@ async fn pre_process_client_request(
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     trace!("Incoming request: {req:?}");
+
+    metrics::REQUESTS_TOTAL.increment();
 
     let config = global_config();
 
@@ -3836,11 +3743,7 @@ async fn pre_process_client_request(
                             architecture: architecture.into_owned(),
                         };
                         let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                        appstate
-                            .database_tx
-                            .send(cmd)
-                            .await
-                            .expect("database task should not die");
+                        send_db_command(cmd).await;
                     }
                 }
 
@@ -3854,6 +3757,7 @@ async fn pre_process_client_request(
     if global_config().reject_pdiff_requests && is_diff_request_path(requested_path) {
         info!("Rejecting diff request {requested_path} for client {client}");
 
+        metrics::PDIFF_REJECTED.increment();
         return quick_response(StatusCode::GONE, "Diff requests are not supported");
     }
 
@@ -3867,6 +3771,7 @@ async fn pre_process_client_request(
             "Rejecting unsafe unrecognized path {} for client {client}",
             req.uri()
         );
+        metrics::UNSAFE_PATH_REJECTED.increment();
         return quick_response(StatusCode::BAD_REQUEST, "Unsupported request");
     }
 
@@ -3916,11 +3821,7 @@ async fn pre_process_client_request(
             "dep11" | "i18n" | "source" => (),
             _ => {
                 let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                appstate
-                    .database_tx
-                    .send(cmd)
-                    .await
-                    .expect("database task should not die");
+                send_db_command(cmd).await;
             }
         }
     }
@@ -3966,8 +3867,15 @@ async fn pre_process_client_request(
 
             let (parts, body) = redirected_response.into_parts();
 
-            let rated =
-                MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+            metrics::REQUESTS_PASSTHROUGH.increment();
+            let counted = PassthroughBody { inner: body };
+
+            let rated = MaybeRated::new(
+                counted,
+                config.min_download_rate,
+                config.rate_check_timeframe,
+                RateCheckDirection::Client,
+            );
 
             let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
                 RateCheckedBodyErr::RateTimeout(error) => {
@@ -3989,7 +3897,15 @@ async fn pre_process_client_request(
 
     let (parts, body) = fwd_response.into_parts();
 
-    let rated = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+    metrics::REQUESTS_PASSTHROUGH.increment();
+    let counted = PassthroughBody { inner: body };
+
+    let rated = MaybeRated::new(
+        counted,
+        config.min_download_rate,
+        config.rate_check_timeframe,
+        RateCheckDirection::Client,
+    );
 
     let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
         RateCheckedBodyErr::RateTimeout(error) => {
@@ -4012,6 +3928,8 @@ async fn pre_process_client_request(
 mod client_counter {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::metrics;
+
     static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
     static CLIENT_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
 
@@ -4026,7 +3944,8 @@ mod client_counter {
 
     impl ClientCounter {
         pub(super) fn new() -> Self {
-            CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+            let current = CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
+            metrics::CONNECTED_CLIENTS_PEAK.update(current as u64);
             Self { _private: () }
         }
     }
@@ -4049,7 +3968,8 @@ mod client_counter {
 
     impl ClientDownload {
         pub(super) fn new() -> Self {
-            CLIENT_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+            let current = CLIENT_DOWNLOADS.fetch_add(1, Ordering::Relaxed) + 1;
+            metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.update(current as u64);
             Self { _private: () }
         }
     }
@@ -4069,6 +3989,12 @@ mod tunnel_limiter {
 
     static TUNNEL_CONNECTIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+    /// Current number of active HTTPS tunnel connections across all clients.
+    #[must_use]
+    pub(crate) fn active_tunnels() -> usize {
+        TUNNEL_CONNECTIONS.lock().values().sum()
+    }
 
     /// Try to acquire a tunnel slot for the given client IP.
     /// Returns `Some(TunnelGuard)` if under the limit, `None` if at capacity.
@@ -4132,6 +4058,9 @@ async fn main_loop(
         let database = database.clone();
         tokio::task::spawn(db_loop(database, db_task_rx));
     }
+    database_task::DB_TASK_QUEUE_SENDER
+        .set(db_task_tx)
+        .expect("DB task queue sender initialized once");
 
     // Initial cache scan task
     {
@@ -4253,12 +4182,21 @@ async fn main_loop(
     let mut usr1_signal = tokio::signal::unix::signal(SignalKind::user_defined1())?;
     let mut usr2_signal = tokio::signal::unix::signal(SignalKind::user_defined2())?;
 
-    let first_cleanup = tokio::time::Instant::now() + Duration::from_hours(1);
-    let mut cleanup_interval = tokio::time::interval_at(first_cleanup, Duration::from_hours(24));
+    // The displayed "Next Cleanup" epoch is advanced from now() on each tick;
+    // the underlying Tokio interval schedules from the original baseline
+    // instead, so under sustained backpressure the displayed value can drift
+    // a few seconds ahead of the real next tick. Accepted limitation.
+    let first_cleanup = tokio::time::Instant::now() + Duration::from_secs(FIRST_CLEANUP_DELAY_SECS);
+    let mut cleanup_interval =
+        tokio::time::interval_at(first_cleanup, Duration::from_secs(CLEANUP_INTERVAL_SECS));
+    set_next_cleanup_epoch(
+        time::OffsetDateTime::now_utc().unix_timestamp()
+            + i64::try_from(FIRST_CLEANUP_DELAY_SECS)
+                .expect("FIRST_CLEANUP_DELAY_SECS fits in i64"),
+    );
 
     let appstate = AppState {
         database,
-        database_tx: db_task_tx,
         https_client,
         active_downloads: ActiveDownloads::new(),
     };
@@ -4286,7 +4224,7 @@ async fn main_loop(
         trace!(
             "Active downloads ({}):  {:?}",
             appstate.active_downloads.len(),
-            &*appstate.active_downloads.inner.read()
+            appstate.active_downloads
         );
 
         let next = tokio::select! {
@@ -4300,6 +4238,10 @@ async fn main_loop(
             },
             _ = cleanup_interval.tick() => {
                 info!("Daily cleanup issued...");
+                set_next_cleanup_epoch(
+                    time::OffsetDateTime::now_utc().unix_timestamp()
+                        + i64::try_from(CLEANUP_INTERVAL_SECS).expect("CLEANUP_INTERVAL_SECS fits in i64"),
+                );
                 let appstate = appstate.clone();
                 tokio::task::spawn( async move {
                     if let Err(err) = task_cleanup(&appstate).await {
@@ -4327,6 +4269,10 @@ async fn main_loop(
             _ = usr2_signal.recv() => {
                 info!("SIGUSR2 received, issuing cleanup...");
                 cleanup_interval.reset();
+                set_next_cleanup_epoch(
+                    time::OffsetDateTime::now_utc().unix_timestamp()
+                        + i64::try_from(CLEANUP_INTERVAL_SECS).expect("CLEANUP_INTERVAL_SECS fits in i64"),
+                );
                 let appstate = appstate.clone();
                 tokio::task::spawn( async move {
                     if let Err(err) = task_cleanup(&appstate).await {
@@ -4343,6 +4289,8 @@ async fn main_loop(
             .inspect_err(|err| {
                 error!("Error accepting connection:  {}", ErrorReport(err));
             })?;
+
+        metrics::CONNECTIONS_ACCEPTED.increment();
 
         let client_counter = client_counter::ClientCounter::new();
 
@@ -4673,7 +4621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let internal_logger = WriteLogger::new(
         LevelFilter::Warn,
         internal_log_config,
-        LOGSTORE.get().expect("Should be set").clone(),
+        LOGSTORE.get().expect("initialized in main()").clone(),
     );
 
     match output_log_file {

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                COALESCE((SELECT SUM(size) FROM downloads  WHERE timestamp >= ?1), 0) AS \"downloaded!: i64\",\n                COALESCE((SELECT SUM(size) FROM deliveries WHERE timestamp >= ?1), 0) AS \"delivered!: i64\";\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "downloaded!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "delivered!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7f810fe6131cf786ce6f5aa8164c3bbbebe548f90584a1e8e7517c40d599d0c9"
+}

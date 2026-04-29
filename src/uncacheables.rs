@@ -1,9 +1,11 @@
-use std::sync::LazyLock;
+use std::{num::NonZero, sync::LazyLock};
 
-use crate::{config::DomainName, nonzero, ringbuffer::RingBuffer};
+use crate::{config::DomainName, metrics, nonzero, ringbuffer::RingBuffer};
+
+pub(crate) const UNCACHEABLES_MAX: NonZero<usize> = nonzero!(20);
 
 static UNCACHEABLES: LazyLock<parking_lot::RwLock<RingBuffer<(DomainName, String)>>> =
-    LazyLock::new(|| parking_lot::RwLock::new(RingBuffer::new(nonzero!(20))));
+    LazyLock::new(|| parking_lot::RwLock::new(RingBuffer::new(UNCACHEABLES_MAX)));
 
 /// Record a request as uncacheable for web-interface display.
 ///
@@ -25,6 +27,8 @@ pub(crate) fn record_uncacheable(host: &DomainName, path: &str) {
     } else {
         uncacheables.push((host.to_owned(), path.to_owned()));
     }
+
+    metrics::UNCACHEABLE.increment();
 }
 
 pub(crate) fn get_uncacheables() -> &'static parking_lot::RwLock<RingBuffer<(DomainName, String)>> {

@@ -1,6 +1,6 @@
 use std::{num::NonZero, sync::Arc};
 
-use crate::ringbuffer::RingBuffer;
+use crate::{metrics, ringbuffer::RingBuffer};
 
 #[derive(Debug)]
 struct LogStoreImpl {
@@ -29,6 +29,9 @@ impl std::io::Write for LogStoreImpl {
         while let Some(pos) = self.buffer[start..].iter().position(|&x| x == b'\n') {
             let line = &self.buffer[start..start + pos];
             let s = String::from_utf8_lossy(line);
+            if self.entries.is_full() {
+                metrics::LOGSTORE_EVICTIONS.increment();
+            }
             self.entries.push(s.trim().to_string());
             start += pos + 1;
         }
@@ -80,5 +83,10 @@ pub(crate) struct LogStoreEntryListGuard<'a> {
 impl LogStoreEntryListGuard<'_> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
         self.guard.iter()
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.guard.entries.len()
     }
 }

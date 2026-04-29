@@ -37,7 +37,18 @@ impl std::fmt::Display for ProxyCacheError {
             Self::Io(e) => write!(f, "{}", ErrorReport(e)),
             Self::Hyper(e) => write!(f, "{}", ErrorReport(e)),
             Self::Sqlx(e) => e.fmt(f),
-            Self::ClientDownloadRate { error, client } => error.display(client).fmt(f),
+            Self::ClientDownloadRate { error, client } => {
+                write!(
+                    f,
+                    "Timeout occurred for client {client} after a download rate of {} [< {}] for the last {} seconds",
+                    HumanFmt::Rate(
+                        error.transferred as u64,
+                        Duration::from_secs(error.timeframe.get() as u64)
+                    ),
+                    HumanFmt::Rate(error.min_rate.get() as u64, Duration::from_secs(1)),
+                    error.timeframe,
+                )
+            }
             Self::MirrorDownloadRate(MirrorDownloadRate {
                 download_rate_err,
                 mirror,

@@ -3,7 +3,10 @@ use std::{
     io::ErrorKind,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{
+        LazyLock,
+        atomic::{AtomicI64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -24,8 +27,28 @@ use crate::{
     deb_mirror::{Mirror, UriFormat as _, mirror_cache_path_impl},
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
-    info_once, process_cache_request, task_cache_scan,
+    info_once, metrics, process_cache_request, task_cache_scan,
 };
+
+/// Delay between daemon startup and the first scheduled cleanup run.
+pub(crate) const FIRST_CLEANUP_DELAY_SECS: u64 = 60 * 60;
+
+/// Interval between recurring cleanup runs.
+pub(crate) const CLEANUP_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Unix-timestamp of the next scheduled cleanup. Updated by main.rs at startup,
+/// after each scheduled tick, and after a SIGUSR2-triggered reset. A value of
+/// `0` means "not yet initialized".
+static NEXT_CLEANUP_EPOCH: AtomicI64 = AtomicI64::new(0);
+
+pub(crate) fn set_next_cleanup_epoch(epoch: i64) {
+    NEXT_CLEANUP_EPOCH.store(epoch, Ordering::Relaxed);
+}
+
+#[must_use]
+pub(crate) fn next_cleanup_epoch() -> i64 {
+    NEXT_CLEANUP_EPOCH.load(Ordering::Relaxed)
+}
 
 async fn body_to_file(
     body: &mut ProxyCacheBody,
@@ -326,9 +349,16 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         }
     }
 
+    let elapsed = start.elapsed();
+    metrics::CLEANUP_EVICTIONS.increment_by(files_removed);
+    metrics::CLEANUP_BYTES_RECLAIMED.increment_by(bytes_removed);
+    metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
+    metrics::LAST_CLEANUP_FILES_REMOVED.set(files_removed);
+    metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(bytes_removed);
+
     info!(
         "Finished cleanup task in {}: retained {} files, removed {} files of size {}",
-        HumanFmt::Time(start.elapsed().into()),
+        HumanFmt::Time(elapsed.into()),
         files_retained,
         files_removed,
         HumanFmt::Size(bytes_removed)
