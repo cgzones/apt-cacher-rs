@@ -1737,11 +1737,11 @@ async fn splice_proxy_body(
     cache_file: &tokio::fs::File,
     content_length: u64,
     file_start_offset: i64,
-    dbarrier: &mut DownloadBarrier,
+    mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
     total_content_length: u64,
-) -> std::io::Result<Option<DemotedClientHandle>> {
+) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
     let _counter = client_counter::ClientDownload::new();
 
     // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
@@ -1770,14 +1770,7 @@ async fn splice_proxy_body(
     let client_range_end = range_filter.skip + range_filter.send;
 
     while remaining > 0 {
-        if let Some(ref rate_checker) = rate_checker
-            && let Some(rate) = rate_checker.check_fail(RateCheckDirection::Upstream)
-        {
-            return Err(std::io::Error::new(
-                ErrorKind::TimedOut,
-                format_rate_timeout(&rate),
-            ));
-        }
+        dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
 
         static_assert!(PIPE_BUFFER_SIZE > 0 && (PIPE_BUFFER_SIZE as u64) < usize::MAX as u64);
         #[expect(
@@ -1865,7 +1858,7 @@ async fn splice_proxy_body(
                 (cache_file, &mut file_offset),
                 got,
                 client_status,
-                dbarrier,
+                &mut dbarrier,
                 &mut client_rate_checker,
                 &mut client_bytes_sent,
             )
@@ -1877,7 +1870,7 @@ async fn splice_proxy_body(
                     cache_path,
                     client_bytes_sent,
                     total_content_length,
-                    dbarrier,
+                    &dbarrier,
                 )?);
             }
         } else {
@@ -1948,7 +1941,7 @@ async fn splice_proxy_body(
             .expect("splice should not return more than requested");
     }
 
-    Ok(demoted_handle)
+    Ok((dbarrier, demoted_handle))
 }
 
 /// Writes the entire buffer to the cache file via pwrite at the specified offset.
@@ -2041,6 +2034,15 @@ async fn pwrite_buf_to_file(
     Ok(())
 }
 
+/// Carries the inner read-loop result out of the async closure in
+/// `splice_proxy_body_tls` so the outer scope (which holds `dbarrier`) can
+/// abort with a structured `MirrorDownloadRate` when an upstream rate
+/// timeout fires mid-read.
+enum TlsReadOutcome {
+    Io(std::io::Error),
+    RateTimeout(InsufficientRate),
+}
+
 /// Transfer body from TLS upstream to client+cache via userspace read then tee+splice fan-out.
 ///
 /// Data flow:
@@ -2054,11 +2056,11 @@ async fn splice_proxy_body_tls(
     cache_file: &tokio::fs::File,
     content_length: u64,
     file_start_offset: i64,
-    dbarrier: &mut DownloadBarrier,
+    mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
     total_content_length: u64,
-) -> std::io::Result<Option<DemotedClientHandle>> {
+) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
     let _counter = client_counter::ClientDownload::new();
 
     // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
@@ -2088,14 +2090,7 @@ async fn splice_proxy_body_tls(
     let client_range_end = range_filter.skip + range_filter.send;
 
     while remaining > 0 {
-        if let Some(ref rate_checker) = rate_checker
-            && let Some(rate) = rate_checker.check_fail(RateCheckDirection::Upstream)
-        {
-            return Err(std::io::Error::new(
-                ErrorKind::TimedOut,
-                format_rate_timeout(&rate),
-            ));
-        }
+        dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
 
         // Step 1: async read from TLS stream into userspace buffer
         // The outer http_timeout ensures a fully stalled connection is killed even if
@@ -2111,7 +2106,7 @@ async fn splice_proxy_body_tls(
             reason = "TLS_READ_BUF_SIZE is checked to be < usize::MAX above"
         )]
         let to_read = std::cmp::min(remaining, read_buf.len() as u64) as usize;
-        let got = match tokio::time::timeout(config.http_timeout, async {
+        let read_outcome = tokio::time::timeout(config.http_timeout, async {
             if let Some(ref mut rc) = rate_checker {
                 loop {
                     match tokio::time::timeout(
@@ -2120,25 +2115,30 @@ async fn splice_proxy_body_tls(
                     )
                     .await
                     {
-                        Ok(result) => return result,
+                        Ok(Ok(n)) => return Ok(n),
+                        Ok(Err(err)) => return Err(TlsReadOutcome::Io(err)),
                         Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                             rc.add(0);
                             if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                                return Err(std::io::Error::new(
-                                    ErrorKind::TimedOut,
-                                    format_rate_timeout(&rate),
-                                ));
+                                return Err(TlsReadOutcome::RateTimeout(rate));
                             }
                         }
                     }
                 }
             } else {
-                upstream.read(&mut read_buf[..to_read]).await
+                upstream
+                    .read(&mut read_buf[..to_read])
+                    .await
+                    .map_err(TlsReadOutcome::Io)
             }
         })
-        .await
-        {
-            Ok(result) => result?,
+        .await;
+        let got = match read_outcome {
+            Ok(Ok(n)) => n,
+            Ok(Err(TlsReadOutcome::Io(err))) => return Err(err),
+            Ok(Err(TlsReadOutcome::RateTimeout(rate))) => {
+                return Err(dbarrier.abort_with_rate_timeout(rate).await);
+            }
             Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
@@ -2179,7 +2179,7 @@ async fn splice_proxy_body_tls(
                 (cache_file, &mut file_offset),
                 got,
                 client_status,
-                dbarrier,
+                &mut dbarrier,
                 &mut client_rate_checker,
                 &mut client_bytes_sent,
             )
@@ -2191,7 +2191,7 @@ async fn splice_proxy_body_tls(
                     cache_path,
                     client_bytes_sent,
                     total_content_length,
-                    dbarrier,
+                    &dbarrier,
                 )?);
             }
         } else {
@@ -2265,7 +2265,7 @@ async fn splice_proxy_body_tls(
             .expect("read(2) should not return more than requested");
     }
 
-    Ok(demoted_handle)
+    Ok((dbarrier, demoted_handle))
 }
 
 /// Duplicate the client socket fd and spawn a task that serves remaining bytes
@@ -4653,7 +4653,11 @@ async fn splice_proxy_drive(
             send: client_send,
         };
 
-        if let Some(tcp_upstream) = upstream.as_tcp() {
+        // `dbarrier` is moved in by value: on success it's returned for the
+        // rename step; on a structured rate-timeout it's already consumed into
+        // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
+        // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
+        let (returned_dbarrier, demoted_handle) = if let Some(tcp_upstream) = upstream.as_tcp() {
             // Zero-copy path for TCP (plain or kTLS)
             splice_proxy_body(
                 tcp_upstream,
@@ -4661,7 +4665,7 @@ async fn splice_proxy_drive(
                 &tempfile,
                 splice_count,
                 body_offset,
-                &mut dbarrier,
+                dbarrier,
                 &range_filter,
                 &temppath,
                 total_content_length.get(),
@@ -4675,7 +4679,7 @@ async fn splice_proxy_drive(
                 &tempfile,
                 splice_count,
                 body_offset,
-                &mut dbarrier,
+                dbarrier,
                 &range_filter,
                 &temppath,
                 total_content_length.get(),
@@ -4688,7 +4692,9 @@ async fn splice_proxy_drive(
                 conn_details.debname
             );
             SpliceProxyError::AfterHeaderError(err)
-        })?
+        })?;
+        dbarrier = returned_dbarrier;
+        demoted_handle
     } else {
         None
     };

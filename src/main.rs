@@ -1722,7 +1722,6 @@ async fn download_file(
                                     download_rate_err,
                                     mirror: conn_details.mirror.clone(),
                                     debname: conn_details.debname.clone(),
-                                    client: conn_details.client,
                                 },
                             ))
                             .await;
@@ -2015,12 +2014,9 @@ async fn serve_unfinished_file(
                     ActiveDownloadStatus::Aborted(ref err) => {
                         match err {
                             AbortReason::MirrorDownloadRate(mdr) => {
-                                if let Err(err) = tx
+                                let _ignore = tx
                                     .send(Err(ChannelBodyError::MirrorDownloadRate((*mdr).clone())))
-                                    .await
-                                {
-                                    warn!("Failed to send mirror download rate:  {err}");
-                                }
+                                    .await;
                             }
                             AbortReason::AlreadyLoggedJustFail => {
                                 drop(st);
@@ -2138,10 +2134,18 @@ async fn serve_downloading_file(
         let st = status.read().await;
 
         match &*st {
-            ActiveDownloadStatus::Aborted(_err) => {
+            ActiveDownloadStatus::Aborted(err) => {
+                let (status_code, msg) = match err {
+                    AbortReason::MirrorDownloadRate(_) => {
+                        (StatusCode::GATEWAY_TIMEOUT, "Upstream Download Timeout")
+                    }
+                    AbortReason::AlreadyLoggedJustFail => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted")
+                    }
+                };
                 drop(st);
                 drop(status);
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted");
+                return quick_response(status_code, msg);
             }
             ActiveDownloadStatus::Init(init_rx) => {
                 let mut init_rx = init_rx.clone();
