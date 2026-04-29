@@ -4,6 +4,11 @@ use crate::{
     AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength,
     cache_quota::QuotaReservation, deb_mirror::Mirror, metrics,
 };
+#[cfg(feature = "splice")]
+use crate::{
+    error::MirrorDownloadRate,
+    rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker},
+};
 
 struct InitBarrierData<'a> {
     status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
@@ -107,26 +112,20 @@ struct DownloadBarrierData {
     debname: String,
     tx: tokio::sync::watch::Sender<()>,
     quota_reservation: Option<QuotaReservation>,
-    /// Bytes written since the last ping.  Single-owner (the download task
-    /// exclusively mutates via `&mut DownloadBarrier`), so a plain `u64`
-    /// suffices — no atomic is needed.
+    /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
     bytes_since_ping: u64,
 }
 
 impl DownloadBarrierData {
-    /// Send a pending batched notification if any bytes have accumulated.
     fn flush_batched_ping(&mut self) {
         if self.bytes_since_ping > 0 {
             self.internal_ping();
         }
     }
 
-    /// Internal helper to send a ping notification and reset the bytes counter.
     fn internal_ping(&mut self) {
-        if let Err(_err @ tokio::sync::watch::error::SendError(())) = self.tx.send(()) {
-            // ignore send error — receivers are gone
-            // Don't cache disconnected state, since send() with no receivers is just an atomic usize load.
-        }
+        // Send error means no receivers; not cached because send() is a cheap atomic load.
+        if let Err(_err @ tokio::sync::watch::error::SendError(())) = self.tx.send(()) {}
         self.bytes_since_ping = 0;
     }
 }
@@ -137,47 +136,10 @@ pub(crate) struct DownloadBarrier {
 }
 
 impl DownloadBarrier {
-    /// Unconditional ping — notifies all waiting receivers immediately.
-    /// Use for one-off notifications (startup prefix, kTLS extra body).
-    #[cfg(feature = "splice")]
-    pub(crate) fn ping(&mut self) {
-        let data = self
-            .data
-            .as_mut()
-            .expect("every sink consumes the instance");
-        data.internal_ping();
-    }
-
-    /// Create a new `watch::Receiver` that will observe future pings.
-    /// Used to hand off progress notifications to a spawned file-serve task.
-    #[cfg(feature = "splice")]
-    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
-        let data = self
-            .data
-            .as_ref()
-            .expect("every sink consumes the instance");
-        data.tx.subscribe()
-    }
-
-    /// Get a reference to the shared download status.
-    #[cfg(feature = "splice")]
-    pub(crate) fn status(&self) -> &Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
-        let data = self
-            .data
-            .as_ref()
-            .expect("every sink consumes the instance");
-        &data.status
-    }
-
-    /// Accumulate `bytes` of newly written data and only send a notification
-    /// once the total since the last ping reaches [`PING_BATCH_THRESHOLD`].
-    /// This avoids excessive wake-ups for small writes.
-    ///
+    /// Accumulate `bytes` and ping receivers once `PING_BATCH_THRESHOLD` is crossed.
     /// `&mut self` enforces single-writer access at compile time.
     pub(crate) fn ping_batched(&mut self, bytes: u64) {
-        /// Minimum bytes accumulated before `ping_batched()` sends a notification.
-        /// This avoids excessive wake-ups for small writes — receivers will be notified
-        /// once roughly 1 MiB of new data is available on disk.
+        /// Roughly 1 MiB; tunes between wake-up overhead and joiner latency.
         const PING_BATCH_THRESHOLD: u64 = 1024 * 1024;
 
         let data = self
@@ -201,17 +163,10 @@ impl DownloadBarrier {
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
         let mut data = self.data.take().expect("every sink consumes the instance");
 
-        // Flush pending notification before dropping the sender, so
-        // receivers can read the tail of the file before seeing the
-        // channel close.
-        //
-        // Ordering invariant: we flush the final ping, then drop `tx`
-        // explicitly, then take the status write lock.  The tokio watch
-        // channel retains the last sent value even after all senders drop,
-        // so a receiver that races with the drop either (a) wakes from
-        // `.changed()` with Ok because it saw the ping, or (b) wakes with
-        // RecvError and then observes the status transitioning to Finished
-        // once `RenameBarrier::release` is called.
+        // Ordering matters: flush the final ping, drop `tx`, then take the status
+        // write lock. The watch channel retains the last sent value after sender drop,
+        // so a racing receiver either wakes from `.changed()` Ok (saw the ping) or
+        // RecvError then observes Finished after `RenameBarrier::release`.
         data.flush_batched_ping();
         drop(data.tx);
 
@@ -226,6 +181,70 @@ impl DownloadBarrier {
                 quota_reservation: data.quota_reservation,
             }),
         }
+    }
+}
+
+#[cfg(feature = "splice")]
+impl DownloadBarrier {
+    /// Unconditional ping (e.g. startup prefix, kTLS extra body).
+    pub(crate) fn ping(&mut self) {
+        let data = self
+            .data
+            .as_mut()
+            .expect("every sink consumes the instance");
+        data.internal_ping();
+    }
+
+    /// Subscribe a `watch::Receiver` for handoff to a spawned file-serve task.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        let data = self
+            .data
+            .as_ref()
+            .expect("every sink consumes the instance");
+        data.tx.subscribe()
+    }
+
+    pub(crate) fn status(&self) -> &Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
+        let data = self
+            .data
+            .as_ref()
+            .expect("every sink consumes the instance");
+        &data.status
+    }
+
+    /// Upstream-rate check that consumes the barrier on failure (into
+    /// `Aborted(MirrorDownloadRate)`) and returns the `io::Error` to propagate.
+    /// Bundling the check and the abort in one by-value call removes the
+    /// "remember to also abort" maintenance burden at every splice loop top.
+    pub(crate) async fn check_upstream_rate(
+        self,
+        rate_checker: Option<&RateChecker>,
+    ) -> Result<Self, std::io::Error> {
+        let Some(rate) = rate_checker.and_then(|rc| rc.check_fail(RateCheckDirection::Upstream))
+        else {
+            return Ok(self);
+        };
+        Err(self.abort_with_rate_timeout(rate).await)
+    }
+
+    /// Mid-stream variant of [`check_upstream_rate`] for callers that already
+    /// obtained an `InsufficientRate` outside of an awaitable barrier-owning
+    /// context (e.g. surfaced from a closure that does not own the barrier).
+    pub(crate) async fn abort_with_rate_timeout(
+        self,
+        download_rate_err: InsufficientRate,
+    ) -> std::io::Error {
+        let data = self
+            .data
+            .as_ref()
+            .expect("every sink consumes the instance");
+        let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {
+            download_rate_err,
+            mirror: data.mirror.clone(),
+            debname: data.debname.clone(),
+        });
+        self.abort_with_reason(reason).await;
+        std::io::Error::new(std::io::ErrorKind::TimedOut, download_rate_err.to_string())
     }
 }
 
