@@ -11,7 +11,6 @@ pub(crate) struct MirrorDownloadRate {
     pub(crate) download_rate_err: InsufficientRate,
     pub(crate) mirror: Mirror,
     pub(crate) debname: String,
-    pub(crate) client: ClientInfo,
 }
 
 #[derive(Debug)]
@@ -53,11 +52,10 @@ impl std::fmt::Display for ProxyCacheError {
                 download_rate_err,
                 mirror,
                 debname,
-                client,
             }) => {
                 write!(
                     f,
-                    "Timeout occurred for mirror {} downloading file {} for client {client} after a download rate of {} [< {}] for the last {} seconds",
+                    "Timeout occurred for mirror {} downloading file {} after a download rate of {} [< {}] for the last {} seconds",
                     mirror,
                     debname,
                     HumanFmt::Rate(
