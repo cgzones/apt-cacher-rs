@@ -1,6 +1,6 @@
 use hyper::body::{Body, Frame, SizeHint};
 
-use crate::{ContentLength, ProxyCacheError, error};
+use crate::{ContentLength, ProxyCacheError, error, metrics};
 
 pub(crate) enum ChannelBodyError {
     MirrorDownloadRate(error::MirrorDownloadRate),
@@ -73,24 +73,32 @@ impl Body for ChannelBody {
 
                     match (self.remaining.exact(), self.remaining.upper()) {
                         (Some(size), _) => match size.overflowing_sub(datalen) {
-                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge {
-                                announced: self.content_length,
-                                received: self.received + datalen,
-                            })),
+                            (_, true) => {
+                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                                Err(Box::new(ProxyCacheError::ContentTooLarge {
+                                    announced: self.content_length,
+                                    received: self.received + datalen,
+                                }))
+                            }
                             (val, false) => {
                                 self.received += datalen;
                                 self.remaining.set_exact(val);
+                                metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
                                 Ok(Frame::data(data))
                             }
                         },
                         (None, Some(size)) => match size.overflowing_sub(datalen) {
-                            (_, true) => Err(Box::new(ProxyCacheError::ContentTooLarge {
-                                announced: self.content_length,
-                                received: self.received + datalen,
-                            })),
+                            (_, true) => {
+                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                                Err(Box::new(ProxyCacheError::ContentTooLarge {
+                                    announced: self.content_length,
+                                    received: self.received + datalen,
+                                }))
+                            }
                             (val, false) => {
                                 self.received += datalen;
                                 self.remaining.set_upper(val);
+                                metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
                                 Ok(Frame::data(data))
                             }
                         },

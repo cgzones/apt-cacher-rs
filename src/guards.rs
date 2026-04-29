@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength,
-    cache_quota::QuotaReservation, deb_mirror::Mirror,
+    cache_quota::QuotaReservation, deb_mirror::Mirror, metrics,
 };
 
 struct InitBarrierData<'a> {
@@ -93,6 +93,7 @@ impl Drop for InitBarrier<'_> {
             tokio::task::block_in_place(|| {
                 *data.status.blocking_write() =
                     ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
+                metrics::DOWNLOADS_ABORTED.increment();
                 data.active_downloads.remove(data.mirror, data.debname);
             });
         }
@@ -193,6 +194,7 @@ impl DownloadBarrier {
         let data = self.data.take().expect("every sink consumes the instance");
 
         *data.status.write().await = ActiveDownloadStatus::Aborted(reason);
+        metrics::DOWNLOADS_ABORTED.increment();
         data.active_downloads.remove(&data.mirror, &data.debname);
     }
 
@@ -233,6 +235,7 @@ impl Drop for DownloadBarrier {
             tokio::task::block_in_place(|| {
                 *data.status.blocking_write() =
                     ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
+                metrics::DOWNLOADS_ABORTED.increment();
                 data.active_downloads.remove(&data.mirror, &data.debname);
             });
         }
@@ -271,6 +274,7 @@ impl Drop for RenameBarrier {
     fn drop(&mut self) {
         if let Some(mut data) = self.data.take() {
             *data.lock = ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
+            metrics::DOWNLOADS_ABORTED.increment();
             drop(data.lock);
 
             data.active_downloads.remove(&data.mirror, &data.debname);

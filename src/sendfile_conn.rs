@@ -15,7 +15,7 @@ use nix::sys::sendfile::sendfile;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
-use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin};
+use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{
     Mirror, Origin, ResourceFile, is_deb_package, is_unsafe_proxy_path, parse_request_path,
     valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
@@ -31,13 +31,13 @@ use crate::http_range::{
     HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range,
 };
 use crate::humanfmt::HumanFmt;
-use crate::rate_checked_body::{InsufficientRate, RateChecker};
+use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::{
     ActiveDownloadStatus, AppState, CachedFlavor, ClientInfo, ConnectionDetails, ContentLength,
     Never, VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter,
     content_type_for_cached_file, global_config, handle_hyper_connection, is_diff_request_path,
-    static_assert, warn_once_or_debug, warn_once_or_info,
+    metrics, static_assert, warn_once_or_debug, warn_once_or_info,
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -136,17 +136,16 @@ pub(crate) async fn handle_sendfile_connection(
             }
         };
 
+        let result =
+            try_sendfile_request(&buf, &stream, client, &appstate, &mut conn_version).await;
+
+        if !matches!(result, SendfileResult::NotApplicable(_)) {
+            metrics::REQUESTS_TOTAL.increment();
+        }
+
         // Parse the request and try to handle it with sendfile
         #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
-        let _: Never = match try_sendfile_request(
-            &buf,
-            &stream,
-            client,
-            &appstate,
-            &mut conn_version,
-        )
-        .await
-        {
+        let _: Never = match result {
             SendfileResult::Served(ConnectionAction::KeepAlive) => {
                 // Request served via sendfile with keep-alive; continue to next request
                 buf.advance(next_header_index);
@@ -258,10 +257,13 @@ async fn read_request_headers(
     match tokio::time::timeout(global_config().http_timeout, inner(stream, buf)).await {
         Ok(Ok(next_index)) => Ok(next_index),
         Ok(Err(err)) => Err(err),
-        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
-            ErrorKind::TimedOut,
-            "reading TCP stream request headers timed out",
-        )),
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+            metrics::HTTP_TIMEOUT_CLIENT.increment();
+            Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "reading TCP stream request headers timed out",
+            ))
+        }
     }
 }
 
@@ -463,6 +465,7 @@ async fn try_sendfile_request(
         // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
         // HTTP/1.1 request that lacks a Host header field.
         if *conn_version == ConnectionVersion::Http11 && find_header(req.headers, &HOST).is_none() {
+            debug!("Missing Host header from HTTP/1.1 request from client {client}");
             return SendfileResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Missing Host header",
@@ -498,6 +501,7 @@ async fn try_sendfile_request(
         if global_config().reject_pdiff_requests && is_diff_request_path(uri_path) {
             info!("Rejecting diff request {uri_path} for client {client}");
 
+            metrics::PDIFF_REJECTED.increment();
             return SendfileResult::Rejection {
                 status: StatusCode::GONE,
                 conn_action,
@@ -509,6 +513,7 @@ async fn try_sendfile_request(
 
         // Reject paths with traversal sequences, control characters, or invalid encoding.
         if is_unsafe_proxy_path(uri_path) {
+            metrics::UNSAFE_PATH_REJECTED.increment();
             warn_once_or_info!(
                 "Rejecting unsafe unrecognized path from client {client}: {uri_path}"
             );
@@ -747,14 +752,43 @@ async fn try_sendfile_request(
             architecture: fields.architecture,
         };
         let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-        appstate
-            .database_tx
-            .send(cmd)
-            .await
-            .expect("database task should not die");
+        send_db_command(cmd).await;
     }
 
-    // Check if the file exists in cache and is not being downloaded
+    // Check if the file is currently being downloaded — if so, serve it via
+    // sendfile from the growing partial file instead of falling back to hyper.
+    // `attach()` atomically records the late joiner under the same write lock
+    // as the lookup; on `NotApplicable` we fall back to hyper, whose
+    // `insert()` may count this client a second time (rare, only when
+    // upstream omits Content-Length).
+    if let Some(dl_status) = appstate
+        .active_downloads
+        .attach(&conn_details.mirror, &conn_details.debname)
+    {
+        let result = serve_unfinished_sendfile(
+            stream,
+            &conn_details,
+            &aliased,
+            dl_status,
+            *conn_version,
+            conn_action,
+            RangeRequestHeaders::extract(req.headers),
+        )
+        .await;
+
+        // CACHE_HITS tracks permanent-file hits only and only when we have
+        // actually served from cache via sendfile (NotApplicable falls back
+        // to hyper); the volatile case is accounted for via VOLATILE_REFETCHED
+        // by the originator.
+        if !matches!(result, SendfileResult::NotApplicable(_))
+            && conn_details.cached_flavor == CachedFlavor::Permanent
+        {
+            metrics::CACHE_HITS.increment();
+        }
+
+        return result;
+    }
+
     let cache_path = {
         let mut p = conn_details.cache_dir_path();
         let filename = Path::new(&conn_details.debname);
@@ -766,38 +800,17 @@ async fn try_sendfile_request(
         p
     };
 
-    // Check if the file is currently being downloaded — if so, serve it via
-    // sendfile from the growing partial file instead of falling back to hyper.
-    if let Some(dl_status) = appstate
-        .active_downloads
-        .get(&conn_details.mirror, &conn_details.debname)
-    {
-        let range_header = find_header(req.headers, &RANGE);
-        let if_range_header = find_header(req.headers, &IF_RANGE);
-        let if_none_match_header = find_header(req.headers, &IF_NONE_MATCH);
-        let if_modified_since_header = find_header(req.headers, &IF_MODIFIED_SINCE);
-
-        return serve_unfinished_sendfile(
-            stream,
-            &conn_details,
-            &aliased,
-            dl_status,
-            *conn_version,
-            conn_action,
-            range_header,
-            if_range_header,
-            if_none_match_header,
-            if_modified_since_header,
-            appstate,
-        )
-        .await;
-    }
-
     // Try to open the cached file; for volatile resources, treat stale files as cache misses.
+    let mut cache_miss_was_volatile_notfound = false;
     let cached_file = 'cache_lookup: {
         let file = match tokio::fs::File::open(&cache_path).await {
             Ok(f) => f,
-            Err(err) if err.kind() == ErrorKind::NotFound => break 'cache_lookup None,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if conn_details.cached_flavor == CachedFlavor::Volatile {
+                    cache_miss_was_volatile_notfound = true;
+                }
+                break 'cache_lookup None;
+            }
             Err(err) => {
                 error!(
                     "Failed to open cached file `{}` for client {client}:  {err}",
@@ -820,6 +833,7 @@ async fn try_sendfile_request(
                         .expect("Platform should support modification timestamps via setup check");
                     if let Ok(elapsed) = last_modified.elapsed() {
                         if elapsed >= VOLATILE_CACHE_MAX_AGE {
+                            metrics::VOLATILE_REFETCHED.increment();
                             break 'cache_lookup None;
                         }
 
@@ -829,6 +843,7 @@ async fn try_sendfile_request(
                             HumanFmt::Time(elapsed),
                             VOLATILE_CACHE_MAX_AGE.as_secs()
                         );
+                        metrics::VOLATILE_HIT.increment();
                     } else {
                         warn!(
                             "Volatile file `{}` was modified in the future, ignoring modification time",
@@ -853,34 +868,38 @@ async fn try_sendfile_request(
     };
 
     if let Some(file) = cached_file {
+        // CACHE_HITS only counts permanent-file hits; fresh volatile hits
+        // were already bumped as VOLATILE_HIT in the cache_lookup block.
+        if conn_details.cached_flavor == CachedFlavor::Permanent {
+            metrics::CACHE_HITS.increment();
+        }
+
         return serve_file_via_sendfile(
             stream,
             &conn_details,
             &aliased,
-            file,
-            &cache_path,
+            (file, &cache_path),
             *conn_version,
             conn_action,
-            find_header(req.headers, &RANGE),
-            find_header(req.headers, &IF_RANGE),
-            find_header(req.headers, &IF_NONE_MATCH),
-            find_header(req.headers, &IF_MODIFIED_SINCE),
-            appstate,
+            RangeRequestHeaders::extract(req.headers),
         )
         .await;
     }
 
-    // Cache miss or stale volatile file — try splice proxy, then hyper fallback
+    // Cache miss or stale volatile file — try splice proxy, then hyper fallback.
+    // The stale-volatile case has already bumped VOLATILE_REFETCHED above; bump
+    // it for the volatile-not-found case too. Permanent-not-found is a real
+    // cache miss.
+    if cache_miss_was_volatile_notfound {
+        metrics::VOLATILE_REFETCHED.increment();
+    } else if conn_details.cached_flavor == CachedFlavor::Permanent {
+        metrics::CACHE_MISSES.increment();
+    }
+
     #[cfg(feature = "splice")]
     {
-        use crate::splice_conn::{ClientRangeRequest, SpliceProxyError, splice_proxy};
+        use crate::splice_conn::{SpliceProxyError, SpliceProxyOutcome, splice_proxy};
 
-        let client_range = ClientRangeRequest {
-            range: find_header(req.headers, &RANGE),
-            if_range: find_header(req.headers, &IF_RANGE),
-            if_none_match: find_header(req.headers, &IF_NONE_MATCH),
-            if_modified_since: find_header(req.headers, &IF_MODIFIED_SINCE),
-        };
         match splice_proxy(
             stream,
             *conn_version,
@@ -888,11 +907,36 @@ async fn try_sendfile_request(
             &conn_details,
             uri.path(),
             appstate,
-            client_range,
+            RangeRequestHeaders::extract(req.headers),
         )
         .await
         {
-            Ok(()) => SendfileResult::Served(conn_action),
+            Ok(SpliceProxyOutcome::Served) => SendfileResult::Served(conn_action),
+            Ok(SpliceProxyOutcome::Concurrent { status: dl_status }) => {
+                // Race-loser path: another connection registered the
+                // download between our earlier `attach()` (which saw
+                // nothing) and `splice_proxy`'s `originate()`. The
+                // existing download's status was handed back by
+                // `originate()` and is held alive by the Arc, so we can
+                // serve from the partial via sendfile directly — no
+                // re-attach, no race-of-races fall-back.
+                let result = serve_unfinished_sendfile(
+                    stream,
+                    &conn_details,
+                    &aliased,
+                    dl_status,
+                    *conn_version,
+                    conn_action,
+                    RangeRequestHeaders::extract(req.headers),
+                )
+                .await;
+                if !matches!(result, SendfileResult::NotApplicable(_))
+                    && conn_details.cached_flavor == CachedFlavor::Permanent
+                {
+                    metrics::CACHE_HITS.increment();
+                }
+                result
+            }
             Err(SpliceProxyError::NotApplicable(reason)) => {
                 warn_once_or_debug!(
                     "splice proxy not applicable for {} from mirror {}{}: {reason}",
@@ -999,13 +1043,31 @@ fn read_cache_info(
     }
 }
 
+/// Raw Range / If-Range / conditional headers from a http client request.
+pub(crate) struct RangeRequestHeaders<'a> {
+    pub(crate) range: Option<&'a str>,
+    pub(crate) if_range: Option<&'a str>,
+    pub(crate) if_none_match: Option<&'a str>,
+    pub(crate) if_modified_since: Option<&'a str>,
+}
+
+impl<'a> RangeRequestHeaders<'a> {
+    fn extract(headers: &[httparse::Header<'a>]) -> Self {
+        Self {
+            range: find_header(headers, &RANGE),
+            if_range: find_header(headers, &IF_RANGE),
+            if_none_match: find_header(headers, &IF_NONE_MATCH),
+            if_modified_since: find_header(headers, &IF_MODIFIED_SINCE),
+        }
+    }
+}
+
 /// Evaluate conditional request headers (If-None-Match, If-Modified-Since) and
 /// Range headers, writing 304 or 416 responses directly to the stream when
 /// appropriate.
 ///
 /// Returns [`ConditionalOutcome::Serve`] with the resolved range parameters
 /// when the caller should proceed with sending the file body.
-#[expect(clippy::too_many_arguments, reason = "mirrors caller context")]
 async fn evaluate_conditional_and_range(
     stream: &TcpStream,
     client: &ClientInfo,
@@ -1013,18 +1075,15 @@ async fn evaluate_conditional_and_range(
     conn_action: ConnectionAction,
     cache_info: &CacheInfo,
     file_size: u64,
-    range_header: Option<&str>,
-    if_range_header: Option<&str>,
-    if_none_match_header: Option<&str>,
-    if_modified_since_header: Option<&str>,
+    headers: RangeRequestHeaders<'_>,
 ) -> Result<ConditionalOutcome, SendfileResult> {
     // Evaluate conditional request (RFC 9110 §13.1.2: If-None-Match takes precedence)
-    let serve_304 = if let Some(inm) = if_none_match_header {
+    let serve_304 = if let Some(inm) = headers.if_none_match {
         cache_info
             .file_etag
             .as_deref()
             .is_some_and(|etag| if_none_match(inm, etag))
-    } else if let Some(ims) = if_modified_since_header
+    } else if let Some(ims) = headers.if_modified_since
         && let Some(ims_time) = HttpDate::parse(ims)
     {
         cache_info.last_modified_for_ims <= ims_time
@@ -1051,10 +1110,10 @@ async fn evaluate_conditional_and_range(
     }
 
     // Handle Range requests
-    if let Some(range) = range_header {
+    if let Some(range) = headers.range {
         match http_parse_range(
             range,
-            if_range_header,
+            headers.if_range,
             file_size,
             cache_info.last_modified_for_ims,
             cache_info.file_etag.as_deref(),
@@ -1096,21 +1155,17 @@ async fn evaluate_conditional_and_range(
 ///
 /// Shared implementation used for both already-cached files and files
 /// that finished downloading while a joining client was waiting.
-#[expect(clippy::too_many_arguments, reason = "consolidates two former callers")]
 pub(crate) async fn serve_file_via_sendfile(
     stream: &TcpStream,
     conn_details: &ConnectionDetails,
     aliased: &str,
-    file: tokio::fs::File,
-    file_path: &Path,
+    source: (tokio::fs::File, &Path),
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
-    range_header: Option<&str>,
-    if_range_header: Option<&str>,
-    if_none_match_header: Option<&str>,
-    if_modified_since_header: Option<&str>,
-    appstate: &AppState,
+    headers: RangeRequestHeaders<'_>,
 ) -> SendfileResult {
+    let (file, file_path) = source;
+
     let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(err) => {
@@ -1138,10 +1193,7 @@ pub(crate) async fn serve_file_via_sendfile(
             conn_action,
             &cache_info,
             file_size,
-            range_header,
-            if_range_header,
-            if_none_match_header,
-            if_modified_since_header,
+            headers,
         )
         .await
         {
@@ -1202,14 +1254,7 @@ pub(crate) async fn serve_file_via_sendfile(
     let start = Instant::now();
 
     // Use sendfile(2) to transfer the file body
-    let transfer_result = async_sendfile(
-        stream,
-        &conn_details.client,
-        &file,
-        content_start,
-        content_length,
-    )
-    .await;
+    let transfer_result = async_sendfile(stream, &file, content_start, content_length).await;
 
     match transfer_result {
         Ok(()) => {
@@ -1233,11 +1278,7 @@ pub(crate) async fn serve_file_via_sendfile(
                 partial,
                 client_ip: conn_details.client.ip(),
             });
-            appstate
-                .database_tx
-                .send(cmd)
-                .await
-                .expect("database task should not die");
+            send_db_command(cmd).await;
 
             SendfileResult::Served(conn_action)
         }
@@ -1250,6 +1291,7 @@ pub(crate) async fn serve_file_via_sendfile(
                     | ErrorKind::TimedOut
             );
             if is_client_disconnect {
+                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
                     "sendfile transfer cancelled for `{}` to client {}:  {}",
                     file_path.display(),
@@ -1271,49 +1313,153 @@ pub(crate) async fn serve_file_via_sendfile(
 }
 
 /// Format an `InsufficientRate` into a timeout `std::io::Error`.
-fn rate_timeout_error(rate: &InsufficientRate, client: &ClientInfo) -> std::io::Error {
-    let msg = rate.display(client).to_string();
-
-    std::io::Error::new(ErrorKind::TimedOut, msg)
+#[must_use]
+pub(crate) fn rate_timeout_error(rate: &InsufficientRate) -> std::io::Error {
+    std::io::Error::new(ErrorKind::TimedOut, rate.to_string())
 }
 
-/// Wait for the socket to become writable, periodically feeding zero-byte
-/// samples into the rate checker (if enabled) so that stalled writes can be
-/// detected by `check_fail()`.
-async fn wait_writable_rated(
+/// Whether the helper waits for read-readiness or write-readiness.
+#[derive(Copy, Clone)]
+enum SocketReadiness {
+    #[cfg_attr(
+        not(feature = "splice"),
+        expect(dead_code, reason = "sendfile backend does not read from any upstream")
+    )]
+    Readable,
+    Writable,
+}
+
+/// Wait for the socket to become readable or writable, bounded by
+/// `http_timeout`.  When a `RateChecker` is supplied, polls in 1-second
+/// slices so a stalled socket trips the configured rate-check window
+/// (which may be much shorter than `http_timeout`).  `RateChecker::add`
+/// back-fills gaps on the next sample on its own; the `rc.add(0)` calls
+/// here only exist to drive `check_fail` on each tick.
+async fn wait_socket_rated(
     socket: &TcpStream,
-    client: &ClientInfo,
+    op: SocketReadiness,
     rate_checker: &mut Option<RateChecker>,
+    direction: RateCheckDirection,
     http_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
+    let timeout_msg = match (op, direction) {
+        (SocketReadiness::Readable, RateCheckDirection::Client) => "client read timed out",
+        (SocketReadiness::Writable, RateCheckDirection::Client) => "client write timed out",
+        (SocketReadiness::Readable, RateCheckDirection::Upstream) => "upstream read timed out",
+        (SocketReadiness::Writable, RateCheckDirection::Upstream) => "upstream write timed out",
+    };
+
+    let wait_once = || async move {
+        match op {
+            SocketReadiness::Readable => socket.readable().await,
+            SocketReadiness::Writable => socket.writable().await,
+        }
+    };
+
     match tokio::time::timeout(http_timeout, async {
         if let Some(rc) = rate_checker {
             loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(1), socket.writable())
-                    .await
-                {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), wait_once()).await {
                     Ok(result) => return result,
-                    Err(_err @ tokio::time::error::Elapsed { .. }) => {
+                    Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                         rc.add(0);
 
-                        if let Some(rate) = rc.check_fail() {
-                            return Err(rate_timeout_error(&rate, client));
+                        if let Some(rate) = rc.check_fail(direction) {
+                            return Err(rate_timeout_error(&rate));
                         }
                     }
                 }
             }
         } else {
-            socket.writable().await
+            wait_once().await
         }
     })
     .await
     {
         Ok(result) => result,
-        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
-            ErrorKind::TimedOut,
-            "client write timed out",
-        )),
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+            match direction {
+                RateCheckDirection::Client => metrics::HTTP_TIMEOUT_CLIENT.increment(),
+                RateCheckDirection::Upstream => metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment(),
+            }
+            Err(std::io::Error::new(ErrorKind::TimedOut, timeout_msg))
+        }
     }
+}
+
+pub(crate) async fn wait_writable_rated(
+    socket: &TcpStream,
+    rate_checker: &mut Option<RateChecker>,
+    direction: RateCheckDirection,
+    http_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    wait_socket_rated(
+        socket,
+        SocketReadiness::Writable,
+        rate_checker,
+        direction,
+        http_timeout,
+    )
+    .await
+}
+
+#[cfg(feature = "splice")]
+pub(crate) async fn wait_readable_rated(
+    socket: &TcpStream,
+    rate_checker: &mut Option<RateChecker>,
+    direction: RateCheckDirection,
+    http_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    wait_socket_rated(
+        socket,
+        SocketReadiness::Readable,
+        rate_checker,
+        direction,
+        http_timeout,
+    )
+    .await
+}
+
+/// Like [`crate::http_helpers::write_all_to_stream`], but additionally enforces
+/// the configured minimum download rate via `rate_checker` (when supplied).
+///
+/// Used for payload-carrying writes; header-only writes should keep using the
+/// non-rated variant since rate-limiting is not meaningful for small fixed
+/// control frames.
+#[cfg(feature = "splice")]
+pub(crate) async fn write_all_to_stream_rated(
+    socket: &TcpStream,
+    mut data: &[u8],
+    rate_checker: &mut Option<RateChecker>,
+    direction: RateCheckDirection,
+    http_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let error_msg = match direction {
+        RateCheckDirection::Client => "client write failed",
+        RateCheckDirection::Upstream => "upstream write failed",
+    };
+
+    while !data.is_empty() {
+        wait_writable_rated(socket, rate_checker, direction, http_timeout).await?;
+
+        let _: Never = match socket.try_write(data) {
+            Ok(0) => {
+                return Err(std::io::Error::new(ErrorKind::WriteZero, error_msg));
+            }
+            Ok(n) => {
+                if let Some(rc) = rate_checker.as_mut() {
+                    rc.add(n);
+                }
+                data = &data[n..];
+                continue;
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+    }
+
+    Ok(())
 }
 
 /// Transfer up to `amount` bytes from `file` at `*file_offset` to `socket`
@@ -1330,7 +1476,6 @@ enum ChunkLoopOutcome {
 
 async fn sendfile_chunk_loop(
     socket: &TcpStream,
-    client: &ClientInfo,
     file: &tokio::fs::File,
     file_offset: &mut i64,
     amount: u64,
@@ -1341,12 +1486,18 @@ async fn sendfile_chunk_loop(
 
     while remaining > 0 {
         if let Some(rc) = rate_checker.as_ref()
-            && let Some(rate) = rc.check_fail()
+            && let Some(rate) = rc.check_fail(RateCheckDirection::Client)
         {
-            return Err(rate_timeout_error(&rate, client));
+            return Err(rate_timeout_error(&rate));
         }
 
-        wait_writable_rated(socket, client, rate_checker, config.http_timeout).await?;
+        wait_writable_rated(
+            socket,
+            rate_checker,
+            RateCheckDirection::Client,
+            config.http_timeout,
+        )
+        .await?;
 
         // Limit each sendfile call to avoid exceeding system limits.
         // 0x7fff_f000 is always within usize range since it fits in 31 bits.
@@ -1381,7 +1532,11 @@ async fn sendfile_chunk_loop(
 
         // Works on Linux, might work on FreeBSD and macOS, and is probably not supported elsewhere
         let _: Never = match result {
-            Ok((0, _)) => {
+            Ok((0, off)) => {
+                debug_assert_eq!(
+                    off, *file_offset,
+                    "no bytes written, offset should not change"
+                );
                 warn_once_or_debug!(
                     "sendfile returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining"
                 );
@@ -1391,13 +1546,22 @@ async fn sendfile_chunk_loop(
             }
             Ok((sent, new_off)) => {
                 *file_offset = new_off;
-                remaining = remaining.saturating_sub(sent as u64);
+                remaining = remaining
+                    .checked_sub(sent as u64)
+                    .expect("sendfile(2) should not transfer more bytes than requested");
+                metrics::BYTES_SERVED_SENDFILE.increment_by(sent as u64);
                 if let Some(rc) = rate_checker {
                     rc.add(sent);
                 }
                 continue;
             }
-            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EAGAIN) => {
+                // The socket is not ready to write, wait for it to become writable.
+                // For sendfile(2) regular input files, regardless of blocking or
+                // non-blocking, are always ready to read.
+                continue;
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
             Err(errno) => return Err(errno_to_io_error(errno, "sendfile failed")),
         };
     }
@@ -1409,7 +1573,6 @@ async fn sendfile_chunk_loop(
 /// starting at `offset` to the TCP socket.
 pub(crate) async fn async_sendfile(
     socket: &TcpStream,
-    client: &ClientInfo,
     file: &tokio::fs::File,
     offset: u64,
     count: u64,
@@ -1429,20 +1592,16 @@ pub(crate) async fn async_sendfile(
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
-    match sendfile_chunk_loop(
-        socket,
-        client,
-        file,
-        &mut file_offset,
-        count,
-        &mut rate_checker,
-    )
-    .await?
-    {
-        ChunkLoopOutcome::Complete => Ok(()),
+    match sendfile_chunk_loop(socket, file, &mut file_offset, count, &mut rate_checker).await? {
+        ChunkLoopOutcome::Complete => {
+            metrics::REQUESTS_SENDFILE.increment();
+            Ok(())
+        }
         ChunkLoopOutcome::Eof { transferred } => Err(std::io::Error::new(
             ErrorKind::UnexpectedEof,
-            format!("sendfile: unexpected end of file (transferred: {transferred})"),
+            format!(
+                "sendfile: unexpected end of file (transferred {transferred}/{count} at offset {file_offset})"
+            ),
         )),
     }
 }
@@ -1456,7 +1615,6 @@ pub(crate) async fn async_sendfile(
 /// `content_start` / `content_length` may describe a sub-range (HTTP Range).
 async fn async_sendfile_unfinished(
     socket: &TcpStream,
-    client: &ClientInfo,
     file: &tokio::fs::File,
     content_start: u64,
     content_length: u64,
@@ -1480,6 +1638,8 @@ async fn async_sendfile_unfinished(
 
     let mut remaining = content_length;
     let mut finished = false;
+
+    metrics::REQUESTS_SENDFILE.increment();
 
     while remaining > 0 {
         // Determine how many bytes the file currently has available past our offset.
@@ -1542,15 +1702,9 @@ async fn async_sendfile_unfinished(
         }
 
         // Transfer what is currently available via the shared sendfile loop.
-        let outcome = sendfile_chunk_loop(
-            socket,
-            client,
-            file,
-            &mut file_offset,
-            sendable,
-            &mut rate_checker,
-        )
-        .await?;
+        let outcome =
+            sendfile_chunk_loop(socket, file, &mut file_offset, sendable, &mut rate_checker)
+                .await?;
         let sent = match outcome {
             ChunkLoopOutcome::Complete => sendable,
             ChunkLoopOutcome::Eof { transferred } => {
@@ -1558,10 +1712,16 @@ async fn async_sendfile_unfinished(
                 // bytes as available.  Re-check the download status directly
                 // rather than relying on another fstat round-trip that could
                 // race with the writer task dropping the watch sender.
-                let st = status.read().await;
-                let is_finished = matches!(*st, ActiveDownloadStatus::Finished(_));
-                let is_aborted = matches!(*st, ActiveDownloadStatus::Aborted(_));
-                drop(st);
+                let (is_finished, is_aborted) = {
+                    let st = status.read().await;
+                    match *st {
+                        ActiveDownloadStatus::Finished(_) => (true, false),
+                        ActiveDownloadStatus::Aborted(_) => (false, true),
+                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download(..) => {
+                            (false, false)
+                        }
+                    }
+                };
                 if is_aborted {
                     return Err(std::io::Error::other("sendfile: upstream download aborted"));
                 }
@@ -1571,7 +1731,9 @@ async fn async_sendfile_unfinished(
                 transferred
             }
         };
-        remaining = remaining.saturating_sub(sent);
+        remaining = remaining
+            .checked_sub(sent)
+            .expect("should not have transferred more bytes than requested");
     }
 
     Ok(())
@@ -1579,10 +1741,6 @@ async fn async_sendfile_unfinished(
 
 /// Serve a file that is currently being downloaded by another task, using
 /// sendfile(2) for zero-copy delivery to the joining client.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors try_sendfile_request context"
-)]
 async fn serve_unfinished_sendfile(
     stream: &TcpStream,
     conn_details: &ConnectionDetails,
@@ -1590,11 +1748,7 @@ async fn serve_unfinished_sendfile(
     dl_status: std::sync::Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
-    range_header: Option<&str>,
-    if_range_header: Option<&str>,
-    if_none_match_header: Option<&str>,
-    if_modified_since_header: Option<&str>,
-    appstate: &AppState,
+    headers: RangeRequestHeaders<'_>,
 ) -> SendfileResult {
     // Wait for the download to leave the Init state and learn the file path,
     // content length, and notification receiver.
@@ -1665,15 +1819,10 @@ async fn serve_unfinished_sendfile(
                         stream,
                         conn_details,
                         aliased,
-                        file,
-                        &finished_path,
+                        (file, &finished_path),
                         conn_version,
                         conn_action,
-                        range_header,
-                        if_range_header,
-                        if_none_match_header,
-                        if_modified_since_header,
-                        appstate,
+                        headers,
                     )
                     .await;
                 }
@@ -1701,7 +1850,6 @@ async fn serve_unfinished_sendfile(
         );
         return SendfileResult::NotApplicable("unknown content length for in-progress download");
     };
-    let total_file_size = exact_size.get();
 
     let metadata = match file.metadata().await {
         Ok(m) => m,
@@ -1728,11 +1876,8 @@ async fn serve_unfinished_sendfile(
             conn_version,
             conn_action,
             &cache_info,
-            total_file_size,
-            range_header,
-            if_range_header,
-            if_none_match_header,
-            if_modified_since_header,
+            exact_size.get(),
+            headers,
         )
         .await
         {
@@ -1792,7 +1937,6 @@ async fn serve_unfinished_sendfile(
 
     let transfer_result = async_sendfile_unfinished(
         stream,
-        &conn_details.client,
         &file,
         content_start,
         content_length,
@@ -1822,11 +1966,7 @@ async fn serve_unfinished_sendfile(
                 partial,
                 client_ip: conn_details.client.ip(),
             });
-            appstate
-                .database_tx
-                .send(cmd)
-                .await
-                .expect("database task should not die");
+            send_db_command(cmd).await;
 
             SendfileResult::Served(conn_action)
         }
@@ -1840,6 +1980,7 @@ async fn serve_unfinished_sendfile(
             );
 
             if is_client_disconnect {
+                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
                     "Joining client {} disconnected while serving downloading file {} from mirror {}{aliased}:  {}",
                     conn_details.client,

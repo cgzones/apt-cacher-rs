@@ -4,7 +4,7 @@ use http::{HeaderName, StatusCode};
 use log::trace;
 use tokio::net::TcpStream;
 
-use crate::{APP_NAME, APP_VIA, Never, global_config, http_range::format_http_date};
+use crate::{APP_NAME, APP_VIA, Never, global_config, http_range::format_http_date, metrics};
 
 /// Represents the action to take after sending a response.
 #[derive(Copy, Clone)]
@@ -92,6 +92,7 @@ pub(crate) async fn write_304_response(
          \r\n"
     );
     trace!("Outgoing 304 response:\n{response}");
+    metrics::record_client_status(StatusCode::NOT_MODIFIED);
     write_all_to_stream(stream, response.as_bytes()).await
 }
 
@@ -117,6 +118,7 @@ pub(crate) async fn write_416_response(
         \r\n"
     );
     trace!("Outgoing 416 response:\n{response}");
+    metrics::record_client_status(StatusCode::RANGE_NOT_SATISFIABLE);
     write_all_to_stream(stream, response.as_bytes()).await
 }
 
@@ -152,6 +154,7 @@ pub(crate) async fn write_invalid_response(
          {msg}"
     );
     trace!("Outgoing error response:\n{response}");
+    metrics::record_client_status(status);
     write_all_to_stream(stream, response.as_bytes()).await
 }
 
@@ -209,6 +212,7 @@ pub(crate) async fn write_response_headers(
     );
 
     trace!("Outgoing file response headers:\n{response}");
+    metrics::record_client_status(headers.status);
     write_all_to_stream(stream, response.as_bytes()).await
 }
 
@@ -247,10 +251,13 @@ pub(crate) async fn write_all_to_stream(stream: &TcpStream, data: &[u8]) -> std:
     match tokio::time::timeout(global_config().http_timeout, inner(stream, data)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(err),
-        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
-            ErrorKind::TimedOut,
-            "TCP stream write operation timed out",
-        )),
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+            metrics::HTTP_TIMEOUT_CLIENT.increment();
+            Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "TCP stream write operation timed out",
+            ))
+        }
     }
 }
 

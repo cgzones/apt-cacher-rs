@@ -26,7 +26,9 @@ use tokio::{
 
 use crate::cache_quota::QuotaExceeded;
 use crate::config::{DomainName, HttpsUpgradeMode};
-use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin};
+use crate::database_task::{
+    DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
+};
 use crate::deb_mirror::{Mirror, Origin};
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::guards::{DownloadBarrier, InitBarrier};
@@ -44,17 +46,20 @@ use crate::humanfmt::HumanFmt;
 use crate::ktls;
 #[cfg(feature = "ktls")]
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
-use crate::rate_checked_body::{InsufficientRate, RateChecker};
+use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;
-use crate::sendfile_conn::{SendfileResult, async_sendfile, serve_file_via_sendfile};
+use crate::sendfile_conn::{
+    RangeRequestHeaders, SendfileResult, async_sendfile, serve_file_via_sendfile,
+    wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
+};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{self, TempPath, tokio_tempfile, touch_volatile_mtime};
 use crate::{
     APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, CachedFlavor, ConnectionDetails,
-    ContentLength, Never, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
+    ContentLength, Never, OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
     VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, client_counter, content_type_for_cached_file,
-    global_cache_quota, global_config, is_host_allowed, static_assert, warn_once_or_debug,
+    global_cache_quota, global_config, is_host_allowed, metrics, static_assert, warn_once_or_debug,
     warn_once_or_info,
 };
 #[cfg(feature = "ktls")]
@@ -67,15 +72,6 @@ use crate::{KTLS_BLOCKED, warn_once};
 // so the individual `Err(Errno::EAGAIN)` arms throughout this module do not
 // need to repeat it.
 static_assert!(nix::errno::Errno::EAGAIN as i32 == nix::errno::Errno::EWOULDBLOCK as i32);
-
-/// Raw Range / If-Range / conditional headers from the client request, extracted before
-/// the splice proxy connects upstream (so the original request is still available).
-pub(crate) struct ClientRangeRequest<'a> {
-    pub range: Option<&'a str>,
-    pub if_range: Option<&'a str>,
-    pub if_none_match: Option<&'a str>,
-    pub if_modified_since: Option<&'a str>,
-}
 
 /// Conditional headers for volatile resource revalidation.
 /// Sent to upstream when a cached volatile file is stale (>30s).
@@ -341,6 +337,7 @@ fn pool_return(host: &str, port: u16, is_tls: bool, conn: UpstreamConn) {
 
     if conns.len() >= POOL_MAX_IDLE_PER_HOST {
         debug!("splice proxy: evicting oldest pooled connection for {host}:{port} (pool full)");
+        metrics::POOL_RETURN_EVICTED.increment();
         conns.remove(0);
     }
     conns.push(PooledConn {
@@ -540,7 +537,9 @@ async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Sch
         Some(Scheme::Https) => {
             let port = mirror.port.map_or(443, std::num::NonZero::get);
             let tcp = tcp_connect(host, port).await?;
-            let tls = tls_connect(tcp, host).await?;
+            let tls = tls_connect(tcp, host).await.inspect_err(|_| {
+                metrics::UPSTREAM_TLS_FAILED.increment();
+            })?;
             Ok((UpstreamConn::Tls(tls), Scheme::Https))
         }
         None => {
@@ -557,6 +556,7 @@ async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Sch
                         return Ok((UpstreamConn::Tls(tls), Scheme::Https));
                     }
                     Err(err) => {
+                        metrics::UPSTREAM_TLS_FAILED.increment();
                         debug!(
                             "splice proxy: TLS handshake failed for {}, trying HTTP:  {}",
                             mirror.format_authority(),
@@ -590,9 +590,11 @@ async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
     )
     .await
     .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
+        metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
         std::io::Error::new(ErrorKind::TimedOut, "upstream TCP connect timed out")
     })?
     .map_err(|err| {
+        metrics::UPSTREAM_CONNECT_FAILED.increment();
         std::io::Error::new(
             err.kind(),
             format!("TCP connect to upstream failed:  {err}"),
@@ -626,6 +628,7 @@ async fn tls_connect(
     )
     .await
     .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
+        metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
         std::io::Error::new(ErrorKind::TimedOut, "TLS handshake timed out")
     })?
     .map_err(|err| {
@@ -655,6 +658,7 @@ async fn tls_connect(
         tokio::time::timeout(global_config().http_timeout, connector.connect(host, tcp))
             .await
             .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
+                metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
                 std::io::Error::new(ErrorKind::TimedOut, "TLS handshake timed out")
             })?
             .map_err(std::io::Error::other)?;
@@ -919,6 +923,7 @@ async fn try_unbuffered_ktls_connect(
             KtlsResult::ResponseNotSpliceable { response }
         }
         Ok(Err(KtlsError::KtlsSetupFailed(err))) => {
+            metrics::KTLS_FALLBACK_PERMANENT.increment();
             warn!(
                 "kTLS: setup failed for {}, blocking kTLS for {}s:  {err}",
                 mirror.format_authority(),
@@ -942,6 +947,7 @@ async fn try_unbuffered_ktls_connect(
             }
         }
         Ok(Err(KtlsError::KtlsSetupFailedTransient(err))) => {
+            metrics::KTLS_FALLBACK_TRANSIENT.increment();
             info!(
                 "kTLS: transient setup failure for {} (no block):  {err}",
                 mirror.format_authority()
@@ -952,7 +958,7 @@ async fn try_unbuffered_ktls_connect(
                 tls_succeeded: true,
             }
         }
-        Err(tokio::time::error::Elapsed { .. }) => {
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
             debug!("kTLS: timed out");
             KtlsResult::Failed {
                 tls_succeeded: false,
@@ -1350,7 +1356,7 @@ async fn unbuffered_ktls_request(
                     );
                     break;
                 }
-                Err(_elapsed @ tokio::time::error::Elapsed { .. }) => {
+                Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                     drain_stop_reason = "per-read timeout";
                     debug!("kTLS drain: {drain_stop_reason} with {incoming_used} bytes buffered");
                     break;
@@ -1460,6 +1466,8 @@ async fn unbuffered_ktls_request(
         extra_body.len()
     );
 
+    metrics::KTLS_RX_ENABLED.increment();
+
     Ok(KtlsReadyState {
         response,
         header_buf,
@@ -1568,7 +1576,7 @@ async fn send_upstream_request(
     .await
     {
         Ok(result) => result,
-        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
             ErrorKind::TimedOut,
             "write operation timed out",
         )),
@@ -1617,10 +1625,13 @@ async fn read_upstream_response_headers(
 
     match tokio::time::timeout(global_config().http_timeout, inner(upstream, buf)).await {
         Ok(result) => result,
-        Err(tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
-            ErrorKind::TimedOut,
-            "timed out reading upstream response headers",
-        )),
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+            metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+            Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "timed out reading upstream response headers",
+            ))
+        }
     }
 }
 
@@ -1659,6 +1670,8 @@ fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<Ups
             "invalid HTTP status code from upstream",
         )
     })?;
+
+    metrics::record_upstream_status(status_code);
 
     let headers = resp.headers;
 
@@ -1731,6 +1744,9 @@ async fn splice_proxy_body(
 ) -> std::io::Result<Option<DemotedClientHandle>> {
     let _counter = client_counter::ClientDownload::new();
 
+    // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
+    metrics::REQUESTS_SPLICE.increment();
+
     let (upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
     let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
 
@@ -1755,7 +1771,7 @@ async fn splice_proxy_body(
 
     while remaining > 0 {
         if let Some(ref rate_checker) = rate_checker
-            && let Some(rate) = rate_checker.check_fail()
+            && let Some(rate) = rate_checker.check_fail(RateCheckDirection::Upstream)
         {
             return Err(std::io::Error::new(
                 ErrorKind::TimedOut,
@@ -1806,45 +1822,18 @@ async fn splice_proxy_body(
                 ));
             }
             Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {
+                continue;
+            }
             // EAGAIN/EWOULDBLOCK: see module-level static_assert.
             Err(nix::errno::Errno::EAGAIN) => {
-                // No data available yet — wait for readability, with rate checking
-                match tokio::time::timeout(config.http_timeout, async {
-                    if let Some(ref mut rc) = rate_checker {
-                        loop {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
-                                upstream.readable(),
-                            )
-                            .await
-                            {
-                                Ok(result) => return result,
-                                Err(_elapsed @ tokio::time::error::Elapsed { .. }) => {
-                                    rc.add(0);
-                                    if let Some(rate) = rc.check_fail() {
-                                        return Err(std::io::Error::new(
-                                            ErrorKind::TimedOut,
-                                            format_rate_timeout(&rate),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        upstream.readable().await
-                    }
-                })
-                .await
-                {
-                    Ok(result) => result?,
-                    Err(tokio::time::error::Elapsed { .. }) => {
-                        return Err(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            "upstream read timed out",
-                        ));
-                    }
-                }
+                wait_readable_rated(
+                    upstream,
+                    &mut rate_checker,
+                    RateCheckDirection::Upstream,
+                    config.http_timeout,
+                )
+                .await?;
 
                 upstream_pipe_sender.writable().await?;
 
@@ -1852,6 +1841,8 @@ async fn splice_proxy_body(
             }
             Err(err) => return Err(errno_to_io_error(err, "splice failed")),
         };
+
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
 
         // Determine how this chunk overlaps with the client range.
         let chunk_start = bytes_done;
@@ -1921,12 +1912,23 @@ async fn splice_proxy_body(
             // Then send to client (may be slow)
             let client_slice = range_slice(&buf, chunk_start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
-                match write_all_to_stream(client, client_slice).await {
-                    Ok(()) => {}
+                match write_all_to_stream_rated(
+                    client,
+                    client_slice,
+                    &mut client_rate_checker,
+                    RateCheckDirection::Client,
+                    config.http_timeout,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
+                    }
                     Err(err)
                         if err.kind() == ErrorKind::BrokenPipe
                             || err.kind() == ErrorKind::ConnectionReset =>
                     {
+                        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                         info!("splice proxy: client disconnected during boundary chunk");
                         client_status = ClientStatus::Disconnected;
                     }
@@ -2059,6 +2061,9 @@ async fn splice_proxy_body_tls(
 ) -> std::io::Result<Option<DemotedClientHandle>> {
     let _counter = client_counter::ClientDownload::new();
 
+    // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
+    metrics::REQUESTS_SPLICE.increment();
+
     let (mut upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
     let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
 
@@ -2084,7 +2089,7 @@ async fn splice_proxy_body_tls(
 
     while remaining > 0 {
         if let Some(ref rate_checker) = rate_checker
-            && let Some(rate) = rate_checker.check_fail()
+            && let Some(rate) = rate_checker.check_fail(RateCheckDirection::Upstream)
         {
             return Err(std::io::Error::new(
                 ErrorKind::TimedOut,
@@ -2116,9 +2121,9 @@ async fn splice_proxy_body_tls(
                     .await
                     {
                         Ok(result) => return result,
-                        Err(_elapsed @ tokio::time::error::Elapsed { .. }) => {
+                        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                             rc.add(0);
-                            if let Some(rate) = rc.check_fail() {
+                            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
                                 return Err(std::io::Error::new(
                                     ErrorKind::TimedOut,
                                     format_rate_timeout(&rate),
@@ -2134,7 +2139,8 @@ async fn splice_proxy_body_tls(
         .await
         {
             Ok(result) => result?,
-            Err(tokio::time::error::Elapsed { .. }) => {
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     "upstream TLS read timed out",
@@ -2147,6 +2153,8 @@ async fn splice_proxy_body_tls(
                 "splice proxy: TLS upstream closed prematurely",
             ));
         }
+
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
 
         // Determine how this chunk overlaps with the client range.
         let chunk_start = bytes_done;
@@ -2200,8 +2208,6 @@ async fn splice_proxy_body_tls(
 
             // Write full chunk to cache via pwrite first, so concurrent clients
             // see progress without being gated on the first client's send speed.
-            // Move `read_buf` into the blocking task and take it back on return
-            // to avoid allocating a fresh Vec for every boundary chunk.
             pwrite_buf_to_file(cache_file, &mut read_buf, got, file_offset).await?;
 
             #[expect(
@@ -2223,12 +2229,23 @@ async fn splice_proxy_body_tls(
                 range_filter.send,
             );
             if matches!(client_status, ClientStatus::Active) && !client_slice.is_empty() {
-                match write_all_to_stream(client, client_slice).await {
-                    Ok(()) => {}
+                match write_all_to_stream_rated(
+                    client,
+                    client_slice,
+                    &mut client_rate_checker,
+                    RateCheckDirection::Client,
+                    config.http_timeout,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
+                    }
                     Err(err)
                         if err.kind() == ErrorKind::BrokenPipe
                             || err.kind() == ErrorKind::ConnectionReset =>
                     {
+                        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                         info!("splice proxy: client disconnected during TLS boundary chunk");
                         client_status = ClientStatus::Disconnected;
                     }
@@ -2326,12 +2343,18 @@ async fn serve_remaining_from_file(
     }
 
     let _counter = client_counter::ClientDownload::new();
+    // The request was already counted as REQUESTS_SPLICE at proxy entry;
+    // only the bytes split to BYTES_SERVED_COPY here.
+    metrics::CLIENTS_DEMOTED.increment();
 
     let mut bytes_sent = offset;
     let mut finished = false;
     let buf_size = config.buffer_size;
     let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
     let mut read_buf = BytesMut::with_capacity(buf_size);
+    let mut client_rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     // TODO: use sendfile?
 
@@ -2343,10 +2366,19 @@ async fn serve_remaining_from_file(
                 Ok(0) => break, // EOF — may need to wait for more data
                 Ok(n) => {
                     bytes_sent += n as u64;
-                    if let Err(err) = write_all_to_stream(&client, &read_buf[..n]).await {
+                    if let Err(err) = write_all_to_stream_rated(
+                        &client,
+                        &read_buf[..n],
+                        &mut client_rate_checker,
+                        RateCheckDirection::Client,
+                        config.http_timeout,
+                    )
+                    .await
+                    {
                         if err.kind() == ErrorKind::BrokenPipe
                             || err.kind() == ErrorKind::ConnectionReset
                         {
+                            metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                             debug!(
                                 "splice proxy: demoted client disconnected at offset {bytes_sent}"
                             );
@@ -2357,6 +2389,7 @@ async fn serve_remaining_from_file(
                         }
                         return;
                     }
+                    metrics::BYTES_SERVED_COPY.increment_by(n as u64);
                 }
                 Err(err) => {
                     error!(
@@ -2477,7 +2510,9 @@ async fn tee_and_splice(
                 }
                 Ok(n) => n,
                 // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-                Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => continue,
+                Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
+                    continue;
+                }
                 Err(err) => return Err(errno_to_io_error(err, "tee failed")),
             };
 
@@ -2490,15 +2525,13 @@ async fn tee_and_splice(
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
             let mut client_remaining = teed;
             while client_remaining > 0 {
-                match tokio::time::timeout(global_config().http_timeout, client.writable()).await {
-                    Ok(result) => result?,
-                    Err(tokio::time::error::Elapsed { .. }) => {
-                        return Err(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            "client write timed out",
-                        ));
-                    }
-                }
+                wait_writable_rated(
+                    client,
+                    client_rate_checker,
+                    RateCheckDirection::Client,
+                    global_config().http_timeout,
+                )
+                .await?;
 
                 upstream_pipe_rx.readable().await?;
 
@@ -2536,9 +2569,10 @@ async fn tee_and_splice(
                     Ok(n) => {
                         client_remaining -= n;
                         *client_bytes_sent += n as u64;
+                        metrics::BYTES_SERVED_SPLICE.increment_by(n as u64);
                         if let Some(rc) = client_rate_checker {
                             rc.add(n);
-                            if rc.check_fail().is_some() {
+                            if rc.check_fail(RateCheckDirection::Client).is_some() {
                                 // Client is too slow — drain remaining teed bytes
                                 // (cache already has them) and signal demotion
                                 info!(
@@ -2560,7 +2594,9 @@ async fn tee_and_splice(
                         continue;
                     }
                     // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-                    Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => continue,
+                    Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
+                        continue;
+                    }
                     Err(err) => return Err(errno_to_io_error(err, "splice failed")),
                 };
             }
@@ -2575,6 +2611,7 @@ async fn tee_and_splice(
             remaining = 0;
         }
     }
+
     Ok(status)
 }
 
@@ -2670,6 +2707,7 @@ async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
             Err(err) => return Err(err),
         }
     }
+
     Ok(())
 }
 
@@ -2733,7 +2771,9 @@ async fn splice_pipe_to_file(
                 eagain_retries = 0;
                 continue;
             }
-            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::EINTR) => {
+                continue;
+            }
             // EAGAIN/EWOULDBLOCK: see module-level static_assert.
             Err(nix::errno::Errno::EAGAIN) => {
                 eagain_retries += 1;
@@ -2753,6 +2793,7 @@ async fn splice_pipe_to_file(
             Err(err) => return Err(errno_to_io_error(err, "splice failed")),
         };
     }
+
     Ok(())
 }
 
@@ -2829,9 +2870,11 @@ async fn standard_upstream_connect(
                             " (reused)"
                         };
                         let poolable = !resp.connection_close;
+                        metrics::POOL_REUSED.increment();
                         return Ok((pooled, resp, hdr_buf, hdr_end, label, poolable));
                     }
                     Err(err) => {
+                        metrics::POOL_MISS_FAILED.increment();
                         debug!(
                             "splice proxy: pooled connection to {host_authority} failed, \
                              opening fresh:  {}",
@@ -2840,12 +2883,17 @@ async fn standard_upstream_connect(
                     }
                 }
             } else {
+                metrics::POOL_MISS_DEAD.increment();
                 debug!("splice proxy: pooled connection to {host_authority} is dead, discarding");
             }
+        } else {
+            metrics::POOL_MISS_EMPTY.increment();
         }
     }
 
     debug!("splice proxy: no pooled connection to {host_authority}, opening fresh...");
+
+    metrics::POOL_NEW.increment();
 
     let (mut up, scheme) = connect_upstream(mirror).await.map_err(|err| {
         warn!("splice proxy: failed to connect to upstream {host_authority}:  {err}");
@@ -3002,6 +3050,9 @@ async fn forward_upstream_body(
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut client_rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     while remaining > 0 {
         static_assert!(TLS_READ_BUF_SIZE < usize::MAX);
@@ -3026,7 +3077,8 @@ async fn forward_upstream_body(
             }
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
-            Err(tokio::time::error::Elapsed { .. }) => {
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     "upstream read timed out during body forward",
@@ -3034,9 +3086,11 @@ async fn forward_upstream_body(
             }
         };
 
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
-            if let Some(rate) = rc.check_fail() {
+            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     format_rate_timeout(&rate),
@@ -3044,7 +3098,15 @@ async fn forward_upstream_body(
             }
         }
 
-        write_all_to_stream(client, &buf[..n]).await?;
+        write_all_to_stream_rated(
+            client,
+            &buf[..n],
+            &mut client_rate_checker,
+            RateCheckDirection::Client,
+            config.http_timeout,
+        )
+        .await?;
+        metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n as u64);
         remaining = remaining
             .checked_sub(n as u64)
             .expect("read should not return more than requested");
@@ -3066,6 +3128,9 @@ async fn forward_upstream_body_until_eof(
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut client_rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     loop {
         buf.clear();
@@ -3073,7 +3138,8 @@ async fn forward_upstream_body_until_eof(
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
-            Err(tokio::time::error::Elapsed { .. }) => {
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     "upstream read timed out during body forward",
@@ -3081,8 +3147,10 @@ async fn forward_upstream_body_until_eof(
             }
         };
 
-        total += n;
-        if total > max_bytes {
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+
+        total += n as u64;
+        if total > max_bytes as u64 {
             warn_once_or_info!(
                 "splice proxy: upstream error response body exceeded {} byte cap, truncating",
                 max_bytes
@@ -3094,7 +3162,7 @@ async fn forward_upstream_body_until_eof(
 
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
-            if let Some(rate) = rc.check_fail() {
+            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     format_rate_timeout(&rate),
@@ -3102,7 +3170,15 @@ async fn forward_upstream_body_until_eof(
             }
         }
 
-        write_all_to_stream(client, &buf[..n]).await?;
+        write_all_to_stream_rated(
+            client,
+            &buf[..n],
+            &mut client_rate_checker,
+            RateCheckDirection::Client,
+            config.http_timeout,
+        )
+        .await?;
+        metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n as u64);
     }
 
     Ok(())
@@ -3139,6 +3215,9 @@ async fn forward_upstream_chunked_body(
 ) -> std::io::Result<()> {
     let config = global_config();
     let mut rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut client_rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
@@ -3276,9 +3355,18 @@ async fn forward_upstream_chunked_body(
             }
             // Framing validated — forward the raw bytes to the client unchanged.
             if !data.is_empty() {
-                write_all_to_stream(client, data).await.map_err(|e| {
+                write_all_to_stream_rated(
+                    client,
+                    data,
+                    &mut client_rate_checker,
+                    RateCheckDirection::Client,
+                    config.http_timeout,
+                )
+                .await
+                .map_err(|e| {
                     std::io::Error::new(e.kind(), format!("chunked forward: client write:  {e}"))
                 })?;
+                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(data.len() as u64);
             }
             done
         }};
@@ -3301,7 +3389,8 @@ async fn forward_upstream_chunked_body(
             }
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
-            Err(tokio::time::error::Elapsed { .. }) => {
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     "upstream read timed out during chunked body forward",
@@ -3309,9 +3398,11 @@ async fn forward_upstream_chunked_body(
             }
         };
 
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
-            if let Some(rate) = rc.check_fail() {
+            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     format_rate_timeout(&rate),
@@ -3368,19 +3459,59 @@ pub(crate) async fn splice_proxy(
     conn_details: &ConnectionDetails,
     upstream_path: &str,
     appstate: &AppState,
-    client_range: ClientRangeRequest<'_>,
-) -> Result<(), SpliceProxyError> {
+    client_range: RangeRequestHeaders<'_>,
+) -> Result<SpliceProxyOutcome, SpliceProxyError> {
     // Register with active downloads to coordinate with concurrent clients.
-    // If another download is already in progress, fall back to hyper.
-    let (init_tx, status) = appstate
+    // A `Concurrent` outcome means another download for this key won the race
+    // between sendfile's earlier `attach()` and our `originate()` here. It is
+    // an alternate success — the caller retries as a sendfile late joiner
+    // instead of falling all the way back to hyper. No late-joiner double
+    // count, since `attach()` and `insert()` are mutually exclusive paths.
+    let (init_tx, status) = match appstate
         .active_downloads
-        .insert(&conn_details.mirror, &conn_details.debname);
-    let Some(init_tx) = init_tx else {
-        return Err(SpliceProxyError::NotApplicable(
-            "concurrent download in progress",
-        ));
+        .originate(&conn_details.mirror, &conn_details.debname)
+    {
+        OriginateOutcome::Originator { init_tx, status } => (init_tx, status),
+        OriginateOutcome::Concurrent { status } => {
+            return Ok(SpliceProxyOutcome::Concurrent { status });
+        }
     };
 
+    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
+    splice_proxy_drive(
+        client_stream,
+        conn_version,
+        conn_action,
+        conn_details,
+        upstream_path,
+        appstate,
+        client_range,
+        init_tx,
+        status,
+    )
+    .await
+    .map(|()| SpliceProxyOutcome::Served)
+}
+
+/// Body of [`splice_proxy`] after the originate check has succeeded. Kept as
+/// a separate fn returning `Result<(), SpliceProxyError>` so the many
+/// `Ok(())` early-returns scattered through the body do not need to be
+/// rewritten just because the outer success type changed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "function has only 1 caller and is a tail call"
+)]
+async fn splice_proxy_drive(
+    client_stream: &TcpStream,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    conn_details: &ConnectionDetails,
+    upstream_path: &str,
+    appstate: &AppState,
+    client_range: RangeRequestHeaders<'_>,
+    init_tx: tokio::sync::watch::Sender<()>,
+    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+) -> Result<(), SpliceProxyError> {
     let ibarrier = InitBarrier::new(
         init_tx,
         &status,
@@ -3526,6 +3657,8 @@ pub(crate) async fn splice_proxy(
                 conn_details.debname, conn_details.mirror
             );
 
+            metrics::VOLATILE_REFETCHED_UPTODATE.increment();
+
             let file = match tokio::fs::File::open(&cache_path).await {
                 Ok(f) => f,
                 Err(err) => {
@@ -3543,15 +3676,10 @@ pub(crate) async fn splice_proxy(
                 client_stream,
                 conn_details,
                 "",
-                file,
-                &cache_path,
+                (file, &cache_path),
                 conn_version,
                 conn_action,
-                client_range.range,
-                client_range.if_range,
-                client_range.if_none_match,
-                client_range.if_modified_since,
-                appstate,
+                client_range,
             )
             .await
             {
@@ -3731,6 +3859,8 @@ pub(crate) async fn splice_proxy(
             conn_details.debname, conn_details.mirror
         );
 
+        metrics::VOLATILE_REFETCHED_UPTODATE.increment();
+
         // Pool the upstream connection back (304 has no body).
         if upstream_resp.connection_close {
             upstream.unset_poolable();
@@ -3754,15 +3884,10 @@ pub(crate) async fn splice_proxy(
             client_stream,
             conn_details,
             "",
-            file,
-            &cache_path,
+            (file, &cache_path),
             conn_version,
             conn_action,
-            client_range.range,
-            client_range.if_range,
-            client_range.if_none_match,
-            client_range.if_modified_since,
-            appstate,
+            client_range,
         )
         .await
         {
@@ -3811,6 +3936,8 @@ pub(crate) async fn splice_proxy(
             upstream_resp.status_code
         );
 
+        metrics::record_client_status(upstream_resp.status_code);
+
         // Forward raw response headers to client
         write_all_to_stream(client_stream, &header_buf[..header_end])
             .await
@@ -3819,12 +3946,24 @@ pub(crate) async fn splice_proxy(
         // Forward any body data that arrived with the headers
         let body_prefix = &header_buf[header_end..];
 
+        let config = global_config();
+        let mut prefix_client_rate_checker = config
+            .min_download_rate
+            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+
         // Forward the remaining body data
         if let Some(cl) = upstream_resp.content_length {
             if !body_prefix.is_empty() {
-                write_all_to_stream(client_stream, body_prefix)
-                    .await
-                    .map_err(SpliceProxyError::AfterHeaderError)?;
+                write_all_to_stream_rated(
+                    client_stream,
+                    body_prefix,
+                    &mut prefix_client_rate_checker,
+                    RateCheckDirection::Client,
+                    config.http_timeout,
+                )
+                .await
+                .map_err(SpliceProxyError::AfterHeaderError)?;
+                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
             let already_sent = body_prefix.len() as u64;
             let remaining = cl.saturating_sub(already_sent);
@@ -3846,9 +3985,16 @@ pub(crate) async fn splice_proxy(
         } else {
             // No Content-Length and not chunked: read until EOF
             if !body_prefix.is_empty() {
-                write_all_to_stream(client_stream, body_prefix)
-                    .await
-                    .map_err(SpliceProxyError::AfterHeaderError)?;
+                write_all_to_stream_rated(
+                    client_stream,
+                    body_prefix,
+                    &mut prefix_client_rate_checker,
+                    RateCheckDirection::Client,
+                    config.http_timeout,
+                )
+                .await
+                .map_err(SpliceProxyError::AfterHeaderError)?;
+                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
             upstream.unset_poolable();
             forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
@@ -3859,6 +4005,14 @@ pub(crate) async fn splice_proxy(
         // InitBarrier fires on return, which is correct: nothing was cached
         // PoolGuard::drop handles returning the connection to pool if poolable
         return Ok(());
+    }
+
+    // Volatile stale-but-present revalidation that returned a fresh body
+    // (200 or 206) — counterpart to the 304 / UPTODATE case above. The
+    // volatile-not-found path leaves `volatile_cache_path` as None and is
+    // intentionally not split into UPTODATE/OUTOFDATE.
+    if volatile_cache_path.is_some() {
+        metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
     }
 
     // Handle resume: if we got 206 but Content-Range is invalid/mismatched,
@@ -3968,8 +4122,7 @@ pub(crate) async fn splice_proxy(
                     &header_buf,
                     header_end,
                     ibarrier,
-                    appstate,
-                    &client_range,
+                    client_range,
                     tls_label,
                 )
                 .await;
@@ -4301,6 +4454,11 @@ pub(crate) async fn splice_proxy(
 
     trace!("Outgoing {status_line} response:\n{response_headers}");
 
+    metrics::record_client_status(if is_partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    });
     write_all_to_stream(client_stream, response_headers.as_bytes())
         .await
         .map_err(|err| {
@@ -4334,7 +4492,6 @@ pub(crate) async fn splice_proxy(
 
             async_sendfile(
                 client_stream,
-                &conn_details.client,
                 &partial_reader,
                 send_start,
                 send_end - send_start,
@@ -4363,21 +4520,31 @@ pub(crate) async fn splice_proxy(
             client_range_len,
         );
         if !client_slice.is_empty() {
-            write_all_to_stream(client_stream, client_slice)
-                .await
-                .map_err(|err| {
-                    let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        log::Level::Info
-                    } else {
-                        log::Level::Warn
-                    };
-                    log::log!(
-                        level,
-                        "splice proxy: failed to write body prefix to client:  {err}"
-                    );
+            let config = global_config();
+            let mut prefix_rc = config
+                .min_download_rate
+                .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+            write_all_to_stream_rated(
+                client_stream,
+                client_slice,
+                &mut prefix_rc,
+                RateCheckDirection::Client,
+                config.http_timeout,
+            )
+            .await
+            .map_err(|err| {
+                let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
+                    log::Level::Info
+                } else {
+                    log::Level::Warn
+                };
+                log::log!(
+                    level,
+                    "splice proxy: failed to write body prefix to client:  {err}"
+                );
 
-                    SpliceProxyError::AfterHeaderError(err)
-                })?;
+                SpliceProxyError::AfterHeaderError(err)
+            })?;
         }
 
         tempfile.write_all(body_prefix).await.map_err(|err| {
@@ -4407,21 +4574,31 @@ pub(crate) async fn splice_proxy(
             client_range_len,
         );
         if !client_slice.is_empty() {
-            write_all_to_stream(client_stream, client_slice)
-                .await
-                .map_err(|err| {
-                    let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        log::Level::Info
-                    } else {
-                        log::Level::Warn
-                    };
-                    log::log!(
-                        level,
-                        "splice proxy: failed to write kTLS extra body to client:  {err}"
-                    );
+            let config = global_config();
+            let mut prefix_rc = config
+                .min_download_rate
+                .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+            write_all_to_stream_rated(
+                client_stream,
+                client_slice,
+                &mut prefix_rc,
+                RateCheckDirection::Client,
+                config.http_timeout,
+            )
+            .await
+            .map_err(|err| {
+                let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
+                    log::Level::Info
+                } else {
+                    log::Level::Warn
+                };
+                log::log!(
+                    level,
+                    "splice proxy: failed to write kTLS extra body to client:  {err}"
+                );
 
-                    SpliceProxyError::AfterHeaderError(err)
-                })?;
+                SpliceProxyError::AfterHeaderError(err)
+            })?;
         }
 
         tempfile.write_all(&ktls_extra_body).await.map_err(|err| {
@@ -4578,11 +4755,7 @@ pub(crate) async fn splice_proxy(
         elapsed,
         client_ip: conn_details.client.ip(),
     });
-    appstate
-        .database_tx
-        .send(cmd)
-        .await
-        .expect("database task should not die");
+    send_db_command(cmd).await;
 
     // Record delivery in database
     let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -4593,11 +4766,7 @@ pub(crate) async fn splice_proxy(
         partial: is_partial,
         client_ip: conn_details.client.ip(),
     });
-    appstate
-        .database_tx
-        .send(cmd)
-        .await
-        .expect("database task should not die");
+    send_db_command(cmd).await;
 
     // Record origin in database (mirrors the hyper path in main.rs).
     if let Some(origin) = Origin::from_path(
@@ -4609,11 +4778,7 @@ pub(crate) async fn splice_proxy(
             "dep11" | "i18n" | "source" => (),
             _ => {
                 let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                appstate
-                    .database_tx
-                    .send(cmd)
-                    .await
-                    .expect("database task should not die");
+                send_db_command(cmd).await;
             }
         }
     }
@@ -4655,7 +4820,8 @@ async fn read_body_to_vec_until_eof(
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
-            Err(tokio::time::error::Elapsed { .. }) => {
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     "upstream read timed out during volatile body buffering",
@@ -4676,7 +4842,7 @@ async fn read_body_to_vec_until_eof(
 
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
-            if let Some(rate) = rc.check_fail() {
+            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     format_rate_timeout(&rate),
@@ -4735,7 +4901,8 @@ async fn read_dechunk_body_to_vec(
                     }
                     Ok(Ok(n)) => n,
                     Ok(Err(err)) => return Err(err),
-                    Err(tokio::time::error::Elapsed { .. }) => {
+                    Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                        metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                         return Err(std::io::Error::new(
                             ErrorKind::TimedOut,
                             "upstream read timed out during chunked body buffering",
@@ -4744,7 +4911,7 @@ async fn read_dechunk_body_to_vec(
                 };
             if let Some(ref mut rc) = rate_checker {
                 rc.add(n);
-                if let Some(rate) = rc.check_fail() {
+                if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
                     return Err(std::io::Error::new(
                         ErrorKind::TimedOut,
                         format_rate_timeout(&rate),
@@ -4856,8 +5023,7 @@ async fn handle_volatile_buffered_download(
     header_buf: &[u8],
     header_end: usize,
     ibarrier: InitBarrier<'_>,
-    appstate: &AppState,
-    client_range: &ClientRangeRequest<'_>,
+    client_range: RangeRequestHeaders<'_>,
     tls_label: &str,
 ) -> Result<(), SpliceProxyError> {
     let max_bytes: usize = VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER
@@ -5062,6 +5228,11 @@ async fn handle_volatile_buffered_download(
 
     trace!("Outgoing {status_line} response:\n{response_headers}");
 
+    metrics::record_client_status(if is_partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    });
     write_all_to_stream(client_stream, response_headers.as_bytes())
         .await
         .map_err(|err| {
@@ -5079,9 +5250,21 @@ async fn handle_volatile_buffered_download(
 
     // Send body (range-filtered if needed) to client.
     let body_slice = &body[client_range_start..client_range_start + client_range_len];
-    write_all_to_stream(client_stream, body_slice)
+    {
+        let config = global_config();
+        let mut volatile_rc = config
+            .min_download_rate
+            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+        write_all_to_stream_rated(
+            client_stream,
+            body_slice,
+            &mut volatile_rc,
+            RateCheckDirection::Client,
+            config.http_timeout,
+        )
         .await
         .map_err(SpliceProxyError::AfterHeaderError)?;
+    }
 
     drop(cork);
 
@@ -5144,11 +5327,7 @@ async fn handle_volatile_buffered_download(
         elapsed,
         client_ip: conn_details.client.ip(),
     });
-    appstate
-        .database_tx
-        .send(cmd)
-        .await
-        .expect("database task should not die");
+    send_db_command(cmd).await;
 
     // Record delivery in database.
     let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -5159,11 +5338,7 @@ async fn handle_volatile_buffered_download(
         partial: is_partial,
         client_ip: conn_details.client.ip(),
     });
-    appstate
-        .database_tx
-        .send(cmd)
-        .await
-        .expect("database task should not die");
+    send_db_command(cmd).await;
 
     // Record origin in database (mirrors the hyper path in main.rs).
     if let Some(origin) = Origin::from_path(
@@ -5175,11 +5350,7 @@ async fn handle_volatile_buffered_download(
             "dep11" | "i18n" | "source" => (),
             _ => {
                 let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                appstate
-                    .database_tx
-                    .send(cmd)
-                    .await
-                    .expect("database task should not die");
+                send_db_command(cmd).await;
             }
         }
     }
@@ -5315,12 +5486,19 @@ pub(crate) async fn splice_simple_proxy(
 
     trace!("Outgoing rewritten headers:\n{rewritten_headers}");
 
+    metrics::record_client_status(resp.status_code);
+    metrics::REQUESTS_PASSTHROUGH.increment();
     write_all_to_stream(client_stream, rewritten_headers.as_bytes())
         .await
         .map_err(SpliceProxyError::ClientError)?;
 
     // Forward any body data that arrived with the headers
     let body_prefix = &hdr_buf[hdr_end..];
+
+    let config = global_config();
+    let mut prefix_client_rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     // Forward the remaining body.
     //
@@ -5337,9 +5515,16 @@ pub(crate) async fn splice_simple_proxy(
             .map_err(SpliceProxyError::AfterHeaderError)?;
     } else if let Some(cl) = resp.content_length {
         if !body_prefix.is_empty() {
-            write_all_to_stream(client_stream, body_prefix)
-                .await
-                .map_err(SpliceProxyError::AfterHeaderError)?;
+            write_all_to_stream_rated(
+                client_stream,
+                body_prefix,
+                &mut prefix_client_rate_checker,
+                RateCheckDirection::Client,
+                config.http_timeout,
+            )
+            .await
+            .map_err(SpliceProxyError::AfterHeaderError)?;
+            metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
         let already_sent = body_prefix.len() as u64;
         let remaining = cl.saturating_sub(already_sent);
@@ -5351,9 +5536,16 @@ pub(crate) async fn splice_simple_proxy(
     } else {
         // No Content-Length and not chunked: read until EOF
         if !body_prefix.is_empty() {
-            write_all_to_stream(client_stream, body_prefix)
-                .await
-                .map_err(SpliceProxyError::AfterHeaderError)?;
+            write_all_to_stream_rated(
+                client_stream,
+                body_prefix,
+                &mut prefix_client_rate_checker,
+                RateCheckDirection::Client,
+                config.http_timeout,
+            )
+            .await
+            .map_err(SpliceProxyError::AfterHeaderError)?;
+            metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
         upstream.unset_poolable();
         forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
@@ -5363,6 +5555,19 @@ pub(crate) async fn splice_simple_proxy(
 
     // PoolGuard::drop handles returning the connection to pool if poolable
     Ok(())
+}
+
+/// Successful outcomes of [`splice_proxy`]. `Concurrent` is an alternate
+/// success path, not an error: another download for the same key won the
+/// originate race, and the carried `status` lets the caller serve the client
+/// from the in-flight partial via the sendfile backend without falling back
+/// to hyper. Late-joiner accounting was already performed inside
+/// [`crate::ActiveDownloads::originate`].
+pub(crate) enum SpliceProxyOutcome {
+    Served,
+    Concurrent {
+        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    },
 }
 
 /// Errors that can occur during splice proxy.

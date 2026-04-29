@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                debname AS \"debname!: String\",\n                COUNT(*) AS \"delivery_count!: i64\",\n                SUM(size) AS \"total_delivered!: i64\",\n                MAX(size) AS \"package_size!: i64\"\n            FROM deliveries\n            WHERE debname LIKE '%.deb'\n               OR debname LIKE '%.udeb'\n               OR debname LIKE '%.ddeb'\n            GROUP BY debname\n            ORDER BY COUNT(*) DESC\n            LIMIT ?;\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "debname!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "delivery_count!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_delivered!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "package_size!: i64",
+        "ordinal": 3,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c6ef189125f79b0f2e0300dde62cd97079311884339f85594bb61c605d9f521e"
+}

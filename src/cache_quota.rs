@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::{cmp::Ordering, num::NonZero};
+use std::{cmp::Ordering, num::NonZero, sync::Arc};
 
 use log::{error, trace, warn};
 
-use crate::ContentLength;
+use crate::{ContentLength, metrics};
 
+/// Represents a quota violation.
 pub(crate) struct QuotaExceeded;
 
 #[derive(Clone)]
@@ -45,6 +45,7 @@ impl CacheQuota {
                 warn!(
                     "Disk quota reached: file={debname} cache_size={curr} content_length={content_length:?} quota={quota}"
                 );
+                metrics::DOWNLOAD_REJECTED_QUOTA.increment();
                 return Err(QuotaExceeded);
             }
         }
@@ -57,6 +58,7 @@ impl CacheQuota {
         let new_size = if let Some(val) = new_size.checked_sub(prev_file_size) {
             val
         } else {
+            metrics::CACHE_SIZE_CORRUPTION.increment();
             error!(
                 "Cache size corruption: quota acquire: file={debname} current_cache_size={curr} content_length={content_length:?} previous_file_size={prev_file_size}"
             );
@@ -65,6 +67,8 @@ impl CacheQuota {
 
         *mg = new_size;
         drop(mg);
+
+        self.sample_utilization_peak();
 
         Ok(QuotaReservation {
             quota: self.clone(),
@@ -78,6 +82,22 @@ impl CacheQuota {
     #[must_use]
     pub(crate) fn current_size(&self) -> u64 {
         *self.cache_size.lock()
+    }
+
+    /// Update `CACHE_QUOTA_UTIL_PEAK_BPS` with the current utilization
+    /// (in basis points: hundredths of a percent). No-op when no quota is
+    /// configured, since utilization is not well defined.
+    pub(crate) fn sample_utilization_peak(&self) {
+        let Some(quota) = self.quota_config else {
+            return;
+        };
+        let current = self.current_size();
+        // bps = current * 10000 / quota, computed in u128 to avoid overflow.
+        // Clamp to 10_000 (= 100.00 %) so over-quota states do not produce a
+        // misleading sentinel; `quota` is NonZero so no div-by-zero.
+        let bps = u128::from(current).saturating_mul(10_000) / std::num::NonZeroU128::from(quota);
+        let bps = usize::try_from(bps.min(10_000)).expect("10_000 fits in u64");
+        metrics::CACHE_QUOTA_UTIL_PEAK_BPS.update(bps as u64);
     }
 
     /// Atomically subtract `removed` bytes and reconcile against the actual
@@ -96,6 +116,8 @@ impl CacheQuota {
         let difference = (*mg).abs_diff(expected);
         if difference != 0 {
             *mg = expected;
+            metrics::RECONCILE_EVENTS.increment();
+            metrics::RECONCILE_BYTES_REPAIRED.increment_by(difference);
         }
         drop(mg);
         (expected, difference)
@@ -106,9 +128,12 @@ impl CacheQuota {
         if let Some(val) = mg.checked_add(amount) {
             *mg = val;
         } else {
+            metrics::CACHE_SIZE_CORRUPTION.increment();
             error!("Cache size corruption: add: current={} added={amount}", *mg);
             *mg = u64::MAX;
         }
+        drop(mg);
+        self.sample_utilization_peak();
     }
 
     pub(crate) fn subtract(&self, amount: u64) {
@@ -116,6 +141,7 @@ impl CacheQuota {
         if let Some(val) = mg.checked_sub(amount) {
             *mg = val;
         } else {
+            metrics::CACHE_SIZE_CORRUPTION.increment();
             error!(
                 "Cache size corruption: subtract: current={} removed={amount}",
                 *mg
@@ -163,29 +189,31 @@ impl QuotaReservation {
 
 impl Drop for QuotaReservation {
     fn drop(&mut self) {
-        if !self.finalized {
-            // Revert: remove the reserved amount, add back prev_file_size
+        if self.finalized {
+            return;
+        }
 
-            match self.reserved.get().cmp(&self.prev_file_size) {
-                Ordering::Equal => {}
+        // Revert: remove the reserved amount, add back prev_file_size
 
-                Ordering::Less => {
-                    let revert = self.prev_file_size - self.reserved.get();
-                    trace!(
-                        "Reverting quota reservation: reserved={} prev_file_size={} revert=-{revert}",
-                        self.reserved, self.prev_file_size
-                    );
-                    self.quota.add(revert);
-                }
+        match self.reserved.get().cmp(&self.prev_file_size) {
+            Ordering::Equal => {}
 
-                Ordering::Greater => {
-                    let revert = self.reserved.get() - self.prev_file_size;
-                    trace!(
-                        "Reverting quota reservation: reserved={} prev_file_size={} revert={revert}",
-                        self.reserved, self.prev_file_size
-                    );
-                    self.quota.subtract(revert);
-                }
+            Ordering::Less => {
+                let revert = self.prev_file_size - self.reserved.get();
+                trace!(
+                    "Reverting quota reservation: reserved={} prev_file_size={} revert=-{revert}",
+                    self.reserved, self.prev_file_size
+                );
+                self.quota.add(revert);
+            }
+
+            Ordering::Greater => {
+                let revert = self.reserved.get() - self.prev_file_size;
+                trace!(
+                    "Reverting quota reservation: reserved={} prev_file_size={} revert={revert}",
+                    self.reserved, self.prev_file_size
+                );
+                self.quota.subtract(revert);
             }
         }
     }

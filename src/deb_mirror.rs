@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::config::DomainName;
+use crate::{config::DomainName, database};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Mirror {
@@ -143,7 +143,7 @@ impl UriFormat for Origin {
     }
 }
 
-impl UriFormat for &crate::database::OriginEntry {
+impl UriFormat for &database::OriginEntry {
     #[inline]
     fn uri(&self) -> String {
         format_origin_uri(
@@ -441,12 +441,15 @@ pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
         .any(|seg| seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control()))
 }
 
+/// Valid Debian package extensions (`.deb`, `.udeb`, `.ddeb`).
+pub(crate) const VALID_DEB_EXTENSIONS: &[&str] = &["deb", "udeb", "ddeb"];
+
 /// Whether the filename represents a Debian binary package (`.deb`, `.udeb`, `.ddeb`).
 #[must_use]
 pub(crate) fn is_deb_package(filename: &str) -> bool {
     let extension = filename.rsplit_once('.').map(|(_, ext)| ext);
 
-    matches!(extension, Some("deb" | "udeb" | "ddeb"))
+    matches!(extension, Some(ext) if VALID_DEB_EXTENSIONS.contains(&ext))
 }
 
 #[must_use]

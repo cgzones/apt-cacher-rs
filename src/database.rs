@@ -59,6 +59,8 @@ pub(crate) struct MirrorStatEntry {
     pub(crate) last_cleanup: i64,
     pub(crate) total_download_size: i64,
     pub(crate) total_delivery_size: i64,
+    pub(crate) download_count: i64,
+    pub(crate) delivery_count: i64,
 }
 
 impl MirrorStatEntry {
@@ -67,9 +69,25 @@ impl MirrorStatEntry {
         NonZero::new(self.port)
     }
 
+    /// Render `host[:port]/path` directly into a `Formatter` without
+    /// allocating an intermediate `String`.
     #[must_use]
-    pub(crate) fn uri(&self) -> String {
-        format!("{}/{}", self.host.format_authority(self.port()), self.path)
+    pub(crate) fn uri(&self) -> impl std::fmt::Display + '_ {
+        struct W<'a> {
+            host: &'a DomainName,
+            port: Option<NonZero<u16>>,
+            path: &'a str,
+        }
+        impl std::fmt::Display for W<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}/{}", self.host.format_authority(self.port), self.path)
+            }
+        }
+        W {
+            host: &self.host,
+            port: self.port(),
+            path: &self.path,
+        }
     }
 
     #[must_use]
@@ -96,14 +114,48 @@ impl OriginEntry {
         NonZero::new(self.port)
     }
 
+    /// Render `host[:port]/mirror_path` directly into a `Formatter` without
+    /// allocating an intermediate `String`.
     #[must_use]
-    pub(crate) fn mirror_uri(&self) -> String {
-        format!(
-            "{}/{}",
-            self.host.format_authority(self.port()),
-            self.mirror_path
-        )
+    pub(crate) fn mirror_uri(&self) -> impl std::fmt::Display + '_ {
+        struct W<'a> {
+            host: &'a DomainName,
+            port: Option<NonZero<u16>>,
+            mirror_path: &'a str,
+        }
+        impl std::fmt::Display for W<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "{}/{}",
+                    self.host.format_authority(self.port),
+                    self.mirror_path
+                )
+            }
+        }
+        W {
+            host: &self.host,
+            port: self.port(),
+            mirror_path: &self.mirror_path,
+        }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct ClientStatEntry {
+    pub(crate) client_ip: IpAddr,
+    pub(crate) last_seen: i64,
+    pub(crate) total_downloaded: i64,
+    pub(crate) total_delivered: i64,
+    pub(crate) request_count: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct TopPackageEntry {
+    pub(crate) debname: String,
+    pub(crate) delivery_count: i64,
+    pub(crate) total_delivered: i64,
+    pub(crate) package_size: i64,
 }
 
 impl Database {
@@ -290,13 +342,15 @@ impl Database {
                 mirrors_v2.last_seen,
                 mirrors_v2.last_cleanup,
                 COALESCE(downloads.total_size, 0) AS "total_download_size: i64",
-                COALESCE(deliveries.total_size, 0) AS "total_delivery_size: i64"
+                COALESCE(deliveries.total_size, 0) AS "total_delivery_size: i64",
+                COALESCE(downloads.cnt, 0) AS "download_count: i64",
+                COALESCE(deliveries.cnt, 0) AS "delivery_count: i64"
             FROM mirrors_v2
             LEFT JOIN
-                (SELECT mirror_id, SUM(size) AS total_size FROM downloads GROUP BY mirror_id) AS downloads
+                (SELECT mirror_id, SUM(size) AS total_size, COUNT(*) AS cnt FROM downloads GROUP BY mirror_id) AS downloads
             ON mirrors_v2.id = downloads.mirror_id
             LEFT JOIN
-                (SELECT mirror_id, SUM(size) AS total_size FROM deliveries GROUP BY mirror_id) AS deliveries
+                (SELECT mirror_id, SUM(size) AS total_size, COUNT(*) AS cnt FROM deliveries GROUP BY mirror_id) AS deliveries
             ON mirrors_v2.id = deliveries.mirror_id
             ;
         "#).fetch_all(&self.conn).await
@@ -368,28 +422,123 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn get_clients(&self) -> Result<Vec<IpAddr>, Error> {
-        struct IpFmt {
+    pub(crate) async fn get_clients_with_stats(&self) -> Result<Vec<ClientStatEntry>, Error> {
+        struct RawClientStat {
             client_ip: Vec<u8>,
+            last_seen: i64,
+            total_downloaded: i64,
+            total_delivered: i64,
+            request_count: i64,
         }
 
-        let ips = query_as!(
-            IpFmt,
-            r"
-                SELECT client_ip FROM deliveries GROUP BY client_ip;
-            "
+        let rows = query_as!(
+            RawClientStat,
+            r#"
+            SELECT
+                client_ip AS "client_ip!: Vec<u8>",
+                MAX(last_seen) AS "last_seen!: i64",
+                SUM(dl_size) AS "total_downloaded!: i64",
+                SUM(del_size) AS "total_delivered!: i64",
+                SUM(del_count) AS "request_count!: i64"
+            FROM (
+                SELECT client_ip, MAX(timestamp) AS last_seen, SUM(size) AS dl_size, 0 AS del_size, 0 AS del_count
+                FROM downloads GROUP BY client_ip
+                UNION ALL
+                SELECT client_ip, MAX(timestamp) AS last_seen, 0 AS dl_size, SUM(size) AS del_size, COUNT(*) AS del_count
+                FROM deliveries GROUP BY client_ip
+            )
+            GROUP BY client_ip;
+            "#
         )
         .fetch_all(&self.conn)
         .await?;
 
-        Ok(ips
+        Ok(rows
             .into_iter()
-            .filter_map(|s| {
-                let octets: [u8; 16] = s.client_ip.try_into().ok()?;
+            .filter_map(|r| {
+                let octets: [u8; 16] = r.client_ip.try_into().ok()?;
                 let ip: Ipv6Addr = octets.into();
-                Some(ip.to_canonical())
+                Some(ClientStatEntry {
+                    client_ip: ip.to_canonical(),
+                    last_seen: r.last_seen,
+                    total_downloaded: r.total_downloaded,
+                    total_delivered: r.total_delivered,
+                    request_count: r.request_count,
+                })
             })
             .collect())
+    }
+
+    /// Total bytes downloaded from upstream and delivered to clients since the given epoch.
+    pub(crate) async fn get_bandwidth_since(&self, since_epoch: i64) -> Result<(i64, i64), Error> {
+        struct Row {
+            downloaded: i64,
+            delivered: i64,
+        }
+
+        let row = query_as!(
+            Row,
+            r#"
+            SELECT
+                COALESCE((SELECT SUM(size) FROM downloads  WHERE timestamp >= ?1), 0) AS "downloaded!: i64",
+                COALESCE((SELECT SUM(size) FROM deliveries WHERE timestamp >= ?1), 0) AS "delivered!: i64";
+            "#,
+            since_epoch
+        )
+        .fetch_one(&self.conn)
+        .await?;
+
+        Ok((row.downloaded, row.delivered))
+    }
+
+    pub(crate) async fn get_top_packages(&self, limit: u32) -> Result<Vec<TopPackageEntry>, Error> {
+        // Exclude volatile resources (Release/Packages/Translation/...) — their
+        // filename does not change, so they would otherwise dominate by count.
+        // Permanent .deb packages always end in `.deb`, `.udeb`, or `.ddeb`
+        // (see `deb_mirror::VALID_DEB_EXTENSIONS`).
+        query_as!(
+            TopPackageEntry,
+            r#"
+            SELECT
+                debname AS "debname!: String",
+                COUNT(*) AS "delivery_count!: i64",
+                SUM(size) AS "total_delivered!: i64",
+                MAX(size) AS "package_size!: i64"
+            FROM deliveries
+            WHERE debname LIKE '%.deb'
+               OR debname LIKE '%.udeb'
+               OR debname LIKE '%.ddeb'
+            GROUP BY debname
+            ORDER BY COUNT(*) DESC
+            LIMIT ?;
+            "#,
+            limit
+        )
+        .fetch_all(&self.conn)
+        .await
+    }
+
+    pub(crate) async fn get_top_packages_by_size(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<TopPackageEntry>, Error> {
+        query_as!(
+            TopPackageEntry,
+            r#"
+            SELECT
+                debname AS "debname!: String",
+                COUNT(*) AS "delivery_count!: i64",
+                SUM(size) AS "total_delivered!: i64",
+                MAX(size) AS "package_size!: i64"
+            FROM deliveries
+            GROUP BY debname
+            ORDER BY SUM(size) DESC
+            LIMIT ?;
+            "#,
+            limit
+        )
+        .fetch_all(&self.conn)
+        .await
     }
 
     pub(crate) async fn register_download(

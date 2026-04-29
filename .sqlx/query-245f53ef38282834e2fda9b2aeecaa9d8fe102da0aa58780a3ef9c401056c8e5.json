@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                client_ip AS \"client_ip!: Vec<u8>\",\n                MAX(last_seen) AS \"last_seen!: i64\",\n                SUM(dl_size) AS \"total_downloaded!: i64\",\n                SUM(del_size) AS \"total_delivered!: i64\",\n                SUM(del_count) AS \"request_count!: i64\"\n            FROM (\n                SELECT client_ip, MAX(timestamp) AS last_seen, SUM(size) AS dl_size, 0 AS del_size, 0 AS del_count\n                FROM downloads GROUP BY client_ip\n                UNION ALL\n                SELECT client_ip, MAX(timestamp) AS last_seen, 0 AS dl_size, SUM(size) AS del_size, COUNT(*) AS del_count\n                FROM deliveries GROUP BY client_ip\n            )\n            GROUP BY client_ip;\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "client_ip!: Vec<u8>",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "last_seen!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_downloaded!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_delivered!: i64",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "request_count!: i64",
+        "ordinal": 4,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "245f53ef38282834e2fda9b2aeecaa9d8fe102da0aa58780a3ef9c401056c8e5"
+}

@@ -6,7 +6,7 @@ use hyper::body::{Body, Frame, SizeHint};
 use log::debug;
 use pin_project::pin_project;
 
-use crate::{ClientInfo, HumanFmt, ringbuffer::SumRingBuffer};
+use crate::{HumanFmt, metrics, ringbuffer::SumRingBuffer};
 
 /// A rate checker that tracks download speed over a sliding time window.
 pub(crate) struct RateChecker {
@@ -27,29 +27,17 @@ pub(crate) struct InsufficientRate {
     _private: (),
 }
 
-impl InsufficientRate {
-    pub(crate) fn display<'a>(&'a self, client: &'a ClientInfo) -> InsufficientRateFormatter<'a> {
-        InsufficientRateFormatter { rate: self, client }
-    }
-}
-
-pub(crate) struct InsufficientRateFormatter<'a> {
-    rate: &'a InsufficientRate,
-    client: &'a ClientInfo,
-}
-
-impl std::fmt::Display for InsufficientRateFormatter<'_> {
+impl std::fmt::Display for InsufficientRate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Timeout occurred for client {} after a download rate of {} [< {}] for the last {} seconds",
-            self.client,
+            "Timeout occurred after a download rate of {} [< {}] for the last {} seconds",
             HumanFmt::Rate(
-                self.rate.transferred as u64,
-                Duration::from_secs(self.rate.timeframe.get() as u64)
+                self.transferred as u64,
+                Duration::from_secs(self.timeframe.get() as u64)
             ),
-            HumanFmt::Rate(self.rate.min_rate.get() as u64, Duration::from_secs(1)),
-            self.rate.timeframe,
+            HumanFmt::Rate(self.min_rate.get() as u64, Duration::from_secs(1)),
+            self.timeframe,
         )
     }
 }
@@ -96,24 +84,35 @@ impl RateChecker {
 
     /// Checks if the download rate is below the minimum threshold and returns an `InsufficientRate` error if so.
     #[must_use]
-    pub(crate) fn check_fail(&self) -> Option<InsufficientRate> {
-        if self.buf.is_full() {
-            let transferred = self.buf.sum();
-            let timeframe = self.buf.capacity();
-            if transferred / timeframe < self.min_download_rate.get() {
-                Some(InsufficientRate {
-                    transferred,
-                    timeframe,
-                    min_rate: self.min_download_rate,
-                    _private: (),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
+    pub(crate) fn check_fail(&self, direction: RateCheckDirection) -> Option<InsufficientRate> {
+        if !self.buf.is_full() {
+            return None;
         }
+
+        let transferred = self.buf.sum();
+        let timeframe = self.buf.capacity();
+        if transferred / timeframe >= self.min_download_rate.get() {
+            return None;
+        }
+
+        match direction {
+            RateCheckDirection::Upstream => metrics::RATE_LIMIT_UPSTREAM.increment(),
+            RateCheckDirection::Client => metrics::RATE_LIMIT_CLIENT.increment(),
+        }
+        Some(InsufficientRate {
+            transferred,
+            timeframe,
+            min_rate: self.min_download_rate,
+            _private: (),
+        })
     }
+}
+
+/// Which side of the proxy a `RateCheckedBody` is measuring.
+#[derive(Copy, Clone)]
+pub(crate) enum RateCheckDirection {
+    Upstream,
+    Client,
 }
 
 /// Error type for `RateCheckedBody` operations.
@@ -133,6 +132,7 @@ where
     #[pin]
     inner: B,
     rchecker: RateChecker,
+    direction: RateCheckDirection,
 }
 
 impl<B> RateCheckedBody<B>
@@ -141,10 +141,16 @@ where
 {
     /// Creates a new `RateCheckedBody` that wraps the given `body` and checks the download rate against the given `min_download_rate` over the given `timeframe`.
     #[must_use]
-    fn new(body: B, min_download_rate: NonZero<usize>, timeframe: NonZero<usize>) -> Self {
+    fn new(
+        body: B,
+        min_download_rate: NonZero<usize>,
+        timeframe: NonZero<usize>,
+        direction: RateCheckDirection,
+    ) -> Self {
         Self {
             inner: body,
             rchecker: RateChecker::with_timeframe(min_download_rate, timeframe),
+            direction,
         }
     }
 }
@@ -170,7 +176,7 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if let Some(download_rate_err) = self.rchecker.check_fail() {
+        if let Some(download_rate_err) = self.rchecker.check_fail(self.direction) {
             return std::task::Poll::Ready(Some(Err(Box::new(RateCheckedBodyErr::RateTimeout(
                 download_rate_err,
             )))));
@@ -213,9 +219,10 @@ where
         body: B,
         min_download_rate: Option<NonZero<usize>>,
         timeframe: NonZero<usize>,
+        direction: RateCheckDirection,
     ) -> Self {
         match min_download_rate {
-            Some(rate) => Self::Rated(RateCheckedBody::new(body, rate, timeframe)),
+            Some(rate) => Self::Rated(RateCheckedBody::new(body, rate, timeframe, direction)),
             None => Self::Plain(body),
         }
     }
@@ -275,7 +282,7 @@ mod tests {
         }
 
         // Buffer should now be full with 3 bytes over 3s = 1 B/s < 100 B/s.
-        let fail = rc.check_fail();
+        let fail = rc.check_fail(RateCheckDirection::Client);
         assert!(fail.is_some(), "rate check should fail for slow transfer");
         let ir = fail.unwrap();
         assert!(ir.transferred <= 3);
@@ -294,7 +301,7 @@ mod tests {
 
         // ~1500 bytes over 3s = 500 B/s > 100 B/s.
         assert!(
-            rc.check_fail().is_none(),
+            rc.check_fail(RateCheckDirection::Client).is_none(),
             "rate check should pass for fast transfer"
         );
     }
@@ -308,7 +315,7 @@ mod tests {
         rc.add(1);
 
         assert!(
-            rc.check_fail().is_none(),
+            rc.check_fail(RateCheckDirection::Client).is_none(),
             "should not fail before buffer is full"
         );
     }
@@ -323,7 +330,7 @@ mod tests {
         rc.add(1);
 
         // Buffer should be [0, 0, 1] — full with 1 byte over 3s = 0 B/s < 100 B/s.
-        let fail = rc.check_fail();
+        let fail = rc.check_fail(RateCheckDirection::Client);
         assert!(fail.is_some(), "rate check should fail after gap");
     }
 }
