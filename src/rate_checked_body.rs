@@ -141,11 +141,7 @@ where
 {
     /// Creates a new `RateCheckedBody` that wraps the given `body` and checks the download rate against the given `min_download_rate` over the given `timeframe`.
     #[must_use]
-    pub(crate) fn new(
-        body: B,
-        min_download_rate: NonZero<usize>,
-        timeframe: NonZero<usize>,
-    ) -> Self {
+    fn new(body: B, min_download_rate: NonZero<usize>, timeframe: NonZero<usize>) -> Self {
         Self {
             inner: body,
             rchecker: RateChecker::with_timeframe(min_download_rate, timeframe),
@@ -160,10 +156,12 @@ where
     type Data = B::Data;
     type Error = Box<RateCheckedBodyErr<B::Error>>;
 
+    #[inline]
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
 
+    #[inline]
     fn is_end_stream(&self) -> bool {
         self.inner.is_end_stream()
     }
@@ -188,6 +186,75 @@ where
         }
 
         msg.map_err(|e| Box::new(RateCheckedBodyErr::Inner(e)))
+    }
+}
+
+/// A `Body` that is optionally wrapped in a [`RateCheckedBody`].
+///
+/// Let call sites express "rate-check this body if `min_download_rate` is
+/// configured, otherwise pass it through" without manually picking between
+/// two body shapes — the unified `Error` (`Box<RateCheckedBodyErr<B::Error>>`)
+/// matches the rated case so downstream error mapping is identical.
+#[pin_project(project = MaybeRatedProj)]
+pub(crate) enum MaybeRated<B>
+where
+    B: Body,
+{
+    Plain(#[pin] B),
+    Rated(#[pin] RateCheckedBody<B>),
+}
+
+impl<B> MaybeRated<B>
+where
+    B: Body,
+{
+    #[must_use]
+    pub(crate) fn new(
+        body: B,
+        min_download_rate: Option<NonZero<usize>>,
+        timeframe: NonZero<usize>,
+    ) -> Self {
+        match min_download_rate {
+            Some(rate) => Self::Rated(RateCheckedBody::new(body, rate, timeframe)),
+            None => Self::Plain(body),
+        }
+    }
+}
+
+impl<B> Body for MaybeRated<B>
+where
+    B: Body,
+{
+    type Data = B::Data;
+    type Error = Box<RateCheckedBodyErr<B::Error>>;
+
+    #[inline]
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Plain(body) => body.size_hint(),
+            Self::Rated(body) => body.size_hint(),
+        }
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Plain(body) => body.is_end_stream(),
+            Self::Rated(body) => body.is_end_stream(),
+        }
+    }
+
+    #[inline]
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.project() {
+            MaybeRatedProj::Plain(body) => body
+                .poll_frame(cx)
+                .map_err(|e| Box::new(RateCheckedBodyErr::Inner(e))),
+            MaybeRatedProj::Rated(body) => body.poll_frame(cx),
+        }
     }
 }
 
