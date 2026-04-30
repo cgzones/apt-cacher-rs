@@ -2338,6 +2338,7 @@ async fn serve_remaining_from_file(
     let mut file = match tokio::fs::File::open(&cache_path).await {
         Ok(f) => f,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to open cache file `{}` for demoted client:  {err}",
                 cache_path.display()
@@ -2347,6 +2348,7 @@ async fn serve_remaining_from_file(
     };
 
     if let Err(err) = file.seek(std::io::SeekFrom::Start(offset)).await {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to seek cache file `{}`:  {err}",
             cache_path.display()
@@ -2404,6 +2406,7 @@ async fn serve_remaining_from_file(
                     metrics::BYTES_SERVED_COPY.increment_by(n as u64);
                 }
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "splice proxy: failed to read cache file `{}`:  {}",
                         cache_path.display(),
@@ -3544,12 +3547,13 @@ async fn splice_proxy_drive(
             }
             Err((err, guard)) => {
                 if err.kind() != std::io::ErrorKind::NotFound {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "splice proxy: failed to open partial file for {} from mirror {}:  {err}",
                         conn_details.debname, conn_details.mirror
                     );
                     drop(guard);
-                    return Err(SpliceProxyError::CacheError(err));
+                    return Err(SpliceProxyError::CacheError);
                 }
                 // File doesn't exist — proceed without resume
                 utils::PartialDownload::Fresh(guard)
@@ -3658,11 +3662,12 @@ async fn splice_proxy_drive(
             let file = match tokio::fs::File::open(&cache_path).await {
                 Ok(f) => f,
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "splice proxy: failed to open cached file `{}` after 304:  {err}",
                         cache_path.display()
                     );
-                    return Err(SpliceProxyError::CacheError(err));
+                    return Err(SpliceProxyError::CacheError);
                 }
             };
             let file = touch_volatile_mtime(file, &cache_path).await;
@@ -3866,11 +3871,12 @@ async fn splice_proxy_drive(
         let file = match tokio::fs::File::open(&cache_path).await {
             Ok(f) => f,
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "splice proxy: failed to open cached file `{}` after 304:  {err}",
                     cache_path.display()
                 );
-                return Err(SpliceProxyError::CacheError(err));
+                return Err(SpliceProxyError::CacheError);
             }
         };
         let file = touch_volatile_mtime(file, &cache_path).await;
@@ -3958,7 +3964,13 @@ async fn splice_proxy_drive(
                     config.http_timeout,
                 )
                 .await
-                .map_err(SpliceProxyError::AfterHeaderError)?;
+                .map_err(|err| {
+                    info!(
+                        "splice proxy: failed to send body prefix to client {}:  {err}",
+                        conn_details.client
+                    );
+                    SpliceProxyError::AfterHeaderError
+                })?;
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
             let already_sent = body_prefix.len() as u64;
@@ -3966,7 +3978,13 @@ async fn splice_proxy_drive(
             if remaining > 0 {
                 forward_upstream_body(&mut upstream, client_stream, remaining)
                     .await
-                    .map_err(SpliceProxyError::AfterHeaderError)?;
+                    .map_err(|err| {
+                        info!(
+                            "splice proxy: failed to send remaining body to client {}:  {err}",
+                            conn_details.client
+                        );
+                        SpliceProxyError::AfterHeaderError
+                    })?;
             }
         } else if upstream_resp.is_chunked {
             // Chunked encoding: forward raw framing, detect termination
@@ -3977,7 +3995,13 @@ async fn splice_proxy_drive(
                 VOLATILE_BODY_MAX,
             )
             .await
-            .map_err(SpliceProxyError::AfterHeaderError)?;
+            .map_err(|err| {
+                info!(
+                    "splice proxy: failed to send body prefix to client {}:  {err}",
+                    conn_details.client
+                );
+                SpliceProxyError::AfterHeaderError
+            })?;
         } else {
             // No Content-Length and not chunked: read until EOF
             if !body_prefix.is_empty() {
@@ -3989,13 +4013,25 @@ async fn splice_proxy_drive(
                     config.http_timeout,
                 )
                 .await
-                .map_err(SpliceProxyError::AfterHeaderError)?;
+                .map_err(|err| {
+                    info!(
+                        "splice proxy: failed to send body prefix to client {}:  {err}",
+                        conn_details.client
+                    );
+                    SpliceProxyError::AfterHeaderError
+                })?;
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
             upstream.unset_poolable();
             forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
                 .await
-                .map_err(SpliceProxyError::AfterHeaderError)?;
+                .map_err(|err| {
+                    info!(
+                        "splice proxy: failed to forward body to client {}:  {err}",
+                        conn_details.client
+                    );
+                    SpliceProxyError::AfterHeaderError
+                })?;
         }
 
         // InitBarrier fires on return, which is correct: nothing was cached
@@ -4086,7 +4122,7 @@ async fn splice_proxy_drive(
                 // Should not happen: invalid Content-Range was already handled above
                 // with a fresh retry. If we still get here, the retried response is
                 // also broken — return error to client.
-                error!(
+                warn!(
                     "splice proxy: unexpected Content-Range state for 206 response of {} from mirror {}: {:?}",
                     conn_details.debname, conn_details.mirror, upstream_resp.content_range
                 );
@@ -4218,11 +4254,12 @@ async fn splice_proxy_drive(
     // Create cache directory and temp file
     let dest_dir = conn_details.cache_dir_path();
     if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to create cache directory `{}`:  {err}",
             dest_dir.display()
         );
-        return Err(SpliceProxyError::CacheError(err));
+        return Err(SpliceProxyError::CacheError);
     }
 
     let filename = Path::new(&conn_details.debname);
@@ -4282,22 +4319,24 @@ async fn splice_proxy_drive(
         utils::PartialDownload::Fresh(guard) => utils::create_partial_file(guard, 0o640)
             .await
             .map_err(|(err, path)| {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "splice proxy: failed to create partial file `{}`:  {err}",
                     path.display()
                 );
-                SpliceProxyError::CacheError(err)
+                SpliceProxyError::CacheError
             })?,
         utils::PartialDownload::Volatile => {
             let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
                 .iter()
                 .collect();
             tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "splice proxy: failed to create temp file `{}`:  {err}",
                     tmppath.display()
                 );
-                SpliceProxyError::CacheError(err)
+                SpliceProxyError::CacheError
             })?
         }
     };
@@ -4482,8 +4521,9 @@ async fn splice_proxy_drive(
             let partial_reader = tokio::fs::File::open(temppath.as_ref())
                 .await
                 .map_err(|err| {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!("splice proxy: failed to open partial file for reading:  {err}");
-                    SpliceProxyError::AfterHeaderError(err)
+                    SpliceProxyError::AfterHeaderError
                 })?;
 
             async_sendfile(
@@ -4495,7 +4535,7 @@ async fn splice_proxy_drive(
             .await
             .map_err(|err| {
                 info!("splice proxy: failed to sendfile partial data to client:  {err}");
-                SpliceProxyError::AfterHeaderError(err)
+                SpliceProxyError::AfterHeaderError
             })?;
         }
     }
@@ -4529,26 +4569,19 @@ async fn splice_proxy_drive(
             )
             .await
             .map_err(|err| {
-                let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
-                    log::Level::Info
-                } else {
-                    log::Level::Warn
-                };
-                log::log!(
-                    level,
-                    "splice proxy: failed to write body prefix to client:  {err}"
-                );
+                info!("splice proxy: failed to write body prefix to client:  {err}");
 
-                SpliceProxyError::AfterHeaderError(err)
+                SpliceProxyError::AfterHeaderError
             })?;
         }
 
         tempfile.write_all(body_prefix).await.map_err(|err| {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
                 temppath.display()
             );
-            SpliceProxyError::AfterHeaderError(err)
+            SpliceProxyError::AfterHeaderError
         })?;
 
         #[cfg(feature = "ktls")]
@@ -4583,26 +4616,19 @@ async fn splice_proxy_drive(
             )
             .await
             .map_err(|err| {
-                let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
-                    log::Level::Info
-                } else {
-                    log::Level::Warn
-                };
-                log::log!(
-                    level,
-                    "splice proxy: failed to write kTLS extra body to client:  {err}"
-                );
+                info!("splice proxy: failed to write kTLS extra body to client:  {err}");
 
-                SpliceProxyError::AfterHeaderError(err)
+                SpliceProxyError::AfterHeaderError
             })?;
         }
 
         tempfile.write_all(&ktls_extra_body).await.map_err(|err| {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
                 temppath.display()
             );
-            SpliceProxyError::AfterHeaderError(err)
+            SpliceProxyError::AfterHeaderError
         })?;
 
         #[expect(
@@ -4684,10 +4710,10 @@ async fn splice_proxy_drive(
         }
         .map_err(|err| {
             info!(
-                "splice proxy: body transfer failed for {}:  {err}",
-                conn_details.debname
+                "splice proxy: body transfer failed for {} from mirror {}:  {err}",
+                conn_details.debname, conn_details.mirror
             );
-            SpliceProxyError::AfterHeaderError(err)
+            SpliceProxyError::AfterHeaderError
         })?;
         dbarrier = returned_dbarrier;
         demoted_handle
@@ -4701,6 +4727,7 @@ async fn splice_proxy_drive(
 
     // Sync cache file to ensure durability
     if let Err(err) = tempfile.sync_all().await {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to sync cache file `{}`:  {err}",
             temppath.display()
@@ -4723,12 +4750,13 @@ async fn splice_proxy_drive(
         }
         Err(err) => {
             drop(rbarrier);
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to rename temp file `{}` to `{}`:  {err}",
                 temppath.display(),
                 dest_file_path.display()
             );
-            return Err(SpliceProxyError::AfterHeaderError(err));
+            return Err(SpliceProxyError::AfterHeaderError);
         }
     }
 
@@ -5041,7 +5069,7 @@ async fn handle_volatile_buffered_download(
             "splice proxy: volatile buffered download failed for {}:  {err}",
             conn_details.debname
         );
-        SpliceProxyError::TransferError(err)
+        SpliceProxyError::TransferError
     })?;
 
     // Drop upstream early to free the socket.
@@ -5127,11 +5155,12 @@ async fn handle_volatile_buffered_download(
     // Create cache directory and temp file.
     let dest_dir = conn_details.cache_dir_path();
     if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to create cache directory `{}`:  {err}",
             dest_dir.display()
         );
-        return Err(SpliceProxyError::CacheError(err));
+        return Err(SpliceProxyError::CacheError);
     }
 
     let filename = Path::new(&conn_details.debname);
@@ -5144,11 +5173,12 @@ async fn handle_volatile_buffered_download(
         .iter()
         .collect();
     let (mut tempfile, temppath) = tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to create temp file `{}`:  {err}",
             tmppath.display()
         );
-        SpliceProxyError::CacheError(err)
+        SpliceProxyError::CacheError
     })?;
 
     // Write ETag xattr if present.
@@ -5259,24 +5289,32 @@ async fn handle_volatile_buffered_download(
             config.http_timeout,
         )
         .await
-        .map_err(SpliceProxyError::AfterHeaderError)?;
+        .map_err(|err| {
+            info!(
+                "splice proxy: failed to write response body to client {}:  {err}",
+                conn_details.client
+            );
+            SpliceProxyError::AfterHeaderError
+        })?;
     }
 
     drop(cork);
 
     // Write full body to cache file.
     tempfile.write_all(&body).await.map_err(|err| {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to write volatile body to cache file `{}`:  {err}",
             temppath.display()
         );
-        SpliceProxyError::AfterHeaderError(err)
+        SpliceProxyError::AfterHeaderError
     })?;
 
     dbarrier.ping();
 
     // Sync cache file.
     if let Err(err) = tempfile.sync_all().await {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to sync cache file `{}`:  {err}",
             temppath.display()
@@ -5295,12 +5333,13 @@ async fn handle_volatile_buffered_download(
         }
         Err(err) => {
             drop(rbarrier);
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to rename temp file `{}` to `{}`:  {err}",
                 temppath.display(),
                 dest_file_path.display()
             );
-            return Err(SpliceProxyError::AfterHeaderError(err));
+            return Err(SpliceProxyError::AfterHeaderError);
         }
     }
 
@@ -5508,7 +5547,10 @@ pub(crate) async fn splice_simple_proxy(
         // Chunked encoding: forward raw framing, detect termination
         forward_upstream_chunked_body(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
             .await
-            .map_err(SpliceProxyError::AfterHeaderError)?;
+            .map_err(|err| {
+                info!("splice proxy: failed to forward chunked body to client:  {err}");
+                SpliceProxyError::AfterHeaderError
+            })?;
     } else if let Some(cl) = resp.content_length {
         if !body_prefix.is_empty() {
             write_all_to_stream_rated(
@@ -5519,7 +5561,10 @@ pub(crate) async fn splice_simple_proxy(
                 config.http_timeout,
             )
             .await
-            .map_err(SpliceProxyError::AfterHeaderError)?;
+            .map_err(|err| {
+                info!("splice proxy: failed to write body prefix to client:  {err}");
+                SpliceProxyError::AfterHeaderError
+            })?;
             metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
         let already_sent = body_prefix.len() as u64;
@@ -5527,7 +5572,10 @@ pub(crate) async fn splice_simple_proxy(
         if remaining > 0 {
             forward_upstream_body(&mut upstream, client_stream, remaining)
                 .await
-                .map_err(SpliceProxyError::AfterHeaderError)?;
+                .map_err(|err| {
+                    info!("splice proxy: failed to forward body to client:  {err}");
+                    SpliceProxyError::AfterHeaderError
+                })?;
         }
     } else {
         // No Content-Length and not chunked: read until EOF
@@ -5540,13 +5588,19 @@ pub(crate) async fn splice_simple_proxy(
                 config.http_timeout,
             )
             .await
-            .map_err(SpliceProxyError::AfterHeaderError)?;
+            .map_err(|err| {
+                info!("splice proxy: failed to write body prefix to client:  {err}");
+                SpliceProxyError::AfterHeaderError
+            })?;
             metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
         upstream.unset_poolable();
         forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
             .await
-            .map_err(SpliceProxyError::AfterHeaderError)?;
+            .map_err(|err| {
+                info!("splice proxy: failed to forward body to client:  {err}");
+                SpliceProxyError::AfterHeaderError
+            })?;
     }
 
     // PoolGuard::drop handles returning the connection to pool if poolable
@@ -5575,27 +5629,12 @@ pub(crate) enum SpliceProxyError {
     /// Error writing to client
     ClientError(std::io::Error),
     /// Error with cache file operations
-    CacheError(std::io::Error),
+    CacheError,
     /// Error during body transfer
-    TransferError(std::io::Error),
+    TransferError,
     /// Error occurring after response headers were already written to the client.
     /// The caller must close the connection without emitting a new HTTP status.
-    AfterHeaderError(std::io::Error),
-}
-
-impl std::fmt::Display for SpliceProxyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotApplicable(reason) => write!(f, "not applicable:  {reason}"),
-            Self::UpstreamError(err) => write!(f, "upstream error:  {}", ErrorReport(&err)),
-            Self::ClientError(err) => write!(f, "client error:  {}", ErrorReport(&err)),
-            Self::CacheError(err) => write!(f, "cache error:  {}", ErrorReport(&err)),
-            Self::TransferError(err) => write!(f, "transfer error:  {}", ErrorReport(&err)),
-            Self::AfterHeaderError(err) => {
-                write!(f, "error after headers sent:  {}", ErrorReport(&err))
-            }
-        }
-    }
+    AfterHeaderError,
 }
 
 #[cfg(test)]
