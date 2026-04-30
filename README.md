@@ -76,10 +76,17 @@ The cleanup can also be manually triggered by sending the signal `USR2` to the `
 `apt-cacher-rs` also reacts to these maintenance signals:
 - `USR1`: reopen the active log file (when logging to a file)
 
-## TLS
+## Crate features
 
-By default [`rustls`](https://github.com/rustls/rustls) is used as TLS backend.
-To use the system provided TLS implementation disable default cargo features and enable the cargo feature `tls_hyper`.
+`apt-cacher-rs` exposes several optional cargo features (the default set is `mmap`, `tls_rustls`, `sendfile`):
+
+- `mmap` *(default)*: serve cached files via memory-mapped I/O (`memmap2`).
+- `sendfile` *(default)*: serve cached files to clients with zero-copy `sendfile(2)`.
+- `tls_rustls` *(default)*: use [`rustls`](https://github.com/rustls/rustls) as the TLS backend for upstream connections.
+- `tls_hyper`: use the system-provided TLS implementation (`hyper-tls`/native TLS) instead of `rustls`; disable default features when enabling this.
+- `webpki-roots`: bundle Mozilla's CA root set with `rustls` instead of relying on the system trust store.
+- `splice`: proxy upstream responses to clients using `splice(2)` (implies `sendfile`).
+- `ktls`: offload TLS encryption to the kernel via kTLS (implies `splice` and `tls_rustls`).
 
 ## Security
 
