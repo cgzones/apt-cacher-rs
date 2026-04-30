@@ -21,7 +21,7 @@ use http::{
 use log::{debug, error, info, trace, warn};
 use nix::fcntl::{SpliceFFlags, splice, tee};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf},
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Interest, ReadBuf},
     net::{TcpStream, unix::pipe},
 };
 
@@ -456,6 +456,36 @@ fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
     }
 
     Ok((sender, receiver))
+}
+
+// Force-clear Tokio's cached readiness on a TCP socket or pipe end.
+//
+// `splice`/`tee` operate on raw fds and can return `EAGAIN` on either
+// participant; Tokio doesn't see those errors so its cache stays "ready".
+// We invoke `try_io` with a no-op closure that returns `WouldBlock` to
+// trigger `clear_readiness` and force the next `readable()`/`writable()`
+// to actually park until a fresh epoll event arrives.
+
+fn clear_tcp_readable_cache(socket: &TcpStream) {
+    let _ignore = socket.try_io(Interest::READABLE, || -> std::io::Result<()> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    });
+}
+
+fn clear_tcp_writable_cache(socket: &TcpStream) {
+    let _ignore = socket.try_io(Interest::WRITABLE, || -> std::io::Result<()> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    });
+}
+
+fn clear_pipe_readable_cache(receiver: &pipe::Receiver) {
+    let _ignore =
+        receiver.try_io(|| -> std::io::Result<()> { Err(std::io::ErrorKind::WouldBlock.into()) });
+}
+
+fn clear_pipe_writable_cache(sender: &pipe::Sender) {
+    let _ignore =
+        sender.try_io(|| -> std::io::Result<()> { Err(std::io::ErrorKind::WouldBlock.into()) });
 }
 
 // ---------------------------------------------------------------------------
@@ -1768,59 +1798,53 @@ async fn splice_proxy_body(
         let chunk_size = std::cmp::min(remaining, PIPE_BUFFER_SIZE as u64) as usize;
 
         // Step 1: splice upstream → pipe_A
-        // Try splice first (non-blocking); if EAGAIN, wait for readability then retry.
-        let got: Result<usize, nix::errno::Errno> = {
-            let upstream_fd = upstream.as_raw_fd();
-            let pipe_a_w_fd = upstream_pipe_sender.as_raw_fd();
+        // Both fds are non-blocking; splice() never waits on I/O and reads
+        // kernel buffer state directly rather than Tokio's userspace ready-flag.
+        // Try the syscall optimistically and only park on EAGAIN — that way the
+        // rated wait (with its rc.add(0) ticks and http_timeout budget) only
+        // runs when we're actually about to park, instead of being cancelled
+        // mid-flight by `select!` on every busy iteration.
+        let got = loop {
+            let res = splice(
+                upstream,
+                None,
+                &upstream_pipe_sender,
+                None,
+                chunk_size,
+                SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
+            );
 
-            tokio::task::spawn_blocking(move || {
-                // SAFETY: upstream_fd is valid because the caller holds a reference to the
-                // TcpStream, and the spawn_blocking result is awaited without cancellation
-                let src = unsafe { BorrowedFd::borrow_raw(upstream_fd) };
-                // SAFETY: pipe_a_w_fd is valid because the caller holds the OwnedFd,
-                // and the spawn_blocking result is awaited without cancellation
-                let dst = unsafe { BorrowedFd::borrow_raw(pipe_a_w_fd) };
-                splice(
-                    src,
-                    None,
-                    dst,
-                    None,
-                    chunk_size,
-                    SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
-                )
-            })
-            .await
-            .expect("spawn_blocking should not panic")
-        };
-
-        let got = match got {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    format!(
-                        "splice proxy: upstream closed prematurely (remaining={remaining}, chunk_size={chunk_size})"
-                    ),
-                ));
-            }
-            Ok(n) => n,
-            Err(nix::errno::Errno::EINTR) => {
-                continue;
-            }
-            // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-            Err(nix::errno::Errno::EAGAIN) => {
-                wait_readable_rated(
-                    upstream,
-                    &mut rate_checker,
-                    RateCheckDirection::Upstream,
-                    config.http_timeout,
-                )
-                .await?;
-
-                upstream_pipe_sender.writable().await?;
-
-                continue;
-            }
-            Err(err) => return Err(errno_to_io_error(err, "splice failed")),
+            let _: Never = match res {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        format!(
+                            "splice proxy: upstream closed prematurely (remaining={remaining}, chunk_size={chunk_size})"
+                        ),
+                    ));
+                }
+                Ok(n) => break n,
+                Err(nix::errno::Errno::EINTR) => continue,
+                // EAGAIN/EWOULDBLOCK: see module-level static_assert.
+                Err(nix::errno::Errno::EAGAIN) => {
+                    // We can't tell from EAGAIN which side is the blocker, so
+                    // clear both caches and wake on whichever next produces a
+                    // fresh epoll event.
+                    clear_tcp_readable_cache(upstream);
+                    clear_pipe_writable_cache(&upstream_pipe_sender);
+                    tokio::select! {
+                        r = wait_readable_rated(
+                            upstream,
+                            &mut rate_checker,
+                            RateCheckDirection::Upstream,
+                            config.http_timeout,
+                        ) => r?,
+                        w = upstream_pipe_sender.writable() => w?,
+                    }
+                    continue;
+                }
+                Err(err) => return Err(errno_to_io_error(err, "splice failed")),
+            };
         };
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
@@ -2468,40 +2492,38 @@ async fn tee_and_splice(
             // Cache is written first so concurrent clients see progress immediately
             // without being gated on a potentially slow first client.
 
-            upstream_pipe_rx.readable().await?;
-            cache_pipe_tx.writable().await?;
-
             // Step 2: tee pipe_A → pipe_B (duplicates without consuming from pipe_A)
-            let teed: Result<usize, nix::errno::Errno> = {
-                let pipe_a_r_fd = upstream_pipe_rx.as_raw_fd();
-                let pipe_b_w_fd = cache_pipe_tx.as_raw_fd();
+            // Same optimistic-then-park pattern as Step 1: try tee first and
+            // only `select!`-park on EAGAIN, after clearing both caches.
+            let teed: usize = loop {
+                let res = tee(
+                    upstream_pipe_rx,
+                    cache_pipe_tx,
+                    remaining,
+                    SpliceFFlags::empty(),
+                );
 
-                tokio::task::spawn_blocking(move || {
-                    // SAFETY: pipe_a_r_fd is valid because the caller holds the OwnedFd,
-                    // and the spawn_blocking result is awaited without cancellation
-                    let src = unsafe { BorrowedFd::borrow_raw(pipe_a_r_fd) };
-                    // SAFETY: pipe_b_w_fd is valid because the caller holds the OwnedFd,
-                    // and the spawn_blocking result is awaited without cancellation
-                    let dst = unsafe { BorrowedFd::borrow_raw(pipe_b_w_fd) };
-                    tee(src, dst, remaining, SpliceFFlags::empty())
-                })
-                .await
-                .expect("spawn_blocking should not panic")
-            };
-
-            let teed: usize = match teed {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "splice proxy: tee returned 0",
-                    ));
-                }
-                Ok(n) => n,
-                // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-                Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
-                    continue;
-                }
-                Err(err) => return Err(errno_to_io_error(err, "tee failed")),
+                let _: Never = match res {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "splice proxy: tee returned 0",
+                        ));
+                    }
+                    Ok(n) => break n,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    // EAGAIN/EWOULDBLOCK: see module-level static_assert.
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        clear_pipe_readable_cache(upstream_pipe_rx);
+                        clear_pipe_writable_cache(cache_pipe_tx);
+                        tokio::select! {
+                            r = upstream_pipe_rx.readable() => r?,
+                            w = cache_pipe_tx.writable() => w?,
+                        }
+                        continue;
+                    }
+                    Err(err) => return Err(errno_to_io_error(err, "tee failed")),
+                };
             };
 
             // Step 3: splice pipe_B → cache file first (fast, local disk I/O)
@@ -2511,39 +2533,22 @@ async fn tee_and_splice(
             dbarrier.ping_batched(teed as u64);
 
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
+            // pipe_A always has data on entry (just filled by tee), so try the
+            // splice optimistically and only park on EAGAIN. This keeps
+            // `wait_writable_rated`'s rc.add(0) ticks and http_timeout intact
+            // — they only run when the client is actually back-pressuring,
+            // not on every busy iteration where pipe-readable would otherwise
+            // win the `select!` race and cancel them mid-flight.
             let mut client_remaining = teed;
             while client_remaining > 0 {
-                wait_writable_rated(
+                let result = splice(
+                    upstream_pipe_rx,
+                    None,
                     client,
-                    client_rate_checker,
-                    RateCheckDirection::Client,
-                    global_config().http_timeout,
-                )
-                .await?;
-
-                upstream_pipe_rx.readable().await?;
-
-                let pipe_a_r_fd = upstream_pipe_rx.as_raw_fd();
-                let client_fd = client.as_raw_fd();
-
-                let result = tokio::task::spawn_blocking(move || {
-                    // SAFETY: pipe_a_r_fd is valid because the caller holds the OwnedFd,
-                    // and the spawn_blocking result is awaited without cancellation
-                    let src = unsafe { BorrowedFd::borrow_raw(pipe_a_r_fd) };
-                    // SAFETY: client_fd is valid because the caller holds a reference,
-                    // and the spawn_blocking result is awaited without cancellation
-                    let dst = unsafe { BorrowedFd::borrow_raw(client_fd) };
-                    splice(
-                        src,
-                        None,
-                        dst,
-                        None,
-                        client_remaining,
-                        SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
-                    )
-                })
-                .await
-                .expect("spawn_blocking should not panic");
+                    None,
+                    client_remaining,
+                    SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
+                );
 
                 let _: Never = match result {
                     Ok(0) | Err(nix::errno::Errno::EPIPE | nix::errno::Errno::ECONNRESET) => {
@@ -2581,8 +2586,20 @@ async fn tee_and_splice(
 
                         continue;
                     }
+                    Err(nix::errno::Errno::EINTR) => continue,
                     // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-                    Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        clear_pipe_readable_cache(upstream_pipe_rx);
+                        clear_tcp_writable_cache(client);
+                        tokio::select! {
+                            w = wait_writable_rated(
+                                client,
+                                client_rate_checker,
+                                RateCheckDirection::Client,
+                                global_config().http_timeout,
+                            ) => w?,
+                            r = upstream_pipe_rx.readable() => r?,
+                        }
                         continue;
                     }
                     Err(err) => return Err(errno_to_io_error(err, "splice failed")),
