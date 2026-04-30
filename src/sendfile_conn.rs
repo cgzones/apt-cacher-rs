@@ -114,7 +114,7 @@ pub(crate) async fn handle_sendfile_connection(
                 index
             }
             Err(err) if err.kind() == ErrorKind::TimedOut => {
-                info!(
+                debug!(
                     "Timeout while reading request headers from client {client} for request {}",
                     req_num + 1
                 );
