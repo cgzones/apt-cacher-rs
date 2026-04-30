@@ -4496,6 +4496,14 @@ struct Cli {
         value_name = "PATH"
     )]
     config_file: PathBuf,
+    /// Cache directory path; overrides `cache_directory` from the
+    /// configuration file (or the built-in default when no file is loaded)
+    #[arg(long, value_name = "PATH")]
+    cache_path: Option<PathBuf>,
+    /// Database file path; overrides `database_path` from the configuration
+    /// file (or the built-in default when no file is loaded)
+    #[arg(long, value_name = "PATH")]
+    database_path: Option<PathBuf>,
     /// Skip timestamp in log messages
     #[arg(long, default_value = "false")]
     skip_log_timestamp: bool,
@@ -4574,7 +4582,7 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let args = Cli::parse();
+    let mut args = Cli::parse();
 
     let is_run_as_root = nix::unistd::geteuid().is_root();
 
@@ -4584,7 +4592,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::process::exit(1);
     }
 
-    let (config, cfg_fallback, config_warnings) = Config::new(&args.config_file)?;
+    let (config, cfg_fallback, config_warnings) = Config::new(
+        &args.config_file,
+        args.cache_path.take(),
+        args.database_path.take(),
+    )?;
 
     let output_log_level = args.log_level.unwrap_or(config.log_level);
     let output_log_file = args.log_file.as_ref().unwrap_or(&config.log_file);
@@ -4731,11 +4743,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .install_default()
                 .expect("first and sole call should succeed");
 
-            #[cfg(feature = "container")]
+            #[cfg(feature = "webpki-roots")]
             let tls_config = rustls::ClientConfig::builder()
                 .with_webpki_roots()
                 .with_no_client_auth();
-            #[cfg(not(feature = "container"))]
+            #[cfg(not(feature = "webpki-roots"))]
             let tls_config = rustls::ClientConfig::builder()
                 .with_native_roots()
                 .inspect_err(|err| error!("Failed to load native roots:  {}", ErrorReport(err)))?

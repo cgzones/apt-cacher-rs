@@ -32,12 +32,24 @@ podman build -t apt-cacher-rs:dev -f Dockerfile .
 ```
 
 The image expects a `volume` mounted at */data* to store the database and cached files.
-You should also provide a configuration file via a mount on */app/apt-cacher-rs.conf*, since the default configuration does not permit any clients.
+You must also provide a configuration file via a mount on */app/apt-cacher-rs.conf*, since the default configuration does not permit any clients.
 For example you can start a container via:
 
 ```bash
 podman run -p 3142:3142/tcp --read-only --rm -v apt-cacher-rs-data:/data:nodev,noexec,nosuid -v /srv/apt-cacher-rs.conf:/app/apt-cacher-rs.conf:ro apt-cacher-rs:dev
 ```
+
+The image's `ENTRYPOINT` hard-codes `--config-file=/app/apt-cacher-rs.conf`, `--cache-path=/data/cache` and `--database-path=/data/apt-cacher-rs.db`; any extra arguments passed to `podman run` are appended after these flags.
+To use different paths, override the entrypoint via `--entrypoint`.
+
+## Command-line options
+
+The most relevant flags (see `apt-cacher-rs --help` for the full list):
+
+- `--config-file=<PATH>`: path to the configuration file (default */etc/apt-cacher-rs/apt-cacher-rs.conf*).
+  If the default file is missing the built-in defaults are used; a missing non-default file is an error.
+- `--cache-path=<PATH>`: overrides the `cache_directory` field from the configuration file (or its default).
+- `--database-path=<PATH>`: overrides the `database_path` field from the configuration file (or its default).
 
 ## How to use
 
