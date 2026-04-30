@@ -3480,7 +3480,9 @@ async fn pre_process_client_request(
                 }
             }
 
-            return serve_web_interface(req, &appstate).await;
+            return serve_web_interface(req.uri(), &appstate)
+                .await
+                .into_hyper_response();
         };
 
     let requested_port = match req.uri().port_u16() {
