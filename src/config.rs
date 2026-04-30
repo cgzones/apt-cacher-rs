@@ -19,21 +19,9 @@ use serde::Deserializer;
 
 use crate::nonzero;
 
-const DEFAULT_CACHE_DIR: &str = if cfg!(feature = "container") {
-    "/data/cache"
-} else {
-    "/var/cache/apt-cacher-rs"
-};
-pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = if cfg!(feature = "container") {
-    "/app/apt-cacher-rs.conf"
-} else {
-    "/etc/apt-cacher-rs/apt-cacher-rs.conf"
-};
-pub(crate) const DEFAULT_DATABASE_PATH: &str = if cfg!(feature = "container") {
-    "/data/apt-cacher-rs.db"
-} else {
-    "/var/lib/apt-cacher-rs/apt-cacher-rs.db"
-};
+const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
+pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = "/etc/apt-cacher-rs/apt-cacher-rs.conf";
+pub(crate) const DEFAULT_DATABASE_PATH: &str = "/var/lib/apt-cacher-rs/apt-cacher-rs.db";
 
 const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
@@ -978,16 +966,30 @@ impl Config {
     }
 
     /// Load the configuration from the given file.
-    /// Return the loaded configuration, a flag whether default settings were used,
-    /// and a list of validation warnings.
-    pub(crate) fn new(file: &Path) -> anyhow::Result<(Self, bool, Vec<String>)> {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
+    /// Return the loaded configuration, a flag indicating whether the default
+    /// configuration file was not found and the built-in defaults were used
+    /// instead, and a list of validation warnings.
+    ///
+    /// When supplied, `cache_directory` overrides [`Self::cache_directory`]
+    /// and `database_path` overrides [`Self::database_path`], applied on top
+    /// of the values from the configuration file (or the built-in defaults
+    /// when no file is loaded). A non-default `file` that does not exist is
+    /// always an error, even when both overrides are supplied.
+    pub(crate) fn new(
+        file: &Path,
+        cache_directory: Option<PathBuf>,
+        database_path: Option<PathBuf>,
+    ) -> anyhow::Result<(Self, bool, Vec<String>)> {
+        let (mut config, fallback) = match std::fs::read_to_string(file) {
+            Ok(content) => (
+                toml::from_str::<Self>(&content).context("Failed to parse configuration")?,
+                false,
+            ),
             Err(err)
                 if err.kind() == std::io::ErrorKind::NotFound
                     && file == Path::new(DEFAULT_CONFIGURATION_PATH) =>
             {
-                return Ok((Self::default(), true, Vec::new()));
+                (Self::default(), true)
             }
             Err(err) => {
                 return Err(err)
@@ -995,11 +997,16 @@ impl Config {
             }
         };
 
-        let mut config: Self = toml::from_str(&content).context("Failed to parse configuration")?;
+        if let Some(path) = cache_directory {
+            config.cache_directory = path;
+        }
+        if let Some(path) = database_path {
+            config.database_path = path;
+        }
 
         let warnings = config.validate()?;
 
-        Ok((config, false, warnings))
+        Ok((config, fallback, warnings))
     }
 
     fn validate(&mut self) -> anyhow::Result<Vec<String>> {

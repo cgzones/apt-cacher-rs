@@ -7,8 +7,7 @@ RUN apk add \
     build-base \
     cmake \
     pkgconf \
-    sqlite-dev \
-    xz-dev
+    xz-static
 
 RUN adduser \
     --disabled-password \
@@ -22,7 +21,7 @@ RUN adduser \
 WORKDIR /app
 COPY . .
 
-RUN cargo install --locked --root /out --path . --features container
+RUN cargo install --locked --root /out --path . --features webpki-roots
 
 # --- final image
 
@@ -36,4 +35,8 @@ COPY --from=builder /out/bin/apt-cacher-rs /app/apt-cacher-rs
 USER app:app
 VOLUME ["/data"]
 EXPOSE 3142/tcp
-CMD ["/app/apt-cacher-rs"]
+ENTRYPOINT ["/app/apt-cacher-rs", \
+            "--config-file=/app/apt-cacher-rs.conf", \
+            "--cache-path=/data/cache", \
+            "--database-path=/data/apt-cacher-rs.db"]
+CMD []
