@@ -1941,7 +1941,7 @@ async fn serve_unfinished_file(
                 "Failed to get metadata of file `{}`:  {err}",
                 file_path.display()
             );
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Error");
+            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
 

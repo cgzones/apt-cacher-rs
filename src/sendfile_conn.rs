@@ -639,7 +639,7 @@ async fn try_sendfile_request(
             {
                 Ok(()) => SendfileResult::Served(conn_action),
                 Err(SpliceProxyError::UpstreamError(err)) => {
-                    warn!(
+                    info!(
                         "simple proxy: upstream error for {uri_path} from host {}:  {err}",
                         mirror.format_authority()
                     );
@@ -648,16 +648,10 @@ async fn try_sendfile_request(
                         msg: "Upstream Error",
                     }
                 }
-                Err(SpliceProxyError::TransferError(err)) => {
-                    warn!(
-                        "simple proxy: transfer error for {uri_path} from host {}:  {err}",
-                        mirror.format_authority()
-                    );
-                    SendfileResult::Invalid {
-                        status: StatusCode::INTERNAL_SERVER_ERROR,
-                        msg: "Transfer Error",
-                    }
-                }
+                Err(SpliceProxyError::TransferError) => SendfileResult::Invalid {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    msg: "Transfer Error",
+                },
                 Err(SpliceProxyError::ClientError(err)) => {
                     debug!(
                         "simple proxy: client error for {uri_path} from host {}:  {err}",
@@ -665,16 +659,14 @@ async fn try_sendfile_request(
                     );
                     SendfileResult::ClientError
                 }
-                Err(SpliceProxyError::AfterHeaderError(err)) => {
-                    info!(
-                        "simple proxy: after-header error for {uri_path} from host {}:  {err}",
-                        mirror.format_authority()
-                    );
-                    SendfileResult::AfterHeaderError
-                }
-                Err(err) => {
-                    warn!("simple proxy: unexpected error for {uri_path}:  {err}");
-                    SendfileResult::NotApplicable("simple proxy failed")
+                Err(SpliceProxyError::AfterHeaderError) => SendfileResult::AfterHeaderError,
+                Err(SpliceProxyError::CacheError) => SendfileResult::Invalid {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    msg: "Cache Access Failure",
+                },
+                Err(SpliceProxyError::NotApplicable(err)) => {
+                    debug!("simple proxy: {uri_path} not applicable:  {err}");
+                    SendfileResult::NotApplicable(err)
                 }
             };
         }
@@ -1034,16 +1026,14 @@ async fn try_sendfile_request(
                 result
             }
             Err(SpliceProxyError::NotApplicable(reason)) => {
-                warn_once_or_debug!(
+                debug!(
                     "splice proxy not applicable for {} from mirror {}{}: {reason}",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    aliased
+                    conn_details.debname, conn_details.mirror, aliased
                 );
                 SendfileResult::NotApplicable(reason)
             }
             Err(SpliceProxyError::UpstreamError(err)) => {
-                warn!(
+                info!(
                     "splice proxy: upstream error for {} from mirror {}{}:  {err}",
                     conn_details.debname, conn_details.mirror, aliased
                 );
@@ -1052,26 +1042,14 @@ async fn try_sendfile_request(
                     msg: "Upstream Error",
                 }
             }
-            Err(SpliceProxyError::CacheError(err)) => {
-                warn!(
-                    "splice proxy: cache error for {} from mirror {}{}:  {err}",
-                    conn_details.debname, conn_details.mirror, aliased
-                );
-                SendfileResult::Invalid {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    msg: "Cache Error",
-                }
-            }
-            Err(SpliceProxyError::TransferError(err)) => {
-                warn!(
-                    "splice proxy: transfer error for {} from mirror {}{}:  {err}",
-                    conn_details.debname, conn_details.mirror, aliased
-                );
-                SendfileResult::Invalid {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    msg: "Transfer Error",
-                }
-            }
+            Err(SpliceProxyError::CacheError) => SendfileResult::Invalid {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                msg: "Cache Access Failure",
+            },
+            Err(SpliceProxyError::TransferError) => SendfileResult::Invalid {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                msg: "Transfer Error",
+            },
             Err(SpliceProxyError::ClientError(err)) => {
                 debug!(
                     "splice proxy: client error for {} from mirror {}{}:  {err}",
@@ -1079,13 +1057,7 @@ async fn try_sendfile_request(
                 );
                 SendfileResult::ClientError
             }
-            Err(SpliceProxyError::AfterHeaderError(err)) => {
-                info!(
-                    "splice proxy: after-header error for {} from mirror {}{}:  {err}",
-                    conn_details.debname, conn_details.mirror, aliased
-                );
-                SendfileResult::AfterHeaderError
-            }
+            Err(SpliceProxyError::AfterHeaderError) => SendfileResult::AfterHeaderError,
         }
     }
 
