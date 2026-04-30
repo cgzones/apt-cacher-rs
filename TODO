@@ -46,5 +46,6 @@ curl -i -L --http1.1 -H "user-agent: apt-cacher-rs/0.1.0" -H "host: apt.llvm.org
   13.  run `cargo publish --dry-run`
   14.  create release commit with changed version number in *Cargo.toml* and *Cargo.lock*
   15.  run `cargo publish`
-  16.  create and push git tag
-  17.  create Release on GitHub
+  16.  create git tag: `git tag -a -s -m "apt-cacher-rs release 0.0.0" v0.0.0`
+  17.  push git tag: `git push origin v0.0.0`
+  18.  create Release on GitHub
