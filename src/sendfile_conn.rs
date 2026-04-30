@@ -24,20 +24,22 @@ use crate::error::{ErrorReport, errno_to_io_error};
 use crate::http_etag::{if_none_match, read_etag};
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, ResponseHeaders, find_header, find_header_end,
-    write_304_response, write_416_response, write_invalid_response, write_response_headers,
+    write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
+    write_response_headers,
 };
 use crate::http_last_modified::read_last_modified;
 use crate::http_range::{
-    HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range,
+    HttpDate, ParsedRange, cache_file_http_date, compute_age, format_http_date, http_parse_range,
 };
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::{
-    ActiveDownloadStatus, AppState, CachedFlavor, ClientInfo, ConnectionDetails, ContentLength,
-    Never, VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter,
+    APP_NAME, ActiveDownloadStatus, AppState, CachedFlavor, ClientInfo, ConnectionDetails,
+    ContentLength, Never, VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter,
     content_type_for_cached_file, global_config, handle_hyper_connection, is_diff_request_path,
     metrics, static_assert, warn_once_or_debug, warn_once_or_info,
+    web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -267,6 +269,99 @@ async fn read_request_headers(
     }
 }
 
+/// Serve a local web-interface request directly from the sendfile path.
+///
+/// The hyper-based handler exists in `web_interface::serve_web_interface`; this
+/// wrapper invokes it and serializes the resulting `WebResponse`
+/// onto the raw `TcpStream` with handwritten headers, so webui responses look
+/// the same regardless of which connection backend served them.
+async fn serve_webui(
+    stream: &TcpStream,
+    uri: &http::Uri,
+    appstate: &AppState,
+    client: &ClientInfo,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+) -> SendfileResult {
+    let cfg = global_config();
+    let allowed_webif_clients = cfg
+        .allowed_webif_clients
+        .as_ref()
+        .unwrap_or(&cfg.allowed_proxy_clients);
+    let client_ip = client.ip();
+    if !allowed_webif_clients.is_empty()
+        && !allowed_webif_clients
+            .iter()
+            .any(|ac| ac.contains(&client_ip))
+    {
+        warn_once_or_info!("Unauthorized web-interface access by client {client}");
+        return SendfileResult::Rejection {
+            status: StatusCode::FORBIDDEN,
+            conn_action,
+            msg: "Unauthorized client",
+        };
+    }
+
+    let response = serve_web_interface(uri, appstate).await;
+
+    if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
+        info!("Failed to write web-interface response to client {client}:  {err}");
+        return SendfileResult::AfterHeaderError;
+    }
+    SendfileResult::Served(conn_action)
+}
+
+/// Format and write a [`WebResponse`] onto the raw stream.
+///
+/// Mirrors the layout used by [`crate::http_helpers::write_response_headers`]:
+/// a single `format!` builds the entire status-line + headers block with named
+/// substitutions, so the wire bytes are easy to read alongside the hyper-side
+/// `WebResponse::into_hyper_response` constructor.
+async fn write_webui_response(
+    stream: &TcpStream,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    response: WebResponse,
+) -> std::io::Result<()> {
+    let date = format_http_date();
+    let content_type = response.content_type();
+    let body_len = response.body.len();
+    let status = response.status;
+
+    // Per-kind extra headers, kept in lockstep with `WebResponse::into_hyper_response`.
+    let extra_headers: String = match response.kind {
+        WebResponseKind::Html => format!(
+            "Cache-Control: no-store\r\n\
+             Content-Security-Policy: {HTML_CSP}\r\n\
+             X-Content-Type-Options: nosniff\r\n\
+             X-Frame-Options: DENY\r\n\
+             X-Robots-Tag: noindex\r\n\
+             Referrer-Policy: no-referrer\r\n",
+        ),
+        WebResponseKind::Static { .. } => String::from(
+            "Cache-Control: public, max-age=86400\r\n\
+             X-Content-Type-Options: nosniff\r\n",
+        ),
+        WebResponseKind::Error => String::new(),
+    };
+
+    let header = format!(
+        "{conn_version} {status}\r\n\
+         Server: {APP_NAME}\r\n\
+         Date: {date}\r\n\
+         Connection: {conn_action}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {body_len}\r\n\
+         {extra_headers}\
+         \r\n",
+    );
+
+    trace!("Outgoing web-interface response headers:\n{header}");
+    metrics::record_client_status(status);
+    write_all_to_stream(stream, header.as_bytes()).await?;
+    write_all_to_stream(stream, &response.body).await
+}
+
 /// Compute the connection action based on the request headers.
 #[must_use]
 fn compute_conn_action(
@@ -471,8 +566,9 @@ async fn try_sendfile_request(
                 msg: "Missing Host header",
             };
         }
-        // No authority means it's likely a direct request (web interface) - fall back
-        return SendfileResult::NotApplicable("no authority");
+        // No authority means it's a direct request to the local web interface.
+        let conn_action = compute_conn_action(&req, *conn_version, &client);
+        return serve_webui(stream, &uri, appstate, &client, *conn_version, conn_action).await;
     };
 
     let requested_host = match authorize_cache_access(&client, authority.host().to_string()) {

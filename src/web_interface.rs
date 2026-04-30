@@ -8,16 +8,12 @@ use std::{
 
 use coarsetime::Instant;
 use hashbrown::HashMap;
-use http::{
-    Method,
-    header::{
-        CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
-        X_FRAME_OPTIONS,
-    },
+use http::header::{
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    X_FRAME_OPTIONS,
 };
 use hyper::{
-    Request, Response, StatusCode,
-    body::Incoming,
+    Response, StatusCode,
     header::{CONNECTION, CONTENT_TYPE, DATE, SERVER},
 };
 use log::{debug, error, trace, warn};
@@ -32,7 +28,6 @@ use crate::{
     database_task::DB_TASK_QUEUE_SENDER,
     deb_mirror::VALID_DEB_EXTENSIONS,
     format_http_date, full_body, get_features, global_cache_quota, global_config, metrics,
-    quick_response,
     task_cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     tunnel_limiter::active_tunnels,
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
@@ -1972,31 +1967,101 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     build_page("apt-cacher-rs web interface", body, options)
 }
 
-/// Build an HTML page response with standard security headers.
-fn html_response(html: String) -> Response<ProxyCacheBody> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(SERVER, APP_NAME)
-        .header(DATE, format_http_date())
-        .header(CONNECTION, "keep-alive")
-        .header(CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(CACHE_CONTROL, "no-store")
-        // `style-src 'self'` permits the linked `/style.css` but blocks any
-        // `<style>` block or inline `style="..."` attribute. If a future
-        // change wants inline styles, it has to either move them into the
-        // stylesheet or extend the CSP — silent CSP rejections are easy to
-        // miss when only some users have devtools open.
-        .header(
-            CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'self'; img-src 'self' data:; \
-             base-uri 'none'; form-action 'none'",
-        )
-        .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(X_FRAME_OPTIONS, "DENY")
-        .header("X-Robots-Tag", "noindex")
-        .header(REFERRER_POLICY, "no-referrer")
-        .body(full_body(html))
-        .expect("HTTP response is valid")
+/// Content-Security-Policy applied to every HTML page.
+///
+/// `style-src 'self'` permits the linked `/style.css` but blocks any `<style>`
+/// block or inline `style="..."` attribute. If a future change wants inline
+/// styles, it has to either move them into the stylesheet or extend the CSP —
+/// silent CSP rejections are easy to miss when only some users have devtools
+/// open.
+pub(crate) const HTML_CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self' data:; \
+     base-uri 'none'; form-action 'none'";
+
+/// A response from the local web interface.
+///
+/// Carries enough information for the hyper backend to construct a
+/// `Response<ProxyCacheBody>` and for the sendfile backend to format the wire
+/// bytes by hand using `format!` (see `sendfile_conn::write_webui_response`).
+/// The two paths derive their headers from the same `WebResponse`, so clients
+/// see the same response regardless of which backend served the request.
+pub(crate) struct WebResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) body: bytes::Bytes,
+    pub(crate) kind: WebResponseKind,
+}
+
+pub(crate) enum WebResponseKind {
+    /// Dashboard or logs page; served with `no-store` cache and full
+    /// security headers.
+    Html,
+    /// Static asset (CSS/SVG) with long-lived caching and `nosniff`.
+    Static { content_type: &'static str },
+    /// Plain-text error response.
+    Error,
+}
+
+impl WebResponse {
+    fn html(html: String) -> Self {
+        Self {
+            status: StatusCode::OK,
+            body: bytes::Bytes::from(html),
+            kind: WebResponseKind::Html,
+        }
+    }
+
+    fn static_resource(content_type: &'static str, content: &'static str) -> Self {
+        Self {
+            status: StatusCode::OK,
+            body: bytes::Bytes::from_static(content.as_bytes()),
+            kind: WebResponseKind::Static { content_type },
+        }
+    }
+
+    fn not_found(msg: &'static str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: bytes::Bytes::from_static(msg.as_bytes()),
+            kind: WebResponseKind::Error,
+        }
+    }
+
+    pub(crate) fn content_type(&self) -> &'static str {
+        match self.kind {
+            WebResponseKind::Html => "text/html; charset=utf-8",
+            WebResponseKind::Static { content_type } => content_type,
+            WebResponseKind::Error => "text/plain; charset=utf-8",
+        }
+    }
+
+    /// Render this response as a `Response<ProxyCacheBody>` for the hyper path.
+    pub(crate) fn into_hyper_response(self) -> Response<ProxyCacheBody> {
+        let mut builder = Response::builder()
+            .status(self.status)
+            .header(SERVER, APP_NAME)
+            .header(DATE, format_http_date())
+            .header(CONNECTION, "keep-alive")
+            .header(CONTENT_TYPE, self.content_type());
+        match self.kind {
+            WebResponseKind::Html => {
+                builder = builder
+                    .header(CACHE_CONTROL, "no-store")
+                    .header(CONTENT_SECURITY_POLICY, HTML_CSP)
+                    .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
+                    .header(X_FRAME_OPTIONS, "DENY")
+                    .header("X-Robots-Tag", "noindex")
+                    .header(REFERRER_POLICY, "no-referrer");
+            }
+            WebResponseKind::Static { .. } => {
+                builder = builder
+                    .header(CACHE_CONTROL, "public, max-age=86400")
+                    .header(X_CONTENT_TYPE_OPTIONS, "nosniff");
+            }
+            WebResponseKind::Error => {}
+        }
+        builder
+            .body(full_body(self.body))
+            .expect("HTTP response is valid")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2004,70 +2069,41 @@ fn html_response(html: String) -> Response<ProxyCacheBody> {
 // ---------------------------------------------------------------------------
 
 #[must_use]
-pub(crate) async fn serve_web_interface(
-    req: Request<Incoming>,
-    appstate: &AppState,
-) -> Response<ProxyCacheBody> {
-    debug_assert_eq!(
-        req.method(),
-        Method::GET,
-        "caller filters out non-GET requests"
-    );
-
+pub(crate) async fn serve_web_interface(uri: &http::Uri, appstate: &AppState) -> WebResponse {
     metrics::WEBUI_REQUESTS.increment();
 
-    let location = req.uri().path();
+    let location = uri.path();
     debug!("Requested local web interface resource `{location}`");
 
-    let options = parse_query(req.uri().query());
+    let options = parse_query(uri.query());
 
     let response = match location {
         "/" => serve_dashboard(appstate, options).await,
         "/logs" => serve_logs(options).await,
-        "/style.css" => serve_stylesheet(),
-        "/favicon.svg" | "/favicon.ico" => serve_favicon(),
+        "/style.css" => WebResponse::static_resource("text/css; charset=utf-8", CSS),
+        "/favicon.svg" | "/favicon.ico" => {
+            WebResponse::static_resource("image/svg+xml", FAVICON_SVG)
+        }
         _ => {
-            debug!("Unknown local web interface resource: {req:?}");
-            quick_response(
-                StatusCode::NOT_FOUND,
-                "Local interface resource not available",
-            )
+            debug!("Unknown local web interface resource: {uri:?}");
+            WebResponse::not_found("Local interface resource not available")
         }
     };
 
-    trace!("Local web interface response:\n{response:?}");
+    trace!(
+        "Local web interface response: status={}, content-type={}, body={} bytes",
+        response.status,
+        response.content_type(),
+        response.body.len()
+    );
 
     response
 }
 
-async fn serve_dashboard(appstate: &AppState, options: QueryOptions) -> Response<ProxyCacheBody> {
+async fn serve_dashboard(appstate: &AppState, options: QueryOptions) -> WebResponse {
     let data = gather_dashboard_data(appstate).await;
     let html = build_dashboard_page(&data, options);
-    html_response(html)
-}
-
-fn serve_static_resource(
-    content_type: &'static str,
-    content: &'static str,
-) -> Response<ProxyCacheBody> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(SERVER, APP_NAME)
-        .header(DATE, format_http_date())
-        .header(CONNECTION, "keep-alive")
-        .header(CONTENT_TYPE, content_type)
-        .header(CACHE_CONTROL, "public, max-age=86400")
-        .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .body(full_body(content))
-        .expect("HTTP response is valid")
-}
-
-fn serve_favicon() -> Response<ProxyCacheBody> {
-    serve_static_resource("image/svg+xml", FAVICON_SVG)
-}
-
-fn serve_stylesheet() -> Response<ProxyCacheBody> {
-    serve_static_resource("text/css; charset=utf-8", CSS)
+    WebResponse::html(html)
 }
 
 // ---------------------------------------------------------------------------
@@ -2625,7 +2661,7 @@ async fn build_top_packages_table(database: &Database, view: TopPackagesView) ->
 // ---------------------------------------------------------------------------
 
 #[must_use]
-async fn serve_logs(options: QueryOptions) -> Response<ProxyCacheBody> {
+async fn serve_logs(options: QueryOptions) -> WebResponse {
     let ls = LOGSTORE.get().expect("initialized in main()");
 
     // HTML-escape every entry on the blocking pool: with a large
@@ -2673,7 +2709,7 @@ async fn serve_logs(options: QueryOptions) -> Response<ProxyCacheBody> {
             refresh_secs: None,
         },
     );
-    html_response(html)
+    WebResponse::html(html)
 }
 
 #[cfg(test)]
