@@ -72,7 +72,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "apt-cacher-rs"
-version = "0.7.0"
+version = "0.8.0-rc.1"
 dependencies = [
  "anyhow",
  "async-compression",

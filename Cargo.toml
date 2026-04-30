@@ -1,6 +1,6 @@
 [package]
 name = "apt-cacher-rs"
-version = "0.7.0"
+version = "0.8.0-rc.1"
 authors = ["Christian Göttsche <cgzones@googlemail.com>"]
 license = "MIT"
 description = "A caching proxy for Debian style package repositories"
