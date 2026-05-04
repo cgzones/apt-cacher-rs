@@ -15,6 +15,7 @@ compile_error!("Feature \"tls_hyper\" and \"tls_rustls\" are mutually exclusive.
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod active_downloads;
+mod cache_conditional;
 mod cache_quota;
 mod channel_body;
 mod config;
@@ -141,6 +142,7 @@ use tokio::signal::unix::SignalKind;
 #[cfg(feature = "splice")]
 use crate::active_downloads::OriginateOutcome;
 use crate::active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads, InsertOutcome};
+use crate::cache_conditional::CacheInfo;
 use crate::cache_quota::QuotaExceeded;
 use crate::config::Config;
 use crate::config::DomainName;
@@ -167,15 +169,11 @@ use crate::error::ErrorReport;
 use crate::error::ProxyCacheError;
 use crate::guards::DownloadBarrier;
 use crate::guards::InitBarrier;
-use crate::http_etag::if_none_match;
 use crate::http_etag::is_valid_etag;
 use crate::http_etag::read_etag;
 use crate::http_etag::write_etag;
-use crate::http_last_modified::read_last_modified;
 use crate::http_last_modified::write_last_modified;
 use crate::http_range::HttpDate;
-use crate::http_range::cache_file_http_date;
-use crate::http_range::compute_age;
 use crate::http_range::format_http_date;
 use crate::humanfmt::HumanFmt;
 use crate::logstore::LogStore;
@@ -1074,41 +1072,6 @@ async fn serve_cached_file(
     file_etag: EtagState,
     prefetched_metadata: Option<std::fs::Metadata>,
 ) -> Response<ProxyCacheBody> {
-    fn decide_serve_304(
-        req: &Request<Empty<()>>,
-        file_etag: Option<&str>,
-        local_modification_time: HttpDate,
-        conn_details: &ConnectionDetails,
-    ) -> bool {
-        // Handle If-None-Match (takes precedence over If-Modified-Since per RFC 9110 §13.1.2)
-        if let Some(inm) = req.headers().get(IF_NONE_MATCH) {
-            // If we don't have a local ETag or the header is invalid, conservatively serve the body.
-            let Some(etag) = file_etag else {
-                return false;
-            };
-
-            let Ok(inm_str) = inm.to_str() else {
-                warn_once!(
-                    "Client {} sent an invalid If-None-Match header: {inm:?}",
-                    conn_details.client
-                );
-                return false;
-            };
-
-            return if_none_match(inm_str, etag);
-        }
-
-        if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE)
-            && let Some(ims_str) = ims.to_str().ok()
-            && let Some(ims_time) = HttpDate::parse(ims_str)
-            && local_modification_time <= ims_time
-        {
-            return true;
-        }
-
-        false
-    }
-
     let aliased = match conn_details.aliased_host {
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
@@ -1132,29 +1095,40 @@ async fn serve_cached_file(
     let file_size = metadata.len();
 
     // Use the provided ETag or fall back to reading from the file if not provided
-    let file_etag = match file_etag {
+    let resolved_etag = match file_etag {
         EtagState::Some(etag) => Some(etag),
         EtagState::Failure => None,
         EtagState::Unknown => read_etag(&file, &file_path),
     };
 
-    // Prefer the upstream Last-Modified persisted in xattr (RFC 9110 §10.2.2). Fall back to the
-    // cache file's birth/modification time when the xattr is unavailable.
-    let cache_ts = cache_file_http_date(&metadata);
-    let stored_last_modified = read_last_modified(&file, &file_path);
-    let (last_modified_for_ims, last_modified_str) = match stored_last_modified {
-        Some((str, time)) => (time, str),
-        None => (cache_ts, cache_ts.format()),
+    let if_none_match_str = match req.headers().get(IF_NONE_MATCH) {
+        Some(v) => {
+            if let Ok(s) = v.to_str() {
+                Some(s)
+            } else {
+                warn_once!(
+                    "Client {} sent an invalid If-None-Match header: {v:?}",
+                    conn_details.client
+                );
+                None
+            }
+        }
+        None => None,
     };
-    let age = compute_age(&metadata);
+    let if_modified_since_str = req
+        .headers()
+        .get(IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok());
 
-    // Handle If-None-Match and If-Modified-Since
-    let serve_304 = decide_serve_304(
-        req,
-        file_etag.as_deref(),
+    let cache_info = CacheInfo::with_etag(&file, &file_path, &metadata, resolved_etag);
+    let serve_304 = cache_info.decide_serve_304(if_none_match_str, if_modified_since_str);
+
+    let cache_conditional::CacheInfo {
+        file_etag,
         last_modified_for_ims,
-        &conn_details,
-    );
+        last_modified_str,
+        age,
+    } = cache_info;
 
     if serve_304 {
         info!(
@@ -1949,7 +1923,7 @@ async fn serve_unfinished_file(
     metrics::REQUESTS_CHANNEL.increment();
 
     // For joining clients, try reading from xattr as the download task may have already written it.
-    let file_etag = match upstream_etag {
+    let resolved_etag = match upstream_etag {
         EtagState::Some(etag) => Some(etag),
         EtagState::Failure => None,
         EtagState::Unknown => read_etag(&file, &file_path),
@@ -1967,15 +1941,12 @@ async fn serve_unfinished_file(
         }
     };
 
-    // Prefer the upstream Last-Modified persisted in xattr (RFC 9110 §10.2.2); fall back to the
-    // cached file's birth/modification time when the xattr is unavailable.
-    let cache_ts = cache_file_http_date(&md);
-    let stored_last_modified = read_last_modified(&file, &file_path);
-    let last_modified_str = match stored_last_modified {
-        Some((str, _time)) => str,
-        None => cache_ts.format(),
-    };
-    let age = compute_age(&md);
+    let cache_conditional::CacheInfo {
+        file_etag,
+        last_modified_str,
+        age,
+        last_modified_for_ims: _,
+    } = CacheInfo::with_etag(&file, &file_path, &md, resolved_etag);
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);

@@ -15,22 +15,19 @@ use nix::sys::sendfile::sendfile;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
+use crate::cache_conditional::CacheInfo;
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{
     Mirror, Origin, ResourceFile, is_deb_package, is_unsafe_proxy_path, parse_request_path,
     valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
 };
 use crate::error::{ErrorReport, errno_to_io_error};
-use crate::http_etag::{if_none_match, read_etag};
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, ResponseHeaders, find_header, find_header_end,
     write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
     write_response_headers,
 };
-use crate::http_last_modified::read_last_modified;
-use crate::http_range::{
-    HttpDate, ParsedRange, cache_file_http_date, compute_age, format_http_date, http_parse_range,
-};
+use crate::http_range::{ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::tcp_cork_guard::CorkGuard;
@@ -1058,14 +1055,6 @@ async fn try_sendfile_request(
     SendfileResult::NotApplicable("file not found in cache")
 }
 
-/// Pre-computed cache metadata used by [`evaluate_conditional_and_range`].
-struct CacheInfo {
-    file_etag: Option<String>,
-    last_modified_for_ims: HttpDate,
-    last_modified_str: String,
-    age: u32,
-}
-
 /// Outcome of [`evaluate_conditional_and_range`].
 enum ConditionalOutcome {
     /// Caller should send a 304 Not Modified (already written to the stream).
@@ -1080,28 +1069,6 @@ enum ConditionalOutcome {
         content_range: Option<String>,
         partial: bool,
     },
-}
-
-/// Read `ETag` / Last-Modified from xattr and file metadata.
-fn read_cache_info(
-    file: &tokio::fs::File,
-    file_path: &Path,
-    metadata: &std::fs::Metadata,
-) -> CacheInfo {
-    let file_etag = read_etag(file, file_path);
-    let cache_ts = cache_file_http_date(metadata);
-    let stored_last_modified = read_last_modified(file, file_path);
-    let (last_modified_for_ims, last_modified_str) = match stored_last_modified {
-        Some((s, time)) => (time, s),
-        None => (cache_ts, cache_ts.format()),
-    };
-    let age = compute_age(metadata);
-    CacheInfo {
-        file_etag,
-        last_modified_for_ims,
-        last_modified_str,
-        age,
-    }
 }
 
 /// Raw Range / If-Range / conditional headers from a http client request.
@@ -1138,19 +1105,7 @@ async fn evaluate_conditional_and_range(
     file_size: u64,
     headers: RangeRequestHeaders<'_>,
 ) -> Result<ConditionalOutcome, SendfileResult> {
-    // Evaluate conditional request (RFC 9110 §13.1.2: If-None-Match takes precedence)
-    let serve_304 = if let Some(inm) = headers.if_none_match {
-        cache_info
-            .file_etag
-            .as_deref()
-            .is_some_and(|etag| if_none_match(inm, etag))
-    } else if let Some(ims) = headers.if_modified_since
-        && let Some(ims_time) = HttpDate::parse(ims)
-    {
-        cache_info.last_modified_for_ims <= ims_time
-    } else {
-        false
-    };
+    let serve_304 = cache_info.decide_serve_304(headers.if_none_match, headers.if_modified_since);
 
     if serve_304 {
         if let Err(err) = write_304_response(
@@ -1244,7 +1199,7 @@ pub(crate) async fn serve_file_via_sendfile(
 
     let file_size = metadata.len();
 
-    let cache_info = read_cache_info(&file, file_path, &metadata);
+    let cache_info = CacheInfo::read(&file, file_path, &metadata);
 
     let (http_status, content_start, content_length, content_range, partial) =
         match evaluate_conditional_and_range(
@@ -1939,7 +1894,7 @@ async fn serve_unfinished_sendfile(
         }
     };
 
-    let cache_info = read_cache_info(&file, &file_path, &metadata);
+    let cache_info = CacheInfo::read(&file, &file_path, &metadata);
 
     // Range handling uses the total upstream size (not the current partial size on disk).
     let (http_status, content_start, content_length, content_range, partial) =
