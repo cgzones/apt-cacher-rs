@@ -50,10 +50,12 @@ use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;
+use crate::sendfile_conn::RangeRequestHeaders;
 use crate::sendfile_conn::{
-    RangeRequestHeaders, SendfileResult, async_sendfile, serve_file_via_sendfile,
+    SendfileResult, async_sendfile, async_sendfile_unfinished, serve_file_via_sendfile,
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
+
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{self, TempPath, hint_sequential_read, tokio_tempfile, touch_volatile_mtime};
 use crate::{
@@ -2304,8 +2306,8 @@ async fn splice_proxy_body_tls(
 fn spawn_file_serve_task(
     client: &TcpStream,
     cache_path: &Path,
-    client_bytes_sent: u64,
-    total_content_length: u64,
+    offset: u64,
+    file_size: u64,
     dbarrier: &DownloadBarrier,
 ) -> std::io::Result<DemotedClientHandle> {
     // Duplicate the client socket so the spawned task owns its own fd.
@@ -2321,39 +2323,35 @@ fn spawn_file_serve_task(
     let status = Arc::clone(dbarrier.status());
     let cache_path = cache_path.to_path_buf();
 
-    warn_once_or_info!(
-        "splice proxy: demoting slow client to file-serve at offset {}",
-        client_bytes_sent
-    );
+    warn_once_or_info!("splice proxy: demoting slow client to file-serve at offset {offset}");
 
     Ok(tokio::task::spawn(serve_remaining_from_file(
         client_stream,
         cache_path,
-        client_bytes_sent,
-        total_content_length,
+        offset,
+        file_size,
         receiver,
         status,
     )))
 }
 
-/// Serve remaining bytes of a download from the cache file to a demoted client.
+/// Serve remaining bytes of a download from the cache file to a demoted client
+/// via Linux `sendfile(2)`.
 ///
-/// This follows the same pattern as `serve_unfinished_file()` in `main.rs`:
-/// read from the cache file, wait for `dbarrier` notifications when at EOF,
-/// and stop when the download finishes or aborts.
+/// Delegates to [`async_sendfile_unfinished`], which handles the same
+/// growing-file / `watch::Receiver` / `ActiveDownloadStatus` interplay used by
+/// the sendfile late-joiner path.  The request was already counted as
+/// `REQUESTS_SPLICE` at proxy entry; only the bytes flow through
+/// `BYTES_SERVED_SENDFILE` (incremented inside `sendfile_chunk_loop`).
 async fn serve_remaining_from_file(
     client: TcpStream,
     cache_path: PathBuf,
     offset: u64,
-    content_length: u64,
-    mut receiver: tokio::sync::watch::Receiver<()>,
+    file_size: u64,
+    receiver: tokio::sync::watch::Receiver<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) {
-    use tokio::io::AsyncSeekExt as _;
-
-    let config = global_config();
-
-    let mut file = match tokio::fs::File::open(&cache_path).await {
+    let file = match tokio::fs::File::open(&cache_path).await {
         Ok(f) => f,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -2365,112 +2363,34 @@ async fn serve_remaining_from_file(
         }
     };
 
-    if let Err(err) = file.seek(std::io::SeekFrom::Start(offset)).await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to seek cache file `{}`:  {err}",
-            cache_path.display()
-        );
-        return;
-    }
-
-    // Demoted clients keep reading the partial cache file linearly through a
-    // BufReader, so warm the kernel readahead window before the loop starts.
+    // Demoted clients keep reading the partial cache file linearly via
+    // sendfile chunks, so warm the kernel readahead window before the loop
+    // starts.
     hint_sequential_read(&file, &cache_path);
 
-    let _counter = client_counter::ClientDownload::new();
-    // The request was already counted as REQUESTS_SPLICE at proxy entry;
-    // only the bytes split to BYTES_SERVED_COPY here.
     metrics::CLIENTS_DEMOTED.increment();
 
-    let mut bytes_sent = offset;
-    let mut finished = false;
-    let buf_size = config.buffer_size;
-    let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
-    let mut read_buf = BytesMut::with_capacity(buf_size);
-    let mut client_rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-
-    // TODO: use sendfile?
-
-    loop {
-        // Read all currently available data from cache file
-        loop {
-            read_buf.clear();
-            match reader.read_buf(&mut read_buf).await {
-                Ok(0) => break, // EOF — may need to wait for more data
-                Ok(n) => {
-                    bytes_sent += n as u64;
-                    if let Err(err) = write_all_to_stream_rated(
-                        &client,
-                        &read_buf[..n],
-                        &mut client_rate_checker,
-                        RateCheckDirection::Client,
-                        config.http_timeout,
-                    )
-                    .await
-                    {
-                        if err.kind() == ErrorKind::BrokenPipe
-                            || err.kind() == ErrorKind::ConnectionReset
-                        {
-                            metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                            debug!(
-                                "splice proxy: demoted client disconnected at offset {bytes_sent}"
-                            );
-                        } else {
-                            info!(
-                                "splice proxy: demoted client write error at offset {bytes_sent}:  {err}"
-                            );
-                        }
-                        return;
-                    }
-                    metrics::BYTES_SERVED_COPY.increment_by(n as u64);
-                }
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "splice proxy: failed to read cache file `{}`:  {}",
-                        cache_path.display(),
-                        ErrorReport(&err)
-                    );
-                    return;
-                }
+    let remaining = file_size.saturating_sub(offset);
+    match async_sendfile_unfinished(&client, &file, offset, remaining, receiver, status).await {
+        Ok(()) => {
+            debug!(
+                "splice proxy: demoted client file-serve complete, sent {remaining} bytes from offset {offset}"
+            );
+        }
+        Err(err) => {
+            if err.kind() == ErrorKind::BrokenPipe || err.kind() == ErrorKind::ConnectionReset {
+                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+                debug!(
+                    "splice proxy: demoted client disconnected during file-serve from offset {offset}:  {err}"
+                );
+            } else {
+                info!(
+                    "splice proxy: demoted client file-serve error from offset {offset}:  {}",
+                    ErrorReport(&err)
+                );
             }
         }
-
-        if finished || bytes_sent >= content_length {
-            break;
-        }
-
-        // Wait for notification that more data has been written to cache
-        if let Err(tokio::sync::watch::error::RecvError { .. }) = receiver.changed().await {
-            // Sender dropped — download finished or aborted
-            let st = status.read().await;
-            let _: Never = match *st {
-                ActiveDownloadStatus::Finished(_) => {
-                    drop(st);
-                    finished = true;
-                    continue; // Read remaining data
-                }
-                ActiveDownloadStatus::Aborted(_) => {
-                    drop(st);
-                    debug!("splice proxy: download aborted, stopping demoted client file-serve");
-                    return;
-                }
-                ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download(..) => {
-                    drop(st);
-                    error!(
-                        "splice proxy: unexpected download state for demoted client file-serve of `{}`",
-                        cache_path.display()
-                    );
-                    return;
-                }
-            };
-        }
     }
-
-    debug!("splice proxy: demoted client file-serve complete, sent {bytes_sent} bytes");
 }
 
 /// Status of the first (splice) client after a tee+splice iteration.
