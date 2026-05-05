@@ -1760,7 +1760,6 @@ async fn splice_proxy_body(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-    total_content_length: u64,
 ) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
@@ -1789,7 +1788,15 @@ async fn splice_proxy_body(
     let mut file_offset: i64 = file_start_offset;
     let mut client_status = ClientStatus::Active;
     let mut bytes_done: u64 = 0;
-    let mut client_bytes_sent: u64 = 0;
+    // Absolute cache-file offset of the next byte the client expects, and the
+    // count of bytes still owed to it. Maintained across both the
+    // `tee_and_splice` and boundary-chunk paths so that on demotion we can
+    // hand sendfile the exact resume point and length regardless of resume
+    // offset, body-prefix advance, or 206 range filtering.
+    let mut client_file_pos: u64 = u64::try_from(file_start_offset)
+        .expect("file_start_offset is non-negative by construction")
+        + range_filter.skip;
+    let mut client_remaining: u64 = range_filter.send;
     let mut demoted_handle: Option<DemotedClientHandle> = None;
     let client_skip = range_filter.skip;
     let client_range_end = range_filter.skip + range_filter.send;
@@ -1879,11 +1886,16 @@ async fn splice_proxy_body(
                 client_status,
                 &mut dbarrier,
                 &mut client_rate_checker,
-                &mut client_bytes_sent,
+                &mut client_file_pos,
+                &mut client_remaining,
             )
             .await?;
 
-            if let ClientStatus::Demoted { client_bytes_sent } = client_status {
+            if let ClientStatus::Demoted {
+                client_file_pos,
+                client_remaining,
+            } = client_status
+            {
                 // Hand accounting off to the spawned demoted-serve task — its
                 // `async_sendfile_unfinished` creates its own `ClientDownload`
                 // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
@@ -1891,8 +1903,8 @@ async fn splice_proxy_body(
                 demoted_handle = Some(spawn_file_serve_task(
                     client,
                     cache_path,
-                    client_bytes_sent,
-                    total_content_length,
+                    client_file_pos,
+                    client_remaining,
                     &dbarrier,
                 )?);
             }
@@ -1938,7 +1950,12 @@ async fn splice_proxy_body(
                 .await
                 {
                     Ok(()) => {
-                        metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
+                        let sent = client_slice.len() as u64;
+                        metrics::BYTES_SERVED_SPLICE.increment_by(sent);
+                        client_file_pos += sent;
+                        client_remaining = client_remaining
+                            .checked_sub(sent)
+                            .expect("client_remaining tracks bytes still owed to the client");
                     }
                     Err(err)
                         if err.kind() == ErrorKind::BrokenPipe
@@ -2082,7 +2099,6 @@ async fn splice_proxy_body_tls(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-    total_content_length: u64,
 ) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
@@ -2112,7 +2128,12 @@ async fn splice_proxy_body_tls(
     let mut read_buf = vec![0u8; TLS_READ_BUF_SIZE]; // TODO: avoid zero initialization
     let mut client_status = ClientStatus::Active;
     let mut bytes_done: u64 = 0;
-    let mut client_bytes_sent: u64 = 0;
+    // See `splice_proxy_body` for the rationale on tracking absolute client
+    // position and remaining bytes here.
+    let mut client_file_pos: u64 = u64::try_from(file_start_offset)
+        .expect("file_start_offset is non-negative by construction")
+        + range_filter.skip;
+    let mut client_remaining: u64 = range_filter.send;
     let mut demoted_handle: Option<DemotedClientHandle> = None;
     let client_skip = range_filter.skip;
     let client_range_end = range_filter.skip + range_filter.send;
@@ -2209,11 +2230,16 @@ async fn splice_proxy_body_tls(
                 client_status,
                 &mut dbarrier,
                 &mut client_rate_checker,
-                &mut client_bytes_sent,
+                &mut client_file_pos,
+                &mut client_remaining,
             )
             .await?;
 
-            if let ClientStatus::Demoted { client_bytes_sent } = client_status {
+            if let ClientStatus::Demoted {
+                client_file_pos,
+                client_remaining,
+            } = client_status
+            {
                 // Hand accounting off to the spawned demoted-serve task — its
                 // `async_sendfile_unfinished` creates its own `ClientDownload`
                 // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
@@ -2221,8 +2247,8 @@ async fn splice_proxy_body_tls(
                 demoted_handle = Some(spawn_file_serve_task(
                     client,
                     cache_path,
-                    client_bytes_sent,
-                    total_content_length,
+                    client_file_pos,
+                    client_remaining,
                     &dbarrier,
                 )?);
             }
@@ -2271,7 +2297,12 @@ async fn splice_proxy_body_tls(
                 .await
                 {
                     Ok(()) => {
-                        metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
+                        let sent = client_slice.len() as u64;
+                        metrics::BYTES_SERVED_SPLICE.increment_by(sent);
+                        client_file_pos += sent;
+                        client_remaining = client_remaining
+                            .checked_sub(sent)
+                            .expect("client_remaining tracks bytes still owed to the client");
                     }
                     Err(err)
                         if err.kind() == ErrorKind::BrokenPipe
@@ -2306,8 +2337,8 @@ async fn splice_proxy_body_tls(
 fn spawn_file_serve_task(
     client: &TcpStream,
     cache_path: &Path,
-    offset: u64,
-    file_size: u64,
+    content_start: u64,
+    content_length: u64,
     dbarrier: &DownloadBarrier,
 ) -> std::io::Result<DemotedClientHandle> {
     // Duplicate the client socket so the spawned task owns its own fd.
@@ -2323,13 +2354,15 @@ fn spawn_file_serve_task(
     let status = Arc::clone(dbarrier.status());
     let cache_path = cache_path.to_path_buf();
 
-    warn_once_or_info!("splice proxy: demoting slow client to file-serve at offset {offset}");
+    warn_once_or_info!(
+        "splice proxy: demoting slow client to file-serve at cache offset {content_start} ({content_length} bytes remaining)"
+    );
 
     Ok(tokio::task::spawn(serve_remaining_from_file(
         client_stream,
         cache_path,
-        offset,
-        file_size,
+        content_start,
+        content_length,
         receiver,
         status,
     )))
@@ -2346,8 +2379,8 @@ fn spawn_file_serve_task(
 async fn serve_remaining_from_file(
     client: TcpStream,
     cache_path: PathBuf,
-    offset: u64,
-    file_size: u64,
+    content_start: u64,
+    content_length: u64,
     receiver: tokio::sync::watch::Receiver<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) {
@@ -2370,22 +2403,30 @@ async fn serve_remaining_from_file(
 
     metrics::CLIENTS_DEMOTED.increment();
 
-    let remaining = file_size.saturating_sub(offset);
-    match async_sendfile_unfinished(&client, &file, offset, remaining, receiver, status).await {
+    match async_sendfile_unfinished(
+        &client,
+        &file,
+        content_start,
+        content_length,
+        receiver,
+        status,
+    )
+    .await
+    {
         Ok(()) => {
             debug!(
-                "splice proxy: demoted client file-serve complete, sent {remaining} bytes from offset {offset}"
+                "splice proxy: demoted client file-serve complete, sent {content_length} bytes from cache offset {content_start}"
             );
         }
         Err(err) => {
             if err.kind() == ErrorKind::BrokenPipe || err.kind() == ErrorKind::ConnectionReset {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 debug!(
-                    "splice proxy: demoted client disconnected during file-serve from offset {offset}:  {err}"
+                    "splice proxy: demoted client disconnected during file-serve from cache offset {content_start}:  {err}"
                 );
             } else {
                 info!(
-                    "splice proxy: demoted client file-serve error from offset {offset}:  {}",
+                    "splice proxy: demoted client file-serve error from cache offset {content_start}:  {}",
                     ErrorReport(&err)
                 );
             }
@@ -2401,8 +2442,15 @@ enum ClientStatus {
     Disconnected,
     /// Client send rate dropped below the minimum threshold.
     /// The caller should spawn a file-serve task to continue serving
-    /// the client from the cache file at the given byte offset.
-    Demoted { client_bytes_sent: u64 },
+    /// the client from the cache file starting at `client_file_pos`
+    /// for `client_remaining` bytes.
+    Demoted {
+        /// Absolute cache file offset of the next byte the client expects.
+        client_file_pos: u64,
+        /// Bytes still owed to the client (matches the response Content-Length
+        /// minus what was already written before/during the splice loop).
+        client_remaining: u64,
+    },
 }
 
 /// Shared tee+splice fan-out: consume `got` bytes from `pipe_A`, duplicate to `pipe_B`,
@@ -2425,7 +2473,8 @@ async fn tee_and_splice(
     client_status: ClientStatus,
     dbarrier: &mut DownloadBarrier,
     client_rate_checker: &mut Option<RateChecker>,
-    client_bytes_sent: &mut u64,
+    client_file_pos: &mut u64,
+    client_remaining: &mut u64,
 ) -> std::io::Result<ClientStatus> {
     let (cache_file, file_offset) = target;
     let mut status = client_status;
@@ -2484,14 +2533,17 @@ async fn tee_and_splice(
             // — they only run when the client is actually back-pressuring,
             // not on every busy iteration where pipe-readable would otherwise
             // win the `select!` race and cancel them mid-flight.
-            let mut client_remaining = teed;
-            while client_remaining > 0 {
+            // Tracks how many of the just-teed bytes are still sitting in
+            // `pipe_A` waiting to be spliced to the client. Distinct from the
+            // outer `client_remaining` parameter (response-level total).
+            let mut teed_remaining = teed;
+            while teed_remaining > 0 {
                 let result = splice(
                     upstream_pipe_rx,
                     None,
                     client,
                     None,
-                    client_remaining,
+                    teed_remaining,
                     SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
                 );
 
@@ -2501,12 +2553,15 @@ async fn tee_and_splice(
                         // by splicing them to /dev/null (discard)
                         info!("splice proxy: client disconnected, continuing cache-only");
                         status = ClientStatus::Disconnected;
-                        drain_pipe(upstream_pipe_rx, client_remaining).await?;
+                        drain_pipe(upstream_pipe_rx, teed_remaining).await?;
                         break;
                     }
                     Ok(n) => {
-                        client_remaining -= n;
-                        *client_bytes_sent += n as u64;
+                        teed_remaining -= n;
+                        *client_file_pos += n as u64;
+                        *client_remaining = client_remaining
+                            .checked_sub(n as u64)
+                            .expect("client_remaining tracks bytes still owed to the client");
                         metrics::BYTES_SERVED_SPLICE.increment_by(n as u64);
                         if let Some(rc) = client_rate_checker {
                             rc.add(n);
@@ -2516,14 +2571,15 @@ async fn tee_and_splice(
                                 info!(
                                     "splice proxy: client send rate too low, demoting to file-serve"
                                 );
-                                // `client_remaining` has already been decremented by `n` (the bytes
+                                // `teed_remaining` has already been decremented by `n` (the bytes
                                 // just sent to the client), so it is exactly the count of teed
                                 // bytes still sitting in pipe_A that need to be drained before
                                 // we can stop servicing the client.
-                                drain_pipe(upstream_pipe_rx, client_remaining).await?;
+                                drain_pipe(upstream_pipe_rx, teed_remaining).await?;
 
                                 status = ClientStatus::Demoted {
-                                    client_bytes_sent: *client_bytes_sent,
+                                    client_file_pos: *client_file_pos,
+                                    client_remaining: *client_remaining,
                                 };
                                 break;
                             }
@@ -4650,7 +4706,6 @@ async fn splice_proxy_drive(
                 dbarrier,
                 &range_filter,
                 &temppath,
-                total_content_length.get(),
             )
             .await
         } else {
@@ -4664,7 +4719,6 @@ async fn splice_proxy_drive(
                 dbarrier,
                 &range_filter,
                 &temppath,
-                total_content_length.get(),
             )
             .await
         }
