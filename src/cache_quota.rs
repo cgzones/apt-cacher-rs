@@ -174,17 +174,32 @@ pub(crate) struct QuotaReservation {
 impl QuotaReservation {
     /// Finalize the reservation after a successful download.
     ///
-    /// Adjusts `cache_size` by the difference between reserved (upper bound) and
-    /// actual bytes received. For `ContentLength::Exact`, this is a no-op (diff=0).
-    /// For `ContentLength::Unknown`, this reclaims the unused reservation.
+    /// Adjusts `cache_size` so the net change from `try_acquire` + `finalize`
+    /// equals `bytes_received - prev_file_size`. For `ContentLength::Exact`
+    /// with an honest upstream this is a no-op. For `ContentLength::Unknown`
+    /// (or an upstream that under-delivered), the unused reservation is
+    /// reclaimed. For an upstream that over-delivered (sent more bytes than
+    /// announced via `Content-Length`), the extra is added so `cache_quota`
+    /// tracks the actual on-disk size.
     pub(crate) fn finalize(mut self, bytes_received: u64) {
-        let size_diff = self.reserved.get().saturating_sub(bytes_received);
-        if size_diff != 0 {
-            trace!(
-                "Finalizing quota reservation: reserved={} received={bytes_received} diff={size_diff}",
-                self.reserved
-            );
-            self.quota.subtract(size_diff);
+        match self.reserved.get().cmp(&bytes_received) {
+            Ordering::Equal => {}
+            Ordering::Greater => {
+                let diff = self.reserved.get() - bytes_received;
+                trace!(
+                    "Finalizing quota reservation: reserved={} received={bytes_received} diff=-{diff}",
+                    self.reserved
+                );
+                self.quota.subtract(diff);
+            }
+            Ordering::Less => {
+                let diff = bytes_received - self.reserved.get();
+                trace!(
+                    "Finalizing quota reservation: reserved={} received={bytes_received} diff=+{diff}",
+                    self.reserved
+                );
+                self.quota.add(diff);
+            }
         }
         self.finalized = true;
     }
