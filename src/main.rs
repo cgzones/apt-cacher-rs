@@ -2198,7 +2198,7 @@ async fn serve_downloading_file(
                     &req,
                     file,
                     path_clone,
-                    EtagState::Unknown,
+                    upstream_etag,
                     None,
                 )
                 .await;
