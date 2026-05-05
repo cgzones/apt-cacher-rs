@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::fmt::Write as _;
 use std::time::{SystemTime, SystemTimeError};
 
 use time::format_description::FormatItem;
@@ -278,11 +279,10 @@ pub(crate) fn http_parse_range(
         "range {start}+{content_length} must not exceed file_size {file_size}"
     );
 
-    ParsedRange::Satisfiable(
-        format!("bytes {start}-{end}/{file_size}"),
-        start,
-        content_length,
-    )
+    let mut content_range = String::with_capacity(32);
+    write!(content_range, "bytes {start}-{end}/{file_size}")
+        .expect("writing to a String never fails");
+    ParsedRange::Satisfiable(content_range, start, content_length)
 }
 
 /// Parse an HTTP `Content-Range` response header value.
