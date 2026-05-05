@@ -16,23 +16,9 @@ impl Counter {
     }
 
     pub(crate) fn increment(&self) {
-        let mut current = self.0.load(Ordering::Relaxed);
-        loop {
-            let Some(next) = current.checked_add(1) else {
-                // counter is at max, avoid overflow
-                return;
-            };
-            match self
-                .0
-                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    // counter was successfully incremented
-                    return;
-                }
-                Err(val) => current = val,
-            }
-        }
+        // Wraparound on `u64::MAX` is acceptable: at one increment per
+        // nanosecond it would still take ~584 years to overflow.
+        self.0.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -77,23 +63,9 @@ impl Accumulator {
     }
 
     pub(crate) fn increment_by(&self, value: u64) {
-        let mut current = self.0.load(Ordering::Relaxed);
-        loop {
-            let Some(next) = current.checked_add(value) else {
-                // counter is at max, avoid overflow
-                return;
-            };
-            match self
-                .0
-                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    // counter was successfully incremented
-                    return;
-                }
-                Err(val) => current = val,
-            }
-        }
+        // Wraparound on `u64::MAX` is acceptable: at one byte per nanosecond
+        // it would still take ~584 years to overflow.
+        self.0.fetch_add(value, Ordering::Relaxed);
     }
 
     #[must_use]
