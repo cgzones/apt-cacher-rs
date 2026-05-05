@@ -1071,6 +1071,7 @@ async fn serve_cached_file(
     file: tokio::fs::File,
     file_path: PathBuf,
     file_etag: EtagState,
+    prefetched_metadata: Option<std::fs::Metadata>,
 ) -> Response<ProxyCacheBody> {
     fn decide_serve_304(
         req: &Request<Empty<()>>,
@@ -1112,16 +1113,19 @@ async fn serve_cached_file(
         None => String::new(),
     };
 
-    let metadata = match file.metadata().await {
-        Ok(m) => m,
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to get metadata of cached file `{}`:  {err}",
-                file_path.display()
-            );
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
-        }
+    let metadata = match prefetched_metadata {
+        Some(m) => m,
+        None => match file.metadata().await {
+            Ok(m) => m,
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to get metadata of cached file `{}`:  {err}",
+                    file_path.display()
+                );
+                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            }
+        },
     };
 
     let file_size = metadata.len();
@@ -1555,10 +1559,8 @@ async fn serve_volatile_file(
         "serve_volatile_file() assumes volatile flavor"
     );
 
-    let modified_system_time = match file.metadata().await {
-        Ok(data) => data
-            .modified()
-            .expect("Platform should support modification timestamps via setup check"),
+    let metadata = match file.metadata().await {
+        Ok(data) => data,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
@@ -1568,7 +1570,11 @@ async fn serve_volatile_file(
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
+    let modified_system_time = metadata
+        .modified()
+        .expect("Platform should support modification timestamps via setup check");
     let local_modification_time = HttpDate::from(modified_system_time);
+    let prev_size = metadata.size();
 
     // Cache volatile files for short periods to reduce up-to-date requests.
     // Compute age from the raw SystemTime — HttpDate rounds sub-second mtimes
@@ -1587,8 +1593,15 @@ async fn serve_volatile_file(
             #[cfg(not(feature = "sendfile"))]
             metrics::VOLATILE_HIT.increment();
 
-            return serve_cached_file(conn_details, &req, file, file_path, EtagState::Unknown)
-                .await;
+            return serve_cached_file(
+                conn_details,
+                &req,
+                file,
+                file_path,
+                EtagState::Unknown,
+                Some(metadata),
+            )
+            .await;
         }
     } else {
         warn!(
@@ -1624,6 +1637,7 @@ async fn serve_volatile_file(
                     file,
                     file_path,
                     local_modification_time,
+                    prev_size,
                 },
                 appstate,
             )
@@ -2179,8 +2193,15 @@ async fn serve_downloading_file(
                     }
                 };
 
-                return serve_cached_file(conn_details, &req, file, path_clone, EtagState::Unknown)
-                    .await;
+                return serve_cached_file(
+                    conn_details,
+                    &req,
+                    file,
+                    path_clone,
+                    EtagState::Unknown,
+                    None,
+                )
+                .await;
             }
             ActiveDownloadStatus::Download(path, content_length, receiver) => {
                 // Cannot use mmap(2) since the file is not yet completely written
@@ -2222,6 +2243,10 @@ enum CacheFileStat {
         file: tokio::fs::File,
         file_path: PathBuf,
         local_modification_time: HttpDate,
+        /// Existing on-disk size at the time `serve_volatile_file` opened the
+        /// file.  Plumbed through so `serve_new_file` does not have to fetch
+        /// the metadata a second time to size the quota reservation.
+        prev_size: u64,
     },
     New,
 }
@@ -2338,6 +2363,7 @@ async fn serve_new_file(
             file: _,
             file_path: _,
             local_modification_time,
+            prev_size: _,
         } = cfstate
         {
             let date_fmt = local_modification_time.format();
@@ -2394,23 +2420,11 @@ async fn serve_new_file(
 
     let (warn_on_override, prev_file_size) = match &cfstate {
         CacheFileStat::Volatile {
-            file,
-            file_path,
+            file: _,
+            file_path: _,
             local_modification_time: _,
-        } => {
-            let size = match file.metadata().await.map(|md| md.size()) {
-                Ok(s) => s,
-                Err(err) => {
-                    error!(
-                        "Failed to get file size of file `{}`:  {err}",
-                        file_path.display()
-                    );
-                    0
-                }
-            };
-
-            (false, size)
-        }
+            prev_size,
+        } => (false, *prev_size),
         CacheFileStat::New => (true, 0),
     };
 
@@ -2457,7 +2471,10 @@ async fn serve_new_file(
 
     let volatile_etag = match &cfstate {
         CacheFileStat::Volatile {
-            file, file_path, ..
+            file,
+            file_path,
+            local_modification_time: _,
+            prev_size: _,
         } => EtagState::from_option(read_etag(file, file_path)),
         CacheFileStat::New => EtagState::Unknown,
     };
@@ -2610,6 +2627,7 @@ async fn serve_new_file(
         mut file,
         file_path,
         local_modification_time: _,
+        prev_size: _,
     } = cfstate
     {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
@@ -2618,7 +2636,8 @@ async fn serve_new_file(
 
             ibarrier.finished(file_path.clone()).await;
 
-            return serve_cached_file(conn_details, &req, file, file_path, volatile_etag).await;
+            return serve_cached_file(conn_details, &req, file, file_path, volatile_etag, None)
+                .await;
         }
 
         metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
@@ -3181,8 +3200,15 @@ pub(crate) async fn process_cache_request(
                     serve_volatile_file(conn_details, req, file, cache_path, appstate).await
                 }
                 CachedFlavor::Permanent => {
-                    serve_cached_file(conn_details, &req, file, cache_path, EtagState::Unknown)
-                        .await
+                    serve_cached_file(
+                        conn_details,
+                        &req,
+                        file,
+                        cache_path,
+                        EtagState::Unknown,
+                        None,
+                    )
+                    .await
                 }
             }
         }
