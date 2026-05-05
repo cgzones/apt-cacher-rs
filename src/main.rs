@@ -187,6 +187,7 @@ use crate::task_cleanup::{
 use crate::task_setup::task_setup;
 use crate::uncacheables::record_uncacheable;
 use crate::utils::TempPath;
+use crate::utils::hint_sequential_read;
 use crate::utils::tokio_tempfile;
 use crate::utils::touch_volatile_mtime;
 use crate::web_interface::serve_web_interface;
@@ -1250,6 +1251,9 @@ async fn serve_cached_file(
             conn_details.debname, conn_details.mirror, aliased, conn_details.client
         );
 
+        // mmap path uses madvise(SEQUENTIAL) on the mapping itself, so no
+        // posix_fadvise is needed here.
+
         // TODO: use become: https://github.com/rust-lang/rust/issues/112788
         return serve_cached_file_mmap(
             conn_details,
@@ -1266,6 +1270,10 @@ async fn serve_cached_file(
         )
         .await;
     }
+
+    // Buf path streams the file straight through; let the kernel grow its
+    // readahead window accordingly.
+    hint_sequential_read(&file, &file_path);
 
     info!(
         "Serving cached file {} from mirror {}{} for client {} via stream...",
@@ -1986,6 +1994,10 @@ async fn serve_unfinished_file(
         let mut finished = false;
         let mut bytes = 0;
         let buf_size = config.buffer_size;
+
+        // Late-joiner reads of an in-progress download are still sequential —
+        // hint readahead before the streaming loop starts.
+        hint_sequential_read(&file, &file_path);
 
         let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
 
