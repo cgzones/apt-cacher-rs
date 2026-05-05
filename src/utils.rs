@@ -241,7 +241,8 @@ pub(crate) async fn open_partial_file(
     }
 
     let mirror = ibarrier.mirror();
-    let mirror_dir = deb_mirror::mirror_cache_path_impl(&mirror.host, mirror.port, &mirror.path);
+    let mirror_dir =
+        deb_mirror::mirror_cache_path_impl(mirror.host(), mirror.port(), mirror.path());
     let filename = format!("{debname}.partial", debname = ibarrier.debname());
     let filename = Path::new(&filename);
     assert!(

@@ -2,27 +2,94 @@ use std::{
     borrow::Cow,
     num::NonZero,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use crate::{config::DomainName, database};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct Mirror {
-    pub(crate) host: DomainName,
-    pub(crate) port: Option<NonZero<u16>>,
-    pub(crate) path: String,
+    host: DomainName,
+    port: Option<NonZero<u16>>,
+    path: String,
+    /// Lazily-populated cache of `host.format_authority(port)` when the result
+    /// is owned (i.e. requires allocation: an IPv6 host or a non-empty port).
+    /// Skipped from `Hash`/`Eq`/`Clone` impls because it is purely derived
+    /// from `host` + `port`.
+    cached_authority: OnceLock<Box<str>>,
+}
+
+impl Mirror {
+    #[must_use]
+    pub(crate) const fn new(host: DomainName, port: Option<NonZero<u16>>, path: String) -> Self {
+        Self {
+            host,
+            port,
+            path,
+            cached_authority: OnceLock::new(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn format_authority(&self) -> Cow<'_, str> {
+        // Fast path: no allocation needed for DNS/IPv4 hosts without a port.
+        if self.port.is_none() && !self.host.is_ipv6() {
+            return Cow::Borrowed(self.host.as_str());
+        }
+        Cow::Borrowed(self.cached_authority.get_or_init(|| {
+            self.host
+                .format_authority(self.port)
+                .into_owned()
+                .into_boxed_str()
+        }))
+    }
+
+    #[must_use]
+    pub(crate) const fn host(&self) -> &DomainName {
+        &self.host
+    }
+
+    #[must_use]
+    pub(crate) const fn port(&self) -> Option<NonZero<u16>> {
+        self.port
+    }
+
+    #[must_use]
+    pub(crate) const fn path(&self) -> &str {
+        self.path.as_str()
+    }
+}
+
+impl PartialEq for Mirror {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host && self.port == other.port && self.path == other.path
+    }
+}
+
+impl Clone for Mirror {
+    fn clone(&self) -> Self {
+        Self {
+            host: self.host.clone(),
+            port: self.port,
+            path: self.path.clone(),
+            cached_authority: OnceLock::new(),
+        }
+    }
+}
+
+impl Eq for Mirror {}
+
+impl std::hash::Hash for Mirror {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.host.hash(state);
+        self.port.hash(state);
+        self.path.hash(state);
+    }
 }
 
 impl std::fmt::Display for Mirror {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.format_authority(), self.path)
-    }
-}
-
-impl Mirror {
-    #[must_use]
-    pub(crate) fn format_authority(&self) -> Cow<'_, str> {
-        self.host.format_authority(self.port)
     }
 }
 
@@ -87,11 +154,7 @@ impl Origin {
         }
 
         Some(Self {
-            mirror: Mirror {
-                host,
-                port,
-                path: mirror_path.to_owned(),
-            },
+            mirror: Mirror::new(host, port, mirror_path.to_owned()),
             distribution: distribution.to_owned(),
             component: component.to_owned(),
             architecture: architecture.to_owned(),
@@ -498,11 +561,11 @@ mod tests {
         assert_eq!(
             result,
             Origin {
-                mirror: Mirror {
-                    host: DomainName::new("deb.debian.org".to_string()).unwrap(),
-                    port: None,
-                    path: "debian".to_string(),
-                },
+                mirror: Mirror::new(
+                    DomainName::new("deb.debian.org".to_string()).unwrap(),
+                    None,
+                    "debian".to_string(),
+                ),
                 distribution: "sid".to_string(),
                 component: "main".to_string(),
                 architecture: "binary-amd64".to_string()
@@ -526,11 +589,11 @@ mod tests {
         assert_eq!(
             result,
             Origin {
-                mirror: Mirror {
-                    host: DomainName::new("site.example.com".to_string()).unwrap(),
-                    port: Some(nonzero!(80)),
-                    path: "private/debian".to_string(),
-                },
+                mirror: Mirror::new(
+                    DomainName::new("site.example.com".to_string()).unwrap(),
+                    Some(nonzero!(80)),
+                    "private/debian".to_string(),
+                ),
                 distribution: "sid".to_string(),
                 component: "main".to_string(),
                 architecture: "binary-amd64".to_string()
@@ -553,11 +616,11 @@ mod tests {
         assert_eq!(
             result,
             Origin {
-                mirror: Mirror {
-                    host: DomainName::new("apt.llvm.org".to_string()).unwrap(),
-                    port: Some(nonzero!(443)),
-                    path: "unstable".to_string(),
-                },
+                mirror: Mirror::new(
+                    DomainName::new("apt.llvm.org".to_string()).unwrap(),
+                    Some(nonzero!(443)),
+                    "unstable".to_string(),
+                ),
                 distribution: "llvm-toolchain-19".to_string(),
                 component: "main".to_string(),
                 architecture: "binary-amd64".to_string()
@@ -580,11 +643,11 @@ mod tests {
         assert_eq!(
             result,
             Origin {
-                mirror: Mirror {
-                    host: DomainName::new("2001:db8::1".to_string()).unwrap(),
-                    port: None,
-                    path: "debian".to_string(),
-                },
+                mirror: Mirror::new(
+                    DomainName::new("2001:db8::1".to_string()).unwrap(),
+                    None,
+                    "debian".to_string(),
+                ),
                 distribution: "sid".to_string(),
                 component: "main".to_string(),
                 architecture: "binary-amd64".to_string()

@@ -215,6 +215,18 @@ impl std::fmt::Display for DomainName {
     }
 }
 
+impl PartialEq<str> for DomainName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<DomainName> for str {
+    fn eq(&self, other: &DomainName) -> bool {
+        self == other.as_str()
+    }
+}
+
 impl<'de> Deserialize<'de> for DomainName {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

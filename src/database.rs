@@ -15,6 +15,7 @@ use sqlx::{
 
 use crate::{
     config::{DomainName, is_valid_domain},
+    deb_mirror,
     deb_mirror::{Mirror, OriginRef, mirror_cache_path_impl},
 };
 
@@ -45,6 +46,13 @@ impl MirrorEntry {
     #[must_use]
     pub(crate) fn cache_path(&self) -> PathBuf {
         mirror_cache_path_impl(&self.host, self.port(), &self.path)
+    }
+}
+
+impl std::convert::From<MirrorEntry> for deb_mirror::Mirror {
+    fn from(entry: MirrorEntry) -> Self {
+        let port = entry.port();
+        Self::new(entry.host, port, entry.path)
     }
 }
 
@@ -161,7 +169,9 @@ pub(crate) struct TopPackageEntry {
 /// Upsert a mirror row and return its `id` in a single round trip via the
 /// `RETURNING` clause.
 async fn upsert_mirror_get_id(tx: &mut SqliteConnection, mirror: &Mirror) -> Result<i64, Error> {
-    let port = mirror.port.map_or(0, std::num::NonZero::get);
+    let host = mirror.host();
+    let port = mirror.port().map_or(0, std::num::NonZero::get);
+    let path = mirror.path();
     let row = query!(
         r"
             INSERT INTO mirrors_v2
@@ -172,9 +182,9 @@ async fn upsert_mirror_get_id(tx: &mut SqliteConnection, mirror: &Mirror) -> Res
             DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP)
             RETURNING id;
         ",
-        mirror.host,
+        host,
         port,
-        mirror.path,
+        path,
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -409,7 +419,9 @@ impl Database {
     }
 
     pub(crate) async fn mirror_cleanup(&self, mirror: &Mirror) -> Result<(), Error> {
-        let port = mirror.port.map_or(0, std::num::NonZero::get);
+        let host = mirror.host();
+        let port = mirror.port().map_or(0, std::num::NonZero::get);
+        let path = mirror.path();
 
         query!(
             r"
@@ -417,9 +429,9 @@ impl Database {
                 SET last_cleanup = unixepoch(CURRENT_TIMESTAMP)
                 WHERE host = ? AND port = ? AND path = ?;
         ",
-            mirror.host,
+            host,
             port,
-            mirror.path
+            path
         )
         .execute(&self.conn)
         .await?;
