@@ -6,7 +6,9 @@ use std::{
 use log::{debug, error};
 use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 
-use crate::{Never, deb_mirror, global_config, guards::InitBarrier, http_range::HttpDate};
+use crate::{
+    Never, deb_mirror, global_config, guards::InitBarrier, http_range::HttpDate, warn_once_or_debug,
+};
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
 #[macro_export]
@@ -343,4 +345,22 @@ pub(crate) async fn touch_volatile_mtime(
         );
     }
     tokio::fs::File::from_std(std_file)
+}
+
+/// Hint to the kernel that `file` will be read sequentially from start to end,
+/// so the page-cache readahead window can grow more aggressively.  Used on
+/// every cache file we are about to stream to a client through the
+/// hyper/sendfile paths.  Failure is non-fatal — the first failure is logged
+/// at warn level (subsequent ones at debug) and we fall back to the kernel's
+/// default readahead policy.
+pub(crate) fn hint_sequential_read(file: &tokio::fs::File, display_path: &Path) {
+    use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+
+    // Avoid using `tokio::task::block_in_place`, since no real I/O is involved
+    if let Err(errno) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
+        warn_once_or_debug!(
+            "posix_fadvise(SEQUENTIAL) failed for `{}`:  {errno}",
+            display_path.display()
+        );
+    }
 }

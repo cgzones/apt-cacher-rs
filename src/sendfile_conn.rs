@@ -34,6 +34,7 @@ use crate::http_range::{
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::tcp_cork_guard::CorkGuard;
+use crate::utils::hint_sequential_read;
 use crate::{
     APP_NAME, ActiveDownloadStatus, AppState, CachedFlavor, ClientInfo, ConnectionDetails,
     ContentLength, Never, VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter,
@@ -1288,6 +1289,10 @@ pub(crate) async fn serve_file_via_sendfile(
         conn_details.debname, conn_details.mirror, conn_details.client,
     );
 
+    // sendfile streams the file linearly through the kernel, so help the
+    // page-cache readahead window grow before the splice loop starts.
+    hint_sequential_read(&file, file_path);
+
     // Cork the socket to coalesce headers + body into fewer TCP segments
     let _cork = CorkGuard::new_optional(stream);
 
@@ -1979,6 +1984,10 @@ async fn serve_unfinished_sendfile(
         "Serving downloading file {} from mirror {}{aliased} for joining client {} via sendfile...",
         conn_details.debname, conn_details.mirror, conn_details.client
     );
+
+    // Joining clients also stream the partial cache file linearly via splice
+    // chunks, so warm the kernel readahead window before the loop starts.
+    hint_sequential_read(&file, &file_path);
 
     let _cork = CorkGuard::new_optional(stream);
 

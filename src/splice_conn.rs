@@ -55,7 +55,7 @@ use crate::sendfile_conn::{
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
 use crate::tcp_cork_guard::CorkGuard;
-use crate::utils::{self, TempPath, tokio_tempfile, touch_volatile_mtime};
+use crate::utils::{self, TempPath, hint_sequential_read, tokio_tempfile, touch_volatile_mtime};
 use crate::{
     APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, CachedFlavor, ConnectionDetails,
     ContentLength, Never, OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
@@ -2355,6 +2355,10 @@ async fn serve_remaining_from_file(
         );
         return;
     }
+
+    // Demoted clients keep reading the partial cache file linearly through a
+    // BufReader, so warm the kernel readahead window before the loop starts.
+    hint_sequential_read(&file, &cache_path);
 
     let _counter = client_counter::ClientDownload::new();
     // The request was already counted as REQUESTS_SPLICE at proxy entry;
