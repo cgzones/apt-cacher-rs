@@ -101,26 +101,29 @@ impl CacheQuota {
     }
 
     /// Atomically subtract `removed` bytes and reconcile against the actual
-    /// on-disk cache size. Returns the (corrected) cache size and the
-    /// discrepancy that was repaired (0 if none).
+    /// on-disk cache size. Returns the in-memory size after the subtract (i.e.
+    /// the value that would stand if no reconciliation were needed), the
+    /// (corrected) cache size, and the discrepancy that was repaired (0 if
+    /// none).
     pub(crate) fn subtract_and_reconcile(
         &self,
         removed: u64,
         actual_cache_size: u64,
         active_downloading_size: u64,
-    ) -> (u64, u64) {
+    ) -> (u64, u64, u64) {
         let mut mg = self.cache_size.lock();
         *mg = mg.saturating_sub(removed);
+        let stored = *mg;
 
         let expected = actual_cache_size + active_downloading_size;
-        let difference = (*mg).abs_diff(expected);
+        let difference = stored.abs_diff(expected);
         if difference != 0 {
             *mg = expected;
             metrics::RECONCILE_EVENTS.increment();
             metrics::RECONCILE_BYTES_REPAIRED.increment_by(difference);
         }
         drop(mg);
-        (expected, difference)
+        (stored, expected, difference)
     }
 
     pub(crate) fn add(&self, amount: u64) {
