@@ -1641,7 +1641,11 @@ pub(crate) async fn async_sendfile(
 /// amount of new data on disk.
 ///
 /// `content_start` / `content_length` may describe a sub-range (HTTP Range).
-async fn async_sendfile_unfinished(
+///
+/// The caller is responsible for bumping the appropriate request-count metric
+/// (`REQUESTS_SENDFILE` for the sendfile late-joiner path, no bump for the
+/// splice demoted-client path which already counted as `REQUESTS_SPLICE`).
+pub(crate) async fn async_sendfile_unfinished(
     socket: &TcpStream,
     file: &tokio::fs::File,
     content_start: u64,
@@ -1666,8 +1670,6 @@ async fn async_sendfile_unfinished(
 
     let mut remaining = content_length;
     let mut finished = false;
-
-    metrics::REQUESTS_SENDFILE.increment();
 
     while remaining > 0 {
         // Determine how many bytes the file currently has available past our offset.
@@ -1966,6 +1968,8 @@ async fn serve_unfinished_sendfile(
     }
 
     let start = Instant::now();
+
+    metrics::REQUESTS_SENDFILE.increment();
 
     let transfer_result = async_sendfile_unfinished(
         stream,
