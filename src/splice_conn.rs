@@ -620,6 +620,18 @@ async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
             format!("TCP connect to upstream failed:  {err}"),
         )
     })
+    .inspect(|tcp| {
+        // Disable Nagle on upstream connections.  Mirror requests are mostly
+        // small headers followed by a long body, so up to a 40 ms ACK delay
+        // between segments is dead time we can avoid.
+        if global_config().upstream_tcp_nodelay
+            && let Err(err) = tcp.set_nodelay(true)
+        {
+            warn_once_or_debug!(
+                "Failed to set TCP_NODELAY on upstream connection to {host}:{port}:  {err}"
+            );
+        }
+    })
 }
 
 /// Perform TLS handshake over an established TCP connection.

@@ -3169,6 +3169,15 @@ async fn tunnel(
             ));
         }
     };
+    // Disable Nagle on the tunnel: TLS handshake records and HTTP request
+    // headers are interactive, and a tunnel cannot coalesce them on our behalf.
+    if config.upstream_tcp_nodelay
+        && let Err(err) = server.set_nodelay(true)
+    {
+        warn_once_or_debug!(
+            "Failed to set TCP_NODELAY on upstream tunnel to {host}:{port}:  {err}"
+        );
+    }
     let mut upgraded = TokioIo::new(upgraded);
 
     /* Proxying data */
@@ -4778,8 +4787,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?;
 
     let https_client = {
+        // Disable Nagle on upstream connections.  Mirror requests are mostly
+        // small headers followed by a long body read, where TCP_NODELAY shaves
+        // up to a 40 ms ACK delay off every request.
+        let mut tcp_connector = HttpConnector::new();
+        tcp_connector.enforce_http(false);
+        tcp_connector.set_nodelay(global_config().upstream_tcp_nodelay);
+
         #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-        let https_connector = HttpsConnector::new();
+        let https_connector = HttpsConnector::new_with_connector(tcp_connector);
 
         #[cfg(feature = "tls_rustls")]
         let https_connector = {
@@ -4821,7 +4837,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .with_tls_config(tls_config)
                 .https_or_http()
                 .enable_http1()
-                .build()
+                .wrap_connector(tcp_connector)
         };
 
         let mut timeout_connector = hyper_timeout::TimeoutConnector::new(https_connector);

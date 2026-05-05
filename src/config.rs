@@ -43,6 +43,7 @@ const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
 const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
 const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
+const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
 const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
@@ -356,6 +357,7 @@ impl From<String> for LogDestination {
     }
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "configuration")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
@@ -500,6 +502,13 @@ pub(crate) struct Config {
     /// Threshold (in bytes) for using memory-mapped files for large downloads.
     #[serde(default = "default_mmap_threshold")]
     pub(crate) mmap_threshold: NonZero<u64>,
+
+    /// Whether to set `TCP_NODELAY` on upstream sockets (hyper, splice, and
+    /// CONNECT tunnels).  Mirror requests are typically a small header
+    /// followed by a long body read; disabling Nagle's algorithm avoids the
+    /// 40 ms ACK delay the kernel can otherwise add to every request.
+    #[serde(default = "default_upstream_tcp_nodelay")]
+    pub(crate) upstream_tcp_nodelay: bool,
 
     /// Whether to reject differential (pdiff) resource requests with 410 Gone.
     /// When disabled, diff requests are proxied to the upstream mirror but not cached
@@ -783,6 +792,10 @@ const fn default_mmap_threshold() -> NonZero<u64> {
     DEFAULT_MMAP_THRESHOLD
 }
 
+const fn default_upstream_tcp_nodelay() -> bool {
+    DEFAULT_UPSTREAM_TCP_NODELAY
+}
+
 const fn default_experimental_parallel_hack_enabled() -> bool {
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED
 }
@@ -967,6 +980,7 @@ impl Config {
             max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
             db_channel_capacity: DEFAULT_DB_CHANNEL_CAPACITY,
             mmap_threshold: DEFAULT_MMAP_THRESHOLD,
+            upstream_tcp_nodelay: DEFAULT_UPSTREAM_TCP_NODELAY,
             reject_pdiff_requests: DEFAULT_REJECT_PDIFF_REQUESTS,
             experimental_parallel_hack_enabled: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED,
             experimental_parallel_hack_maxparallel: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL,
