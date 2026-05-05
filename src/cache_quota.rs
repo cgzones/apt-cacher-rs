@@ -68,7 +68,7 @@ impl CacheQuota {
         *mg = new_size;
         drop(mg);
 
-        self.sample_utilization_peak();
+        self.sample_utilization_peak_with(new_size);
 
         Ok(QuotaReservation {
             quota: self.clone(),
@@ -87,11 +87,13 @@ impl CacheQuota {
     /// Update `CACHE_QUOTA_UTIL_PEAK_BPS` with the current utilization
     /// (in basis points: hundredths of a percent). No-op when no quota is
     /// configured, since utilization is not well defined.
-    pub(crate) fn sample_utilization_peak(&self) {
+    ///
+    /// `current` is taken as a parameter so callers that already hold (or
+    /// just released) the `cache_size` lock do not have to re-acquire it.
+    pub(crate) fn sample_utilization_peak_with(&self, current: u64) {
         let Some(quota) = self.quota_config else {
             return;
         };
-        let current = self.current_size();
         // bps = current * 10000 / quota, computed in u128 to avoid overflow.
         // Clamp to 10_000 (= 100.00 %) so over-quota states do not produce a
         // misleading sentinel; `quota` is NonZero so no div-by-zero.
@@ -135,8 +137,9 @@ impl CacheQuota {
             error!("Cache size corruption: add: current={} added={amount}", *mg);
             *mg = u64::MAX;
         }
+        let new_size = *mg;
         drop(mg);
-        self.sample_utilization_peak();
+        self.sample_utilization_peak_with(new_size);
     }
 
     pub(crate) fn subtract(&self, amount: u64) {

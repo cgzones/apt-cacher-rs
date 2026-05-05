@@ -1059,8 +1059,8 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     };
 
     // Sample utilization so the peak metric reflects long idle stretches.
-    global_cache_quota().sample_utilization_peak();
     let cache_size = global_cache_quota().current_size();
+    global_cache_quota().sample_utilization_peak_with(cache_size);
 
     let next_cleanup_epoch = next_cleanup_epoch();
 
