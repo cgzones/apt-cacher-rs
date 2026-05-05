@@ -4268,9 +4268,31 @@ async fn splice_proxy_drive(
         "path construction must not contain absolute components"
     );
 
+    let prev_file_size = match conn_details.cached_flavor {
+        CachedFlavor::Volatile => {
+            let prev_path = dest_dir.join(filename);
+            match tokio::fs::metadata(&prev_path).await {
+                Ok(m) => m.len(),
+                Err(err) if err.kind() == ErrorKind::NotFound => 0,
+                Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "splice proxy: failed to stat existing volatile file `{}`:  {err}",
+                        prev_path.display()
+                    );
+                    return Err(SpliceProxyError::CacheError);
+                }
+            }
+        }
+        CachedFlavor::Permanent => {
+            // permanent files are never overridden
+            0
+        }
+    };
+
     let reservation = match global_cache_quota().try_acquire(
         ContentLength::Exact(total_content_length),
-        0, // splice only handles cache misses
+        prev_file_size,
         &conn_details.debname,
     ) {
         Ok(r) => Some(r),
@@ -5097,10 +5119,29 @@ async fn handle_volatile_buffered_download(
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
 
+    let prev_file_size = {
+        let prev_path = conn_details
+            .cache_dir_path()
+            .join(Path::new(&conn_details.debname));
+
+        match tokio::fs::metadata(&prev_path).await {
+            Ok(m) => m.len(),
+            Err(err) if err.kind() == ErrorKind::NotFound => 0,
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "splice proxy: failed to stat existing volatile file `{}`:  {err}",
+                    prev_path.display()
+                );
+                return Err(SpliceProxyError::CacheError);
+            }
+        }
+    };
+
     // Acquire cache quota with exact known size.
     let reservation = match global_cache_quota().try_acquire(
         ContentLength::Exact(total_content_length),
-        0,
+        prev_file_size,
         &conn_details.debname,
     ) {
         Ok(r) => Some(r),
