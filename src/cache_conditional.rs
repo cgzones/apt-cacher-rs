@@ -68,7 +68,7 @@ impl CacheInfo {
     /// Apply RFC 9110 §13.1.2 precedence: `If-None-Match` evaluated against the
     /// stored `ETag` wins; otherwise fall back to `If-Modified-Since` against the
     /// stored `Last-Modified`. Header values come pre-decoded as strings;
-    /// unparseable values are treated as absent.
+    /// unparsable values are treated as absent.
     #[must_use]
     pub(crate) fn decide_serve_304(
         &self,
