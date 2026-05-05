@@ -1738,17 +1738,20 @@ fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<Ups
     })
 }
 
+enum DeliveryResult {
+    Success,
+    Failure,
+}
+
 /// Splice data from upstream TCP socket to client socket, with zero-copy tee to a cache file.
 ///
 /// Data flow (all in kernel space, zero userspace copies):
 ///   upstream → splice → `pipe_A` → tee → `pipe_B` → splice → `cache_file`
 ///                                  ↓
 ///                            splice → client
-/// Return type for `splice_proxy_body` / `splice_proxy_body_tls` when a client
-/// was demoted to file-serve.  The caller must `.await` the join handle
-/// after the download barrier has been consumed (so the spawned task can
-/// observe `ActiveDownloadStatus::Finished`).
-type DemotedClientHandle = tokio::task::JoinHandle<()>;
+/// The caller must `.await` the join handle after the download barrier has been
+/// consumed (so the spawned task can observe `ActiveDownloadStatus::Finished`).
+type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
 
 #[expect(clippy::too_many_arguments, reason = "called from a single site")]
 async fn splice_proxy_body(
@@ -1760,7 +1763,7 @@ async fn splice_proxy_body(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
+) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool)> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
     // accounting cleanly — see the `ClientStatus::Demoted` branch below.
@@ -1981,7 +1984,8 @@ async fn splice_proxy_body(
             .expect("splice should not return more than requested");
     }
 
-    Ok((dbarrier, demoted_handle))
+    let client_disconnected = matches!(client_status, ClientStatus::Disconnected);
+    Ok((dbarrier, demoted_handle, client_disconnected))
 }
 
 /// Writes the entire buffer to the cache file via pwrite at the specified offset.
@@ -2099,7 +2103,7 @@ async fn splice_proxy_body_tls(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
+) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool)> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
     // accounting cleanly — see the `ClientStatus::Demoted` branch below.
@@ -2328,7 +2332,8 @@ async fn splice_proxy_body_tls(
             .expect("read(2) should not return more than requested");
     }
 
-    Ok((dbarrier, demoted_handle))
+    let client_disconnected = matches!(client_status, ClientStatus::Disconnected);
+    Ok((dbarrier, demoted_handle, client_disconnected))
 }
 
 /// Duplicate the client socket fd and spawn a task that serves remaining bytes
@@ -2383,7 +2388,7 @@ async fn serve_remaining_from_file(
     content_length: u64,
     receiver: tokio::sync::watch::Receiver<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-) {
+) -> DeliveryResult {
     let file = match tokio::fs::File::open(&cache_path).await {
         Ok(f) => f,
         Err(err) => {
@@ -2392,7 +2397,7 @@ async fn serve_remaining_from_file(
                 "splice proxy: failed to open cache file `{}` for demoted client:  {err}",
                 cache_path.display()
             );
-            return;
+            return DeliveryResult::Failure;
         }
     };
 
@@ -2417,6 +2422,7 @@ async fn serve_remaining_from_file(
             debug!(
                 "splice proxy: demoted client file-serve complete, sent {content_length} bytes from cache offset {content_start}"
             );
+            DeliveryResult::Success
         }
         Err(err) => {
             if err.kind() == ErrorKind::BrokenPipe || err.kind() == ErrorKind::ConnectionReset {
@@ -2430,6 +2436,8 @@ async fn serve_remaining_from_file(
                     ErrorReport(&err)
                 );
             }
+
+            DeliveryResult::Failure
         }
     }
 }
@@ -4563,8 +4571,32 @@ async fn splice_proxy_drive(
     )]
     let mut pre_loop_file_pos: u64 = resume_offset;
 
+    // Latches if a pre-loop client write fails.  We swallow the error to
+    // keep caching the buffered prefix/extra-body, but if the splice loop
+    // never runs (entire body is in the prefix; `splice_count == 0`) we
+    // need to close the connection at the end so the handler does not
+    // keep-alive a socket whose write side just broke and so we do not
+    // claim success after sending fewer bytes than `Content-Length`.
+    let mut prefix_client_failed = false;
+
     // If upstream sent body data in the same read as headers, write it directly.
     if !body_prefix.is_empty() {
+        // Cache write first: the bytes are already in our hands, so the cache
+        // file is the source of truth that other clients read from.  Only
+        // after that do we attempt the client write — if the client has
+        // disconnected, we log and keep filling the cache; if the splice loop
+        // later observes the broken client connection, it will continue via
+        // its disconnect/cache-only handling instead of dropping these prefix
+        // bytes from the cache entirely.
+        tempfile.write_all(body_prefix).await.map_err(|err| {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
+                temppath.display()
+            );
+            SpliceProxyError::AfterHeaderError
+        })?;
+
         let client_slice = range_slice(
             body_prefix,
             pre_loop_file_pos,
@@ -4576,7 +4608,7 @@ async fn splice_proxy_drive(
             let mut prefix_rc = config
                 .min_download_rate
                 .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-            write_all_to_stream_rated(
+            if let Err(err) = write_all_to_stream_rated(
                 client_stream,
                 client_slice,
                 &mut prefix_rc,
@@ -4584,21 +4616,13 @@ async fn splice_proxy_drive(
                 config.http_timeout,
             )
             .await
-            .map_err(|err| {
-                info!("splice proxy: failed to write body prefix to client:  {err}");
-
-                SpliceProxyError::AfterHeaderError
-            })?;
+            {
+                info!(
+                    "splice proxy: failed to write body prefix to client (continuing cache-only):  {err}"
+                );
+                prefix_client_failed = true;
+            }
         }
-
-        tempfile.write_all(body_prefix).await.map_err(|err| {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
-                temppath.display()
-            );
-            SpliceProxyError::AfterHeaderError
-        })?;
 
         #[cfg(feature = "ktls")]
         {
@@ -4612,6 +4636,20 @@ async fn splice_proxy_drive(
     // Write any kTLS-drained buffered plaintext to client + cache
     #[cfg(feature = "ktls")]
     if !ktls_extra_body.is_empty() {
+        // Same ordering as the body_prefix branch above: persist to the cache
+        // first, then attempt the (potentially failing) client write.  When
+        // the upstream sends fast enough that the entire body lands inside
+        // the kTLS handshake drain, ktls_extra_body holds the full file —
+        // dropping it on a disconnected client would lose everything.
+        tempfile.write_all(&ktls_extra_body).await.map_err(|err| {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
+                temppath.display()
+            );
+            SpliceProxyError::AfterHeaderError
+        })?;
+
         let client_slice = range_slice(
             &ktls_extra_body,
             pre_loop_file_pos,
@@ -4623,7 +4661,7 @@ async fn splice_proxy_drive(
             let mut prefix_rc = config
                 .min_download_rate
                 .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-            write_all_to_stream_rated(
+            if let Err(err) = write_all_to_stream_rated(
                 client_stream,
                 client_slice,
                 &mut prefix_rc,
@@ -4631,21 +4669,13 @@ async fn splice_proxy_drive(
                 config.http_timeout,
             )
             .await
-            .map_err(|err| {
-                info!("splice proxy: failed to write kTLS extra body to client:  {err}");
-
-                SpliceProxyError::AfterHeaderError
-            })?;
+            {
+                info!(
+                    "splice proxy: failed to write kTLS extra body to client (continuing cache-only):  {err}"
+                );
+                prefix_client_failed = true;
+            }
         }
-
-        tempfile.write_all(&ktls_extra_body).await.map_err(|err| {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
-                temppath.display()
-            );
-            SpliceProxyError::AfterHeaderError
-        })?;
 
         #[expect(
             unused_assignments,
@@ -4663,7 +4693,7 @@ async fn splice_proxy_drive(
     drop(cork);
 
     // Transfer the remaining body
-    let demoted_handle = if splice_count > 0 {
+    let (demoted_handle, body_client_disconnected) = if splice_count > 0 {
         let body_offset: i64 = (resume_offset + body_content_length.get() - splice_count)
             .try_into()
             .expect("the body prefix + extra body is limited in size");
@@ -4695,44 +4725,45 @@ async fn splice_proxy_drive(
         // rename step; on a structured rate-timeout it's already consumed into
         // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
         // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
-        let (returned_dbarrier, demoted_handle) = if let Some(tcp_upstream) = upstream.as_tcp() {
-            // Zero-copy path for TCP (plain or kTLS)
-            splice_proxy_body(
-                tcp_upstream,
-                client_stream,
-                &tempfile,
-                splice_count,
-                body_offset,
-                dbarrier,
-                &range_filter,
-                &temppath,
-            )
-            .await
-        } else {
-            // TLS: userspace read, then tee+splice fan-out
-            splice_proxy_body_tls(
-                &mut upstream,
-                client_stream,
-                &tempfile,
-                splice_count,
-                body_offset,
-                dbarrier,
-                &range_filter,
-                &temppath,
-            )
-            .await
-        }
-        .map_err(|err| {
-            info!(
-                "splice proxy: body transfer failed for {} from mirror {}:  {err}",
-                conn_details.debname, conn_details.mirror
-            );
-            SpliceProxyError::AfterHeaderError
-        })?;
+        let (returned_dbarrier, demoted_handle, body_client_disconnected) =
+            if let Some(tcp_upstream) = upstream.as_tcp() {
+                // Zero-copy path for TCP (plain or kTLS)
+                splice_proxy_body(
+                    tcp_upstream,
+                    client_stream,
+                    &tempfile,
+                    splice_count,
+                    body_offset,
+                    dbarrier,
+                    &range_filter,
+                    &temppath,
+                )
+                .await
+            } else {
+                // TLS: userspace read, then tee+splice fan-out
+                splice_proxy_body_tls(
+                    &mut upstream,
+                    client_stream,
+                    &tempfile,
+                    splice_count,
+                    body_offset,
+                    dbarrier,
+                    &range_filter,
+                    &temppath,
+                )
+                .await
+            }
+            .map_err(|err| {
+                info!(
+                    "splice proxy: body transfer failed for {} from mirror {}:  {err}",
+                    conn_details.debname, conn_details.mirror
+                );
+                SpliceProxyError::AfterHeaderError
+            })?;
         dbarrier = returned_dbarrier;
-        demoted_handle
+        (demoted_handle, body_client_disconnected)
     } else {
-        None
+        (None, false)
     };
 
     // PoolGuard::drop returns the connection to pool if still poolable.
@@ -4776,38 +4807,12 @@ async fn splice_proxy_drive(
 
     let elapsed = start.elapsed();
 
-    info!(
-        "Splice proxy{tls_label}: served and cached {} from mirror {} for client {} in {} (size={}, rate={}{})",
-        conn_details.debname,
-        conn_details.mirror,
-        conn_details.client,
-        HumanFmt::Time(elapsed.into()),
-        HumanFmt::Size(total_content_length.get()),
-        HumanFmt::Rate(body_content_length.get(), elapsed),
-        if resume_offset > 0 {
-            format!(", resumed from {}", HumanFmt::Size(resume_offset))
-        } else {
-            String::new()
-        }
-    );
-
     // Record download in database (mirrors download_file() in main.rs).
     let cmd = DatabaseCommand::Download(DbCmdDownload {
         mirror: conn_details.mirror.clone(),
         debname: conn_details.debname.clone(),
         size: total_content_length.get(),
         elapsed,
-        client_ip: conn_details.client.ip(),
-    });
-    send_db_command(cmd).await;
-
-    // Record delivery in database
-    let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
-        mirror: conn_details.mirror.clone(),
-        debname: conn_details.debname.clone(),
-        size: total_content_length.get(),
-        elapsed,
-        partial: is_partial,
         client_ip: conn_details.client.ip(),
     });
     send_db_command(cmd).await;
@@ -4830,14 +4835,64 @@ async fn splice_proxy_drive(
     // If the first client was demoted to file-serve, wait for the
     // background task to finish sending before returning control to the
     // connection handler (which may reuse the socket for keep-alive).
-    if let Some(handle) = demoted_handle
-        && let Err(err) = handle.await
-    {
-        error!(
-            "splice proxy: demoted client file-serve task panicked:  {}",
-            ErrorReport(&err)
+    // No demotion means the splice loop served the client itself (or there
+    // was no body to splice) — that's a success, not a failure.
+    let demoted_client_succeeded = if let Some(handle) = demoted_handle {
+        match handle.await {
+            Ok(DeliveryResult::Success) => true,
+            Ok(DeliveryResult::Failure) => false,
+            Err(err) => {
+                error!(
+                    "splice proxy: demoted client file-serve task panicked:  {}",
+                    ErrorReport(&err)
+                );
+                false
+            }
+        }
+    } else {
+        true
+    };
+
+    let client_succeeded =
+        !prefix_client_failed && !body_client_disconnected && demoted_client_succeeded;
+
+    info!(
+        "Splice proxy{tls_label}: {} {} from mirror {} for client {} in {} (size={}, rate={}{})",
+        if client_succeeded {
+            "served and cached"
+        } else {
+            "cached"
+        },
+        conn_details.debname,
+        conn_details.mirror,
+        conn_details.client,
+        HumanFmt::Time(elapsed.into()),
+        HumanFmt::Size(total_content_length.get()),
+        HumanFmt::Rate(body_content_length.get(), elapsed),
+        if resume_offset > 0 {
+            format!(", resumed from {}", HumanFmt::Size(resume_offset))
+        } else {
+            String::new()
+        }
+    );
+
+    if !client_succeeded {
+        debug!(
+            "splice proxy: closing connection to client {}",
+            conn_details.client
         );
+        return Err(SpliceProxyError::AfterHeaderError);
     }
+
+    let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+        mirror: conn_details.mirror.clone(),
+        debname: conn_details.debname.clone(),
+        size: total_content_length.get(),
+        elapsed,
+        partial: is_partial,
+        client_ip: conn_details.client.ip(),
+    });
+    send_db_command(cmd).await;
 
     Ok(())
 }
