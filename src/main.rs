@@ -883,6 +883,52 @@ where
     }
 }
 
+/// Body wrapper that holds a [`client_counter::ClientDownload`] for the lifetime
+/// of the body so paths without their own counter (passthrough, upstream
+/// error-body relay) still register in `ACTIVE_CLIENT_DOWNLOADS`. Forwards
+/// `Body` methods unchanged.
+#[pin_project]
+struct ClientCountedBody<B: Body> {
+    #[pin]
+    inner: B,
+    _counter: client_counter::ClientDownload,
+}
+
+impl<B: Body> ClientCountedBody<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            _counter: client_counter::ClientDownload::new(),
+        }
+    }
+}
+
+impl<B> Body for ClientCountedBody<B>
+where
+    B: Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    #[inline]
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
 #[cfg(feature = "mmap")]
 const MMAP_FRAME_SIZE: usize = 2 * 1024 * 1024; // 2MiB
 
@@ -2808,8 +2854,10 @@ async fn serve_new_file(
 
             let (parts, body) = fwd_response.into_parts();
 
+            let counted = ClientCountedBody::new(body);
+
             let rated = MaybeRated::new(
-                body,
+                counted,
                 config.min_download_rate,
                 config.rate_check_timeframe,
                 RateCheckDirection::Client,
@@ -3872,7 +3920,7 @@ async fn pre_process_client_request(
             let (parts, body) = redirected_response.into_parts();
 
             metrics::REQUESTS_PASSTHROUGH.increment();
-            let counted = PassthroughBody { inner: body };
+            let counted = ClientCountedBody::new(PassthroughBody { inner: body });
 
             let rated = MaybeRated::new(
                 counted,
@@ -3902,7 +3950,7 @@ async fn pre_process_client_request(
     let (parts, body) = fwd_response.into_parts();
 
     metrics::REQUESTS_PASSTHROUGH.increment();
-    let counted = PassthroughBody { inner: body };
+    let counted = ClientCountedBody::new(PassthroughBody { inner: body });
 
     let rated = MaybeRated::new(
         counted,
