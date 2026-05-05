@@ -115,9 +115,33 @@ impl From<SystemTime> for HttpDate {
 }
 
 /// Format the current date and time as an HTTP date string.
+///
+/// Cached at 1-second granularity.
 #[must_use]
 pub(crate) fn format_http_date() -> String {
-    HttpDate::now().format()
+    static CACHE: std::sync::LazyLock<parking_lot::Mutex<(HttpDate, String)>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new((HttpDate(u64::MAX), String::new())));
+
+    let now = HttpDate::now();
+
+    {
+        let cached = CACHE.lock();
+        if cached.0 == now {
+            return cached.1.clone();
+        }
+    }
+
+    let formatted = now.format();
+
+    {
+        let mut cached = CACHE.lock();
+        if cached.0 != now {
+            cached.0 = now;
+            cached.1.clone_from(&formatted);
+        }
+    }
+
+    formatted
 }
 
 /// Maximum value for the HTTP `Age` header, per RFC 9111 §5.1.
