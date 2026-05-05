@@ -1760,7 +1760,12 @@ async fn splice_proxy_body(
     cache_path: &Path,
     total_content_length: u64,
 ) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
-    let _counter = client_counter::ClientDownload::new();
+    // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
+    // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
+    // accounting cleanly — see the `ClientStatus::Demoted` branch below.
+    // `Option` is required because the borrow checker can't prove the demotion
+    // branch fires at most once per call when it's nested in the loop below.
+    let mut counter = Some(client_counter::ClientDownload::new());
 
     // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
     metrics::REQUESTS_SPLICE.increment();
@@ -1877,6 +1882,10 @@ async fn splice_proxy_body(
             .await?;
 
             if let ClientStatus::Demoted { client_bytes_sent } = client_status {
+                // Hand accounting off to the spawned demoted-serve task — its
+                // `async_sendfile_unfinished` creates its own `ClientDownload`
+                // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
+                drop(counter.take());
                 demoted_handle = Some(spawn_file_serve_task(
                     client,
                     cache_path,
@@ -2073,7 +2082,12 @@ async fn splice_proxy_body_tls(
     cache_path: &Path,
     total_content_length: u64,
 ) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>)> {
-    let _counter = client_counter::ClientDownload::new();
+    // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
+    // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
+    // accounting cleanly — see the `ClientStatus::Demoted` branch below.
+    // `Option` is required because the borrow checker can't prove the demotion
+    // branch fires at most once per call when it's nested in the loop below.
+    let mut counter = Some(client_counter::ClientDownload::new());
 
     // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
     metrics::REQUESTS_SPLICE.increment();
@@ -2198,6 +2212,10 @@ async fn splice_proxy_body_tls(
             .await?;
 
             if let ClientStatus::Demoted { client_bytes_sent } = client_status {
+                // Hand accounting off to the spawned demoted-serve task — its
+                // `async_sendfile_unfinished` creates its own `ClientDownload`
+                // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
+                drop(counter.take());
                 demoted_handle = Some(spawn_file_serve_task(
                     client,
                     cache_path,
