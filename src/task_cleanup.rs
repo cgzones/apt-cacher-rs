@@ -335,16 +335,16 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         let active_downloading_size = appstate.active_downloads.download_size();
 
         let quota = global_cache_quota();
-        let (csize, difference) =
+        let (stored, csize, difference) =
             quota.subtract_and_reconcile(bytes_removed, actual_cache_size, active_downloading_size);
 
         if difference != 0 {
             warn!(
-                "Repaired cache size discrepancy of {difference}: actual={actual_cache_size} stored={csize} active={active_downloading_size}"
+                "Repaired cache size discrepancy of {difference}: actual={actual_cache_size} stored={stored} corrected={csize} active={active_downloading_size}"
             );
         } else {
             debug!(
-                "actual cache size: {actual_cache_size}; stored cache size: {csize}; active download size: {active_downloading_size}"
+                "actual cache size: {actual_cache_size}; stored cache size: {stored}; active download size: {active_downloading_size}"
             );
         }
     }
