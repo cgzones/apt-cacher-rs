@@ -628,11 +628,7 @@ async fn try_sendfile_request(
 
             record_uncacheable(&requested_host, uri_path);
 
-            let mirror = Mirror {
-                host: requested_host,
-                port: requested_port,
-                path: String::new(),
-            };
+            let mirror = Mirror::new(requested_host, requested_port, String::new());
 
             return match splice_simple_proxy(stream, *conn_version, conn_action, &mirror, uri_path)
                 .await
@@ -820,11 +816,7 @@ async fn try_sendfile_request(
 
     let conn_details = ConnectionDetails {
         client,
-        mirror: Mirror {
-            host: requested_host,
-            port: requested_port,
-            path: mirror_path.into_owned(),
-        },
+        mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
         aliased_host,
         debname,
         cached_flavor,

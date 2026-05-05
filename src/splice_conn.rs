@@ -280,7 +280,7 @@ fn upstream_pool() -> &'static parking_lot::Mutex<hashbrown::HashMap<PoolKey, Ve
 /// Resolve the port for a mirror, defaulting to 80 or 443 based on TLS.
 fn mirror_port(mirror: &Mirror, is_tls: bool) -> u16 {
     mirror
-        .port
+        .port()
         .map_or(if is_tls { 443 } else { 80 }, NonZero::get)
 }
 
@@ -501,8 +501,8 @@ fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
 
     // Check scheme cache first
     let key = SchemeKeyRef {
-        host: mirror.host.as_str(),
-        port: mirror.port.map(std::num::NonZero::get),
+        host: mirror.host(),
+        port: mirror.port().map(std::num::NonZero::get),
     };
     let cached = SCHEME_CACHE
         .get()
@@ -523,7 +523,7 @@ fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
     if config
         .http_only_mirrors
         .iter()
-        .any(|m| m.permits(mirror.host.as_str()))
+        .any(|m| m.permits(mirror.host()))
     {
         return Some(Scheme::Http);
     }
@@ -544,16 +544,16 @@ fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
 ///
 /// Times out after the configured HTTP timeout.
 async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Scheme)> {
-    let host = mirror.host.as_str();
+    let host = mirror.host().as_str();
 
     match resolve_mirror_scheme(mirror) {
         Some(Scheme::Http) => {
-            let port = mirror.port.map_or(80, std::num::NonZero::get);
+            let port = mirror.port().map_or(80, std::num::NonZero::get);
             let tcp = tcp_connect(host, port).await?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
         Some(Scheme::Https) => {
-            let port = mirror.port.map_or(443, std::num::NonZero::get);
+            let port = mirror.port().map_or(443, std::num::NonZero::get);
             let tcp = tcp_connect(host, port).await?;
             let tls = tls_connect(tcp, host).await.inspect_err(|_| {
                 metrics::UPSTREAM_TLS_FAILED.increment();
@@ -563,7 +563,7 @@ async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Sch
         None => {
             // Auto mode: try HTTPS first, fall back to HTTP
             // TODO: retry HTTPS after small period, fall back to HTTP
-            let https_port = mirror.port.map_or(443, std::num::NonZero::get);
+            let https_port = mirror.port().map_or(443, std::num::NonZero::get);
             match tcp_connect(host, https_port).await {
                 Ok(tcp) => match tls_connect(tcp, host).await {
                     Ok(tls) => {
@@ -591,7 +591,7 @@ async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Sch
                 }
             }
 
-            let plain_port = mirror.port.map_or(80, std::num::NonZero::get);
+            let plain_port = mirror.port().map_or(80, std::num::NonZero::get);
             let tcp = tcp_connect(host, plain_port).await?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
@@ -863,8 +863,8 @@ async fn try_unbuffered_ktls_connect(
 
     // Skip kTLS for mirrors where setup has recently failed (retry after KTLS_BLOCK_DURATION)
     let key = SchemeKeyRef {
-        host: mirror.host.as_str(),
-        port: mirror.port.map(std::num::NonZero::get),
+        host: mirror.host().as_str(),
+        port: mirror.port().map(std::num::NonZero::get),
     };
     {
         let blocked = KTLS_BLOCKED.get().expect("Initialized in main()");
@@ -874,7 +874,7 @@ async fn try_unbuffered_ktls_connect(
             Some(at) if now.duration_since(at) < KTLS_BLOCK_DURATION => {
                 debug!(
                     "kTLS: skipping {} (setup blocked since {}s ago)",
-                    mirror.host,
+                    mirror.host(),
                     now.duration_since(at).as_secs()
                 );
                 return KtlsResult::Failed {
@@ -899,8 +899,8 @@ async fn try_unbuffered_ktls_connect(
         }
     }
 
-    let host = mirror.host.as_str();
-    let port = mirror.port.map_or(443, std::num::NonZero::get);
+    let host = mirror.host().as_str();
+    let port = mirror.port().map_or(443, std::num::NonZero::get);
 
     let mut tcp = match tcp_connect(host, port).await {
         Ok(tcp) => tcp,
@@ -1497,8 +1497,8 @@ async fn unbuffered_ktls_request(
 /// Update the scheme cache for a mirror after successful connection.
 fn cache_scheme(mirror: &Mirror, scheme: Scheme) {
     let key = SchemeKeyRef {
-        host: mirror.host.as_str(),
-        port: mirror.port.map(std::num::NonZero::get),
+        host: mirror.host().as_str(),
+        port: mirror.port().map(std::num::NonZero::get),
     };
     let scheme_cache = SCHEME_CACHE.get().expect("Initialized in main()");
     if scheme_cache.read().contains_key(&key) {
@@ -2859,7 +2859,7 @@ async fn standard_upstream_connect(
     if let Some(scheme) = resolve_mirror_scheme(mirror) {
         let is_tls = matches!(scheme, Scheme::Https);
         let port = mirror_port(mirror, is_tls);
-        if let Some(mut pooled) = pool_checkout(mirror.host.as_str(), port, is_tls) {
+        if let Some(mut pooled) = pool_checkout(mirror.host(), port, is_tls) {
             if pooled.check_alive() {
                 match send_and_read_headers(
                     &mut pooled,
@@ -2998,7 +2998,7 @@ async fn follow_redirect(
         }
     });
     let original_port_effective = mirror_port(&conn_details.mirror, upstream.is_tls());
-    if moved_host == conn_details.mirror.host.as_str()
+    if moved_host == conn_details.mirror.host()
         && moved_port_effective == original_port_effective
         && moved_path == original_path
     {
@@ -3018,11 +3018,7 @@ async fn follow_redirect(
     upstream.unset_poolable();
 
     let moved_port = moved_uri.port_u16().and_then(NonZero::new);
-    let redirect_mirror = Mirror {
-        host: moved_domain,
-        port: moved_port,
-        path: String::new(),
-    };
+    let redirect_mirror = Mirror::new(moved_domain, moved_port, String::new());
     let redirect_authority = redirect_mirror.format_authority();
     let redirect_path = moved_path;
 
@@ -3715,7 +3711,7 @@ async fn splice_proxy_drive(
         }
     }
 
-    let pool_host = mirror.host.to_string();
+    let pool_host = mirror.host().to_string();
 
     #[cfg(feature = "ktls")]
     let (
@@ -3741,7 +3737,7 @@ async fn splice_proxy_drive(
             let splice_extra = state.extra_body;
             let port = mirror_port(mirror, true);
             (
-                PoolGuard::new(UpstreamConn::Tcp(tcp), pool_host.clone(), port, poolable),
+                PoolGuard::new(UpstreamConn::Tcp(tcp), pool_host, port, poolable),
                 state.response,
                 state.header_buf,
                 state.header_end,
@@ -3763,7 +3759,7 @@ async fn splice_proxy_drive(
             .await?;
             let port = mirror_port(mirror, up.is_tls());
             (
-                PoolGuard::new(up, pool_host.clone(), port, poolable),
+                PoolGuard::new(up, pool_host, port, poolable),
                 resp,
                 hdr_buf,
                 hdr_end,
@@ -3788,7 +3784,7 @@ async fn splice_proxy_drive(
             .await?;
             let port = mirror_port(mirror, up.is_tls());
             (
-                PoolGuard::new(up, pool_host.clone(), port, poolable),
+                PoolGuard::new(up, pool_host, port, poolable),
                 resp,
                 hdr_buf,
                 hdr_end,
@@ -3811,7 +3807,7 @@ async fn splice_proxy_drive(
         .await?;
         let port = mirror_port(mirror, up.is_tls());
         (
-            PoolGuard::new(up, pool_host.clone(), port, poolable),
+            PoolGuard::new(up, pool_host, port, poolable),
             resp,
             hdr_buf,
             hdr_end,
@@ -4823,8 +4819,8 @@ async fn splice_proxy_drive(
     // Record origin in database (mirrors the hyper path in main.rs).
     if let Some(origin) = Origin::from_path(
         upstream_path,
-        conn_details.mirror.host.clone(),
-        conn_details.mirror.port,
+        conn_details.mirror.host().clone(),
+        conn_details.mirror.port(),
     ) {
         match origin.architecture.as_str() {
             "dep11" | "i18n" | "source" => (),
@@ -5419,8 +5415,8 @@ async fn handle_volatile_buffered_download(
     // Record origin in database (mirrors the hyper path in main.rs).
     if let Some(origin) = Origin::from_path(
         upstream_path,
-        conn_details.mirror.host.clone(),
-        conn_details.mirror.port,
+        conn_details.mirror.host().clone(),
+        conn_details.mirror.port(),
     ) {
         match origin.architecture.as_str() {
             "dep11" | "i18n" | "source" => (),
@@ -5543,7 +5539,7 @@ pub(crate) async fn splice_simple_proxy(
         resp.status_code
     );
 
-    let mut upstream = PoolGuard::new(up, mirror.host.to_string(), port, poolable);
+    let mut upstream = PoolGuard::new(up, mirror.host().to_string(), port, poolable);
 
     // Rewrite response headers: adjust HTTP version and Connection header
     // to match the client's protocol version and keep-alive strategy.
@@ -5886,22 +5882,22 @@ mod tests {
 
     #[test]
     fn test_mirror_port_defaults() {
-        let mirror = Mirror {
-            host: DomainName::new("example.com".into()).unwrap(),
-            port: None,
-            path: String::new(),
-        };
+        let mirror = Mirror::new(
+            DomainName::new("example.com".into()).unwrap(),
+            None,
+            String::new(),
+        );
         assert_eq!(mirror_port(&mirror, false), 80);
         assert_eq!(mirror_port(&mirror, true), 443);
     }
 
     #[test]
     fn test_mirror_port_explicit() {
-        let mirror = Mirror {
-            host: DomainName::new("example.com".into()).unwrap(),
-            port: Some(NonZero::new(8080).unwrap()),
-            path: String::new(),
-        };
+        let mirror = Mirror::new(
+            DomainName::new("example.com".into()).unwrap(),
+            Some(NonZero::new(8080).unwrap()),
+            String::new(),
+        );
         assert_eq!(mirror_port(&mirror, false), 8080);
         assert_eq!(mirror_port(&mirror, true), 8080);
     }

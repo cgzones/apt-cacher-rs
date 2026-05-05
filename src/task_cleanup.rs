@@ -424,11 +424,7 @@ async fn cleanup_mirror_deb_files(
         mirror.cache_path().display(),
     );
 
-    let mirror = Mirror {
-        port: mirror.port(),
-        host: mirror.host,
-        path: mirror.path,
-    };
+    let mirror = mirror.into();
 
     if cached_files.is_empty() {
         return Ok(CleanupDone {
@@ -615,11 +611,7 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
     .iter()
     .collect();
 
-    let mirror = Mirror {
-        port: mirror.port(),
-        host: mirror.host,
-        path: mirror.path,
-    };
+    let mirror = mirror.into();
 
     let mut byhash_dir = match tokio::fs::read_dir(&mirror_byhash_path).await {
         Ok(d) => d,

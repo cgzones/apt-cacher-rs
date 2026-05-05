@@ -1653,15 +1653,15 @@ impl ConnectionDetails {
     pub(crate) fn cache_dir_path(&self) -> PathBuf {
         let root = &global_config().cache_directory;
 
-        let host = self.aliased_host.unwrap_or(&self.mirror.host);
-        let host = host.format_cache_dir(self.mirror.port);
+        let host = self.aliased_host.unwrap_or_else(|| self.mirror.host());
+        let host = host.format_cache_dir(self.mirror.port());
         let host = Path::new(host.as_ref());
         assert!(
             host.is_relative(),
             "path construction must not contain absolute components"
         );
 
-        let uri_path = Path::new(&self.mirror.path);
+        let uri_path = Path::new(self.mirror.path());
         assert!(
             uri_path.is_relative(),
             "path construction must not contain absolute components"
@@ -2433,7 +2433,7 @@ async fn serve_new_file(
         Some(h) => h,
         None => {
             // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers
-            &HeaderValue::from_str(&conn_details.mirror.host.format_authority(None))
+            &HeaderValue::from_str(&conn_details.mirror.host().format_authority(None))
                 .expect("connection host should be valid")
         }
     };
@@ -3596,11 +3596,11 @@ async fn pre_process_client_request(
 
                     let conn_details = ConnectionDetails {
                         client,
-                        mirror: Mirror {
-                            host: requested_host,
-                            port: requested_port,
-                            path: mirror_path.into_owned(),
-                        },
+                        mirror: Mirror::new(
+                            requested_host,
+                            requested_port,
+                            mirror_path.into_owned(),
+                        ),
                         aliased_host,
                         debname: filename.into_owned(),
                         cached_flavor: CachedFlavor::Permanent,
@@ -3629,11 +3629,7 @@ async fn pre_process_client_request(
 
                 let conn_details = ConnectionDetails {
                     client,
-                    mirror: Mirror {
-                        host: requested_host,
-                        port: requested_port,
-                        path: mirror_path.into_owned(),
-                    },
+                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
                     aliased_host,
                     debname: format!("{distribution}_{filename}"),
                     cached_flavor: CachedFlavor::Volatile,
@@ -3653,11 +3649,7 @@ async fn pre_process_client_request(
 
                 let conn_details = ConnectionDetails {
                     client,
-                    mirror: Mirror {
-                        host: requested_host,
-                        port: requested_port,
-                        path: mirror_path.into_owned(),
-                    },
+                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
                     aliased_host,
                     debname: filename.into_owned(),
                     cached_flavor: CachedFlavor::Permanent,
@@ -3696,11 +3688,7 @@ async fn pre_process_client_request(
 
                 let conn_details = ConnectionDetails {
                     client,
-                    mirror: Mirror {
-                        host: requested_host,
-                        port: requested_port,
-                        path: mirror_path.into_owned(),
-                    },
+                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
                     aliased_host,
                     debname: format!("{distribution}_{component}_{filename}"),
                     cached_flavor: CachedFlavor::Volatile,
@@ -3732,11 +3720,7 @@ async fn pre_process_client_request(
 
                 let conn_details = ConnectionDetails {
                     client,
-                    mirror: Mirror {
-                        host: requested_host,
-                        port: requested_port,
-                        path: mirror_path.into_owned(),
-                    },
+                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
                     aliased_host,
                     debname: format!("{distribution}_{component}_{architecture}_{filename}"),
                     cached_flavor: CachedFlavor::Volatile,
