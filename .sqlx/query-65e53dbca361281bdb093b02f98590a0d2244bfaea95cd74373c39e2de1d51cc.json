@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT INTO deliveries\n                (mirror_id, debname, size, duration, partial, client_ip)\n                VALUES\n                (?, ?, ?, ?, ?, ?);\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "65e53dbca361281bdb093b02f98590a0d2244bfaea95cd74373c39e2de1d51cc"
+}

@@ -9,8 +9,8 @@ use std::{
 
 use log::{LevelFilter, debug, info, trace, warn};
 use sqlx::{
-    ConnectOptions as _, Error, Executor as _, Pool, Sqlite, SqlitePool, query, query_as,
-    sqlite::SqliteConnectOptions,
+    ConnectOptions as _, Error, Executor as _, Pool, Sqlite, SqliteConnection, SqlitePool, query,
+    query_as, sqlite::SqliteConnectOptions,
 };
 
 use crate::{
@@ -158,6 +158,29 @@ pub(crate) struct TopPackageEntry {
     pub(crate) package_size: i64,
 }
 
+/// Upsert a mirror row and return its `id` in a single round trip via the
+/// `RETURNING` clause.
+async fn upsert_mirror_get_id(tx: &mut SqliteConnection, mirror: &Mirror) -> Result<i64, Error> {
+    let port = mirror.port.map_or(0, std::num::NonZero::get);
+    let row = query!(
+        r"
+            INSERT INTO mirrors_v2
+            (host, port, path)
+            VALUES
+            (?, ?, ?)
+            ON CONFLICT
+            DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP)
+            RETURNING id;
+        ",
+        mirror.host,
+        port,
+        mirror.path,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    Ok(row.id)
+}
+
 impl Database {
     pub(crate) async fn connect(
         path: &std::path::Path,
@@ -252,38 +275,20 @@ impl Database {
     }
 
     pub(crate) async fn add_origin(&self, origin: &OriginRef<'_>) -> Result<(), Error> {
-        let port = origin.mirror.port.map_or(0, std::num::NonZero::get);
-
         let mut tx = self.conn.begin().await?;
 
-        query!(
-            r"
-                INSERT INTO mirrors_v2
-                (host, port, path)
-                VALUES
-                (?, ?, ?)
-                ON CONFLICT
-                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
-        ",
-            origin.mirror.host,
-            port,
-            origin.mirror.path,
-        )
-        .execute(&mut *tx)
-        .await?;
+        let mirror_id = upsert_mirror_get_id(&mut tx, origin.mirror).await?;
 
         query!(
             r"
                 INSERT INTO origins
                 (mirror_id, distribution, component, architecture)
                 VALUES
-                ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?)
+                (?, ?, ?, ?)
                 ON CONFLICT (mirror_id, distribution, component, architecture)
                 DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
         ",
-            origin.mirror.host,
-            port,
-            origin.mirror.path,
+            mirror_id,
             origin.distribution,
             origin.component,
             origin.architecture
@@ -561,36 +566,18 @@ impl Database {
         };
         let client: &[u8] = &client.octets();
 
-        let port = mirror.port.map_or(0, std::num::NonZero::get);
-
         let mut tx = self.conn.begin().await?;
 
-        query!(
-            r"
-                INSERT INTO mirrors_v2
-                (host, port, path)
-                VALUES
-                (?, ?, ?)
-                ON CONFLICT
-                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
-        ",
-            mirror.host,
-            port,
-            mirror.path
-        )
-        .execute(&mut *tx)
-        .await?;
+        let mirror_id = upsert_mirror_get_id(&mut tx, mirror).await?;
 
         query!(
             r"
                 INSERT INTO downloads
                 (mirror_id, debname, size, duration, client_ip)
                 VALUES
-                ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?, ?);
+                (?, ?, ?, ?, ?);
         ",
-            mirror.host,
-            port,
-            mirror.path,
+            mirror_id,
             debname,
             size,
             duration,
@@ -626,36 +613,18 @@ impl Database {
         };
         let client: &[u8] = &client.octets();
 
-        let port = mirror.port.map_or(0, std::num::NonZero::get);
-
         let mut tx = self.conn.begin().await?;
 
-        query!(
-            r"
-                INSERT INTO mirrors_v2
-                (host, port, path)
-                VALUES
-                (?, ?, ?)
-                ON CONFLICT
-                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
-            ",
-            mirror.host,
-            port,
-            mirror.path
-        )
-        .execute(&mut *tx)
-        .await?;
+        let mirror_id = upsert_mirror_get_id(&mut tx, mirror).await?;
 
         query!(
             r"
                 INSERT INTO deliveries
                 (mirror_id, debname, size, duration, partial, client_ip)
                 VALUES
-                ((SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?), ?, ?, ?, ?, ?);
+                (?, ?, ?, ?, ?, ?);
             ",
-            mirror.host,
-            port,
-            mirror.path,
+            mirror_id,
             debname,
             size,
             duration,

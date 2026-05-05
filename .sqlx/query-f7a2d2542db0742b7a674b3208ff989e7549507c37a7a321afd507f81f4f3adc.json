@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO mirrors_v2\n            (host, port, path)\n            VALUES\n            (?, ?, ?)\n            ON CONFLICT\n            DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP)\n            RETURNING id;\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f7a2d2542db0742b7a674b3208ff989e7549507c37a7a321afd507f81f4f3adc"
+}
