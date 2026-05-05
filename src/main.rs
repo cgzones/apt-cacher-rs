@@ -3016,65 +3016,70 @@ async fn serve_new_file(
         .download(outpath.to_path_buf(), total_content_length, reservation)
         .await;
 
-    let cd = conn_details.clone();
-    let curr_downloads = appstate.active_downloads.download_count();
-    tokio::task::spawn(async move {
-        download_file(
-            &cd,
-            warn_on_override,
-            (body, body_content_length),
-            (outfile, outpath),
-            dbarrier,
-            resume_offset,
-        )
-        .await;
-    });
+    {
+        let cd = conn_details.clone();
+        tokio::task::spawn(async move {
+            download_file(
+                &cd,
+                warn_on_override,
+                (body, body_content_length),
+                (outfile, outpath),
+                dbarrier,
+                resume_offset,
+            )
+            .await;
+        });
+    }
 
     if conn_details.cached_flavor != CachedFlavor::Volatile
         && config.experimental_parallel_hack_enabled
-        && config
+    {
+        let curr_downloads = appstate.active_downloads.download_count();
+
+        if config
             .experimental_parallel_hack_maxparallel
             .is_none_or(|max_parallel| curr_downloads <= max_parallel.get())
-        && config
-            .experimental_parallel_hack_minsize
-            .is_none_or(|size| total_content_length.upper() > size)
-    {
-        #[expect(clippy::cast_precision_loss, reason = "generate probability value")]
-        let p = (curr_downloads.saturating_sub(1) as f64)
-            .mul_add(-config.experimental_parallel_hack_factor, 1.0)
-            .max(0.0);
-        let d = Bernoulli::new(p).expect("p is valid");
-        let v = d.sample(&mut rand::rng());
+            && config
+                .experimental_parallel_hack_minsize
+                .is_none_or(|size| total_content_length.upper() > size)
+        {
+            #[expect(clippy::cast_precision_loss, reason = "generate probability value")]
+            let p = (curr_downloads.saturating_sub(1) as f64)
+                .mul_add(-config.experimental_parallel_hack_factor, 1.0)
+                .max(0.0);
+            let d = Bernoulli::new(p).expect("p is valid");
+            let v = d.sample(&mut rand::rng());
 
-        if v {
-            debug!(
-                "Trying parallel download hack for client {} and file {} with code {} and retry after value {}",
-                conn_details.client,
-                conn_details.debname,
-                config.experimental_parallel_hack_statuscode,
-                config.experimental_parallel_hack_retryafter
-            );
-
-            let mut response_builder = Response::builder()
-                .status(config.experimental_parallel_hack_statuscode)
-                .header(DATE, format_http_date())
-                .header(VIA, APP_VIA)
-                .header(CONNECTION, "keep-alive");
-
-            if config.experimental_parallel_hack_retryafter != 0 {
-                response_builder = response_builder.header(
-                    RETRY_AFTER,
-                    HeaderValue::from(config.experimental_parallel_hack_retryafter),
+            if v {
+                debug!(
+                    "Trying parallel download hack for client {} and file {} with code {} and retry after value {}",
+                    conn_details.client,
+                    conn_details.debname,
+                    config.experimental_parallel_hack_statuscode,
+                    config.experimental_parallel_hack_retryafter
                 );
+
+                let mut response_builder = Response::builder()
+                    .status(config.experimental_parallel_hack_statuscode)
+                    .header(DATE, format_http_date())
+                    .header(VIA, APP_VIA)
+                    .header(CONNECTION, "keep-alive");
+
+                if config.experimental_parallel_hack_retryafter != 0 {
+                    response_builder = response_builder.header(
+                        RETRY_AFTER,
+                        HeaderValue::from(config.experimental_parallel_hack_retryafter),
+                    );
+                }
+
+                let response = response_builder
+                    .body(empty_body())
+                    .expect("Response is valid");
+
+                trace!("Outgoing parallel download hack response: {response:?}");
+
+                return response;
             }
-
-            let response = response_builder
-                .body(empty_body())
-                .expect("Response is valid");
-
-            trace!("Outgoing parallel download hack response: {response:?}");
-
-            return response;
         }
     }
 
