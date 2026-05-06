@@ -1733,6 +1733,15 @@ fn build_metrics_html() -> String {
         WarnNonzero(metrics::UNHANDLED_REQUEST_HEADERS.get()),
     );
     t.row_tip(
+        "Request Read Failures (peer disconnect / protocol error)",
+        "Header-read failures before any request was parsed. Peer-disconnect counts normal client closes between keep-alive requests; protocol-error counts oversized or malformed headers and is the abuse signal.",
+        format_args!(
+            "{} / {}",
+            metrics::REQUEST_READ_PEER_DISCONNECT.get(),
+            WarnNonzero(metrics::REQUEST_READ_PROTOCOL_ERROR.get()),
+        ),
+    );
+    t.row_tip(
         "Upstream Retries",
         "Upstream requests retried after a transient failure.",
         metrics::UPSTREAM_RETRIES.get(),

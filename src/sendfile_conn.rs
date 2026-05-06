@@ -111,19 +111,22 @@ pub(crate) async fn handle_sendfile_connection(
                 req_num += 1;
                 index
             }
-            Err(err) if err.kind() == ErrorKind::TimedOut => {
-                debug!(
-                    "Timeout while reading request headers from client {client} for request {}",
-                    req_num + 1
-                );
-                return;
-            }
             Err(err) => {
-                warn_once_or_info!(
-                    "Failed to read request number {} from client {client}:  {}",
-                    req_num + 1,
-                    ErrorReport(&err),
-                );
+                if is_peer_disconnect(&err) {
+                    metrics::REQUEST_READ_PEER_DISCONNECT.increment();
+                    info!(
+                        "Client {client} disconnected before request number {} was received:  {}",
+                        req_num + 1,
+                        ErrorReport(&err),
+                    );
+                } else {
+                    metrics::REQUEST_READ_PROTOCOL_ERROR.increment();
+                    warn_once_or_info!(
+                        "Failed to read request number {} from client {client}:  {}",
+                        req_num + 1,
+                        ErrorReport(&err),
+                    );
+                }
                 let _ignore = write_invalid_response(
                     &stream,
                     conn_version,

@@ -164,6 +164,17 @@ pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
 /// look up headers by name and never trip this counter.
 pub(crate) static UNHANDLED_REQUEST_HEADERS: Counter = Counter::new();
 
+/// Request-header reads that failed before any request was parsed, broken
+/// down by whether the peer was the cause (reset/eof) or the byte stream
+/// itself was malformed (oversized headers, garbage). Useful for separating
+/// "client went away" noise from genuine protocol abuse.
+///
+/// Scope: only updated by the sendfile backend's manual header-read loop;
+/// in `cfg(not(feature = "sendfile"))` builds (non-default) hyper handles
+/// header parsing internally and these counters stay at 0.
+pub(crate) static REQUEST_READ_PEER_DISCONNECT: Counter = Counter::new();
+pub(crate) static REQUEST_READ_PROTOCOL_ERROR: Counter = Counter::new();
+
 /// Peak concurrent connected clients.
 pub(crate) static CONNECTED_CLIENTS_PEAK: Peak = Peak::new();
 /// Peak concurrent in-flight upstream downloads.
