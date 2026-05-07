@@ -158,6 +158,11 @@ pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
 /// validate `https_tunnel_max_connections_per_client` headroom.
 pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();
 
+/// Plain-HTTP connections rejected at accept time because the per-source-IP
+/// cap (`max_connections_per_client_ip`) was reached. Climbing values
+/// indicate a noisy or malicious source IP; consider alerting.
+pub(crate) static CONNECTION_REJECTED_PER_IP_CAP: Counter = Counter::new();
+
 /// Requests that included an HTTP header outside the daemon's known set
 /// (`warn_once_or_info!("Unhandled HTTP header …")`). Each occurrence is
 /// counted; the log entry itself is debounced.

@@ -33,6 +33,7 @@ const DEFAULT_HTTPS_UPGRADE_MODE: HttpsUpgradeMode = HttpsUpgradeMode::Auto;
 const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
 const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
 const DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT: Option<NonZero<usize>> = Some(nonzero!(10));
+const DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP: Option<NonZero<usize>> = None;
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
 const DEFAULT_LOG_DESTINATION: LogDestination = LogDestination::Console;
 const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
@@ -475,6 +476,16 @@ pub(crate) struct Config {
     )]
     pub(crate) https_tunnel_max_connections_per_client: Option<NonZero<usize>>,
 
+    /// Maximum number of concurrent plain-HTTP connections accepted per source
+    /// IP address. `None` means unlimited. Set to bound resource use against
+    /// half-open connection floods on deployments exposed to less-trusted
+    /// networks. Note: clients behind a NAT share a single IP for this cap.
+    #[serde(
+        default = "default_max_connections_per_client_ip",
+        deserialize_with = "from_nonzero_usize"
+    )]
+    pub(crate) max_connections_per_client_ip: Option<NonZero<usize>>,
+
     /// Minimum transfer rate (in bytes per second) for downloads and uploads.
     /// Connections that fail to fulfill this limit are cancelled.
     #[serde(
@@ -756,6 +767,10 @@ const fn default_https_tunnel_max_connections_per_client() -> Option<NonZero<usi
     DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT
 }
 
+const fn default_max_connections_per_client_ip() -> Option<NonZero<usize>> {
+    DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP
+}
+
 const fn default_byhash_retention_days() -> u64 {
     DEFAULT_BYHASH_RETENTION_DAYS
 }
@@ -972,6 +987,7 @@ impl Config {
             https_tunnel_allowed_mirrors: Vec::new(),
             https_tunnel_max_connections_per_client:
                 DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT,
+            max_connections_per_client_ip: DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP,
             byhash_retention_days: DEFAULT_BYHASH_RETENTION_DAYS,
             usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
             logstore_capacity: DEFAULT_LOGSTORE_CAPACITY,

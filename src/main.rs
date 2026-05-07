@@ -3988,12 +3988,19 @@ async fn pre_process_client_request(
 }
 
 mod client_counter {
+    use std::net::IpAddr;
+    use std::num::NonZero;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hashbrown::HashMap;
 
     use crate::metrics;
 
     static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
     static CLIENT_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
+
+    static CONNECTIONS_PER_IP: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
     #[must_use]
     pub(crate) fn connected_clients() -> usize {
@@ -4001,20 +4008,44 @@ mod client_counter {
     }
 
     pub(super) struct ClientCounter {
-        _private: (),
+        client_ip: IpAddr,
     }
 
     impl ClientCounter {
-        pub(super) fn new() -> Self {
+        /// Acquire a connection slot for `client_ip`. Returns `None` and
+        /// increments [`metrics::CONNECTION_REJECTED_PER_IP_CAP`] when the
+        /// per-IP cap is set and already reached.
+        pub(super) fn try_new(
+            client_ip: IpAddr,
+            max_per_ip: Option<NonZero<usize>>,
+        ) -> Option<Self> {
+            if let Some(max) = max_per_ip {
+                let mut map = CONNECTIONS_PER_IP.lock();
+                let count = map.entry(client_ip).or_insert(0);
+                if *count >= max.get() {
+                    drop(map);
+                    metrics::CONNECTION_REJECTED_PER_IP_CAP.increment();
+                    return None;
+                }
+                *count += 1;
+            }
             let current = CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
             metrics::CONNECTED_CLIENTS_PEAK.update(current as u64);
-            Self { _private: () }
+            Some(Self { client_ip })
         }
     }
 
     impl Drop for ClientCounter {
         fn drop(&mut self) {
             CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+            let mut map = CONNECTIONS_PER_IP.lock();
+            if let hashbrown::hash_map::Entry::Occupied(mut entry) = map.entry(self.client_ip) {
+                let count = entry.get_mut();
+                *count -= 1;
+                if *count == 0 {
+                    entry.remove();
+                }
+            }
         }
     }
 
@@ -4366,7 +4397,22 @@ async fn main_loop(
 
         metrics::CONNECTIONS_ACCEPTED.increment();
 
-        let client_counter = client_counter::ClientCounter::new();
+        let Some(client_counter) = client_counter::ClientCounter::try_new(
+            client.ip(),
+            config.max_connections_per_client_ip,
+        ) else {
+            info!(
+                "Rejecting connection from client {client}: \
+                 per-client-IP connection limit ({}) reached",
+                config
+                    .max_connections_per_client_ip
+                    .expect("limit reached implies a configured cap")
+            );
+            // Drop the stream; closing the socket is the cheapest available
+            // signal — sending a 503 would itself be subject to the same load.
+            drop(stream);
+            continue;
+        };
 
         info!("New client connection from {client}");
         let client_start = Instant::now();

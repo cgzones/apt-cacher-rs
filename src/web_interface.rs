@@ -1885,6 +1885,11 @@ fn build_metrics_html() -> String {
             metrics::TUNNEL_REJECTED_CAPACITY.get()
         ),
     );
+    t.row_tip(
+        "Connections Rejected (per-IP cap)",
+        "Plain-HTTP connections dropped at accept time because `max_connections_per_client_ip` was reached. Stays at 0 unless the cap is configured; climbing values point to a noisy or malicious source IP.",
+        WarnNonzero(metrics::CONNECTION_REJECTED_PER_IP_CAP.get()),
+    );
     t.finish()
 }
 
