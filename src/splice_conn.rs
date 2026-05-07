@@ -3949,6 +3949,7 @@ async fn splice_proxy_drive(
             upstream_resp.status_code
         );
 
+        metrics::REQUESTS_PASSTHROUGH.increment();
         metrics::record_client_status(upstream_resp.status_code);
 
         // Forward raw response headers to client

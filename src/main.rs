@@ -2861,7 +2861,8 @@ async fn serve_new_file(
 
             let (parts, body) = fwd_response.into_parts();
 
-            let counted = ClientCountedBody::new(body);
+            metrics::REQUESTS_PASSTHROUGH.increment();
+            let counted = ClientCountedBody::new(PassthroughBody { inner: body });
 
             let rated = MaybeRated::new(
                 counted,
