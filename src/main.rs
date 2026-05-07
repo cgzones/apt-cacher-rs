@@ -2212,6 +2212,7 @@ async fn serve_downloading_file(
                 let file = match tokio::fs::File::open(&path_clone).await {
                     Ok(f) => f,
                     Err(err) => {
+                        metrics::CACHE_IO_FAILURE.increment();
                         error!(
                             "Failed to open downloaded file `{}`:  {err}",
                             path_clone.display()
@@ -2238,6 +2239,7 @@ async fn serve_downloading_file(
                 let file = match tokio::fs::File::open(&path).await {
                     Ok(f) => f,
                     Err(err) => {
+                        metrics::CACHE_IO_FAILURE.increment();
                         error!(
                             "Failed to open downloading file `{}`:  {err}",
                             path.display()

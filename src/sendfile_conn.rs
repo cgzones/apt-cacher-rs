@@ -893,6 +893,7 @@ async fn try_sendfile_request(
                 break 'cache_lookup None;
             }
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to open cached file `{}` for client {client}:  {err}",
                     cache_path.display()
@@ -933,6 +934,7 @@ async fn try_sendfile_request(
                     }
                 }
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "Failed to get metadata of cached file `{}` for client {client}:  {err}",
                         cache_path.display()
@@ -1188,6 +1190,7 @@ pub(crate) async fn serve_file_via_sendfile(
     let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get metadata of cached file `{}` for client {}:  {err}",
                 file_path.display(),
@@ -1805,6 +1808,7 @@ async fn serve_unfinished_sendfile(
                     let file = match tokio::fs::File::open(path).await {
                         Ok(f) => f,
                         Err(err) => {
+                            metrics::CACHE_IO_FAILURE.increment();
                             error!(
                                 "Failed to open downloading file `{}` for joining client {}:  {err}",
                                 path.display(),
@@ -1829,6 +1833,7 @@ async fn serve_unfinished_sendfile(
                     let file = match tokio::fs::File::open(&finished_path).await {
                         Ok(f) => f,
                         Err(err) => {
+                            metrics::CACHE_IO_FAILURE.increment();
                             error!(
                                 "Failed to open finished file `{}` for joining client {}:  {err}",
                                 finished_path.display(),
@@ -1880,6 +1885,7 @@ async fn serve_unfinished_sendfile(
     let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get metadata of downloading file `{}` for joining client {}:  {err}",
                 file_path.display(),
