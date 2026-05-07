@@ -198,14 +198,15 @@ impl Database {
     ) -> Result<Self, Error> {
         let url = format!("sqlite://{}", path.display());
 
-        info!("Opening database `{url}`...");
-        debug!("Using slow timeout of {slow_timeout:?}");
+        debug!("Opening database `{url}` with slow timeout of {slow_timeout:?}...");
 
         let opts = SqliteConnectOptions::from_str(&url)?
             .create_if_missing(true)
             .log_statements(LevelFilter::Trace)
             .log_slow_statements(LevelFilter::Warn, slow_timeout);
         let conn = SqlitePool::connect_with(opts).await?;
+
+        info!("Database `{}` opened", path.display());
 
         Ok(Self { conn })
     }
