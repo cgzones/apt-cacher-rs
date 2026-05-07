@@ -40,8 +40,8 @@ const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
 const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
 const DEFAULT_RATE_CHECK_TIMEFRAME: NonZero<usize> = nonzero!(30);
 const DEFAULT_MAX_UPSTREAM_DOWNLOADS: Option<NonZero<usize>> = Some(nonzero!(20));
-const DEFAULT_BYHASH_RETENTION_DAYS: u64 = 90;
-const DEFAULT_USAGE_RETENTION_DAYS: u64 = 30;
+const DEFAULT_BYHASH_RETENTION_DAYS: NonZero<u64> = nonzero!(90);
+const DEFAULT_USAGE_RETENTION_DAYS: Option<NonZero<u64>> = Some(nonzero!(30));
 const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
 const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
 const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
@@ -427,11 +427,14 @@ pub(crate) struct Config {
 
     /// Retention time (in days) for files acquired "by-hash".
     #[serde(default = "default_byhash_retention_days")]
-    pub(crate) byhash_retention_days: u64,
+    pub(crate) byhash_retention_days: NonZero<u64>,
 
     /// Retention time (in days) for usage logs.
-    #[serde(default = "default_usage_retention_days")]
-    pub(crate) usage_retention_days: u64,
+    #[serde(
+        default = "default_usage_retention_days",
+        deserialize_with = "from_nonzero_u64"
+    )]
+    pub(crate) usage_retention_days: Option<NonZero<u64>>,
 
     /// Mirror aliases.
     #[serde(default = "default_aliases")]
@@ -678,6 +681,15 @@ where
     Ok(NonZero::new(u))
 }
 
+fn from_nonzero_u64<'de, D>(deserializer: D) -> Result<Option<NonZero<u64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let u: u64 = Deserialize::deserialize(deserializer)?;
+
+    Ok(NonZero::new(u))
+}
+
 fn parse_log_destination<'de, D>(deserializer: D) -> Result<LogDestination, D::Error>
 where
     D: Deserializer<'de>,
@@ -771,11 +783,11 @@ const fn default_max_connections_per_client_ip() -> Option<NonZero<usize>> {
     DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP
 }
 
-const fn default_byhash_retention_days() -> u64 {
+const fn default_byhash_retention_days() -> NonZero<u64> {
     DEFAULT_BYHASH_RETENTION_DAYS
 }
 
-const fn default_usage_retention_days() -> u64 {
+const fn default_usage_retention_days() -> Option<NonZero<u64>> {
     DEFAULT_USAGE_RETENTION_DAYS
 }
 
@@ -1055,10 +1067,17 @@ impl Config {
         let mut warnings: Vec<String> = Vec::new();
         // TODO: check bind_addr.is_documentation() once stable: https://github.com/rust-lang/rust/issues/27709
 
-        if let LogDestination::File(ref path) = self.log_file
-            && path.as_os_str().is_empty()
-        {
-            bail!("Invalid log_file value: must not be empty");
+        if let LogDestination::File(ref path) = self.log_file {
+            if path.as_os_str().is_empty() {
+                bail!("Invalid log_file value: must not be empty");
+            }
+
+            if !path.is_absolute() {
+                warnings.push(format!(
+                    "log_file `{}` is not an absolute path",
+                    path.display()
+                ));
+            }
         }
 
         if self.database_slow_timeout < Duration::from_secs(1)
@@ -1078,6 +1097,14 @@ impl Config {
             );
         }
 
+        if self.database_slow_timeout > self.http_timeout {
+            warnings.push(format!(
+                "database_slow_timeout ({}s) is greater than http_timeout ({}s); HTTP requests will time out before slow-database warnings fire",
+                self.database_slow_timeout.as_secs_f32(),
+                self.http_timeout.as_secs_f32()
+            ));
+        }
+
         if self.buffer_size < 1024 || self.buffer_size > 1024 * 1024 * 1024 {
             bail!(
                 "Invalid buffer_size value of {}: must be in between 1k and 1G",
@@ -1085,13 +1112,25 @@ impl Config {
             );
         }
 
-        if self.byhash_retention_days == 0 {
-            bail!("Invalid byhash_retention_days value of 0: must be at least 1");
+        if self.buffer_size > 16 * 1024 * 1024 {
+            warnings.push(format!(
+                "buffer_size of {} is very large; consider a smaller value to avoid excessive memory usage",
+                self.buffer_size
+            ));
+        }
+
+        if let Some(quota) = self.disk_quota
+            && quota < nonzero!(200 * 1024 * 1024)
+        {
+            warnings.push(format!(
+                "disk_quota of {} is very small; consider a larger value to avoid requests being rejected",
+                quota.get()
+            ));
         }
 
         if self
             .byhash_retention_days
-            .checked_mul(24 * 60 * 60)
+            .checked_mul(nonzero!(24 * 60 * 60))
             .is_none()
         {
             bail!(
@@ -1100,14 +1139,19 @@ impl Config {
             );
         }
 
-        if self
-            .usage_retention_days
-            .checked_mul(24 * 60 * 60)
-            .is_none()
+        if self.byhash_retention_days > nonzero!(365) {
+            warnings.push(format!(
+                "byhash_retention_days of {} is very large; consider a smaller value to avoid excessive disk usage",
+                self.byhash_retention_days.get()
+            ));
+        }
+
+        if let Some(days) = self.usage_retention_days
+            && days.checked_mul(nonzero!(24 * 60 * 60)).is_none()
         {
             bail!(
                 "Invalid usage_retention_days value of {}: Overflow",
-                self.usage_retention_days
+                days.get()
             );
         }
 
@@ -1196,11 +1240,43 @@ impl Config {
             );
         }
 
+        if !self.https_tunnel_enabled
+            && self.https_tunnel_allowed_mirrors != default_https_tunnel_allowed_mirrors()
+        {
+            warnings.push(
+                "https_tunnel_allowed_mirrors is set but https_tunnel_enabled is false".to_string(),
+            );
+        }
+
         if !self.https_tunnel_enabled && self.https_tunnel_max_connections_per_client.is_some() {
             warnings.push(
                 "https_tunnel_max_connections_per_client is set but https_tunnel_enabled is false"
                     .to_string(),
             );
+        }
+
+        if self.https_upgrade_mode == HttpsUpgradeMode::Never && !self.https_tunnel_enabled {
+            warnings.push(
+                "https_upgrade_mode is Never and https_tunnel_enabled is false; clients have no encrypted path to mirrors"
+                    .to_string(),
+            );
+        }
+
+        if self.https_tunnel_enabled {
+            const TYPICAL_TLS_PORTS: &[u16] = &[443, 8443];
+
+            let unusual = self
+                .https_tunnel_allowed_ports
+                .iter()
+                .filter(|p| !TYPICAL_TLS_PORTS.contains(&p.get()))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !unusual.is_empty() {
+                warnings.push(format!(
+                    "https_tunnel_allowed_ports contains non-TLS-typical port(s): {unusual}"
+                ));
+            }
         }
 
         if self.min_download_rate.is_none()
@@ -1217,6 +1293,13 @@ impl Config {
                 "Invalid rate_check_timeframe value of {}s: must be between 1s and 360s",
                 self.rate_check_timeframe
             );
+        }
+
+        if self.min_download_rate.is_some() && self.rate_check_timeframe < nonzero!(5) {
+            warnings.push(format!(
+                "rate_check_timeframe of {}s is very short; consider at least 5s to avoid premature cancellations",
+                self.rate_check_timeframe
+            ));
         }
 
         #[cfg(not(feature = "mmap"))]
@@ -1262,6 +1345,16 @@ impl Config {
                 "Invalid experimental_parallel_hack_retryafter value of {}: must be between 1 and 300",
                 self.experimental_parallel_hack_retryafter
             );
+        }
+
+        if self.experimental_parallel_hack_enabled
+            && let Some(minsize) = self.experimental_parallel_hack_minsize
+            && let Some(quota) = self.disk_quota
+            && minsize > quota
+        {
+            warnings.push(format!(
+                "experimental_parallel_hack_minsize ({minsize}) is greater than disk_quota ({quota}); the hack will never trigger"
+            ));
         }
 
         if self.cache_directory.as_os_str().is_empty() {

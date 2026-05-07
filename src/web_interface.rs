@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     fmt::{self, Display, Formatter, Write as _},
     path::{Path, PathBuf},
@@ -1274,7 +1275,10 @@ fn build_configuration_html(rd: &RuntimeDetails, https_mode: &str) -> String {
     );
     t.row(
         "Usage Retention",
-        format_args!("{} days", rd.config.usage_retention_days),
+        match rd.config.usage_retention_days {
+            Some(d) => Cow::Owned(format!("{} days", d.get())),
+            None => Cow::Borrowed("forever"),
+        },
     );
     t.row(
         "ByHash Retention",

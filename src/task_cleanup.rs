@@ -263,9 +263,9 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         error!("Failed to clean up invalid database rows:  {err}");
     }
 
-    let usage_retention_days = global_config().usage_retention_days;
-    if usage_retention_days != 0 {
+    if let Some(usage_retention_days) = global_config().usage_retention_days {
         let retention_secs = usage_retention_days
+            .get()
             .checked_mul(24 * 60 * 60)
             .expect("overflow check during config parsing");
         let now_secs = coarsetime::Clock::now_since_epoch().as_secs();
@@ -601,7 +601,7 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
     let mut files_removed = 0;
     let mut files_retained = 0;
     let now = SystemTime::now();
-    let keep_span = Duration::from_secs(24 * 60 * 60 * global_config().byhash_retention_days);
+    let keep_span = Duration::from_secs(24 * 60 * 60 * global_config().byhash_retention_days.get());
 
     let mirror_byhash_path: PathBuf = [
         &global_config().cache_directory,
