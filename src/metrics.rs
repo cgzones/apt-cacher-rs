@@ -212,7 +212,9 @@ pub(crate) static BYTES_SERVED_SPLICE: Accumulator = Accumulator::new();
 /// Bytes delivered via plain userspace read/write copy.
 pub(crate) static BYTES_SERVED_COPY: Accumulator = Accumulator::new();
 /// Bytes delivered to late joiners via the hyper `ChannelBody` streaming path
-/// (`serve_unfinished_file`). Counted at frame-poll time.
+/// (`serve_unfinished_file`). Counted at frame-poll time (when hyper requests
+/// the frame, not when the kernel acks the write) — slightly overcounts on
+/// aborted clients vs. the post-write splice/sendfile counters.
 pub(crate) static BYTES_SERVED_CHANNEL: Accumulator = Accumulator::new();
 
 /// Bytes proxied uncached. Counted at frame-poll time (no post-write hook in

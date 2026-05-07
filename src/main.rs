@@ -1969,8 +1969,6 @@ async fn serve_unfinished_file(
 ) -> Response<ProxyCacheBody> {
     let config = global_config();
 
-    metrics::REQUESTS_CHANNEL.increment();
-
     // For joining clients, try reading from xattr as the download task may have already written it.
     let resolved_etag = match upstream_etag {
         EtagState::Some(etag) => Some(etag),
@@ -2143,6 +2141,7 @@ async fn serve_unfinished_file(
         response_builder = response_builder.header(CONTENT_LENGTH, HeaderValue::from(size.get()));
     }
 
+    metrics::REQUESTS_CHANNEL.increment();
     let channel_body = ChannelBody::new(rx, content_length);
 
     let rated = MaybeRated::new(
