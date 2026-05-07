@@ -1842,7 +1842,7 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "kTLS RX Enabled / permanent Fallbacks / transient Fallbacks",
-        "Connections where kernel-TLS receive offload was enabled vs. fell back to userspace TLS, either permanently or for a single record.",
+        "Connections where kernel-TLS receive offload was enabled and successfully started splicing application data, vs. fallback events: permanent (host blocked from kTLS retries until cooldown expires) or transient (post-`setup_rx` drain race; host not blocked).",
         format_args!(
             "{} / {} / {}",
             metrics::KTLS_RX_ENABLED.get(),

@@ -393,11 +393,18 @@ pub(crate) static AUTHZ_REJECTED_CLIENT: Counter = Counter::new();
 /// Authorization rejection: HTTPS-tunnel CONNECT denied by the tunnel-mirror list.
 pub(crate) static AUTHZ_REJECTED_TUNNEL_MIRROR: Counter = Counter::new();
 
-/// kTLS receive offload was enabled on an upstream connection.
+/// kTLS receive offload was enabled and the connection successfully started
+/// splicing application data. Connections where the kernel-level setup
+/// succeeded but a subsequent step (e.g. the post-`setup_rx` drain) failed
+/// are not counted here — they fall under `KTLS_FALLBACK_TRANSIENT`.
 pub(crate) static KTLS_RX_ENABLED: Counter = Counter::new();
-/// kTLS fell back to userspace TLS for the rest of the connection.
+/// kTLS setup failed permanently for this host: the host is added to the
+/// kTLS-blocklist for the configured cooldown and subsequent connections
+/// skip kTLS until it expires.
 pub(crate) static KTLS_FALLBACK_PERMANENT: Counter = Counter::new();
-/// kTLS fell back to userspace TLS for a single record (recovered after).
+/// kTLS setup failed for a transient reason (e.g. drain race after
+/// `setup_rx` already succeeded at the kernel level); the host is not
+/// blocked from kTLS retries on subsequent connections.
 pub(crate) static KTLS_FALLBACK_TRANSIENT: Counter = Counter::new();
 
 /// Transfers cancelled because the upstream min-rate threshold was not met.

@@ -1090,15 +1090,18 @@ async fn unbuffered_ktls_request(
          (shared ClientSessionMemoryCache enables resumption for subsequent connections)"
     );
 
-    // TLS handshake succeeded — all errors from here are KtlsSetupFailed
-    // (except ResponseNotSpliceable for non-200/no-CL responses).
+    // TLS handshake succeeded — errors from here are KtlsSetupFailed,
+    // with two exceptions: ResponseNotSpliceable (non-200/no-CL responses,
+    // routing decision) and KtlsSetupFailedTransient (post-`setup_rx`
+    // drain race in Phase 5, no host-block).
 
     // --- Phase 2 of 5: Send HTTP Request ---
     // Process any pending records (e.g. NewSessionTickets from TLS 1.3),
     // then encrypt and send the HTTP request.
     //
     // From here on, TLS handshake has succeeded, so errors are KtlsSetupFailed
-    // (except ResponseNotSpliceable for non-200/no-CL responses).
+    // (except ResponseNotSpliceable for non-200/no-CL responses, and
+    // KtlsSetupFailedTransient for the Phase 5 post-`setup_rx` drain race).
     outgoing_used = 0;
     // Guard against a connection stuck in non-WriteTraffic states post-handshake.
     // TLS 1.3 typically sends 1-2 NewSessionTicket records; a handful of iterations
