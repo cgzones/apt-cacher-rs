@@ -1719,19 +1719,28 @@ fn build_metrics_html() -> String {
             metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.get(),
         ),
     );
-    t.row_tip(
-        "Upstream Pool (reused / new, miss: empty / dead / failed, return-evicted)",
-        "Upstream connection pool counters: reused vs. newly opened connections, miss reasons (pool empty, peer-closed connection, failed health check), and connections evicted when returned.",
-        format_args!(
-            "{} / {}, miss: {} / {} / {}, return-evicted {}",
-            metrics::POOL_REUSED.get(),
-            metrics::POOL_NEW.get(),
-            metrics::POOL_MISS_EMPTY.get(),
-            metrics::POOL_MISS_DEAD.get(),
-            metrics::POOL_MISS_FAILED.get(),
-            metrics::POOL_RETURN_EVICTED.get(),
-        ),
-    );
+    {
+        let pool_new = metrics::POOL_NEW.get();
+        let miss_empty = metrics::POOL_MISS_EMPTY.get();
+        let miss_dead = metrics::POOL_MISS_DEAD.get();
+        let miss_failed = metrics::POOL_MISS_FAILED.get();
+        // Invariant: every POOL_NEW falls through from exactly one POOL_MISS_*
+        // arm, so the three miss counters must sum to POOL_NEW. Warn on
+        // mismatch — counting bug or split call site.
+        t.row_tip(
+            "Upstream Pool (reused / new, miss: empty / dead / failed, return-evicted)",
+            "Upstream connection pool counters: reused vs. newly opened connections, miss reasons (pool empty, peer-closed connection, failed health check), and connections evicted when returned.",
+            format_args!(
+                "{} / {}, miss: {} / {} / {}, return-evicted {}",
+                metrics::POOL_REUSED.get(),
+                WarnIf::new(pool_new, pool_new != miss_empty + miss_dead + miss_failed),
+                miss_empty,
+                miss_dead,
+                miss_failed,
+                metrics::POOL_RETURN_EVICTED.get(),
+            ),
+        );
+    }
     t.row_tip(
         "HTTP Timeouts (upstream connect / upstream read / client header read / client header write / client body)",
         "Configured-timeout firings on upstream connect, upstream body read, client request-header read, client response-header write, and client response-body write paths.",
