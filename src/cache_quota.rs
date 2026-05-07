@@ -119,12 +119,18 @@ impl CacheQuota {
 
         let expected = actual_cache_size + active_downloading_size;
         let difference = stored.abs_diff(expected);
+        let increased = expected > stored;
         if difference != 0 {
             *mg = expected;
             metrics::RECONCILE_EVENTS.increment();
             metrics::RECONCILE_BYTES_REPAIRED.increment_by(difference);
         }
         drop(mg);
+        // An upward reconcile may push past the prior utilisation peak; downward
+        // reconciles cannot, so skip the sample to avoid pointless work.
+        if increased {
+            self.sample_utilization_peak_with(expected);
+        }
         (stored, expected, difference)
     }
 
