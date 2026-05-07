@@ -291,8 +291,17 @@ pub(crate) static UPSTREAM_HYPER_BODY_ERR: Counter = Counter::new();
 pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 
 /// Bytes copied client → upstream through the CONNECT tunnel.
+///
+/// Counts are recorded only when the tunnel terminates cleanly:
+/// `tokio::io::copy_bidirectional_with_sizes` returns the per-direction
+/// totals as a tuple on success, but on error it discards them. Tunnels
+/// that fail mid-transfer are therefore not reflected in this counter.
 pub(crate) static BYTES_TUNNELED_CLIENT_TO_UPSTREAM: Accumulator = Accumulator::new();
 /// Bytes copied upstream → client through the CONNECT tunnel.
+///
+/// Same caveat as `BYTES_TUNNELED_CLIENT_TO_UPSTREAM`: only successfully
+/// terminated tunnels contribute; bytes transferred before an error are
+/// unobservable through `copy_bidirectional_with_sizes`'s API.
 pub(crate) static BYTES_TUNNELED_UPSTREAM_TO_CLIENT: Accumulator = Accumulator::new();
 
 /// HTTP timeout firings: upstream body read.
