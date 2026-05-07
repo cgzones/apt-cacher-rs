@@ -282,8 +282,22 @@ pub(crate) static BYTES_TUNNELED_UPSTREAM_TO_CLIENT: Accumulator = Accumulator::
 pub(crate) static HTTP_TIMEOUT_UPSTREAM_READ: Counter = Counter::new();
 /// HTTP timeout firings: upstream TCP/TLS handshake.
 pub(crate) static HTTP_TIMEOUT_UPSTREAM_CONNECT: Counter = Counter::new();
-/// HTTP timeout firings: client failing to drain the response in time.
-pub(crate) static HTTP_TIMEOUT_CLIENT: Counter = Counter::new();
+/// HTTP timeout firings: client failed to send request headers in time
+/// (slow-loris-shaped, or a stalled client between keep-alive requests).
+///
+/// Scope: only updated by the sendfile backend's `read_request_headers`;
+/// in `cfg(not(feature = "sendfile"))` builds (non-default) hyper's own
+/// (default-off) `header_read_timeout` would govern this and the counter
+/// stays at 0.
+pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER: Counter = Counter::new();
+/// HTTP timeout firings: client failed to drain the response body in time
+/// (slow reader, dropped link, or `min_download_rate` violation).
+///
+/// Scope: covers every sendfile/splice/userspace-copy client write path
+/// (via `wait_socket_rated` and `write_all_to_stream`). Hyper's
+/// internal-timer body delivery is not routed through these helpers and
+/// is not counted here.
+pub(crate) static HTTP_TIMEOUT_CLIENT_BODY: Counter = Counter::new();
 
 /// `max_upstream_downloads` saturation episodes — debounced (latched at cap,
 /// cleared when the active set drains to zero). Climbing → recurring saturation.

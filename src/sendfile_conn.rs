@@ -261,7 +261,7 @@ async fn read_request_headers(
         Ok(Ok(next_index)) => Ok(next_index),
         Ok(Err(err)) => Err(err),
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            metrics::HTTP_TIMEOUT_CLIENT.increment();
+            metrics::HTTP_TIMEOUT_CLIENT_HEADER.increment();
             Err(std::io::Error::new(
                 ErrorKind::TimedOut,
                 "reading TCP stream request headers timed out",
@@ -1403,7 +1403,7 @@ async fn wait_socket_rated(
         Ok(result) => result,
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
             match direction {
-                RateCheckDirection::Client => metrics::HTTP_TIMEOUT_CLIENT.increment(),
+                RateCheckDirection::Client => metrics::HTTP_TIMEOUT_CLIENT_BODY.increment(),
                 RateCheckDirection::Upstream => metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment(),
             }
             Err(std::io::Error::new(ErrorKind::TimedOut, timeout_msg))

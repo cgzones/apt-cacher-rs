@@ -252,7 +252,7 @@ pub(crate) async fn write_all_to_stream(stream: &TcpStream, data: &[u8]) -> std:
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(err),
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            metrics::HTTP_TIMEOUT_CLIENT.increment();
+            metrics::HTTP_TIMEOUT_CLIENT_BODY.increment();
             Err(std::io::Error::new(
                 ErrorKind::TimedOut,
                 "TCP stream write operation timed out",

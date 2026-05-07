@@ -1718,13 +1718,14 @@ fn build_metrics_html() -> String {
         ),
     );
     t.row_tip(
-        "HTTP Timeouts (upstream connect / upstream read / client)",
-        "Configured-timeout firings on upstream connect, upstream read, and client read paths.",
+        "HTTP Timeouts (upstream connect / upstream read / client header / client body)",
+        "Configured-timeout firings on upstream connect, upstream body read, client request-header read, and client response-body write paths.",
         format_args!(
-            "{} / {} / {}",
+            "{} / {} / {} / {}",
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.get(),
             metrics::HTTP_TIMEOUT_UPSTREAM_READ.get(),
-            metrics::HTTP_TIMEOUT_CLIENT.get(),
+            metrics::HTTP_TIMEOUT_CLIENT_HEADER.get(),
+            metrics::HTTP_TIMEOUT_CLIENT_BODY.get(),
         ),
     );
     t.row_tip(
