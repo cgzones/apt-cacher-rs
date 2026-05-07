@@ -154,6 +154,9 @@ pub(crate) static TUNNEL_CONNECTS_TOTAL: Counter = Counter::new();
 pub(crate) static TUNNEL_REJECTED_POLICY: Counter = Counter::new();
 /// CONNECT tunnels rejected because the active-tunnel cap was reached.
 pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
+/// Peak concurrent CONNECT tunnels (sum across all source IPs).  Use to
+/// validate `https_tunnel_max_connections_per_client` headroom.
+pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();
 
 /// Requests that included an HTTP header outside the daemon's known set
 /// (`warn_once_or_info!("Unhandled HTTP header …")`). Each occurrence is

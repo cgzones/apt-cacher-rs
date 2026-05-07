@@ -4046,16 +4046,24 @@ mod client_counter {
 mod tunnel_limiter {
     use std::net::IpAddr;
     use std::num::NonZero;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hashbrown::HashMap;
+
+    use crate::metrics;
 
     static TUNNEL_CONNECTIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
+    /// Total active tunnels across all source IPs. Maintained alongside
+    /// the per-IP map so the dashboard / peak metric can be read without
+    /// taking the per-IP lock.
+    static ACTIVE_TUNNELS: AtomicUsize = AtomicUsize::new(0);
+
     /// Current number of active HTTPS tunnel connections across all clients.
     #[must_use]
     pub(crate) fn active_tunnels() -> usize {
-        TUNNEL_CONNECTIONS.lock().values().sum()
+        ACTIVE_TUNNELS.load(Ordering::Relaxed)
     }
 
     /// Try to acquire a tunnel slot for the given client IP.
@@ -4068,6 +4076,8 @@ mod tunnel_limiter {
         }
         *count += 1;
         drop(map);
+        let current = ACTIVE_TUNNELS.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics::CONNECT_TUNNEL_ACTIVE_PEAK.update(current as u64);
         Some(TunnelGuard { client_ip })
     }
 
@@ -4085,6 +4095,8 @@ mod tunnel_limiter {
                     entry.remove();
                 }
             }
+            drop(map);
+            ACTIVE_TUNNELS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }

@@ -1858,9 +1858,14 @@ fn build_metrics_html() -> String {
         ),
     );
     t.row_tip(
-        "Tunnel Connects",
-        "HTTPS-tunnel CONNECT requests accepted.",
-        metrics::TUNNEL_CONNECTS_TOTAL.get(),
+        "Tunnel Connects (total / active / peak)",
+        "HTTPS-tunnel CONNECT requests accepted, currently active, and peak observed since startup.",
+        format_args!(
+            "{} / {} / {}",
+            metrics::TUNNEL_CONNECTS_TOTAL.get(),
+            active_tunnels(),
+            metrics::CONNECT_TUNNEL_ACTIVE_PEAK.get(),
+        ),
     );
     t.row_tip(
         "Tunnel Bytes (client \u{2192} upstream / upstream \u{2192} client)",
