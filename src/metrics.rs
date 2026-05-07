@@ -283,9 +283,10 @@ pub(crate) static UPSTREAM_HYPER_CONNECT_FAILED: Counter = Counter::new();
 /// received, while streaming the body (peer aborted / framing error).
 pub(crate) static UPSTREAM_HYPER_BODY_ERR: Counter = Counter::new();
 
-/// Local cache I/O failures: stat/open of cached files returning a 5xx to
-/// the client. Distinct from `CACHE_SIZE_CORRUPTION`, which is specific to
-/// on-disk size accounting drift.
+/// Local cache I/O failures: any cached-file syscall (stat/open/mmap/seek/
+/// create) that returned a 5xx to the client. Distinct from
+/// `CACHE_SIZE_CORRUPTION`, which is specific to on-disk size accounting
+/// drift.
 pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 
 /// Bytes copied client → upstream through the CONNECT tunnel.

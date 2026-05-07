@@ -1384,6 +1384,7 @@ async fn serve_cached_file_mmap(
     })
     .await
     .expect("task should not panic") else {
+        metrics::CACHE_IO_FAILURE.increment();
         return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
     };
 
@@ -1447,6 +1448,7 @@ async fn serve_cached_file_buf(
     let client = conn_details.client;
 
     if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "Error seeking cached file `{}` to {start}/{file_size}:  {err}",
             file_path.display()
@@ -3016,6 +3018,7 @@ async fn serve_new_file(
             match utils::create_partial_file(guard, 0o640).await {
                 Ok((f, p)) => (f, p),
                 Err((err, path)) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!("Error creating partial file `{}`:  {err}", path.display());
                     return quick_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -3032,6 +3035,7 @@ async fn serve_new_file(
             match tokio_tempfile(&tmppath, 0o640).await {
                 Ok((f, p)) => (f, p),
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "Error creating temporary file `{}`:  {err}",
                         tmppath.display()
