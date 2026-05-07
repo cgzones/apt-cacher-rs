@@ -5367,6 +5367,7 @@ async fn handle_volatile_buffered_download(
     } else {
         StatusCode::OK
     });
+    metrics::REQUESTS_SPLICE.increment();
     write_all_to_stream(client_stream, response_headers.as_bytes())
         .await
         .map_err(|err| {
@@ -5404,6 +5405,7 @@ async fn handle_volatile_buffered_download(
             );
             SpliceProxyError::AfterHeaderError
         })?;
+        metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
 
     drop(cork);
