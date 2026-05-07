@@ -1280,6 +1280,7 @@ pub(crate) async fn serve_file_via_sendfile(
     let start = Instant::now();
 
     // Use sendfile(2) to transfer the file body
+    metrics::REQUESTS_SENDFILE.increment();
     let transfer_result = async_sendfile(stream, &file, content_start, content_length).await;
 
     match transfer_result {
@@ -1620,10 +1621,7 @@ pub(crate) async fn async_sendfile(
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     match sendfile_chunk_loop(socket, file, &mut file_offset, count, &mut rate_checker).await? {
-        ChunkLoopOutcome::Complete => {
-            metrics::REQUESTS_SENDFILE.increment();
-            Ok(())
-        }
+        ChunkLoopOutcome::Complete => Ok(()),
         ChunkLoopOutcome::Eof { transferred } => Err(std::io::Error::new(
             ErrorKind::UnexpectedEof,
             format!(

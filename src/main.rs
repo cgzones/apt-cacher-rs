@@ -620,6 +620,7 @@ struct DeliveryStreamBody<S> {
 impl<S> DeliveryStreamBody<S> {
     #[must_use]
     fn new(stream: S, size: u64, partial: bool, conn_details: ConnectionDetails) -> Self {
+        metrics::REQUESTS_COPY.increment();
         Self {
             stream,
             start: Instant::now(),
@@ -678,7 +679,6 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
         let duration = self.start.elapsed();
         let transferred_bytes = self.transferred_bytes;
         metrics::BYTES_SERVED_COPY.increment_by(transferred_bytes);
-        metrics::REQUESTS_COPY.increment();
         let project = self.project();
         let cd = project.conn_details.take().expect("Option is set in new()");
         let error = project.error.take();
@@ -948,6 +948,7 @@ struct MmapBody {
 impl MmapBody {
     #[must_use]
     fn new(mapping: Mmap, length: usize, partial: bool, conn_details: ConnectionDetails) -> Self {
+        metrics::REQUESTS_MMAP.increment();
         Self {
             mapping: Arc::new(mapping),
             position: 0,
@@ -968,7 +969,6 @@ impl Drop for MmapBody {
         let elapsed = self.start.elapsed();
         let transferred_bytes = self.position as u64;
         metrics::BYTES_SERVED_MMAP.increment_by(self.position as u64);
-        metrics::REQUESTS_MMAP.increment();
         let cd = self.conn_details.take().expect("set in new()");
         tokio::task::spawn(async move {
             let aliased = match cd.aliased_host {
