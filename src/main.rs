@@ -3405,11 +3405,17 @@ fn connect_response(
         None
     };
 
+    // Account for the active tunnel regardless of whether the per-IP cap
+    // is configured, so `CONNECT_TUNNEL_ACTIVE_PEAK` and the dashboard's
+    // active count stay accurate on unlimited deployments.
+    let active_tunnel_guard = tunnel_limiter::ActiveTunnelGuard::new();
+
     metrics::TUNNEL_CONNECTS_TOTAL.increment();
     info!("Using un-cached tunnel for client {client} to {host}:{port}");
 
     tokio::task::spawn(async move {
         let _tunnel_guard = tunnel_guard;
+        let _active_tunnel_guard = active_tunnel_guard;
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 if let Err(err) = tunnel(client, upgraded, &host, port).await {
@@ -4089,9 +4095,9 @@ mod tunnel_limiter {
     static TUNNEL_CONNECTIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-    /// Total active tunnels across all source IPs. Maintained alongside
-    /// the per-IP map so the dashboard / peak metric can be read without
-    /// taking the per-IP lock.
+    /// Total active tunnels across all source IPs. Updated by
+    /// [`ActiveTunnelGuard`] on every CONNECT regardless of whether the
+    /// per-IP cap is configured, so the dashboard reflects real activity.
     static ACTIVE_TUNNELS: AtomicUsize = AtomicUsize::new(0);
 
     /// Current number of active HTTPS tunnel connections across all clients.
@@ -4100,8 +4106,35 @@ mod tunnel_limiter {
         ACTIVE_TUNNELS.load(Ordering::Relaxed)
     }
 
-    /// Try to acquire a tunnel slot for the given client IP.
+    /// Unconditionally count an active CONNECT tunnel for the lifetime of
+    /// this guard. Updates [`metrics::CONNECT_TUNNEL_ACTIVE_PEAK`] on
+    /// construction.
+    ///
+    /// Independent from the per-IP rate-limit [`TunnelGuard`] so the
+    /// dashboard's "active" and "peak" counts are maintained even when
+    /// `https_tunnel_max_connections_per_client` is unset.
+    pub(super) struct ActiveTunnelGuard {
+        _private: (),
+    }
+
+    impl ActiveTunnelGuard {
+        pub(super) fn new() -> Self {
+            let current = ACTIVE_TUNNELS.fetch_add(1, Ordering::Relaxed) + 1;
+            metrics::CONNECT_TUNNEL_ACTIVE_PEAK.update(current as u64);
+            Self { _private: () }
+        }
+    }
+
+    impl Drop for ActiveTunnelGuard {
+        fn drop(&mut self) {
+            ACTIVE_TUNNELS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Try to acquire a per-source-IP tunnel slot.
     /// Returns `Some(TunnelGuard)` if under the limit, `None` if at capacity.
+    /// Does *not* update the active-tunnel counter — that's
+    /// [`ActiveTunnelGuard`]'s job, and the caller composes both guards.
     pub(super) fn try_acquire(client_ip: IpAddr, max: NonZero<usize>) -> Option<TunnelGuard> {
         let mut map = TUNNEL_CONNECTIONS.lock();
         let count = map.entry(client_ip).or_insert(0);
@@ -4110,8 +4143,6 @@ mod tunnel_limiter {
         }
         *count += 1;
         drop(map);
-        let current = ACTIVE_TUNNELS.fetch_add(1, Ordering::Relaxed) + 1;
-        metrics::CONNECT_TUNNEL_ACTIVE_PEAK.update(current as u64);
         Some(TunnelGuard { client_ip })
     }
 
@@ -4129,8 +4160,6 @@ mod tunnel_limiter {
                     entry.remove();
                 }
             }
-            drop(map);
-            ACTIVE_TUNNELS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
