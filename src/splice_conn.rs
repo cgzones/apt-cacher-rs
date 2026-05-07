@@ -1237,7 +1237,29 @@ async fn unbuffered_ktls_request(
     // the entire buffer after each TLS record is appended.
     let mut header_search_offset = 0usize;
 
+    let mut header_read_rounds = 0u32;
+
     while !headers_complete {
+        /// Cap on outer header-read iterations. Each iteration corresponds to
+        /// one network read (or one record-processing pass that asks for more
+        /// data). A healthy small-header response completes in 1-2 iterations;
+        /// even a large-header response over 1-KiB packets sits well below
+        /// 256. Hitting the cap means the rustls state machine is stuck (e.g.
+        /// peer keeps sending records that never advance to `ReadTraffic`) —
+        /// fail fast and attribute the failure rather than waiting for
+        /// `http_timeout`.
+        const MAX_PHASE3_ROUNDS: u32 = 256;
+
+        header_read_rounds = header_read_rounds.saturating_add(1);
+        if header_read_rounds > MAX_PHASE3_ROUNDS {
+            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "Phase 3 header-read loop exceeded {MAX_PHASE3_ROUNDS} iterations without completion"
+                ),
+            )));
+        }
+
         // Process any TLS records already in the incoming buffer
         let need_more_data = loop {
             if incoming_used == 0 {
