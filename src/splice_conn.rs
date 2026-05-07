@@ -723,6 +723,10 @@ enum KtlsError {
     /// (non-200 status or missing/zero Content-Length). The caller reconnects
     /// via the standard path.
     ResponseNotSpliceable { response: UpstreamResponse },
+    /// TLS handshake succeeded but the upstream emitted malformed HTTP — the
+    /// failure has nothing to do with kTLS. The caller falls back to the
+    /// standard path without blocking kTLS for this host.
+    UpstreamProtocolError(std::io::Error),
     /// TLS+HTTP succeeded, but kTLS setup failed for a persistent reason
     /// (unsupported cipher, kernel lacks TLS ULP, ENOENT on setsockopt, ...).
     /// Blocks kTLS for the full `KTLS_BLOCK_DURATION`.
@@ -956,6 +960,19 @@ async fn try_unbuffered_ktls_connect(
             );
             KtlsResult::ResponseNotSpliceable { response }
         }
+        Ok(Err(KtlsError::UpstreamProtocolError(err))) => {
+            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+            warn!(
+                "kTLS: upstream {} sent malformed HTTP (no host-block):  {err}",
+                mirror.format_authority()
+            );
+            // Do not insert into KTLS_BLOCKED. The TLS layer worked; the upstream's
+            // HTTP framing is at fault, and that condition is independent of the
+            // kernel-TLS offload. Userspace fallback will hit the same problem.
+            KtlsResult::Failed {
+                tls_succeeded: true,
+            }
+        }
         Ok(Err(KtlsError::KtlsSetupFailed(err))) => {
             metrics::KTLS_FALLBACK_PERMANENT.increment();
             warn!(
@@ -1091,16 +1108,18 @@ async fn unbuffered_ktls_request(
     );
 
     // TLS handshake succeeded — errors from here are KtlsSetupFailed,
-    // with two exceptions: ResponseNotSpliceable (non-200/no-CL responses,
-    // routing decision) and KtlsSetupFailedTransient (post-`setup_rx`
-    // drain race in Phase 5, no host-block).
+    // with three exceptions: ResponseNotSpliceable (non-200/no-CL responses,
+    // routing decision), UpstreamProtocolError (malformed HTTP from upstream,
+    // no host-block), and KtlsSetupFailedTransient (post-`setup_rx` drain
+    // race in Phase 5, no host-block).
 
     // --- Phase 2 of 5: Send HTTP Request ---
     // Process any pending records (e.g. NewSessionTickets from TLS 1.3),
     // then encrypt and send the HTTP request.
     //
     // From here on, TLS handshake has succeeded, so errors are KtlsSetupFailed
-    // (except ResponseNotSpliceable for non-200/no-CL responses, and
+    // (except ResponseNotSpliceable for non-200/no-CL responses,
+    // UpstreamProtocolError for malformed HTTP from the upstream, and
     // KtlsSetupFailedTransient for the Phase 5 post-`setup_rx` drain race).
     outgoing_used = 0;
     // Guard against a connection stuck in non-WriteTraffic states post-handshake.
@@ -1326,8 +1345,13 @@ async fn unbuffered_ktls_request(
     }
 
     // --- Parse response to check status before setting up kTLS ---
+    // Malformed HTTP from the upstream is not a kTLS issue — surface it as
+    // UpstreamProtocolError so the host stays eligible for kTLS retries.
     let response = parse_upstream_response(&header_buf, header_end).map_err(|err| {
-        KtlsError::KtlsSetupFailed(std::io::Error::new(err.kind(), format!("kTLS:  {err}")))
+        KtlsError::UpstreamProtocolError(std::io::Error::new(
+            err.kind(),
+            format!("kTLS upstream protocol error:  {err}"),
+        ))
     })?;
 
     if response.status_code != 200 || response.content_length.is_none_or(|ct| ct == 0) {
