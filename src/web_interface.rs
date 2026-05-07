@@ -1529,7 +1529,11 @@ fn build_metrics_html() -> String {
             format_args!(
                 "{} / {} ({} / {})",
                 metrics::VOLATILE_HIT.get(),
-                WarnIf::new(refetched, refetched != refetched_uptodate + refetched_outofdate),
+                // Subset invariant: UPTODATE + OUTOFDATE only count the
+                // stale-but-present case; the volatile-not-found case bumps
+                // REFETCHED without either subset, so REFETCHED >= sum is the
+                // true invariant. Warn only on the impossible reverse direction.
+                WarnIf::new(refetched, refetched < refetched_uptodate + refetched_outofdate),
                 refetched_uptodate,
                 refetched_outofdate,
             ),
