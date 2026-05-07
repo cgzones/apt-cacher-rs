@@ -1370,6 +1370,19 @@ async fn wait_socket_rated(
     direction: RateCheckDirection,
     http_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
+    // The timeout-metric branch below maps `Upstream → HTTP_TIMEOUT_UPSTREAM_READ`
+    // unconditionally, so passing `(Writable, Upstream)` here would mislabel an
+    // upstream-write stall as an upstream-read stall. No caller does this today.
+    // If you need to wait on an upstream write, introduce a dedicated
+    // `HTTP_TIMEOUT_UPSTREAM_WRITE` metric and extend the match below first.
+    debug_assert!(
+        !matches!(
+            (op, direction),
+            (SocketReadiness::Writable, RateCheckDirection::Upstream)
+        ),
+        "wait_socket_rated has no metric for upstream-write timeouts; add HTTP_TIMEOUT_UPSTREAM_WRITE before introducing a caller"
+    );
+
     let timeout_msg = match (op, direction) {
         (SocketReadiness::Readable, RateCheckDirection::Client) => "client read timed out",
         (SocketReadiness::Writable, RateCheckDirection::Client) => "client write timed out",
