@@ -79,6 +79,15 @@ impl RateChecker {
         }
     }
 
+    /// Returns the configured timeframe (in seconds) over which the
+    /// rate is averaged.  Used by callers (e.g. `wait_socket_rated`)
+    /// that need to size their own poll cadence relative to the window.
+    #[cfg(feature = "sendfile")]
+    #[must_use]
+    pub(crate) fn timeframe(&self) -> NonZero<usize> {
+        self.buf.capacity()
+    }
+
     /// Adds the given number of bytes to the rate checker.
     pub(crate) fn add(&mut self, bytes: usize) {
         let elapsed = self.last.elapsed();

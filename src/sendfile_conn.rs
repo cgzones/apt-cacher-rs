@@ -1355,12 +1355,37 @@ enum SocketReadiness {
     Writable,
 }
 
+/// Cadence for the rate-check tick, derived from the configured
+/// `rate_check_timeframe`.  Aim for roughly five samples per window so
+/// `check_fail` fires well within the window on stalled sockets, then
+/// clamp to `[1 s, 5 s]`: the upper bound caps timer churn for the
+/// default 30 s window, and the lower bound preserves the original 1 s
+/// granularity for the warned-but-allowed sub-5 s configurations.
+///
+/// Worst-case detection latency is `timeframe + rate_check_tick`.  For
+/// the default 30 s window that is 35 s (~1.17× the window); the prior
+/// fixed-1 s tick gave 31 s (~1.03×) at the cost of one inner timer
+/// per second on every stalled socket.  Trade is intentional: the
+/// extra ~4 s of detection lag is negligible against a window measured
+/// in tens of seconds, and timer churn on the fast path drops 5×.
+fn rate_check_tick(rc: &RateChecker) -> std::time::Duration {
+    let secs = (rc.timeframe().get() / 5).clamp(1, 5);
+    std::time::Duration::from_secs(secs as u64)
+}
+
 /// Wait for the socket to become readable or writable, bounded by
-/// `http_timeout`.  When a `RateChecker` is supplied, polls in 1-second
-/// slices so a stalled socket trips the configured rate-check window
-/// (which may be much shorter than `http_timeout`).  `RateChecker::add`
-/// back-fills gaps on the next sample on its own; the `rc.add(0)` calls
-/// here only exist to drive `check_fail` on each tick.
+/// `http_timeout`.  When a `RateChecker` is supplied, also wakes up
+/// every [`rate_check_tick`] so a stalled socket trips the configured
+/// rate-check window.  `RateChecker::add` back-fills gaps on the next
+/// sample on its own; the `rc.add(0)` calls here only exist to drive
+/// `check_fail` on each tick.
+///
+/// Implementation note: the previous version constructed two
+/// `tokio::time::Timeout` futures per call (outer `http_timeout` plus a
+/// fresh inner 1 s timer per loop iteration), allocating even on the
+/// fast path where `wait_once` returns instantly.  This version pins
+/// one outer `Sleep` and one re-armable inner `Sleep`, then drives them
+/// with `tokio::select!` — no per-iteration allocation.
 async fn wait_socket_rated(
     socket: &TcpStream,
     op: SocketReadiness,
@@ -1388,40 +1413,54 @@ async fn wait_socket_rated(
         (SocketReadiness::Writable, RateCheckDirection::Upstream) => "upstream write timed out",
     };
 
-    let wait_once = || async move {
-        match op {
-            SocketReadiness::Readable => socket.readable().await,
-            SocketReadiness::Writable => socket.writable().await,
-        }
+    let bump_timeout = || match direction {
+        RateCheckDirection::Client => metrics::HTTP_TIMEOUT_CLIENT_BODY.increment(),
+        RateCheckDirection::Upstream => metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment(),
     };
 
-    match tokio::time::timeout(http_timeout, async {
-        if let Some(rc) = rate_checker {
-            loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(1), wait_once()).await {
-                    Ok(result) => return result,
-                    Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                        rc.add(0);
+    let outer = tokio::time::sleep(http_timeout);
+    tokio::pin!(outer);
 
-                        if let Some(rate) = rc.check_fail(direction) {
-                            return Err(rate_timeout_error(&rate, direction));
-                        }
+    if let Some(rc) = rate_checker {
+        let tick_period = rate_check_tick(rc);
+        let tick = tokio::time::sleep(tick_period);
+        tokio::pin!(tick);
+
+        loop {
+            tokio::select! {
+                biased;
+                result = async {
+                    match op {
+                        SocketReadiness::Readable => socket.readable().await,
+                        SocketReadiness::Writable => socket.writable().await,
                     }
+                } => return result,
+                () = &mut tick => {
+                    rc.add(0);
+                    if let Some(rate) = rc.check_fail(direction) {
+                        return Err(rate_timeout_error(&rate, direction));
+                    }
+                    tick.as_mut().reset(tokio::time::Instant::now() + tick_period);
+                }
+                () = &mut outer => {
+                    bump_timeout();
+                    return Err(std::io::Error::new(ErrorKind::TimedOut, timeout_msg));
                 }
             }
-        } else {
-            wait_once().await
         }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            match direction {
-                RateCheckDirection::Client => metrics::HTTP_TIMEOUT_CLIENT_BODY.increment(),
-                RateCheckDirection::Upstream => metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment(),
+    } else {
+        tokio::select! {
+            biased;
+            result = async {
+                match op {
+                    SocketReadiness::Readable => socket.readable().await,
+                    SocketReadiness::Writable => socket.writable().await,
+                }
+            } => result,
+            () = &mut outer => {
+                bump_timeout();
+                Err(std::io::Error::new(ErrorKind::TimedOut, timeout_msg))
             }
-            Err(std::io::Error::new(ErrorKind::TimedOut, timeout_msg))
         }
     }
 }
