@@ -4170,6 +4170,7 @@ async fn splice_proxy_drive(
                 )
                 .await;
             }
+            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
             debug!(
                 "splice proxy: no Content-Length for file {} from mirror {}",
                 conn_details.debname, conn_details.mirror
@@ -4194,6 +4195,7 @@ async fn splice_proxy_drive(
     let resume_offset = resume_offset; // mark immutable
 
     let Some(total_content_length) = NonZero::new(total_file_size) else {
+        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         debug!(
             "splice proxy: zero total file size for file {} from mirror {}",
             conn_details.debname, conn_details.mirror
@@ -4212,6 +4214,7 @@ async fn splice_proxy_drive(
         return Ok(());
     };
     let Some(body_content_length) = NonZero::new(body_content_length) else {
+        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         debug!(
             "splice proxy: zero body content length for file {} from mirror {}",
             conn_details.debname, conn_details.mirror
