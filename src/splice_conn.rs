@@ -4634,6 +4634,8 @@ async fn splice_proxy_drive(
                     "splice proxy: failed to write body prefix to client (continuing cache-only):  {err}"
                 );
                 prefix_client_failed = true;
+            } else {
+                metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
             }
         }
 
@@ -4687,6 +4689,8 @@ async fn splice_proxy_drive(
                     "splice proxy: failed to write kTLS extra body to client (continuing cache-only):  {err}"
                 );
                 prefix_client_failed = true;
+            } else {
+                metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
             }
         }
 
