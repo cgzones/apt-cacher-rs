@@ -1822,11 +1822,11 @@ fn build_metrics_html() -> String {
         WarnNonzero(metrics::UPSTREAM_PROTOCOL_VIOLATION.get()),
     );
     t.row_tip(
-        "Upstream (hyper) Failures connect / body",
-        "Hyper-backend upstream failures: pre-response (connect/TLS/request) and post-response body-stream errors. Splice-path equivalents are reported separately.",
+        "Upstream (hyper) Failures pre-response / body",
+        "Hyper-backend upstream failures: pre-response (connect/TLS/request framing) aggregated, and post-response body-stream errors. Splice-path equivalents are reported separately.",
         format_args!(
             "{} / {}",
-            WarnNonzero(metrics::UPSTREAM_HYPER_CONNECT_FAILED.get()),
+            WarnNonzero(metrics::UPSTREAM_HYPER_REQUEST_FAILED.get()),
             WarnNonzero(metrics::UPSTREAM_HYPER_BODY_ERR.get()),
         ),
     );

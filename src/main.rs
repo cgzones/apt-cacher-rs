@@ -447,7 +447,7 @@ pub(crate) async fn request_with_retry(
                     return Ok(response);
                 }
                 Err(err) if !err.is_connect() => {
-                    metrics::UPSTREAM_HYPER_CONNECT_FAILED.increment();
+                    metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
                     warn_once_or_info!(
                         "Request of internal client to {} failed:  {}",
                         parts.uri,
@@ -490,7 +490,7 @@ pub(crate) async fn request_with_retry(
                     }
 
                     if attempt > MAX_ATTEMPTS {
-                        metrics::UPSTREAM_HYPER_CONNECT_FAILED.increment();
+                        metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
                         if let Some(auth) = parts.uri.authority() {
                             let key = SchemeKeyRef {
                                 host: auth.host(),

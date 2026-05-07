@@ -275,10 +275,11 @@ pub(crate) static REQUESTS_CHANNEL: Counter = Counter::new();
 /// Any non-zero value points to a misbehaving upstream.
 pub(crate) static UPSTREAM_PROTOCOL_VIOLATION: Counter = Counter::new();
 
-/// Hyper-backend upstream request failures during connect / TLS / before any
-/// response was received. Splice-path equivalents are
-/// `UPSTREAM_CONNECT_FAILED` / `UPSTREAM_TLS_FAILED`.
-pub(crate) static UPSTREAM_HYPER_CONNECT_FAILED: Counter = Counter::new();
+/// Hyper-backend upstream request failures that aborted before any response
+/// headers were observed: TCP connect, TLS handshake, and post-connect
+/// framing/protocol errors are all aggregated here. Splice-path connect/TLS
+/// equivalents are `UPSTREAM_CONNECT_FAILED` / `UPSTREAM_TLS_FAILED`.
+pub(crate) static UPSTREAM_HYPER_REQUEST_FAILED: Counter = Counter::new();
 /// Hyper-backend upstream errors observed *after* response headers were
 /// received, while streaming the body (peer aborted / framing error).
 pub(crate) static UPSTREAM_HYPER_BODY_ERR: Counter = Counter::new();
