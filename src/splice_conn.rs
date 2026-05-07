@@ -57,7 +57,9 @@ use crate::sendfile_conn::{
 };
 
 use crate::tcp_cork_guard::CorkGuard;
-use crate::utils::{self, TempPath, hint_sequential_read, tokio_tempfile, touch_volatile_mtime};
+use crate::utils::{
+    self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_tempfile, touch_volatile_mtime,
+};
 use crate::{
     APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, CachedFlavor, ConnectionDetails,
     ContentLength, Never, OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
@@ -1972,10 +1974,7 @@ async fn splice_proxy_body(
                             .checked_sub(sent)
                             .expect("client_remaining tracks bytes still owed to the client");
                     }
-                    Err(err)
-                        if err.kind() == ErrorKind::BrokenPipe
-                            || err.kind() == ErrorKind::ConnectionReset =>
-                    {
+                    Err(err) if is_peer_disconnect(&err) => {
                         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                         info!("splice proxy: client disconnected during boundary chunk");
                         client_status = ClientStatus::Disconnected;
@@ -2320,10 +2319,7 @@ async fn splice_proxy_body_tls(
                             .checked_sub(sent)
                             .expect("client_remaining tracks bytes still owed to the client");
                     }
-                    Err(err)
-                        if err.kind() == ErrorKind::BrokenPipe
-                            || err.kind() == ErrorKind::ConnectionReset =>
-                    {
+                    Err(err) if is_peer_disconnect(&err) => {
                         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                         info!("splice proxy: client disconnected during TLS boundary chunk");
                         client_status = ClientStatus::Disconnected;
@@ -2437,7 +2433,7 @@ async fn serve_remaining_from_file(
             DeliveryResult::Success
         }
         Err(err) => {
-            if err.kind() == ErrorKind::BrokenPipe || err.kind() == ErrorKind::ConnectionReset {
+            if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 debug!(
                     "splice proxy: demoted client disconnected during file-serve from cache offset {content_start}:  {err}"
@@ -4533,7 +4529,7 @@ async fn splice_proxy_drive(
     write_all_to_stream(client_stream, response_headers.as_bytes())
         .await
         .map_err(|err| {
-            let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
+            let level = if is_peer_disconnect(&err) {
                 log::Level::Info
             } else {
                 log::Level::Warn
@@ -5362,7 +5358,7 @@ async fn handle_volatile_buffered_download(
     write_all_to_stream(client_stream, response_headers.as_bytes())
         .await
         .map_err(|err| {
-            let level = if err.kind() == std::io::ErrorKind::BrokenPipe {
+            let level = if is_peer_disconnect(&err) {
                 log::Level::Info
             } else {
                 log::Level::Warn

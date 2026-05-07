@@ -34,6 +34,24 @@ macro_rules! static_assert {
     };
 }
 
+/// Returns `true` when `err` indicates the peer terminated the connection
+/// (by reset, abort, half-close, EOF, or socket-level timeout). Used to
+/// demote routine "client went away" log lines from warn to info, since
+/// they are not actionable for the operator.
+#[must_use]
+pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::TimedOut
+            | ErrorKind::UnexpectedEof
+    )
+}
+
 /// Tri-state of an in-progress download's partial-file handling.
 ///
 /// - `Volatile`: non-permanent cache flavor — no partial-file semantics; caller creates a

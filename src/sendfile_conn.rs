@@ -31,7 +31,7 @@ use crate::http_range::{ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::tcp_cork_guard::CorkGuard;
-use crate::utils::hint_sequential_read;
+use crate::utils::{hint_sequential_read, is_peer_disconnect};
 use crate::{
     APP_NAME, ActiveDownloadStatus, AppState, CachedFlavor, ClientInfo, ConnectionDetails,
     ContentLength, Never, VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter,
@@ -1303,14 +1303,7 @@ pub(crate) async fn serve_file_via_sendfile(
             SendfileResult::Served(conn_action)
         }
         Err(err) => {
-            let is_client_disconnect = matches!(
-                err.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::TimedOut
-            );
-            if is_client_disconnect {
+            if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
                     "sendfile transfer cancelled for `{}` to client {}:  {}",
@@ -2007,15 +2000,7 @@ async fn serve_unfinished_sendfile(
             SendfileResult::Served(conn_action)
         }
         Err(err) => {
-            let is_client_disconnect = matches!(
-                err.kind(),
-                ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::TimedOut
-            );
-
-            if is_client_disconnect {
+            if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
                     "Joining client {} disconnected while serving downloading file {} from mirror {}{aliased}:  {}",

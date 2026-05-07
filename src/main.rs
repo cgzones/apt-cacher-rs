@@ -186,6 +186,7 @@ use crate::task_setup::task_setup;
 use crate::uncacheables::record_uncacheable;
 use crate::utils::TempPath;
 use crate::utils::hint_sequential_read;
+use crate::utils::is_peer_disconnect;
 use crate::utils::tokio_tempfile;
 use crate::utils::touch_volatile_mtime;
 use crate::web_interface::serve_web_interface;
@@ -3408,19 +3409,15 @@ fn connect_response(
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 if let Err(err) = tunnel(client, upgraded, &host, port).await {
-                    if err.kind() == std::io::ErrorKind::NotConnected {
-                        info!(
-                            "Error tunneling connection for client {client} to {host}:{port}:  {err}"
-                        );
-                    } else if err.kind() == std::io::ErrorKind::ConnectionReset {
-                        warn!(
-                            "Error tunneling connection for client {client} to {host}:{port}:  {err}"
-                        );
+                    let level = if is_peer_disconnect(&err) {
+                        Level::Info
                     } else {
-                        error!(
-                            "Error tunneling connection for client {client} to {host}:{port}:  {err}"
-                        );
-                    }
+                        Level::Error
+                    };
+                    log!(
+                        level,
+                        "Error tunneling connection for client {client} to {host}:{port}:  {err}"
+                    );
                 }
             }
             Err(err) => {
@@ -4464,30 +4461,15 @@ where
         + 'static,
 {
     #[must_use]
-    fn is_iokind(err: &hyper::Error, kind: std::io::ErrorKind) -> bool {
+    fn hyper_is_peer_disconnect(err: &hyper::Error) -> bool {
         if let Some(err) = std::error::Error::source(&err)
             && let Some(ioerr) = err.downcast_ref::<std::io::Error>()
-            && ioerr.kind() == kind
+            && is_peer_disconnect(ioerr)
         {
             return true;
         }
 
         false
-    }
-
-    #[must_use]
-    fn is_connection_reset(err: &hyper::Error) -> bool {
-        is_iokind(err, std::io::ErrorKind::ConnectionReset)
-    }
-
-    #[must_use]
-    fn is_shutdown_disconnect(err: &hyper::Error) -> bool {
-        is_iokind(err, std::io::ErrorKind::NotConnected)
-    }
-
-    #[must_use]
-    fn is_broken_pipe(err: &hyper::Error) -> bool {
-        is_iokind(err, std::io::ErrorKind::BrokenPipe)
     }
 
     #[must_use]
@@ -4513,15 +4495,11 @@ where
         .with_upgrades()
         .await
     {
-        if err.is_incomplete_message() || is_connection_reset(&err) {
-            info!("Connection to client {client} cancelled");
-        } else if is_shutdown_disconnect(&err) {
+        if err.is_incomplete_message() || hyper_is_peer_disconnect(&err) {
             info!(
-                "Improper connection shutdown for client {client}:  {}",
+                "Connection to client {client} disconnected:  {}",
                 ErrorReport(&err)
             );
-        } else if is_broken_pipe(&err) {
-            info!("Broken pipe for client {client}:  {}", ErrorReport(&err));
         } else if let Some(perr) = is_timeout(&err) {
             info!("{perr}");
         } else {
