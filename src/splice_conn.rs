@@ -4945,6 +4945,8 @@ async fn read_body_to_vec_until_eof(
             }
         };
 
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+
         if body.len().checked_add(n).is_none_or(|sum| sum > max_bytes) {
             warn_once_or_info!(
                 "splice proxy: volatile response body exceeded {max_bytes} byte cap"
@@ -5022,6 +5024,7 @@ async fn read_dechunk_body_to_vec(
                         ));
                     }
                 };
+            metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
             if let Some(ref mut rc) = rate_checker {
                 rc.add(n);
                 if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
