@@ -2567,6 +2567,7 @@ async fn tee_and_splice(
                     Ok(0) | Err(nix::errno::Errno::EPIPE | nix::errno::Errno::ECONNRESET) => {
                         // Client disconnected — drain the remaining teed bytes from pipe_A
                         // by splicing them to /dev/null (discard)
+                        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                         info!("splice proxy: client disconnected, continuing cache-only");
                         status = ClientStatus::Disconnected;
                         drain_pipe(upstream_pipe_rx, teed_remaining).await?;
