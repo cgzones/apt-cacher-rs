@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::num::NonZero;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
+use std::os::fd::AsFd as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -1552,6 +1552,27 @@ enum ChunkLoopOutcome {
     Eof { transferred: u64 },
 }
 
+/// Reason the inner blocking sendfile loop returned to async context.
+enum SendfileBatchStop {
+    /// Inner loop transferred all `count` requested bytes.
+    Done,
+    /// `sendfile(2)` returned 0 — caller treats as EOF.
+    Eof,
+    /// `sendfile(2)` returned `EAGAIN` — caller must wait for the socket
+    /// to become writable before re-entering the blocking loop.
+    NeedsWritable,
+    /// `sendfile(2)` returned an error other than `EAGAIN`/`EINTR`.
+    Error(nix::errno::Errno),
+}
+
+struct SendfileBatch {
+    /// Total bytes transferred during this batch.
+    transferred: usize,
+    /// Updated file offset after the last successful sendfile call.
+    new_offset: i64,
+    stop: SendfileBatchStop,
+}
+
 async fn sendfile_chunk_loop(
     socket: &TcpStream,
     file: &tokio::fs::File,
@@ -1559,6 +1580,11 @@ async fn sendfile_chunk_loop(
     amount: u64,
     rate_checker: &mut Option<RateChecker>,
 ) -> std::io::Result<ChunkLoopOutcome> {
+    // Per-syscall cap to avoid exceeding system limits.  Always within
+    // usize range since it fits in 31 bits.
+    const MAX_PER_SYSCALL: usize = 0x7fff_f000;
+    static_assert!(MAX_PER_SYSCALL < usize::MAX);
+
     let config = global_config();
     let mut remaining = amount;
 
@@ -1577,44 +1603,83 @@ async fn sendfile_chunk_loop(
         )
         .await?;
 
-        // Limit each sendfile call to avoid exceeding system limits.
-        // 0x7fff_f000 is always within usize range since it fits in 31 bits.
-        static_assert!(0x7fff_f000 < usize::MAX);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "no truncation since 0x7fff_f000 < usize::MAX"
-        )]
-        let chunk_size = std::cmp::min(remaining, 0x7fff_f000) as usize;
+        // Hand the entire "transfer up to `count` bytes" loop to one
+        // spawn_blocking so consecutive sendfile() syscalls run on the same
+        // blocking-pool thread without bouncing back through the tokio
+        // scheduler each time.  The blocking task only returns when the
+        // kernel socket buffer fills (EAGAIN), the file ends, or all
+        // requested bytes have moved — sharply reducing the per-request
+        // spawn_blocking count for large cached-file serves.
+        let count: usize = remaining.try_into().unwrap_or(usize::MAX);
+        let off_in = *file_offset;
 
-        let result = {
-            // Copy file descriptors
-            let socket_fd = socket.as_raw_fd();
-            let file_fd = file.as_raw_fd();
-            let mut off = *file_offset;
+        // Dup the socket and file descriptors so the blocking task owns its
+        // own kernel descriptors for the duration of the batch.  If the
+        // outer future is cancelled mid-batch (client disconnect, runtime
+        // shutdown), tokio cannot abort spawn_blocking — it merely detaches
+        // the JoinHandle.  Without these dups the kernel could reassign the
+        // raw fds (parent's TcpStream/File Drop closes them) before the
+        // blocking task's next sendfile() syscall, silently sending file
+        // data to an unrelated descriptor.  One dup pair per batch
+        // amortises across many sendfile() syscalls inside the closure.
+        let socket_dup = nix::unistd::dup(socket.as_fd())
+            .map_err(|errno| errno_to_io_error(errno, "dup of socket fd failed"))?;
+        let file_dup = nix::unistd::dup(file.as_fd())
+            .map_err(|errno| errno_to_io_error(errno, "dup of file fd failed"))?;
 
-            tokio::task::spawn_blocking(move || {
-                // SAFETY: socket_fd and file_fd are valid for the duration of this
-                // blocking task because the caller (`sendfile_chunk_loop`) holds
-                // references to the TcpStream and File, and awaits this task's
-                // completion before returning. BorrowedFd is used instead of OwnedFd
-                // (try_clone_to_owned) to avoid a dup() syscall per sendfile iteration.
-                let socket = unsafe { BorrowedFd::borrow_raw(socket_fd) };
-                // SAFETY: same reasoning as above — file_fd is valid for the
-                // duration of this blocking task.
-                let file = unsafe { BorrowedFd::borrow_raw(file_fd) };
-                sendfile(socket, file, Some(&mut off), chunk_size).map(|sent| (sent, off))
-            })
-            .await
-            .expect("task should not panic")
-        };
+        let batch = tokio::task::spawn_blocking(move || {
+            // OwnedFd ownership lives entirely inside the closure: the
+            // kernel descriptors stay open until the closure returns,
+            // regardless of whether the outer future was cancelled.
+            let socket = socket_dup.as_fd();
+            let file = file_dup.as_fd();
 
-        // Works on Linux, might work on FreeBSD and macOS, and is probably not supported elsewhere
-        let _: Never = match result {
-            Ok((0, off)) => {
-                debug_assert_eq!(
-                    off, *file_offset,
-                    "no bytes written, offset should not change"
-                );
+            let mut transferred: usize = 0;
+            let mut off = off_in;
+            let mut left = count;
+            let stop = loop {
+                if left == 0 {
+                    break SendfileBatchStop::Done;
+                }
+                let chunk_size = std::cmp::min(left, MAX_PER_SYSCALL);
+                match sendfile(socket, file, Some(&mut off), chunk_size) {
+                    Ok(0) => break SendfileBatchStop::Eof,
+                    Ok(n) => {
+                        transferred += n;
+                        left -= n;
+                    }
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        break SendfileBatchStop::NeedsWritable;
+                    }
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(e) => break SendfileBatchStop::Error(e),
+                }
+            };
+            SendfileBatch {
+                transferred,
+                new_offset: off,
+                stop,
+            }
+        })
+        .await
+        .expect("task should not panic");
+
+        // Apply state changes from whatever progress the batch made before
+        // it stopped (success or EAGAIN both leave us with bytes to credit).
+        *file_offset = batch.new_offset;
+        remaining = remaining
+            .checked_sub(batch.transferred as u64)
+            .expect("sendfile(2) should not transfer more bytes than requested");
+        metrics::BYTES_SERVED_SENDFILE.increment_by(batch.transferred as u64);
+        if let Some(rc) = rate_checker
+            && batch.transferred > 0
+        {
+            rc.add(batch.transferred);
+        }
+
+        match batch.stop {
+            SendfileBatchStop::Done => return Ok(ChunkLoopOutcome::Complete),
+            SendfileBatchStop::Eof => {
                 warn_once_or_debug!(
                     "sendfile returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining"
                 );
@@ -1622,26 +1687,11 @@ async fn sendfile_chunk_loop(
                     transferred: amount - remaining,
                 });
             }
-            Ok((sent, new_off)) => {
-                *file_offset = new_off;
-                remaining = remaining
-                    .checked_sub(sent as u64)
-                    .expect("sendfile(2) should not transfer more bytes than requested");
-                metrics::BYTES_SERVED_SENDFILE.increment_by(sent as u64);
-                if let Some(rc) = rate_checker {
-                    rc.add(sent);
-                }
-                continue;
+            SendfileBatchStop::NeedsWritable => (),
+            SendfileBatchStop::Error(errno) => {
+                return Err(errno_to_io_error(errno, "sendfile failed"));
             }
-            Err(nix::errno::Errno::EAGAIN) => {
-                // The socket is not ready to write, wait for it to become writable.
-                // For sendfile(2) regular input files, regardless of blocking or
-                // non-blocking, are always ready to read.
-                continue;
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(errno) => return Err(errno_to_io_error(errno, "sendfile failed")),
-        };
+        }
     }
 
     Ok(ChunkLoopOutcome::Complete)
