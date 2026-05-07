@@ -1170,6 +1170,13 @@ fn build_daemon_status_html(
             metrics::CONNECTED_CLIENTS_PEAK.get(),
         ),
     );
+    if let Some(cap) = rd.config.max_connections_per_client_ip {
+        t.row_tip(
+            "Per-Client-IP Connections (peak / cap)",
+            "Highest concurrent connection count observed from any single source IP since startup, against the configured cap. Use to right-size `max_connections_per_client_ip`.",
+            format_args!("{} / {}", metrics::PER_CLIENT_IP_PEAK.get(), cap),
+        );
+    }
     t.row(
         "Active Upstream Downloads",
         format_args!(

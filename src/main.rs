@@ -4028,6 +4028,9 @@ mod client_counter {
                     return None;
                 }
                 *count += 1;
+                let observed = *count as u64;
+                drop(map);
+                metrics::PER_CLIENT_IP_PEAK.update(observed);
             }
             let current = CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
             metrics::CONNECTED_CLIENTS_PEAK.update(current as u64);

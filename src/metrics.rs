@@ -163,6 +163,13 @@ pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();
 /// indicate a noisy or malicious source IP; consider alerting.
 pub(crate) static CONNECTION_REJECTED_PER_IP_CAP: Counter = Counter::new();
 
+/// Highest concurrent connection count observed from any single source IP.
+/// Only updated when `max_connections_per_client_ip` is configured (the
+/// per-IP map is otherwise not maintained). Use to size the cap: deploy
+/// with a generously high value, watch this peak settle, then lower the
+/// cap to a comfortable margin above it.
+pub(crate) static PER_CLIENT_IP_PEAK: Peak = Peak::new();
+
 /// Requests that included an HTTP header outside the daemon's known set
 /// (`warn_once_or_info!("Unhandled HTTP header …")`). Each occurrence is
 /// counted; the log entry itself is debounced.
