@@ -308,11 +308,23 @@ pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER: Counter = Counter::new();
 /// HTTP timeout firings: client failed to drain the response body in time
 /// (slow reader, dropped link, or `min_download_rate` violation).
 ///
-/// Scope: covers every sendfile/splice/userspace-copy client write path
-/// (via `wait_socket_rated` and `write_all_to_stream`). Hyper's
-/// internal-timer body delivery is not routed through these helpers and
-/// is not counted here.
+/// Scope: response-body writes via `write_all_to_stream(.., WritePhase::Body)`,
+/// every rated-write helper (`write_all_to_stream_rated`, `wait_socket_rated`),
+/// and the sendfile chunk loop. Hyper's internal-timer body delivery is not
+/// routed through these helpers and is not counted here. Header-write timeouts
+/// are tracked separately in `HTTP_TIMEOUT_CLIENT_HEADER_WRITE`.
 pub(crate) static HTTP_TIMEOUT_CLIENT_BODY: Counter = Counter::new();
+/// HTTP timeout firings: client failed to drain a response-header (or other
+/// small fixed control) write in time. Distinct from
+/// `HTTP_TIMEOUT_CLIENT_HEADER`, which counts request-header *reads* that
+/// stalled before any request was parsed.
+///
+/// Scope: header-only writes via `write_all_to_stream(.., WritePhase::Header)`
+/// — response headers, 304/416/error responses, and the splice path's
+/// upstream TLS-handshake control writes (the latter is a known scope leak
+/// since these bytes go upstream rather than to the client; the helper is
+/// shared).
+pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER_WRITE: Counter = Counter::new();
 
 /// `max_upstream_downloads` saturation episodes — debounced (latched at cap,
 /// cleared when the active set drains to zero). Climbing → recurring saturation.

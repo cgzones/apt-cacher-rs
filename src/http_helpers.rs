@@ -29,6 +29,14 @@ pub(crate) enum ConnectionVersion {
     Http11,
 }
 
+/// Distinguishes header-only writes from body-payload writes for timeout
+/// metric attribution in [`write_all_to_stream`].
+#[derive(Copy, Clone)]
+pub(crate) enum WritePhase {
+    Header,
+    Body,
+}
+
 impl std::fmt::Display for ConnectionVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -93,7 +101,7 @@ pub(crate) async fn write_304_response(
     );
     trace!("Outgoing 304 response:\n{response}");
     metrics::record_client_status(StatusCode::NOT_MODIFIED);
-    write_all_to_stream(stream, response.as_bytes()).await
+    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
 }
 
 /// Write a 416 Range Not Satisfiable response to the stream.
@@ -119,7 +127,7 @@ pub(crate) async fn write_416_response(
     );
     trace!("Outgoing 416 response:\n{response}");
     metrics::record_client_status(StatusCode::RANGE_NOT_SATISFIABLE);
-    write_all_to_stream(stream, response.as_bytes()).await
+    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
 }
 
 /// Write an error response to the stream.
@@ -155,7 +163,7 @@ pub(crate) async fn write_invalid_response(
     );
     trace!("Outgoing error response:\n{response}");
     metrics::record_client_status(status);
-    write_all_to_stream(stream, response.as_bytes()).await
+    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
 }
 
 pub(crate) struct ResponseHeaders<'a> {
@@ -213,13 +221,20 @@ pub(crate) async fn write_response_headers(
 
     trace!("Outgoing file response headers:\n{response}");
     metrics::record_client_status(headers.status);
-    write_all_to_stream(stream, response.as_bytes()).await
+    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
 }
 
 /// Write all bytes to the TCP stream, handling partial writes.
 ///
-/// Times out after the configured HTTP timeout.
-pub(crate) async fn write_all_to_stream(stream: &TcpStream, data: &[u8]) -> std::io::Result<()> {
+/// `phase` selects which timeout counter to bump if the configured HTTP
+/// timeout fires (`HTTP_TIMEOUT_CLIENT_HEADER_WRITE` for headers, control
+/// frames, and small fixed responses; `HTTP_TIMEOUT_CLIENT_BODY` for
+/// response-body bytes).
+pub(crate) async fn write_all_to_stream(
+    stream: &TcpStream,
+    data: &[u8],
+    phase: WritePhase,
+) -> std::io::Result<()> {
     async fn inner(stream: &TcpStream, mut data: &[u8]) -> std::io::Result<()> {
         while !data.is_empty() {
             stream.writable().await?;
@@ -252,7 +267,10 @@ pub(crate) async fn write_all_to_stream(stream: &TcpStream, data: &[u8]) -> std:
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(err),
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            metrics::HTTP_TIMEOUT_CLIENT_BODY.increment();
+            match phase {
+                WritePhase::Header => metrics::HTTP_TIMEOUT_CLIENT_HEADER_WRITE.increment(),
+                WritePhase::Body => metrics::HTTP_TIMEOUT_CLIENT_BODY.increment(),
+            }
             Err(std::io::Error::new(
                 ErrorKind::TimedOut,
                 "TCP stream write operation timed out",

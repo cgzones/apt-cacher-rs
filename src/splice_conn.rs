@@ -35,8 +35,8 @@ use crate::error::{ErrorReport, errno_to_io_error};
 use crate::guards::{DownloadBarrier, InitBarrier};
 use crate::http_etag::{is_valid_etag, read_etag, write_etag};
 use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, find_header, write_416_response, write_all_to_stream,
-    write_invalid_response,
+    ConnectionAction, ConnectionVersion, WritePhase, find_header, write_416_response,
+    write_all_to_stream, write_invalid_response,
 };
 use crate::http_last_modified::write_last_modified;
 use crate::http_range::{
@@ -760,7 +760,7 @@ async fn transmit_tls_data(
     outgoing_used: &mut usize,
 ) -> std::io::Result<()> {
     let result = if *outgoing_used > 0 {
-        let r = write_all_to_stream(tcp, &outgoing[..*outgoing_used]).await;
+        let r = write_all_to_stream(tcp, &outgoing[..*outgoing_used], WritePhase::Header).await;
         *outgoing_used = 0;
         r
     } else {
@@ -1170,7 +1170,7 @@ async fn unbuffered_ktls_request(
                 };
 
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
-                write_all_to_stream(tcp, &outgoing[..enc_len])
+                write_all_to_stream(tcp, &outgoing[..enc_len], WritePhase::Header)
                     .await
                     .map_err(KtlsError::KtlsSetupFailed)?;
                 break;
@@ -3953,7 +3953,7 @@ async fn splice_proxy_drive(
         metrics::record_client_status(upstream_resp.status_code);
 
         // Forward raw response headers to client
-        write_all_to_stream(client_stream, &header_buf[..header_end])
+        write_all_to_stream(client_stream, &header_buf[..header_end], WritePhase::Header)
             .await
             .map_err(SpliceProxyError::ClientError)?;
 
@@ -4531,21 +4531,25 @@ async fn splice_proxy_drive(
     } else {
         StatusCode::OK
     });
-    write_all_to_stream(client_stream, response_headers.as_bytes())
-        .await
-        .map_err(|err| {
-            let level = if is_peer_disconnect(&err) {
-                log::Level::Info
-            } else {
-                log::Level::Warn
-            };
-            log::log!(
-                level,
-                "splice proxy: failed to write response headers to client:  {err}"
-            );
+    write_all_to_stream(
+        client_stream,
+        response_headers.as_bytes(),
+        WritePhase::Header,
+    )
+    .await
+    .map_err(|err| {
+        let level = if is_peer_disconnect(&err) {
+            log::Level::Info
+        } else {
+            log::Level::Warn
+        };
+        log::log!(
+            level,
+            "splice proxy: failed to write response headers to client:  {err}"
+        );
 
-            SpliceProxyError::ClientError(err)
-        })?;
+        SpliceProxyError::ClientError(err)
+    })?;
 
     // For resumed downloads, send the existing partial file content to the client first
     // using sendfile(2) for zero-copy transfer from the cache file to the client socket.
@@ -5368,20 +5372,24 @@ async fn handle_volatile_buffered_download(
         StatusCode::OK
     });
     metrics::REQUESTS_SPLICE.increment();
-    write_all_to_stream(client_stream, response_headers.as_bytes())
-        .await
-        .map_err(|err| {
-            let level = if is_peer_disconnect(&err) {
-                log::Level::Info
-            } else {
-                log::Level::Warn
-            };
-            log::log!(
-                level,
-                "splice proxy: failed to write response headers to client:  {err}"
-            );
-            SpliceProxyError::ClientError(err)
-        })?;
+    write_all_to_stream(
+        client_stream,
+        response_headers.as_bytes(),
+        WritePhase::Header,
+    )
+    .await
+    .map_err(|err| {
+        let level = if is_peer_disconnect(&err) {
+            log::Level::Info
+        } else {
+            log::Level::Warn
+        };
+        log::log!(
+            level,
+            "splice proxy: failed to write response headers to client:  {err}"
+        );
+        SpliceProxyError::ClientError(err)
+    })?;
 
     // Send body (range-filtered if needed) to client.
     let body_slice = &body[client_range_start..client_range_start + client_range_len];
@@ -5633,9 +5641,13 @@ pub(crate) async fn splice_simple_proxy(
 
     metrics::record_client_status(resp.status_code);
     metrics::REQUESTS_PASSTHROUGH.increment();
-    write_all_to_stream(client_stream, rewritten_headers.as_bytes())
-        .await
-        .map_err(SpliceProxyError::ClientError)?;
+    write_all_to_stream(
+        client_stream,
+        rewritten_headers.as_bytes(),
+        WritePhase::Header,
+    )
+    .await
+    .map_err(SpliceProxyError::ClientError)?;
 
     // Forward any body data that arrived with the headers
     let body_prefix = &hdr_buf[hdr_end..];

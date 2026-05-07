@@ -23,7 +23,7 @@ use crate::deb_mirror::{
 };
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, ResponseHeaders, find_header, find_header_end,
+    ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header, find_header_end,
     write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
     write_response_headers,
 };
@@ -359,8 +359,8 @@ async fn write_webui_response(
 
     trace!("Outgoing web-interface response headers:\n{header}");
     metrics::record_client_status(status);
-    write_all_to_stream(stream, header.as_bytes()).await?;
-    write_all_to_stream(stream, &response.body).await
+    write_all_to_stream(stream, header.as_bytes(), WritePhase::Header).await?;
+    write_all_to_stream(stream, &response.body, WritePhase::Body).await
 }
 
 /// Compute the connection action based on the request headers.
