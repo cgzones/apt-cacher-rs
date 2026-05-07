@@ -3370,7 +3370,7 @@ fn connect_response(
     {
         info!("Rejecting https tunnel request for client {client} to not permitted port {port}");
         metrics::TUNNEL_REJECTED_POLICY.increment();
-        return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
+        return quick_response(StatusCode::FORBIDDEN, "HTTPS tunnel port not permitted");
     }
 
     if !config.https_tunnel_allowed_mirrors.is_empty()
@@ -3384,7 +3384,7 @@ fn connect_response(
         );
         metrics::TUNNEL_REJECTED_POLICY.increment();
         metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
-        return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
+        return quick_response(StatusCode::FORBIDDEN, "HTTPS tunnel target not permitted");
     }
 
     let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
