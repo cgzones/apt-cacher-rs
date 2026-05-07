@@ -154,6 +154,12 @@ pub(crate) static TUNNEL_CONNECTS_TOTAL: Counter = Counter::new();
 pub(crate) static TUNNEL_REJECTED_POLICY: Counter = Counter::new();
 /// CONNECT tunnels rejected because the active-tunnel cap was reached.
 pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
+/// Post-acceptance tunnel failures: the CONNECT was accepted (counted in
+/// `TUNNEL_CONNECTS_TOTAL`) but the tunnel did not complete cleanly.
+/// Covers HTTP-upgrade failure, upstream TCP connect failure / timeout,
+/// and mid-transfer errors from `copy_bidirectional_with_sizes`. Climbing
+/// values point to flaky upstream tunnels or aborted clients.
+pub(crate) static TUNNEL_TRANSFER_FAILED: Counter = Counter::new();
 /// Peak concurrent CONNECT tunnels (sum across all source IPs).  Use to
 /// validate `https_tunnel_max_connections_per_client` headroom.
 pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();

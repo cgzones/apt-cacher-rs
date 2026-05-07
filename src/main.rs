@@ -3426,6 +3426,7 @@ fn connect_response(
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 if let Err(err) = tunnel(client, upgraded, &host, port).await {
+                    metrics::TUNNEL_TRANSFER_FAILED.increment();
                     let level = if is_peer_disconnect(&err) {
                         Level::Info
                     } else {
@@ -3438,6 +3439,7 @@ fn connect_response(
                 }
             }
             Err(err) => {
+                metrics::TUNNEL_TRANSFER_FAILED.increment();
                 error!(
                     "Error upgrading connection for client {client} to {host}:{port}:  {}",
                     ErrorReport(&err)
