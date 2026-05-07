@@ -1728,6 +1728,11 @@ fn build_metrics_html() -> String {
         ),
     );
     t.row_tip(
+        "Unhandled Request Headers",
+        "Requests carrying an HTTP header outside the daemon's known set, on the upstream-relay path. Useful as a first-contact discovery signal; the log line itself is debounced.",
+        WarnNonzero(metrics::UNHANDLED_REQUEST_HEADERS.get()),
+    );
+    t.row_tip(
         "Upstream Retries",
         "Upstream requests retried after a transient failure.",
         metrics::UPSTREAM_RETRIES.get(),

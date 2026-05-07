@@ -2462,14 +2462,18 @@ async fn serve_new_file(
 
     for (name, value) in req.headers() {
         match name {
-            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE | &CACHE_CONTROL => (),
+            &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE | &CACHE_CONTROL
+            | &CONNECTION => (),
             n if n == PROXY_CONNECTION => (),
             &HOST => host = Some(value),
 
-            _ => warn_once_or_info!(
-                "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}",
-                conn_details.client
-            ),
+            _ => {
+                metrics::UNHANDLED_REQUEST_HEADERS.increment();
+                warn_once_or_info!(
+                    "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}",
+                    conn_details.client
+                );
+            }
         }
     }
     // mark immutable

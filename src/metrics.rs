@@ -155,6 +155,15 @@ pub(crate) static TUNNEL_REJECTED_POLICY: Counter = Counter::new();
 /// CONNECT tunnels rejected because the active-tunnel cap was reached.
 pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
 
+/// Requests that included an HTTP header outside the daemon's known set
+/// (`warn_once_or_info!("Unhandled HTTP header …")`). Each occurrence is
+/// counted; the log entry itself is debounced.
+///
+/// Scope: only counts requests that traverse the upstream-relay path
+/// (cache miss or volatile revalidation). Cache hits served via sendfile
+/// look up headers by name and never trip this counter.
+pub(crate) static UNHANDLED_REQUEST_HEADERS: Counter = Counter::new();
+
 /// Peak concurrent connected clients.
 pub(crate) static CONNECTED_CLIENTS_PEAK: Peak = Peak::new();
 /// Peak concurrent in-flight upstream downloads.
