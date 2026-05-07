@@ -4015,6 +4015,11 @@ mod client_counter {
 
     pub(super) struct ClientCounter {
         client_ip: IpAddr,
+        /// `true` iff `try_new` inserted/incremented an entry in
+        /// `CONNECTIONS_PER_IP`. When `false`, `Drop` skips the mutex
+        /// acquire entirely — the no-cap deployment path is then a single
+        /// atomic decrement.
+        tracked_per_ip: bool,
     }
 
     impl ClientCounter {
@@ -4025,7 +4030,7 @@ mod client_counter {
             client_ip: IpAddr,
             max_per_ip: Option<NonZero<usize>>,
         ) -> Option<Self> {
-            if let Some(max) = max_per_ip {
+            let tracked_per_ip = if let Some(max) = max_per_ip {
                 let mut map = CONNECTIONS_PER_IP.lock();
                 let count = map.entry(client_ip).or_insert(0);
                 if *count >= max.get() {
@@ -4037,16 +4042,25 @@ mod client_counter {
                 let observed = *count as u64;
                 drop(map);
                 metrics::PER_CLIENT_IP_PEAK.update(observed);
-            }
+                true
+            } else {
+                false
+            };
             let current = CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
             metrics::CONNECTED_CLIENTS_PEAK.update(current as u64);
-            Some(Self { client_ip })
+            Some(Self {
+                client_ip,
+                tracked_per_ip,
+            })
         }
     }
 
     impl Drop for ClientCounter {
         fn drop(&mut self) {
             CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+            if !self.tracked_per_ip {
+                return;
+            }
             let mut map = CONNECTIONS_PER_IP.lock();
             if let hashbrown::hash_map::Entry::Occupied(mut entry) = map.entry(self.client_ip) {
                 let count = entry.get_mut();
