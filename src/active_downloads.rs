@@ -12,7 +12,7 @@
 //!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
 //!   module-private [`AT_CAP`] latch so each saturation episode counts once.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,21 +24,30 @@ use crate::deb_mirror::Mirror;
 use crate::error::MirrorDownloadRate;
 use crate::{global_config, metrics};
 
+/// Layout discriminator for the active-downloads key.  `subdir` mirrors
+/// `ConnectionDetails::subdir`: `None` for structured pool, `Some("flat")`
+/// / `Some("dists/by-hash")` / etc. for layouts that live under a
+/// dedicated subtree.  Without this discriminator a flat-pool `.deb` and a
+/// structured-pool `.deb` with the same filename under the same mirror
+/// path would collide on the in-flight key (different files on disk, same
+/// late-joiner attach target).
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct ActiveDownloadKey {
     mirror: Mirror,
     debname: String,
+    subdir: Option<&'static Path>,
 }
 
 #[derive(Hash)]
 struct ActiveDownloadKeyRef<'a> {
     mirror: &'a Mirror,
     debname: &'a str,
+    subdir: Option<&'static Path>,
 }
 
 impl Equivalent<ActiveDownloadKey> for ActiveDownloadKeyRef<'_> {
     fn equivalent(&self, key: &ActiveDownloadKey) -> bool {
-        self.mirror == &key.mirror && self.debname == key.debname
+        self.mirror == &key.mirror && self.debname == key.debname && self.subdir == key.subdir
     }
 }
 
@@ -172,7 +181,12 @@ impl ActiveDownloads {
     /// `LATE_JOINER_PEAK_PER_DOWNLOAD`) is performed atomically when joining,
     /// so callers do not need to follow up with any metric helper.
     #[must_use]
-    pub(crate) fn insert(&self, mirror: &Mirror, debname: &str) -> InsertOutcome {
+    pub(crate) fn insert(
+        &self,
+        mirror: &Mirror,
+        debname: &str,
+        subdir: Option<&'static Path>,
+    ) -> InsertOutcome {
         enum LookupResult {
             Occupied {
                 status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
@@ -190,6 +204,7 @@ impl ActiveDownloads {
         let key = ActiveDownloadKey {
             mirror: mirror.to_owned(),
             debname: debname.to_owned(),
+            subdir,
         };
 
         // Create channel and status before acquiring write lock to minimize lock scope
@@ -240,10 +255,16 @@ impl ActiveDownloads {
     /// partial file via the sendfile backend before falling back to hyper.
     #[cfg(feature = "splice")]
     #[must_use]
-    pub(crate) fn originate(&self, mirror: &Mirror, debname: &str) -> OriginateOutcome {
+    pub(crate) fn originate(
+        &self,
+        mirror: &Mirror,
+        debname: &str,
+        subdir: Option<&'static Path>,
+    ) -> OriginateOutcome {
         let key = ActiveDownloadKey {
             mirror: mirror.to_owned(),
             debname: debname.to_owned(),
+            subdir,
         };
 
         let (tx, rx) = tokio::sync::watch::channel(());
@@ -295,8 +316,12 @@ impl ActiveDownloads {
         outcome
     }
 
-    pub(crate) fn remove(&self, mirror: &Mirror, debname: &str) {
-        let key = ActiveDownloadKeyRef { mirror, debname };
+    pub(crate) fn remove(&self, mirror: &Mirror, debname: &str, subdir: Option<&'static Path>) {
+        let key = ActiveDownloadKeyRef {
+            mirror,
+            debname,
+            subdir,
+        };
         let mut guard = self.inner.write();
         let was_present = guard.remove(&key);
         // Sample the post-remove length under the same write lock so the
@@ -329,8 +354,13 @@ impl ActiveDownloads {
         &self,
         mirror: &Mirror,
         debname: &str,
+        subdir: Option<&'static Path>,
     ) -> Option<Arc<tokio::sync::RwLock<ActiveDownloadStatus>>> {
-        let key = ActiveDownloadKeyRef { mirror, debname };
+        let key = ActiveDownloadKeyRef {
+            mirror,
+            debname,
+            subdir,
+        };
         let mut guard = self.inner.write();
         let entry = guard.get_mut(&key)?;
         entry.late_joiners += 1;

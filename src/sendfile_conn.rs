@@ -20,8 +20,9 @@ use crate::cache_conditional::CacheInfo;
 use crate::cache_metadata::{self, CacheMetadataKeyRef};
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{
-    Mirror, Origin, ResourceFile, is_deb_package, is_unsafe_proxy_path, parse_request_path,
-    valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
+    FlatKind, Mirror, Origin, ResourceFile, is_deb_package, is_unsafe_proxy_path,
+    parse_request_path, valid_architecture, valid_component, valid_distribution, valid_filename,
+    valid_mirrorname,
 };
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::http_helpers::{
@@ -807,6 +808,34 @@ async fn try_sendfile_request(
                 origin,
             )
         }
+        ResourceFile::Flat {
+            kind,
+            mirror_path,
+            filename,
+        } => {
+            let mirror_path =
+                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
+            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
+
+            let (cached_flavor, subdir) = match kind {
+                FlatKind::Metadata => (CachedFlavor::Volatile, Path::new("flat")),
+                FlatKind::Pool => {
+                    if !is_deb_package(&filename) {
+                        return SendfileResult::NotApplicable("non Debian binary flat pool file");
+                    }
+                    (CachedFlavor::Permanent, Path::new("flat"))
+                }
+                FlatKind::ByHash => (CachedFlavor::Permanent, Path::new("flat/by-hash")),
+            };
+
+            (
+                filename.into_owned(),
+                cached_flavor,
+                Some(subdir),
+                mirror_path,
+                None,
+            )
+        }
     };
 
     let aliased_host = global_config()
@@ -849,7 +878,7 @@ async fn try_sendfile_request(
     // upstream omits Content-Length).
     if let Some(dl_status) = appstate
         .active_downloads
-        .attach(&conn_details.mirror, &conn_details.debname)
+        .attach(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
     {
         let result = serve_unfinished_sendfile(
             stream,
@@ -1213,7 +1242,11 @@ pub(crate) async fn serve_file_via_sendfile(
     let cache_info = if let Some(meta) = prefetched_upstream_metadata {
         CacheInfo::with_meta(&metadata, meta)
     } else {
-        let key = CacheMetadataKeyRef::new(&conn_details.mirror, &conn_details.debname);
+        let key = CacheMetadataKeyRef::new(
+            &conn_details.mirror,
+            &conn_details.debname,
+            conn_details.subdir,
+        );
         CacheInfo::resolve(&file, file_path, &metadata, &key)
     };
 

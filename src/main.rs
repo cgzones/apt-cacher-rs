@@ -159,6 +159,7 @@ use crate::database_task::DbCmdDownload;
 use crate::database_task::DbCmdOrigin;
 use crate::database_task::db_loop;
 use crate::database_task::send_db_command;
+use crate::deb_mirror::FlatKind;
 use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
 use crate::deb_mirror::ResourceFile;
@@ -1175,8 +1176,11 @@ async fn serve_cached_file(
 
     let file_size = metadata.len();
 
-    let cache_key =
-        cache_metadata::CacheMetadataKeyRef::new(&conn_details.mirror, &conn_details.debname);
+    let cache_key = cache_metadata::CacheMetadataKeyRef::new(
+        &conn_details.mirror,
+        &conn_details.debname,
+        conn_details.subdir,
+    );
 
     // Caller pre-resolves on the volatile / late-joiner / originator paths;
     // otherwise fall back to the post-flight cache (lazy-loads xattr on miss).
@@ -1681,7 +1685,7 @@ async fn serve_volatile_file(
 
     match appstate
         .active_downloads
-        .insert(&conn_details.mirror, &conn_details.debname)
+        .insert(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
     {
         InsertOutcome::Joined { status } => {
             debug!(
@@ -2613,6 +2617,7 @@ async fn serve_new_file(
         &appstate.active_downloads,
         &conn_details.mirror,
         &conn_details.debname,
+        conn_details.subdir,
     );
 
     let (warn_on_override, prev_file_size) = match &cfstate {
@@ -2680,6 +2685,7 @@ async fn serve_new_file(
             let key = cache_metadata::CacheMetadataKeyRef::new(
                 &conn_details.mirror,
                 &conn_details.debname,
+                conn_details.subdir,
             );
 
             Some(cache_metadata::store().resolve(&key, file, file_path))
@@ -3449,7 +3455,7 @@ pub(crate) async fn process_cache_request(
 
             match appstate
                 .active_downloads
-                .insert(&conn_details.mirror, &conn_details.debname)
+                .insert(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
             {
                 InsertOutcome::Originator { init_tx, status } => {
                     trace!(
@@ -3964,6 +3970,46 @@ async fn pre_process_client_request(
                         send_db_command(cmd).await;
                     }
                 }
+
+                return process_cache_request(conn_details, req, appstate).await;
+            }
+            ResourceFile::Flat {
+                kind,
+                mirror_path,
+                filename,
+            } => {
+                validate!(mirror_path, ValidateKind::MirrorPath);
+                validate!(filename, ValidateKind::Filename);
+
+                trace!(
+                    "Decoded flat mirror path: `{mirror_path}`; Decoded flat filename: `{filename}` (kind: {kind:?})"
+                );
+
+                let (cached_flavor, subdir) = match kind {
+                    FlatKind::Metadata => (CachedFlavor::Volatile, Path::new("flat")),
+                    FlatKind::Pool => {
+                        if !deb_mirror::is_deb_package(&filename) {
+                            warn_once_or_info!(
+                                "Unsupported flat pool file extension in filename `{filename}` from client {client}"
+                            );
+                            return quick_response(
+                                hyper::StatusCode::BAD_REQUEST,
+                                "Unsupported request",
+                            );
+                        }
+                        (CachedFlavor::Permanent, Path::new("flat"))
+                    }
+                    FlatKind::ByHash => (CachedFlavor::Permanent, Path::new("flat/by-hash")),
+                };
+
+                let conn_details = ConnectionDetails {
+                    client,
+                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
+                    aliased_host,
+                    debname: filename.into_owned(),
+                    cached_flavor,
+                    subdir: Some(subdir),
+                };
 
                 return process_cache_request(conn_details, req, appstate).await;
             }

@@ -3573,7 +3573,7 @@ pub(crate) async fn splice_proxy(
     // count, since `attach()` and `insert()` are mutually exclusive paths.
     let (init_tx, status) = match appstate
         .active_downloads
-        .originate(&conn_details.mirror, &conn_details.debname)
+        .originate(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
     {
         OriginateOutcome::Originator { init_tx, status } => (init_tx, status),
         OriginateOutcome::Concurrent { status } => {
@@ -3622,6 +3622,7 @@ async fn splice_proxy_drive(
         &appstate.active_downloads,
         &conn_details.mirror,
         &conn_details.debname,
+        conn_details.subdir,
     );
 
     let mirror = &conn_details.mirror;
@@ -3690,6 +3691,7 @@ async fn splice_proxy_drive(
             let key = cache_metadata::CacheMetadataKeyRef::new(
                 &conn_details.mirror,
                 &conn_details.debname,
+                conn_details.subdir,
             );
             let if_none_match = cache_metadata::store()
                 .resolve(&key, &file, &cache_path)

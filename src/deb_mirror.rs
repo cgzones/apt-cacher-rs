@@ -205,6 +205,22 @@ impl UriFormat for &database::OriginEntry {
     }
 }
 
+/// Classification of a flat (trivial) repository resource.
+///
+/// Flat repositories serve apt resources directly under a base directory
+/// without the `dists/<dist>/<component>/binary-<arch>/` and `pool/...`
+/// hierarchies of structured Debian archives.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum FlatKind {
+    /// `Release`, `Release.gpg`, `InRelease`, `Packages{,.gz,.xz}`,
+    /// `Sources{,.gz,.xz}`.
+    Metadata,
+    /// A binary package (`.deb`, `.udeb`, `.ddeb`) served from the flat tree.
+    Pool,
+    /// A by-hash content-addressed file at `<base>/by-hash/SHA*/<hex>`.
+    ByHash,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum ResourceFile<'a> {
     /// A pool file
@@ -250,6 +266,13 @@ pub(crate) enum ResourceFile<'a> {
         mirror_path: &'a str,
         distribution: &'a str,
         component: &'a str,
+        filename: &'a str,
+    },
+    /// A resource served from a flat (trivial) repository.
+    /// See <https://wiki.debian.org/DebianRepository/Format#Flat_Repository_Format>.
+    Flat {
+        kind: FlatKind,
+        mirror_path: &'a str,
         filename: &'a str,
     },
 }
@@ -412,6 +435,72 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         return None;
     }
 
+    /*
+     * Flat (trivial) repository format — only reached when neither `/pool/`
+     * nor `/dists/` matched, so structured-layout rejections are preserved.
+     *
+     * apt/InRelease
+     * apt/Release.gpg
+     * apt/Packages.gz
+     * apt/twilio-cli_5.0.0_amd64.deb
+     * apt/by-hash/SHA256/<hex>
+     */
+    let (mirror_path, tail) = path.rsplit_once('/')?;
+    if mirror_path.is_empty() {
+        return None;
+    }
+
+    // By-hash: `<base>/by-hash/SHA*/<hex>` — hex tail of length >= 64 ensures
+    // SHA256 or stronger.  On structural mismatch fall through to None rather
+    // than reclassifying as a pool file.
+    if tail.len() >= 64 && tail.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if let Some((base, hash_algo)) = mirror_path.rsplit_once('/')
+            && hash_algo.starts_with("SHA")
+            && let Some((flat_base, by_hash_dir)) = base.rsplit_once('/')
+            && by_hash_dir == "by-hash"
+            && !flat_base.is_empty()
+        {
+            return Some(ResourceFile::Flat {
+                kind: FlatKind::ByHash,
+                mirror_path: flat_base,
+                filename: tail,
+            });
+        }
+        return None;
+    }
+
+    // Metadata: closed allowlist of canonical filenames documented by the
+    // flat-repo spec.  `Release.gpg` is accepted only here; the structured
+    // matcher's narrower set stays as-is.
+    if matches!(
+        tail,
+        "InRelease"
+            | "Release"
+            | "Release.gpg"
+            | "Packages"
+            | "Packages.gz"
+            | "Packages.xz"
+            | "Sources"
+            | "Sources.gz"
+            | "Sources.xz"
+    ) {
+        return Some(ResourceFile::Flat {
+            kind: FlatKind::Metadata,
+            mirror_path,
+            filename: tail,
+        });
+    }
+
+    // Pool data: enforce the strict `<name>_<version>_<arch>.<ext>` shape.
+    // Anything else falls through to the splice proxy.
+    if is_flat_deb_filename(tail) {
+        return Some(ResourceFile::Flat {
+            kind: FlatKind::Pool,
+            mirror_path,
+            filename: tail,
+        });
+    }
+
     None
 }
 
@@ -498,6 +587,28 @@ pub(crate) fn is_deb_package(filename: &str) -> bool {
     let extension = filename.rsplit_once('.').map(|(_, ext)| ext);
 
     matches!(extension, Some(ext) if VALID_DEB_EXTENSIONS.contains(&ext))
+}
+
+/// Whether the filename matches the strict `<name>_<version>_<arch>.<ext>`
+/// shape expected for binary packages served from a flat (trivial) repository.
+///
+/// This is intentionally stricter than [`is_deb_package`] so that an arbitrary
+/// `.deb`-suffixed filename in an unrelated S3 path isn't auto-cached just
+/// because the flat-repo fallback matched.
+#[must_use]
+pub(crate) fn is_flat_deb_filename(filename: &str) -> bool {
+    let Some((stem, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if !VALID_DEB_EXTENSIONS.contains(&ext) {
+        return false;
+    }
+    let mut parts = stem.split('_');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(name), Some(version), Some(arch), None)
+            if !name.is_empty() && !version.is_empty() && !arch.is_empty()
+    )
 }
 
 #[must_use]
@@ -843,6 +954,100 @@ mod tests {
         );
 
         /*
+         * Flat (trivial) repository format
+         */
+
+        assert_eq!(
+            parse_request_path("apt/InRelease"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "apt",
+                filename: "InRelease"
+            })
+        );
+
+        assert_eq!(
+            parse_request_path("apt/Release.gpg"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "apt",
+                filename: "Release.gpg"
+            })
+        );
+
+        assert_eq!(
+            parse_request_path("foo/bar/baz/Packages.gz"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "foo/bar/baz",
+                filename: "Packages.gz"
+            })
+        );
+
+        assert_eq!(
+            parse_request_path("apt/Sources.xz"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "apt",
+                filename: "Sources.xz"
+            })
+        );
+
+        assert_eq!(
+            parse_request_path("apt/twilio-cli_5.0.0_amd64.deb"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Pool,
+                mirror_path: "apt",
+                filename: "twilio-cli_5.0.0_amd64.deb"
+            })
+        );
+
+        // Flat package nested below the base directory (Packages may list
+        // entries with relative subpaths).
+        assert_eq!(
+            parse_request_path("apt/sub/twilio-cli_5.0.0_amd64.deb"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Pool,
+                mirror_path: "apt/sub",
+                filename: "twilio-cli_5.0.0_amd64.deb"
+            })
+        );
+
+        assert_eq!(
+            parse_request_path(
+                "apt/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::ByHash,
+                mirror_path: "apt",
+                filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            })
+        );
+
+        // The reporter's exact request path.
+        assert_eq!(
+            parse_request_path("/apt/InRelease"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "apt",
+                filename: "InRelease"
+            })
+        );
+
+        // Paths with neither `/pool/` nor `/dists/` that nonetheless carry a
+        // valid flat-shaped filename are accepted as flat — even if the path
+        // segments look like a typo'd structured layout.  No collision with
+        // structured caches because flat resources live under a `flat/` subdir.
+        assert_eq!(
+            parse_request_path("debian/loop/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Pool,
+                mirror_path: "debian/loop/main/f/firefox-esr",
+                filename: "firefox-esr_115.9.1esr-1_amd64.deb"
+            })
+        );
+
+        /*
          * failures
          */
 
@@ -851,26 +1056,7 @@ mod tests {
             None
         );
 
-        assert_eq!(
-            parse_request_path("debian/loop/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
-            None
-        );
-
-        assert_eq!(
-            parse_request_path("pool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
-            None
-        );
-
-        assert_eq!(
-            parse_request_path(
-                "debian%2Fpool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"
-            ),
-            None
-        );
-
         assert_eq!(parse_request_path("debian/dists/sid/Foo"), None);
-
-        assert_eq!(parse_request_path("debian/bar/sid/InRelease"), None);
 
         assert_eq!(parse_request_path("debian/dists/a/b/InRelease"), None);
 
@@ -883,6 +1069,48 @@ mod tests {
             parse_request_path("debian/dists/trixie/main/by-hash/SHA256/cf31e359ca5"),
             None
         );
+
+        // Empty mirror path before the flat resource.
+        assert_eq!(parse_request_path("InRelease"), None);
+        assert_eq!(parse_request_path("/InRelease"), None);
+
+        // Flat .deb shape with an extra underscore (four components).
+        assert_eq!(parse_request_path("apt/foo_1.0_amd64_extra.deb"), None);
+
+        // Flat .deb missing one component.
+        assert_eq!(parse_request_path("apt/foo_1.0.deb"), None);
+
+        // Flat .deb with an empty component.
+        assert_eq!(parse_request_path("apt/_3.5_amd64.deb"), None);
+        assert_eq!(parse_request_path("apt/foo__amd64.deb"), None);
+
+        // Single-component filename without underscores.
+        assert_eq!(parse_request_path("apt/foo.deb"), None);
+
+        // Flat by-hash with non-`SHA` algorithm segment.
+        assert_eq!(
+            parse_request_path(
+                "apt/by-hash/MD5/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            None
+        );
+
+        // Flat by-hash with hex tail shorter than 64 chars (excludes weak hashes).
+        assert_eq!(
+            parse_request_path("apt/by-hash/SHA1/cf31e359ca586340c1b2d3ddaa1d473519ad26bd"),
+            None
+        );
+
+        // Hex tail at an unrecognized location must not be reclassified as Pool.
+        assert_eq!(
+            parse_request_path(
+                "apt/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            None
+        );
+
+        // Arbitrary non-apt filename in an otherwise flat-shaped path.
+        assert_eq!(parse_request_path("apt/random.txt"), None);
     }
 
     #[test]
@@ -1090,5 +1318,39 @@ mod tests {
         assert!(!is_diff_request_path(
             "/debian/dists/sid/main/source/Sources.diff/Index"
         ));
+    }
+
+    #[test]
+    fn test_is_flat_deb_filename() {
+        // valid
+        assert!(is_flat_deb_filename("twilio-cli_5.0.0_amd64.deb"));
+        assert!(is_flat_deb_filename("firefox-esr_115.9.1esr-1_amd64.deb"));
+        assert!(is_flat_deb_filename("libssh-doc_0.10.6-2_all.deb"));
+        assert!(is_flat_deb_filename("foo_1.0_amd64.udeb"));
+        assert!(is_flat_deb_filename("foo_1.0_amd64.ddeb"));
+        // URL-encoded characters in version are tolerated.
+        assert!(is_flat_deb_filename(
+            "libtirpc3t64_1.3.4%2bds-1.2_amd64.deb"
+        ));
+
+        // invalid: wrong extension
+        assert!(!is_flat_deb_filename("twilio-cli_5.0.0_amd64.dsc"));
+        assert!(!is_flat_deb_filename("twilio-cli_5.0.0_amd64.tar.gz"));
+        assert!(!is_flat_deb_filename("Packages.gz"));
+
+        // invalid: no extension
+        assert!(!is_flat_deb_filename("twilio-cli_5.0.0_amd64"));
+
+        // invalid: too few components
+        assert!(!is_flat_deb_filename("foo.deb"));
+        assert!(!is_flat_deb_filename("foo_1.0.deb"));
+
+        // invalid: too many components
+        assert!(!is_flat_deb_filename("foo_1.0_amd64_extra.deb"));
+
+        // invalid: empty component
+        assert!(!is_flat_deb_filename("_1.0_amd64.deb"));
+        assert!(!is_flat_deb_filename("foo__amd64.deb"));
+        assert!(!is_flat_deb_filename("foo_1.0_.deb"));
     }
 }

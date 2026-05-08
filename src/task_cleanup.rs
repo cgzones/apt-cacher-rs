@@ -24,7 +24,7 @@ use crate::{
     AppState, CachedFlavor, ClientInfo, ConnectionDetails, ProxyCacheBody, ProxyCacheError,
     RETENTION_TIME, cache_metadata,
     database::{MirrorEntry, OriginEntry},
-    deb_mirror::{Mirror, UriFormat as _, mirror_cache_path_impl},
+    deb_mirror::{Mirror, UriFormat as _, is_deb_package, mirror_cache_path_impl},
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
     info_once, metrics, process_cache_request, task_cache_scan,
@@ -295,10 +295,12 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
 
     cleanup_stale_partials(&global_config().cache_directory, &mirrors).await;
 
-    // Create a stream of futures for both deb files and byhash files cleanup
+    // Create a stream of futures for structured deb files, flat deb files,
+    // and by-hash files cleanup.
     let cleanup_tasks = mirrors.into_iter().flat_map(|mirror| {
         [
             tokio::task::spawn(cleanup_mirror_deb_files(mirror.clone(), appstate.clone())),
+            tokio::task::spawn(cleanup_mirror_flat_files(mirror.clone(), appstate.clone())),
             tokio::task::spawn(cleanup_mirror_byhash_files(mirror)),
         ]
     });
@@ -596,8 +598,9 @@ async fn cleanup_mirror_deb_files(
         // are opaque (debnames are URL-decoded ASCII; mismatches aren't
         // in the map).
         if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-            cache_metadata::store()
-                .invalidate(&cache_metadata::CacheMetadataKeyRef::new(&mirror, debname));
+            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
+                &mirror, debname, None,
+            ));
         }
 
         debug!("Removed unreferenced file `{}`", path.display());
@@ -619,41 +622,324 @@ async fn cleanup_mirror_deb_files(
     })
 }
 
-async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone, ProxyCacheError> {
-    let mut bytes_removed = 0;
-    let mut files_removed = 0;
-    let mut files_retained = 0;
-    let now = SystemTime::now();
-    let keep_span = Duration::from_secs(24 * 60 * 60 * global_config().byhash_retention_days.get());
+/// Collect Debian binary packages (`.deb`, `.udeb`, `.ddeb`) from the flat
+/// subdirectory.  Metadata files (`InRelease`, `Packages*`, ...) and the
+/// `by-hash/` subtree are filtered out by the extension check.
+async fn collect_flat_cached_debs(
+    flat_path: &Path,
+) -> Result<HashMap<OsString, PathBuf>, ProxyCacheError> {
+    let mut ret = HashMap::new();
 
-    let mirror_byhash_path: PathBuf = [
+    let mut dir = match tokio::fs::read_dir(flat_path).await {
+        Ok(d) => d,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(ret),
+        Err(err) => return Err(ProxyCacheError::Io(err)),
+    };
+
+    while let Some(entry) = dir.next_entry().await? {
+        let name = entry.file_name();
+        if name.to_str().is_some_and(is_deb_package) {
+            ret.insert(name, entry.path());
+        }
+    }
+
+    Ok(ret)
+}
+
+/// Fetch the flat Packages file for a mirror, trying `Packages.xz`,
+/// `Packages.gz`, then raw `Packages`.  Mirrors `get_package_file` but for the
+/// dist/comp/arch-less flat layout.
+async fn get_flat_packages_file(
+    mirror: &Mirror,
+    appstate: &AppState,
+) -> Result<(Response<ProxyCacheBody>, PackageFormat), StatusCode> {
+    let authority = mirror.format_authority();
+    let mirror_path = mirror.path();
+    let base_uri = format!("http://{authority}/{mirror_path}/Packages");
+
+    let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
+
+    for pkgfmt in [PackageFormat::Xz, PackageFormat::Gz, PackageFormat::Raw] {
+        uri_buffer.clear();
+        uri_buffer.push_str(&base_uri);
+        uri_buffer.push_str(pkgfmt.extension());
+        let uri = uri_buffer.as_str();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(CACHE_CONTROL, "max-age=604800") // 1 week
+            .body(Empty::new())
+            .expect("Request should be valid");
+
+        let conn_details = ConnectionDetails {
+            client: ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(127, 0, 0, 2),
+                0,
+            ))),
+            mirror: mirror.clone(),
+            aliased_host: None,
+            debname: format!("Packages{}", pkgfmt.extension()),
+            cached_flavor: CachedFlavor::Volatile,
+            subdir: Some(Path::new("flat")),
+        };
+
+        let response = process_cache_request(conn_details, req, appstate.clone()).await;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            debug!("Cleanup request {uri} not found");
+            continue;
+        }
+
+        if response.status() != StatusCode::OK {
+            warn!(
+                "Cleanup request {uri} failed with status code {}:  {response:?}",
+                response.status(),
+            );
+            return Err(response.status());
+        }
+
+        return Ok((response, pkgfmt));
+    }
+
+    Err(StatusCode::NOT_FOUND)
+}
+
+async fn cleanup_mirror_flat_files(
+    mirror: MirrorEntry,
+    appstate: AppState,
+) -> Result<CleanupDone, ProxyCacheError> {
+    let mirror_cache_path = mirror.cache_path();
+    let flat_path: PathBuf = [
         &global_config().cache_directory,
-        &mirror.cache_path(),
-        Path::new("dists/by-hash"),
+        &mirror_cache_path,
+        Path::new("flat"),
     ]
     .iter()
     .collect();
 
-    let mirror = mirror.into();
-
-    let mut byhash_dir = match tokio::fs::read_dir(&mirror_byhash_path).await {
-        Ok(d) => d,
+    // Probe: skip mirrors that have no flat subtree.  Flat-only mirrors are
+    // discovered through the regular `get_mirrors` query because every served
+    // file (including the first flat .deb) writes a Delivery row that
+    // upserts the mirror id.
+    match tokio::fs::metadata(&flat_path).await {
+        Ok(_) => {}
         Err(err) if err.kind() == ErrorKind::NotFound => {
-            debug!(
-                "Directory `{}` not found. Cleanup skipped.",
-                mirror_byhash_path.display()
-            );
             return Ok(CleanupDone {
-                mirror,
-                files_retained,
-                files_removed,
-                bytes_removed,
+                mirror: mirror.into(),
+                files_retained: 0,
+                files_removed: 0,
+                bytes_removed: 0,
             });
         }
         Err(err) => {
             error!(
+                "Error probing flat directory `{}`:  {err}",
+                flat_path.display()
+            );
+            return Err(ProxyCacheError::Io(err));
+        }
+    }
+
+    let mut cached_files = collect_flat_cached_debs(&flat_path)
+        .await
+        .inspect_err(|err| {
+            error!("Error listing files in `{}`:  {err}", flat_path.display());
+        })?;
+
+    let num_total_files = cached_files.len() as u64;
+
+    let mirror: Mirror = mirror.into();
+
+    info!(
+        "Found {} cached flat deb files for mirror {mirror}",
+        cached_files.len(),
+    );
+
+    if cached_files.is_empty() {
+        return Ok(CleanupDone {
+            mirror,
+            files_retained: num_total_files,
+            files_removed: 0,
+            bytes_removed: 0,
+        });
+    }
+
+    let (mut response, pkgfmt) = match get_flat_packages_file(&mirror, &appstate).await {
+        Ok(r) => r,
+        Err(StatusCode::NOT_FOUND) => {
+            warn!("Could not find flat Packages file for mirror {mirror}; skipping cleanup");
+            return Ok(CleanupDone {
+                mirror,
+                files_retained: num_total_files,
+                files_removed: 0,
+                bytes_removed: 0,
+            });
+        }
+        Err(status) => {
+            warn!(
+                "Could not fetch flat Packages file for mirror {mirror} ({status}); skipping cleanup",
+            );
+            return Ok(CleanupDone {
+                mirror,
+                files_retained: num_total_files,
+                files_removed: 0,
+                bytes_removed: 0,
+            });
+        }
+    };
+
+    let memfdname = format!("flat_packages{}", pkgfmt.extension());
+
+    let memfd = MemfdOptions::new().create(&memfdname).map_err(|err| {
+        error!("Error creating in-memory file `{memfdname}`:  {err}");
+        ProxyCacheError::Memfd(err)
+    })?;
+
+    let file = tokio::fs::File::from_std(memfd.into_file());
+
+    let file = body_to_file(response.body_mut(), file)
+        .await
+        .inspect_err(|err| {
+            error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
+        })?;
+
+    pkgfmt
+        .reduce_file_list(file, &memfdname, &mut cached_files)
+        .await?;
+
+    if cached_files.is_empty() {
+        return Ok(CleanupDone {
+            mirror,
+            files_retained: num_total_files,
+            files_removed: 0,
+            bytes_removed: 0,
+        });
+    }
+
+    let mut bytes_removed = 0;
+    let mut files_removed = 0;
+    let now = SystemTime::now();
+
+    for path in cached_files.values() {
+        let data = match tokio::fs::metadata(path).await {
+            Ok(d) => Some(d),
+            Err(err) => {
+                error!(
+                    "Error inspecting unreferenced file `{}`:  {err}",
+                    path.display()
+                );
+                None
+            }
+        };
+
+        if let Some(data) = &data {
+            const KEEP_SPAN: Duration = Duration::from_hours(3 * 24); // 3 days
+
+            let created = match data.created() {
+                Ok(d) => d,
+                Err(created_err) => {
+                    info_once!(
+                        "Failed to get create timestamp for file `{}`:  {created_err}",
+                        path.display()
+                    );
+                    match data.modified() {
+                        Ok(d) => d,
+                        Err(modified_err) => {
+                            error!(
+                                "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            if let Ok(existing_for) = now.duration_since(created)
+                && existing_for < KEEP_SPAN
+            {
+                debug!(
+                    "Keeping unreferenced file `{}` since it is too new ({}, threshold={})",
+                    path.display(),
+                    HumanFmt::Time(existing_for),
+                    HumanFmt::Time(KEEP_SPAN)
+                );
+                continue;
+            }
+        }
+
+        let size = match &data {
+            Some(d) => d.len(),
+            None => 0,
+        };
+
+        if let Err(err) = tokio::fs::remove_file(&path).await {
+            error!(
+                "Error removing unreferenced file `{}`:  {err}",
+                path.display()
+            );
+            continue;
+        }
+
+        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
+            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
+                &mirror,
+                debname,
+                Some(Path::new("flat")),
+            ));
+        }
+
+        debug!("Removed unreferenced flat file `{}`", path.display());
+
+        bytes_removed += size;
+        files_removed += 1;
+    }
+
+    info!(
+        "Removed {files_removed} unreferenced flat deb files for mirror {mirror} ({})",
+        HumanFmt::Size(bytes_removed)
+    );
+
+    Ok(CleanupDone {
+        mirror,
+        files_retained: num_total_files - files_removed,
+        files_removed,
+        bytes_removed,
+    })
+}
+
+/// Result of a single by-hash directory walk.
+#[derive(Default)]
+struct ByHashStats {
+    files_retained: u64,
+    files_removed: u64,
+    bytes_removed: u64,
+}
+
+/// Walk a single by-hash directory, removing entries older than `keep_span`.
+/// `NotFound` is treated as "nothing to do" so the caller can probe both the
+/// structured and flat layouts without pre-checking either.
+async fn cleanup_byhash_dir(
+    byhash_path: &Path,
+    keep_span: Duration,
+    now: SystemTime,
+) -> Result<ByHashStats, ProxyCacheError> {
+    let mut stats = ByHashStats::default();
+
+    let mut byhash_dir = match tokio::fs::read_dir(byhash_path).await {
+        Ok(d) => d,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            debug!(
+                "Directory `{}` not found. Cleanup skipped.",
+                byhash_path.display()
+            );
+            return Ok(stats);
+        }
+        Err(err) => {
+            error!(
                 "Error traversing directory `{}`:  {}",
-                mirror_byhash_path.display(),
+                byhash_path.display(),
                 err
             );
             return Err(ProxyCacheError::Io(err));
@@ -667,7 +953,7 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
             continue;
         }
 
-        files_retained += 1;
+        stats.files_retained += 1;
 
         let metadata = match entry.metadata().await {
             Ok(d) => d,
@@ -718,21 +1004,52 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
             continue;
         }
 
-        bytes_removed += metadata.len();
-        files_removed += 1;
-        files_retained -= 1;
+        stats.bytes_removed += metadata.len();
+        stats.files_removed += 1;
+        stats.files_retained -= 1;
     }
 
+    Ok(stats)
+}
+
+async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone, ProxyCacheError> {
+    let now = SystemTime::now();
+    let keep_span = Duration::from_secs(24 * 60 * 60 * global_config().byhash_retention_days.get());
+    let mirror_cache_path = mirror.cache_path();
+
+    let mut total = ByHashStats::default();
+
+    // Walk both the structured (`dists/by-hash`) and flat (`flat/by-hash`)
+    // layouts.  Each call short-circuits on `NotFound`, so a mirror with only
+    // one layout pays only a stat call for the missing one.
+    for sub in ["dists/by-hash", "flat/by-hash"] {
+        let path: PathBuf = [
+            &global_config().cache_directory,
+            &mirror_cache_path,
+            Path::new(sub),
+        ]
+        .iter()
+        .collect();
+
+        let stats = cleanup_byhash_dir(&path, keep_span, now).await?;
+        total.files_retained += stats.files_retained;
+        total.files_removed += stats.files_removed;
+        total.bytes_removed += stats.bytes_removed;
+    }
+
+    let mirror = mirror.into();
+
     info!(
-        "Removed {files_removed} files acquired by-hash for mirror {mirror} ({})",
-        HumanFmt::Size(bytes_removed)
+        "Removed {} files acquired by-hash for mirror {mirror} ({})",
+        total.files_removed,
+        HumanFmt::Size(total.bytes_removed)
     );
 
     Ok(CleanupDone {
         mirror,
-        files_retained,
-        files_removed,
-        bytes_removed,
+        files_retained: total.files_retained,
+        files_removed: total.files_removed,
+        bytes_removed: total.bytes_removed,
     })
 }
 

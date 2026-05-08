@@ -123,16 +123,25 @@ impl std::ops::Deref for UpstreamMetadataView<'_> {
 
 /// Cache key.  Mirrors the keying used by `active_downloads.rs` so the
 /// in-flight and post-flight stores look up the same logical resource.
+/// `subdir` discriminates files served from different on-disk subtrees
+/// (e.g. flat pool vs structured pool) — without it, two same-named
+/// `.deb` files under the same mirror path would share `ETag` /
+/// Last-Modified, leaking validators between unrelated cached files.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CacheMetadataKey {
     pub(crate) mirror: Mirror,
     pub(crate) debname: String,
+    pub(crate) subdir: Option<&'static Path>,
 }
 
 impl CacheMetadataKey {
     #[must_use]
-    pub(crate) fn new(mirror: Mirror, debname: String) -> Self {
-        Self { mirror, debname }
+    pub(crate) fn new(mirror: Mirror, debname: String, subdir: Option<&'static Path>) -> Self {
+        Self {
+            mirror,
+            debname,
+            subdir,
+        }
     }
 }
 
@@ -144,12 +153,21 @@ impl CacheMetadataKey {
 pub(crate) struct CacheMetadataKeyRef<'a> {
     pub(crate) mirror: &'a Mirror,
     pub(crate) debname: &'a str,
+    pub(crate) subdir: Option<&'static Path>,
 }
 
 impl<'a> CacheMetadataKeyRef<'a> {
     #[must_use]
-    pub(crate) fn new(mirror: &'a Mirror, debname: &'a str) -> Self {
-        Self { mirror, debname }
+    pub(crate) fn new(
+        mirror: &'a Mirror,
+        debname: &'a str,
+        subdir: Option<&'static Path>,
+    ) -> Self {
+        Self {
+            mirror,
+            debname,
+            subdir,
+        }
     }
 
     /// Materialise an owned [`CacheMetadataKey`] (used on the cold-path
@@ -159,13 +177,14 @@ impl<'a> CacheMetadataKeyRef<'a> {
         CacheMetadataKey {
             mirror: self.mirror.clone(),
             debname: self.debname.to_owned(),
+            subdir: self.subdir,
         }
     }
 }
 
 impl Equivalent<CacheMetadataKey> for CacheMetadataKeyRef<'_> {
     fn equivalent(&self, key: &CacheMetadataKey) -> bool {
-        self.mirror == &key.mirror && self.debname == key.debname
+        self.mirror == &key.mirror && self.debname == key.debname && self.subdir == key.subdir
     }
 }
 
@@ -380,6 +399,7 @@ mod tests {
                 "/debian".into(),
             ),
             "test.deb".into(),
+            None,
         )
     }
 
