@@ -2,7 +2,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use log::{debug, error};
+use tracing::{debug, error};
 
 use crate::metrics;
 

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use http::StatusCode;
-use log::trace;
+use tracing::trace;
 
 use crate::RETENTION_TIME;
 use crate::cache_layout::{

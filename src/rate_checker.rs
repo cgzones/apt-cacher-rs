@@ -1,7 +1,7 @@
 use std::num::NonZero;
 
 use coarsetime::{Duration, Instant};
-use log::debug;
+use tracing::debug;
 
 use crate::{humanfmt::HumanFmt, metrics, ringbuffer::SumRingBuffer};
 

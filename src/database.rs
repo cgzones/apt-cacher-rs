@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
-use log::{LevelFilter, debug, info, trace, warn};
 use sqlx::{
     ConnectOptions as _, Error, Executor as _, Pool, Sqlite, SqliteConnection, SqlitePool, query,
     query_as, sqlite::SqliteConnectOptions,
 };
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     CLEANUP_CLIENT_ADDR,
@@ -402,8 +402,10 @@ impl Database {
 
         let opts = SqliteConnectOptions::from_str(&url)?
             .create_if_missing(true)
-            .log_statements(LevelFilter::Trace)
-            .log_slow_statements(LevelFilter::Warn, slow_timeout);
+            // These two take `log::LevelFilter`, the crate's only remaining
+            // `log` use — don't drop the `log` dep to "modernize" onto tracing.
+            .log_statements(log::LevelFilter::Trace)
+            .log_slow_statements(log::LevelFilter::Warn, slow_timeout);
         let conn = SqlitePool::connect_with(opts).await?;
 
         info!("Database `{}` opened", path.display());

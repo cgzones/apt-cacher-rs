@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, num::NonZero, sync::Arc};
 
-use log::{error, trace, warn};
+use tracing::{error, trace, warn};
 
 use crate::{ContentLength, metrics};
 

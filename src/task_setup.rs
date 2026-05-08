@@ -1,7 +1,7 @@
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use anyhow::Context as _;
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
 use crate::{cache_layout::SUBDIR_TMP, global_config};

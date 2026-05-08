@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use hashbrown::HashMap;
-use log::{debug, error, warn};
+use tracing::{debug, error, warn};
 
 use crate::cache_layout::CacheLayout;
 use crate::deb_mirror::{Mirror, is_deb_package};

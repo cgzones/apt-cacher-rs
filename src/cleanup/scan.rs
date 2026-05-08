@@ -2,7 +2,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use hashbrown::HashMap;
-use log::{debug, error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::cleanup::engine::{Candidate, SpanClass};
 use crate::deb_mirror::{is_deb_package, is_strict_path_descendant, path_starts_with_segment};

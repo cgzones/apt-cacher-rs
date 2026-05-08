@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use coarsetime::Clock;
 use hashbrown::HashMap;
-use log::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     AppState, RETENTION_TIME,

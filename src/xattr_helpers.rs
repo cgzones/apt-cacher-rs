@@ -10,8 +10,8 @@
 
 use std::{num::ParseIntError, path::Path};
 
-use log::warn;
 use nix::libc;
+use tracing::warn;
 use xattr::FileExt as _;
 
 /// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].

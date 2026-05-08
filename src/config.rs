@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context as _, anyhow, bail};
 use http::StatusCode;
 use ipnet::IpNet;
-use log::LevelFilter;
 use serde::{Deserialize, Deserializer};
+use tracing::level_filters::LevelFilter;
 
 use crate::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::nonzero;
@@ -33,7 +33,7 @@ const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
 const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
 const DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT: Option<NonZero<usize>> = Some(nonzero!(10));
 const DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP: Option<NonZero<usize>> = None;
-const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
+const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 const DEFAULT_LOG_DESTINATION: LogDestination = LogDestination::Console;
 const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
 const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s

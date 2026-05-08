@@ -13,12 +13,12 @@ use http::{
     StatusCode,
     header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE},
 };
-use log::{debug, error, info, trace, warn};
 use nix::sys::sendfile::sendfile;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,

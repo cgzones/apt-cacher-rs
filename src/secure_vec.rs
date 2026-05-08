@@ -5,8 +5,8 @@
 
 use std::{num::NonZero, sync::LazyLock};
 
-use log::{debug, error};
 use nix::libc;
+use tracing::{debug, error};
 
 use crate::warn_once_or_debug;
 

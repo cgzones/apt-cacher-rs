@@ -38,8 +38,8 @@ use std::num::NonZero;
 use std::sync::OnceLock;
 
 use hashbrown::{Equivalent, HashSet};
-use log::warn;
 use parking_lot::RwLock;
+use tracing::warn;
 
 use crate::{
     cache_layout::{SUBDIR_FLAT, SUBDIR_FLAT_PREFIX},
