@@ -324,6 +324,16 @@ pub(crate) async fn request_with_retry(
     request: Request<Empty<bytes::Bytes>>,
 ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
     const MAX_ATTEMPTS: u32 = 10;
+    // Auto-mode's HTTPS-upgrade revert branch only fires once `attempt`
+    // has crossed this threshold; below it, transient connect errors
+    // retry without reverting the scheme.
+    const HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS: u32 = 2;
+    // The Always-mode terminal-failure HTTPS_UPGRADE_FAILED bump below
+    // (gated on `attempt > MAX_ATTEMPTS` with `https_upgrade_test` still
+    // set) relies on the Auto-mode revert firing first. If MAX_ATTEMPTS
+    // were ever <= HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS, Auto mode would
+    // also fall through here with the flag set and over-count Auto.
+    static_assert!(MAX_ATTEMPTS > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS);
 
     debug_assert_eq!(
         request.body().size_hint().exact(),
@@ -466,7 +476,7 @@ pub(crate) async fn request_with_retry(
                     if is_io_timed_out_in_chain(&err) {
                         metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
                     }
-                    if attempt > 2
+                    if attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
                         && https_upgrade_test
                         && https_upgrade_mode != HttpsUpgradeMode::Always
                     {
@@ -501,6 +511,14 @@ pub(crate) async fn request_with_retry(
 
                     if attempt > MAX_ATTEMPTS {
                         metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
+                        if https_upgrade_test {
+                            // Terminal connect failure with the upgrade flag
+                            // still set: in Always mode the revert branch
+                            // above is gated off, so the only outcome of an
+                            // attempted upgrade is failure here. Keep the
+                            // ATTEMPTED == SUCCEEDED + FAILED identity.
+                            metrics::HTTPS_UPGRADE_FAILED.increment();
+                        }
                         if let Some(auth) = parts.uri.authority() {
                             let key = SchemeKeyRef {
                                 host: auth.host(),
