@@ -207,29 +207,33 @@ pub(crate) struct OriginRow {
     pub(crate) architecture: String,
 }
 
-/// Upsert a mirror row and return its `id` in a single round trip via the
-/// `RETURNING` clause.
-async fn upsert_mirror_get_id(tx: &mut SqliteConnection, mirror: &Mirror) -> Result<i64, Error> {
+/// Upsert a mirror row and return `(id, was_inserted)` in a single round
+/// trip via `RETURNING`. `was_inserted` is `first_seen = last_seen`: equal
+/// only on a fresh INSERT, since ON CONFLICT rewrites just `last_seen`.
+async fn upsert_mirror_get_id(
+    tx: &mut SqliteConnection,
+    mirror: &Mirror,
+) -> Result<(i64, bool), Error> {
     let host = mirror.host();
     let port = mirror.port().map_or(0, std::num::NonZero::get);
     let path = mirror.path();
     let row = query!(
-        r"
+        r#"
             INSERT INTO mirrors_v2
             (host, port, path)
             VALUES
             (?, ?, ?)
             ON CONFLICT
             DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP)
-            RETURNING id;
-        ",
+            RETURNING id, (first_seen = last_seen) AS "was_inserted!: bool";
+        "#,
         host,
         port,
         path,
     )
     .fetch_one(&mut *tx)
     .await?;
-    Ok(row.id)
+    Ok((row.id, row.was_inserted))
 }
 
 impl Database {
@@ -610,12 +614,14 @@ impl Database {
     }
 
     /// Pool-based variant of the private `upsert_mirror_get_id`. Issued on a
-    /// mirror-id cache miss in the batched `db_loop`.
-    pub(crate) async fn upsert_mirror_id(&self, mirror: &Mirror) -> Result<i64, Error> {
+    /// mirror-id cache miss in the batched `db_loop`. Returns the row `id`
+    /// and `was_inserted = true` when the mirror was inserted for the first
+    /// time (no prior row in `mirrors_v2`).
+    pub(crate) async fn upsert_mirror_id(&self, mirror: &Mirror) -> Result<(i64, bool), Error> {
         let mut tx = self.conn.begin().await?;
-        let id = upsert_mirror_get_id(&mut tx, mirror).await?;
+        let result = upsert_mirror_get_id(&mut tx, mirror).await?;
         tx.commit().await?;
-        Ok(id)
+        Ok(result)
     }
 
     /// Bulk-update `mirrors_v2.last_seen` for a set of (id, `last_seen`) pairs.

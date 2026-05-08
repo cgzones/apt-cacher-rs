@@ -139,7 +139,7 @@ async fn resolve_mirror_id(
         return Ok(entry.id);
     }
     metrics::DB_MIRROR_CACHE_MISSES.increment();
-    let id = db.upsert_mirror_id(mirror).await?;
+    let (id, was_inserted) = db.upsert_mirror_id(mirror).await?;
     // The DB upsert just set last_seen to now; mirror that locally so the
     // periodic flush doesn't redundantly write it.
     cache.insert(
@@ -151,6 +151,9 @@ async fn resolve_mirror_id(
         },
     );
     metrics::DB_MIRROR_CACHE_ENTRIES.set(cache.len() as u64);
+    if was_inserted {
+        info!("Encountered new mirror for the first time:  {mirror}");
+    }
     Ok(id)
 }
 
