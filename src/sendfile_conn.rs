@@ -651,9 +651,10 @@ async fn try_sendfile_request(
             };
         }
         Err(cache_layout::ClassifyError::NonDebPool { filename: _ }) => {
-            // Structured pool with non-deb extension: hand back to hyper
-            // so the simple proxy can handle it without caching.
-            return SendfileResult::NotApplicable("non Debian binary package pool file");
+            // Pool filename failed the deb extension check (structured
+            // Pool) or the strict flat-pool shape check; hand back to
+            // hyper so the simple proxy can handle it without caching.
+            return SendfileResult::NotApplicable("unsupported pool filename");
         }
     };
 

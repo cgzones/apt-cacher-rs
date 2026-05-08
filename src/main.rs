@@ -3744,11 +3744,12 @@ async fn pre_process_client_request(
                 return quick_response(StatusCode::BAD_REQUEST, "Unsupported request");
             }
             Err(cache_layout::ClassifyError::NonDebPool { filename }) => {
-                // Structured Pool with non-deb extension: log and fall
+                // Either a structured Pool filename without a
+                // `.deb`/`.udeb`/`.ddeb` extension, or a Flat::Pool
+                // filename whose decoded form failed the strict
+                // `<name>_<ver>_<arch>.<ext>` shape check.  Log and fall
                 // through to the simple proxy below (no caching).
-                warn_once_or_info!(
-                    "Unsupported pool file extension in filename `{filename}` from client {client}"
-                );
+                warn_once_or_info!("Unsupported pool filename `{filename}` from client {client}");
             }
         }
     }
