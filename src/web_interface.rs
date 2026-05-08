@@ -1806,13 +1806,14 @@ fn build_metrics_html() -> String {
     );
     }
     t.row_tip(
-        "Authorization Rejected (mirror / client / tunnel-mirror)",
-        "Requests rejected by mirror, client, or HTTPS-tunnel-mirror authorization rules.",
+        "Authorization Rejected (mirror / client / tunnel-mirror / webui)",
+        "Requests rejected by mirror, client, HTTPS-tunnel-mirror, or web-interface authorization rules.",
         format_args!(
-            "{} / {} / {}",
+            "{} / {} / {} / {}",
             metrics::AUTHZ_REJECTED_MIRROR.get(),
             metrics::AUTHZ_REJECTED_CLIENT.get(),
             metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.get(),
+            metrics::AUTHZ_REJECTED_WEBUI.get(),
         ),
     );
     t.row_tip(

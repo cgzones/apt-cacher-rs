@@ -294,6 +294,7 @@ async fn serve_webui(
             .any(|ac| ac.contains(&client_ip))
     {
         warn_once_or_info!("Unauthorized web-interface access by client {client}");
+        metrics::AUTHZ_REJECTED_WEBUI.increment();
         return SendfileResult::Rejection {
             status: StatusCode::FORBIDDEN,
             conn_action,

@@ -424,6 +424,9 @@ pub(crate) static AUTHZ_REJECTED_MIRROR: Counter = Counter::new();
 pub(crate) static AUTHZ_REJECTED_CLIENT: Counter = Counter::new();
 /// Authorization rejection: HTTPS-tunnel CONNECT denied by the tunnel-mirror list.
 pub(crate) static AUTHZ_REJECTED_TUNNEL_MIRROR: Counter = Counter::new();
+/// Authorization rejection: web-interface access denied by the webif-client
+/// allowlist (`allowed_webif_clients`, falling back to `allowed_proxy_clients`).
+pub(crate) static AUTHZ_REJECTED_WEBUI: Counter = Counter::new();
 
 /// kTLS receive offload was enabled and the connection successfully started
 /// splicing application data. Connections where the kernel-level setup

@@ -3685,6 +3685,7 @@ async fn pre_process_client_request(
                         .any(|ac| ac.contains(&client_ip))
                 {
                     warn_once_or_info!("Unauthorized web-interface access by client {client}");
+                    metrics::AUTHZ_REJECTED_WEBUI.increment();
                     return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
                 }
             }
