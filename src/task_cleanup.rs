@@ -731,6 +731,91 @@ async fn get_flat_packages_file(
     Err(StatusCode::NOT_FOUND)
 }
 
+/// Remove cached deb files in `cached_files` that are older than `keep_span`,
+/// dropping any matching `cache_metadata` entries on success.
+///
+/// Used by the flat-cleanup path both when a Packages index has reduced the
+/// map down to genuinely-unreferenced files (short span) and as a fallback
+/// when the Packages index is unfetchable (long span, since we cannot tell
+/// which entries are still referenced).
+async fn sweep_aged_cached_debs(
+    cached_files: &HashMap<OsString, PathBuf>,
+    keep_span: Duration,
+    mirror: &Mirror,
+    layout: CacheLayout,
+) -> (u64, u64) {
+    let mut bytes_removed = 0u64;
+    let mut files_removed = 0u64;
+    let now = SystemTime::now();
+
+    for path in cached_files.values() {
+        let data = match tokio::fs::metadata(path).await {
+            Ok(d) => Some(d),
+            Err(err) => {
+                error!("Error inspecting cached file `{}`:  {err}", path.display());
+                None
+            }
+        };
+
+        if let Some(data) = &data {
+            let created = match data.created() {
+                Ok(d) => d,
+                Err(created_err) => {
+                    info_once!(
+                        "Failed to get create timestamp for file `{}`:  {created_err}",
+                        path.display()
+                    );
+                    match data.modified() {
+                        Ok(d) => d,
+                        Err(modified_err) => {
+                            error!(
+                                "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            if let Ok(existing_for) = now.duration_since(created)
+                && existing_for < keep_span
+            {
+                debug!(
+                    "Keeping cached file `{}` since it is too new ({}, threshold={})",
+                    path.display(),
+                    HumanFmt::Time(existing_for),
+                    HumanFmt::Time(keep_span)
+                );
+                continue;
+            }
+        }
+
+        let size = match &data {
+            Some(d) => d.len(),
+            None => 0,
+        };
+
+        if let Err(err) = tokio::fs::remove_file(&path).await {
+            error!("Error removing cached file `{}`:  {err}", path.display());
+            continue;
+        }
+
+        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
+            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
+                mirror, debname, layout,
+            ));
+        }
+
+        debug!("Removed cached file `{}`", path.display());
+
+        bytes_removed += size;
+        files_removed += 1;
+    }
+
+    (files_removed, bytes_removed)
+}
+
 async fn cleanup_mirror_flat_files(
     mirror: MirrorEntry,
     appstate: AppState,
@@ -794,24 +879,29 @@ async fn cleanup_mirror_flat_files(
 
     let (mut response, pkgfmt) = match get_flat_packages_file(&mirror, &appstate).await {
         Ok(r) => r,
-        Err(StatusCode::NOT_FOUND) => {
-            warn!("Could not find flat Packages file for mirror {mirror}; skipping cleanup");
-            return Ok(CleanupDone {
-                mirror,
-                files_retained: num_total_files,
-                files_removed: 0,
-                bytes_removed: 0,
-            });
-        }
         Err(status) => {
+            // Flat caching can mint a `MirrorEntry` for any nested deb URL
+            // (e.g. `apt/sub/pkg_..._amd64.deb`), which means a mirror path
+            // may legitimately have cached debs but no co-located Packages
+            // index. Without a fallback those debs would never be GC'd. Fall
+            // back to a long time-based retention so abandoned/typo'd flat
+            // mirror paths eventually drain instead of accumulating forever.
             warn!(
-                "Could not fetch flat Packages file for mirror {mirror} ({status}); skipping cleanup",
+                "Could not fetch flat Packages file for mirror {mirror} ({status}); falling back to {} time-based retention",
+                HumanFmt::Time(RETENTION_TIME),
+            );
+            let (files_removed, bytes_removed) =
+                sweep_aged_cached_debs(&cached_files, RETENTION_TIME, &mirror, CacheLayout::Flat)
+                    .await;
+            info!(
+                "Removed {files_removed} aged flat deb files for mirror {mirror} ({})",
+                HumanFmt::Size(bytes_removed)
             );
             return Ok(CleanupDone {
                 mirror,
-                files_retained: num_total_files,
-                files_removed: 0,
-                bytes_removed: 0,
+                files_retained: num_total_files - files_removed,
+                files_removed,
+                bytes_removed,
             });
         }
     };
@@ -844,82 +934,13 @@ async fn cleanup_mirror_flat_files(
         });
     }
 
-    let mut bytes_removed = 0;
-    let mut files_removed = 0;
-    let now = SystemTime::now();
-
-    for path in cached_files.values() {
-        let data = match tokio::fs::metadata(path).await {
-            Ok(d) => Some(d),
-            Err(err) => {
-                error!(
-                    "Error inspecting unreferenced file `{}`:  {err}",
-                    path.display()
-                );
-                None
-            }
-        };
-
-        if let Some(data) = &data {
-            let created = match data.created() {
-                Ok(d) => d,
-                Err(created_err) => {
-                    info_once!(
-                        "Failed to get create timestamp for file `{}`:  {created_err}",
-                        path.display()
-                    );
-                    match data.modified() {
-                        Ok(d) => d,
-                        Err(modified_err) => {
-                            error!(
-                                "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
-                                path.display()
-                            );
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            if let Ok(existing_for) = now.duration_since(created)
-                && existing_for < UNREFERENCED_KEEP_SPAN
-            {
-                debug!(
-                    "Keeping unreferenced file `{}` since it is too new ({}, threshold={})",
-                    path.display(),
-                    HumanFmt::Time(existing_for),
-                    HumanFmt::Time(UNREFERENCED_KEEP_SPAN)
-                );
-                continue;
-            }
-        }
-
-        let size = match &data {
-            Some(d) => d.len(),
-            None => 0,
-        };
-
-        if let Err(err) = tokio::fs::remove_file(&path).await {
-            error!(
-                "Error removing unreferenced file `{}`:  {err}",
-                path.display()
-            );
-            continue;
-        }
-
-        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
-                &mirror,
-                debname,
-                CacheLayout::Flat,
-            ));
-        }
-
-        debug!("Removed unreferenced flat file `{}`", path.display());
-
-        bytes_removed += size;
-        files_removed += 1;
-    }
+    let (files_removed, bytes_removed) = sweep_aged_cached_debs(
+        &cached_files,
+        UNREFERENCED_KEEP_SPAN,
+        &mirror,
+        CacheLayout::Flat,
+    )
+    .await;
 
     info!(
         "Removed {files_removed} unreferenced flat deb files for mirror {mirror} ({})",
@@ -945,10 +966,16 @@ struct ByHashStats {
 /// Walk a single by-hash directory, removing entries older than `keep_span`.
 /// `NotFound` is treated as "nothing to do" so the caller can probe both the
 /// structured and flat layouts without pre-checking either.
+///
+/// `mirror` and `layout` identify the in-memory `cache_metadata` keys to drop
+/// alongside each removed file. Without this, the resolve-side cache would
+/// retain entries for GC'd hashes and grow unbounded over long uptimes.
 async fn cleanup_byhash_dir(
     byhash_path: &Path,
     keep_span: Duration,
     now: SystemTime,
+    mirror: &Mirror,
+    layout: CacheLayout,
 ) -> Result<ByHashStats, ProxyCacheError> {
     let mut stats = ByHashStats::default();
 
@@ -1029,6 +1056,12 @@ async fn cleanup_byhash_dir(
             continue;
         }
 
+        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
+            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
+                mirror, debname, layout,
+            ));
+        }
+
         stats.bytes_removed += metadata.len();
         stats.files_removed += 1;
         stats.files_retained -= 1;
@@ -1044,24 +1077,26 @@ async fn cleanup_mirror_byhash_files(
     let now = SystemTime::now();
     let keep_span = Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get());
     let mirror_cache_path = mirror.cache_path();
+    let mirror: Mirror = mirror.into();
 
     let mut total = ByHashStats::default();
 
     // Walk both the structured (`dists/by-hash`) and flat (`flat/by-hash`)
     // layouts.  Each call short-circuits on `NotFound`, so a mirror with only
     // one layout pays only a stat call for the missing one.
-    for sub in [SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH] {
+    for (sub, layout) in [
+        (SUBDIR_DISTS_BYHASH, CacheLayout::DistsByHash),
+        (SUBDIR_FLAT_BYHASH, CacheLayout::FlatByHash),
+    ] {
         let path: PathBuf = [&config.cache_directory, &mirror_cache_path, Path::new(sub)]
             .iter()
             .collect();
 
-        let stats = cleanup_byhash_dir(&path, keep_span, now).await?;
+        let stats = cleanup_byhash_dir(&path, keep_span, now, &mirror, layout).await?;
         total.files_retained += stats.files_retained;
         total.files_removed += stats.files_removed;
         total.bytes_removed += stats.bytes_removed;
     }
-
-    let mirror = mirror.into();
 
     info!(
         "Removed {} files acquired by-hash for mirror {mirror} ({})",
