@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                    INSERT INTO origins\n                    (mirror_id, distribution, component, architecture)\n                    VALUES\n                    (?, ?, ?, ?)\n                    ON CONFLICT (mirror_id, distribution, component, architecture)\n                    DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "2325dd9579a31d0e4775d39eec4aea4f475d90c28a63d3ee011e99d42a19bdc7"
+}

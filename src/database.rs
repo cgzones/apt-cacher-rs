@@ -16,8 +16,17 @@ use sqlx::{
 use crate::{
     config::{DomainName, is_valid_domain},
     deb_mirror,
-    deb_mirror::{Mirror, OriginRef, mirror_cache_path_impl},
+    deb_mirror::{Mirror, mirror_cache_path_impl},
 };
+
+/// Conservative upper bound on the number of bind parameters allowed in a
+/// single `SQLite` statement.
+///
+/// `SQLite` caps this at `SQLITE_MAX_VARIABLE_NUMBER`, whose compile-time default
+/// is 999 on builds < 3.32 and 32766 on newer ones. We can't depend on the
+/// runtime build so the lower historical value is hard-coded; batched
+/// statements that approach the limit must chunk their inputs.
+const SQLITE_MAX_BIND_PARAMETERS: usize = 999;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Database {
@@ -166,6 +175,38 @@ pub(crate) struct TopPackageEntry {
     pub(crate) package_size: i64,
 }
 
+/// Pre-converted SQL-ready row for a `deliveries` insert. Constructed once by
+/// the producer side of the batch pipeline so the per-event hot path stays
+/// out of `i64::try_from` and IPv6-mapping conversions.
+#[derive(Debug)]
+pub(crate) struct DeliveryRow {
+    pub(crate) mirror_id: i64,
+    pub(crate) debname: String,
+    pub(crate) size: i64,
+    pub(crate) duration: i64,
+    pub(crate) partial: u8,
+    pub(crate) client_ip: [u8; 16],
+}
+
+/// Pre-converted SQL-ready row for a `downloads` insert.
+#[derive(Debug)]
+pub(crate) struct DownloadRow {
+    pub(crate) mirror_id: i64,
+    pub(crate) debname: String,
+    pub(crate) size: i64,
+    pub(crate) duration: i64,
+    pub(crate) client_ip: [u8; 16],
+}
+
+/// Pre-converted SQL-ready row for an `origins` upsert.
+#[derive(Debug)]
+pub(crate) struct OriginRow {
+    pub(crate) mirror_id: i64,
+    pub(crate) distribution: String,
+    pub(crate) component: String,
+    pub(crate) architecture: String,
+}
+
 /// Upsert a mirror row and return its `id` in a single round trip via the
 /// `RETURNING` clause.
 async fn upsert_mirror_get_id(tx: &mut SqliteConnection, mirror: &Mirror) -> Result<i64, Error> {
@@ -281,33 +322,6 @@ impl Database {
         trace!("Performing database migrations...");
 
         sqlx::migrate!().run(&self.conn).await?;
-
-        Ok(())
-    }
-
-    pub(crate) async fn add_origin(&self, origin: &OriginRef<'_>) -> Result<(), Error> {
-        let mut tx = self.conn.begin().await?;
-
-        let mirror_id = upsert_mirror_get_id(&mut tx, origin.mirror).await?;
-
-        query!(
-            r"
-                INSERT INTO origins
-                (mirror_id, distribution, component, architecture)
-                VALUES
-                (?, ?, ?, ?)
-                ON CONFLICT (mirror_id, distribution, component, architecture)
-                DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
-        ",
-            mirror_id,
-            origin.distribution,
-            origin.component,
-            origin.architecture
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
 
         Ok(())
     }
@@ -559,96 +573,181 @@ impl Database {
         .await
     }
 
-    pub(crate) async fn register_download(
-        &self,
-        mirror: &Mirror,
-        debname: &str,
-        size: u64,
-        duration: Duration,
-        client: IpAddr,
-    ) -> Result<(), Error> {
-        let size = i64::try_from(size).map_err(|err| Error::TypeNotFound {
-            type_name: err.to_string(),
-        })?;
-        let duration = i64::try_from(duration.as_millis()).map_err(|err| Error::TypeNotFound {
-            type_name: err.to_string(),
-        })?;
-        let client = match client {
-            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
-            IpAddr::V6(ipv6) => ipv6,
-        };
-        let client: &[u8] = &client.octets();
+    /// Hydrate the in-memory mirror-id cache at startup.
+    ///
+    /// Returns one entry per row in `mirrors_v2`. Used by the batched
+    /// `db_loop` so subsequent delivery/download/origin events resolve the
+    /// `mirror_id` from memory instead of upserting on every event.
+    pub(crate) async fn load_all_mirror_ids(&self) -> Result<Vec<(i64, Mirror)>, Error> {
+        struct Row {
+            id: i64,
+            host: String,
+            port: u16,
+            path: String,
+        }
 
-        let mut tx = self.conn.begin().await?;
-
-        let mirror_id = upsert_mirror_get_id(&mut tx, mirror).await?;
-
-        query!(
-            r"
-                INSERT INTO downloads
-                (mirror_id, debname, size, duration, client_ip)
-                VALUES
-                (?, ?, ?, ?, ?);
-        ",
-            mirror_id,
-            debname,
-            size,
-            duration,
-            client
+        let rows = query_as!(
+            Row,
+            r#"
+              SELECT id AS "id!: i64", host, port AS "port!: u16", path
+              FROM mirrors_v2;
+            "#,
         )
-        .execute(&mut *tx)
+        .fetch_all(&self.conn)
         .await?;
 
-        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                // Reconstruct DomainName via its parser so an Ipv4/Ipv6 row
+                // round-trips to the right enum variant. Skip rows whose host
+                // no longer parses — `cleanup_invalid_rows` will eventually
+                // remove them.
+                let host = DomainName::new(r.host).ok()?;
+                Some((r.id, Mirror::new(host, NonZero::new(r.port), r.path)))
+            })
+            .collect())
+    }
 
+    /// Pool-based variant of the private `upsert_mirror_get_id`. Issued on a
+    /// mirror-id cache miss in the batched `db_loop`.
+    pub(crate) async fn upsert_mirror_id(&self, mirror: &Mirror) -> Result<i64, Error> {
+        let mut tx = self.conn.begin().await?;
+        let id = upsert_mirror_get_id(&mut tx, mirror).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Bulk-update `mirrors_v2.last_seen` for a set of (id, `last_seen`) pairs.
+    ///
+    /// Issues one UPDATE per chunk: a CTE injects all pairs as a single
+    /// `VALUES` clause, then the UPDATE joins on it and uses `MAX(existing, new)`
+    /// so flushes are idempotent even if a stale timestamp arrives after a
+    /// fresh one. Chunked by [`SQLITE_MAX_BIND_PARAMETERS`]; all chunks share
+    /// one transaction. Returns the total rows affected.
+    pub(crate) async fn batch_update_mirror_last_seen(
+        &self,
+        pairs: &[(i64, i64)],
+    ) -> Result<u64, Error> {
+        const BINDS_PER_ROW: usize = 2;
+        const CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMETERS / BINDS_PER_ROW;
+
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.conn.begin().await?;
+        let mut affected = 0u64;
+        for chunk in pairs.chunks(CHUNK_SIZE) {
+            let mut qb: sqlx::QueryBuilder<'_, Sqlite> =
+                sqlx::QueryBuilder::new("WITH new_seen(id, ts) AS (");
+            qb.push_values(chunk, |mut b, &(id, ts)| {
+                b.push_bind(id).push_bind(ts);
+            });
+            qb.push(
+                ") UPDATE mirrors_v2 \
+                  SET last_seen = MAX(last_seen, \
+                      (SELECT ts FROM new_seen WHERE new_seen.id = mirrors_v2.id)) \
+                  WHERE id IN (SELECT id FROM new_seen)",
+            );
+            let res = qb.build().execute(&mut *tx).await?;
+            affected = affected.saturating_add(res.rows_affected());
+        }
+        tx.commit().await?;
+        Ok(affected)
+    }
+
+    /// Insert a batch of delivery rows in a single transaction.
+    ///
+    /// Chunks the input so no single statement exceeds
+    /// [`SQLITE_MAX_BIND_PARAMETERS`]. All chunks share one transaction so the
+    /// flush remains atomic from the caller's perspective.
+    pub(crate) async fn batch_insert_deliveries(&self, rows: &[DeliveryRow]) -> Result<(), Error> {
+        const BINDS_PER_ROW: usize = 6;
+        const CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMETERS / BINDS_PER_ROW;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.conn.begin().await?;
+        for chunk in rows.chunks(CHUNK_SIZE) {
+            let mut qb: sqlx::QueryBuilder<'_, Sqlite> = sqlx::QueryBuilder::new(
+                "INSERT INTO deliveries (mirror_id, debname, size, duration, partial, client_ip) ",
+            );
+            qb.push_values(chunk, |mut b, row| {
+                b.push_bind(row.mirror_id)
+                    .push_bind(&row.debname)
+                    .push_bind(row.size)
+                    .push_bind(row.duration)
+                    .push_bind(row.partial)
+                    .push_bind(&row.client_ip[..]);
+            });
+            qb.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
-    pub(crate) async fn register_delivery(
-        &self,
-        mirror: &Mirror,
-        debname: &str,
-        size: u64,
-        duration: Duration,
-        partial: bool,
-        client: IpAddr,
-    ) -> Result<(), Error> {
-        let size = i64::try_from(size).map_err(|err| Error::TypeNotFound {
-            type_name: err.to_string(),
-        })?;
-        let duration = i64::try_from(duration.as_millis()).map_err(|err| Error::TypeNotFound {
-            type_name: err.to_string(),
-        })?;
-        let partial = u8::from(partial);
-        let client = match client {
-            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
-            IpAddr::V6(ipv6) => ipv6,
-        };
-        let client: &[u8] = &client.octets();
+    /// Insert a batch of download rows in a single transaction.
+    ///
+    /// Chunks the input so no single statement exceeds
+    /// [`SQLITE_MAX_BIND_PARAMETERS`]. All chunks share one transaction so the
+    /// flush remains atomic from the caller's perspective.
+    pub(crate) async fn batch_insert_downloads(&self, rows: &[DownloadRow]) -> Result<(), Error> {
+        const BINDS_PER_ROW: usize = 5;
+        const CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMETERS / BINDS_PER_ROW;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
 
         let mut tx = self.conn.begin().await?;
-
-        let mirror_id = upsert_mirror_get_id(&mut tx, mirror).await?;
-
-        query!(
-            r"
-                INSERT INTO deliveries
-                (mirror_id, debname, size, duration, partial, client_ip)
-                VALUES
-                (?, ?, ?, ?, ?, ?);
-            ",
-            mirror_id,
-            debname,
-            size,
-            duration,
-            partial,
-            client
-        )
-        .execute(&mut *tx)
-        .await?;
-
+        for chunk in rows.chunks(CHUNK_SIZE) {
+            let mut qb: sqlx::QueryBuilder<'_, Sqlite> = sqlx::QueryBuilder::new(
+                "INSERT INTO downloads (mirror_id, debname, size, duration, client_ip) ",
+            );
+            qb.push_values(chunk, |mut b, row| {
+                b.push_bind(row.mirror_id)
+                    .push_bind(&row.debname)
+                    .push_bind(row.size)
+                    .push_bind(row.duration)
+                    .push_bind(&row.client_ip[..]);
+            });
+            qb.build().execute(&mut *tx).await?;
+        }
         tx.commit().await?;
+        Ok(())
+    }
 
+    /// UPSERT a batch of origin rows in a single transaction. The per-row
+    /// `ON CONFLICT DO UPDATE last_seen` clause prevents a true multi-row
+    /// VALUES form, but transaction grouping still amortises the commit.
+    pub(crate) async fn batch_upsert_origins(&self, rows: &[OriginRow]) -> Result<(), Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.conn.begin().await?;
+        for row in rows {
+            query!(
+                r"
+                    INSERT INTO origins
+                    (mirror_id, distribution, component, architecture)
+                    VALUES
+                    (?, ?, ?, ?)
+                    ON CONFLICT (mirror_id, distribution, component, architecture)
+                    DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
+                ",
+                row.mirror_id,
+                row.distribution,
+                row.component,
+                row.architecture,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

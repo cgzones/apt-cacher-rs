@@ -496,6 +496,35 @@ pub(crate) static DB_QUEUE_FULL_WAITS: Counter = Counter::new();
 /// Debounced `DB_QUEUE_FULL_WAITS` — counts each saturation episode once
 /// (latched until the channel drains fully to empty).
 pub(crate) static DB_QUEUE_FULL_TRANSITIONS: Counter = Counter::new();
+/// Commands dropped because the DB task channel was closed (graceful shutdown
+/// or unexpected receiver death). Bumped instead of panicking so request tasks
+/// can finish their response after the DB drain begins.
+pub(crate) static DB_COMMANDS_DROPPED_SHUTDOWN: Counter = Counter::new();
+
+/// Batch flushes triggered because the buffered-command count reached
+/// `db_batch_flush_max_count`. Under sustained load this should dominate
+/// `DB_BATCH_FLUSHES_BY_TIME`.
+pub(crate) static DB_BATCH_FLUSHES_BY_SIZE: Counter = Counter::new();
+/// Batch flushes triggered by the periodic interval tick. Dominant during
+/// idle hours; ratio with `_BY_SIZE` indicates whether the size threshold
+/// is well-tuned.
+pub(crate) static DB_BATCH_FLUSHES_BY_TIME: Counter = Counter::new();
+/// Batch flushes performed during graceful shutdown drain.
+pub(crate) static DB_BATCH_FLUSHES_ON_SHUTDOWN: Counter = Counter::new();
+/// Peak number of buffered commands flushed in a single batch.
+pub(crate) static DB_BATCH_SIZE_PEAK: Peak = Peak::new();
+/// Mirror-id cache hits: the `(host, port, path)` lookup found an existing id
+/// without touching the database.
+pub(crate) static DB_MIRROR_CACHE_HITS: Counter = Counter::new();
+/// Mirror-id cache misses: one synchronous upsert against `mirrors_v2` was
+/// performed to obtain the id. After warmup this should grow only when a
+/// previously-unseen mirror appears.
+pub(crate) static DB_MIRROR_CACHE_MISSES: Counter = Counter::new();
+/// Total `mirrors_v2.last_seen` rows updated by the periodic flush task.
+pub(crate) static DB_MIRROR_LAST_SEEN_FLUSHED: Accumulator = Accumulator::new();
+/// Current size of the in-memory mirror-id cache (entries hydrated at startup
+/// plus newly observed mirrors). Entries are never evicted, so this only grows.
+pub(crate) static DB_MIRROR_CACHE_ENTRIES: StateU64 = StateU64::new();
 
 /// Total cache files evicted across all cleanup runs.
 pub(crate) static CLEANUP_EVICTIONS: Accumulator = Accumulator::new();

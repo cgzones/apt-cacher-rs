@@ -225,6 +225,9 @@ pub(crate) const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(
 /// Maximum age for volatile cache entries before they are treated as stale.
 pub(crate) const VOLATILE_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 
+/// Maximum time to wait for the database task to drain on shutdown before giving up.
+const DB_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Derive the Content-Type for a cached file based on its filename extension.
 #[must_use]
 pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
@@ -4349,10 +4352,19 @@ async fn main_loop(
 
     // Database background task
     let (db_task_tx, db_task_rx) = tokio::sync::mpsc::channel(config.db_channel_capacity.get());
-    {
+    let (db_shutdown_tx, db_shutdown_rx) = tokio::sync::watch::channel(false);
+    let db_join = {
         let database = database.clone();
-        tokio::task::spawn(db_loop(database, db_task_rx));
-    }
+        let flush_max_count = config.db_batch_flush_max_count.get();
+        let flush_interval = Duration::from_secs(config.db_batch_flush_interval_secs.get());
+        tokio::task::spawn(db_loop(
+            database,
+            db_task_rx,
+            db_shutdown_rx,
+            flush_max_count,
+            flush_interval,
+        ))
+    };
     database_task::DB_TASK_QUEUE_SENDER
         .set(db_task_tx)
         .expect("DB task queue sender initialized once");
@@ -4516,6 +4528,21 @@ async fn main_loop(
     };
     info!("Ready and listening on http://{addr}");
 
+    let drain_db_task = async move {
+        if db_shutdown_tx.send(true).is_err() {
+            warn!("Database task already exited before shutdown signal");
+        }
+        match tokio::time::timeout(DB_DRAIN_TIMEOUT, db_join).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => error!("Database task did not exit cleanly:  {err}"),
+            Err(_) => error!(
+                "Database task did not drain within {} seconds, abandoning",
+                DB_DRAIN_TIMEOUT.as_secs()
+            ),
+        }
+    };
+    tokio::pin!(drain_db_task);
+
     loop {
         trace!(
             "Active downloads ({}):  {:?}",
@@ -4526,10 +4553,12 @@ async fn main_loop(
         let next = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("SIGINT received, stopping...");
+                drain_db_task.as_mut().await;
                 return Ok(());
             },
             _ = term_signal.recv() => {
                 info!("SIGTERM received, stopping...");
+                drain_db_task.as_mut().await;
                 return Ok(());
             },
             _ = cleanup_interval.tick() => {

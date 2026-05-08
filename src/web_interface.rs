@@ -1197,9 +1197,9 @@ fn build_daemon_status_html(
     );
     t.row("Active HTTPS Tunnels", active_tunnels());
     t.row(
-        "DB Command Queue (current / max, peak, sent, full-waits, full-transitions)",
+        "DB Command Queue (current / max, peak, sent, full-waits, full-transitions, dropped)",
         format_args!(
-            "{} / {db_channel_max}, peak {}, sent {}, full-waits {}, full-transitions {}",
+            "{} / {db_channel_max}, peak {}, sent {}, full-waits {}, full-transitions {}, dropped {}",
             Colorize {
                 inner: db_channel_in_flight,
                 class: depth_class,
@@ -1211,6 +1211,29 @@ fn build_daemon_status_html(
             metrics::DB_COMMANDS_SENT.get(),
             WarnNonzero(metrics::DB_QUEUE_FULL_WAITS.get()),
             WarnNonzero(metrics::DB_QUEUE_FULL_TRANSITIONS.get()),
+            WarnNonzero(metrics::DB_COMMANDS_DROPPED_SHUTDOWN.get()),
+        ),
+    );
+    t.row_tip(
+        "DB Batch Flushes (by size / by time / on shutdown, peak size)",
+        "Batch flush trigger counts and the peak number of commands coalesced into a single flush. Under load `by size` should dominate; idle periods favour `by time`.",
+        format_args!(
+            "{} / {} / {}, peak {}",
+            metrics::DB_BATCH_FLUSHES_BY_SIZE.get(),
+            metrics::DB_BATCH_FLUSHES_BY_TIME.get(),
+            metrics::DB_BATCH_FLUSHES_ON_SHUTDOWN.get(),
+            metrics::DB_BATCH_SIZE_PEAK.get(),
+        ),
+    );
+    t.row_tip(
+        "DB Mirror Cache (entries, hits / misses, last_seen flushed)",
+        "Process-local mirror-id cache: current entry count (hydrated at startup, grows on each newly observed mirror; never evicted), hit/miss totals, and the cumulative number of `mirrors_v2.last_seen` rows the periodic task has flushed back to disk.",
+        format_args!(
+            "{}, {} / {}, {}",
+            metrics::DB_MIRROR_CACHE_ENTRIES.get(),
+            metrics::DB_MIRROR_CACHE_HITS.get(),
+            metrics::DB_MIRROR_CACHE_MISSES.get(),
+            metrics::DB_MIRROR_LAST_SEEN_FLUSHED.get(),
         ),
     );
     t.row(

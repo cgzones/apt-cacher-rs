@@ -43,6 +43,8 @@ const DEFAULT_MAX_UPSTREAM_DOWNLOADS: Option<NonZero<usize>> = Some(nonzero!(20)
 const DEFAULT_BYHASH_RETENTION_DAYS: NonZero<u64> = nonzero!(90);
 const DEFAULT_USAGE_RETENTION_DAYS: Option<NonZero<u64>> = Some(nonzero!(30));
 const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
+const DEFAULT_DB_BATCH_FLUSH_MAX_COUNT: NonZero<usize> = nonzero!(256);
+const DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS: NonZero<u64> = nonzero!(15);
 const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
 const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
 const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
@@ -516,6 +518,15 @@ pub(crate) struct Config {
     #[serde(default = "default_db_channel_capacity")]
     pub(crate) db_channel_capacity: NonZero<usize>,
 
+    /// Maximum number of pending database events buffered before a batch flush.
+    #[serde(default = "default_db_batch_flush_max_count")]
+    pub(crate) db_batch_flush_max_count: NonZero<usize>,
+
+    /// Interval (in seconds) between database batch flushes and mirror
+    /// `last_seen` syncs.
+    #[serde(default = "default_db_batch_flush_interval_secs")]
+    pub(crate) db_batch_flush_interval_secs: NonZero<u64>,
+
     /// Threshold (in bytes) for using memory-mapped files for large downloads.
     #[serde(default = "default_mmap_threshold")]
     pub(crate) mmap_threshold: NonZero<u64>,
@@ -818,6 +829,14 @@ const fn default_db_channel_capacity() -> NonZero<usize> {
     DEFAULT_DB_CHANNEL_CAPACITY
 }
 
+const fn default_db_batch_flush_max_count() -> NonZero<usize> {
+    DEFAULT_DB_BATCH_FLUSH_MAX_COUNT
+}
+
+const fn default_db_batch_flush_interval_secs() -> NonZero<u64> {
+    DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS
+}
+
 const fn default_mmap_threshold() -> NonZero<u64> {
     DEFAULT_MMAP_THRESHOLD
 }
@@ -1021,6 +1040,8 @@ impl Config {
             rate_check_timeframe: DEFAULT_RATE_CHECK_TIMEFRAME,
             max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
             db_channel_capacity: DEFAULT_DB_CHANNEL_CAPACITY,
+            db_batch_flush_max_count: DEFAULT_DB_BATCH_FLUSH_MAX_COUNT,
+            db_batch_flush_interval_secs: DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS,
             mmap_threshold: DEFAULT_MMAP_THRESHOLD,
             upstream_tcp_nodelay: DEFAULT_UPSTREAM_TCP_NODELAY,
             reject_pdiff_requests: DEFAULT_REJECT_PDIFF_REQUESTS,
@@ -1173,6 +1194,20 @@ impl Config {
             bail!(
                 "Invalid db_channel_capacity value of {}: must be between 1 and 4096",
                 self.db_channel_capacity
+            );
+        }
+
+        if self.db_batch_flush_max_count > nonzero!(4096) {
+            bail!(
+                "Invalid db_batch_flush_max_count value of {}: must be between 1 and 4096",
+                self.db_batch_flush_max_count
+            );
+        }
+
+        if self.db_batch_flush_interval_secs > nonzero!(300) {
+            bail!(
+                "Invalid db_batch_flush_interval_secs value of {}: must be between 1 and 300",
+                self.db_batch_flush_interval_secs
             );
         }
 

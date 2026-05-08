@@ -123,14 +123,6 @@ pub(crate) struct Origin {
     pub(crate) architecture: String,
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) struct OriginRef<'a> {
-    pub(crate) mirror: &'a Mirror,
-    pub(crate) distribution: &'a str,
-    pub(crate) component: &'a str,
-    pub(crate) architecture: &'a str,
-}
-
 impl Origin {
     #[must_use]
     pub(crate) fn from_path(
@@ -163,17 +155,6 @@ impl Origin {
             component: component.to_owned(),
             architecture: architecture.to_owned(),
         })
-    }
-
-    #[must_use]
-    #[inline]
-    pub(crate) const fn as_ref(&self) -> OriginRef<'_> {
-        OriginRef {
-            mirror: &self.mirror,
-            distribution: self.distribution.as_str(),
-            component: self.component.as_str(),
-            architecture: self.architecture.as_str(),
-        }
     }
 }
 
