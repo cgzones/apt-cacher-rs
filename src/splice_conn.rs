@@ -1841,8 +1841,10 @@ async fn splice_proxy_body(
     // branch fires at most once per call when it's nested in the loop below.
     let mut counter = Some(client_counter::ClientDownload::new());
 
-    // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
-    metrics::REQUESTS_SPLICE.increment();
+    // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
+    // response-headers emission (next to `record_client_status`), since
+    // this body fn is skipped when the entire response fits in the
+    // body_prefix / kTLS extra-body and we still need to count it.
 
     let (upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
     let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
@@ -2178,8 +2180,10 @@ async fn splice_proxy_body_tls(
     // branch fires at most once per call when it's nested in the loop below.
     let mut counter = Some(client_counter::ClientDownload::new());
 
-    // Paired with BYTES_SERVED_SPLICE in tee_and_splice / boundary fallback.
-    metrics::REQUESTS_SPLICE.increment();
+    // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
+    // response-headers emission (next to `record_client_status`), since
+    // this body fn is skipped when the entire response fits in the
+    // body_prefix / kTLS extra-body and we still need to count it.
 
     let (mut upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
     let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
@@ -2443,8 +2447,9 @@ fn spawn_file_serve_task(
 /// Delegates to [`async_sendfile_unfinished`], which handles the same
 /// growing-file / `watch::Receiver` / `ActiveDownloadStatus` interplay used by
 /// the sendfile late-joiner path.  The request was already counted as
-/// `REQUESTS_SPLICE` at proxy entry; only the bytes flow through
-/// `BYTES_SERVED_SENDFILE` (incremented inside `sendfile_chunk_loop`).
+/// `REQUESTS_SPLICE` when its response headers were emitted; only the bytes
+/// flow through `BYTES_SERVED_SENDFILE` (incremented inside
+/// `sendfile_chunk_loop`).
 async fn serve_remaining_from_file(
     client: TcpStream,
     cache_path: PathBuf,
@@ -4599,6 +4604,10 @@ async fn splice_proxy_drive(
     } else {
         StatusCode::OK
     });
+    // Bump once per splice-served response, regardless of whether the body
+    // ends up flowing through `splice_proxy_body{,_tls}`, the body-prefix
+    // direct write, or the kTLS-extra-body direct write.
+    metrics::REQUESTS_SPLICE.increment();
     write_all_to_stream(
         client_stream,
         response_headers.as_bytes(),
