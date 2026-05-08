@@ -4702,6 +4702,15 @@ where
         .await
     {
         if err.is_incomplete_message() || hyper_is_peer_disconnect(&err) {
+            // Hyper does not expose per-frame write errors, so we cannot
+            // tell whether the disconnect happened mid-body, between
+            // pipelined requests, or before any response was started. Bump
+            // on the full outer guard — both peer-disconnect and incomplete-
+            // message framing breaks indicate the client went away — since
+            // the alternative (silently dropping these) gives the operator
+            // a worse signal. See the docstring on
+            // CLIENT_DISCONNECTED_MID_BODY for the scope caveat.
+            metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
             info!(
                 "Connection to client {client} disconnected:  {}",
                 ErrorReport(&err)

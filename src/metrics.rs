@@ -137,7 +137,18 @@ pub(crate) static VOLATILE_REFETCHED_UPTODATE: Counter = Counter::new();
 /// Subset of `VOLATILE_REFETCHED`: stale-but-present, upstream returned a fresh body.
 pub(crate) static VOLATILE_REFETCHED_OUTOFDATE: Counter = Counter::new();
 
-/// Body-write failures attributed to the client (`BrokenPipe` / `ConnectionReset`).
+/// Body-write failures attributed to the client (`BrokenPipe` /
+/// `ConnectionReset` / `ConnectionAborted`).
+///
+/// Scope per backend:
+///   * sendfile / splice — bumped only when the failing write happens
+///     mid-body (the helpers see the syscall error directly).
+///   * hyper — hyper does not expose per-frame write errors, so the
+///     bump fires once per connection on any peer-disconnect surfaced by
+///     `serve_connection`. That includes pre-body and between-keepalive
+///     disconnects, so the hyper count slightly over-attributes to
+///     "mid-body" — interpret as "client peer-disconnects during a
+///     hyper-served request lifetime."
 pub(crate) static CLIENT_DISCONNECTED_MID_BODY: Counter = Counter::new();
 
 /// Requests rejected because the path failed safety validation.
