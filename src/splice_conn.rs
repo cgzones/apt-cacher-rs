@@ -1905,6 +1905,7 @@ async fn splice_proxy_body(
 
             let _: Never = match res {
                 Ok(0) => {
+                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     return Err(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
                         format!(
@@ -2272,6 +2273,7 @@ async fn splice_proxy_body_tls(
             }
         };
         if got == 0 {
+            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
             return Err(std::io::Error::new(
                 ErrorKind::UnexpectedEof,
                 "splice proxy: TLS upstream closed prematurely",
@@ -4484,6 +4486,7 @@ async fn splice_proxy_drive(
         .get()
         .checked_sub(body_prefix.len() as u64)
     else {
+        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         error!(
             "splice proxy: body prefix ({} bytes) exceeds body content length ({} bytes) \
              for {} from mirror {}",
@@ -4512,6 +4515,7 @@ async fn splice_proxy_drive(
         splice_count = if let Some(sc) = splice_count.checked_sub(extra_len) {
             sc
         } else {
+            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
             error!(
                 "splice proxy: kTLS extra body ({extra_len} bytes) exceeds remaining \
                  body content length ({splice_count} bytes) for {} from mirror {}",
