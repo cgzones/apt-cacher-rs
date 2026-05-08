@@ -33,12 +33,18 @@ pub(crate) fn is_valid_etag(s: &str) -> bool {
             .all(|&c| c == 0x21 || (0x23..=0x7E).contains(&c) || c >= 0x80)
 }
 
-/// Read an `ETag` from the file's extended attributes.
+/// Read an `ETag` from the file's extended attributes, distinguishing
+/// transient I/O errors from a stable "no value" outcome.
 ///
-/// Returns `None` on any error (graceful degradation).
-#[must_use]
-pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<String> {
-    let data = xattr_helpers::read_helper(file, display_path, XATTR_ETAG)?;
+/// See [`xattr_helpers::try_read_helper`] for the semantics; a malformed
+/// stored `ETag` is scrubbed and reported as `Ok(None)`.
+pub(crate) fn try_read_etag(
+    file: &tokio::fs::File,
+    display_path: &Path,
+) -> Result<Option<String>, xattr_helpers::XattrIoError> {
+    let Some(data) = xattr_helpers::try_read_helper(file, display_path, XATTR_ETAG)? else {
+        return Ok(None);
+    };
 
     if !is_valid_etag(&data) {
         warn!(
@@ -49,10 +55,20 @@ pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<S
 
         xattr_helpers::remove_helper(file, display_path, XATTR_ETAG);
 
-        return None;
+        return Ok(None);
     }
 
-    Some(data)
+    Ok(Some(data))
+}
+
+/// Read an `ETag` from the file's extended attributes.
+///
+/// Returns `None` on any error (graceful degradation).  Callers that
+/// need to distinguish transient I/O errors from a stable "no value"
+/// outcome should use [`try_read_etag`].
+#[must_use]
+pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<String> {
+    try_read_etag(file, display_path).ok().flatten()
 }
 
 /// Write an `ETag` to the file's extended attributes.

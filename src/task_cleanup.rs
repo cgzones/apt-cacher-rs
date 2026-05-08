@@ -22,7 +22,7 @@ use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{
     AppState, CachedFlavor, ClientInfo, ConnectionDetails, ProxyCacheBody, ProxyCacheError,
-    RETENTION_TIME,
+    RETENTION_TIME, cache_metadata,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, UriFormat as _, mirror_cache_path_impl},
     global_cache_quota, global_config,
@@ -587,6 +587,16 @@ async fn cleanup_mirror_deb_files(
                 path.display()
             );
             continue;
+        }
+
+        // Drop the post-flight ETag/Last-Modified entry for the removed
+        // file so a subsequent re-cache starts from a clean state instead
+        // of reusing the stale entry until the next rename.  Treat a
+        // non-UTF-8 filename as opaque (debnames are URL-decoded ASCII in
+        // practice; an OsString that doesn't decode is not in the map).
+        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
+            cache_metadata::store()
+                .invalidate(&cache_metadata::CacheMetadataKeyRef::new(&mirror, debname));
         }
 
         debug!("Removed unreferenced file `{}`", path.display());

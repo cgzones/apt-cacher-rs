@@ -16,6 +16,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod active_downloads;
 mod cache_conditional;
+mod cache_metadata;
 mod cache_quota;
 mod channel_body;
 mod config;
@@ -144,6 +145,8 @@ use tokio::signal::unix::SignalKind;
 use crate::active_downloads::OriginateOutcome;
 use crate::active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads, InsertOutcome};
 use crate::cache_conditional::CacheInfo;
+use crate::cache_metadata::UpstreamMetadata;
+use crate::cache_metadata::UpstreamMetadataView;
 use crate::cache_quota::QuotaExceeded;
 use crate::config::Config;
 use crate::config::DomainName;
@@ -1141,36 +1144,21 @@ impl Body for MmapBody {
     }
 }
 
-enum EtagState {
-    Some(String),
-    Failure,
-    Unknown,
-}
-
-impl EtagState {
-    fn from_option(etag: Option<String>) -> Self {
-        match etag {
-            Some(etag) => Self::Some(etag),
-            None => Self::Failure,
-        }
-    }
-}
-
 #[must_use]
 async fn serve_cached_file(
     conn_details: ConnectionDetails,
     req: &Request<Empty<()>>,
     file: tokio::fs::File,
     file_path: PathBuf,
-    file_etag: EtagState,
-    prefetched_metadata: Option<std::fs::Metadata>,
+    prefetched_upstream_metadata: Option<&UpstreamMetadata>,
+    prefetched_local_metadata: Option<std::fs::Metadata>,
 ) -> Response<ProxyCacheBody> {
     let aliased = match conn_details.aliased_host {
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
     };
 
-    let metadata = match prefetched_metadata {
+    let metadata = match prefetched_local_metadata {
         Some(m) => m,
         None => match file.metadata().await {
             Ok(m) => m,
@@ -1187,11 +1175,16 @@ async fn serve_cached_file(
 
     let file_size = metadata.len();
 
-    // Use the provided ETag or fall back to reading from the file if not provided
-    let resolved_etag = match file_etag {
-        EtagState::Some(etag) => Some(etag),
-        EtagState::Failure => None,
-        EtagState::Unknown => read_etag(&file, &file_path),
+    let cache_key =
+        cache_metadata::CacheMetadataKeyRef::new(&conn_details.mirror, &conn_details.debname);
+
+    // Caller pre-resolves on the volatile / late-joiner / originator paths;
+    // otherwise fall back to the post-flight cache (lazy-loads xattr on miss).
+    let resolved_meta = match prefetched_upstream_metadata {
+        Some(meta) => UpstreamMetadataView::Borrowed(meta),
+        None => UpstreamMetadataView::Arc(
+            cache_metadata::store().resolve(&cache_key, &file, &file_path),
+        ),
     };
 
     let if_none_match_str = match req.headers().get(IF_NONE_MATCH) {
@@ -1213,7 +1206,7 @@ async fn serve_cached_file(
         .get(IF_MODIFIED_SINCE)
         .and_then(|v| v.to_str().ok());
 
-    let cache_info = CacheInfo::with_etag(&file, &file_path, &metadata, resolved_etag);
+    let cache_info = CacheInfo::with_meta(&metadata, &resolved_meta);
     let serve_304 = cache_info.decide_serve_304(if_none_match_str, if_modified_since_str);
 
     let cache_conditional::CacheInfo {
@@ -1670,15 +1663,8 @@ async fn serve_volatile_file(
             #[cfg(not(feature = "sendfile"))]
             metrics::VOLATILE_HIT.increment();
 
-            return serve_cached_file(
-                conn_details,
-                &req,
-                file,
-                file_path,
-                EtagState::Unknown,
-                Some(metadata),
-            )
-            .await;
+            return serve_cached_file(conn_details, &req, file, file_path, None, Some(metadata))
+                .await;
         }
     } else {
         warn!(
@@ -1702,7 +1688,7 @@ async fn serve_volatile_file(
                 "Serving file {} already in cache / download from mirror {} for client {}...",
                 conn_details.debname, conn_details.mirror, conn_details.client
             );
-            serve_downloading_file(conn_details, req, status, EtagState::Unknown).await
+            serve_downloading_file(conn_details, req, status, None).await
         }
         InsertOutcome::Originator { init_tx, status } => {
             serve_new_file(
@@ -2014,16 +2000,9 @@ async fn serve_unfinished_file(
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     content_length: ContentLength,
     mut receiver: tokio::sync::watch::Receiver<()>,
-    upstream_etag: EtagState,
+    upstream_metadata: &UpstreamMetadata,
 ) -> Response<ProxyCacheBody> {
     let config = global_config();
-
-    // For joining clients, try reading from xattr as the download task may have already written it.
-    let resolved_etag = match upstream_etag {
-        EtagState::Some(etag) => Some(etag),
-        EtagState::Failure => None,
-        EtagState::Unknown => read_etag(&file, &file_path),
-    };
 
     let md = match file.metadata().await {
         Ok(data) => data,
@@ -2042,7 +2021,7 @@ async fn serve_unfinished_file(
         last_modified_str,
         age,
         last_modified_for_ims: _,
-    } = CacheInfo::with_etag(&file, &file_path, &md, resolved_etag);
+    } = CacheInfo::with_meta(&md, upstream_metadata);
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -2099,7 +2078,7 @@ async fn serve_unfinished_file(
                 /* sender closed, either download finished or aborted */
                 let st = status.read().await;
                 let _: Never = match *st {
-                    ActiveDownloadStatus::Finished(_) => {
+                    ActiveDownloadStatus::Finished { .. } => {
                         drop(st);
                         finished = true;
                         continue;
@@ -2123,7 +2102,7 @@ async fn serve_unfinished_file(
 
                         return;
                     }
-                    ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download(..) => {
+                    ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
                         error!(
                             "Invalid download state {:?} of file `{}`, cancelling stream",
                             *st,
@@ -2220,7 +2199,7 @@ async fn serve_downloading_file(
     conn_details: ConnectionDetails,
     req: Request<Empty<()>>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    upstream_etag: EtagState,
+    prefetched_upstream_metadata: Option<&UpstreamMetadata>,
 ) -> Response<ProxyCacheBody> {
     let mut init_waited = false;
 
@@ -2255,8 +2234,15 @@ async fn serve_downloading_file(
                 let _ignore = init_rx.changed().await;
                 init_waited = true;
             }
-            ActiveDownloadStatus::Finished(path) => {
+            ActiveDownloadStatus::Finished { path, meta, .. } => {
                 let path_clone = path.clone();
+                let prefetched_upstream_metadata = if let Some(meta) = prefetched_upstream_metadata
+                {
+                    Some(UpstreamMetadataView::Borrowed(meta))
+                } else {
+                    meta.as_ref()
+                        .map(|meta| UpstreamMetadataView::Arc(Arc::clone(meta)))
+                };
                 drop(st);
                 drop(status);
                 let file = match tokio::fs::File::open(&path_clone).await {
@@ -2279,12 +2265,17 @@ async fn serve_downloading_file(
                     &req,
                     file,
                     path_clone,
-                    upstream_etag,
+                    prefetched_upstream_metadata.as_deref(),
                     None,
                 )
                 .await;
             }
-            ActiveDownloadStatus::Download(path, content_length, receiver) => {
+            ActiveDownloadStatus::Download {
+                path,
+                content_length,
+                rx: receiver,
+                meta,
+            } => {
                 // Cannot use mmap(2) since the file is not yet completely written
                 let file = match tokio::fs::File::open(&path).await {
                     Ok(f) => f,
@@ -2303,6 +2294,7 @@ async fn serve_downloading_file(
                 let path_clone = path.clone();
                 let content_length_copy = *content_length;
                 let receiver_clone = receiver.clone();
+                let upstream_metadata = Arc::clone(meta);
                 drop(st);
 
                 return serve_unfinished_file(
@@ -2312,7 +2304,7 @@ async fn serve_downloading_file(
                     status,
                     content_length_copy,
                     receiver_clone,
-                    upstream_etag,
+                    &upstream_metadata,
                 )
                 .await;
             }
@@ -2507,7 +2499,7 @@ async fn serve_new_file(
         uri: &Uri,
         host: &HeaderValue,
         cfstate: &CacheFileStat,
-        volatile_etag: &EtagState,
+        volatile_etag: Option<&str>,
         resume_offset: u64,
         resume_if_range: Option<&str>,
     ) -> Request<Empty<bytes::Bytes>> {
@@ -2584,7 +2576,7 @@ async fn serve_new_file(
                 .append(CACHE_CONTROL, HeaderValue::from_static("max-age=300"));
             assert!(!r, "header does not exist by previous construction");
 
-            if let EtagState::Some(etag) = volatile_etag {
+            if let Some(etag) = volatile_etag {
                 let r = request.headers_mut().append(
                     IF_NONE_MATCH,
                     HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
@@ -2678,15 +2670,25 @@ async fn serve_new_file(
         );
     }
 
-    let volatile_etag = match &cfstate {
+    let prefetched_upstream_metadata = match &cfstate {
         CacheFileStat::Volatile {
             file,
             file_path,
             local_modification_time: _,
             prev_size: _,
-        } => EtagState::from_option(read_etag(file, file_path)),
-        CacheFileStat::New => EtagState::Unknown,
+        } => {
+            let key = cache_metadata::CacheMetadataKeyRef::new(
+                &conn_details.mirror,
+                &conn_details.debname,
+            );
+
+            Some(cache_metadata::store().resolve(&key, file, file_path))
+        }
+        CacheFileStat::New => None,
     };
+    let volatile_etag = prefetched_upstream_metadata
+        .as_ref()
+        .and_then(|m| m.etag.as_deref());
 
     // Check for a partial download file to resume (permanent files only).
     // Opens the file upfront (if it exists and is non-empty) to get size + mtime
@@ -2759,7 +2761,7 @@ async fn serve_new_file(
         &req_uri,
         host,
         &cfstate,
-        &volatile_etag,
+        volatile_etag,
         resume_offset,
         resume_if_range.as_deref(),
     );
@@ -2799,7 +2801,7 @@ async fn serve_new_file(
                 &req_uri,
                 host,
                 &cfstate,
-                &volatile_etag,
+                volatile_etag,
                 resume_offset,
                 resume_if_range.as_deref(),
             );
@@ -2845,8 +2847,15 @@ async fn serve_new_file(
 
             ibarrier.finished(file_path.clone()).await;
 
-            return serve_cached_file(conn_details, &req, file, file_path, volatile_etag, None)
-                .await;
+            return serve_cached_file(
+                conn_details,
+                &req,
+                file,
+                file_path,
+                prefetched_upstream_metadata.as_deref(),
+                None,
+            )
+            .await;
         }
 
         metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
@@ -2920,7 +2929,7 @@ async fn serve_new_file(
         // upstream's perspective this is a fresh unconditional fetch — no
         // If-Modified-Since, no If-None-Match, no Range.
         let retry_request =
-            build_fwd_request(&req_uri, host, &CacheFileStat::New, &volatile_etag, 0, None);
+            build_fwd_request(&req_uri, host, &CacheFileStat::New, volatile_etag, 0, None);
 
         fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
             Ok(r) => r,
@@ -3245,8 +3254,18 @@ async fn serve_new_file(
         );
     }
 
+    let upstream_metadata = Arc::new(UpstreamMetadata::from_upstream(
+        upstream_etag,
+        upstream_last_modified,
+    ));
+
     let dbarrier = ibarrier
-        .download(outpath.to_path_buf(), total_content_length, reservation)
+        .download(
+            outpath.to_path_buf(),
+            total_content_length,
+            reservation,
+            Arc::clone(&upstream_metadata),
+        )
         .await;
 
     {
@@ -3316,13 +3335,7 @@ async fn serve_new_file(
         }
     }
 
-    serve_downloading_file(
-        conn_details,
-        req,
-        status,
-        EtagState::from_option(upstream_etag),
-    )
-    .await
+    serve_downloading_file(conn_details, req, status, Some(&upstream_metadata)).await
 }
 
 /// Create a TCP connection to host:port, build a tunnel between the connection and
@@ -3423,15 +3436,7 @@ pub(crate) async fn process_cache_request(
                     serve_volatile_file(conn_details, req, file, cache_path, appstate).await
                 }
                 CachedFlavor::Permanent => {
-                    serve_cached_file(
-                        conn_details,
-                        &req,
-                        file,
-                        cache_path,
-                        EtagState::Unknown,
-                        None,
-                    )
-                    .await
+                    serve_cached_file(conn_details, &req, file, cache_path, None, None).await
                 }
             }
         }
@@ -3470,7 +3475,7 @@ pub(crate) async fn process_cache_request(
                         "Serving file {} already in download from mirror {} for client {}...",
                         conn_details.debname, conn_details.mirror, conn_details.client
                     );
-                    serve_downloading_file(conn_details, req, status, EtagState::Unknown).await
+                    serve_downloading_file(conn_details, req, status, None).await
                 }
             }
         }
@@ -4368,6 +4373,9 @@ async fn main_loop(
     database_task::DB_TASK_QUEUE_SENDER
         .set(db_task_tx)
         .expect("DB task queue sender initialized once");
+
+    // Process-local cache for cached-file ETag / Last-Modified xattrs.
+    cache_metadata::init().expect("cache metadata store initialized once");
 
     // Initial cache scan task
     {

@@ -63,9 +63,9 @@ use crate::utils::{
 use crate::{
     APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, CachedFlavor, ConnectionDetails,
     ContentLength, Never, OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
-    VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, client_counter, content_type_for_cached_file,
-    global_cache_quota, global_config, is_host_allowed_cached, metrics, static_assert,
-    warn_once_or_debug, warn_once_or_info,
+    VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, cache_metadata, client_counter,
+    content_type_for_cached_file, global_cache_quota, global_config, is_host_allowed_cached,
+    metrics, static_assert, warn_once_or_debug, warn_once_or_info,
 };
 #[cfg(feature = "ktls")]
 use crate::{KTLS_BLOCKED, warn_once};
@@ -3687,7 +3687,14 @@ async fn splice_proxy_drive(
                 .modified()
                 .expect("Platform should support modification timestamps via setup check");
             let if_modified_since = HttpDate::from(mtime).format();
-            let if_none_match = read_etag(&file, &cache_path);
+            let key = cache_metadata::CacheMetadataKeyRef::new(
+                &conn_details.mirror,
+                &conn_details.debname,
+            );
+            let if_none_match = cache_metadata::store()
+                .resolve(&key, &file, &cache_path)
+                .etag
+                .clone();
             volatile_cond = Some(VolatileCondHeaders {
                 if_modified_since,
                 if_none_match,
@@ -3791,9 +3798,9 @@ async fn splice_proxy_drive(
                 conn_details,
                 "",
                 (file, &cache_path),
-                conn_version,
-                conn_action,
+                (conn_version, conn_action),
                 client_range,
+                None,
             )
             .await
             {
@@ -4003,9 +4010,9 @@ async fn splice_proxy_drive(
             conn_details,
             "",
             (file, &cache_path),
-            conn_version,
-            conn_action,
+            (conn_version, conn_action),
             client_range,
+            None,
         )
         .await
         {
@@ -4492,11 +4499,16 @@ async fn splice_proxy_drive(
         write_last_modified(&tempfile, &temppath, lm);
     }
 
+    let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
+        upstream_resp.etag.clone(),
+        upstream_resp.last_modified.clone(),
+    );
     let mut dbarrier = ibarrier
         .download(
             temppath.to_path_buf(),
             ContentLength::Exact(total_content_length),
             reservation,
+            Arc::new(download_meta),
         )
         .await;
 
@@ -5413,12 +5425,18 @@ async fn handle_volatile_buffered_download(
         write_last_modified(&tempfile, &temppath, lm);
     }
 
+    let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
+        upstream_resp.etag.clone(),
+        upstream_resp.last_modified.clone(),
+    );
+
     // Transition barrier: InitBarrier → DownloadBarrier.
     let mut dbarrier: DownloadBarrier = ibarrier
         .download(
             temppath.to_path_buf(),
             ContentLength::Exact(total_content_length),
             reservation,
+            Arc::new(download_meta),
         )
         .await;
 

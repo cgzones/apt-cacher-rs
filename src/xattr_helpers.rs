@@ -37,51 +37,81 @@ pub(crate) fn remove_helper(file: &tokio::fs::File, display_path: &Path, key: &s
     }
 }
 
+/// Marker returned by [`try_read_helper`] (and the typed wrappers in
+/// [`crate::http_etag`] / [`crate::http_last_modified`]) when the xattr
+/// syscall failed in a way that may succeed on retry — distinct from a
+/// stable "no value" outcome (xattr absent, filesystem doesn't support
+/// xattrs, or a malformed value was scrubbed).  Callers that don't need
+/// the distinction can use the non-`try_` variants which collapse both
+/// outcomes to `None`; callers that negative-cache (see
+/// [`crate::cache_metadata`]) must use the `try_` variants and skip the
+/// cache write on `Err`.
+#[derive(Debug)]
+pub(crate) struct XattrIoError;
+
+/// Read the extended attribute value for the given key, distinguishing
+/// transient I/O errors from a stable "no value" outcome.
+///
+/// - `Ok(Some(s))` — xattr present and decoded as UTF-8.
+/// - `Ok(None)` — xattr absent, FS does not support xattrs, or the value
+///   was malformed (invalid UTF-8) and has been scrubbed.  Safe to
+///   negative-cache.
+/// - `Err(XattrIoError)` — transient syscall failure (warning is logged
+///   here).  Callers must NOT cache the absence; the next request may
+///   succeed.
+pub(crate) fn try_read_helper(
+    file: &tokio::fs::File,
+    display_path: &Path,
+    key: &str,
+) -> Result<Option<String>, XattrIoError> {
+    let data = tokio::task::block_in_place(|| XattrFile(file).get_xattr(key));
+
+    match data {
+        Ok(None) => Ok(None),
+
+        Ok(Some(val)) => match String::from_utf8(val) {
+            Ok(s) => Ok(Some(s)),
+            Err(err @ std::string::FromUtf8Error { .. }) => {
+                warn!(
+                    "Discarding invalid UTF-8 xattr from `{}` for key `{key}`:  {err}",
+                    display_path.display()
+                );
+
+                remove_helper(file, display_path, key);
+
+                Ok(None)
+            }
+        },
+
+        Err(err) => {
+            let kind = err.kind();
+            if kind == std::io::ErrorKind::Unsupported
+                || err.raw_os_error() == Some(Errno::ENODATA as i32)
+            {
+                Ok(None)
+            } else {
+                warn!(
+                    "Unexpected error reading xattr from `{}` for key `{key}`:  {err}",
+                    display_path.display()
+                );
+                Err(XattrIoError)
+            }
+        }
+    }
+}
+
 /// Read the extended attribute value for the given key from the file.
 ///
-/// Returns `None` on any error (graceful degradation).
+/// Returns `None` on any error (graceful degradation).  Callers that
+/// need to distinguish transient I/O errors from a stable "no value"
+/// outcome (e.g. for negative caching) should use [`try_read_helper`].
 #[must_use]
 pub(crate) fn read_helper(
     file: &tokio::fs::File,
     display_path: &Path,
     key: &str,
 ) -> Option<String> {
-    let data = tokio::task::block_in_place(|| XattrFile(file).get_xattr(key));
-
-    match data {
-        Ok(None) => None,
-
-        Ok(Some(val)) => {
-            let s = match String::from_utf8(val) {
-                Ok(s) => s,
-                Err(err @ std::string::FromUtf8Error { .. }) => {
-                    warn!(
-                        "Discarding invalid UTF-8 xattr from `{}` for key `{key}`:  {err}",
-                        display_path.display()
-                    );
-
-                    remove_helper(file, display_path, key);
-
-                    return None;
-                }
-            };
-
-            Some(s)
-        }
-
-        Err(err) => {
-            let kind = err.kind();
-            if kind != std::io::ErrorKind::Unsupported
-                && err.raw_os_error() != Some(Errno::ENODATA as i32)
-            {
-                warn!(
-                    "Unexpected error reading xattr from `{}` for key `{key}`:  {err}",
-                    display_path.display()
-                );
-            }
-            None
-        }
-    }
+    try_read_helper(file, display_path, key).ok().flatten()
 }
 
 /// Write the given value to the extended attribute for the given key on the file.

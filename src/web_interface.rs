@@ -22,7 +22,7 @@ use time::{OffsetDateTime, format_description::FormatItem, macros::format_descri
 
 use crate::{
     APP_NAME, APP_VERSION, AppState, HumanFmt, LOGSTORE, ProxyCacheBody, RUNTIMEDETAILS,
-    RuntimeDetails,
+    RuntimeDetails, cache_metadata,
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
@@ -1235,6 +1235,11 @@ fn build_daemon_status_html(
             metrics::DB_MIRROR_CACHE_MISSES.get(),
             metrics::DB_MIRROR_LAST_SEEN_FLUSHED.get(),
         ),
+    );
+    t.row_tip(
+        "Metadata Cache Entries",
+        "Process-local entries cached from per-file ETag and Last-Modified xattrs. Skips fgetxattr(2) on subsequent conditional-request hits; rebuilt lazily after restart.",
+        cache_metadata::store().len(),
     );
     t.row(
         "Log Entries",

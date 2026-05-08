@@ -3,6 +3,7 @@ use std::num::NonZero;
 use std::os::fd::AsFd as _;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
@@ -16,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::cache_conditional::CacheInfo;
+use crate::cache_metadata::{self, CacheMetadataKeyRef};
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{
     Mirror, Origin, ResourceFile, is_deb_package, is_unsafe_proxy_path, parse_request_path,
@@ -968,9 +970,9 @@ async fn try_sendfile_request(
             &conn_details,
             &aliased,
             (file, &cache_path),
-            *conn_version,
-            conn_action,
+            (*conn_version, conn_action),
             RangeRequestHeaders::extract(req.headers),
+            None,
         )
         .await;
     }
@@ -1183,11 +1185,12 @@ pub(crate) async fn serve_file_via_sendfile(
     conn_details: &ConnectionDetails,
     aliased: &str,
     source: (tokio::fs::File, &Path),
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
+    conn_settings: (ConnectionVersion, ConnectionAction),
     headers: RangeRequestHeaders<'_>,
+    prefetched_upstream_metadata: Option<&cache_metadata::UpstreamMetadata>,
 ) -> SendfileResult {
     let (file, file_path) = source;
+    let (conn_version, conn_action) = conn_settings;
 
     let metadata = match file.metadata().await {
         Ok(m) => m,
@@ -1207,7 +1210,12 @@ pub(crate) async fn serve_file_via_sendfile(
 
     let file_size = metadata.len();
 
-    let cache_info = CacheInfo::read(&file, file_path, &metadata);
+    let cache_info = if let Some(meta) = prefetched_upstream_metadata {
+        CacheInfo::with_meta(&metadata, meta)
+    } else {
+        let key = CacheMetadataKeyRef::new(&conn_details.mirror, &conn_details.debname);
+        CacheInfo::resolve(&file, file_path, &metadata, &key)
+    };
 
     let (http_status, content_start, content_length, content_range, partial) =
         match evaluate_conditional_and_range(
@@ -1814,7 +1822,7 @@ pub(crate) async fn async_sendfile_unfinished(
                     // Sender dropped — download finished or aborted.
                     let st = status.read().await;
                     match *st {
-                        ActiveDownloadStatus::Finished(_) => {
+                        ActiveDownloadStatus::Finished { .. } => {
                             drop(st);
                             finished = true;
                             continue;
@@ -1825,7 +1833,7 @@ pub(crate) async fn async_sendfile_unfinished(
                                 "sendfile: upstream download aborted",
                             ));
                         }
-                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download(..) => {
+                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
                             drop(st);
                             return Err(std::io::Error::other(
                                 "sendfile: unexpected download state for demoted client file-serve",
@@ -1850,9 +1858,9 @@ pub(crate) async fn async_sendfile_unfinished(
                 let (is_finished, is_aborted) = {
                     let st = status.read().await;
                     match *st {
-                        ActiveDownloadStatus::Finished(_) => (true, false),
+                        ActiveDownloadStatus::Finished { .. } => (true, false),
                         ActiveDownloadStatus::Aborted(_) => (false, true),
-                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download(..) => {
+                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
                             (false, false)
                         }
                     }
@@ -1886,8 +1894,10 @@ async fn serve_unfinished_sendfile(
     headers: RangeRequestHeaders<'_>,
 ) -> SendfileResult {
     // Wait for the download to leave the Init state and learn the file path,
-    // content length, and notification receiver.
-    let (file, file_path, total_size, receiver) = {
+    // content length, notification receiver, and the upstream metadata
+    // captured on the status (so we don't need to xattr-read the temp file
+    // for ETag / Last-Modified during the conditional-request decision).
+    let (file, file_path, total_size, receiver, status_meta) = {
         let mut init_waited = false;
         loop {
             let st = dl_status.read().await;
@@ -1910,7 +1920,12 @@ async fn serve_unfinished_sendfile(
 
                     continue;
                 }
-                ActiveDownloadStatus::Download(path, cl, rx) => {
+                ActiveDownloadStatus::Download {
+                    path,
+                    content_length,
+                    rx,
+                    meta,
+                } => {
                     let file = match tokio::fs::File::open(path).await {
                         Ok(f) => f,
                         Err(err) => {
@@ -1926,15 +1941,20 @@ async fn serve_unfinished_sendfile(
                             };
                         }
                     };
-                    let r = (file, path.clone(), *cl, rx.clone());
+                    let r = (
+                        file,
+                        path.clone(),
+                        *content_length,
+                        rx.clone(),
+                        Arc::clone(meta),
+                    );
                     drop(st);
                     break r;
                 }
-                ActiveDownloadStatus::Finished(path) => {
+                ActiveDownloadStatus::Finished { path, meta, .. } => {
                     let finished_path = path.clone();
+                    let prefetched = meta.clone();
                     drop(st);
-                    // Download finished before we could join — serve the
-                    // completed file directly via sendfile.
 
                     let file = match tokio::fs::File::open(&finished_path).await {
                         Ok(f) => f,
@@ -1957,9 +1977,9 @@ async fn serve_unfinished_sendfile(
                         conn_details,
                         aliased,
                         (file, &finished_path),
-                        conn_version,
-                        conn_action,
+                        (conn_version, conn_action),
                         headers,
+                        prefetched.as_deref(),
                     )
                     .await;
                 }
@@ -2004,7 +2024,10 @@ async fn serve_unfinished_sendfile(
         }
     };
 
-    let cache_info = CacheInfo::read(&file, &file_path, &metadata);
+    // Late-joiner: use the in-flight metadata captured from the active-
+    // downloads status (no xattr reads — the temp file may still be
+    // having its xattrs written concurrently).
+    let cache_info = CacheInfo::with_meta(&metadata, &status_meta);
 
     // Range handling uses the total upstream size (not the current partial size on disk).
     let (http_status, content_start, content_length, content_range, partial) =

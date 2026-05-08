@@ -13,16 +13,20 @@ fn is_valid_http_date(s: &str) -> bool {
     HttpDate::parse(s).is_some()
 }
 
-/// Read a `Last-Modified` value from the file's extended attributes.
+/// Read a `Last-Modified` value from the file's extended attributes,
+/// distinguishing transient I/O errors from a stable "no value" outcome.
 ///
-/// Returns `None` on any error or if the stored value is not a valid HTTP-date
-/// (graceful degradation).
-#[must_use]
-pub(crate) fn read_last_modified(
+/// See [`xattr_helpers::try_read_helper`] for the semantics; a stored
+/// value that fails to parse as an HTTP-date is scrubbed and reported
+/// as `Ok(None)`.
+pub(crate) fn try_read_last_modified(
     file: &tokio::fs::File,
     display_path: &Path,
-) -> Option<(String, HttpDate)> {
-    let data = xattr_helpers::read_helper(file, display_path, XATTR_LAST_MODIFIED)?;
+) -> Result<Option<(String, HttpDate)>, xattr_helpers::XattrIoError> {
+    let Some(data) = xattr_helpers::try_read_helper(file, display_path, XATTR_LAST_MODIFIED)?
+    else {
+        return Ok(None);
+    };
 
     let Some(time) = HttpDate::parse(&data) else {
         warn!(
@@ -33,10 +37,10 @@ pub(crate) fn read_last_modified(
 
         xattr_helpers::remove_helper(file, display_path, XATTR_LAST_MODIFIED);
 
-        return None;
+        return Ok(None);
     };
 
-    Some((data, time))
+    Ok(Some((data, time)))
 }
 
 /// Write a `Last-Modified` value to the file's extended attributes.
@@ -79,7 +83,7 @@ mod tests {
         write_last_modified(&file, &path, value);
 
         // Skip the round-trip assertion when xattrs aren't supported on the test FS.
-        if let Some((got_str, got_time)) = read_last_modified(&file, &path) {
+        if let Ok(Some((got_str, got_time))) = try_read_last_modified(&file, &path) {
             assert_eq!(got_str, value);
             assert_eq!(got_time, HttpDate::from_secs(12_345_678_909));
         }
@@ -92,6 +96,6 @@ mod tests {
         let file = tokio::fs::File::create(&path).await.expect("create file");
 
         write_last_modified(&file, &path, "garbage");
-        assert_eq!(read_last_modified(&file, &path), None);
+        assert!(matches!(try_read_last_modified(&file, &path), Ok(None)));
     }
 }

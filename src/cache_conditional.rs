@@ -7,12 +7,13 @@
 //! `sendfile_conn.rs` previously rebuilt this view inline; sharing it keeps
 //! their behavior in lockstep.
 
+#[cfg(feature = "sendfile")]
 use std::path::Path;
 
-use crate::http_etag::if_none_match;
+use crate::cache_metadata::UpstreamMetadata;
 #[cfg(feature = "sendfile")]
-use crate::http_etag::read_etag;
-use crate::http_last_modified::read_last_modified;
+use crate::cache_metadata::{self, CacheMetadataKeyRef};
+use crate::http_etag::if_none_match;
 use crate::http_range::{HttpDate, cache_file_http_date, compute_age};
 
 /// Pre-computed cache representation metadata used to evaluate conditional
@@ -26,39 +27,38 @@ pub(crate) struct CacheInfo {
 }
 
 impl CacheInfo {
-    /// Build a [`CacheInfo`] reading both `ETag` and `Last-Modified` from the
-    /// file's xattrs.
+    /// Build a [`CacheInfo`] for a post-flight cache-hit serve, consulting
+    /// the in-process [`cache_metadata`] cache before any xattr read.
+    /// On miss, the cache lazy-loads from xattrs.
     #[cfg(feature = "sendfile")]
     #[must_use]
-    pub(crate) fn read(
+    pub(crate) fn resolve(
         file: &tokio::fs::File,
         file_path: &Path,
         metadata: &std::fs::Metadata,
+        key: &CacheMetadataKeyRef<'_>,
     ) -> Self {
-        Self::with_etag(file, file_path, metadata, read_etag(file, file_path))
+        let resolved = cache_metadata::store().resolve(key, file, file_path);
+        Self::with_meta(metadata, &resolved)
     }
 
-    /// Build a [`CacheInfo`] using a caller-supplied `file_etag` (e.g. one
-    /// already resolved through an `EtagState` cache to skip a redundant
-    /// xattr read).
+    /// Build a [`CacheInfo`] from a caller-supplied [`UpstreamMetadata`]
+    /// snapshot — typically the one carried on
+    /// [`crate::ActiveDownloadStatus::Download`] for late-joiner reads, so
+    /// no xattr/cache lookup happens at all.
     #[must_use]
-    pub(crate) fn with_etag(
-        file: &tokio::fs::File,
-        file_path: &Path,
-        metadata: &std::fs::Metadata,
-        file_etag: Option<String>,
-    ) -> Self {
+    pub(crate) fn with_meta(metadata: &std::fs::Metadata, meta: &UpstreamMetadata) -> Self {
         let cache_ts = cache_file_http_date(metadata);
 
-        let (last_modified_for_ims, last_modified_str) = match read_last_modified(file, file_path) {
-            Some((s, time)) => (time, s),
+        let (last_modified_for_ims, last_modified_str) = match meta.last_modified.as_ref() {
+            Some((s, time)) => (*time, s.clone()),
             None => (cache_ts, cache_ts.format()),
         };
 
         let age = compute_age(metadata);
 
         Self {
-            file_etag,
+            file_etag: meta.etag.clone(),
             last_modified_for_ims,
             last_modified_str,
             age,

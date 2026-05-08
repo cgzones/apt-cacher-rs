@@ -2,7 +2,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength,
-    cache_quota::QuotaReservation, deb_mirror::Mirror, metrics,
+    cache_metadata::{self, CacheMetadataKey, UpstreamMetadata},
+    cache_quota::QuotaReservation,
+    deb_mirror::Mirror,
+    metrics,
 };
 #[cfg(feature = "splice")]
 use crate::{
@@ -43,10 +46,15 @@ impl<'a> InitBarrier<'a> {
         }
     }
 
+    /// Finalise the entry without going through `Download` (e.g. a
+    /// volatile-revalidation 304 from upstream — the existing on-disk
+    /// file remains valid).  No upstream metadata is published; readers
+    /// that observe `Finished { meta: None }` fall through to the
+    /// post-flight cache, which will lazy-load from xattr if needed.
     pub(crate) async fn finished(mut self, path: PathBuf) {
         let data = self.data.take().expect("every sink consumes the instance");
 
-        *data.status.write().await = ActiveDownloadStatus::Finished(path);
+        *data.status.write().await = ActiveDownloadStatus::Finished { path, meta: None };
         data.active_downloads.remove(data.mirror, data.debname);
     }
 
@@ -55,12 +63,18 @@ impl<'a> InitBarrier<'a> {
         path: PathBuf,
         content_length: ContentLength,
         quota_reservation: Option<QuotaReservation>,
+        meta: Arc<UpstreamMetadata>,
     ) -> DownloadBarrier {
         let data = self.data.take().expect("every sink consumes the instance");
 
         let (tx, rx) = tokio::sync::watch::channel(());
 
-        *data.status.write().await = ActiveDownloadStatus::Download(path, content_length, rx);
+        *data.status.write().await = ActiveDownloadStatus::Download {
+            path,
+            content_length,
+            rx,
+            meta,
+        };
 
         DownloadBarrier {
             data: Some(DownloadBarrierData {
@@ -279,6 +293,16 @@ pub(crate) struct RenameBarrier {
 }
 
 impl RenameBarrier {
+    /// Transition the barrier to `Finished`, publish the upstream metadata
+    /// to the post-flight [`cache_metadata`] cache, and clear the
+    /// active-downloads entry.
+    ///
+    /// Ordering matters: the cache is populated **before** the entry is
+    /// removed so that workers which miss the active-downloads entry
+    /// always find the cache primed with the rename's values.  Conversely,
+    /// workers that still see the entry observe `Finished { meta = Some
+    /// (...) }` and read the values directly from status.  Either way they
+    /// agree with the on-disk file produced by the just-completed rename.
     pub(crate) fn release(mut self, path: PathBuf, bytes_received: u64) {
         let mut data = self.data.take().expect("every sink consumes the instance");
 
@@ -286,9 +310,38 @@ impl RenameBarrier {
             reservation.finalize(bytes_received);
         }
 
-        *data.lock = ActiveDownloadStatus::Finished(path);
+        // Carry the in-flight metadata over to the post-flight cache and
+        // the `Finished` status before we tear the active-downloads entry
+        // down.  The barrier reached this point via `DownloadBarrier`
+        // (which set the status to `Download { meta }`); any other shape
+        // is a logic bug — log it, fall back to no metadata, and proceed
+        // with the status / cache transitions so the active-downloads
+        // entry doesn't leak.
+        let meta_for_status: Option<Arc<UpstreamMetadata>> = match &*data.lock {
+            ActiveDownloadStatus::Download { meta, .. } => Some(Arc::clone(meta)),
+            ActiveDownloadStatus::Init(_)
+            | ActiveDownloadStatus::Finished { .. }
+            | ActiveDownloadStatus::Aborted(_) => {
+                log::error!(
+                    "RenameBarrier::release reached with non-Download status: {:?}",
+                    *data.lock
+                );
+                None
+            }
+        };
+
+        *data.lock = ActiveDownloadStatus::Finished {
+            path,
+            meta: meta_for_status.clone(),
+        };
         drop(data.lock);
 
+        if let Some(meta) = meta_for_status {
+            cache_metadata::store().set(
+                CacheMetadataKey::new(data.mirror.clone(), data.debname.clone()),
+                meta,
+            );
+        }
         data.active_downloads.remove(&data.mirror, &data.debname);
     }
 }

@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::ContentLength;
+use crate::cache_metadata::UpstreamMetadata;
 use crate::deb_mirror::Mirror;
 use crate::error::MirrorDownloadRate;
 use crate::{global_config, metrics};
@@ -50,8 +51,26 @@ pub(crate) enum AbortReason {
 #[derive(Debug)]
 pub(crate) enum ActiveDownloadStatus {
     Init(tokio::sync::watch::Receiver<()>),
-    Download(PathBuf, ContentLength, tokio::sync::watch::Receiver<()>),
-    Finished(PathBuf),
+    /// In-flight download; `meta` carries upstream-supplied `ETag` /
+    /// Last-Modified for late joiners that need them for response headers
+    /// or conditional-request decisions, avoiding xattr reads on the temp
+    /// file while it's still being written.
+    Download {
+        path: PathBuf,
+        content_length: ContentLength,
+        rx: tokio::sync::watch::Receiver<()>,
+        meta: Arc<UpstreamMetadata>,
+    },
+    /// Rename-completed (or revalidation-confirmed) cached file.
+    /// `meta` is `Some` when the values came from a fresh upstream
+    /// response (`RenameBarrier::release`); `None` when the entry was
+    /// produced by `InitBarrier::finished` (e.g. volatile-revalidation
+    /// 304) — in that case readers fall through to the post-flight
+    /// [`crate::cache_metadata`] cache, which lazy-loads from xattrs.
+    Finished {
+        path: PathBuf,
+        meta: Option<Arc<UpstreamMetadata>>,
+    },
     Aborted(AbortReason),
 }
 
@@ -331,8 +350,8 @@ impl ActiveDownloads {
 
             for entry in self.inner.read().values() {
                 let d = entry.status.blocking_read();
-                if let ActiveDownloadStatus::Download(_, size, _) = &*d {
-                    sum += size.upper().get();
+                if let ActiveDownloadStatus::Download { content_length, .. } = &*d {
+                    sum += content_length.upper().get();
                 }
             }
 
@@ -349,11 +368,11 @@ impl ActiveDownloads {
                 let d = entry.status.blocking_read();
                 match &*d {
                     ActiveDownloadStatus::Init(_)
-                    | ActiveDownloadStatus::Download(_, _, _)
+                    | ActiveDownloadStatus::Download { .. }
                     | ActiveDownloadStatus::Aborted(_) => {
                         count += 1;
                     }
-                    ActiveDownloadStatus::Finished(_) => (),
+                    ActiveDownloadStatus::Finished { .. } => (),
                 }
             }
 
