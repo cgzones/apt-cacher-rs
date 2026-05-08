@@ -136,6 +136,10 @@ pub(crate) static CLIENT_STATUS_416: Counter = Counter::new();
 pub(crate) static VOLATILE_HIT: Counter = Counter::new();
 /// Volatile-resource fetch from upstream (stale on disk or absent).
 /// Mutually exclusive with `CACHE_MISSES` (which counts permanent files only).
+/// `VOLATILE_REFETCHED_UPTODATE` and `VOLATILE_REFETCHED_OUTOFDATE` are
+/// subsets covering the stale-but-present case; the volatile-not-found
+/// case bumps neither sub-bucket, so their sum is strictly less than
+/// `VOLATILE_REFETCHED`.
 pub(crate) static VOLATILE_REFETCHED: Counter = Counter::new();
 /// Subset of `VOLATILE_REFETCHED`: stale-but-present, upstream returned 304.
 pub(crate) static VOLATILE_REFETCHED_UPTODATE: Counter = Counter::new();
