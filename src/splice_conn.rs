@@ -2932,7 +2932,11 @@ async fn standard_upstream_connect(
     SpliceProxyError,
 > {
     // Try a pooled connection first.
-    // Resolve scheme to determine the port for pool lookup.
+    // Resolve scheme to determine the port for pool lookup. In Auto mode
+    // without a cached scheme there is no key to look up by, so account
+    // for it as `POOL_MISS_NO_SCHEME` and fall through to the fresh-connect
+    // path — the invariant `POOL_NEW ≈ sum(POOL_MISS_*)` then holds for
+    // first connections too.
     if let Some(scheme) = resolve_mirror_scheme(mirror) {
         let is_tls = matches!(scheme, Scheme::Https);
         let port = mirror_port(mirror, is_tls);
@@ -2974,6 +2978,8 @@ async fn standard_upstream_connect(
         } else {
             metrics::POOL_MISS_EMPTY.increment();
         }
+    } else {
+        metrics::POOL_MISS_NO_SCHEME.increment();
     }
 
     debug!("splice proxy: no pooled connection to {host_authority}, opening fresh...");

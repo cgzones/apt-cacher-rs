@@ -1724,19 +1724,24 @@ fn build_metrics_html() -> String {
         let miss_empty = metrics::POOL_MISS_EMPTY.get();
         let miss_dead = metrics::POOL_MISS_DEAD.get();
         let miss_failed = metrics::POOL_MISS_FAILED.get();
+        let miss_no_scheme = metrics::POOL_MISS_NO_SCHEME.get();
         // Invariant: every POOL_NEW falls through from exactly one POOL_MISS_*
-        // arm, so the three miss counters must sum to POOL_NEW. Warn on
+        // arm, so the four miss counters must sum to POOL_NEW. Warn on
         // mismatch — counting bug or split call site.
         t.row_tip(
-            "Upstream Pool (reused / new, miss: empty / dead / failed, return-evicted)",
-            "Upstream connection pool counters: reused vs. newly opened connections, miss reasons (pool empty, peer-closed connection, failed health check), and connections evicted when returned.",
+            "Upstream Pool (reused / new, miss: empty / dead / failed / no-scheme, return-evicted)",
+            "Upstream connection pool counters: reused vs. newly opened connections, miss reasons (pool empty, peer-closed connection, failed health check, no cached scheme so the pool was bypassed), and connections evicted when returned.",
             format_args!(
-                "{} / {}, miss: {} / {} / {}, return-evicted {}",
+                "{} / {}, miss: {} / {} / {} / {}, return-evicted {}",
                 metrics::POOL_REUSED.get(),
-                WarnIf::new(pool_new, pool_new != miss_empty + miss_dead + miss_failed),
+                WarnIf::new(
+                    pool_new,
+                    pool_new != miss_empty + miss_dead + miss_failed + miss_no_scheme,
+                ),
                 miss_empty,
                 miss_dead,
                 miss_failed,
+                miss_no_scheme,
                 metrics::POOL_RETURN_EVICTED.get(),
             ),
         );

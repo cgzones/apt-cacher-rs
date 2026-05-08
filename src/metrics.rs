@@ -257,6 +257,10 @@ pub(crate) static POOL_MISS_EMPTY: Counter = Counter::new();
 pub(crate) static POOL_MISS_DEAD: Counter = Counter::new();
 /// Pool miss: pooled entry's request failed in flight.
 pub(crate) static POOL_MISS_FAILED: Counter = Counter::new();
+/// Pool miss: no cached scheme for the mirror, so no `(host, port, is_tls)`
+/// key existed to look up by — the pool was bypassed entirely. Distinct
+/// from `POOL_MISS_EMPTY`, which is a lookup that returned no entry.
+pub(crate) static POOL_MISS_NO_SCHEME: Counter = Counter::new();
 
 /// Pool returns where the per-host slot was full and the oldest entry was
 /// evicted (raise `POOL_MAX_IDLE_PER_HOST` if recurring).
