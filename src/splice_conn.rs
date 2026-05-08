@@ -1551,6 +1551,16 @@ async fn unbuffered_ktls_request(
 
     metrics::KTLS_RX_ENABLED.increment();
 
+    // Credit body bytes that arrived through the kTLS handshake — both the
+    // body_prefix bundled with the response headers and the extra_body
+    // drained from already-buffered TLS records after the headers. Both
+    // are upstream payload that downstream consumers will write to the
+    // cache/client without a separate read syscall, so credit them here.
+    let downloaded_body = (header_buf.len() - header_end) + extra_body.len();
+    if downloaded_body > 0 {
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(downloaded_body as u64);
+    }
+
     Ok(KtlsReadyState {
         response,
         header_buf,
@@ -2907,6 +2917,15 @@ async fn send_and_read_headers(
     let mut hdr_buf = BytesMut::with_capacity(MAX_RESPONSE_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
     let resp = parse_upstream_response(&hdr_buf, hdr_end)?;
+    // Credit body bytes that arrived bundled with the response headers
+    // in the same read (the body_prefix). Done after parse so an
+    // unparseable response is not credited as a successful download —
+    // mirrors `record_upstream_status` below. Subsequent reads of
+    // remaining body bytes credit themselves separately.
+    let body_prefix_len = (hdr_buf.len() - hdr_end) as u64;
+    if body_prefix_len > 0 {
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(body_prefix_len);
+    }
     metrics::record_upstream_status(resp.status_code);
     Ok((resp, hdr_buf, hdr_end))
 }
