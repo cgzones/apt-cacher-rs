@@ -98,7 +98,10 @@ pub(crate) static REQUESTS_TOTAL: Counter = Counter::new();
 /// Web interface requests entering `serve_web_interface`. Subset of
 /// `REQUESTS_TOTAL` (every `WebUI` request bumps both counters).
 pub(crate) static WEBUI_REQUESTS: Counter = Counter::new();
-/// TCP connections accepted by the listener.
+/// TCP connections accepted by the listener (counted at `accept()`,
+/// before the per-IP cap check). Connections subsequently rejected by
+/// `max_connections_per_client_ip` are included here and also counted
+/// in `CONNECTION_REJECTED_PER_IP_CAP`.
 pub(crate) static CONNECTIONS_ACCEPTED: Counter = Counter::new();
 
 /// Upstream response class buckets (2xx/3xx/4xx/5xx/other).
