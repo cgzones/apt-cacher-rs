@@ -150,7 +150,9 @@ pub(crate) static UNCACHEABLE: Counter = Counter::new();
 
 /// HTTPS CONNECT tunnels accepted.
 pub(crate) static TUNNEL_CONNECTS_TOTAL: Counter = Counter::new();
-/// CONNECT tunnels rejected by the per-mirror policy list.
+/// CONNECT tunnels rejected by the global tunnel-disabled flag or by the
+/// per-port allowlist. Mirror-allowlist denials are tracked separately as
+/// `AUTHZ_REJECTED_TUNNEL_MIRROR`.
 pub(crate) static TUNNEL_REJECTED_POLICY: Counter = Counter::new();
 /// CONNECT tunnels rejected because the active-tunnel cap was reached.
 pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();

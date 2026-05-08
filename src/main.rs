@@ -3514,7 +3514,6 @@ fn connect_response(
         info!(
             "Rejecting https tunnel request for client {client} due to not permitted host {host}"
         );
-        metrics::TUNNEL_REJECTED_POLICY.increment();
         metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunnel target not permitted");
     }
