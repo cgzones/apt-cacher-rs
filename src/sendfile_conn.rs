@@ -127,6 +127,10 @@ pub(crate) async fn handle_sendfile_connection(
                         ErrorReport(&err),
                     );
                 }
+                // Count the attempted request so REQUESTS_TOTAL stays >=
+                // CLIENT_STATUS_*: write_invalid_response below bumps
+                // CLIENT_STATUS_400 even though parsing failed.
+                metrics::REQUESTS_TOTAL.increment();
                 let _ignore = write_invalid_response(
                     &stream,
                     conn_version,
