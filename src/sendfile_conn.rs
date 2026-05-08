@@ -1592,6 +1592,20 @@ async fn sendfile_chunk_loop(
     let config = global_config();
     let mut remaining = amount;
 
+    // Dup the socket and file descriptors once per chunk_loop call and
+    // pass ownership through each spawn_blocking, getting them back via
+    // the closure return value.  If the outer future is cancelled
+    // mid-batch (client disconnect, runtime shutdown), tokio cannot
+    // abort spawn_blocking — it merely detaches the JoinHandle.  The
+    // detached closure still owns the OwnedFds, so the kernel
+    // descriptors stay open until it returns and cannot be reassigned
+    // to an unrelated FD by a parent's TcpStream/File Drop.  One dup
+    // pair per transfer amortises across many EAGAIN cycles.
+    let mut socket_dup = nix::unistd::dup(socket.as_fd())
+        .map_err(|errno| errno_to_io_error(errno, "dup of socket fd failed"))?;
+    let mut file_dup = nix::unistd::dup(file.as_fd())
+        .map_err(|errno| errno_to_io_error(errno, "dup of file fd failed"))?;
+
     while remaining > 0 {
         if let Some(rc) = rate_checker.as_ref()
             && let Some(rate) = rc.check_fail(RateCheckDirection::Client)
@@ -1617,27 +1631,10 @@ async fn sendfile_chunk_loop(
         let count: usize = remaining.try_into().unwrap_or(usize::MAX);
         let off_in = *file_offset;
 
-        // Dup the socket and file descriptors so the blocking task owns its
-        // own kernel descriptors for the duration of the batch.  If the
-        // outer future is cancelled mid-batch (client disconnect, runtime
-        // shutdown), tokio cannot abort spawn_blocking — it merely detaches
-        // the JoinHandle.  Without these dups the kernel could reassign the
-        // raw fds (parent's TcpStream/File Drop closes them) before the
-        // blocking task's next sendfile() syscall, silently sending file
-        // data to an unrelated descriptor.  One dup pair per batch
-        // amortises across many sendfile() syscalls inside the closure.
-        let socket_dup = nix::unistd::dup(socket.as_fd())
-            .map_err(|errno| errno_to_io_error(errno, "dup of socket fd failed"))?;
-        let file_dup = nix::unistd::dup(file.as_fd())
-            .map_err(|errno| errno_to_io_error(errno, "dup of file fd failed"))?;
+        let s = socket_dup;
+        let f = file_dup;
 
-        let batch = tokio::task::spawn_blocking(move || {
-            // OwnedFd ownership lives entirely inside the closure: the
-            // kernel descriptors stay open until the closure returns,
-            // regardless of whether the outer future was cancelled.
-            let socket = socket_dup.as_fd();
-            let file = file_dup.as_fd();
-
+        let (batch, s, f) = tokio::task::spawn_blocking(move || {
             let mut transferred: usize = 0;
             let mut off = off_in;
             let mut left = count;
@@ -1646,7 +1643,7 @@ async fn sendfile_chunk_loop(
                     break SendfileBatchStop::Done;
                 }
                 let chunk_size = std::cmp::min(left, MAX_PER_SYSCALL);
-                match sendfile(socket, file, Some(&mut off), chunk_size) {
+                match sendfile(s.as_fd(), f.as_fd(), Some(&mut off), chunk_size) {
                     Ok(0) => break SendfileBatchStop::Eof,
                     Ok(n) => {
                         transferred += n;
@@ -1659,14 +1656,21 @@ async fn sendfile_chunk_loop(
                     Err(e) => break SendfileBatchStop::Error(e),
                 }
             };
-            SendfileBatch {
-                transferred,
-                new_offset: off,
-                stop,
-            }
+            (
+                SendfileBatch {
+                    transferred,
+                    new_offset: off,
+                    stop,
+                },
+                s,
+                f,
+            )
         })
         .await
         .expect("task should not panic");
+
+        socket_dup = s;
+        file_dup = f;
 
         // Apply state changes from whatever progress the batch made before
         // it stopped (success or EAGAIN both leave us with bytes to credit).
