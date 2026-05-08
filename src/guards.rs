@@ -1,10 +1,8 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength,
+    cache_layout::CacheLayout,
     cache_metadata::{self, CacheMetadataKey, UpstreamMetadata},
     cache_quota::QuotaReservation,
     deb_mirror::Mirror,
@@ -21,7 +19,7 @@ struct InitBarrierData<'a> {
     active_downloads: &'a ActiveDownloads,
     mirror: &'a Mirror,
     debname: &'a str,
-    subdir: Option<&'static Path>,
+    layout: CacheLayout,
     /// Unused, receivers just needs to get notified by drop
     _tx: tokio::sync::watch::Sender<()>,
 }
@@ -38,7 +36,7 @@ impl<'a> InitBarrier<'a> {
         active_downloads: &'a ActiveDownloads,
         mirror: &'a Mirror,
         debname: &'a str,
-        subdir: Option<&'static Path>,
+        layout: CacheLayout,
     ) -> Self {
         Self {
             data: Some(InitBarrierData {
@@ -46,7 +44,7 @@ impl<'a> InitBarrier<'a> {
                 active_downloads,
                 mirror,
                 debname,
-                subdir,
+                layout,
                 _tx: tx,
             }),
         }
@@ -62,7 +60,7 @@ impl<'a> InitBarrier<'a> {
 
         *data.status.write().await = ActiveDownloadStatus::Finished { path, meta: None };
         data.active_downloads
-            .remove(data.mirror, data.debname, data.subdir);
+            .remove(data.mirror, data.debname, data.layout);
     }
 
     pub(crate) async fn download(
@@ -89,7 +87,7 @@ impl<'a> InitBarrier<'a> {
                 active_downloads: data.active_downloads.clone(),
                 mirror: data.mirror.clone(),
                 debname: data.debname.to_owned(),
-                subdir: data.subdir,
+                layout: data.layout,
                 tx,
                 quota_reservation,
                 bytes_since_ping: 0,
@@ -122,7 +120,7 @@ impl Drop for InitBarrier<'_> {
                     ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
                 metrics::DOWNLOADS_ABORTED.increment();
                 data.active_downloads
-                    .remove(data.mirror, data.debname, data.subdir);
+                    .remove(data.mirror, data.debname, data.layout);
             });
         }
     }
@@ -133,7 +131,7 @@ struct DownloadBarrierData {
     active_downloads: ActiveDownloads,
     mirror: Mirror,
     debname: String,
-    subdir: Option<&'static Path>,
+    layout: CacheLayout,
     tx: tokio::sync::watch::Sender<()>,
     quota_reservation: Option<QuotaReservation>,
     /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
@@ -182,7 +180,7 @@ impl DownloadBarrier {
         *data.status.write().await = ActiveDownloadStatus::Aborted(reason);
         metrics::DOWNLOADS_ABORTED.increment();
         data.active_downloads
-            .remove(&data.mirror, &data.debname, data.subdir);
+            .remove(&data.mirror, &data.debname, data.layout);
     }
 
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
@@ -203,7 +201,7 @@ impl DownloadBarrier {
                 active_downloads: data.active_downloads,
                 mirror: data.mirror,
                 debname: data.debname,
-                subdir: data.subdir,
+                layout: data.layout,
                 quota_reservation: data.quota_reservation,
             }),
         }
@@ -286,7 +284,7 @@ impl Drop for DownloadBarrier {
                     ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
                 metrics::DOWNLOADS_ABORTED.increment();
                 data.active_downloads
-                    .remove(&data.mirror, &data.debname, data.subdir);
+                    .remove(&data.mirror, &data.debname, data.layout);
             });
         }
     }
@@ -297,7 +295,7 @@ struct RenameBarrierData {
     active_downloads: ActiveDownloads,
     mirror: Mirror,
     debname: String,
-    subdir: Option<&'static Path>,
+    layout: CacheLayout,
     quota_reservation: Option<QuotaReservation>,
 }
 
@@ -353,12 +351,12 @@ impl RenameBarrier {
 
         if let Some(meta) = meta_for_status {
             cache_metadata::store().set(
-                CacheMetadataKey::new(data.mirror.clone(), data.debname.clone(), data.subdir),
+                CacheMetadataKey::new(data.mirror.clone(), data.debname.clone(), data.layout),
                 meta,
             );
         }
         data.active_downloads
-            .remove(&data.mirror, &data.debname, data.subdir);
+            .remove(&data.mirror, &data.debname, data.layout);
     }
 }
 
@@ -370,7 +368,7 @@ impl Drop for RenameBarrier {
             drop(data.lock);
 
             data.active_downloads
-                .remove(&data.mirror, &data.debname, data.subdir);
+                .remove(&data.mirror, &data.debname, data.layout);
         }
     }
 }

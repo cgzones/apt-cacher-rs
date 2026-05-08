@@ -4,6 +4,7 @@ use log::{error, trace, warn};
 use tokio::fs::DirEntry;
 
 use crate::{
+    cache_layout::KNOWN_HOST_SUBDIRS,
     database::{Database, MirrorEntry},
     deb_mirror::is_deb_package,
     error::ProxyCacheError,
@@ -167,12 +168,16 @@ async fn scan_mirror_dir(host: &DirEntry, mirror: &MirrorEntry) -> u64 {
         }
 
         if file_type.is_dir() {
-            if entry.file_name() == "dists" {
+            // Recognized layout subdirs (`dists/`, `flat/`) get their sizes
+            // tallied; `tmp/` is skipped (partial-download scratch space).
+            // Anything else falls through to the warn below.
+            let name = entry.file_name();
+            if KNOWN_HOST_SUBDIRS.iter().any(|known| name == *known) {
                 dir_size += scan_sub_dir(entry).await;
                 continue;
             }
 
-            if entry.file_name() == "tmp" {
+            if name == "tmp" {
                 continue;
             }
         }

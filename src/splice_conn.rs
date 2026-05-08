@@ -56,13 +56,14 @@ use crate::sendfile_conn::{
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
 
+use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{
     self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_tempfile, touch_volatile_mtime,
 };
 use crate::{
-    APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, CachedFlavor, ConnectionDetails,
-    ContentLength, Never, OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
+    APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, ContentLength, Never,
+    OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
     VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, cache_metadata, client_counter,
     content_type_for_cached_file, global_cache_quota, global_config, is_host_allowed_cached,
     metrics, static_assert, warn_once_or_debug, warn_once_or_info,
@@ -3571,10 +3572,11 @@ pub(crate) async fn splice_proxy(
     // an alternate success — the caller retries as a sendfile late joiner
     // instead of falling all the way back to hyper. No late-joiner double
     // count, since `attach()` and `insert()` are mutually exclusive paths.
-    let (init_tx, status) = match appstate
-        .active_downloads
-        .originate(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
-    {
+    let (init_tx, status) = match appstate.active_downloads.originate(
+        &conn_details.mirror,
+        &conn_details.debname,
+        conn_details.layout,
+    ) {
         OriginateOutcome::Originator { init_tx, status } => (init_tx, status),
         OriginateOutcome::Concurrent { status } => {
             return Ok(SpliceProxyOutcome::Concurrent { status });
@@ -3622,7 +3624,7 @@ async fn splice_proxy_drive(
         &appstate.active_downloads,
         &conn_details.mirror,
         &conn_details.debname,
-        conn_details.subdir,
+        conn_details.layout,
     );
 
     let mirror = &conn_details.mirror;
@@ -3691,7 +3693,7 @@ async fn splice_proxy_drive(
             let key = cache_metadata::CacheMetadataKeyRef::new(
                 &conn_details.mirror,
                 &conn_details.debname,
-                conn_details.subdir,
+                conn_details.layout,
             );
             let if_none_match = cache_metadata::store()
                 .resolve(&key, &file, &cache_path)

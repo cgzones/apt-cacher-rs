@@ -17,13 +17,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::cache_conditional::CacheInfo;
+use crate::cache_layout::{self, CachedFlavor, ConnectionDetails};
 use crate::cache_metadata::{self, CacheMetadataKeyRef};
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
-use crate::deb_mirror::{
-    FlatKind, Mirror, Origin, ResourceFile, is_deb_package, is_unsafe_proxy_path,
-    parse_request_path, valid_architecture, valid_component, valid_distribution, valid_filename,
-    valid_mirrorname,
-};
+use crate::deb_mirror::{Mirror, Origin, is_unsafe_proxy_path, parse_request_path};
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header, find_header_end,
@@ -36,10 +33,10 @@ use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{hint_sequential_read, is_peer_disconnect};
 use crate::{
-    APP_NAME, ActiveDownloadStatus, AppState, CachedFlavor, ClientInfo, ConnectionDetails,
-    ContentLength, Never, VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter,
-    content_type_for_cached_file, global_config, handle_hyper_connection, is_diff_request_path,
-    metrics, static_assert, warn_once_or_debug, warn_once_or_info,
+    APP_NAME, ActiveDownloadStatus, AppState, ClientInfo, ContentLength, Never,
+    VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter, content_type_for_cached_file,
+    global_config, handle_hyper_connection, is_diff_request_path, metrics, static_assert,
+    warn_once_or_debug, warn_once_or_info,
     web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
 };
 
@@ -415,50 +412,6 @@ fn compute_conn_action(
     }
 }
 
-/// URL-decode and validate a single field. On failure returns the
-/// `SendfileResult::Invalid` the caller should propagate.
-fn decode_and_validate_field<'a>(
-    raw: &'a str,
-    validator: fn(&str) -> bool,
-    field_name: &str,
-    client: &ClientInfo,
-) -> Result<std::borrow::Cow<'a, str>, SendfileResult> {
-    match urlencoding::decode(raw) {
-        Ok(s) if validator(&s) => Ok(s),
-        Ok(s) => {
-            warn_once_or_info!("Unsupported {field_name} `{s}` from client {client}");
-            Err(SendfileResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported request",
-            })
-        }
-        Err(err) => {
-            warn_once_or_info!(
-                "Failed to decode {field_name} `{}` from client {client}:  {err}",
-                raw.escape_debug()
-            );
-            Err(SendfileResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported URL encoding",
-            })
-        }
-    }
-}
-
-/// URL-decode a field and validate it, returning early from the caller on failure.
-///
-/// Thin wrapper over [`decode_and_validate_field`] that performs the early
-/// return; the underlying helper is exposed so it can be unit-tested and
-/// used from contexts that cannot early-return `SendfileResult`.
-macro_rules! decode_and_validate {
-    ($raw:expr, $validator:expr, $field_name:expr, $client:expr) => {{
-        match decode_and_validate_field($raw, $validator, $field_name, $client) {
-            Ok(s) => s,
-            Err(e) => return e,
-        }
-    }};
-}
-
 /// Try to serve a request using sendfile(2).
 /// Return whether the request was handled.
 async fn try_sendfile_request(
@@ -678,163 +631,29 @@ async fn try_sendfile_request(
         return SendfileResult::NotApplicable("unrecognized resource path");
     };
 
-    // Per-resource origin fields for Packages (to record after ConnectionDetails is built)
-    struct PackagesOriginFields {
-        distribution: String,
-        component: String,
-        architecture: String,
-    }
-
-    // Decode, validate, and build per-resource debname / cached_flavor / subdir.
-    let (debname, cached_flavor, subdir, mirror_path, origin_fields) = match resource {
-        ResourceFile::Pool {
-            mirror_path,
-            filename,
-        } => {
-            let mirror_path =
-                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
-            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
-            if !is_deb_package(&filename) {
-                return SendfileResult::NotApplicable("non Debian binary package pool file");
-            }
-
-            (
-                filename.into_owned(),
-                CachedFlavor::Permanent,
-                None,
-                mirror_path,
-                None,
-            )
-        }
-        ResourceFile::Release {
-            mirror_path,
-            distribution,
-            filename,
-        } => {
-            let mirror_path =
-                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
-            let distribution =
-                decode_and_validate!(distribution, valid_distribution, "distribution", &client);
-            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
-
-            (
-                format!("{distribution}_{filename}"),
-                CachedFlavor::Volatile,
-                Some(Path::new("dists")),
-                mirror_path,
-                None,
-            )
-        }
-        ResourceFile::ByHash {
-            mirror_path,
-            filename,
-        } => {
-            let mirror_path =
-                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
-            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
-
-            (
-                filename.into_owned(),
-                CachedFlavor::Permanent,
-                Some(Path::new("dists/by-hash")),
-                mirror_path,
-                None,
-            )
-        }
-        ResourceFile::Icon {
-            mirror_path,
-            distribution,
-            component,
-            filename,
-        }
-        | ResourceFile::Sources {
-            mirror_path,
-            distribution,
-            component,
-            filename,
-        }
-        | ResourceFile::Translation {
-            mirror_path,
-            distribution,
-            component,
-            filename,
-        } => {
-            let mirror_path =
-                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
-            let distribution =
-                decode_and_validate!(distribution, valid_distribution, "distribution", &client);
-            let component = decode_and_validate!(component, valid_component, "component", &client);
-            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
-
-            (
-                format!("{distribution}_{component}_{filename}"),
-                CachedFlavor::Volatile,
-                Some(Path::new("dists")),
-                mirror_path,
-                None,
-            )
-        }
-        ResourceFile::Packages {
-            mirror_path,
-            distribution,
-            component,
-            architecture,
-            filename,
-        } => {
-            let mirror_path =
-                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
-            let distribution =
-                decode_and_validate!(distribution, valid_distribution, "distribution", &client);
-            let component = decode_and_validate!(component, valid_component, "component", &client);
-            let architecture =
-                decode_and_validate!(architecture, valid_architecture, "architecture", &client);
-            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
-
-            let debname = format!("{distribution}_{component}_{architecture}_{filename}");
-            let origin = match architecture.as_ref() {
-                "dep11" | "i18n" | "source" => None,
-                _ => Some(PackagesOriginFields {
-                    distribution: distribution.into_owned(),
-                    component: component.into_owned(),
-                    architecture: architecture.into_owned(),
-                }),
+    let class = match cache_layout::classify_request(&resource, &client) {
+        Ok(class) => class,
+        Err(cache_layout::ClassifyError::BadEncoding { kind, raw, source }) => {
+            warn_once_or_info!(
+                "Failed to decode {kind} `{}` from client {client}:  {source}",
+                raw.escape_debug()
+            );
+            return SendfileResult::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                msg: "Unsupported URL encoding",
             };
-
-            (
-                debname,
-                CachedFlavor::Volatile,
-                Some(Path::new("dists")),
-                mirror_path,
-                origin,
-            )
         }
-        ResourceFile::Flat {
-            kind,
-            mirror_path,
-            filename,
-        } => {
-            let mirror_path =
-                decode_and_validate!(mirror_path, valid_mirrorname, "mirror path", &client);
-            let filename = decode_and_validate!(filename, valid_filename, "filename", &client);
-
-            let (cached_flavor, subdir) = match kind {
-                FlatKind::Metadata => (CachedFlavor::Volatile, Path::new("flat")),
-                FlatKind::Pool => {
-                    if !is_deb_package(&filename) {
-                        return SendfileResult::NotApplicable("non Debian binary flat pool file");
-                    }
-                    (CachedFlavor::Permanent, Path::new("flat"))
-                }
-                FlatKind::ByHash => (CachedFlavor::Permanent, Path::new("flat/by-hash")),
+        Err(cache_layout::ClassifyError::InvalidValue { kind, decoded }) => {
+            warn_once_or_info!("Unsupported {kind} `{decoded}` from client {client}");
+            return SendfileResult::Invalid {
+                status: StatusCode::BAD_REQUEST,
+                msg: "Unsupported request",
             };
-
-            (
-                filename.into_owned(),
-                cached_flavor,
-                Some(subdir),
-                mirror_path,
-                None,
-            )
+        }
+        Err(cache_layout::ClassifyError::NonDebPool { filename: _ }) => {
+            // Structured pool with non-deb extension: hand back to hyper
+            // so the simple proxy can handle it without caching.
+            return SendfileResult::NotApplicable("non Debian binary package pool file");
         }
     };
 
@@ -851,15 +670,15 @@ async fn try_sendfile_request(
 
     let conn_details = ConnectionDetails {
         client,
-        mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
+        mirror: Mirror::new(requested_host, requested_port, class.mirror_path),
         aliased_host,
-        debname,
-        cached_flavor,
-        subdir,
+        debname: class.debname,
+        cached_flavor: class.cached_flavor,
+        layout: class.layout,
     };
 
     // Record origin for Packages requests (mirrors main.rs behavior)
-    if let Some(fields) = origin_fields {
+    if let Some(fields) = class.origin_fields {
         let origin = Origin {
             mirror: conn_details.mirror.clone(),
             distribution: fields.distribution,
@@ -876,10 +695,11 @@ async fn try_sendfile_request(
     // as the lookup; on `NotApplicable` we fall back to hyper, whose
     // `insert()` may count this client a second time (rare, only when
     // upstream omits Content-Length).
-    if let Some(dl_status) = appstate
-        .active_downloads
-        .attach(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
-    {
+    if let Some(dl_status) = appstate.active_downloads.attach(
+        &conn_details.mirror,
+        &conn_details.debname,
+        conn_details.layout,
+    ) {
         let result = serve_unfinished_sendfile(
             stream,
             &conn_details,
@@ -1245,7 +1065,7 @@ pub(crate) async fn serve_file_via_sendfile(
         let key = CacheMetadataKeyRef::new(
             &conn_details.mirror,
             &conn_details.debname,
-            conn_details.subdir,
+            conn_details.layout,
         );
         CacheInfo::resolve(&file, file_path, &metadata, &key)
     };

@@ -21,8 +21,12 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter};
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{
-    AppState, CachedFlavor, ClientInfo, ConnectionDetails, ProxyCacheBody, ProxyCacheError,
-    RETENTION_TIME, cache_metadata,
+    AppState, ClientInfo, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
+    cache_layout::{
+        CacheLayout, CachedFlavor, ConnectionDetails, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT,
+        SUBDIR_FLAT_BYHASH,
+    },
+    cache_metadata,
     config::Config,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, UriFormat as _, is_deb_package, mirror_cache_path_impl},
@@ -216,7 +220,7 @@ async fn get_package_file(
                 pkgfmt.extension()
             ),
             cached_flavor: CachedFlavor::Volatile,
-            subdir: Some(Path::new("dists")),
+            layout: CacheLayout::Dists,
         };
 
         let response = process_cache_request(conn_details, req, appstate.clone()).await;
@@ -619,7 +623,9 @@ async fn cleanup_mirror_deb_files(
         // in the map).
         if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
             cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
-                &mirror, debname, None,
+                &mirror,
+                debname,
+                CacheLayout::StructuredPool,
             ));
         }
 
@@ -701,7 +707,7 @@ async fn get_flat_packages_file(
             aliased_host: None,
             debname: format!("Packages{}", pkgfmt.extension()),
             cached_flavor: CachedFlavor::Volatile,
-            subdir: Some(Path::new("flat")),
+            layout: CacheLayout::Flat,
         };
 
         let response = process_cache_request(conn_details, req, appstate.clone()).await;
@@ -734,7 +740,7 @@ async fn cleanup_mirror_flat_files(
     let flat_path: PathBuf = [
         &config.cache_directory,
         &mirror_cache_path,
-        Path::new("flat"),
+        Path::new(SUBDIR_FLAT),
     ]
     .iter()
     .collect();
@@ -905,7 +911,7 @@ async fn cleanup_mirror_flat_files(
             cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
                 &mirror,
                 debname,
-                Some(Path::new("flat")),
+                CacheLayout::Flat,
             ));
         }
 
@@ -1044,7 +1050,7 @@ async fn cleanup_mirror_byhash_files(
     // Walk both the structured (`dists/by-hash`) and flat (`flat/by-hash`)
     // layouts.  Each call short-circuits on `NotFound`, so a mirror with only
     // one layout pays only a stat call for the missing one.
-    for sub in ["dists/by-hash", "flat/by-hash"] {
+    for sub in [SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH] {
         let path: PathBuf = [&config.cache_directory, &mirror_cache_path, Path::new(sub)]
             .iter()
             .collect();

@@ -73,8 +73,8 @@ use std::{hash::Hash, path::Path, sync::Arc};
 use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::{
-    deb_mirror::Mirror, http_etag::try_read_etag, http_last_modified::try_read_last_modified,
-    http_range::HttpDate,
+    cache_layout::CacheLayout, deb_mirror::Mirror, http_etag::try_read_etag,
+    http_last_modified::try_read_last_modified, http_range::HttpDate,
 };
 
 /// Upstream-supplied metadata for a single cached file.  Used both as the
@@ -123,7 +123,7 @@ impl std::ops::Deref for UpstreamMetadataView<'_> {
 
 /// Cache key.  Mirrors the keying used by `active_downloads.rs` so the
 /// in-flight and post-flight stores look up the same logical resource.
-/// `subdir` discriminates files served from different on-disk subtrees
+/// `layout` discriminates files served from different on-disk subtrees
 /// (e.g. flat pool vs structured pool) — without it, two same-named
 /// `.deb` files under the same mirror path would share `ETag` /
 /// Last-Modified, leaking validators between unrelated cached files.
@@ -131,16 +131,16 @@ impl std::ops::Deref for UpstreamMetadataView<'_> {
 pub(crate) struct CacheMetadataKey {
     pub(crate) mirror: Mirror,
     pub(crate) debname: String,
-    pub(crate) subdir: Option<&'static Path>,
+    pub(crate) layout: CacheLayout,
 }
 
 impl CacheMetadataKey {
     #[must_use]
-    pub(crate) fn new(mirror: Mirror, debname: String, subdir: Option<&'static Path>) -> Self {
+    pub(crate) fn new(mirror: Mirror, debname: String, layout: CacheLayout) -> Self {
         Self {
             mirror,
             debname,
-            subdir,
+            layout,
         }
     }
 }
@@ -153,20 +153,16 @@ impl CacheMetadataKey {
 pub(crate) struct CacheMetadataKeyRef<'a> {
     pub(crate) mirror: &'a Mirror,
     pub(crate) debname: &'a str,
-    pub(crate) subdir: Option<&'static Path>,
+    pub(crate) layout: CacheLayout,
 }
 
 impl<'a> CacheMetadataKeyRef<'a> {
     #[must_use]
-    pub(crate) fn new(
-        mirror: &'a Mirror,
-        debname: &'a str,
-        subdir: Option<&'static Path>,
-    ) -> Self {
+    pub(crate) fn new(mirror: &'a Mirror, debname: &'a str, layout: CacheLayout) -> Self {
         Self {
             mirror,
             debname,
-            subdir,
+            layout,
         }
     }
 
@@ -177,14 +173,14 @@ impl<'a> CacheMetadataKeyRef<'a> {
         CacheMetadataKey {
             mirror: self.mirror.clone(),
             debname: self.debname.to_owned(),
-            subdir: self.subdir,
+            layout: self.layout,
         }
     }
 }
 
 impl Equivalent<CacheMetadataKey> for CacheMetadataKeyRef<'_> {
     fn equivalent(&self, key: &CacheMetadataKey) -> bool {
-        self.mirror == &key.mirror && self.debname == key.debname && self.subdir == key.subdir
+        self.mirror == &key.mirror && self.debname == key.debname && self.layout == key.layout
     }
 }
 
@@ -399,7 +395,7 @@ mod tests {
                 "/debian".into(),
             ),
             "test.deb".into(),
-            None,
+            CacheLayout::StructuredPool,
         )
     }
 

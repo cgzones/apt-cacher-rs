@@ -12,42 +12,40 @@
 //!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
 //!   module-private [`AT_CAP`] latch so each saturation episode counts once.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::ContentLength;
+use crate::cache_layout::CacheLayout;
 use crate::cache_metadata::UpstreamMetadata;
 use crate::deb_mirror::Mirror;
 use crate::error::MirrorDownloadRate;
 use crate::{global_config, metrics};
 
-/// Layout discriminator for the active-downloads key.  `subdir` mirrors
-/// `ConnectionDetails::subdir`: `None` for structured pool, `Some("flat")`
-/// / `Some("dists/by-hash")` / etc. for layouts that live under a
-/// dedicated subtree.  Without this discriminator a flat-pool `.deb` and a
-/// structured-pool `.deb` with the same filename under the same mirror
-/// path would collide on the in-flight key (different files on disk, same
-/// late-joiner attach target).
+/// Layout-aware key for in-flight downloads.  `layout` distinguishes
+/// same-named files served from different on-disk subtrees (e.g. a flat
+/// pool `.deb` vs a structured pool `.deb` under the same mirror path)
+/// so a late joiner cannot splice from the wrong file.
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct ActiveDownloadKey {
     mirror: Mirror,
     debname: String,
-    subdir: Option<&'static Path>,
+    layout: CacheLayout,
 }
 
 #[derive(Hash)]
 struct ActiveDownloadKeyRef<'a> {
     mirror: &'a Mirror,
     debname: &'a str,
-    subdir: Option<&'static Path>,
+    layout: CacheLayout,
 }
 
 impl Equivalent<ActiveDownloadKey> for ActiveDownloadKeyRef<'_> {
     fn equivalent(&self, key: &ActiveDownloadKey) -> bool {
-        self.mirror == &key.mirror && self.debname == key.debname && self.subdir == key.subdir
+        self.mirror == &key.mirror && self.debname == key.debname && self.layout == key.layout
     }
 }
 
@@ -185,7 +183,7 @@ impl ActiveDownloads {
         &self,
         mirror: &Mirror,
         debname: &str,
-        subdir: Option<&'static Path>,
+        layout: CacheLayout,
     ) -> InsertOutcome {
         enum LookupResult {
             Occupied {
@@ -204,7 +202,7 @@ impl ActiveDownloads {
         let key = ActiveDownloadKey {
             mirror: mirror.to_owned(),
             debname: debname.to_owned(),
-            subdir,
+            layout,
         };
 
         // Create channel and status before acquiring write lock to minimize lock scope
@@ -259,12 +257,12 @@ impl ActiveDownloads {
         &self,
         mirror: &Mirror,
         debname: &str,
-        subdir: Option<&'static Path>,
+        layout: CacheLayout,
     ) -> OriginateOutcome {
         let key = ActiveDownloadKey {
             mirror: mirror.to_owned(),
             debname: debname.to_owned(),
-            subdir,
+            layout,
         };
 
         let (tx, rx) = tokio::sync::watch::channel(());
@@ -316,11 +314,11 @@ impl ActiveDownloads {
         outcome
     }
 
-    pub(crate) fn remove(&self, mirror: &Mirror, debname: &str, subdir: Option<&'static Path>) {
+    pub(crate) fn remove(&self, mirror: &Mirror, debname: &str, layout: CacheLayout) {
         let key = ActiveDownloadKeyRef {
             mirror,
             debname,
-            subdir,
+            layout,
         };
         let mut guard = self.inner.write();
         let was_present = guard.remove(&key);
@@ -354,12 +352,12 @@ impl ActiveDownloads {
         &self,
         mirror: &Mirror,
         debname: &str,
-        subdir: Option<&'static Path>,
+        layout: CacheLayout,
     ) -> Option<Arc<tokio::sync::RwLock<ActiveDownloadStatus>>> {
         let key = ActiveDownloadKeyRef {
             mirror,
             debname,
-            subdir,
+            layout,
         };
         let mut guard = self.inner.write();
         let entry = guard.get_mut(&key)?;

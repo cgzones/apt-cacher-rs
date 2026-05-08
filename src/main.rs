@@ -16,6 +16,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod active_downloads;
 mod cache_conditional;
+mod cache_layout;
 mod cache_metadata;
 mod cache_quota;
 mod channel_body;
@@ -145,11 +146,11 @@ use tokio::signal::unix::SignalKind;
 use crate::active_downloads::OriginateOutcome;
 use crate::active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads, InsertOutcome};
 use crate::cache_conditional::CacheInfo;
+use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::cache_metadata::UpstreamMetadataView;
 use crate::cache_quota::QuotaExceeded;
 use crate::config::Config;
-use crate::config::DomainName;
 use crate::config::HttpsUpgradeMode;
 use crate::config::LogDestination;
 use crate::database::Database;
@@ -159,17 +160,10 @@ use crate::database_task::DbCmdDownload;
 use crate::database_task::DbCmdOrigin;
 use crate::database_task::db_loop;
 use crate::database_task::send_db_command;
-use crate::deb_mirror::FlatKind;
 use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
-use crate::deb_mirror::ResourceFile;
 use crate::deb_mirror::is_diff_request_path;
 use crate::deb_mirror::parse_request_path;
-use crate::deb_mirror::valid_architecture;
-use crate::deb_mirror::valid_component;
-use crate::deb_mirror::valid_distribution;
-use crate::deb_mirror::valid_filename;
-use crate::deb_mirror::valid_mirrorname;
 use crate::error::ErrorReport;
 use crate::error::ProxyCacheError;
 use crate::guards::DownloadBarrier;
@@ -1179,7 +1173,7 @@ async fn serve_cached_file(
     let cache_key = cache_metadata::CacheMetadataKeyRef::new(
         &conn_details.mirror,
         &conn_details.debname,
-        conn_details.subdir,
+        conn_details.layout,
     );
 
     // Caller pre-resolves on the volatile / late-joiner / originator paths;
@@ -1683,10 +1677,11 @@ async fn serve_volatile_file(
     #[cfg(not(feature = "sendfile"))]
     metrics::VOLATILE_REFETCHED.increment();
 
-    match appstate
-        .active_downloads
-        .insert(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
-    {
+    match appstate.active_downloads.insert(
+        &conn_details.mirror,
+        &conn_details.debname,
+        conn_details.layout,
+    ) {
         InsertOutcome::Joined { status } => {
             debug!(
                 "Serving file {} already in cache / download from mirror {} for client {}...",
@@ -1710,51 +1705,6 @@ async fn serve_volatile_file(
             )
             .await
         }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CachedFlavor {
-    Permanent,
-    Volatile,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ConnectionDetails {
-    pub(crate) client: ClientInfo,
-    pub(crate) mirror: Mirror,
-    pub(crate) aliased_host: Option<&'static DomainName>,
-    pub(crate) debname: String,
-    pub(crate) cached_flavor: CachedFlavor,
-    pub(crate) subdir: Option<&'static Path>,
-}
-
-impl ConnectionDetails {
-    #[must_use]
-    pub(crate) fn cache_dir_path(&self) -> PathBuf {
-        let root = &global_config().cache_directory;
-
-        let host = self.aliased_host.unwrap_or_else(|| self.mirror.host());
-        let host = host.format_cache_dir(self.mirror.port());
-        let host = Path::new(host.as_ref());
-        assert!(
-            host.is_relative(),
-            "path construction must not contain absolute components"
-        );
-
-        let uri_path = Path::new(self.mirror.path());
-        assert!(
-            uri_path.is_relative(),
-            "path construction must not contain absolute components"
-        );
-
-        let subdir = self.subdir.unwrap_or_else(|| Path::new(""));
-        assert!(
-            subdir.is_relative(),
-            "path construction must not contain absolute components"
-        );
-
-        [root.as_path(), host, uri_path, subdir].iter().collect()
     }
 }
 
@@ -2617,7 +2567,7 @@ async fn serve_new_file(
         &appstate.active_downloads,
         &conn_details.mirror,
         &conn_details.debname,
-        conn_details.subdir,
+        conn_details.layout,
     );
 
     let (warn_on_override, prev_file_size) = match &cfstate {
@@ -2685,7 +2635,7 @@ async fn serve_new_file(
             let key = cache_metadata::CacheMetadataKeyRef::new(
                 &conn_details.mirror,
                 &conn_details.debname,
-                conn_details.subdir,
+                conn_details.layout,
             );
 
             Some(cache_metadata::store().resolve(&key, file, file_path))
@@ -3453,10 +3403,11 @@ pub(crate) async fn process_cache_request(
                 CachedFlavor::Volatile => metrics::VOLATILE_REFETCHED.increment(),
             }
 
-            match appstate
-                .active_downloads
-                .insert(&conn_details.mirror, &conn_details.debname, conn_details.subdir)
-            {
+            match appstate.active_downloads.insert(
+                &conn_details.mirror,
+                &conn_details.debname,
+                conn_details.layout,
+            ) {
                 InsertOutcome::Originator { init_tx, status } => {
                     trace!(
                         "File {} not found, serving new version...",
@@ -3756,262 +3707,48 @@ async fn pre_process_client_request(
     );
 
     if let Some(resource) = parse_request_path(requested_path) {
-        #[derive(Clone, Copy)]
-        enum ValidateKind {
-            MirrorPath,
-            Distribution,
-            Component,
-            Architecture,
-            Filename,
-        }
-
-        impl Display for ValidateKind {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(match self {
-                    Self::MirrorPath => "mirror path",
-                    Self::Distribution => "distribution",
-                    Self::Component => "component",
-                    Self::Architecture => "architecture",
-                    Self::Filename => "filename",
-                })
-            }
-        }
-
-        #[inline]
-        #[must_use]
-        fn validate(name: &str, kind: ValidateKind) -> bool {
-            match kind {
-                ValidateKind::MirrorPath => valid_mirrorname(name),
-                ValidateKind::Distribution => valid_distribution(name),
-                ValidateKind::Component => valid_component(name),
-                ValidateKind::Architecture => valid_architecture(name),
-                ValidateKind::Filename => valid_filename(name),
-            }
-        }
-
-        macro_rules! validate {
-            ($name: ident, $kind: expr) => {
-                let encoded = $name;
-                let kind = $kind;
-                let decoded = match urlencoding::decode(encoded) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        warn_once_or_info!("Failed to decode {kind} `{encoded}`:  {err}");
-                        return quick_response(StatusCode::BAD_REQUEST, "Unsupported URL encoding");
-                    }
+        match cache_layout::classify_request(&resource, &client) {
+            Ok(class) => {
+                let mirror = Mirror::new(requested_host, requested_port, class.mirror_path);
+                let conn_details = ConnectionDetails {
+                    client,
+                    mirror,
+                    aliased_host,
+                    debname: class.debname,
+                    cached_flavor: class.cached_flavor,
+                    layout: class.layout,
                 };
-                if !validate(&decoded, kind) {
-                    warn_once_or_info!("Unsupported {kind} `{decoded}`");
-                    return quick_response(hyper::StatusCode::BAD_REQUEST, "Unsupported request");
-                }
 
-                let $name = decoded;
-            };
-        }
-
-        match resource {
-            ResourceFile::Pool {
-                mirror_path,
-                filename,
-            } => {
-                validate!(mirror_path, ValidateKind::MirrorPath);
-                validate!(filename, ValidateKind::Filename);
-
-                // TODO: cache .dsc?
-                let is_deb = deb_mirror::is_deb_package(&filename);
-
-                if is_deb {
-                    trace!("Decoded mirror path: `{mirror_path}`; Decoded filename: `{filename}`");
-
-                    let conn_details = ConnectionDetails {
-                        client,
-                        mirror: Mirror::new(
-                            requested_host,
-                            requested_port,
-                            mirror_path.into_owned(),
-                        ),
-                        aliased_host,
-                        debname: filename.into_owned(),
-                        cached_flavor: CachedFlavor::Permanent,
-                        subdir: None,
+                if let Some(fields) = class.origin_fields {
+                    let origin = Origin {
+                        mirror: conn_details.mirror.clone(),
+                        distribution: fields.distribution,
+                        component: fields.component,
+                        architecture: fields.architecture,
                     };
-
-                    return process_cache_request(conn_details, req, appstate).await;
+                    let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+                    send_db_command(cmd).await;
                 }
 
+                return process_cache_request(conn_details, req, appstate).await;
+            }
+            Err(cache_layout::ClassifyError::BadEncoding { kind, raw, source }) => {
+                warn_once_or_info!(
+                    "Failed to decode {kind} `{}`:  {source}",
+                    raw.escape_debug()
+                );
+                return quick_response(StatusCode::BAD_REQUEST, "Unsupported URL encoding");
+            }
+            Err(cache_layout::ClassifyError::InvalidValue { kind, decoded }) => {
+                warn_once_or_info!("Unsupported {kind} `{decoded}`");
+                return quick_response(StatusCode::BAD_REQUEST, "Unsupported request");
+            }
+            Err(cache_layout::ClassifyError::NonDebPool { filename }) => {
+                // Structured Pool with non-deb extension: log and fall
+                // through to the simple proxy below (no caching).
                 warn_once_or_info!(
                     "Unsupported pool file extension in filename `{filename}` from client {client}"
                 );
-            }
-            ResourceFile::Release {
-                mirror_path,
-                distribution,
-                filename,
-            } => {
-                validate!(mirror_path, ValidateKind::MirrorPath);
-                validate!(distribution, ValidateKind::Distribution);
-                validate!(filename, ValidateKind::Filename);
-
-                trace!(
-                    "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded filename: `{filename}`"
-                );
-
-                let conn_details = ConnectionDetails {
-                    client,
-                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
-                    aliased_host,
-                    debname: format!("{distribution}_{filename}"),
-                    cached_flavor: CachedFlavor::Volatile,
-                    subdir: Some(Path::new("dists")),
-                };
-
-                return process_cache_request(conn_details, req, appstate).await;
-            }
-            ResourceFile::ByHash {
-                mirror_path,
-                filename,
-            } => {
-                validate!(mirror_path, ValidateKind::MirrorPath);
-                validate!(filename, ValidateKind::Filename);
-
-                trace!("Decoded mirror path: `{mirror_path}`; Decoded filename: `{filename}`");
-
-                let conn_details = ConnectionDetails {
-                    client,
-                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
-                    aliased_host,
-                    debname: filename.into_owned(),
-                    cached_flavor: CachedFlavor::Permanent,
-                    subdir: Some(Path::new("dists/by-hash")),
-                };
-
-                // files requested by hash shouldn't be volatile
-                return process_cache_request(conn_details, req, appstate).await;
-            }
-            ResourceFile::Icon {
-                mirror_path,
-                distribution,
-                component,
-                filename,
-            }
-            | ResourceFile::Sources {
-                mirror_path,
-                distribution,
-                component,
-                filename,
-            }
-            | ResourceFile::Translation {
-                mirror_path,
-                distribution,
-                component,
-                filename,
-            } => {
-                validate!(mirror_path, ValidateKind::MirrorPath);
-                validate!(distribution, ValidateKind::Distribution);
-                validate!(component, ValidateKind::Component);
-                validate!(filename, ValidateKind::Filename);
-
-                trace!(
-                    "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded filename: `{filename}`"
-                );
-
-                let conn_details = ConnectionDetails {
-                    client,
-                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
-                    aliased_host,
-                    debname: format!("{distribution}_{component}_{filename}"),
-                    cached_flavor: CachedFlavor::Volatile,
-                    subdir: Some(Path::new("dists/")),
-                };
-
-                return process_cache_request(conn_details, req, appstate).await;
-            }
-            ResourceFile::Packages {
-                mirror_path,
-                distribution,
-                component,
-                architecture,
-                filename,
-            } => {
-                validate!(mirror_path, ValidateKind::MirrorPath);
-                validate!(distribution, ValidateKind::Distribution);
-                validate!(component, ValidateKind::Component);
-                validate!(architecture, ValidateKind::Architecture);
-                validate!(filename, ValidateKind::Filename);
-
-                trace!(
-                    "Decoded mirror path: `{mirror_path}`; \
-                    Decoded distribution: `{distribution}`; \
-                    Decoded component: `{component}`; \
-                    Decoded architecture: `{architecture}`; \
-                    Decoded filename: `{filename}`"
-                );
-
-                let conn_details = ConnectionDetails {
-                    client,
-                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
-                    aliased_host,
-                    debname: format!("{distribution}_{component}_{architecture}_{filename}"),
-                    cached_flavor: CachedFlavor::Volatile,
-                    subdir: Some(Path::new("dists")),
-                };
-
-                match architecture.as_ref() {
-                    // TODO: cache some of them?
-                    "dep11" | "i18n" | "source" => (),
-                    _ => {
-                        let origin = Origin {
-                            mirror: conn_details.mirror.clone(),
-                            distribution: distribution.into_owned(),
-                            component: component.into_owned(),
-                            architecture: architecture.into_owned(),
-                        };
-                        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                        send_db_command(cmd).await;
-                    }
-                }
-
-                return process_cache_request(conn_details, req, appstate).await;
-            }
-            ResourceFile::Flat {
-                kind,
-                mirror_path,
-                filename,
-            } => {
-                validate!(mirror_path, ValidateKind::MirrorPath);
-                validate!(filename, ValidateKind::Filename);
-
-                trace!(
-                    "Decoded flat mirror path: `{mirror_path}`; Decoded flat filename: `{filename}` (kind: {kind:?})"
-                );
-
-                let (cached_flavor, subdir) = match kind {
-                    FlatKind::Metadata => (CachedFlavor::Volatile, Path::new("flat")),
-                    FlatKind::Pool => {
-                        if !deb_mirror::is_deb_package(&filename) {
-                            warn_once_or_info!(
-                                "Unsupported flat pool file extension in filename `{filename}` from client {client}"
-                            );
-                            return quick_response(
-                                hyper::StatusCode::BAD_REQUEST,
-                                "Unsupported request",
-                            );
-                        }
-                        (CachedFlavor::Permanent, Path::new("flat"))
-                    }
-                    FlatKind::ByHash => (CachedFlavor::Permanent, Path::new("flat/by-hash")),
-                };
-
-                let conn_details = ConnectionDetails {
-                    client,
-                    mirror: Mirror::new(requested_host, requested_port, mirror_path.into_owned()),
-                    aliased_host,
-                    debname: filename.into_owned(),
-                    cached_flavor,
-                    subdir: Some(subdir),
-                };
-
-                return process_cache_request(conn_details, req, appstate).await;
             }
         }
     }
