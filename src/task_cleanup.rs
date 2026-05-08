@@ -277,6 +277,14 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
 
     let mirrors = appstate.database.get_mirrors().await.inspect_err(|err| {
         error!("Error looking up hosts:  {err}");
+        // Earlier steps in this task (cleanup_invalid_rows /
+        // delete_usage_logs) may already have run, but no per-mirror
+        // cleanup work was done; record the failed-run state so the
+        // dashboard does not display stale prior-run values.
+        let elapsed = start.elapsed();
+        metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
+        metrics::LAST_CLEANUP_FILES_REMOVED.set(0);
+        metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(0);
     })?;
 
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
