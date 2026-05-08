@@ -406,7 +406,11 @@ pub(crate) static HTTPS_UPGRADE_FAILED: Counter = Counter::new();
 /// Scheme-cache entries purged after `MAX_ATTEMPTS` connection failures.
 pub(crate) static SCHEME_CACHE_REMOVED: Counter = Counter::new();
 
-/// Database operations in `db_loop` that returned an error (any kind).
+/// Database operations that returned an error. Bumped from `db_loop`
+/// (background task) and from synchronous DB callers outside the
+/// loop — `init_tables`, `cleanup_invalid_rows`, `delete_usage_logs`,
+/// `mirror_cleanup`, `get_mirrors`, `get_mirrors_with_stats`. Any
+/// non-zero value indicates `SQLite` trouble worth investigating.
 pub(crate) static DB_OPERATION_FAILED: Counter = Counter::new();
 
 /// Active downloads that finished in `Aborted` state (rate-limit / failure).

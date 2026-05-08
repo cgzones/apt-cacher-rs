@@ -7,7 +7,7 @@ use crate::{
     database::{Database, MirrorEntry},
     deb_mirror::is_deb_package,
     error::ProxyCacheError,
-    global_config,
+    global_config, metrics,
 };
 
 /// Returns the size in bytes of the entire cache.
@@ -18,6 +18,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
     let mirrors = match database.get_mirrors().await {
         Ok(m) => m,
         Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Error fetching mirrors:  {err}");
             return Err(ProxyCacheError::Sqlx(err));
         }

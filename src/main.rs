@@ -4325,6 +4325,7 @@ async fn main_loop(
         })?;
 
     database.init_tables().await.inspect_err(|err| {
+        metrics::DB_OPERATION_FAILED.increment();
         error!(
             "Error initializing database `{}`:  {err}",
             config.database_path.display()
@@ -4332,6 +4333,7 @@ async fn main_loop(
     })?;
 
     database.cleanup_invalid_rows().await.inspect_err(|err| {
+        metrics::DB_OPERATION_FAILED.increment();
         error!("Failed to clean up invalid database rows:  {err}");
     })?;
 
@@ -4400,6 +4402,7 @@ async fn main_loop(
             let mut mirrors = match database.get_recent_mirrors(STALE_THRESHOLD).await {
                 Ok(m) => m,
                 Err(err) => {
+                    metrics::DB_OPERATION_FAILED.increment();
                     error!("Failed to get list of mirrors to initialize scheme cache:  {err}");
                     return;
                 }

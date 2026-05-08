@@ -260,6 +260,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let start = Instant::now();
 
     if let Err(err) = appstate.database.cleanup_invalid_rows().await {
+        metrics::DB_OPERATION_FAILED.increment();
         error!("Failed to clean up invalid database rows:  {err}");
     }
 
@@ -271,11 +272,13 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         let now_secs = coarsetime::Clock::now_since_epoch().as_secs();
         let keep_date = Duration::from_secs(now_secs.saturating_sub(retention_secs));
         if let Err(err) = appstate.database.delete_usage_logs(keep_date).await {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Failed to delete old usage logs:  {err}");
         }
     }
 
     let mirrors = appstate.database.get_mirrors().await.inspect_err(|err| {
+        metrics::DB_OPERATION_FAILED.increment();
         error!("Error looking up hosts:  {err}");
         // Earlier steps in this task (cleanup_invalid_rows /
         // delete_usage_logs) may already have run, but no per-mirror
@@ -331,6 +334,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
             .mirror_cleanup(&cleanup_result.mirror)
             .await
         {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Error setting cleanup timestamp:  {err}");
         }
 

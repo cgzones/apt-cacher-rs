@@ -957,6 +957,7 @@ async fn build_mirror_section(
             (m, html, rows, aggregate)
         }
         Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Failed to query mirrors:  {err}");
             let mut buf = String::new();
             write_section_error(&mut buf, "mirrors", &err);
@@ -1383,6 +1384,7 @@ fn build_cache_stats_html(
     let bandwidth_day = match bandwidth_day_result {
         Ok(v) => Some(v),
         Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Failed to query bandwidth window:  {err}");
             None
         }
@@ -1390,6 +1392,7 @@ fn build_cache_stats_html(
     let bandwidth_week = match bandwidth_week_result {
         Ok(v) => Some(v),
         Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Failed to query bandwidth window:  {err}");
             None
         }
@@ -2541,6 +2544,7 @@ async fn build_origin_table(database: &Database, now_epoch: i64) -> (String, usi
     let mut origins = match database.get_origins().await {
         Ok(o) => o,
         Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Failed to query origins:  {err}");
             let mut buf = String::new();
             write_section_error(&mut buf, "origins", &err);
@@ -2584,6 +2588,7 @@ async fn build_client_table(database: &Database, now_epoch: i64) -> (String, usi
     let mut clients = match database.get_clients_with_stats().await {
         Ok(o) => o,
         Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Failed to query clients:  {err}");
             let mut buf = String::new();
             write_section_error(&mut buf, "clients", &err);
@@ -2674,6 +2679,7 @@ async fn build_top_packages_table(database: &Database, view: TopPackagesView) ->
     let packages = match result {
         Ok(p) => p,
         Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
             error!("Failed to query {label}:  {err}");
             let mut buf = String::new();
             write_section_error(&mut buf, label, &err);
