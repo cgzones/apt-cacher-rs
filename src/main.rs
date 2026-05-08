@@ -506,6 +506,11 @@ pub(crate) async fn request_with_retry(
                         https_upgrade_test = false;
                         sleep_prev = 0;
                         sleep_curr = 500;
+                        // The revert iteration is another upstream attempt
+                        // even though the retry budget (`attempt`) is not
+                        // consumed for it. Match the regular retry arm in
+                        // counting it as a retry.
+                        metrics::UPSTREAM_RETRIES.increment();
                         continue;
                     }
 
