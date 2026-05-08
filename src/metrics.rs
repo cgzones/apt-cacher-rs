@@ -237,6 +237,9 @@ pub(crate) static BYTES_DOWNLOADED_UPSTREAM: Accumulator = Accumulator::new();
 
 /// Requests that attached to an in-flight download instead of fetching anew.
 /// High values relative to `CACHE_MISSES` mean coalescing carries real traffic.
+/// Late joiners on a permanent resource are counted as `CACHE_MISSES`; late
+/// joiners on a volatile resource bump only this counter and the originator's
+/// `VOLATILE_REFETCHED`, not the per-request {hit, miss} buckets.
 pub(crate) static LATE_JOINERS_TOTAL: Counter = Counter::new();
 /// Peak concurrent late joiners attached to a single in-flight download.
 pub(crate) static LATE_JOINER_PEAK_PER_DOWNLOAD: Peak = Peak::new();

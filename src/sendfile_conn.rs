@@ -855,14 +855,17 @@ async fn try_sendfile_request(
         )
         .await;
 
-        // CACHE_HITS tracks permanent-file hits only and only when we have
-        // actually served from cache via sendfile (NotApplicable falls back
-        // to hyper); the volatile case is accounted for via VOLATILE_REFETCHED
-        // by the originator.
+        // Coalesced permanent late-joiners count as `CACHE_MISSES`: the file
+        // was not yet fully on disk so we would have fetched upstream if not
+        // for the in-flight originator. `LATE_JOINERS_TOTAL` is the subset of
+        // misses that attached. `attach()` already bumped that counter.
+        // `NotApplicable` falls back to hyper, which bumps `CACHE_MISSES`
+        // itself on its own miss path; the volatile case is accounted for via
+        // `VOLATILE_REFETCHED` by the originator.
         if !matches!(result, SendfileResult::NotApplicable(_))
             && conn_details.cached_flavor == CachedFlavor::Permanent
         {
-            metrics::CACHE_HITS.increment();
+            metrics::CACHE_MISSES.increment();
         }
 
         return result;
@@ -1000,8 +1003,10 @@ async fn try_sendfile_request(
                 // existing download's status was handed back by
                 // `originate()` and is held alive by the Arc, so we can
                 // serve from the partial via sendfile directly — no
-                // re-attach, no race-of-races fall-back.
-                let result = serve_unfinished_sendfile(
+                // re-attach, no race-of-races fall-back. `CACHE_MISSES` was
+                // bumped above when the cache lookup found no usable file;
+                // `LATE_JOINERS_TOTAL` was bumped inside `originate()`.
+                serve_unfinished_sendfile(
                     stream,
                     &conn_details,
                     &aliased,
@@ -1010,13 +1015,7 @@ async fn try_sendfile_request(
                     conn_action,
                     RangeRequestHeaders::extract(req.headers),
                 )
-                .await;
-                if !matches!(result, SendfileResult::NotApplicable(_))
-                    && conn_details.cached_flavor == CachedFlavor::Permanent
-                {
-                    metrics::CACHE_HITS.increment();
-                }
-                result
+                .await
             }
             Err(SpliceProxyError::NotApplicable(reason)) => {
                 debug!(
