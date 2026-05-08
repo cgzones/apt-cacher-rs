@@ -23,6 +23,7 @@ use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use crate::{
     AppState, CachedFlavor, ClientInfo, ConnectionDetails, ProxyCacheBody, ProxyCacheError,
     RETENTION_TIME, cache_metadata,
+    config::Config,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, UriFormat as _, is_deb_package, mirror_cache_path_impl},
     global_cache_quota, global_config,
@@ -35,6 +36,11 @@ pub(crate) const FIRST_CLEANUP_DELAY_SECS: u64 = 60 * 60;
 
 /// Interval between recurring cleanup runs.
 pub(crate) const CLEANUP_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Grace period for unreferenced cached deb files. Apt updates that bypass
+/// the proxy register their origin lazily; this delay prevents a freshly
+/// cached file from being wiped before its origin row is observed.
+const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 
 /// Unix-timestamp of the next scheduled cleanup. Updated by main.rs at startup,
 /// after each scheduled tick, and after a SIGUSR2-triggered reset. A value of
@@ -53,8 +59,9 @@ pub(crate) fn next_cleanup_epoch() -> i64 {
 async fn body_to_file(
     body: &mut ProxyCacheBody,
     file: tokio::fs::File,
+    config: &Config,
 ) -> Result<tokio::fs::File, ProxyCacheError> {
-    let mut writer = BufWriter::with_capacity(global_config().buffer_size, file);
+    let mut writer = BufWriter::with_capacity(config.buffer_size, file);
 
     while let Some(next) = body.frame().await {
         let frame = next.map_err(|err| *err)?;
@@ -84,14 +91,23 @@ async fn collect_cached_files(
     };
 
     while let Some(entry) = host_dir.next_entry().await? {
-        let path = entry.path();
-
-        if path.extension().is_some_and(|ext| ext == "deb") {
-            ret.insert(entry.file_name(), path);
+        let name = entry.file_name();
+        // Mirror `collect_flat_cached_debs`: structured Pool admits
+        // `.deb`/`.udeb`/`.ddeb` (see `is_deb_package` in `deb_mirror.rs`),
+        // so the cleanup scan must enumerate the same set.
+        if name.to_str().is_some_and(is_deb_package) {
+            ret.insert(name, entry.path());
         }
     }
 
     Ok(ret)
+}
+
+/// Extract the basename from a `Filename:` line of a Debian Packages stanza.
+fn parse_filename_field(line: &str) -> Option<&std::ffi::OsStr> {
+    let line = line.trim();
+    let filepath = line.strip_prefix("Filename: ")?;
+    Path::new(filepath).file_name()
 }
 
 #[derive(Clone, Copy)]
@@ -117,10 +133,11 @@ impl PackageFormat {
         file: tokio::fs::File,
         filename: &str,
         file_list: &mut HashMap<OsString, PathBuf>,
+        config: &Config,
     ) -> Result<(), ProxyCacheError> {
         debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
 
-        let buffer_size = global_config().buffer_size;
+        let buffer_size = config.buffer_size;
 
         let mut file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
 
@@ -148,11 +165,7 @@ impl PackageFormat {
                     return Err(err.into());
                 }
                 Ok(_bytes_read) => {
-                    let Some(filepath) = buffer.strip_prefix("Filename: ") else {
-                        continue;
-                    };
-
-                    let Some(filename) = Path::new(filepath).file_name() else {
+                    let Some(filename) = parse_filename_field(&buffer) else {
                         continue;
                     };
 
@@ -257,6 +270,8 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     // Use buffer_unordered to limit concurrent cleanup tasks and avoid thundering herd
     const MAX_CONCURRENT_CLEANUP_TASKS: usize = 10;
 
+    let config = global_config();
+
     let start = Instant::now();
 
     if let Err(err) = appstate.database.cleanup_invalid_rows().await {
@@ -264,7 +279,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         error!("Failed to clean up invalid database rows:  {err}");
     }
 
-    if let Some(usage_retention_days) = global_config().usage_retention_days {
+    if let Some(usage_retention_days) = config.usage_retention_days {
         let retention_secs = usage_retention_days
             .get()
             .checked_mul(24 * 60 * 60)
@@ -293,15 +308,23 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
 
-    cleanup_stale_partials(&global_config().cache_directory, &mirrors).await;
+    cleanup_stale_partials(&config.cache_directory, &mirrors).await;
 
     // Create a stream of futures for structured deb files, flat deb files,
     // and by-hash files cleanup.
     let cleanup_tasks = mirrors.into_iter().flat_map(|mirror| {
         [
-            tokio::task::spawn(cleanup_mirror_deb_files(mirror.clone(), appstate.clone())),
-            tokio::task::spawn(cleanup_mirror_flat_files(mirror.clone(), appstate.clone())),
-            tokio::task::spawn(cleanup_mirror_byhash_files(mirror)),
+            tokio::task::spawn(cleanup_mirror_deb_files(
+                mirror.clone(),
+                appstate.clone(),
+                config,
+            )),
+            tokio::task::spawn(cleanup_mirror_flat_files(
+                mirror.clone(),
+                appstate.clone(),
+                config,
+            )),
+            tokio::task::spawn(cleanup_mirror_byhash_files(mirror, config)),
         ]
     });
 
@@ -391,6 +414,7 @@ struct CleanupDone {
 async fn cleanup_mirror_deb_files(
     mirror: MirrorEntry,
     appstate: AppState,
+    config: &Config,
 ) -> Result<CleanupDone, ProxyCacheError> {
     let origins = appstate
         .database
@@ -417,7 +441,7 @@ async fn cleanup_mirror_deb_files(
         })
         .collect::<Vec<_>>();
 
-    let mirror_path: PathBuf = [&global_config().cache_directory, &mirror.cache_path()]
+    let mirror_path: PathBuf = [&config.cache_directory, &mirror.cache_path()]
         .iter()
         .collect();
 
@@ -451,16 +475,13 @@ async fn cleanup_mirror_deb_files(
 
     for origin in &active_origins {
         let (mut response, pkgfmt) = match get_package_file(&mirror, origin, &appstate).await {
-            Ok(r) => r,
-            Err(StatusCode::NOT_FOUND) => {
-                warn!(
-                    "Could not find package file for {origin:?}; continuing cleanup for mirror {mirror}..."
-                );
-                continue;
-            }
+            // A missing Packages file leaves us unable to complete the
+            // reference set; deleting now risks wiping files referenced
+            // only by this origin (typical when a distribution goes EOL
+            // upstream). Bail conservatively and retry next cycle.
             Err(status) => {
                 warn!(
-                    "Could not find package file for {origin:?} ({status}); skipping cleanup for mirror {mirror}"
+                    "Could not fetch package file for {origin:?} ({status}); skipping cleanup for mirror {mirror}"
                 );
 
                 return Ok(CleanupDone {
@@ -470,6 +491,7 @@ async fn cleanup_mirror_deb_files(
                     bytes_removed: 0,
                 });
             }
+            Ok(r) => r,
         };
 
         let memfdname = {
@@ -502,14 +524,14 @@ async fn cleanup_mirror_deb_files(
 
         let file = tokio::fs::File::from_std(memfd.into_file());
 
-        let file = body_to_file(response.body_mut(), file)
+        let file = body_to_file(response.body_mut(), file, config)
             .await
             .inspect_err(|err| {
                 error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
             })?;
 
         pkgfmt
-            .reduce_file_list(file, &memfdname, &mut cached_files)
+            .reduce_file_list(file, &memfdname, &mut cached_files, config)
             .await?;
 
         if cached_files.is_empty() {
@@ -543,8 +565,6 @@ async fn cleanup_mirror_deb_files(
          * For example if `apt update` was run un-proxied.
          */
         if let Some(data) = &data {
-            const KEEP_SPAN: Duration = Duration::from_hours(3 * 24); // 3 days
-
             let created = match data.created() {
                 Ok(d) => d,
                 Err(created_err) => {
@@ -566,13 +586,13 @@ async fn cleanup_mirror_deb_files(
             };
 
             if let Ok(existing_for) = now.duration_since(created)
-                && existing_for < KEEP_SPAN
+                && existing_for < UNREFERENCED_KEEP_SPAN
             {
                 debug!(
                     "Keeping unreferenced file `{}` since it is too new ({}, threshold={})",
                     path.display(),
                     HumanFmt::Time(existing_for),
-                    HumanFmt::Time(KEEP_SPAN)
+                    HumanFmt::Time(UNREFERENCED_KEEP_SPAN)
                 );
                 continue;
             }
@@ -708,10 +728,11 @@ async fn get_flat_packages_file(
 async fn cleanup_mirror_flat_files(
     mirror: MirrorEntry,
     appstate: AppState,
+    config: &Config,
 ) -> Result<CleanupDone, ProxyCacheError> {
     let mirror_cache_path = mirror.cache_path();
     let flat_path: PathBuf = [
-        &global_config().cache_directory,
+        &config.cache_directory,
         &mirror_cache_path,
         Path::new("flat"),
     ]
@@ -798,14 +819,14 @@ async fn cleanup_mirror_flat_files(
 
     let file = tokio::fs::File::from_std(memfd.into_file());
 
-    let file = body_to_file(response.body_mut(), file)
+    let file = body_to_file(response.body_mut(), file, config)
         .await
         .inspect_err(|err| {
             error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
         })?;
 
     pkgfmt
-        .reduce_file_list(file, &memfdname, &mut cached_files)
+        .reduce_file_list(file, &memfdname, &mut cached_files, config)
         .await?;
 
     if cached_files.is_empty() {
@@ -834,8 +855,6 @@ async fn cleanup_mirror_flat_files(
         };
 
         if let Some(data) = &data {
-            const KEEP_SPAN: Duration = Duration::from_hours(3 * 24); // 3 days
-
             let created = match data.created() {
                 Ok(d) => d,
                 Err(created_err) => {
@@ -857,13 +876,13 @@ async fn cleanup_mirror_flat_files(
             };
 
             if let Ok(existing_for) = now.duration_since(created)
-                && existing_for < KEEP_SPAN
+                && existing_for < UNREFERENCED_KEEP_SPAN
             {
                 debug!(
                     "Keeping unreferenced file `{}` since it is too new ({}, threshold={})",
                     path.display(),
                     HumanFmt::Time(existing_for),
-                    HumanFmt::Time(KEEP_SPAN)
+                    HumanFmt::Time(UNREFERENCED_KEEP_SPAN)
                 );
                 continue;
             }
@@ -959,7 +978,7 @@ async fn cleanup_byhash_dir(
             Ok(d) => d,
             Err(err) => {
                 error!("Error inspecting file `{}`:  {err}", path.display());
-                return Err(ProxyCacheError::Io(err));
+                continue;
             }
         };
 
@@ -967,7 +986,7 @@ async fn cleanup_byhash_dir(
             Ok(m) => m,
             Err(err) => {
                 error!("Failed to get mtime of file `{}`:  {err}", path.display());
-                return Err(ProxyCacheError::Io(err));
+                continue;
             }
         };
 
@@ -1012,9 +1031,12 @@ async fn cleanup_byhash_dir(
     Ok(stats)
 }
 
-async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone, ProxyCacheError> {
+async fn cleanup_mirror_byhash_files(
+    mirror: MirrorEntry,
+    config: &Config,
+) -> Result<CleanupDone, ProxyCacheError> {
     let now = SystemTime::now();
-    let keep_span = Duration::from_secs(24 * 60 * 60 * global_config().byhash_retention_days.get());
+    let keep_span = Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get());
     let mirror_cache_path = mirror.cache_path();
 
     let mut total = ByHashStats::default();
@@ -1023,13 +1045,9 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
     // layouts.  Each call short-circuits on `NotFound`, so a mirror with only
     // one layout pays only a stat call for the missing one.
     for sub in ["dists/by-hash", "flat/by-hash"] {
-        let path: PathBuf = [
-            &global_config().cache_directory,
-            &mirror_cache_path,
-            Path::new(sub),
-        ]
-        .iter()
-        .collect();
+        let path: PathBuf = [&config.cache_directory, &mirror_cache_path, Path::new(sub)]
+            .iter()
+            .collect();
 
         let stats = cleanup_byhash_dir(&path, keep_span, now).await?;
         total.files_retained += stats.files_retained;
@@ -1053,14 +1071,13 @@ async fn cleanup_mirror_byhash_files(mirror: MirrorEntry) -> Result<CleanupDone,
     })
 }
 
-/// Remove stale `.partial` files that are older than 3 days.
+/// Remove stale entries from each mirror's `tmp/` directory.
 ///
-/// Partial files live under `{cache_dir}/{mirror_dir}/tmp/*.partial`.
-/// Iterates known mirror directories directly instead of walking the entire cache tree.
+/// Iterates known mirror directories directly (rather than walking the entire
+/// cache tree) and delegates to [`cleanup_tmp_dir`] for the per-directory
+/// policy.
 async fn cleanup_stale_partials(cache_dir: &Path, mirrors: &[MirrorEntry]) {
-    const MAX_AGE: Duration = Duration::from_hours(3 * 24);
-
-    let cutoff = SystemTime::now() - MAX_AGE;
+    let now = SystemTime::now();
     let mut removed = 0u64;
 
     for mirror in mirrors {
@@ -1068,16 +1085,28 @@ async fn cleanup_stale_partials(cache_dir: &Path, mirrors: &[MirrorEntry]) {
         let tmp_dir: PathBuf = [cache_dir, mirror_dir.as_path(), Path::new("tmp")]
             .iter()
             .collect();
-        removed += cleanup_partials_in_dir(&tmp_dir, &cutoff).await;
+        removed += cleanup_tmp_dir(&tmp_dir, now).await;
     }
 
     if removed > 0 {
-        info!("Removed {removed} stale partial file(s)");
+        info!("Removed {removed} stale tmp file(s)");
     }
 }
 
-/// Remove stale `.partial` files from a single `tmp/` directory.
-async fn cleanup_partials_in_dir(tmp_dir: &Path, cutoff: &SystemTime) -> u64 {
+/// Remove stale entries from a single `tmp/` directory.
+///
+/// `.partial` files are deleted when zero-byte (no useful resume state) or
+/// older than `PARTIAL_MAX_AGE`. Any other artifact (defensive — current code
+/// only writes `.partial` here) is deleted once it has aged past
+/// `FOREIGN_MAX_AGE`, the longer threshold acknowledging that we don't know
+/// what produced it.
+async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
+    const PARTIAL_MAX_AGE: Duration = Duration::from_hours(3 * 24);
+    const FOREIGN_MAX_AGE: Duration = Duration::from_hours(7 * 24);
+
+    let partial_cutoff = now - PARTIAL_MAX_AGE;
+    let foreign_cutoff = now - FOREIGN_MAX_AGE;
+
     let mut entries = match tokio::fs::read_dir(tmp_dir).await {
         Ok(e) => e,
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -1085,7 +1114,7 @@ async fn cleanup_partials_in_dir(tmp_dir: &Path, cutoff: &SystemTime) -> u64 {
         }
         Err(err) => {
             error!(
-                "Failed to read partial directory `{}`:  {err}",
+                "Failed to read tmp directory `{}`:  {err}",
                 tmp_dir.display()
             );
             return 0;
@@ -1100,7 +1129,7 @@ async fn cleanup_partials_in_dir(tmp_dir: &Path, cutoff: &SystemTime) -> u64 {
             Ok(None) => break,
             Err(err) => {
                 error!(
-                    "Failed to iterate partial directory `{}`:  {err}",
+                    "Failed to iterate tmp directory `{}`:  {err}",
                     tmp_dir.display()
                 );
                 break;
@@ -1109,38 +1138,113 @@ async fn cleanup_partials_in_dir(tmp_dir: &Path, cutoff: &SystemTime) -> u64 {
 
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
-            error!("Failed to decode name of partial file `{}`", name.display());
+            error!("Failed to decode name of tmp file `{}`", name.display());
             continue;
         };
-        if !name_str.ends_with(".partial") {
-            info!("Skipping non-partial file `{name_str}`");
-            continue;
-        }
 
-        let md = match entry.metadata().await {
-            Ok(m) => m,
+        let file_type = match entry.file_type().await {
+            Ok(ft) => ft,
             Err(err) => {
-                error!("Failed to stat partial file `{name_str}`:  {err}");
+                error!("Failed to get file type of tmp entry `{name_str}`:  {err}");
                 continue;
             }
         };
 
-        // Delete zero-byte partials unconditionally (no useful data to resume from)
-        // and non-zero partials that are older than the cutoff.
+        let md = match entry.metadata().await {
+            Ok(m) => m,
+            Err(err) => {
+                error!("Failed to stat tmp file `{name_str}`:  {err}");
+                continue;
+            }
+        };
+
         let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if md.len() == 0 || mtime < *cutoff {
+        // Apply the per-suffix `.partial` policy only to regular files: a
+        // symlink-to-dir or a stray directory named `*.partial` should not
+        // be measured by `len()` (zero for a symlink) and should be reaped
+        // under the longer foreign cutoff instead.
+        let is_partial = file_type.is_file() && name_str.ends_with(".partial");
+        let should_remove = if is_partial {
+            // Zero-byte partials carry no resume state; aged partials are stale.
+            md.len() == 0 || mtime < partial_cutoff
+        } else if mtime < foreign_cutoff {
+            true
+        } else {
+            debug!("Keeping unexpected tmp entry `{name_str}` (not yet past foreign cutoff)");
+            continue;
+        };
+
+        if should_remove {
             let path = entry.path();
-            if let Err(err) = tokio::fs::remove_file(&path).await {
+            // The tmp/ producer (`download_file`) only writes regular
+            // files, so a directory or symlink here is unexpected — but
+            // `remove_file` would fail on a real directory and re-fail
+            // every cleanup pass.  Dispatch on `file_type.is_dir()` (which,
+            // unlike `Metadata::is_dir`, is unambiguous about not following
+            // symlinks) so a real directory is recursively cleaned up while
+            // a symlink-to-dir is unlinked via `remove_file` rather than
+            // having `remove_dir_all` traverse its target.
+            let removal = if file_type.is_dir() {
+                tokio::fs::remove_dir_all(&path).await
+            } else {
+                tokio::fs::remove_file(&path).await
+            };
+            if let Err(err) = removal {
                 error!(
-                    "Failed to remove stale partial file `{}`:  {err}",
+                    "Failed to remove stale tmp entry `{}`:  {err}",
                     path.display()
                 );
             } else {
-                debug!("Removed stale partial file `{}`", path.display());
+                debug!("Removed stale tmp entry `{}`", path.display());
                 removed += 1;
             }
         }
     }
 
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn parse_filename_field_strips_lf() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n"),
+            Some(OsStr::new("abc_1.0_amd64.deb")),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_strips_crlf() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\r\n"),
+            Some(OsStr::new("abc_1.0_amd64.deb")),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_no_terminator() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb"),
+            Some(OsStr::new("abc_1.0_amd64.deb")),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_handles_udeb_extension() {
+        assert_eq!(
+            parse_filename_field("Filename: pool/main/i/inst/inst_1.0_amd64.udeb\n"),
+            Some(OsStr::new("inst_1.0_amd64.udeb")),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_skips_other_keys() {
+        assert_eq!(parse_filename_field("Package: stub\n"), None);
+        assert_eq!(parse_filename_field("\n"), None);
+        assert_eq!(parse_filename_field(""), None);
+    }
 }
