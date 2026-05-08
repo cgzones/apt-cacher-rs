@@ -26,9 +26,12 @@ pub(crate) fn record_uncacheable(host: &DomainName, path: &str) {
         uncacheables.push(entry);
     } else {
         uncacheables.push((host.to_owned(), path.to_owned()));
+        // Bump only on a fresh (host, path) insertion so the counter
+        // tracks unique resources observed (not raw request count). This
+        // is what the dashboard's "Uncacheable Evictions" line subtracts
+        // UNCACHEABLES_MAX from.
+        metrics::UNCACHEABLE.increment();
     }
-
-    metrics::UNCACHEABLE.increment();
 }
 
 pub(crate) fn get_uncacheables() -> &'static parking_lot::RwLock<RingBuffer<(DomainName, String)>> {

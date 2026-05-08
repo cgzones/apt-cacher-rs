@@ -158,7 +158,10 @@ pub(crate) static UNSAFE_PATH_REJECTED: Counter = Counter::new();
 /// Requests rejected because they targeted a `pdiff` resource.
 pub(crate) static PDIFF_REJECTED: Counter = Counter::new();
 
-/// Resources marked uncacheable and tracked in the in-memory ring.
+/// Unique `(host, path)` resources marked uncacheable. Bumped only on the
+/// first observation that inserts a new ring entry; repeated requests for
+/// the same resource do not bump it. Once the count exceeds
+/// `UNCACHEABLES_MAX`, the surplus equals the number of ring evictions.
 pub(crate) static UNCACHEABLE: Counter = Counter::new();
 
 /// HTTPS CONNECT tunnels accepted.
