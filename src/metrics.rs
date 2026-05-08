@@ -92,9 +92,11 @@ impl StateU64 {
     }
 }
 
-/// Total client requests handled.
+/// Total client requests handled, including web-interface requests.
+/// Subtract `WEBUI_REQUESTS` to get proxy-only requests.
 pub(crate) static REQUESTS_TOTAL: Counter = Counter::new();
-/// Web interface requests entering `serve_web_interface`.
+/// Web interface requests entering `serve_web_interface`. Subset of
+/// `REQUESTS_TOTAL` (every `WebUI` request bumps both counters).
 pub(crate) static WEBUI_REQUESTS: Counter = Counter::new();
 /// TCP connections accepted by the listener.
 pub(crate) static CONNECTIONS_ACCEPTED: Counter = Counter::new();
