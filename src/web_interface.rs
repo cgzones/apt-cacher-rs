@@ -1797,13 +1797,14 @@ fn build_metrics_html() -> String {
     {
         let attempted = metrics::HTTPS_UPGRADE_ATTEMPTED.get();
         let succeeded = metrics::HTTPS_UPGRADE_SUCCEEDED.get();
+        let reverted = metrics::HTTPS_UPGRADE_REVERTED.get();
         let failed = metrics::HTTPS_UPGRADE_FAILED.get();
         t.row_tip(
-        "HTTPS Upgrade (attempted / succeeded / failed, scheme-cache removed)",
-        "HTTPS upgrade attempts on plain-HTTP requests, plus removals from the per-host scheme cache.",
+        "HTTPS Upgrade (attempted / succeeded / reverted / failed, scheme-cache removed)",
+        "HTTPS upgrade attempts on plain-HTTP requests (reverted: Auto-mode soft give-up; failed: Always-mode terminal failure), plus removals from the per-host scheme cache.",
         format_args!(
-            "{} / {succeeded} / {failed}, {}",
-            WarnIf::new(attempted, attempted != succeeded + failed),
+            "{} / {succeeded} / {reverted} / {failed}, {}",
+            WarnIf::new(attempted, attempted != succeeded + reverted + failed),
             metrics::SCHEME_CACHE_REMOVED.get(),
         ),
     );

@@ -332,7 +332,8 @@ pub(crate) async fn request_with_retry(
     // (gated on `attempt > MAX_ATTEMPTS` with `https_upgrade_test` still
     // set) relies on the Auto-mode revert firing first. If MAX_ATTEMPTS
     // were ever <= HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS, Auto mode would
-    // also fall through here with the flag set and over-count Auto.
+    // also fall through here with the flag set and bump HTTPS_UPGRADE_FAILED
+    // instead of HTTPS_UPGRADE_REVERTED.
     static_assert!(MAX_ATTEMPTS > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS);
 
     debug_assert_eq!(
@@ -465,6 +466,14 @@ pub(crate) async fn request_with_retry(
                         metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                     }
                     metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
+                    if https_upgrade_test {
+                        // Non-connect transport error (e.g. read timeout,
+                        // request framing) terminates the request without
+                        // retry. Count the upgrade attempt as failed so the
+                        // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity
+                        // holds.
+                        metrics::HTTPS_UPGRADE_FAILED.increment();
+                    }
                     warn_once_or_info!(
                         "Request of internal client to {} failed:  {}",
                         parts.uri,
@@ -498,7 +507,7 @@ pub(crate) async fn request_with_retry(
                                 .expect("authority must exist for a https upgrade")
                         );
 
-                        metrics::HTTPS_UPGRADE_FAILED.increment();
+                        metrics::HTTPS_UPGRADE_REVERTED.increment();
                         // reset https upgrade
                         let mut uri_parts = parts.uri.into_parts();
                         uri_parts.scheme.clone_from(&orig_scheme);
@@ -521,7 +530,8 @@ pub(crate) async fn request_with_retry(
                             // still set: in Always mode the revert branch
                             // above is gated off, so the only outcome of an
                             // attempted upgrade is failure here. Keep the
-                            // ATTEMPTED == SUCCEEDED + FAILED identity.
+                            // ATTEMPTED == SUCCEEDED + REVERTED + FAILED
+                            // identity.
                             metrics::HTTPS_UPGRADE_FAILED.increment();
                         }
                         if let Some(auth) = parts.uri.authority() {

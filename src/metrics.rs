@@ -412,6 +412,9 @@ pub(crate) static LOGSTORE_EVICTIONS: Counter = Counter::new();
 pub(crate) static CACHE_QUOTA_UTIL_PEAK_BPS: Peak = Peak::new();
 
 /// HTTPS upgrade attempted on an HTTP request (Auto / uncached scheme).
+/// Every attempt resolves to exactly one of `HTTPS_UPGRADE_SUCCEEDED`,
+/// `HTTPS_UPGRADE_REVERTED`, or `HTTPS_UPGRADE_FAILED`, so the identity
+/// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` holds.
 pub(crate) static HTTPS_UPGRADE_ATTEMPTED: Counter = Counter::new();
 /// HTTPS upgrade succeeded: bumped on the first successful upstream
 /// response (any status) after the upgrade flag was set. The host's
@@ -420,9 +423,18 @@ pub(crate) static HTTPS_UPGRADE_ATTEMPTED: Counter = Counter::new();
 /// response with an unsupported scheme or a non-2xx status still
 /// counts as a success here.
 pub(crate) static HTTPS_UPGRADE_SUCCEEDED: Counter = Counter::new();
-/// HTTPS upgrade failed (Auto-mode revert to original scheme, or
-/// terminal connect failure with the upgrade flag still set in
-/// Always-mode).
+/// HTTPS upgrade reverted: Auto-mode gave up on the upgrade after
+/// `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS` connect failures and reverted
+/// to the original scheme. The request itself may still succeed via the
+/// original scheme — this counter only marks that the upgrade attempt
+/// was abandoned, not that the request as a whole failed.
+pub(crate) static HTTPS_UPGRADE_REVERTED: Counter = Counter::new();
+/// HTTPS upgrade failed terminally: the request returned without
+/// the upgrade resolving to a success or a revert. Reached when
+/// Always-mode exhausts all `MAX_ATTEMPTS` connect retries (Auto-mode
+/// would have reverted first, see `HTTPS_UPGRADE_REVERTED`), or when
+/// any mode hits a non-connect transport error (e.g. read timeout,
+/// request framing) that terminates the request without retry.
 pub(crate) static HTTPS_UPGRADE_FAILED: Counter = Counter::new();
 
 /// Scheme-cache entries purged after `MAX_ATTEMPTS` connection failures.
