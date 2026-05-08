@@ -52,6 +52,25 @@ pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
     )
 }
 
+/// Walks the `Error::source()` chain looking for any `std::io::Error` with
+/// `ErrorKind::TimedOut`. Used to attribute `hyper-timeout` firings on the
+/// connector's connect/read/write paths to the matching upstream timeout
+/// counter; classifies any wrapped `TimedOut` io error regardless of which
+/// phase produced it.
+#[must_use]
+pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::TimedOut
+        {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
 /// Tri-state of an in-progress download's partial-file handling.
 ///
 /// - `Volatile`: non-permanent cache flavor — no partial-file semantics; caller creates a

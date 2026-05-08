@@ -332,9 +332,21 @@ pub(crate) static BYTES_TUNNELED_CLIENT_TO_UPSTREAM: Accumulator = Accumulator::
 /// unobservable through `copy_bidirectional_with_sizes`'s API.
 pub(crate) static BYTES_TUNNELED_UPSTREAM_TO_CLIENT: Accumulator = Accumulator::new();
 
-/// HTTP timeout firings: upstream body read.
+/// HTTP timeout firings: upstream read (response headers and body).
+///
+/// Splice path: bumped when the per-read deadline fires inside the
+/// upstream body splice loop or kTLS read path. Hyper path: bumped when
+/// `hyper-timeout`'s read/write timeout surfaces as a hyper transport
+/// error during request/response header exchange or body streaming
+/// (detected by walking the error source chain for an
+/// `io::ErrorKind::TimedOut`).
 pub(crate) static HTTP_TIMEOUT_UPSTREAM_READ: Counter = Counter::new();
 /// HTTP timeout firings: upstream TCP/TLS handshake.
+///
+/// Splice path: bumped when `tcp_connect` or the TLS handshake exceeds
+/// the configured timeout. Hyper path: bumped when `hyper-timeout`'s
+/// connect timeout fires (detected by walking the connect error source
+/// chain for an `io::ErrorKind::TimedOut`).
 pub(crate) static HTTP_TIMEOUT_UPSTREAM_CONNECT: Counter = Counter::new();
 /// HTTP timeout firings: client failed to send request headers in time
 /// (slow-loris-shaped, or a stalled client between keep-alive requests).

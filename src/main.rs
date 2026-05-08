@@ -189,6 +189,7 @@ use crate::task_setup::task_setup;
 use crate::uncacheables::record_uncacheable;
 use crate::utils::TempPath;
 use crate::utils::hint_sequential_read;
+use crate::utils::is_io_timed_out_in_chain;
 use crate::utils::is_peer_disconnect;
 use crate::utils::tokio_tempfile;
 use crate::utils::touch_volatile_mtime;
@@ -450,6 +451,9 @@ pub(crate) async fn request_with_retry(
                     return Ok(response);
                 }
                 Err(err) if !err.is_connect() => {
+                    if is_io_timed_out_in_chain(&err) {
+                        metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+                    }
                     metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
                     warn_once_or_info!(
                         "Request of internal client to {} failed:  {}",
@@ -459,6 +463,9 @@ pub(crate) async fn request_with_retry(
                     return Err((err, parts.uri));
                 }
                 Err(err) => {
+                    if is_io_timed_out_in_chain(&err) {
+                        metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+                    }
                     if attempt > 2
                         && https_upgrade_test
                         && https_upgrade_mode != HttpsUpgradeMode::Always
@@ -1775,6 +1782,9 @@ async fn download_file(
                             .await;
                     }
                     RateCheckedBodyErr::Inner(ierr) => {
+                        if is_io_timed_out_in_chain(&ierr) {
+                            metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+                        }
                         metrics::UPSTREAM_HYPER_BODY_ERR.increment();
                         error!(
                             "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {}",
