@@ -346,8 +346,13 @@ pub(crate) static BYTES_TUNNELED_UPSTREAM_TO_CLIENT: Accumulator = Accumulator::
 
 /// HTTP timeout firings: upstream read (response headers and body).
 ///
-/// Splice path: bumped when the per-read deadline fires inside the
-/// upstream body splice loop or kTLS read path. Hyper path: bumped when
+/// Splice path: bumped when the per-read deadline fires anywhere in the
+/// upstream read flow — `read_upstream_response_headers`, the body
+/// splice loops (TCP and kTLS variants), the chunked / EOF / volatile
+/// buffered-download readers, the error-response forwarder, and
+/// `read_body_to_vec_until_eof` / `read_dechunk_body_to_vec`. The name
+/// is historical; coverage is "upstream read deadline fired," whether
+/// the bytes were headers or body. Hyper path: bumped when
 /// `hyper-timeout`'s read/write timeout surfaces as a hyper transport
 /// error during request/response header exchange or body streaming
 /// (detected by walking the error source chain for an
