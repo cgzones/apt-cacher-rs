@@ -1,8 +1,8 @@
 use std::{convert::Infallible, pin::Pin, sync::Arc, task::Poll::Ready};
 
 use http_body::{Body, Frame, SizeHint};
-use log::info;
 use memmap2::Mmap;
+use tracing::info;
 
 use crate::{
     cache_layout::{CachedFlavor, ConnectionDetails},

@@ -20,8 +20,8 @@ use http::{
 };
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
-use log::{debug, error, trace, warn};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
+use tracing::{debug, error, trace, warn};
 
 use crate::{
     APP_NAME, APP_VERSION, AppState, LOGSTORE, ProxyCacheBody, RUNTIMEDETAILS, RuntimeDetails,

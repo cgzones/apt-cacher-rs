@@ -54,7 +54,7 @@ use std::{
     string::FromUtf8Error,
 };
 
-use log::trace;
+use tracing::trace;
 
 use crate::{
     ClientInfo,

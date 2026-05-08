@@ -9,12 +9,12 @@ use std::io::IoSliceMut;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd};
 use std::sync::OnceLock;
 
-use log::{debug, info, warn};
 use nix::libc;
 use nix::sys::socket::sockopt::TlsCryptoInfo;
 use nix::sys::socket::{self, ControlMessageOwned, MsgFlags, SockaddrStorage, TlsGetRecordType};
 use rustls::ConnectionTrafficSecrets;
 use rustls::crypto::cipher::NONCE_LEN;
+use tracing::{debug, info, warn};
 
 use crate::error::errno_to_io_error;
 use crate::{Never, static_assert, warn_once};

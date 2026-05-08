@@ -4,7 +4,7 @@ macro_rules! warn_once {
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
         match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
-            Ok(false) => log::warn!($($t)*),
+            Ok(false) => tracing::warn!($($t)*),
             Ok(true) => unreachable!("value must never change from true to false"),
             Err(_) => {}
         }
@@ -16,12 +16,11 @@ macro_rules! warn_once_or_info {
     ($($t:tt)*) => {{
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        let level = match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
-            Ok(false) => log::Level::Warn,
+        match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
+            Ok(false) => tracing::warn!($($t)*),
             Ok(true) => unreachable!("value must never change from true to false"),
-            Err(_) => log::Level::Info,
-        };
-        log::log!(level, $($t)*);
+            Err(_) => tracing::info!($($t)*),
+        }
     }};
 }
 
@@ -30,12 +29,11 @@ macro_rules! warn_once_or_debug {
     ($($t:tt)*) => {{
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        let level = match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
-            Ok(false) => log::Level::Warn,
+        match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
+            Ok(false) => tracing::warn!($($t)*),
             Ok(true) => unreachable!("value must never change from true to false"),
-            Err(_) => log::Level::Debug,
-        };
-        log::log!(level, $($t)*);
+            Err(_) => tracing::debug!($($t)*),
+        }
     }};
 }
 
@@ -45,7 +43,7 @@ macro_rules! info_once {
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
         match FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
-            Ok(false) => log::info!($($t)*),
+            Ok(false) => tracing::info!($($t)*),
             Ok(true) => unreachable!("value must never change from true to false"),
             Err(_) => {}
         }

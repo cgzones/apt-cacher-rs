@@ -23,7 +23,7 @@ use std::{
 use coarsetime::Instant;
 use futures_util::StreamExt as _;
 use hashbrown::HashMap;
-use log::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     AppState, cache_layout::CacheLayout, cache_metadata, config::CacheHost,

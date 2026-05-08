@@ -5,9 +5,9 @@ use bytes::Buf as _;
 use hashbrown::HashMap;
 use http::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
 use http_body_util::{BodyExt as _, Empty};
-use log::{debug, error, warn};
 use memfd::MemfdOptions;
 use tokio::io::{AsyncBufRead, AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
+use tracing::{debug, error, warn};
 
 use crate::{
     AppState, ClientInfo, Never, ProxyCacheBody,

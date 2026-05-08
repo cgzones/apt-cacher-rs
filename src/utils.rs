@@ -3,8 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use log::{debug, error, info, warn};
 use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     Never,

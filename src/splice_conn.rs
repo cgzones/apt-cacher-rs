@@ -21,12 +21,12 @@ use http::{
         TRANSFER_ENCODING,
     },
 };
-use log::{debug, error, info, trace, warn};
 use nix::fcntl::{SpliceFFlags, splice, tee};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Interest, ReadBuf},
     net::{TcpStream, unix::pipe},
 };
+use tracing::{debug, error, info, trace, warn};
 
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_quota::QuotaExceeded;

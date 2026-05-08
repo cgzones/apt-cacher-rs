@@ -1,8 +1,8 @@
 use std::io::ErrorKind;
 
 use http::{HeaderName, StatusCode};
-use log::trace;
 use tokio::net::TcpStream;
+use tracing::trace;
 
 use crate::{
     APP_NAME, APP_VIA, Never, global_config, http_range::format_http_date, humanfmt::HumanFmt,

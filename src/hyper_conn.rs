@@ -19,12 +19,12 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::tokio::TokioIo};
-use log::{debug, error, info, trace, warn};
 #[cfg(feature = "mmap")]
 use memmap2::{Advice, MmapOptions};
 use pin_project::{pin_project, pinned_drop};
 use rand::distr::{Bernoulli, Distribution as _};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "mmap")]
 use crate::mmap_body::MmapBody;

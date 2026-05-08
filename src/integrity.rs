@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hashbrown::{Equivalent, HashMap};
-use log::{debug, error, warn};
 use parking_lot::Mutex;
 use tokio::io::AsyncBufRead;
+use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
 use crate::limits::LimitedReader;

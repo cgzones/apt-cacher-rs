@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use coarsetime::Clock;
 use hashbrown::HashSet;
-use log::{debug, error, warn};
+use tracing::{debug, error, warn};
 
 use crate::cache_layout::CacheLayout;
 use crate::database::MirrorEntry;

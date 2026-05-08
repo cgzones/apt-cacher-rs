@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use log::warn;
+use tracing::warn;
 
 use crate::xattr_helpers;
 

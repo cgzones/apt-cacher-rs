@@ -1,7 +1,7 @@
 use std::{io::ErrorKind, os::fd::AsRawFd as _};
 
-use log::warn;
 use tokio::net::TcpStream;
+use tracing::warn;
 
 use crate::{static_assert, warn_once_or_debug};
 

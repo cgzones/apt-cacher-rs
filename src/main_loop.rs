@@ -7,8 +7,8 @@ use coarsetime::Instant;
 use futures_util::StreamExt as _;
 use http::{Method, Request, Uri, header::USER_AGENT};
 use http_body_util::Empty;
-use log::{debug, error, info, trace, warn};
 use tokio::{net::TcpListener, signal::unix::SignalKind};
+use tracing::{debug, error, info, trace, warn};
 
 #[cfg(not(feature = "sendfile"))]
 use crate::hyper_conn::handle_hyper_connection;
@@ -355,16 +355,8 @@ pub(crate) async fn main_loop(
             },
             _ = usr1_signal.recv() => {
                 if let Some(output_log_file) = OUTPUT_LOG_FILE.get() {
-                    info!("SIGUSR1 received, reopening log file `{}`...", output_log_file.path.display());
-                    let res = tokio::task::block_in_place(|| output_log_file.reopen());
-                    match res {
-                        Ok(()) => info!("Log file `{}` reopened", output_log_file.path.display()),
-                        Err(err) => error!(
-                            "Failed to reopen log file `{}`:  {}",
-                            output_log_file.path.display(),
-                            ErrorReport(&err)
-                        ),
-                    }
+                    info!("SIGUSR1 received, requesting reopen of log file `{}`...", output_log_file.path.display());
+                    output_log_file.request_reopen();
                 } else {
                     info!("Ignoring SIGUSR1 because logging is set to console");
                 }

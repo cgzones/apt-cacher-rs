@@ -3,8 +3,8 @@ use std::{sync::OnceLock, time::Duration as StdDuration};
 
 use coarsetime::Clock;
 use hashbrown::HashMap;
-use log::{debug, error, info, warn};
 use tokio::time::MissedTickBehavior;
+use tracing::{debug, error, info, warn};
 
 use crate::{
     database::{Database, DeliveryRow, DownloadRow, OriginRow},

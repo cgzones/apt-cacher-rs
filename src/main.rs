@@ -77,12 +77,16 @@ use std::{
     fmt::Debug,
     fmt::Display,
     hash::Hash,
+    io::IsTerminal as _,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZero,
     os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -95,14 +99,13 @@ use http::{
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use hyper_util::client::legacy::connect::HttpConnector;
-use log::{LevelFilter, debug, error, info, trace, warn};
 use pin_project::pin_project;
 #[cfg(feature = "mmap")]
 use rate_checked_body::{MaybeRated, RateCheckedBodyErr};
-use simplelog::{
-    ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
-};
+use time::format_description::well_known::Rfc2822;
 use tokio::runtime::Builder;
+use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 // TODO: replace usages with ! once stable
 enum Never {}
@@ -561,7 +564,7 @@ struct Cli {
     log_file: Option<config::LogDestination>,
     /// Logging level
     #[arg(short, long, value_name = "SEVERITY")]
-    log_level: Option<LevelFilter>,
+    log_level: Option<tracing::level_filters::LevelFilter>,
     /// Configuration file path
     #[arg(
         short = 'c',
@@ -600,6 +603,7 @@ struct RuntimeDetails {
 struct ReopenableLogFile {
     path: PathBuf,
     file: Arc<parking_lot::Mutex<std::fs::File>>,
+    reopen_requested: Arc<AtomicBool>,
 }
 
 impl ReopenableLogFile {
@@ -612,6 +616,7 @@ impl ReopenableLogFile {
         Ok(Self {
             path: path.to_path_buf(),
             file: Arc::new(parking_lot::Mutex::new(file)),
+            reopen_requested: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -624,17 +629,44 @@ impl ReopenableLogFile {
         *self.file.lock() = file;
         Ok(())
     }
+
+    fn request_reopen(&self) {
+        self.reopen_requested.store(true, Ordering::Relaxed);
+    }
 }
 
 impl std::io::Write for ReopenableLogFile {
-    #[inline]
+    #[expect(
+        clippy::print_stderr,
+        reason = "logger-internal failure, can't log via itself"
+    )]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        /* Deferred here so the swap happens on the single non-blocking worker thread. */
+        if self.reopen_requested.swap(false, Ordering::Relaxed)
+            && let Err(err) = self.reopen()
+        {
+            eprintln!(
+                "Failed to reopen log file `{}`:  {err}",
+                self.path.display()
+            );
+        }
         std::io::Write::write(&mut *self.file.lock(), buf)
     }
 
     #[inline]
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::Write::flush(&mut *self.file.lock())
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct UtcTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for UtcTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = time::OffsetDateTime::now_utc();
+        let formatted = now.format(&Rfc2822).map_err(|_err| std::fmt::Error)?;
+        w.write_str(&formatted)
     }
 }
 
@@ -744,6 +776,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::process::exit(1);
     }
 
+    tracing_log::LogTracer::init()?;
+
     let (config, cfg_fallback, config_warnings) = config::Config::new(
         &args.config_file,
         args.cache_path.take(),
@@ -752,28 +786,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let output_log_level = args.log_level.unwrap_or(config.log_level);
     let output_log_file = args.log_file.as_ref().unwrap_or(&config.log_file);
-
-    let output_log_config = ConfigBuilder::new()
-        .set_time_level(if args.skip_log_timestamp {
-            LevelFilter::Off
-        } else {
-            LevelFilter::Error
-        })
-        .set_thread_level(if output_log_level >= LevelFilter::Debug {
-            LevelFilter::Error
-        } else {
-            LevelFilter::Off
-        })
-        .build();
-
-    let internal_log_config = ConfigBuilder::new()
-        .set_location_level(LevelFilter::Error)
-        .set_level_padding(simplelog::LevelPadding::Right)
-        .set_target_level(LevelFilter::Warn)
-        .set_thread_level(LevelFilter::Error)
-        .set_thread_mode(simplelog::ThreadLogMode::Names)
-        .set_time_format_rfc2822()
-        .build();
 
     LOGSTORE
         .set(logstore::LogStore::new(config.logstore_capacity))
@@ -788,23 +800,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .set(parking_lot::RwLock::new(HashMap::new()))
         .expect("Initial set in main() should succeed");
 
-    let internal_logger = WriteLogger::new(
-        LevelFilter::Warn,
-        internal_log_config,
-        LOGSTORE.get().expect("initialized in main()").clone(),
-    );
+    let logstore_handle = LOGSTORE.get().expect("initialized in main()").clone();
+    let internal_layer = tracing_subscriber::fmt::layer()
+        .with_writer(move || logstore_handle.clone())
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_names(true)
+        .with_level(true)
+        .with_timer(UtcTimer)
+        .with_filter(tracing::level_filters::LevelFilter::WARN);
 
-    match output_log_file {
+    let skip_timestamp = args.skip_log_timestamp;
+    // journald prepends its own timestamp
+    let skip_stderr_timestamp = skip_timestamp || std::env::var_os("JOURNAL_STREAM").is_some();
+    let output_thread_names = output_log_level >= tracing::level_filters::LevelFilter::DEBUG;
+    let stderr_is_tty = std::io::stderr().is_terminal();
+
+    let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = match output_log_file {
         config::LogDestination::Console => {
-            CombinedLogger::init(vec![
-                TermLogger::new(
-                    output_log_level,
-                    output_log_config,
-                    TerminalMode::Mixed,
-                    ColorChoice::Auto,
-                ),
-                internal_logger,
-            ])?;
+            let base = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr as fn() -> std::io::Stderr)
+                .with_ansi(stderr_is_tty)
+                .with_target(false)
+                .with_thread_names(output_thread_names)
+                .with_level(true);
+            let layer = if skip_stderr_timestamp {
+                base.without_time().with_filter(output_log_level).boxed()
+            } else {
+                base.with_timer(UtcTimer)
+                    .with_filter(output_log_level)
+                    .boxed()
+            };
+            tracing_subscriber::registry()
+                .with(internal_layer)
+                .with(layer)
+                .init();
+            None
         }
 
         config::LogDestination::File(path) => {
@@ -830,12 +861,30 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .set(log_file_handle.clone())
                 .expect("Initial set in main() should succeed");
 
-            CombinedLogger::init(vec![
-                WriteLogger::new(output_log_level, output_log_config, log_file_handle),
-                internal_logger,
-            ])?;
+            let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .lossy(false)
+                .finish(log_file_handle);
+
+            let base = tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(false)
+                .with_thread_names(output_thread_names)
+                .with_level(true);
+            let layer = if skip_timestamp {
+                base.without_time().with_filter(output_log_level).boxed()
+            } else {
+                base.with_timer(UtcTimer)
+                    .with_filter(output_log_level)
+                    .boxed()
+            };
+            tracing_subscriber::registry()
+                .with(internal_layer)
+                .with(layer)
+                .init();
+            Some(guard)
         }
-    }
+    };
 
     let config_http_timeout = config.http_timeout;
 

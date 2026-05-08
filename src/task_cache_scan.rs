@@ -1,8 +1,8 @@
 use std::{borrow::Cow, path::Path};
 
 use hashbrown::HashMap;
-use log::{debug, error, info, trace, warn};
 use tokio::fs::DirEntry;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     cache_layout::{KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},

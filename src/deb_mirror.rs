@@ -1,6 +1,6 @@
 use std::{borrow::Cow, num::NonZero, path::PathBuf, sync::OnceLock};
 
-use log::debug;
+use tracing::debug;
 
 use crate::{
     config::{CacheHost, ClientHost},

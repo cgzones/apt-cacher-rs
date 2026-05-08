@@ -30,7 +30,7 @@
 use std::{cell::LazyCell, num::NonZero};
 
 use http::StatusCode;
-use log::{info, trace};
+use tracing::{info, trace};
 
 use crate::{
     ClientInfo,
