@@ -404,9 +404,16 @@ pub(crate) static CACHE_QUOTA_UTIL_PEAK_BPS: Peak = Peak::new();
 
 /// HTTPS upgrade attempted on an HTTP request (Auto / uncached scheme).
 pub(crate) static HTTPS_UPGRADE_ATTEMPTED: Counter = Counter::new();
-/// HTTPS upgrade succeeded (https scheme cached for the host).
+/// HTTPS upgrade succeeded: bumped on the first successful upstream
+/// response (any status) after the upgrade flag was set. The host's
+/// https scheme is also cached in this same code path when no entry
+/// exists yet, but the metric fires before the cache-write check, so a
+/// response with an unsupported scheme or a non-2xx status still
+/// counts as a success here.
 pub(crate) static HTTPS_UPGRADE_SUCCEEDED: Counter = Counter::new();
-/// HTTPS upgrade failed and was reverted to the original scheme.
+/// HTTPS upgrade failed (Auto-mode revert to original scheme, or
+/// terminal connect failure with the upgrade flag still set in
+/// Always-mode).
 pub(crate) static HTTPS_UPGRADE_FAILED: Counter = Counter::new();
 
 /// Scheme-cache entries purged after `MAX_ATTEMPTS` connection failures.
