@@ -612,7 +612,12 @@ async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
     )
     .await
     .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
+        // A connect timeout is a TCP setup failure too: classify it under
+        // both the timeout-specific counter and the broad connect-failed
+        // counter so dashboards summing UPSTREAM_CONNECT_FAILED see all
+        // TCP setup losses, not just non-timeout errors.
         metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+        metrics::UPSTREAM_CONNECT_FAILED.increment();
         std::io::Error::new(ErrorKind::TimedOut, "upstream TCP connect timed out")
     })?
     .map_err(|err| {
