@@ -1735,6 +1735,12 @@ struct UpstreamResponse {
 }
 
 /// Parse upstream HTTP response headers.
+///
+/// Does **not** record the upstream status metric — callers must call
+/// `metrics::record_upstream_status` themselves once the response is going
+/// to be honored. The kTLS path may parse a response that is then thrown
+/// away in favor of a standard-path reconnect (`ResponseNotSpliceable`); a
+/// metric bump here would double-count for that flow.
 fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<UpstreamResponse> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
@@ -1756,8 +1762,6 @@ fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<Ups
             "invalid HTTP status code from upstream",
         )
     })?;
-
-    metrics::record_upstream_status(status_code);
 
     let headers = resp.headers;
 
@@ -2896,6 +2900,7 @@ async fn send_and_read_headers(
     let mut hdr_buf = BytesMut::with_capacity(MAX_RESPONSE_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
     let resp = parse_upstream_response(&hdr_buf, hdr_end)?;
+    metrics::record_upstream_status(resp.status_code);
     Ok((resp, hdr_buf, hdr_end))
 }
 
@@ -3681,12 +3686,17 @@ async fn splice_proxy_drive(
             if conn_details.cached_flavor == CachedFlavor::Volatile {
                 // Volatile files without Content-Length: fall through to standard
                 // path for buffered download (same as 206/416 fall-through below).
+                // The standard reconnect will bump `record_upstream_status` itself.
                 debug!(
                     "splice proxy: volatile file without Content-Length (from kTLS attempt), \
                      falling back to standard path for buffered download"
                 );
             } else {
                 debug!("splice proxy: no usable Content-Length (from kTLS attempt), returning 502");
+                // Honoring the kTLS-parsed response: record its status before
+                // emitting our own 502 to the client. (The standard path is not
+                // reconnected for, so no other site will record this 200.)
+                metrics::record_upstream_status(response.status_code);
                 write_invalid_response(
                     client_stream,
                     conn_version,
@@ -3720,6 +3730,9 @@ async fn splice_proxy_drive(
                 conn_details.debname, conn_details.mirror
             );
 
+            // Honoring the kTLS-parsed 304: record its upstream status here
+            // since no standard-path reconnect will run for this response.
+            metrics::record_upstream_status(response.status_code);
             metrics::VOLATILE_REFETCHED_UPTODATE.increment();
 
             let file = match tokio::fs::File::open(&cache_path).await {
@@ -3803,6 +3816,9 @@ async fn splice_proxy_drive(
             let poolable = false;
             let splice_extra = state.extra_body;
             let port = mirror_port(mirror, true);
+            // Honoring the kTLS-parsed response: record its upstream status
+            // here since no standard-path reconnect will run for this flow.
+            metrics::record_upstream_status(state.response.status_code);
             (
                 PoolGuard::new(UpstreamConn::Tcp(tcp), pool_host, port, poolable),
                 state.response,
