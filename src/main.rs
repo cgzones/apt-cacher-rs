@@ -66,6 +66,7 @@ use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZero;
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -2204,7 +2205,12 @@ async fn serve_downloading_file(
                 };
                 drop(st);
                 drop(status);
-                let file = match tokio::fs::File::open(&path_clone).await {
+                let file = match tokio::fs::File::options()
+                    .read(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(&path_clone)
+                    .await
+                {
                     Ok(f) => f,
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
@@ -2236,7 +2242,12 @@ async fn serve_downloading_file(
                 meta,
             } => {
                 // Cannot use mmap(2) since the file is not yet completely written
-                let file = match tokio::fs::File::open(&path).await {
+                let file = match tokio::fs::File::options()
+                    .read(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(&path)
+                    .await
+                {
                     Ok(f) => f,
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
@@ -3375,7 +3386,12 @@ pub(crate) async fn process_cache_request(
         p
     };
 
-    match tokio::fs::File::open(&cache_path).await {
+    match tokio::fs::File::options()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&cache_path)
+        .await
+    {
         Ok(file) => {
             // CACHE_HITS only counts permanent-file hits; volatile hits live
             // in VOLATILE_HIT / VOLATILE_REFETCHED.
@@ -4648,9 +4664,10 @@ struct ReopenableLogFile {
 
 impl ReopenableLogFile {
     fn new(path: &Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
+        let file = std::fs::File::options()
             .append(true)
             .create(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -4659,9 +4676,10 @@ impl ReopenableLogFile {
     }
 
     fn reopen(&self) -> std::io::Result<()> {
-        let file = std::fs::OpenOptions::new()
+        let file = std::fs::File::options()
             .append(true)
             .create(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(&self.path)?;
         *self.file.lock() = file;
         Ok(())
@@ -4783,6 +4801,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )]
             let log_file_handle = match ReopenableLogFile::new(path) {
                 Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::TooManyLinks => {
+                    eprintln!(
+                        "Failed to open log file `{}`:  {err}; symlinks are not supported",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
                 Err(err) => {
                     eprintln!("Failed to open log file `{}`:  {err}", path.display());
                     std::process::exit(1);

@@ -742,7 +742,12 @@ async fn try_sendfile_request(
     // Try to open the cached file; for volatile resources, treat stale files as cache misses.
     let mut cache_miss_was_volatile_notfound = false;
     let cached_file = 'cache_lookup: {
-        let file = match tokio::fs::File::open(&cache_path).await {
+        let file = match tokio::fs::File::options()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&cache_path)
+            .await
+        {
             Ok(f) => f,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 if conn_details.cached_flavor == CachedFlavor::Volatile {
@@ -1780,7 +1785,12 @@ async fn serve_unfinished_sendfile(
                     rx,
                     meta,
                 } => {
-                    let file = match tokio::fs::File::open(path).await {
+                    let file = match tokio::fs::File::options()
+                        .read(true)
+                        .custom_flags(nix::libc::O_NOFOLLOW)
+                        .open(path)
+                        .await
+                    {
                         Ok(f) => f,
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();
@@ -1810,7 +1820,12 @@ async fn serve_unfinished_sendfile(
                     let prefetched = meta.clone();
                     drop(st);
 
-                    let file = match tokio::fs::File::open(&finished_path).await {
+                    let file = match tokio::fs::File::options()
+                        .read(true)
+                        .custom_flags(nix::libc::O_NOFOLLOW)
+                        .open(&finished_path)
+                        .await
+                    {
                         Ok(f) => f,
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();

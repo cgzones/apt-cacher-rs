@@ -2482,7 +2482,12 @@ async fn serve_remaining_from_file(
     receiver: tokio::sync::watch::Receiver<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> DeliveryResult {
-    let file = match tokio::fs::File::open(&cache_path).await {
+    let file = match tokio::fs::File::options()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&cache_path)
+        .await
+    {
         Ok(f) => f,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -3686,7 +3691,11 @@ async fn splice_proxy_drive(
         let cache_path = conn_details
             .cache_dir_path()
             .join(Path::new(&conn_details.debname));
-        if let Ok(file) = tokio::fs::File::open(&cache_path).await
+        if let Ok(file) = tokio::fs::File::options()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&cache_path)
+            .await
             && let Ok(metadata) = file.metadata().await
         {
             // Use mtime (last revalidated time), matching the hyper backend.
@@ -3789,7 +3798,12 @@ async fn splice_proxy_drive(
             metrics::record_upstream_status(response.status_code);
             metrics::VOLATILE_REFETCHED_UPTODATE.increment();
 
-            let file = match tokio::fs::File::open(&cache_path).await {
+            let file = match tokio::fs::File::options()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(&cache_path)
+                .await
+            {
                 Ok(f) => f,
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
@@ -4001,7 +4015,12 @@ async fn splice_proxy_drive(
         }
         drop(upstream);
 
-        let file = match tokio::fs::File::open(&cache_path).await {
+        let file = match tokio::fs::File::options()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&cache_path)
+            .await
+        {
             Ok(f) => f,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
@@ -4692,7 +4711,10 @@ async fn splice_proxy_drive(
         let send_start = client_range_start.min(resume_offset);
         let send_end = client_range_end.min(resume_offset);
         if send_end > send_start {
-            let partial_reader = tokio::fs::File::open(temppath.as_ref())
+            let partial_reader = tokio::fs::File::options()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(temppath.as_ref())
                 .await
                 .map_err(|err| {
                     metrics::CACHE_IO_FAILURE.increment();

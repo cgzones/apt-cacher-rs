@@ -264,6 +264,7 @@ pub(crate) async fn open_partial_file(
         let mut file = tokio::fs::File::options()
             .write(true)
             .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)
             .await?;
 
@@ -324,6 +325,7 @@ pub(crate) async fn create_partial_file(
             .write(true)
             .read(true)
             .mode(mode)
+            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)
             .await
     }
