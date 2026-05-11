@@ -2,6 +2,7 @@ use std::{
     ffi::OsString,
     io::ErrorKind,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     sync::{
         LazyLock,
@@ -114,6 +115,319 @@ fn parse_filename_field(line: &str) -> Option<&std::ffi::OsStr> {
     Path::new(filepath).file_name()
 }
 
+/// Decode `hex` into exactly `N` bytes. Returns `None` on wrong length or any
+/// non-hexadecimal byte. Accepts upper- and lower-case (Debian uses lowercase
+/// but real-world Packages indices have occasionally mixed case).
+fn hex_decode_exact<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N * 2 {
+        return None;
+    }
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        let hi = hex_digit(bytes[2 * i])?;
+        let lo = hex_digit(bytes[2 * i + 1])?;
+        out[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    Some(out)
+}
+
+const fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse a Packages stanza line of the form `"<prefix><hex>"` into a fixed-size
+/// byte array. Returns `None` if the line does not carry the expected prefix
+/// or the hex payload is malformed.
+fn parse_hex_field<const N: usize>(line: &str, prefix: &str) -> Option<[u8; N]> {
+    let rest = line.trim().strip_prefix(prefix)?.trim_start();
+    hex_decode_exact::<N>(rest)
+}
+
+/// Lowercase-hex encoding suitable for log messages.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from(HEX[(*b >> 4) as usize]));
+        out.push(char::from(HEX[(*b & 0x0f) as usize]));
+    }
+    out
+}
+
+/// Hash algorithm we accept from Debian `Packages` stanzas. SHA256 is the
+/// universal default in modern indices; SHA512 is used as a fallback when
+/// SHA256 is missing.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum HashAlgo {
+    Sha256,
+    Sha512,
+}
+
+impl HashAlgo {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => "SHA256",
+            Self::Sha512 => "SHA512",
+        }
+    }
+}
+
+/// Outcome of verifying a cache file against an expected digest.
+#[derive(Debug)]
+enum Verdict {
+    /// Computed digest equals the expected one.
+    Match,
+    /// Computed digest differs from the expected one and the underlying file
+    /// did not change inode/size during hashing.
+    Mismatch { computed: Vec<u8> },
+    /// The file's `(inode, size)` changed between hash start and finish, so a
+    /// concurrent writer raced us; the cleanup leaves the file alone.
+    Raced,
+    /// Open/read failed; cleanup leaves the file alone.
+    IoError(std::io::Error),
+}
+
+/// Per-call context for [`PackageFormat::reduce_file_list`]: needed to invalidate
+/// per-file `cache_metadata` entries and to attribute checksum-mismatch
+/// removals back to the per-mirror `CleanupDone` totals.
+struct ReduceContext<'a> {
+    mirror: &'a Mirror,
+    layout: CacheLayout,
+    mismatch_files: &'a mut u64,
+    mismatch_bytes: &'a mut u64,
+}
+
+/// Accumulated state of the current Debian `Packages` stanza.
+#[derive(Debug)]
+struct Stanza {
+    filename: Option<OsString>,
+    sha256: Option<[u8; 32]>,
+    sha512: Option<[u8; 64]>,
+}
+
+impl Stanza {
+    const fn new() -> Self {
+        Self {
+            filename: None,
+            sha256: None,
+            sha512: None,
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.filename.is_none() && self.sha256.is_none() && self.sha512.is_none()
+    }
+
+    fn reset(&mut self) {
+        self.filename = None;
+        self.sha256 = None;
+        self.sha512 = None;
+    }
+
+    fn ingest(&mut self, line: &str) {
+        if self.filename.is_none()
+            && let Some(name) = parse_filename_field(line)
+        {
+            self.filename = Some(name.to_os_string());
+            return;
+        }
+        if self.sha256.is_none()
+            && let Some(h) = parse_hex_field::<32>(line, "SHA256: ")
+        {
+            self.sha256 = Some(h);
+            return;
+        }
+        if self.sha512.is_none()
+            && let Some(h) = parse_hex_field::<64>(line, "SHA512: ")
+        {
+            self.sha512 = Some(h);
+        }
+    }
+
+    /// Preferred (algo, expected-digest) pair: SHA256 wins, SHA512 is the
+    /// fallback, `None` means the stanza advertised no usable checksum.
+    fn chosen(&self) -> Option<(HashAlgo, Vec<u8>)> {
+        if let Some(h) = self.sha256 {
+            Some((HashAlgo::Sha256, h.to_vec()))
+        } else {
+            self.sha512.map(|h| (HashAlgo::Sha512, h.to_vec()))
+        }
+    }
+}
+
+/// Hash the contents of an open file using the given digest algorithm.
+/// Synchronous code, blocking the current thread.
+fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut hasher = D::new();
+    #[expect(clippy::large_stack_arrays, reason = "ensure efficient file hashing")]
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+/// Blocking digest-and-compare with an inode/size race check after hashing.
+/// Runs on the blocking pool via [`verify_cache_file`].
+fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut file = match std::fs::File::options()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(err) => return Verdict::IoError(err),
+    };
+    let pre_meta = match file.metadata() {
+        Ok(m) => m,
+        Err(err) => return Verdict::IoError(err),
+    };
+    let pre_ino = pre_meta.ino();
+    let pre_size = pre_meta.len();
+
+    let computed = match algo {
+        HashAlgo::Sha256 => match hash_open_file::<sha2::Sha256>(&mut file) {
+            Ok(h) => h,
+            Err(err) => return Verdict::IoError(err),
+        },
+        HashAlgo::Sha512 => match hash_open_file::<sha2::Sha512>(&mut file) {
+            Ok(h) => h,
+            Err(err) => return Verdict::IoError(err),
+        },
+    };
+
+    if computed.as_slice() == expected {
+        return Verdict::Match;
+    }
+
+    // Race check: a fresh download finishing mid-hash either replaces the
+    // file via rename (different inode) or rewrites it in place (size change).
+    // Either way our digest is for content no longer at `path`, so bail.
+    if let Ok(post_meta) = std::fs::metadata(path)
+        && (post_meta.ino() != pre_ino || post_meta.len() != pre_size)
+    {
+        return Verdict::Raced;
+    }
+    Verdict::Mismatch { computed }
+}
+
+async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: Vec<u8>) -> Verdict {
+    match tokio::task::spawn_blocking(move || verify_file_sync(&path, algo, &expected)).await {
+        Ok(v) => v,
+        Err(join_err) => Verdict::IoError(std::io::Error::other(join_err)),
+    }
+}
+
+/// Process one stanza: if its `Filename:` basename matches a candidate
+/// cached file, verify the file content and either retain it (match), warn-
+/// and-retain it (no usable hash advertised, transient error, or concurrent
+/// rename race), or warn-and-evict it (genuine digest mismatch).
+async fn flush_stanza(
+    stanza: &mut Stanza,
+    file_list: &mut HashMap<OsString, PathBuf>,
+    ctx: &mut ReduceContext<'_>,
+) {
+    let Some(filename) = stanza.filename.take() else {
+        stanza.reset();
+        return;
+    };
+    let Some(path) = file_list.get(&filename).cloned() else {
+        stanza.reset();
+        return;
+    };
+
+    match stanza.chosen() {
+        None => {
+            warn!(
+                "Packages stanza for `{}` advertises no SHA256/SHA512; retaining cache file `{}` without verification",
+                Path::new(&filename).display(),
+                path.display(),
+            );
+            file_list.remove(&filename);
+        }
+        Some((algo, expected)) => {
+            let pre_size = match tokio::fs::metadata(&path).await {
+                Ok(m) => m.len(),
+                Err(err) => {
+                    error!(
+                        "Failed to stat cache file `{}` before {} verification:  {err}; retaining",
+                        path.display(),
+                        algo.as_str(),
+                    );
+                    file_list.remove(&filename);
+                    stanza.reset();
+                    return;
+                }
+            };
+            match verify_cache_file(path.clone(), algo, expected.clone()).await {
+                Verdict::Match => {
+                    file_list.remove(&filename);
+                }
+                Verdict::Mismatch { computed } => {
+                    warn!(
+                        "Cache file `{}` failed {} verification: expected={}, computed={}",
+                        path.display(),
+                        algo.as_str(),
+                        hex_encode(&expected),
+                        hex_encode(&computed),
+                    );
+                    if let Err(err) = tokio::fs::remove_file(&path).await {
+                        error!(
+                            "Error removing checksum-mismatched cache file `{}`:  {err}",
+                            path.display()
+                        );
+                    } else {
+                        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
+                            cache_metadata::store().invalidate(
+                                &cache_metadata::CacheMetadataKeyRef::new(
+                                    ctx.mirror, debname, ctx.layout,
+                                ),
+                            );
+                        }
+                        metrics::CLEANUP_CHECKSUM_MISMATCHES.increment();
+                        *ctx.mismatch_files += 1;
+                        *ctx.mismatch_bytes += pre_size;
+                    }
+                    file_list.remove(&filename);
+                }
+                Verdict::Raced => {
+                    warn!(
+                        "Cache file `{}` changed during {} verification; retaining (concurrent re-cache)",
+                        path.display(),
+                        algo.as_str(),
+                    );
+                    file_list.remove(&filename);
+                }
+                Verdict::IoError(err) => {
+                    error!(
+                        "Failed to {} cache file `{}`:  {err}; retaining",
+                        algo.as_str(),
+                        path.display(),
+                    );
+                    file_list.remove(&filename);
+                }
+            }
+        }
+    }
+    stanza.reset();
+}
+
 #[derive(Clone, Copy)]
 enum PackageFormat {
     Raw,
@@ -131,12 +445,15 @@ impl PackageFormat {
         }
     }
 
-    // TODO: verify hashes
+    /// Stream a (possibly compressed) Debian `Packages` file stanza by stanza,
+    /// reducing the candidate `file_list` by basename and verifying matched
+    /// cache files against the stanza's `SHA256:`/`SHA512:` digest.
     async fn reduce_file_list(
         self,
         file: tokio::fs::File,
         filename: &str,
         file_list: &mut HashMap<OsString, PathBuf>,
+        ctx: &mut ReduceContext<'_>,
         config: &Config,
     ) -> Result<(), ProxyCacheError> {
         debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
@@ -160,23 +477,31 @@ impl PackageFormat {
         };
 
         let mut buffer = String::with_capacity(128);
+        let mut stanza = Stanza::new();
         loop {
             buffer.clear();
             match reader.read_line(&mut buffer).await {
-                Ok(0) => return Ok(()), // EOF
+                Ok(0) => {
+                    // Flush the final stanza if the Packages file doesn't end
+                    // with a blank line.
+                    if !stanza.is_empty() {
+                        flush_stanza(&mut stanza, file_list, ctx).await;
+                    }
+                    return Ok(());
+                }
                 Err(err) => {
                     error!("Failed to read in-memory file `{filename}`:  {err}");
                     return Err(err.into());
                 }
                 Ok(_bytes_read) => {
-                    let Some(filename) = parse_filename_field(&buffer) else {
+                    if buffer.trim().is_empty() {
+                        flush_stanza(&mut stanza, file_list, ctx).await;
+                        if file_list.is_empty() {
+                            return Ok(());
+                        }
                         continue;
-                    };
-
-                    if file_list.remove(filename).is_some() && file_list.is_empty() {
-                        // No files left to potentially remove
-                        return Ok(());
                     }
+                    stanza.ingest(&buffer);
                 }
             }
         }
@@ -477,6 +802,9 @@ async fn cleanup_mirror_deb_files(
         });
     }
 
+    let mut mismatch_files: u64 = 0;
+    let mut mismatch_bytes: u64 = 0;
+
     for origin in &active_origins {
         let (mut response, pkgfmt) = match get_package_file(&mirror, origin, &appstate).await {
             // A missing Packages file leaves us unable to complete the
@@ -490,9 +818,9 @@ async fn cleanup_mirror_deb_files(
 
                 return Ok(CleanupDone {
                     mirror,
-                    files_retained: num_total_files,
-                    files_removed: 0,
-                    bytes_removed: 0,
+                    files_retained: num_total_files - mismatch_files,
+                    files_removed: mismatch_files,
+                    bytes_removed: mismatch_bytes,
                 });
             }
             Ok(r) => r,
@@ -534,22 +862,30 @@ async fn cleanup_mirror_deb_files(
                 error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
             })?;
 
-        pkgfmt
-            .reduce_file_list(file, &memfdname, &mut cached_files, config)
-            .await?;
+        {
+            let mut ctx = ReduceContext {
+                mirror: &mirror,
+                layout: CacheLayout::StructuredPool,
+                mismatch_files: &mut mismatch_files,
+                mismatch_bytes: &mut mismatch_bytes,
+            };
+            pkgfmt
+                .reduce_file_list(file, &memfdname, &mut cached_files, &mut ctx, config)
+                .await?;
+        }
 
         if cached_files.is_empty() {
             return Ok(CleanupDone {
                 mirror,
-                files_retained: num_total_files,
-                files_removed: 0,
-                bytes_removed: 0,
+                files_retained: num_total_files - mismatch_files,
+                files_removed: mismatch_files,
+                bytes_removed: mismatch_bytes,
             });
         }
     }
 
-    let mut bytes_removed = 0;
-    let mut files_removed = 0;
+    let mut aged_files: u64 = 0;
+    let mut aged_bytes: u64 = 0;
     let now = SystemTime::now();
 
     for path in cached_files.values() {
@@ -631,14 +967,17 @@ async fn cleanup_mirror_deb_files(
 
         debug!("Removed unreferenced file `{}`", path.display());
 
-        bytes_removed += size;
-        files_removed += 1;
+        aged_bytes += size;
+        aged_files += 1;
     }
 
     info!(
-        "Removed {files_removed} unreferenced deb files for mirror {mirror} ({})",
-        HumanFmt::Size(bytes_removed)
+        "Removed {aged_files} unreferenced deb files for mirror {mirror} ({})",
+        HumanFmt::Size(aged_bytes)
     );
+
+    let files_removed = mismatch_files + aged_files;
+    let bytes_removed = mismatch_bytes + aged_bytes;
 
     Ok(CleanupDone {
         mirror,
@@ -921,20 +1260,30 @@ async fn cleanup_mirror_flat_files(
             error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
         })?;
 
-    pkgfmt
-        .reduce_file_list(file, &memfdname, &mut cached_files, config)
-        .await?;
+    let mut mismatch_files: u64 = 0;
+    let mut mismatch_bytes: u64 = 0;
+    {
+        let mut ctx = ReduceContext {
+            mirror: &mirror,
+            layout: CacheLayout::Flat,
+            mismatch_files: &mut mismatch_files,
+            mismatch_bytes: &mut mismatch_bytes,
+        };
+        pkgfmt
+            .reduce_file_list(file, &memfdname, &mut cached_files, &mut ctx, config)
+            .await?;
+    }
 
     if cached_files.is_empty() {
         return Ok(CleanupDone {
             mirror,
-            files_retained: num_total_files,
-            files_removed: 0,
-            bytes_removed: 0,
+            files_retained: num_total_files - mismatch_files,
+            files_removed: mismatch_files,
+            bytes_removed: mismatch_bytes,
         });
     }
 
-    let (files_removed, bytes_removed) = sweep_aged_cached_debs(
+    let (aged_files, aged_bytes) = sweep_aged_cached_debs(
         &cached_files,
         UNREFERENCED_KEEP_SPAN,
         &mirror,
@@ -942,9 +1291,12 @@ async fn cleanup_mirror_flat_files(
     )
     .await;
 
+    let files_removed = mismatch_files + aged_files;
+    let bytes_removed = mismatch_bytes + aged_bytes;
+
     info!(
-        "Removed {files_removed} unreferenced flat deb files for mirror {mirror} ({})",
-        HumanFmt::Size(bytes_removed)
+        "Removed {aged_files} unreferenced flat deb files for mirror {mirror} ({})",
+        HumanFmt::Size(aged_bytes)
     );
 
     Ok(CleanupDone {
@@ -1287,5 +1639,143 @@ mod tests {
         assert_eq!(parse_filename_field("Package: stub\n"), None);
         assert_eq!(parse_filename_field("\n"), None);
         assert_eq!(parse_filename_field(""), None);
+    }
+
+    #[test]
+    fn hex_decode_exact_round_trip_lowercase() {
+        let bytes: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+        let s = hex_encode(&bytes);
+        assert_eq!(s, "deadbeef");
+        assert_eq!(hex_decode_exact::<4>(&s), Some(bytes));
+    }
+
+    #[test]
+    fn hex_decode_exact_accepts_uppercase() {
+        assert_eq!(
+            hex_decode_exact::<4>("DEADBEEF"),
+            Some([0xde, 0xad, 0xbe, 0xef])
+        );
+    }
+
+    #[test]
+    fn hex_decode_exact_rejects_wrong_length() {
+        assert_eq!(hex_decode_exact::<4>("deadbe"), None); // too short
+        assert_eq!(hex_decode_exact::<4>("deadbeef00"), None); // too long
+    }
+
+    #[test]
+    fn hex_decode_exact_rejects_non_hex() {
+        assert_eq!(hex_decode_exact::<4>("deadbeeg"), None);
+        assert_eq!(hex_decode_exact::<4>("deadbe!f"), None);
+    }
+
+    #[test]
+    fn parse_hex_field_sha256() {
+        let hash = [0x11u8; 32];
+        let line = format!("SHA256: {}\n", hex_encode(&hash));
+        assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), Some(hash));
+    }
+
+    #[test]
+    fn parse_hex_field_sha512() {
+        let hash = [0x22u8; 64];
+        let line = format!("SHA512:  {}\r\n", hex_encode(&hash));
+        assert_eq!(parse_hex_field::<64>(&line, "SHA512: "), Some(hash));
+    }
+
+    #[test]
+    fn parse_hex_field_rejects_wrong_prefix() {
+        let line = format!("MD5sum: {}\n", hex_encode(&[0u8; 32]));
+        assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), None);
+    }
+
+    #[test]
+    fn parse_hex_field_rejects_malformed_payload() {
+        // 63 hex chars (one short of 64); should fail length check.
+        let payload = "0".repeat(63);
+        let line = format!("SHA256: {payload}\n");
+        assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), None);
+    }
+
+    #[test]
+    fn stanza_ingest_collects_filename_and_sha256() {
+        let mut s = Stanza::new();
+        s.ingest("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n");
+        s.ingest(&format!("SHA256: {}\n", hex_encode(&[0xab; 32])));
+        assert_eq!(s.filename.as_deref(), Some(OsStr::new("abc_1.0_amd64.deb")));
+        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, vec![0xab; 32])));
+    }
+
+    #[test]
+    fn stanza_chosen_prefers_sha256_over_sha512() {
+        let mut s = Stanza::new();
+        s.sha256 = Some([0x11u8; 32]);
+        s.sha512 = Some([0x22u8; 64]);
+        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, vec![0x11u8; 32])));
+    }
+
+    #[test]
+    fn stanza_chosen_falls_back_to_sha512() {
+        let mut s = Stanza::new();
+        s.sha512 = Some([0x33u8; 64]);
+        assert_eq!(s.chosen(), Some((HashAlgo::Sha512, vec![0x33u8; 64])));
+    }
+
+    #[test]
+    fn stanza_chosen_returns_none_without_hash() {
+        let s = Stanza::new();
+        assert_eq!(s.chosen(), None);
+    }
+
+    #[test]
+    fn stanza_ingest_ignores_unrelated_lines() {
+        let mut s = Stanza::new();
+        s.ingest("Package: stub\n");
+        s.ingest("Description: a stub\n");
+        s.ingest(" continued description text\n");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn verify_file_sync_match_and_mismatch() {
+        use sha2::Digest as _;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.deb");
+        let payload = b"hello apt-cacher-rs world";
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            f.write_all(payload).expect("write");
+        }
+
+        let expected_sha256 = sha2::Sha256::digest(payload).to_vec();
+        assert!(matches!(
+            verify_file_sync(&path, HashAlgo::Sha256, &expected_sha256),
+            Verdict::Match
+        ));
+
+        let wrong: Vec<u8> = vec![0u8; 32];
+        let v = verify_file_sync(&path, HashAlgo::Sha256, &wrong);
+        let Verdict::Mismatch { computed } = v else {
+            unreachable!("expected Mismatch verdict, got {v:?}")
+        };
+        assert_eq!(computed, expected_sha256);
+
+        let expected_sha512 = sha2::Sha512::digest(payload).to_vec();
+        assert!(matches!(
+            verify_file_sync(&path, HashAlgo::Sha512, &expected_sha512),
+            Verdict::Match
+        ));
+    }
+
+    #[test]
+    fn verify_file_sync_io_error_on_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does_not_exist");
+        assert!(matches!(
+            verify_file_sync(&missing, HashAlgo::Sha256, &[0u8; 32]),
+            Verdict::IoError(_)
+        ));
     }
 }

@@ -530,6 +530,12 @@ pub(crate) static DB_MIRROR_CACHE_ENTRIES: StateU64 = StateU64::new();
 pub(crate) static CLEANUP_EVICTIONS: Accumulator = Accumulator::new();
 /// Total bytes reclaimed across all cleanup runs.
 pub(crate) static CLEANUP_BYTES_RECLAIMED: Accumulator = Accumulator::new();
+/// Cache files removed by cleanup because their content hash did not match the
+/// value advertised in the upstream Packages stanza. A non-zero counter
+/// indicates either disk corruption, an upstream mirror returning a different
+/// build than its index claims, or a stale cache file whose origin re-issued
+/// the same `Filename:` under a different content.
+pub(crate) static CLEANUP_CHECKSUM_MISMATCHES: Counter = Counter::new();
 
 /// Last cleanup run: duration in seconds (atomically updated; readers may
 /// observe a transient mix across the trio between updates).

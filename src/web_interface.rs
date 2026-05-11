@@ -1911,6 +1911,11 @@ fn build_metrics_html() -> String {
         ),
     );
     t.row_tip(
+        "Cleanup Checksum Mismatches",
+        "Cache files removed because their content hash did not match the SHA256/SHA512 advertised in the upstream Packages stanza. Non-zero indicates corruption or a mirror inconsistency.",
+        AlertNonzero(metrics::CLEANUP_CHECKSUM_MISMATCHES.get()),
+    );
+    t.row_tip(
         "Last Cleanup",
         "Duration, files removed and bytes reclaimed by the most recent cache-cleanup run.",
         format_args!(
