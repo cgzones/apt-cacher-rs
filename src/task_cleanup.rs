@@ -113,9 +113,11 @@ async fn packages_body_to_memfd(
     })
 }
 
-async fn collect_cached_files(
-    host_path: &Path,
-) -> Result<HashMap<String, PathBuf>, ProxyCacheError> {
+/// Walk `host_path` and return the basename→full-path map of regular files
+/// to consider for cleanup.  Not read-only: stray non-regular *files*
+/// (symlinks, FIFOs, sockets, devices) are unlinked inline; stray
+/// directories are warned and skipped.
+async fn scan_cached_files(host_path: &Path) -> Result<HashMap<String, PathBuf>, ProxyCacheError> {
     let mut ret = HashMap::new();
 
     let mut host_dir = match tokio::fs::read_dir(host_path).await {
@@ -149,7 +151,7 @@ async fn collect_cached_files(
             );
             continue;
         };
-        // Mirror `collect_flat_cached_debs`: structured Pool admits
+        // Mirror `scan_flat_cached_debs`: structured Pool admits
         // `.deb`/`.udeb`/`.ddeb` (see `is_deb_package` in `deb_mirror.rs`),
         // so the cleanup scan must enumerate the same set.
         if !is_deb_package(name_str) {
@@ -544,7 +546,7 @@ async fn process_stanza(
         }
         Some((algo, expected)) => {
             // lstat (not stat) so a hostile symlink planted between
-            // `collect_cached_files` (which filters via `file_type()`,
+            // `scan_cached_files` (which filters via `file_type()`,
             // lstat-semantics) and now is detected here rather than
             // followed.  A non-regular result therefore indicates a
             // concurrent type swap.
@@ -1039,11 +1041,9 @@ async fn cleanup_mirror_deb_files(
         .iter()
         .collect();
 
-    let mut cached_files = collect_cached_files(&mirror_path)
-        .await
-        .inspect_err(|err| {
-            error!("Error listing files in `{}`:  {err}", mirror_path.display());
-        })?;
+    let mut cached_files = scan_cached_files(&mirror_path).await.inspect_err(|err| {
+        error!("Error listing files in `{}`:  {err}", mirror_path.display());
+    })?;
 
     let num_total_files = cached_files.len() as u64;
 
@@ -1211,11 +1211,14 @@ fn is_nested_mirror_boundary(candidate: &str, nested_mirror_paths: &[String]) ->
         .any(|p| path_starts_with_segment(candidate, p))
 }
 
-/// Collect Debian binary packages (`.deb`, `.udeb`, `.ddeb`) under a flat
-/// repository root, recursing into any sub-directories.  Keys are paths
-/// relative to `flat_root`, forward-slash joined to match the `Filename:`
-/// stanza syntax.  Metadata files, the `by-hash/` subtree, the `tmp/`
-/// partial-download dir, and symlinks are skipped.
+/// Scan a flat repository root for Debian binary packages (`.deb`, `.udeb`,
+/// `.ddeb`), recursing into any sub-directories.  Keys are paths relative to
+/// `flat_root`, forward-slash joined to match the `Filename:` stanza syntax.
+/// Metadata files, the `by-hash/` subtree, and the `tmp/` partial-download
+/// dir are skipped.
+///
+/// Not read-only: stray symlinks and other non-regular *files* are unlinked
+/// inline (see `CACHE_NON_REGULAR` / `CACHE_IO_FAILURE`).
 ///
 /// `mirror_path` is the path of the mirror being cleaned (e.g. `apt`);
 /// `nested_mirror_paths` lists paths of other registered mirrors under the
@@ -1223,7 +1226,7 @@ fn is_nested_mirror_boundary(candidate: &str, nested_mirror_paths: &[String]) ->
 /// recursion reaches a directory that is itself the root of (or contains) a
 /// nested mirror, the subtree is skipped — that mirror has its own Packages
 /// index and its own cleanup run, so the parent must not own those files.
-async fn collect_flat_cached_debs(
+async fn scan_flat_cached_debs(
     flat_root: &Path,
     mirror_path: &str,
     nested_mirror_paths: &[String],
@@ -1487,7 +1490,7 @@ async fn cleanup_mirror_flat_files(
         }
     }
 
-    let mut cached_files = collect_flat_cached_debs(&flat_path, &mirror.path, &nested_mirror_paths)
+    let mut cached_files = scan_flat_cached_debs(&flat_path, &mirror.path, &nested_mirror_paths)
         .await
         .inspect_err(|err| {
             error!("Error listing files in `{}`:  {err}", flat_path.display());
