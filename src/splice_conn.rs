@@ -67,7 +67,7 @@ use crate::{
     OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
     VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, cache_metadata, client_counter,
     content_type_for_cached_file, global_cache_quota, global_config, is_host_allowed_cached,
-    metrics, static_assert, warn_once_or_debug, warn_once_or_info,
+    metrics, static_assert, warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
 };
 #[cfg(feature = "ktls")]
 use crate::{KTLS_BLOCKED, warn_once};
@@ -4721,14 +4721,7 @@ async fn splice_proxy_drive(
     // Write response headers to client
     let last_modified_str = upstream_resp.last_modified.as_deref();
     let content_type = content_type_for_cached_file(&conn_details.debname);
-    if let Some(upstream_ct) = upstream_resp.content_type.as_deref()
-        && !upstream_ct.eq_ignore_ascii_case(content_type)
-    {
-        warn!(
-            "splice proxy: upstream Content-Type `{upstream_ct}` differs from expected `{content_type}` for {}",
-            conn_details.debname
-        );
-    }
+    warn_on_content_type_mismatch(upstream_resp.content_type.as_deref(), &conn_details.debname);
     let date = format_http_date();
     // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
     let age: u32 = 0;
@@ -5578,14 +5571,7 @@ async fn handle_volatile_buffered_download(
     // Send response headers to client.
     let last_modified_str = upstream_resp.last_modified.as_deref().unwrap_or("");
     let content_type = content_type_for_cached_file(&conn_details.debname);
-    if let Some(upstream_ct) = upstream_resp.content_type.as_deref()
-        && !upstream_ct.eq_ignore_ascii_case(content_type)
-    {
-        warn!(
-            "splice proxy: upstream Content-Type `{upstream_ct}` differs from expected `{content_type}` for {}",
-            conn_details.debname
-        );
-    }
+    warn_on_content_type_mismatch(upstream_resp.content_type.as_deref(), &conn_details.debname);
     let date = format_http_date();
     // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
     let age: u32 = 0;

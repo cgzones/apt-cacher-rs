@@ -227,6 +227,25 @@ pub(crate) const VOLATILE_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 /// Maximum time to wait for the database task to drain on shutdown before giving up.
 const DB_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Warn (once) if the upstream `Content-Type` differs from the type derived
+/// from the cached file's basename. The non-standard `binary/octet-stream`
+/// is widely advertised by Debian mirrors and is treated as a no-op rather
+/// than a mismatch to keep the log quiet.
+pub(crate) fn warn_on_content_type_mismatch(upstream: Option<&str>, debname: &str) {
+    let Some(upstream_ct) = upstream else {
+        return;
+    };
+    if upstream_ct.eq_ignore_ascii_case("binary/octet-stream") {
+        return;
+    }
+    let expected = content_type_for_cached_file(debname);
+    if !upstream_ct.eq_ignore_ascii_case(expected) {
+        warn_once_or_info!(
+            "Upstream Content-Type `{upstream_ct}` differs from expected `{expected}` for {debname}"
+        );
+    }
+}
+
 /// Derive the Content-Type for a cached file based on its filename extension.
 #[must_use]
 pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
@@ -3101,12 +3120,7 @@ async fn serve_new_file(
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|hv| hv.to_str().ok());
-    if let Some(ct) = upstream_content_type {
-        let expected = content_type_for_cached_file(&conn_details.debname);
-        if ct != expected {
-            warn_once_or_info!("Content-Type mismatch: expected {expected}, got {ct}");
-        }
-    }
+    warn_on_content_type_mismatch(upstream_content_type, &conn_details.debname);
 
     let (_parts, body) = fwd_response.into_parts();
 
