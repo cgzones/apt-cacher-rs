@@ -9,6 +9,7 @@ use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 use crate::{
     Never,
     cache_layout::{SUBDIR_FLAT, SUBDIR_TMP},
+    config::CacheHost,
     deb_mirror, global_config,
     guards::InitBarrier,
     http_etag::read_etag,
@@ -387,7 +388,13 @@ pub(crate) async fn tokio_tempfile(
 fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
     let mirror = ibarrier.mirror();
     let layout = ibarrier.layout();
-    let host = ibarrier.aliased_host().unwrap_or_else(|| mirror.host());
+    // Resolve to the on-disk cache identity.  Mirrors the rule in
+    // `ConnectionDetails::cache_dir_path` so the `.partial` lands next to the
+    // eventual rename target.
+    let host: &CacheHost = match ibarrier.aliased_host() {
+        Some(cache) => cache,
+        None => mirror.host().as_cache_host(),
+    };
     let filename = format!("{debname}.partial", debname = ibarrier.debname());
     let filename_path = Path::new(&filename);
     assert!(

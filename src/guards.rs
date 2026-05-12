@@ -5,7 +5,7 @@ use crate::{
     cache_layout::CacheLayout,
     cache_metadata::{self, CacheMetadataKey, UpstreamMetadata},
     cache_quota::QuotaReservation,
-    config::DomainName,
+    config::CacheHost,
     deb_mirror::Mirror,
     metrics,
 };
@@ -24,7 +24,7 @@ struct InitBarrierData<'a> {
     /// here so that `partial_path_for_barrier` lays the `.partial` next to
     /// the eventual rename target produced by
     /// `ConnectionDetails::cache_dir_path`, which also uses this host.
-    aliased_host: Option<&'static DomainName>,
+    aliased_host: Option<&'static CacheHost>,
     debname: &'a str,
     layout: CacheLayout,
     /// Unused, receivers just needs to get notified by drop
@@ -42,7 +42,7 @@ impl<'a> InitBarrier<'a> {
         status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
         active_downloads: &'a ActiveDownloads,
         mirror: &'a Mirror,
-        aliased_host: Option<&'static DomainName>,
+        aliased_host: Option<&'static CacheHost>,
         debname: &'a str,
         layout: CacheLayout,
     ) -> Self {
@@ -133,7 +133,7 @@ impl<'a> InitBarrier<'a> {
     /// `partial_path_for_barrier`) can place the `.partial` file in the
     /// same host directory as the eventual rename target.
     #[must_use]
-    pub(crate) fn aliased_host(&self) -> Option<&'static DomainName> {
+    pub(crate) fn aliased_host(&self) -> Option<&'static CacheHost> {
         self.data
             .as_ref()
             .expect("every sink consumes the instance")

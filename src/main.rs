@@ -1,4 +1,3 @@
-#![cfg_attr(not(any(feature = "mmap", feature = "sendfile")), forbid(unsafe_code))]
 #![allow(
     clippy::too_many_lines,
     reason = "prefer documented and clear structure"
@@ -152,9 +151,11 @@ use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::cache_metadata::UpstreamMetadataView;
 use crate::cache_quota::QuotaExceeded;
+use crate::config::CacheHost;
 use crate::config::Config;
 use crate::config::HttpsUpgradeMode;
 use crate::config::LogDestination;
+use crate::config::resolve_alias;
 use crate::database::Database;
 use crate::database_task::DatabaseCommand;
 use crate::database_task::DbCmdDelivery;
@@ -2340,7 +2341,7 @@ mod permitted_host_cache {
     use hashbrown::HashMap;
     use http::StatusCode;
 
-    use crate::{ClientInfo, config::DomainName, global_config, metrics, warn_once_or_info};
+    use crate::{ClientInfo, config::ClientHost, global_config, metrics, warn_once_or_info};
 
     #[must_use]
     fn is_host_allowed(requested_host: &str) -> bool {
@@ -2361,7 +2362,7 @@ mod permitted_host_cache {
     /// re-scan `allowed_mirrors`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum HostReject {
-        /// Failed `DomainName::new` — malformed `Host:` header.
+        /// Failed `ClientHost::new` — malformed `Host:` header.
         Unsupported,
         /// Validated, but not permitted by `allowed_mirrors`.
         Forbidden,
@@ -2369,19 +2370,19 @@ mod permitted_host_cache {
 
     /// Caches the full validation + allow-list check result per raw `Host:`
     /// string.  On hit, [`authorize_cache_access`] returns a cloned
-    /// `DomainName` without re-running `DomainName::new` or scanning
+    /// `ClientHost` without re-running `ClientHost::new` or scanning
     /// `allowed_mirrors`.
     #[derive(Default)]
     struct PermittedHostCache {
-        entries: parking_lot::RwLock<HashMap<Box<str>, Result<DomainName, HostReject>>>,
+        entries: parking_lot::RwLock<HashMap<Box<str>, Result<ClientHost, HostReject>>>,
     }
 
     impl PermittedHostCache {
-        fn lookup(&self, host: &str) -> Option<Result<DomainName, HostReject>> {
+        fn lookup(&self, host: &str) -> Option<Result<ClientHost, HostReject>> {
             self.entries.read().get(host).cloned()
         }
 
-        fn insert(&self, host: Box<str>, result: Result<DomainName, HostReject>) {
+        fn insert(&self, host: Box<str>, result: Result<ClientHost, HostReject>) {
             let mut map = self.entries.write();
             if map.len() >= PERMITTED_HOST_CACHE_MAX_ENTRIES && !map.contains_key(host.as_ref()) {
                 // Best-effort cap — clear and start over rather than implement
@@ -2401,7 +2402,7 @@ mod permitted_host_cache {
     /// redirect-destination call sites.  On a hit, returns the cached
     /// allow/deny result without re-scanning `allowed_mirrors`.  On a
     /// miss, falls through to the uncached scan (these call sites don't
-    /// have a `DomainName` to store, so we don't populate the cache here
+    /// have a `ClientHost` to store, so we don't populate the cache here
     /// — only [`authorize_cache_access`] does).
     #[must_use]
     pub(crate) fn is_host_allowed_cached(requested_host: &str) -> bool {
@@ -2414,7 +2415,7 @@ mod permitted_host_cache {
     pub(crate) fn authorize_cache_access(
         client: &ClientInfo,
         requested_host: &str,
-    ) -> Result<DomainName, (http::StatusCode, &'static str)> {
+    ) -> Result<ClientHost, (http::StatusCode, &'static str)> {
         let config = global_config();
 
         let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
@@ -2429,7 +2430,7 @@ mod permitted_host_cache {
             return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
         }
 
-        // Hot path: cache hit returns a cloned DomainName without
+        // Hot path: cache hit returns a cloned ClientHost without
         // re-validating or rescanning allowed_mirrors.
         if let Some(cached) = PERMITTED_HOST_CACHE.lookup(requested_host) {
             return finalize_host_result(cached, requested_host);
@@ -2437,10 +2438,10 @@ mod permitted_host_cache {
 
         // Miss: validate the host and check allowed_mirrors, then cache
         // whatever the outcome was (success, malformed, or not-allowed).
-        // `DomainName::new` consumes its argument, so we hand it an owned
+        // `ClientHost::new` consumes its argument, so we hand it an owned
         // copy and reuse the original `&str` for the cache key.
-        let result = match DomainName::new(requested_host.to_owned()) {
-            Ok(d) if is_host_allowed(&d) => Ok(d),
+        let result = match ClientHost::new(requested_host.to_owned()) {
+            Ok(c) if is_host_allowed(&c) => Ok(c),
             Ok(_) => Err(HostReject::Forbidden),
             Err(_) => Err(HostReject::Unsupported),
         };
@@ -2449,9 +2450,9 @@ mod permitted_host_cache {
     }
 
     fn finalize_host_result(
-        result: Result<DomainName, HostReject>,
+        result: Result<ClientHost, HostReject>,
         raw_host: &str,
-    ) -> Result<DomainName, (http::StatusCode, &'static str)> {
+    ) -> Result<ClientHost, (http::StatusCode, &'static str)> {
         match result {
             Ok(d) => Ok(d),
             Err(HostReject::Unsupported) => {
@@ -3716,11 +3717,7 @@ async fn pre_process_client_request(
         Err((status, msg)) => return quick_response(status, msg),
     };
 
-    let aliased_host = config
-        .aliases
-        .iter()
-        .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())
-        .map(|alias| &alias.main);
+    let aliased_host = resolve_alias(&config.aliases, &requested_host);
 
     if req.body().size_hint().exact() != Some(0) {
         warn_once_or_info!(
@@ -3745,12 +3742,11 @@ async fn pre_process_client_request(
                 // claimed by structured caching.  Reject flat URLs on
                 // that host and fall through to the simple-proxy
                 // passthrough.
-                if class.layout.is_flat()
-                    && flat_blocklist::is_blocked(
-                        aliased_host.unwrap_or(&requested_host),
-                        requested_port,
-                    )
-                {
+                let cache_id: &CacheHost = match aliased_host {
+                    Some(cache) => cache,
+                    None => requested_host.as_cache_host(),
+                };
+                if class.layout.is_flat() && flat_blocklist::is_blocked(cache_id, requested_port) {
                     warn_once_or_info!(
                         "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing `{requested_path}` through uncached"
                     );

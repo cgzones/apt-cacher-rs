@@ -401,9 +401,10 @@ mod tests {
     use crate::http_last_modified::write_last_modified;
 
     fn fixture_key() -> CacheMetadataKey {
+        use crate::config::ClientHost;
         CacheMetadataKey::new(
             Mirror::new(
-                String::from("example.test").into(),
+                ClientHost::new(String::from("example.test")).unwrap(),
                 std::num::NonZero::new(80),
                 "/debian".into(),
                 MirrorKind::Structured,

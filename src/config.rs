@@ -254,14 +254,6 @@ impl AsRef<std::ffi::OsStr> for DomainName {
     }
 }
 
-/// Used by sqlx to convert database rows into `DomainName`.
-/// Data stored in the DB was validated before insertion and on program startup.
-impl From<String> for DomainName {
-    fn from(value: String) -> Self {
-        Self::new(value).expect("Caller must ensure value is a valid domain")
-    }
-}
-
 impl From<DomainName> for String {
     fn from(val: DomainName) -> Self {
         match val {
@@ -306,27 +298,212 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host-kind newtypes
+// ---------------------------------------------------------------------------
+//
+// Two semantically distinct flavours of host string exist in this codebase:
+//
+// * [`ClientHost`] — the host the client put on the wire (post-validation).
+//   Used verbatim for the upstream TCP/TLS connect, the outgoing `Host:`
+//   header, the DB primary key on `mirrors_v2`, and origin lookups.
+// * [`CacheHost`]  — the alias-resolved on-disk identity.  Used for the
+//   per-host cache directory, the flat-collision blocklist, and the
+//   cleanup/scan filesystem traversal.
+//
+// Both wrap a validated [`DomainName`] and carry the same byte content when
+// no alias maps the client name.  Keeping them as distinct types prevents
+// callers from accidentally handing a resolved name to a function that
+// expects a raw one (and vice versa) — the invariant used to rest on
+// careful variable naming alone.
+//
+// `#[repr(transparent)]` matches the layout of the inner `DomainName`; no
+// `unsafe` cast helper is exposed today, but the attribute documents the
+// invariant and leaves room for one later.
+
+/// Host name as supplied by the client on the wire (post-validation).
+///
+/// Stored in [`crate::deb_mirror::Mirror::host`] and in the
+/// `mirrors_v2.host` column; threaded into the upstream-connection path
+/// (TCP connect, TLS SNI, outgoing `Host:` header).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub(crate) struct ClientHost(DomainName);
+
+/// Alias-resolved on-disk identity.
+///
+/// Equal to [`Alias::main`] when an alias mapping fires for the
+/// originating client host, otherwise equal (in byte content) to that
+/// client host.  Used by [`crate::cache_layout::ConnectionDetails`] for
+/// path construction and by [`crate::flat_blocklist`] as the collision
+/// key.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub(crate) struct CacheHost(DomainName);
+
+impl ClientHost {
+    /// Parse a [`ClientHost`] from a string.
+    ///
+    /// Returns an error if the string is not a valid domain name.
+    pub(crate) fn new(host: String) -> Result<Self, String> {
+        Ok(Self(DomainName::new(host)?))
+    }
+
+    /// Convert this client host to a [`CacheHost`] identity, without
+    /// allocating.
+    #[must_use]
+    pub(crate) fn into_cache_host(self) -> CacheHost {
+        CacheHost(self.0)
+    }
+
+    /// Borrow this client host as its on-disk cache identity, without
+    /// allocating.  Encodes the `resolve_alias` fall-back rule (no
+    /// alias matched → cache identity equals client host).  Only call
+    /// this where the no-alias branch has been observed; otherwise
+    /// the borrow would mislabel a non-canonical name as canonical.
+    #[must_use]
+    pub(crate) fn as_cache_host(&self) -> &CacheHost {
+        // `transmute` is well-typed only when both sides share an
+        // identical layout, so this additionally catches a regression
+        // that changes the inner field type of either wrapper to
+        // something that happens to be the same width as `DomainName`.
+        const _: fn() = || {
+            let _ = std::mem::transmute::<ClientHost, DomainName>;
+            let _ = std::mem::transmute::<CacheHost, DomainName>;
+        };
+        // SAFETY: both wrappers are `#[repr(transparent)]` over
+        // `DomainName`, so `&ClientHost` and `&CacheHost` share an
+        // identical in-memory layout.
+        unsafe { &*std::ptr::from_ref(self).cast::<CacheHost>() }
+    }
+}
+
+impl std::ops::Deref for ClientHost {
+    type Target = DomainName;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CacheHost {
+    type Target = DomainName;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ClientHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::fmt::Display for CacheHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ClientHost {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for CacheHost {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
+}
+
+impl From<DomainName> for ClientHost {
+    fn from(value: DomainName) -> Self {
+        Self(value)
+    }
+}
+
+impl From<DomainName> for CacheHost {
+    fn from(value: DomainName) -> Self {
+        Self(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientHost {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        DomainName::deserialize(deserializer).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheHost {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        DomainName::deserialize(deserializer).map(Self)
+    }
+}
+
+// sqlx delegations: the inner `DomainName` already validates on decode
+// and encodes via its `into` to `&String`; both wrappers forward without
+// reimplementing the column/type plumbing.
+impl sqlx::Type<sqlx::Sqlite> for ClientHost {
+    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
+        <DomainName as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+
+    fn compatible(ty: &<sqlx::Sqlite as sqlx::Database>::TypeInfo) -> bool {
+        <DomainName as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for ClientHost {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <DomainName as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(&self.0, buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for ClientHost {
+    fn decode(
+        value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        <DomainName as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value).map(Self)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Alias {
-    pub(crate) main: DomainName,
-    pub(crate) aliases: Vec<DomainName>,
+    pub(crate) main: CacheHost,
+    pub(crate) aliases: Vec<ClientHost>,
 }
 
-/// Resolve `host` through `aliases` to the on-disk host identity used by
-/// `ConnectionDetails::cache_dir_path`. Returns the alias `main` host when
-/// `host` is a registered alias, else `host` itself. State keyed on the
-/// cache-dir identity (e.g. the flat-collision blocklist) must resolve
-/// through this so multiple aliases pointing at the same `main` share keys.
+/// Resolve a client-supplied host through `aliases` to the on-disk
+/// cache identity used by
+/// [`crate::cache_layout::ConnectionDetails::cache_dir_path`].
 ///
-/// `aliases[].aliases` is sorted at config load (see `Config::parse`), so
-/// the inner lookup is a binary search.
+/// Returns `Some(&main)` when `host` is listed as an alias of some
+/// configured group, otherwise `None` — callers that want the
+/// resolved-or-echo shape do `.unwrap_or(...)` themselves.  State
+/// keyed on the cache-dir identity (e.g. the flat-collision
+/// blocklist) must resolve through this so multiple aliases pointing
+/// at the same `main` share keys.
+///
+/// `aliases[].aliases` is sorted at config load (see `Config::parse`),
+/// so the inner lookup is a binary search.
 #[must_use]
-pub(crate) fn resolve_cache_host<'a>(aliases: &'a [Alias], host: &'a DomainName) -> &'a DomainName {
+pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Option<&'a CacheHost> {
     aliases
         .iter()
         .find(|alias| alias.aliases.binary_search(host).is_ok())
-        .map_or(host, |alias| &alias.main)
+        .map(|alias| &alias.main)
 }
 
 #[derive(Debug)]
@@ -1228,8 +1405,14 @@ impl Config {
 
                 if let Some(falias) = remaining_aliases.iter().find(|ialias| {
                     ialias.main == alias.main
-                        || ialias.aliases.binary_search(&alias.main).is_ok()
-                        || alias.aliases.binary_search(&ialias.main).is_ok()
+                        || ialias
+                            .aliases
+                            .binary_search_by(|a| a.as_str().cmp(alias.main.as_str()))
+                            .is_ok()
+                        || alias
+                            .aliases
+                            .binary_search_by(|a| a.as_str().cmp(ialias.main.as_str()))
+                            .is_ok()
                         || intersect(&ialias.aliases, &alias.aliases)
                 }) {
                     bail!("Alias {} conflicts with alias {}", alias.main, falias.main);
@@ -1648,5 +1831,131 @@ mod test {
         assert!(!is_valid_config_domain("*.1.1"));
         assert!(!is_valid_config_domain("*.168.1.1"));
         assert!(!is_valid_config_domain("*.0.0.1"));
+    }
+
+    // -----------------------------------------------------------------
+    // Alias resolution + host-wrapper helpers
+    // -----------------------------------------------------------------
+
+    fn dn(s: &str) -> DomainName {
+        DomainName::new(s.to_owned()).expect("test input must be a valid domain")
+    }
+
+    fn ch(s: &str) -> ClientHost {
+        ClientHost::new(s.to_owned()).expect("test input must be a valid domain")
+    }
+
+    /// Build an `Alias` group with the alias list pre-sorted, matching
+    /// the invariant `Config::validate` enforces at load time.
+    fn alias_group(main: &str, aliases: &[&str]) -> Alias {
+        let mut aliases: Vec<ClientHost> = aliases.iter().map(|s| ch(s)).collect();
+        aliases.sort_unstable();
+        Alias {
+            main: CacheHost::from(dn(main)),
+            aliases,
+        }
+    }
+
+    #[test]
+    fn resolve_alias_empty_slice_returns_none() {
+        let aliases: [Alias; 0] = [];
+        assert!(resolve_alias(&aliases, &ch("deb.debian.org")).is_none());
+    }
+
+    #[test]
+    fn resolve_alias_hit_returns_main() {
+        let aliases = [alias_group(
+            "deb.debian.org",
+            &[
+                "ftp.de.debian.org",
+                "ftp.us.debian.org",
+                "ftp.fr.debian.org",
+            ],
+        )];
+        let resolved = resolve_alias(&aliases, &ch("ftp.us.debian.org")).expect("alias matches");
+        assert_eq!(resolved.as_str(), "deb.debian.org");
+    }
+
+    #[test]
+    fn resolve_alias_main_is_not_self_alias() {
+        // Mains are not implicitly registered as aliases of themselves;
+        // a request *to* the main returns `None` so the cache identity
+        // falls back to the client host (which equals the main here).
+        let aliases = [alias_group("deb.debian.org", &["ftp.de.debian.org"])];
+        assert!(resolve_alias(&aliases, &ch("deb.debian.org")).is_none());
+    }
+
+    #[test]
+    fn resolve_alias_multi_group_picks_owning_group() {
+        let aliases = [
+            alias_group("deb.debian.org", &["ftp.de.debian.org"]),
+            alias_group("archive.ubuntu.com", &["de.archive.ubuntu.com"]),
+        ];
+        let resolved =
+            resolve_alias(&aliases, &ch("de.archive.ubuntu.com")).expect("alias matches");
+        assert_eq!(resolved.as_str(), "archive.ubuntu.com");
+    }
+
+    #[test]
+    fn resolve_alias_empty_aliases_group_does_not_break_search() {
+        // A configured group with no aliases must not be considered a
+        // match for any host (and must not corrupt subsequent groups).
+        let aliases = [
+            alias_group("solo.example.com", &[]),
+            alias_group("deb.debian.org", &["ftp.de.debian.org"]),
+        ];
+        assert!(resolve_alias(&aliases, &ch("solo.example.com")).is_none());
+        let hit = resolve_alias(&aliases, &ch("ftp.de.debian.org")).expect("alias matches");
+        assert_eq!(hit.as_str(), "deb.debian.org");
+    }
+
+    #[test]
+    fn resolve_alias_unknown_host_returns_none() {
+        let aliases = [alias_group("deb.debian.org", &["ftp.de.debian.org"])];
+        assert!(resolve_alias(&aliases, &ch("apt.llvm.org")).is_none());
+    }
+
+    #[test]
+    fn client_host_into_cache_host_preserves_inner() {
+        let client = ch("example.test");
+        let cache = client.clone().into_cache_host();
+        assert_eq!(cache.as_str(), "example.test");
+        assert_eq!(client.as_str(), cache.as_str());
+    }
+
+    #[test]
+    fn client_host_as_cache_host_zero_alloc_view() {
+        // Both wrappers are `#[repr(transparent)]` around `DomainName`,
+        // so `as_cache_host` returns a borrow with identical bytes.
+        let client = ch("example.test");
+        let cache_view = client.as_cache_host();
+        assert_eq!(client.as_str(), cache_view.as_str());
+        assert_eq!(
+            std::ptr::from_ref(client.as_str()).addr(),
+            std::ptr::from_ref(cache_view.as_str()).addr(),
+        );
+    }
+
+    #[test]
+    fn client_host_cross_kind_equality() {
+        let client = ch("example.test");
+        let cache = CacheHost::from(dn("example.test"));
+        let other = CacheHost::from(dn("other.test"));
+        assert!(*client == *cache);
+        assert!(*cache == *client);
+        assert!(*client != *other);
+        assert!(*other != *client);
+    }
+
+    #[test]
+    fn host_wrapper_deref_exposes_format_helpers() {
+        // `Deref<Target = DomainName>` is the contract every caller
+        // relies on for `as_str` / `format_cache_dir` / `format_authority`.
+        let client = ch("example.test");
+        let cache = CacheHost::from(dn("example.test"));
+        let port = NonZero::new(8080);
+        assert_eq!(client.format_cache_dir(port).as_ref(), "example.test:8080");
+        assert_eq!(cache.format_cache_dir(port).as_ref(), "example.test:8080");
+        assert_eq!(client.format_authority(port).as_ref(), "example.test:8080");
     }
 }

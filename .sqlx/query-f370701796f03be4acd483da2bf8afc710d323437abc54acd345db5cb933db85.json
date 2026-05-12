@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "\n              SELECT\n                mirrors_v2.host,\n                mirrors_v2.port AS \"port: u16\",\n                mirrors_v2.path AS mirror_path,\n                origins.distribution,\n                origins.component,\n                origins.architecture,\n                origins.last_seen\n              FROM origins\n              JOIN mirrors_v2\n              WHERE mirrors_v2.host = ? AND mirrors_v2.port = ? AND mirrors_v2.path = ? AND mirrors_v2.id = origins.mirror_id;\n        ",
+  "query": "\n              SELECT\n                mirrors_v2.host AS \"host: ClientHost\",\n                mirrors_v2.port AS \"port: u16\",\n                mirrors_v2.path AS mirror_path,\n                origins.distribution,\n                origins.component,\n                origins.architecture,\n                origins.last_seen\n              FROM origins\n              JOIN mirrors_v2\n              WHERE mirrors_v2.id = origins.mirror_id;\n        ",
   "describe": {
     "columns": [
       {
-        "name": "host",
+        "name": "host: ClientHost",
         "ordinal": 0,
         "type_info": "Text"
       },
@@ -40,7 +40,7 @@
       }
     ],
     "parameters": {
-      "Right": 3
+      "Right": 0
     },
     "nullable": [
       false,
@@ -52,5 +52,5 @@
       false
     ]
   },
-  "hash": "75fe5d47a56d03b256978fe3a5e163fe4d8e2c4ae5232ab6301f48e3412aec59"
+  "hash": "f370701796f03be4acd483da2bf8afc710d323437abc54acd345db5cb933db85"
 }

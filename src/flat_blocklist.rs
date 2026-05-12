@@ -43,26 +43,28 @@ use parking_lot::RwLock;
 
 use crate::{
     cache_layout::SUBDIR_FLAT,
-    config::{DomainName, resolve_cache_host},
+    config::{CacheHost, ClientHost, resolve_alias},
     database::Database,
     global_config,
 };
 
 type Port = NonZero<u16>;
 
-/// (host, port) entry shape used as the blocklist key.
+/// (host, port) entry shape used as the blocklist key.  The host is the
+/// alias-resolved cache identity, so sibling aliases of the same
+/// configured `main` share a single entry.
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct BlocklistKey {
-    host: DomainName,
+    host: CacheHost,
     port: Option<Port>,
 }
 
 /// Borrowed counterpart to [`BlocklistKey`] used for read-side lookups via
 /// `hashbrown::Equivalent`, so hot-path `is_blocked` callers do not need
-/// to clone the `DomainName` on every flat request.
+/// to clone the `CacheHost` on every flat request.
 #[derive(Hash)]
 struct BlocklistKeyRef<'a> {
-    host: &'a DomainName,
+    host: &'a CacheHost,
     port: Option<Port>,
 }
 
@@ -97,14 +99,17 @@ pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
     let aliases = global_config().aliases.as_slice();
     let mut set = HashSet::with_capacity(collision_rows.len());
     for (host, port, path) in collision_rows {
-        let host = DomainName::new(host).expect("invalid rows are cleaned up right before");
+        let host = ClientHost::new(host).expect("invalid rows are cleaned up right before");
         let port = NonZero::new(port);
         // Key the blocklist on the alias-resolved host (the same identity
         // `ConnectionDetails::cache_dir_path` uses for the on-disk host
         // directory), so a structured mirror registered via one alias also
         // blocks flat requests arriving via sibling aliases of the same
         // main host.
-        let resolved = resolve_cache_host(aliases, &host).clone();
+        let resolved: CacheHost = match resolve_alias(aliases, &host) {
+            Some(c) => c.clone(),
+            None => host.into_cache_host(),
+        };
 
         warn!(
             "Structured mirror at `{ha}/{path}` collides with host-level flat layout - flat caching disabled for host `{ha}` (structured wins)",
@@ -130,7 +135,7 @@ pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
 /// even when it surfaced after a flat row already existed.  The
 /// `HashSet::insert` is idempotent, so repeat calls cost only a write
 /// lock + lookup.
-pub(crate) fn record_mirror(host: &DomainName, port: Option<Port>, mirror_path: &str) {
+pub(crate) fn record_mirror(host: &CacheHost, port: Option<Port>, mirror_path: &str) {
     if !path_collides_with_flat_layout(mirror_path) {
         return;
     }
@@ -153,7 +158,7 @@ pub(crate) fn record_mirror(host: &DomainName, port: Option<Port>, mirror_path: 
 
 /// Whether flat caching is blocked for the given `(host, port)` pair.
 #[must_use]
-pub(crate) fn is_blocked(host: &DomainName, port: Option<Port>) -> bool {
+pub(crate) fn is_blocked(host: &CacheHost, port: Option<Port>) -> bool {
     BLOCKLIST
         .get()
         .expect("initialized in main()")

@@ -1,6 +1,9 @@
 use std::{borrow::Cow, num::NonZero, path::PathBuf, sync::OnceLock};
 
-use crate::{config::DomainName, database};
+use crate::{
+    config::{CacheHost, ClientHost},
+    database,
+};
 
 /// On-disk layout family of a mirror.  Stored in the `mirrors_v2.kind`
 /// INTEGER column (added by the `20260512155314_mirror_kind` migration);
@@ -42,7 +45,7 @@ impl MirrorKind {
 
 #[derive(Debug)]
 pub(crate) struct Mirror {
-    host: DomainName,
+    host: ClientHost,
     port: Option<NonZero<u16>>,
     path: String,
     kind: MirrorKind,
@@ -56,7 +59,7 @@ pub(crate) struct Mirror {
 impl Mirror {
     #[must_use]
     pub(crate) const fn new(
-        host: DomainName,
+        host: ClientHost,
         port: Option<NonZero<u16>>,
         path: String,
         kind: MirrorKind,
@@ -90,7 +93,7 @@ impl Mirror {
     }
 
     #[must_use]
-    pub(crate) const fn host(&self) -> &DomainName {
+    pub(crate) const fn host(&self) -> &ClientHost {
         &self.host
     }
 
@@ -178,7 +181,7 @@ impl std::fmt::Display for Mirror {
               throws away the with_capacity sizing we want here"
 )]
 pub(crate) fn mirror_cache_path_impl(
-    host: &DomainName,
+    host: &CacheHost,
     port: Option<NonZero<u16>>,
     path: &str,
 ) -> PathBuf {
@@ -211,7 +214,7 @@ impl Origin {
     #[must_use]
     pub(crate) fn from_path(
         path: &str,
-        host: DomainName,
+        host: ClientHost,
         port: Option<NonZero<u16>>,
     ) -> Option<Self> {
         /* /debian/dists/sid/main/binary-amd64/Packages{,.diff,.gz,.xz} */
@@ -250,7 +253,7 @@ pub(crate) trait UriFormat {
 }
 
 fn format_origin_uri(
-    host: &DomainName,
+    host: &ClientHost,
     port: Option<NonZero<u16>>,
     mirror_path: &str,
     dist: &str,
@@ -804,7 +807,7 @@ pub(crate) fn valid_architecture(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{config::DomainName, nonzero};
+    use crate::nonzero;
 
     use super::*;
 
@@ -812,7 +815,7 @@ mod tests {
     fn test_parse_1() {
         let result = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/Packages/",
-            DomainName::new("deb.debian.org".to_string()).unwrap(),
+            ClientHost::new("deb.debian.org".to_string()).unwrap(),
             None,
         )
         .unwrap();
@@ -820,7 +823,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    DomainName::new("deb.debian.org".to_string()).unwrap(),
+                    ClientHost::new("deb.debian.org".to_string()).unwrap(),
                     None,
                     "debian".to_string(),
                     MirrorKind::Structured,
@@ -841,7 +844,7 @@ mod tests {
         let result = Origin::from_path(
             "/private/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
         84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
-            DomainName::new("site.example.com".to_string()).unwrap(),
+            ClientHost::new("site.example.com".to_string()).unwrap(),
             Some(nonzero!(80)),
         )
         .unwrap();
@@ -849,7 +852,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    DomainName::new("site.example.com".to_string()).unwrap(),
+                    ClientHost::new("site.example.com".to_string()).unwrap(),
                     Some(nonzero!(80)),
                     "private/debian".to_string(),
                     MirrorKind::Structured,
@@ -869,7 +872,7 @@ mod tests {
     fn test_parse_3() {
         let result = Origin::from_path(
             "/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages.gz",
-            DomainName::new("apt.llvm.org".to_string()).unwrap(),
+            ClientHost::new("apt.llvm.org".to_string()).unwrap(),
             Some(nonzero!(443)),
         )
         .unwrap();
@@ -877,7 +880,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    DomainName::new("apt.llvm.org".to_string()).unwrap(),
+                    ClientHost::new("apt.llvm.org".to_string()).unwrap(),
                     Some(nonzero!(443)),
                     "unstable".to_string(),
                     MirrorKind::Structured,
@@ -897,7 +900,7 @@ mod tests {
     fn test_parse_ipv6() {
         let result = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/Packages/",
-            DomainName::new("2001:db8::1".to_string()).unwrap(),
+            ClientHost::new("2001:db8::1".to_string()).unwrap(),
             None,
         )
         .unwrap();
@@ -905,7 +908,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    DomainName::new("2001:db8::1".to_string()).unwrap(),
+                    ClientHost::new("2001:db8::1".to_string()).unwrap(),
                     None,
                     "debian".to_string(),
                     MirrorKind::Structured,
@@ -923,7 +926,7 @@ mod tests {
         // IPv6 with port
         let result = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/Packages/",
-            DomainName::new("::1".to_string()).unwrap(),
+            ClientHost::new("::1".to_string()).unwrap(),
             Some(nonzero!(8080)),
         )
         .unwrap();

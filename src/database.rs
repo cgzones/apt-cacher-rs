@@ -15,7 +15,7 @@ use sqlx::{
 
 use crate::{
     cache_layout::SUBDIR_FLAT,
-    config::{DomainName, resolve_cache_host},
+    config::{CacheHost, ClientHost, DomainName, resolve_alias},
     deb_mirror,
     deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
     flat_blocklist, global_config,
@@ -37,7 +37,7 @@ pub(crate) struct Database {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorEntry {
-    pub(crate) host: DomainName,
+    pub(crate) host: ClientHost,
     /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) path: String,
@@ -68,13 +68,17 @@ impl MirrorEntry {
     /// non-existent) sibling directory whenever the request arrived via an
     /// alias.
     #[must_use]
-    pub(crate) fn cache_host(&self) -> &DomainName {
-        resolve_cache_host(&global_config().aliases, &self.host)
+    pub(crate) fn cache_host(&self) -> &CacheHost {
+        match resolve_alias(&global_config().aliases, &self.host) {
+            Some(c) => c,
+            None => self.host.as_cache_host(),
+        }
     }
 
     #[must_use]
     pub(crate) fn cache_path(&self) -> PathBuf {
-        mirror_cache_path_impl(self.cache_host(), self.port(), &self.path)
+        let cache = self.cache_host();
+        mirror_cache_path_impl(cache, self.port(), &self.path)
     }
 
     /// On-disk flat root for this mirror: `<cache_dir>/<host>/flat/<mirror_path>`.
@@ -86,7 +90,8 @@ impl MirrorEntry {
             mirror_path.is_relative(),
             "mirror path must be relative when building the flat root"
         );
-        let host_dir = self.cache_host().format_cache_dir(self.port());
+        let cache = self.cache_host();
+        let host_dir = cache.format_cache_dir(self.port());
         [
             cache_dir,
             Path::new(host_dir.as_ref()),
@@ -114,7 +119,7 @@ impl std::convert::From<MirrorEntry> for deb_mirror::Mirror {
 
 #[derive(Debug)]
 pub(crate) struct MirrorStatEntry {
-    pub(crate) host: DomainName,
+    pub(crate) host: ClientHost,
     /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) path: String,
@@ -138,7 +143,7 @@ impl MirrorStatEntry {
     #[must_use]
     pub(crate) fn uri(&self) -> impl std::fmt::Display + '_ {
         struct W<'a> {
-            host: &'a DomainName,
+            host: &'a ClientHost,
             port: Option<NonZero<u16>>,
             path: &'a str,
         }
@@ -156,19 +161,23 @@ impl MirrorStatEntry {
 
     /// Same alias-resolution semantics as [`MirrorEntry::cache_host`].
     #[must_use]
-    pub(crate) fn cache_host(&self) -> &DomainName {
-        resolve_cache_host(&global_config().aliases, &self.host)
+    fn cache_host(&self) -> &CacheHost {
+        match resolve_alias(&global_config().aliases, &self.host) {
+            Some(c) => c,
+            None => self.host.as_cache_host(),
+        }
     }
 
     #[must_use]
     pub(crate) fn cache_path(&self) -> PathBuf {
-        mirror_cache_path_impl(self.cache_host(), self.port(), &self.path)
+        let cache = self.cache_host();
+        mirror_cache_path_impl(cache, self.port(), &self.path)
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct OriginEntry {
-    pub(crate) host: DomainName,
+    pub(crate) host: ClientHost,
     /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) mirror_path: String,
@@ -189,7 +198,7 @@ impl OriginEntry {
     #[must_use]
     pub(crate) fn mirror_uri(&self) -> impl std::fmt::Display + '_ {
         struct W<'a> {
-            host: &'a DomainName,
+            host: &'a ClientHost,
             port: Option<NonZero<u16>>,
             mirror_path: &'a str,
         }
@@ -313,7 +322,11 @@ async fn upsert_mirror_get_id(
         // Resolve the requested host through configured aliases so the
         // blocklist key matches the on-disk host directory built by
         // `ConnectionDetails::cache_dir_path` (`aliased_host.unwrap_or(...)`).
-        let resolved_host = resolve_cache_host(&global_config().aliases, mirror.host());
+        let resolved_host: &CacheHost = match resolve_alias(&global_config().aliases, mirror.host())
+        {
+            Some(c) => c,
+            None => mirror.host().as_cache_host(),
+        };
         flat_blocklist::record_mirror(resolved_host, mirror.port(), mirror.path());
     }
     Ok((row.id, row.was_inserted))
@@ -417,7 +430,7 @@ impl Database {
         query_as!(
             MirrorEntry,
             r#"
-              SELECT host, port AS "port: u16", path, kind AS "kind!: i64"
+              SELECT host AS "host: ClientHost", port AS "port: u16", path, kind AS "kind!: i64"
               FROM mirrors_v2;
         "#,
         )
@@ -438,7 +451,7 @@ impl Database {
         query_as!(
             MirrorEntry,
             r#"
-              SELECT host, port AS "port: u16", path, kind AS "kind!: i64"
+              SELECT host AS "host: ClientHost", port AS "port: u16", path, kind AS "kind!: i64"
               FROM mirrors_v2
               WHERE last_seen >= unixepoch() - ?;
         "#,
@@ -480,7 +493,7 @@ impl Database {
         query_as!(MirrorStatEntry,
             r#"
             SELECT
-                mirrors_v2.host,
+                mirrors_v2.host AS "host: ClientHost",
                 mirrors_v2.port AS "port: u16",
                 mirrors_v2.path,
                 mirrors_v2.first_seen,
@@ -506,7 +519,7 @@ impl Database {
             OriginEntry,
             r#"
               SELECT
-                mirrors_v2.host,
+                mirrors_v2.host AS "host: ClientHost",
                 mirrors_v2.port AS "port: u16",
                 mirrors_v2.path AS mirror_path,
                 origins.distribution,
@@ -524,7 +537,7 @@ impl Database {
 
     pub(crate) async fn get_origins_by_mirror(
         &self,
-        host: &str,
+        host: &ClientHost,
         port: Option<NonZero<u16>>,
         path: &str,
     ) -> Result<Vec<OriginEntry>, Error> {
@@ -533,7 +546,7 @@ impl Database {
         query_as!(OriginEntry,
             r#"
               SELECT
-                mirrors_v2.host,
+                mirrors_v2.host AS "host: ClientHost",
                 mirrors_v2.port AS "port: u16",
                 mirrors_v2.path AS mirror_path,
                 origins.distribution,
@@ -723,7 +736,10 @@ impl Database {
                 // an on-disk corruption that bypassed cleanup.
                 let host = DomainName::new(r.host).ok()?;
                 let kind = MirrorKind::from_db_int(r.kind)?;
-                Some((r.id, Mirror::new(host, NonZero::new(r.port), r.path, kind)))
+                Some((
+                    r.id,
+                    Mirror::new(ClientHost::from(host), NonZero::new(r.port), r.path, kind),
+                ))
             })
             .collect())
     }

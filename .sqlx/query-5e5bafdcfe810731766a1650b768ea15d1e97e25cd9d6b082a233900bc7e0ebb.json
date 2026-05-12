@@ -1,10 +1,10 @@
 {
   "db_name": "SQLite",
-  "query": "\n              SELECT host, port AS \"port: u16\", path, kind AS \"kind!: i64\"\n              FROM mirrors_v2\n              WHERE last_seen >= unixepoch() - ?;\n        ",
+  "query": "\n              SELECT host AS \"host: ClientHost\", port AS \"port: u16\", path, kind AS \"kind!: i64\"\n              FROM mirrors_v2\n              WHERE last_seen >= unixepoch() - ?;\n        ",
   "describe": {
     "columns": [
       {
-        "name": "host",
+        "name": "host: ClientHost",
         "ordinal": 0,
         "type_info": "Text"
       },
@@ -34,5 +34,5 @@
       false
     ]
   },
-  "hash": "dabed1b47844be500d88eb2b35466f61da0aa5d1ee6c0f13cfdd85bf7e5631a0"
+  "hash": "5e5bafdcfe810731766a1650b768ea15d1e97e25cd9d6b082a233900bc7e0ebb"
 }

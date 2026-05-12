@@ -56,7 +56,7 @@ use log::trace;
 
 use crate::{
     ClientInfo,
-    config::DomainName,
+    config::CacheHost,
     deb_mirror::{
         FlatKind, Mirror, MirrorKind, ResourceFile, is_deb_package, is_flat_deb_filename,
         valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
@@ -189,7 +189,7 @@ impl CacheLayout {
 pub(crate) struct ConnectionDetails {
     pub(crate) client: ClientInfo,
     pub(crate) mirror: Mirror,
-    pub(crate) aliased_host: Option<&'static DomainName>,
+    pub(crate) aliased_host: Option<&'static CacheHost>,
     pub(crate) debname: String,
     pub(crate) cached_flavor: CachedFlavor,
     pub(crate) layout: CacheLayout,
@@ -211,8 +211,10 @@ impl ConnectionDetails {
     pub(crate) fn cache_dir_path(&self) -> PathBuf {
         let root = &global_config().cache_directory;
 
-        let host = self.aliased_host.unwrap_or_else(|| self.mirror.host());
-        let host = host.format_cache_dir(self.mirror.port());
+        let host = match self.aliased_host {
+            Some(cache) => cache.format_cache_dir(self.mirror.port()),
+            None => self.mirror.host().format_cache_dir(self.mirror.port()),
+        };
         let host = Path::new(host.as_ref());
         assert!(
             host.is_relative(),

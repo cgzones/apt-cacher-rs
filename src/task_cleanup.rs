@@ -27,7 +27,7 @@ use crate::{
         SUBDIR_TMP,
     },
     cache_metadata,
-    config::{Config, DomainName},
+    config::{ClientHost, Config},
     database::MirrorEntry,
     deb_mirror::{
         Mirror, UriFormat as _, is_deb_package, is_strict_path_descendant, mirror_cache_path_impl,
@@ -847,7 +847,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     // Group mirror paths by (host, port) and sort each group once so each
     // mirror's nested-paths derivation is O(k) over its host's siblings
     // instead of O(n) over every mirror.  Stored as borrows into `mirrors`.
-    let mut paths_by_host: HashMap<(&DomainName, u16), Vec<&str>> = HashMap::new();
+    let mut paths_by_host: HashMap<(&ClientHost, u16), Vec<&str>> = HashMap::new();
     for entry in &mirrors {
         paths_by_host
             .entry((&entry.host, entry.port().map_or(0, std::num::NonZero::get)))
@@ -1847,7 +1847,8 @@ async fn cleanup_stale_partials(cache_dir: &Path, mirrors: &[MirrorEntry]) {
     let mut removed = 0u64;
 
     for mirror in mirrors {
-        let mirror_dir = mirror_cache_path_impl(mirror.cache_host(), mirror.port(), &mirror.path);
+        let cache = mirror.cache_host();
+        let mirror_dir = mirror_cache_path_impl(&cache, mirror.port(), &mirror.path);
         let structured_tmp: PathBuf = [cache_dir, mirror_dir.as_path(), Path::new(SUBDIR_TMP)]
             .iter()
             .collect();

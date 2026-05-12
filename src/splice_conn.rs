@@ -26,7 +26,7 @@ use tokio::{
 };
 
 use crate::cache_quota::QuotaExceeded;
-use crate::config::{DomainName, HttpsUpgradeMode};
+use crate::config::{ClientHost, HttpsUpgradeMode};
 use crate::database_task::{
     DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
 };
@@ -3167,7 +3167,7 @@ async fn follow_redirect(
         );
         return Ok(None);
     }
-    let Ok(moved_domain) = DomainName::new(moved_host.to_owned()) else {
+    let Ok(moved_domain) = ClientHost::new(moved_host.to_owned()) else {
         warn!(
             "splice proxy: 301 redirect host `{moved_host}` is not a valid domain, not following"
         );
@@ -3188,7 +3188,7 @@ async fn follow_redirect(
         }
     });
     let original_port_effective = mirror_port(&conn_details.mirror, upstream.is_tls());
-    if moved_host == conn_details.mirror.host()
+    if moved_host == conn_details.mirror.host().as_str()
         && moved_port_effective == original_port_effective
         && moved_path == original_path
     {
@@ -6267,7 +6267,7 @@ mod tests {
     #[test]
     fn test_mirror_port_defaults() {
         let mirror = Mirror::new(
-            DomainName::new("example.com".into()).unwrap(),
+            ClientHost::new("example.com".into()).unwrap(),
             None,
             String::new(),
             MirrorKind::Structured,
@@ -6279,7 +6279,7 @@ mod tests {
     #[test]
     fn test_mirror_port_explicit() {
         let mirror = Mirror::new(
-            DomainName::new("example.com".into()).unwrap(),
+            ClientHost::new("example.com".into()).unwrap(),
             Some(NonZero::new(8080).unwrap()),
             String::new(),
             MirrorKind::Structured,

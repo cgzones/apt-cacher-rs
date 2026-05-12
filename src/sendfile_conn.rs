@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use crate::cache_conditional::CacheInfo;
 use crate::cache_layout::{self, CachedFlavor, ConnectionDetails};
 use crate::cache_metadata::{self, CacheMetadataKeyRef};
+use crate::config::{CacheHost, resolve_alias};
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{Mirror, Origin, is_unsafe_proxy_path, parse_request_path};
 use crate::error::{ErrorReport, errno_to_io_error};
@@ -667,20 +668,18 @@ async fn try_sendfile_request(
         }
     };
 
-    let aliased_host = global_config()
-        .aliases
-        .iter()
-        .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())
-        .map(|alias| &alias.main);
+    let aliased_host = resolve_alias(&global_config().aliases, &requested_host);
 
     // Per-host flat collision: a structured mirror with
     // `mirror_path == "flat"` (or `"flat/..."`) has already claimed the
     // host-level `flat/` anchor; hand back to hyper which will pass the
     // request through uncached. The blocklist is keyed on the alias-resolved
     // host (matching the on-disk host directory) so sibling aliases share it.
-    if class.layout.is_flat()
-        && flat_blocklist::is_blocked(aliased_host.unwrap_or(&requested_host), requested_port)
-    {
+    let cache_id: &CacheHost = match aliased_host {
+        Some(cache) => cache,
+        None => requested_host.as_cache_host(),
+    };
+    if class.layout.is_flat() && flat_blocklist::is_blocked(cache_id, requested_port) {
         return SendfileResult::NotApplicable("flat host blocked by structured collision");
     }
 
