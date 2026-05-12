@@ -148,7 +148,7 @@ impl CacheQuota {
         self.sample_utilization_peak_with(new_size);
     }
 
-    pub(crate) fn subtract(&self, amount: u64) {
+    fn subtract(&self, amount: u64) {
         let mut mg = self.cache_size.lock();
         if let Some(val) = mg.checked_sub(amount) {
             *mg = val;

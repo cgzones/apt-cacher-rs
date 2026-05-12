@@ -258,7 +258,7 @@ impl TempPath {
 
     /// Remove the underlying file and return a fresh `TempPath` guarding the same path
     /// with `keep_on_drop = true` so a retried download can still be resumed on failure.
-    pub(crate) async fn renew(self) -> Self {
+    async fn renew(self) -> Self {
         Self {
             path: Some(self.remove().await),
             keep_on_drop: true,

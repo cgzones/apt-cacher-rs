@@ -960,7 +960,7 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
 }
 
 #[must_use]
-pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
+fn is_valid_config_domain(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
     let len = domain.len();

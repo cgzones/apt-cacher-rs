@@ -1229,10 +1229,7 @@ pub(crate) async fn serve_file_via_sendfile(
 /// Format an `InsufficientRate` into a timeout `std::io::Error`, tagging
 /// which side of the proxy the slow transfer was observed on.
 #[must_use]
-pub(crate) fn rate_timeout_error(
-    rate: &InsufficientRate,
-    direction: RateCheckDirection,
-) -> std::io::Error {
+fn rate_timeout_error(rate: &InsufficientRate, direction: RateCheckDirection) -> std::io::Error {
     let context = match direction {
         RateCheckDirection::Client => " for client",
         RateCheckDirection::Upstream => " for upstream",

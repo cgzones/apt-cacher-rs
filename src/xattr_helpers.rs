@@ -106,11 +106,7 @@ pub(crate) fn try_read_helper(
 /// need to distinguish transient I/O errors from a stable "no value"
 /// outcome (e.g. for negative caching) should use [`try_read_helper`].
 #[must_use]
-pub(crate) fn read_helper(
-    file: &tokio::fs::File,
-    display_path: &Path,
-    key: &'static str,
-) -> Option<String> {
+fn read_helper(file: &tokio::fs::File, display_path: &Path, key: &'static str) -> Option<String> {
     try_read_helper(file, display_path, key).ok().flatten()
 }
 
