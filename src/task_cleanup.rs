@@ -169,10 +169,27 @@ async fn collect_cached_files(
         };
         if !file_type.is_file() {
             metrics::CACHE_NON_REGULAR.increment();
-            warn!(
-                "Skipping non-regular entry in mirror pool directory: `{}`",
-                entry.path().display()
-            );
+            let path = entry.path();
+            if file_type.is_dir() {
+                warn!(
+                    "Skipping unexpected directory in mirror pool directory: `{}`",
+                    path.display()
+                );
+            } else {
+                warn!(
+                    "Removing non-regular entry in mirror pool directory: `{}`",
+                    path.display()
+                );
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to remove non-regular entry `{}`:  {err}",
+                        path.display()
+                    );
+                } else {
+                    debug!("Removed non-regular entry `{}`", path.display());
+                }
+            }
             continue;
         }
 
@@ -1261,10 +1278,20 @@ async fn collect_flat_cached_debs(
 
             if file_type.is_symlink() {
                 metrics::CACHE_NON_REGULAR.increment();
+                let path = entry.path();
                 warn!(
-                    "Skipping unrecognized symlink entry in cache: `{}`",
-                    entry.path().display()
+                    "Removing unrecognized symlink entry in cache: `{}`",
+                    path.display()
                 );
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to remove symlink entry `{}`:  {err}",
+                        path.display()
+                    );
+                } else {
+                    debug!("Removed symlink entry `{}`", path.display());
+                }
                 continue;
             }
 
@@ -1307,10 +1334,17 @@ async fn collect_flat_cached_debs(
 
             if !file_type.is_file() {
                 metrics::CACHE_NON_REGULAR.increment();
-                warn!(
-                    "Skipping unrecognized entry in cache: `{}`",
-                    entry.path().display()
-                );
+                let path = entry.path();
+                warn!("Removing non-regular entry in cache: `{}`", path.display());
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to remove non-regular entry `{}`:  {err}",
+                        path.display()
+                    );
+                } else {
+                    debug!("Removed non-regular entry `{}`", path.display());
+                }
                 continue;
             }
 
@@ -1650,10 +1684,28 @@ async fn cleanup_byhash_dir(
 
         if !file_type.is_file() {
             metrics::CACHE_NON_REGULAR.increment();
-            warn!(
-                "Skipping unrecognized non-regular file in by-hash directory: `{}`",
-                path.display()
-            );
+            if file_type.is_dir() {
+                warn!(
+                    "Skipping unexpected directory in by-hash directory: `{}`",
+                    path.display()
+                );
+            } else {
+                warn!(
+                    "Removing non-regular entry in by-hash directory: `{}`",
+                    path.display()
+                );
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to remove non-regular entry `{}`:  {err}",
+                        path.display()
+                    );
+                } else {
+                    debug!("Removed non-regular entry `{}`", path.display());
+                    stats.bytes_removed += mdata.len();
+                    stats.files_removed += 1;
+                }
+            }
             continue;
         }
 

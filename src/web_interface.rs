@@ -1888,7 +1888,7 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Cache Non-Regular Files",
-        "Cache entries observed as non-regular files (FIFO, socket, device, directory, symlink). Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which retain pool/by-hash entries unverified, but actively remove non-regular entries from tmp/).",
+        "Cache entries observed as non-regular files (FIFO, socket, device, directory, symlink). Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which actively unlink unexpected non-regular files in pool/flat/by-hash/tmp, but leave unexpected directories outside tmp/ alone with a warn).",
         AlertNonzero(metrics::CACHE_NON_REGULAR.get()),
     );
     t.row_tip(

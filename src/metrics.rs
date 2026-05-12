@@ -333,11 +333,15 @@ pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 /// Cache entries observed to be non-regular files (FIFO, socket, device,
 /// directory, symlink).  Bumped by serving paths (which then return 5xx),
 /// download paths (which abort the download), and cleanup paths (which
-/// retain pool/by-hash entries unverified, but actively remove non-regular
-/// entries from `tmp/`).  A non-zero count indicates either a hostile
+/// actively unlink unexpected non-regular *files* in pool / flat / by-hash
+/// / `tmp/`, but leave unexpected *directories* in pool / flat / by-hash
+/// alone with a warn — `tmp/` is the only location where a stray directory
+/// is recursively removed).  A non-zero count indicates either a hostile
 /// filesystem or a misconfigured cache directory and is worth operator
 /// attention.  Disjoint from `CACHE_IO_FAILURE`: a non-regular-file
-/// detection is reported here only, not as an I/O failure.
+/// detection is reported here only.  If a subsequent removal attempt's
+/// syscall itself fails, that is reported separately under
+/// `CACHE_IO_FAILURE`.
 pub(crate) static CACHE_NON_REGULAR: Counter = Counter::new();
 
 /// Bytes copied client → upstream through the CONNECT tunnel.
