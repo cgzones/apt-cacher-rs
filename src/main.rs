@@ -1566,7 +1566,7 @@ fn serve_cached_file_response(
     last_modified_str: String,
     age: u32,
     content_length: u64,
-    content_type: &str,
+    content_type: &'static str,
     body: ProxyCacheBody,
     content_range: Option<String>,
     etag: Option<String>,

@@ -28,7 +28,7 @@ impl xattr::FileExt for XattrFile<'_> {}
 
 /// Remove the extended attribute for the given key from the file.
 /// Logs warnings on failure but never propagates errors.
-pub(crate) fn remove_helper(file: &tokio::fs::File, display_path: &Path, key: &str) {
+pub(crate) fn remove_helper(file: &tokio::fs::File, display_path: &Path, key: &'static str) {
     if let Err(err) = tokio::task::block_in_place(|| XattrFile(file).remove_xattr(key)) {
         warn!(
             "Failed to remove invalid xattr from `{}` for key `{key}`:  {err}",
@@ -62,7 +62,7 @@ pub(crate) struct XattrIoError;
 pub(crate) fn try_read_helper(
     file: &tokio::fs::File,
     display_path: &Path,
-    key: &str,
+    key: &'static str,
 ) -> Result<Option<String>, XattrIoError> {
     let data = tokio::task::block_in_place(|| XattrFile(file).get_xattr(key));
 
@@ -109,14 +109,19 @@ pub(crate) fn try_read_helper(
 pub(crate) fn read_helper(
     file: &tokio::fs::File,
     display_path: &Path,
-    key: &str,
+    key: &'static str,
 ) -> Option<String> {
     try_read_helper(file, display_path, key).ok().flatten()
 }
 
 /// Write the given value to the extended attribute for the given key on the file.
 /// Logs warnings on failure but never propagates errors.
-pub(crate) fn write_helper(file: &tokio::fs::File, display_path: &Path, key: &str, value: &[u8]) {
+pub(crate) fn write_helper(
+    file: &tokio::fs::File,
+    display_path: &Path,
+    key: &'static str,
+    value: &[u8],
+) {
     let data = tokio::task::block_in_place(|| XattrFile(file).set_xattr(key, value));
 
     if let Err(err) = data {

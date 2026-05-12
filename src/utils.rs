@@ -90,7 +90,7 @@ pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) 
 ///
 /// On any other I/O error, the error is returned untouched so the caller
 /// can choose to log + propagate or log + swallow.
-pub(crate) async fn probe_dir(path: &Path, purpose: &str) -> std::io::Result<bool> {
+pub(crate) async fn probe_dir(path: &Path, purpose: &'static str) -> std::io::Result<bool> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(md) if md.file_type().is_dir() => Ok(true),
         Ok(md) if md.file_type().is_symlink() => {

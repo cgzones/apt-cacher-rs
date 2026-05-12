@@ -449,7 +449,7 @@ struct Table {
 }
 
 impl Table {
-    fn new(headers: &[&str]) -> Self {
+    fn new(headers: &[&'static str]) -> Self {
         // Realistic dashboard tables (Mirrors, Origins) easily exceed 10 KB.
         // Pre-size to skip the reallocation chain.
         let mut out = String::with_capacity(16 * 1024);
@@ -1254,7 +1254,7 @@ fn build_daemon_status_html(
     t.finish()
 }
 
-fn build_configuration_html(rd: &RuntimeDetails, https_mode: &str) -> String {
+fn build_configuration_html(rd: &RuntimeDetails, https_mode: &'static str) -> String {
     let mut t = DetailsTable::new();
     t.row(
         "Bind Address + Port",

@@ -138,7 +138,7 @@ pub(crate) async fn write_invalid_response(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     status: StatusCode,
-    msg: &str,
+    msg: &'static str,
 ) -> std::io::Result<()> {
     let date = format_http_date();
     let content_length = msg.len();

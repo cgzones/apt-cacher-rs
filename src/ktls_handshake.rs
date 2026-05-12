@@ -33,7 +33,11 @@ pub(crate) fn discard_incoming(buf: &mut [u8], used: &mut usize, discard: usize)
 
 /// Try to grow the incoming buffer if full, returning an error if the
 /// maximum size is exceeded.
-pub(crate) fn grow_incoming(buf: &mut SecureVec, used: usize, phase: &str) -> io::Result<()> {
+pub(crate) fn grow_incoming(
+    buf: &mut SecureVec,
+    used: usize,
+    phase: &'static str,
+) -> io::Result<()> {
     /// Maximum incoming buffer size (2 MiB). Prevents unbounded growth if a
     /// server sends many TLS records without completing the handshake.
     const MAX_INCOMING_BUF: usize = 2 * 1024 * 1024;
