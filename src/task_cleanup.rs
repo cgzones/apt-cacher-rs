@@ -27,7 +27,7 @@ use crate::{
         SUBDIR_TMP,
     },
     cache_metadata,
-    config::{ClientHost, Config},
+    config::{CacheHost, Config, resolve_alias},
     database::MirrorEntry,
     deb_mirror::{
         Mirror, UriFormat as _, is_deb_package, is_strict_path_descendant, mirror_cache_path_impl,
@@ -844,13 +844,25 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     // does not age-evict files that belong to a nested mirror (which has
     // its own Packages index and its own cleanup run).
 
-    // Group mirror paths by (host, port) and sort each group once so each
-    // mirror's nested-paths derivation is O(k) over its host's siblings
-    // instead of O(n) over every mirror.  Stored as borrows into `mirrors`.
-    let mut paths_by_host: HashMap<(&ClientHost, u16), Vec<&str>> = HashMap::new();
+    // Group mirror paths by (cache_host, port) and sort each group once so
+    // each mirror's nested-paths derivation is O(k) over its host's siblings
+    // instead of O(n) over every mirror.  Keying on the alias-resolved
+    // `CacheHost` (the same identity `MirrorEntry::cache_path` and
+    // `flat_root_path` use to build on-disk paths) matches the cleanup
+    // layout: two DB rows whose raw `ClientHost` differs but resolves to
+    // the same `main` host share `<cache>/<main_host>/…` on disk, so they
+    // must share a nesting bucket — otherwise a parent's flat-cleanup could
+    // recurse into and age-evict files owned by a sibling alias's mirror.
+    // Stored as borrows into `mirrors` and the global aliases table.
+    let aliases = config.aliases.as_slice();
+    let mut paths_by_host: HashMap<(&CacheHost, u16), Vec<&str>> = HashMap::new();
     for entry in &mirrors {
+        let cache_host: &CacheHost = match resolve_alias(aliases, &entry.host) {
+            Some(c) => c,
+            None => entry.host.as_cache_host(),
+        };
         paths_by_host
-            .entry((&entry.host, entry.port().map_or(0, std::num::NonZero::get)))
+            .entry((cache_host, entry.port().map_or(0, std::num::NonZero::get)))
             .or_default()
             .push(entry.path.as_str());
     }
@@ -864,11 +876,12 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let nested_per_mirror: Vec<Vec<String>> = mirrors
         .iter()
         .map(|mirror| {
+            let cache_host: &CacheHost = match resolve_alias(aliases, &mirror.host) {
+                Some(c) => c,
+                None => mirror.host.as_cache_host(),
+            };
             let host_paths = paths_by_host
-                .get(&(
-                    &mirror.host,
-                    mirror.port().map_or(0, std::num::NonZero::get),
-                ))
+                .get(&(cache_host, mirror.port().map_or(0, std::num::NonZero::get)))
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             derive_nested_paths(&mirror.path, host_paths)
@@ -1848,7 +1861,7 @@ async fn cleanup_stale_partials(cache_dir: &Path, mirrors: &[MirrorEntry]) {
 
     for mirror in mirrors {
         let cache = mirror.cache_host();
-        let mirror_dir = mirror_cache_path_impl(&cache, mirror.port(), &mirror.path);
+        let mirror_dir = mirror_cache_path_impl(cache, mirror.port(), &mirror.path);
         let structured_tmp: PathBuf = [cache_dir, mirror_dir.as_path(), Path::new(SUBDIR_TMP)]
             .iter()
             .collect();
