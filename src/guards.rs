@@ -5,6 +5,7 @@ use crate::{
     cache_layout::CacheLayout,
     cache_metadata::{self, CacheMetadataKey, UpstreamMetadata},
     cache_quota::QuotaReservation,
+    config::DomainName,
     deb_mirror::Mirror,
     metrics,
 };
@@ -18,6 +19,12 @@ struct InitBarrierData<'a> {
     status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: &'a ActiveDownloads,
     mirror: &'a Mirror,
+    /// When the request was resolved against an alias mapping, the on-disk
+    /// host directory is the alias' main host (not `mirror.host()`).  Kept
+    /// here so that `partial_path_for_barrier` lays the `.partial` next to
+    /// the eventual rename target produced by
+    /// `ConnectionDetails::cache_dir_path`, which also uses this host.
+    aliased_host: Option<&'static DomainName>,
     debname: &'a str,
     layout: CacheLayout,
     /// Unused, receivers just needs to get notified by drop
@@ -35,6 +42,7 @@ impl<'a> InitBarrier<'a> {
         status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
         active_downloads: &'a ActiveDownloads,
         mirror: &'a Mirror,
+        aliased_host: Option<&'static DomainName>,
         debname: &'a str,
         layout: CacheLayout,
     ) -> Self {
@@ -43,6 +51,7 @@ impl<'a> InitBarrier<'a> {
                 status,
                 active_downloads,
                 mirror,
+                aliased_host,
                 debname,
                 layout,
                 _tx: tx,
@@ -109,6 +118,26 @@ impl<'a> InitBarrier<'a> {
             .as_ref()
             .expect("every sink consumes the instance")
             .debname
+    }
+
+    #[must_use]
+    pub(crate) fn layout(&self) -> CacheLayout {
+        self.data
+            .as_ref()
+            .expect("every sink consumes the instance")
+            .layout
+    }
+
+    /// Aliased host the request was redirected to, if any.  Matches the
+    /// host used by `ConnectionDetails::cache_dir_path` so callers (notably
+    /// `partial_path_for_barrier`) can place the `.partial` file in the
+    /// same host directory as the eventual rename target.
+    #[must_use]
+    pub(crate) fn aliased_host(&self) -> Option<&'static DomainName> {
+        self.data
+            .as_ref()
+            .expect("every sink consumes the instance")
+            .aliased_host
     }
 }
 

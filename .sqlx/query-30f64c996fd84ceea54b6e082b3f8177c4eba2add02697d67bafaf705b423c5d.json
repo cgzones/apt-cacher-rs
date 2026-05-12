@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n              SELECT host, port AS \"port: u16\", path, kind AS \"kind!: i64\"\n              FROM mirrors_v2;\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "host",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "port: u16",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "path",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "kind!: i64",
+        "ordinal": 3,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "30f64c996fd84ceea54b6e082b3f8177c4eba2add02697d67bafaf705b423c5d"
+}

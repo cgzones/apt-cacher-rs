@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use log::{debug, error, info, warn};
 
-use crate::global_config;
+use crate::{cache_layout::SUBDIR_TMP, global_config};
 
 fn remove_dir_contents<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(path)? {
@@ -70,7 +70,7 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
         }
     }
 
-    let cache_tmp_path = cache_path.join("tmp");
+    let cache_tmp_path = cache_path.join(SUBDIR_TMP);
 
     std::fs::create_dir_all(&cache_tmp_path)
         .with_context(|| format!("Failed to create directory `{}`", cache_tmp_path.display()))?;

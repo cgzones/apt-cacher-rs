@@ -1,0 +1,30 @@
+-- Add a `kind` column to mirrors so the flat-collision blocklist can
+-- distinguish a structured mirror that happens to use a `flat[/...]` path
+-- (real collision with the host-anchored flat layout) from a flat mirror
+-- whose own base URL is `flat[/...]` (self-block false positive before
+-- this column existed).
+--
+-- Named `kind` (not `layout`) to avoid confusion with the finer-grained
+-- `CacheLayout` enum on the application side, which describes a file's
+-- on-disk subtree (`StructuredPool` / `Dists` / `DistsByHash` / `Flat`
+-- / `FlatByHash`).  This column carries the coarser two-state mirror
+-- identity (`Structured` vs `Flat`) — the `MirrorKind` enum is the
+-- single source of truth for the encoding.
+--
+-- Encoded as INTEGER (0 = structured, 1 = flat) to keep the row small.
+-- SQLite's ALTER TABLE ADD COLUMN does not accept a CHECK constraint,
+-- so the {0, 1} invariant is enforced at the app layer
+-- (`cleanup_invalid_rows` purges any out-of-range values so downstream
+-- code can rely on the invariant without panic-on-corrupt-data risk).
+--
+-- `(host, port, path)` stays as the unique key.  Real apt deployments do
+-- not serve both a structured `<path>/dists/...` and a flat
+-- `<path>/InRelease` tree at the same `<path>` on the same host, so a
+-- single row per `(host, port, path)` suffices; the upsert latches the
+-- column to `0` (structured) whenever a structured request arrives so
+-- the blocklist seed never loses a collision.
+--
+-- Backfill `0` (structured) for existing rows: that preserves the
+-- pre-fix behaviour for any `path = 'flat[/%]'` rows that were
+-- previously seeded into the blocklist.
+ALTER TABLE mirrors_v2 ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;

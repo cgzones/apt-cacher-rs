@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     net::{IpAddr, Ipv6Addr},
     num::{NonZero, TryFromIntError},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr as _,
     time::Duration,
 };
@@ -14,9 +14,11 @@ use sqlx::{
 };
 
 use crate::{
-    config::{DomainName, is_valid_domain},
+    cache_layout::SUBDIR_FLAT,
+    config::{DomainName, resolve_cache_host},
     deb_mirror,
-    deb_mirror::{Mirror, mirror_cache_path_impl},
+    deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
+    flat_blocklist, global_config,
 };
 
 /// Conservative upper bound on the number of bind parameters allowed in a
@@ -39,6 +41,12 @@ pub(crate) struct MirrorEntry {
     /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) path: String,
+    /// Raw `mirrors_v2.kind` (INTEGER) value.  `cleanup_invalid_rows`
+    /// purges rows whose encoding falls outside the [`MirrorKind`]
+    /// invariant before any code reads `MirrorEntry`s, so the
+    /// `From<MirrorEntry> for Mirror` conversion's `unwrap_or` fallback
+    /// is pure defense-in-depth.
+    kind: i64,
 }
 
 impl MirrorEntry {
@@ -52,14 +60,41 @@ impl MirrorEntry {
         self.host.format_authority(self.port())
     }
 
+    /// On-disk host identity for this mirror, resolved through configured
+    /// aliases.  The DB stores the raw client-supplied host, but
+    /// `ConnectionDetails::cache_dir_path` writes cached files under the
+    /// alias' `main` host.  Cleanup / scan code must use the same resolution
+    /// so the paths line up; raw `self.host` would point at an empty (or
+    /// non-existent) sibling directory whenever the request arrived via an
+    /// alias.
+    #[must_use]
+    pub(crate) fn cache_host(&self) -> &DomainName {
+        resolve_cache_host(&global_config().aliases, &self.host)
+    }
+
     #[must_use]
     pub(crate) fn cache_path(&self) -> PathBuf {
-        let Self {
-            host,
-            port: _,
-            path,
-        } = self;
-        mirror_cache_path_impl(host, self.port(), path)
+        mirror_cache_path_impl(self.cache_host(), self.port(), &self.path)
+    }
+
+    /// On-disk flat root for this mirror: `<cache_dir>/<host>/flat/<mirror_path>`.
+    /// Callers append further segments (`by-hash`, `tmp`, …) as needed.
+    #[must_use]
+    pub(crate) fn flat_root_path(&self, cache_dir: &Path) -> PathBuf {
+        let mirror_path = Path::new(&self.path);
+        assert!(
+            mirror_path.is_relative(),
+            "mirror path must be relative when building the flat root"
+        );
+        let host_dir = self.cache_host().format_cache_dir(self.port());
+        [
+            cache_dir,
+            Path::new(host_dir.as_ref()),
+            Path::new(SUBDIR_FLAT),
+            mirror_path,
+        ]
+        .iter()
+        .collect()
     }
 }
 
@@ -70,8 +105,10 @@ impl std::convert::From<MirrorEntry> for deb_mirror::Mirror {
             host,
             port: _,
             path,
+            kind,
         } = entry;
-        Self::new(host, port, path)
+        let kind = MirrorKind::from_db_int(kind).unwrap_or(MirrorKind::Structured);
+        Self::new(host, port, path, kind)
     }
 }
 
@@ -117,9 +154,15 @@ impl MirrorStatEntry {
         }
     }
 
+    /// Same alias-resolution semantics as [`MirrorEntry::cache_host`].
+    #[must_use]
+    pub(crate) fn cache_host(&self) -> &DomainName {
+        resolve_cache_host(&global_config().aliases, &self.host)
+    }
+
     #[must_use]
     pub(crate) fn cache_path(&self) -> PathBuf {
-        mirror_cache_path_impl(&self.host, self.port(), &self.path)
+        mirror_cache_path_impl(self.cache_host(), self.port(), &self.path)
     }
 }
 
@@ -220,6 +263,11 @@ pub(crate) struct OriginRow {
 /// Upsert a mirror row and return `(id, was_inserted)` in a single round
 /// trip via `RETURNING`. `was_inserted` is `first_seen = last_seen`: equal
 /// only on a fresh INSERT, since ON CONFLICT rewrites just `last_seen`.
+///
+/// The `kind` column on ON-CONFLICT latches to `Structured` (0) whenever
+/// any structured request arrives for an existing row, so the blocklist
+/// seed at next startup cannot lose a collision that surfaced only after
+/// a flat row already existed for the same `(host, port, path)`.
 async fn upsert_mirror_get_id(
     tx: &mut SqliteConnection,
     mirror: &Mirror,
@@ -227,22 +275,47 @@ async fn upsert_mirror_get_id(
     let host = mirror.host();
     let port = mirror.port().map_or(0, std::num::NonZero::get);
     let path = mirror.path();
+    let kind = mirror.kind().as_db_int();
     let row = query!(
         r#"
             INSERT INTO mirrors_v2
-            (host, port, path)
+            (host, port, path, kind)
             VALUES
-            (?, ?, ?)
+            (?, ?, ?, ?)
             ON CONFLICT
-            DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP)
-            RETURNING id, (first_seen = last_seen) AS "was_inserted!: bool";
+            DO UPDATE SET
+              last_seen = unixepoch(CURRENT_TIMESTAMP),
+              kind = CASE
+                WHEN excluded.kind = 0 THEN 0
+                ELSE mirrors_v2.kind
+              END
+            RETURNING id, kind AS "kind!: i64", (first_seen = last_seen) AS "was_inserted!: bool";
         "#,
         host,
         port,
         path,
+        kind,
     )
     .fetch_one(&mut *tx)
     .await?;
+    // Newly-registered structured mirrors at `path = "flat"` (or
+    // `flat/<anything>`) would have their files written into the same
+    // `<host>/flat/` tree the host-level flat layout reserves.  Record
+    // the host in the blocklist so subsequent flat URLs for it fall
+    // through to passthrough uncached.
+    //
+    // Gate on the post-upsert `kind` column rather than `was_inserted`:
+    // a structured request can latch a previously-flat row to structured
+    // (was_inserted=false), and that transition must still be observed
+    // by the blocklist.  `record_mirror`'s `path_collides_with_flat_layout`
+    // check is the cheap pre-filter; the HashSet insert is idempotent.
+    if row.kind == MirrorKind::Structured.as_db_int() {
+        // Resolve the requested host through configured aliases so the
+        // blocklist key matches the on-disk host directory built by
+        // `ConnectionDetails::cache_dir_path` (`aliased_host.unwrap_or(...)`).
+        let resolved_host = resolve_cache_host(&global_config().aliases, mirror.host());
+        flat_blocklist::record_mirror(resolved_host, mirror.port(), mirror.path());
+    }
     Ok((row.id, row.was_inserted))
 }
 
@@ -344,7 +417,7 @@ impl Database {
         query_as!(
             MirrorEntry,
             r#"
-              SELECT host, port AS "port: u16", path
+              SELECT host, port AS "port: u16", path, kind AS "kind!: i64"
               FROM mirrors_v2;
         "#,
         )
@@ -365,7 +438,7 @@ impl Database {
         query_as!(
             MirrorEntry,
             r#"
-              SELECT host, port AS "port: u16", path
+              SELECT host, port AS "port: u16", path, kind AS "kind!: i64"
               FROM mirrors_v2
               WHERE last_seen >= unixepoch() - ?;
         "#,
@@ -373,6 +446,34 @@ impl Database {
         )
         .fetch_all(&self.conn)
         .await
+    }
+
+    /// Return every mirror row whose `path` collides with the host-level
+    /// `flat/` anchor used by the new flat-repository layout — i.e. a
+    /// structured mirror at `path = 'flat'` or `path` starting with
+    /// `'flat/'`.  Used at startup to seed the
+    /// [`crate::flat_blocklist`].
+    pub(crate) async fn load_flat_collision_mirrors(
+        &self,
+    ) -> Result<Vec<(String, u16, String)>, Error> {
+        struct Row {
+            host: String,
+            port: u16,
+            path: String,
+        }
+
+        let rows = query_as!(
+            Row,
+            r#"
+              SELECT host, port AS "port!: u16", path
+              FROM mirrors_v2
+              WHERE kind = 0 AND (path = 'flat' OR path LIKE 'flat/%');
+            "#,
+        )
+        .fetch_all(&self.conn)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.host, r.port, r.path)).collect())
     }
 
     pub(crate) async fn get_mirrors_with_stats(&self) -> Result<Vec<MirrorStatEntry>, Error> {
@@ -598,12 +699,13 @@ impl Database {
             host: String,
             port: u16,
             path: String,
+            kind: i64,
         }
 
         let rows = query_as!(
             Row,
             r#"
-              SELECT id AS "id!: i64", host, port AS "port!: u16", path
+              SELECT id AS "id!: i64", host, port AS "port!: u16", path, kind AS "kind!: i64"
               FROM mirrors_v2;
             "#,
         )
@@ -614,11 +716,14 @@ impl Database {
             .into_iter()
             .filter_map(|r| {
                 // Reconstruct DomainName via its parser so an Ipv4/Ipv6 row
-                // round-trips to the right enum variant. Skip rows whose host
-                // no longer parses — `cleanup_invalid_rows` will eventually
-                // remove them.
+                // round-trips to the right enum variant. `cleanup_invalid_rows`
+                // ran at startup and rejects exactly the same hosts (via
+                // `DomainName::new`) plus any out-of-range `kind` values, so
+                // both `?`s below are defense-in-depth — a hit here would mean
+                // an on-disk corruption that bypassed cleanup.
                 let host = DomainName::new(r.host).ok()?;
-                Some((r.id, Mirror::new(host, NonZero::new(r.port), r.path)))
+                let kind = MirrorKind::from_db_int(r.kind)?;
+                Some((r.id, Mirror::new(host, NonZero::new(r.port), r.path, kind)))
             })
             .collect())
     }
@@ -791,31 +896,52 @@ impl Database {
             );
         }
 
-        // Remove mirrors with invalid host names (and cascade to their origins/downloads/deliveries)
+        // Remove mirrors whose `host` no longer parses through
+        // `DomainName::new` or whose `kind` is outside the [`MirrorKind`]
+        // invariant.  Cascade to origins/downloads/deliveries.
+        //
+        // The host check uses `DomainName::new` (not `is_valid_domain`) so
+        // the row set this function purges is exactly the set of rows
+        // downstream code — notably `flat_blocklist::init` — relies on
+        // being absent.  Any future tightening of `DomainName::new` then
+        // automatically also tightens cleanup, instead of opening a
+        // panic gap between the two validators.
         {
             struct MirrorRow {
                 id: i64,
                 host: String,
+                kind: i64,
             }
 
             let mut tx = self.conn.begin().await?;
 
             let mirrors = query_as!(
                 MirrorRow,
-                r#"SELECT id AS "id!: i64", host FROM mirrors_v2;"#
+                r#"SELECT id AS "id!: i64", host, kind AS "kind!: i64" FROM mirrors_v2;"#
             )
             .fetch_all(&mut *tx)
             .await?;
 
             for mirror in mirrors {
-                if is_valid_domain(&mirror.host) {
+                let bad_host = DomainName::new(mirror.host.clone()).is_err();
+                let bad_kind = MirrorKind::from_db_int(mirror.kind).is_none();
+
+                if !bad_host && !bad_kind {
                     continue;
                 }
 
-                warn!(
-                    "Removing mirror id={} with invalid host `{}`",
-                    mirror.id, mirror.host
-                );
+                if bad_host {
+                    warn!(
+                        "Removing mirror id={} with invalid host `{}`",
+                        mirror.id, mirror.host
+                    );
+                }
+                if bad_kind {
+                    warn!(
+                        "Removing mirror id={} (host `{}`) with out-of-range kind={}",
+                        mirror.id, mirror.host, mirror.kind
+                    );
+                }
 
                 query!(r"DELETE FROM origins WHERE mirror_id = ?;", mirror.id)
                     .execute(&mut *tx)

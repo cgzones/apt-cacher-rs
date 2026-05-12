@@ -25,6 +25,7 @@ mod database;
 mod database_task;
 mod deb_mirror;
 mod error;
+mod flat_blocklist;
 mod guards;
 mod http_etag;
 #[cfg(feature = "sendfile")]
@@ -147,7 +148,7 @@ use tokio::signal::unix::SignalKind;
 use crate::active_downloads::OriginateOutcome;
 use crate::active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads, InsertOutcome};
 use crate::cache_conditional::CacheInfo;
-use crate::cache_layout::{CachedFlavor, ConnectionDetails};
+use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::cache_metadata::UpstreamMetadataView;
 use crate::cache_quota::QuotaExceeded;
@@ -2581,6 +2582,7 @@ async fn serve_new_file(
         &status,
         &appstate.active_downloads,
         &conn_details.mirror,
+        conn_details.aliased_host,
         &conn_details.debname,
         conn_details.layout,
     );
@@ -3149,7 +3151,7 @@ async fn serve_new_file(
         }
         utils::PartialDownload::Volatile => {
             // Volatile file: random temp file
-            let tmppath: PathBuf = [&config.cache_directory, Path::new("tmp"), filename]
+            let tmppath: PathBuf = [&config.cache_directory, Path::new(SUBDIR_TMP), filename]
                 .iter()
                 .collect();
             match tokio_tempfile(&tmppath, 0o640).await {
@@ -3701,28 +3703,50 @@ async fn pre_process_client_request(
     if let Some(resource) = parse_request_path(requested_path) {
         match cache_layout::classify_request(&resource, &client) {
             Ok(class) => {
-                let mirror = Mirror::new(requested_host, requested_port, class.mirror_path);
-                let conn_details = ConnectionDetails {
-                    client,
-                    mirror,
-                    aliased_host,
-                    debname: class.debname,
-                    cached_flavor: class.cached_flavor,
-                    layout: class.layout,
-                };
-
-                if let Some(fields) = class.origin_fields {
-                    let origin = Origin {
-                        mirror: conn_details.mirror.clone(),
-                        distribution: fields.distribution,
-                        component: fields.component,
-                        architecture: fields.architecture,
+                // Per-host flat collision: if a structured mirror with
+                // `mirror_path == "flat"` (or `"flat/..."`) was registered
+                // on this host, the host-level `flat/` anchor is already
+                // claimed by structured caching.  Reject flat URLs on
+                // that host and fall through to the simple-proxy
+                // passthrough.
+                if class.layout.is_flat()
+                    && flat_blocklist::is_blocked(
+                        aliased_host.unwrap_or(&requested_host),
+                        requested_port,
+                    )
+                {
+                    warn_once_or_info!(
+                        "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing `{requested_path}` through uncached"
+                    );
+                } else {
+                    let mirror = Mirror::new(
+                        requested_host,
+                        requested_port,
+                        class.mirror_path,
+                        class.layout.mirror_kind(),
+                    );
+                    let conn_details = ConnectionDetails {
+                        client,
+                        mirror,
+                        aliased_host,
+                        debname: class.debname,
+                        cached_flavor: class.cached_flavor,
+                        layout: class.layout,
                     };
-                    let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                    send_db_command(cmd).await;
-                }
 
-                return process_cache_request(conn_details, req, appstate).await;
+                    if let Some(fields) = class.origin_fields {
+                        let origin = Origin {
+                            mirror: conn_details.mirror.clone(),
+                            distribution: fields.distribution,
+                            component: fields.component,
+                            architecture: fields.architecture,
+                        };
+                        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+                        send_db_command(cmd).await;
+                    }
+
+                    return process_cache_request(conn_details, req, appstate).await;
+                }
             }
             Err(cache_layout::ClassifyError::BadEncoding { kind, raw, source }) => {
                 warn_once_or_info!(
@@ -4119,7 +4143,6 @@ async fn main_loop(
         })?;
 
     database.init_tables().await.inspect_err(|err| {
-        metrics::DB_OPERATION_FAILED.increment();
         error!(
             "Error initializing database `{}`:  {err}",
             config.database_path.display()
@@ -4127,8 +4150,23 @@ async fn main_loop(
     })?;
 
     database.cleanup_invalid_rows().await.inspect_err(|err| {
-        metrics::DB_OPERATION_FAILED.increment();
         error!("Failed to clean up invalid database rows:  {err}");
+    })?;
+
+    // Seed the per-host flat-layout collision blocklist from any
+    // pre-existing structured mirrors whose `mirror_path` starts with
+    // `flat/` (or equals `flat`).  Those hosts get flat caching disabled
+    // — see `flat_blocklist` for the rationale.
+    //
+    // Both failure modes here are startup-fatal: a DB read error would
+    // leave the blocklist empty and silently re-allow flat caching at
+    // collision sites, and a double-init is a programmer error in main-
+    // loop ordering.  `.expect` panics with `{msg}: {err:?}`, so the
+    // panic line surfaces the specific `InitFailure` variant alongside
+    // the message (the DB error itself has already been logged inside
+    // `init`).
+    flat_blocklist::init(&database).await.inspect_err(|err| {
+        error!("Failed to load flat-collision mirrors at startup:  {err}");
     })?;
 
     // Database background task
@@ -4152,6 +4190,52 @@ async fn main_loop(
 
     // Process-local cache for cached-file ETag / Last-Modified xattrs.
     cache_metadata::init().expect("cache metadata store initialized once");
+
+    // Migration warning: scan the existing `mirrors_v2` rows for paths
+    // containing a `RESERVED_MIRROR_PATH_SEGMENTS` segment.  Pre-existing
+    // rows still load via `get_mirrors`, but the validator now rejects
+    // them on insert — flag them once at startup so an operator can
+    // investigate (cleanup walks against e.g. `<host>/by-hash` would
+    // otherwise collide with the layout plumbing for that mirror's
+    // sibling).
+    let mirrors = database.get_mirrors().await.inspect_err(|err| {
+        error!("Failed to scan mirrors for reserved-segment migration warning:  {err}");
+    })?;
+
+    for mirror in &mirrors {
+        if deb_mirror::mirror_path_has_reserved_segment(&mirror.path) {
+            warn!(
+                "Pre-existing mirror row `{}/{}` uses a reserved path segment (one of {:?}); cleanup walks may collide with cache plumbing - investigate and consider removing the row",
+                mirror.host,
+                mirror.path,
+                deb_mirror::RESERVED_MIRROR_PATH_SEGMENTS,
+            );
+        }
+    }
+
+    // Migration warning: the pre-fix flat layout cached every flat-repo
+    // file under `<cache>/<host>/<mirror_path>/flat/...`.  Post-fix lookups
+    // go to `<cache>/<host>/flat/<mirror_path>/...`, so those legacy
+    // directories are now unreachable disk waste.  Probe each registered
+    // mirror's legacy flat dir and warn so the operator can reclaim
+    // space; we deliberately do not remove anything automatically because
+    // a mis-configured alias change could otherwise wipe live cache.
+    for mirror in &mirrors {
+        let legacy_flat = config
+            .cache_directory
+            .join(mirror.cache_host().format_cache_dir(mirror.port()).as_ref())
+            .join(&mirror.path)
+            .join(cache_layout::SUBDIR_FLAT);
+        match tokio::fs::symlink_metadata(&legacy_flat).await {
+            Ok(md) if md.file_type().is_dir() => {
+                warn!(
+                    "Legacy pre-fix flat cache directory `{}` is now unreachable (flat files moved to `<host>/flat/<mirror_path>/`); inspect and remove to reclaim disk space",
+                    legacy_flat.display(),
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
 
     // Initial cache scan task
     {

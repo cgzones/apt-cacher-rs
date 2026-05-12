@@ -30,7 +30,7 @@ use crate::config::{DomainName, HttpsUpgradeMode};
 use crate::database_task::{
     DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
 };
-use crate::deb_mirror::{Mirror, Origin};
+use crate::deb_mirror::{Mirror, MirrorKind, Origin};
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::guards::{DownloadBarrier, InitBarrier};
 use crate::http_etag::{is_valid_etag, write_etag};
@@ -57,7 +57,7 @@ use crate::sendfile_conn::{
 };
 use crate::xattr_helpers;
 
-use crate::cache_layout::{CachedFlavor, ConnectionDetails};
+use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{
     self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_tempfile, touch_volatile_mtime,
@@ -3207,7 +3207,13 @@ async fn follow_redirect(
     upstream.unset_poolable();
 
     let moved_port = moved_uri.port_u16().and_then(NonZero::new);
-    let redirect_mirror = Mirror::new(moved_domain, moved_port, String::new());
+    // Redirect Mirror: used only for upstream dispatch/formatting; never persisted.
+    let redirect_mirror = Mirror::new(
+        moved_domain,
+        moved_port,
+        String::new(),
+        MirrorKind::Structured,
+    );
     let redirect_authority = redirect_mirror.format_authority();
     let redirect_path = moved_path;
 
@@ -3704,6 +3710,7 @@ async fn splice_proxy_drive(
         &status,
         &appstate.active_downloads,
         &conn_details.mirror,
+        conn_details.aliased_host,
         &conn_details.debname,
         conn_details.layout,
     );
@@ -4589,9 +4596,13 @@ async fn splice_proxy_drive(
                 SpliceProxyError::CacheError
             })?,
         utils::PartialDownload::Volatile => {
-            let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
-                .iter()
-                .collect();
+            let tmppath: PathBuf = [
+                &global_config().cache_directory,
+                Path::new(SUBDIR_TMP),
+                filename,
+            ]
+            .iter()
+            .collect();
             tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -5522,9 +5533,13 @@ async fn handle_volatile_buffered_download(
         "path construction must not contain absolute components"
     );
 
-    let tmppath: PathBuf = [&global_config().cache_directory, Path::new("tmp"), filename]
-        .iter()
-        .collect();
+    let tmppath: PathBuf = [
+        &global_config().cache_directory,
+        Path::new(SUBDIR_TMP),
+        filename,
+    ]
+    .iter()
+    .collect();
     let (mut tempfile, temppath) = tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
@@ -6218,6 +6233,7 @@ mod tests {
             DomainName::new("example.com".into()).unwrap(),
             None,
             String::new(),
+            MirrorKind::Structured,
         );
         assert_eq!(mirror_port(&mirror, false), 80);
         assert_eq!(mirror_port(&mirror, true), 443);
@@ -6229,6 +6245,7 @@ mod tests {
             DomainName::new("example.com".into()).unwrap(),
             Some(NonZero::new(8080).unwrap()),
             String::new(),
+            MirrorKind::Structured,
         );
         assert_eq!(mirror_port(&mirror, false), 8080);
         assert_eq!(mirror_port(&mirror, true), 8080);

@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n              SELECT host, port AS \"port: u16\", path\n              FROM mirrors_v2;\n        ",
+  "query": "\n              SELECT host, port AS \"port!: u16\", path\n              FROM mirrors_v2\n              WHERE kind = 0 AND (path = 'flat' OR path LIKE 'flat/%');\n            ",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Text"
       },
       {
-        "name": "port: u16",
+        "name": "port!: u16",
         "ordinal": 1,
         "type_info": "Integer"
       },
@@ -28,5 +28,5 @@
       false
     ]
   },
-  "hash": "5602bef216820e284175081acb486cb52b458ff54e90fa75edcc73387a8c9dd9"
+  "hash": "c0b087db0f5d6eae8c28ab13783a24169c895b73f182babb93154b35a382a628"
 }

@@ -1,5 +1,4 @@
 use std::{
-    ffi::OsString,
     io::ErrorKind,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     os::unix::fs::OpenOptionsExt as _,
@@ -24,16 +23,20 @@ use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 use crate::{
     AppState, ClientInfo, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
     cache_layout::{
-        CacheLayout, CachedFlavor, ConnectionDetails, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT,
-        SUBDIR_FLAT_BYHASH,
+        CacheLayout, CachedFlavor, ConnectionDetails, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH,
+        SUBDIR_TMP,
     },
     cache_metadata,
-    config::Config,
-    database::{MirrorEntry, OriginEntry},
-    deb_mirror::{Mirror, UriFormat as _, is_deb_package, mirror_cache_path_impl},
+    config::{Config, DomainName},
+    database::MirrorEntry,
+    deb_mirror::{
+        Mirror, UriFormat as _, is_deb_package, is_strict_path_descendant, mirror_cache_path_impl,
+        path_starts_with_segment,
+    },
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
     info_once, metrics, process_cache_request, task_cache_scan,
+    utils::probe_dir,
 };
 
 /// Delay between daemon startup and the first scheduled cleanup run.
@@ -61,6 +64,17 @@ pub(crate) fn next_cleanup_epoch() -> i64 {
     NEXT_CLEANUP_EPOCH.load(Ordering::Relaxed)
 }
 
+/// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
+/// Non-UTF-8 filenames are silently skipped: debnames are URL-decoded ASCII,
+/// so any non-UTF-8 path can't be in the metadata store to begin with.
+fn invalidate_metadata_for(path: &Path, mirror: &Mirror, layout: CacheLayout) {
+    if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
+        cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
+            mirror, debname, layout,
+        ));
+    }
+}
+
 async fn body_to_file(
     body: &mut ProxyCacheBody,
     file: tokio::fs::File,
@@ -84,9 +98,24 @@ async fn body_to_file(
     Ok(file)
 }
 
+async fn packages_body_to_memfd(
+    memfdname: &str,
+    body: &mut ProxyCacheBody,
+    config: &Config,
+) -> Result<tokio::fs::File, ProxyCacheError> {
+    let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
+        error!("Error creating in-memory file `{memfdname}`:  {err}");
+        ProxyCacheError::Memfd(err)
+    })?;
+    let file = tokio::fs::File::from_std(memfd.into_file());
+    body_to_file(body, file, config).await.inspect_err(|err| {
+        error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
+    })
+}
+
 async fn collect_cached_files(
     host_path: &Path,
-) -> Result<HashMap<OsString, PathBuf>, ProxyCacheError> {
+) -> Result<HashMap<String, PathBuf>, ProxyCacheError> {
     let mut ret = HashMap::new();
 
     let mut host_dir = match tokio::fs::read_dir(host_path).await {
@@ -97,22 +126,80 @@ async fn collect_cached_files(
 
     while let Some(entry) = host_dir.next_entry().await? {
         let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
         // Mirror `collect_flat_cached_debs`: structured Pool admits
         // `.deb`/`.udeb`/`.ddeb` (see `is_deb_package` in `deb_mirror.rs`),
         // so the cleanup scan must enumerate the same set.
-        if name.to_str().is_some_and(is_deb_package) {
-            ret.insert(name, entry.path());
+        if !is_deb_package(name_str) {
+            continue;
         }
+
+        // Use `file_type()` (lstat semantics) so a symlink planted in
+        // the cache by a hostile filesystem doesn't trick later
+        // `metadata()`/hash verification into following it outside the
+        // cache tree.  Matches `collect_flat_cached_debs`.
+        let file_type = match entry.file_type().await {
+            Ok(ft) => ft,
+            Err(err) => {
+                error!(
+                    "Failed to get file type of `{}`:  {err}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        ret.insert(name_str.to_owned(), entry.path());
     }
 
     Ok(ret)
 }
 
-/// Extract the basename from a `Filename:` line of a Debian Packages stanza.
-fn parse_filename_field(line: &str) -> Option<&std::ffi::OsStr> {
+/// Extract the `Filename:` field's relative-path value from a Debian
+/// `Packages` stanza line.  Returns the path verbatim (e.g.
+/// `pool/main/a/abc/abc_1.0_amd64.deb` for a structured archive, or
+/// `amd64/twilio_5.0.0_amd64.deb` for a flat repo with a sub-arch layout).
+///
+/// **Security**: rejects empty values, absolute paths, NUL bytes, backslash,
+/// and any segment equal to `..` or `.`.  An attacker-controlled upstream
+/// Packages stanza could otherwise inject a traversal sequence; rejecting
+/// here keeps the downstream `HashMap` key honest even if a later refactor
+/// joins it to a filesystem path.
+fn parse_filename_field(line: &str) -> Option<&str> {
     let line = line.trim();
     let filepath = line.strip_prefix("Filename: ")?;
-    Path::new(filepath).file_name()
+    if !is_safe_filename_relpath(filepath) {
+        return None;
+    }
+    Some(filepath)
+}
+
+/// `true` iff `s` is a safe relative path: non-empty, no leading `/`, no
+/// backslash, no ASCII control character (`< 0x20`, plus `0x7f` DEL), and
+/// every `/`-separated segment is non-empty and not `.` or `..`.
+fn is_safe_filename_relpath(s: &str) -> bool {
+    if s.is_empty() || s.starts_with('/') {
+        return false;
+    }
+    if s.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'\\') {
+        return false;
+    }
+    s.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// Derive the on-disk cache key for a structured-pool entry.  Structured
+/// pool URLs flatten the long `pool/main/<l>/<pkg>/` URL path to just the
+/// `.deb` basename on disk, so cleanup matches `Filename:` stanzas by the
+/// basename portion only.  Borrows from `relpath` to avoid allocating a
+/// fresh `String` per matched stanza.
+fn structured_lookup_key(relpath: &str) -> Option<&str> {
+    Path::new(relpath).file_name().and_then(|n| n.to_str())
 }
 
 /// Decode `hex` into exactly `N` bytes. Returns `None` on wrong length or any
@@ -208,7 +295,11 @@ struct ReduceContext<'a> {
 /// Accumulated state of the current Debian `Packages` stanza.
 #[derive(Debug)]
 struct Stanza {
-    filename: Option<OsString>,
+    /// Full relative-path value from the `Filename:` field, validated by
+    /// [`is_safe_filename_relpath`].  Structured cleanup derives the on-
+    /// disk lookup key from this via [`structured_lookup_key`]; flat
+    /// cleanup uses it verbatim.
+    filename: Option<String>,
     sha256: Option<[u8; 32]>,
     sha512: Option<[u8; 64]>,
 }
@@ -236,7 +327,7 @@ impl Stanza {
         if self.filename.is_none()
             && let Some(name) = parse_filename_field(line)
         {
-            self.filename = Some(name.to_os_string());
+            self.filename = Some(name.to_owned());
             return;
         }
         if self.sha256.is_none()
@@ -254,11 +345,15 @@ impl Stanza {
 
     /// Preferred (algo, expected-digest) pair: SHA256 wins, SHA512 is the
     /// fallback, `None` means the stanza advertised no usable checksum.
-    fn chosen(&self) -> Option<(HashAlgo, Vec<u8>)> {
-        if let Some(h) = self.sha256 {
-            Some((HashAlgo::Sha256, h.to_vec()))
+    /// Returns a borrow into the stanza so a hot Packages scan does not
+    /// allocate a fresh `Vec<u8>` per matched stanza.
+    fn chosen(&self) -> Option<(HashAlgo, &[u8])> {
+        if let Some(h) = self.sha256.as_ref() {
+            Some((HashAlgo::Sha256, h.as_slice()))
         } else {
-            self.sha512.map(|h| (HashAlgo::Sha512, h.to_vec()))
+            self.sha512
+                .as_ref()
+                .map(|h| (HashAlgo::Sha512, h.as_slice()))
         }
     }
 }
@@ -334,32 +429,56 @@ async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: Vec<u8>) -> 
     }
 }
 
-/// Process one stanza: if its `Filename:` basename matches a candidate
+/// Process one stanza: if its `Filename:` value resolves to a candidate
 /// cached file, verify the file content and either retain it (match), warn-
 /// and-retain it (no usable hash advertised, transient error, or concurrent
 /// rename race), or warn-and-evict it (genuine digest mismatch).
+///
+/// The `Filename:` field is a full relative path from the repo root.  For
+/// structured archives the on-disk cache flattens that to the basename, so
+/// the lookup key is the basename portion.  For flat archives the URL path
+/// is the on-disk path verbatim, so the lookup key is the relpath itself.
 async fn flush_stanza(
     stanza: &mut Stanza,
-    file_list: &mut HashMap<OsString, PathBuf>,
+    file_list: &mut HashMap<String, PathBuf>,
     ctx: &mut ReduceContext<'_>,
 ) {
-    let Some(filename) = stanza.filename.take() else {
-        stanza.reset();
+    process_stanza(stanza, file_list, ctx).await;
+    stanza.reset();
+}
+
+/// Body of [`flush_stanza`] split out so a single trailing `stanza.reset()`
+/// covers every exit path. Borrows `stanza` immutably; the caller is
+/// responsible for clearing it afterwards.
+async fn process_stanza(
+    stanza: &Stanza,
+    file_list: &mut HashMap<String, PathBuf>,
+    ctx: &mut ReduceContext<'_>,
+) {
+    let Some(filename) = stanza.filename.as_deref() else {
         return;
     };
-    let Some(path) = file_list.get(&filename).cloned() else {
-        stanza.reset();
+
+    let lookup_key: &str = if ctx.layout.is_flat() {
+        filename
+    } else {
+        let Some(key) = structured_lookup_key(filename) else {
+            return;
+        };
+        key
+    };
+
+    let Some(path) = file_list.get(lookup_key).cloned() else {
         return;
     };
 
     match stanza.chosen() {
         None => {
             warn!(
-                "Packages stanza for `{}` advertises no SHA256/SHA512; retaining cache file `{}` without verification",
-                Path::new(&filename).display(),
+                "Packages stanza for `{filename}` advertises no SHA256/SHA512; retaining cache file `{}` without verification",
                 path.display(),
             );
-            file_list.remove(&filename);
+            file_list.remove(lookup_key);
         }
         Some((algo, expected)) => {
             let pre_size = match tokio::fs::metadata(&path).await {
@@ -370,21 +489,18 @@ async fn flush_stanza(
                         path.display(),
                         algo.as_str(),
                     );
-                    file_list.remove(&filename);
-                    stanza.reset();
+                    file_list.remove(lookup_key);
                     return;
                 }
             };
-            match verify_cache_file(path.clone(), algo, expected.clone()).await {
-                Verdict::Match => {
-                    file_list.remove(&filename);
-                }
+            match verify_cache_file(path.clone(), algo, expected.to_vec()).await {
+                Verdict::Match => {}
                 Verdict::Mismatch { computed } => {
                     warn!(
                         "Cache file `{}` failed {} verification: expected={}, computed={}",
                         path.display(),
                         algo.as_str(),
-                        hex_encode(&expected),
+                        hex_encode(expected),
                         hex_encode(&computed),
                     );
                     if let Err(err) = tokio::fs::remove_file(&path).await {
@@ -393,18 +509,11 @@ async fn flush_stanza(
                             path.display()
                         );
                     } else {
-                        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-                            cache_metadata::store().invalidate(
-                                &cache_metadata::CacheMetadataKeyRef::new(
-                                    ctx.mirror, debname, ctx.layout,
-                                ),
-                            );
-                        }
+                        invalidate_metadata_for(&path, ctx.mirror, ctx.layout);
                         metrics::CLEANUP_CHECKSUM_MISMATCHES.increment();
                         *ctx.mismatch_files += 1;
                         *ctx.mismatch_bytes += pre_size;
                     }
-                    file_list.remove(&filename);
                 }
                 Verdict::Raced => {
                     warn!(
@@ -412,7 +521,6 @@ async fn flush_stanza(
                         path.display(),
                         algo.as_str(),
                     );
-                    file_list.remove(&filename);
                 }
                 Verdict::IoError(err) => {
                     error!(
@@ -420,12 +528,11 @@ async fn flush_stanza(
                         algo.as_str(),
                         path.display(),
                     );
-                    file_list.remove(&filename);
                 }
             }
+            file_list.remove(lookup_key);
         }
     }
-    stanza.reset();
 }
 
 #[derive(Clone, Copy)]
@@ -452,7 +559,7 @@ impl PackageFormat {
         self,
         file: tokio::fs::File,
         filename: &str,
-        file_list: &mut HashMap<OsString, PathBuf>,
+        file_list: &mut HashMap<String, PathBuf>,
         ctx: &mut ReduceContext<'_>,
         config: &Config,
     ) -> Result<(), ProxyCacheError> {
@@ -508,21 +615,25 @@ impl PackageFormat {
     }
 }
 
-async fn get_package_file(
+/// Try each of `.xz`, `.gz`, raw in turn — first format that returns 200 wins.
+/// Each request is a self-issued `process_cache_request` against `base_uri` +
+/// extension; the caller supplies the per-format `debname` and the
+/// `CacheLayout` under which to cache the result.
+async fn try_fetch_packages_file<F>(
     mirror: &Mirror,
-    origin: &OriginEntry,
+    base_uri: &str,
+    layout: CacheLayout,
+    debname_for: F,
     appstate: &AppState,
-) -> Result<(Response<ProxyCacheBody>, PackageFormat), StatusCode> {
-    let base_uri = origin.uri();
-    let distribution = &origin.distribution;
-    let component = &origin.component;
-    let architecture = &origin.architecture;
-
+) -> Result<(Response<ProxyCacheBody>, PackageFormat), StatusCode>
+where
+    F: Fn(PackageFormat) -> String,
+{
     let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
 
     for pkgfmt in [PackageFormat::Xz, PackageFormat::Gz, PackageFormat::Raw] {
         uri_buffer.clear();
-        uri_buffer.push_str(&base_uri);
+        uri_buffer.push_str(base_uri);
         uri_buffer.push_str(pkgfmt.extension());
         let uri = uri_buffer.as_str();
 
@@ -540,12 +651,9 @@ async fn get_package_file(
             ))),
             mirror: mirror.clone(),
             aliased_host: None,
-            debname: format!(
-                "{distribution}_{component}_{architecture}_Packages{}",
-                pkgfmt.extension()
-            ),
+            debname: debname_for(pkgfmt),
             cached_flavor: CachedFlavor::Volatile,
-            layout: CacheLayout::Dists,
+            layout,
         };
 
         let response = process_cache_request(conn_details, req, appstate.clone()).await;
@@ -569,6 +677,19 @@ async fn get_package_file(
     Err(StatusCode::NOT_FOUND)
 }
 
+/// RAII guard that releases the `task_cleanup` active flag on drop, so a
+/// panic inside `task_cleanup_impl` cannot leave the flag stuck `true`
+/// (which would block every subsequent scheduled run).
+struct ActiveGuard<'a>(&'a parking_lot::Mutex<bool>);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        let mut val = self.0.lock();
+        debug_assert!(*val, "cleanup state must be active after completion");
+        *val = false;
+    }
+}
+
 pub(crate) async fn task_cleanup(appstate: &AppState) -> Result<(), ProxyCacheError> {
     static TASK_ACTIVE: LazyLock<parking_lot::Mutex<bool>> =
         LazyLock::new(|| parking_lot::Mutex::new(false));
@@ -583,16 +704,9 @@ pub(crate) async fn task_cleanup(appstate: &AppState) -> Result<(), ProxyCacheEr
         }
         *val = true;
     }
+    let _guard = ActiveGuard(mutex);
 
-    let ret = task_cleanup_impl(appstate).await;
-
-    {
-        let mut val = mutex.lock();
-        assert!(*val, "cleanup state must be active after completion");
-        *val = false;
-    }
-
-    ret
+    task_cleanup_impl(appstate).await
 }
 
 async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
@@ -641,21 +755,66 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
 
     // Create a stream of futures for structured deb files, flat deb files,
     // and by-hash files cleanup.
-    let cleanup_tasks = mirrors.into_iter().flat_map(|mirror| {
-        [
-            tokio::task::spawn(cleanup_mirror_deb_files(
-                mirror.clone(),
-                appstate.clone(),
-                config,
-            )),
-            tokio::task::spawn(cleanup_mirror_flat_files(
-                mirror.clone(),
-                appstate.clone(),
-                config,
-            )),
-            tokio::task::spawn(cleanup_mirror_byhash_files(mirror, config)),
-        ]
-    });
+    //
+    // For each mirror, collect the paths of any other mirrors registered
+    // under the same alias-resolved (cache_host, port) whose path lives
+    // *inside* this mirror's path (segment-aligned).  The flat-cleanup
+    // walks the on-disk flat subtree recursively, and these nested mirror
+    // roots must be treated as boundaries so a parent mirror's cleanup
+    // does not age-evict files that belong to a nested mirror (which has
+    // its own Packages index and its own cleanup run).
+
+    // Group mirror paths by (host, port) and sort each group once so each
+    // mirror's nested-paths derivation is O(k) over its host's siblings
+    // instead of O(n) over every mirror.  Stored as borrows into `mirrors`.
+    let mut paths_by_host: HashMap<(&DomainName, u16), Vec<&str>> = HashMap::new();
+    for entry in &mirrors {
+        paths_by_host
+            .entry((&entry.host, entry.port().map_or(0, std::num::NonZero::get)))
+            .or_default()
+            .push(entry.path.as_str());
+    }
+    for paths in paths_by_host.values_mut() {
+        paths.sort_unstable();
+    }
+
+    // Materialise each mirror's nested-paths list to owned data so the
+    // `paths_by_host` borrow on `mirrors` can end before we consume
+    // `mirrors` in the per-future move below.
+    let nested_per_mirror: Vec<Vec<String>> = mirrors
+        .iter()
+        .map(|mirror| {
+            let host_paths = paths_by_host
+                .get(&(
+                    &mirror.host,
+                    mirror.port().map_or(0, std::num::NonZero::get),
+                ))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            derive_nested_paths(&mirror.path, host_paths)
+        })
+        .collect();
+    drop(paths_by_host);
+
+    let cleanup_tasks = mirrors
+        .into_iter()
+        .zip(nested_per_mirror)
+        .flat_map(|(mirror, nested)| {
+            [
+                tokio::task::spawn(cleanup_mirror_deb_files(
+                    mirror.clone(),
+                    appstate.clone(),
+                    config,
+                )),
+                tokio::task::spawn(cleanup_mirror_flat_files(
+                    mirror.clone(),
+                    nested,
+                    appstate.clone(),
+                    config,
+                )),
+                tokio::task::spawn(cleanup_mirror_byhash_files(mirror, config)),
+            ]
+        });
 
     let results = futures_util::stream::iter(cleanup_tasks)
         .buffer_unordered(MAX_CONCURRENT_CLEANUP_TASKS)
@@ -667,18 +826,14 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let mut bytes_removed = 0;
 
     for res in results {
-        let task_result = match res {
-            Ok(tr) => tr,
-            Err(err) => {
-                error!("Error joining cleanup task:  {err}");
+        let cleanup_result = match res {
+            Ok(Ok(cr)) => cr,
+            Ok(Err(err)) => {
+                error!("Error in cleanup task:  {err}");
                 continue;
             }
-        };
-
-        let cleanup_result = match task_result {
-            Ok(cr) => cr,
-            Err(err) => {
-                error!("Error in cleanup task:  {err}");
+            Err(join_err) => {
+                error!("Error joining cleanup task:  {join_err}");
                 continue;
             }
         };
@@ -740,6 +895,30 @@ struct CleanupDone {
     bytes_removed: u64,
 }
 
+impl CleanupDone {
+    fn empty(mirror: Mirror) -> Self {
+        Self::tally(mirror, 0, 0, 0)
+    }
+
+    fn retained_only(mirror: Mirror, retained: u64) -> Self {
+        Self {
+            mirror,
+            files_retained: retained,
+            files_removed: 0,
+            bytes_removed: 0,
+        }
+    }
+
+    fn tally(mirror: Mirror, total: u64, files_removed: u64, bytes_removed: u64) -> Self {
+        Self {
+            mirror,
+            files_retained: total.saturating_sub(files_removed),
+            files_removed,
+            bytes_removed,
+        }
+    }
+}
+
 async fn cleanup_mirror_deb_files(
     mirror: MirrorEntry,
     appstate: AppState,
@@ -794,19 +973,31 @@ async fn cleanup_mirror_deb_files(
     let mirror = mirror.into();
 
     if cached_files.is_empty() {
-        return Ok(CleanupDone {
-            mirror,
-            files_retained: num_total_files,
-            files_removed: 0,
-            bytes_removed: 0,
-        });
+        return Ok(CleanupDone::retained_only(mirror, num_total_files));
     }
 
     let mut mismatch_files: u64 = 0;
     let mut mismatch_bytes: u64 = 0;
 
     for origin in &active_origins {
-        let (mut response, pkgfmt) = match get_package_file(&mirror, origin, &appstate).await {
+        let base_uri = origin.uri();
+        let (mut response, pkgfmt) = match try_fetch_packages_file(
+            &mirror,
+            &base_uri,
+            CacheLayout::Dists,
+            |pkgfmt| {
+                format!(
+                    "{}_{}_{}_Packages{}",
+                    origin.distribution,
+                    origin.component,
+                    origin.architecture,
+                    pkgfmt.extension()
+                )
+            },
+            &appstate,
+        )
+        .await
+        {
             // A missing Packages file leaves us unable to complete the
             // reference set; deleting now risks wiping files referenced
             // only by this origin (typical when a distribution goes EOL
@@ -816,51 +1007,25 @@ async fn cleanup_mirror_deb_files(
                     "Could not fetch package file for {origin:?} ({status}); skipping cleanup for mirror {mirror}"
                 );
 
-                return Ok(CleanupDone {
+                return Ok(CleanupDone::tally(
                     mirror,
-                    files_retained: num_total_files - mismatch_files,
-                    files_removed: mismatch_files,
-                    bytes_removed: mismatch_bytes,
-                });
+                    num_total_files,
+                    mismatch_files,
+                    mismatch_bytes,
+                ));
             }
             Ok(r) => r,
         };
 
-        let memfdname = {
-            let total_len = origin.distribution.len()
-                + origin.component.len()
-                + origin.architecture.len()
-                + pkgfmt.extension().len()
-                + 3
-                + "packages".len();
-            let mut buffer = String::with_capacity(total_len);
+        let memfdname = format!(
+            "{}_{}_{}_packages{}",
+            origin.distribution,
+            origin.component,
+            origin.architecture,
+            pkgfmt.extension(),
+        );
 
-            buffer.push_str(&origin.distribution);
-            buffer.push('_');
-            buffer.push_str(&origin.component);
-            buffer.push('_');
-            buffer.push_str(&origin.architecture);
-            buffer.push('_');
-            buffer.push_str("packages");
-            buffer.push_str(pkgfmt.extension());
-
-            debug_assert_eq!(buffer.len(), total_len, "should pre-allocate correctly");
-
-            buffer
-        };
-
-        let memfd = MemfdOptions::new().create(&memfdname).map_err(|err| {
-            error!("Error creating in-memory file `{memfdname}`:  {err}");
-            ProxyCacheError::Memfd(err)
-        })?;
-
-        let file = tokio::fs::File::from_std(memfd.into_file());
-
-        let file = body_to_file(response.body_mut(), file, config)
-            .await
-            .inspect_err(|err| {
-                error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
-            })?;
+        let file = packages_body_to_memfd(&memfdname, response.body_mut(), config).await?;
 
         {
             let mut ctx = ReduceContext {
@@ -875,199 +1040,197 @@ async fn cleanup_mirror_deb_files(
         }
 
         if cached_files.is_empty() {
-            return Ok(CleanupDone {
+            return Ok(CleanupDone::tally(
                 mirror,
-                files_retained: num_total_files - mismatch_files,
-                files_removed: mismatch_files,
-                bytes_removed: mismatch_bytes,
-            });
-        }
-    }
-
-    let mut aged_files: u64 = 0;
-    let mut aged_bytes: u64 = 0;
-    let now = SystemTime::now();
-
-    for path in cached_files.values() {
-        let data = match tokio::fs::metadata(path).await {
-            Ok(d) => Some(d),
-            Err(err) => {
-                error!(
-                    "Error inspecting unreferenced file `{}`:  {err}",
-                    path.display()
-                );
-                None
-            }
-        };
-
-        /*
-         * File might be from an origin not yet registered.
-         * For example if `apt update` was run un-proxied.
-         */
-        if let Some(data) = &data {
-            let created = match data.created() {
-                Ok(d) => d,
-                Err(created_err) => {
-                    info_once!(
-                        "Failed to get create timestamp for file `{}`:  {created_err}",
-                        path.display()
-                    );
-                    match data.modified() {
-                        Ok(d) => d,
-                        Err(modified_err) => {
-                            error!(
-                                "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
-                                path.display()
-                            );
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            if let Ok(existing_for) = now.duration_since(created)
-                && existing_for < UNREFERENCED_KEEP_SPAN
-            {
-                debug!(
-                    "Keeping unreferenced file `{}` since it is too new ({}, threshold={})",
-                    path.display(),
-                    HumanFmt::Time(existing_for),
-                    HumanFmt::Time(UNREFERENCED_KEEP_SPAN)
-                );
-                continue;
-            }
-        }
-
-        let size = match &data {
-            Some(d) => d.len(),
-            None => 0,
-        };
-
-        if let Err(err) = tokio::fs::remove_file(&path).await {
-            error!(
-                "Error removing unreferenced file `{}`:  {err}",
-                path.display()
-            );
-            continue;
-        }
-
-        // Drop the post-flight ETag/Last-Modified entry so a re-cache
-        // starts clean.  A concurrent re-download finishing between
-        // `remove_file` and `invalidate` loses its fresh `set()`; the
-        // next request re-populates from xattr.  Non-UTF-8 filenames
-        // are opaque (debnames are URL-decoded ASCII; mismatches aren't
-        // in the map).
-        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
-                &mirror,
-                debname,
-                CacheLayout::StructuredPool,
+                num_total_files,
+                mismatch_files,
+                mismatch_bytes,
             ));
         }
-
-        debug!("Removed unreferenced file `{}`", path.display());
-
-        aged_bytes += size;
-        aged_files += 1;
     }
+
+    // Files left in `cached_files` are not referenced by any Packages
+    // stanza we fetched.  They may legitimately belong to an origin not
+    // yet observed by the proxy (e.g. `apt update` run un-proxied), so a
+    // grace period of `UNREFERENCED_KEEP_SPAN` keeps young files in place;
+    // older unreferenced files are reaped.
+    let (aged_files, aged_bytes) = sweep_aged_cached_debs(
+        &cached_files,
+        UNREFERENCED_KEEP_SPAN,
+        &mirror,
+        CacheLayout::StructuredPool,
+    )
+    .await;
 
     info!(
         "Removed {aged_files} unreferenced deb files for mirror {mirror} ({})",
         HumanFmt::Size(aged_bytes)
     );
 
-    let files_removed = mismatch_files + aged_files;
-    let bytes_removed = mismatch_bytes + aged_bytes;
-
-    Ok(CleanupDone {
+    Ok(CleanupDone::tally(
         mirror,
-        files_retained: num_total_files - files_removed,
-        files_removed,
-        bytes_removed,
-    })
+        num_total_files,
+        mismatch_files + aged_files,
+        mismatch_bytes + aged_bytes,
+    ))
 }
 
-/// Collect Debian binary packages (`.deb`, `.udeb`, `.ddeb`) from the flat
-/// subdirectory.  Metadata files (`InRelease`, `Packages*`, ...) and the
-/// `by-hash/` subtree are filtered out by the extension check.
+/// Derive the paths of mirrors registered under the same `(host, port)` that
+/// live *inside* `mirror_path` (segment-aligned), given the sorted list of
+/// sibling paths on that host (which may include `mirror_path` itself; self
+/// is filtered out by the segment-alignment check).
+///
+/// The empty-`mirror_path` case denotes a host-root mirror that nests every
+/// other path on the host.
+///
+/// Sorted input lets the lookup skip directly to the prefix region via
+/// `partition_point`.  Within that region, lexicographic order can still
+/// interleave non-nested neighbours (e.g. `debian-security` between `debian`
+/// and `debian/...` since `-` < `/` in ASCII), so segment alignment is
+/// enforced as a filter rather than a `take_while` terminator.
+#[must_use]
+fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<String> {
+    if mirror_path.is_empty() {
+        return host_paths_sorted
+            .iter()
+            .filter(|p| !p.is_empty())
+            .map(|p| (*p).to_owned())
+            .collect();
+    }
+    let start = host_paths_sorted.partition_point(|p| *p <= mirror_path);
+    host_paths_sorted[start..]
+        .iter()
+        .take_while(|p| p.starts_with(mirror_path))
+        .filter(|p| is_strict_path_descendant(p, mirror_path))
+        .map(|p| (*p).to_owned())
+        .collect()
+}
+
+/// Whether the on-disk position `candidate` (the mirror-path-equivalent of
+/// a subdir reached during recursion) sits at or inside a registered nested
+/// mirror's root.  Match semantics are segment-aligned:
+///
+/// - `apt/amd64` matches the registered root `apt/amd64` (equality).
+/// - `apt/amd64/foo` matches the registered root `apt/amd64` (descendant —
+///   the walker has already entered the nested subtree).
+/// - `apt/amd64` does **not** match the registered root `apt/amd64/special`:
+///   recursion must continue into `apt/amd64` so the walker can reach the
+///   real boundary at `apt/amd64/special`.
+/// - `apt-tools` does not match the registered root `apt` (segment-aligned,
+///   not a byte prefix).
+#[must_use]
+fn is_nested_mirror_boundary(candidate: &str, nested_mirror_paths: &[String]) -> bool {
+    nested_mirror_paths
+        .iter()
+        .any(|p| path_starts_with_segment(candidate, p))
+}
+
+/// Collect Debian binary packages (`.deb`, `.udeb`, `.ddeb`) under a flat
+/// repository root, recursing into any sub-directories.  Keys are paths
+/// relative to `flat_root`, forward-slash joined to match the `Filename:`
+/// stanza syntax.  Metadata files, the `by-hash/` subtree, the `tmp/`
+/// partial-download dir, and symlinks are skipped.
+///
+/// `mirror_path` is the path of the mirror being cleaned (e.g. `apt`);
+/// `nested_mirror_paths` lists paths of other registered mirrors under the
+/// same host that live *inside* `mirror_path` (e.g. `apt/amd64`).  When the
+/// recursion reaches a directory that is itself the root of (or contains) a
+/// nested mirror, the subtree is skipped — that mirror has its own Packages
+/// index and its own cleanup run, so the parent must not own those files.
 async fn collect_flat_cached_debs(
-    flat_path: &Path,
-) -> Result<HashMap<OsString, PathBuf>, ProxyCacheError> {
+    flat_root: &Path,
+    mirror_path: &str,
+    nested_mirror_paths: &[String],
+) -> Result<HashMap<String, PathBuf>, ProxyCacheError> {
     let mut ret = HashMap::new();
+    let mut stack: Vec<(PathBuf, String)> = vec![(flat_root.to_path_buf(), String::new())];
 
-    let mut dir = match tokio::fs::read_dir(flat_path).await {
-        Ok(d) => d,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(ret),
-        Err(err) => return Err(ProxyCacheError::Io(err)),
-    };
+    while let Some((current, rel_prefix)) = stack.pop() {
+        let mut dir = match tokio::fs::read_dir(&current).await {
+            Ok(d) => d,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(ProxyCacheError::Io(err)),
+        };
 
-    while let Some(entry) = dir.next_entry().await? {
-        let name = entry.file_name();
-        if name.to_str().is_some_and(is_deb_package) {
-            ret.insert(name, entry.path());
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+
+            // Use `file_type()` (lstat semantics) so a symlink planted in
+            // the cache by a hostile filesystem doesn't trick us into
+            // walking outside the cache tree.
+            let file_type = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(err) => {
+                    error!(
+                        "Failed to get file type of `{}`:  {err}",
+                        entry.path().display()
+                    );
+                    continue;
+                }
+            };
+
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                // Skip the by-hash subtree (handled by the by-hash
+                // cleanup), the tmp partial-download dir, and recurse
+                // everything else.
+                if name == SUBDIR_FLAT_BYHASH || name == SUBDIR_TMP {
+                    continue;
+                }
+                let child_rel = if rel_prefix.is_empty() {
+                    name_str.to_owned()
+                } else {
+                    format!("{rel_prefix}/{name_str}")
+                };
+
+                // Translate the on-disk position back to a mirror-path
+                // equivalent (`<mirror_path>/<child_rel>`) so it can be
+                // compared against the registered nested mirror paths.
+                // Hits delimit a boundary: the nested mirror owns
+                // everything inside, so do not descend.
+                let owned_full;
+                let candidate_full: &str = if mirror_path.is_empty() {
+                    child_rel.as_str()
+                } else {
+                    owned_full = format!("{mirror_path}/{child_rel}");
+                    owned_full.as_str()
+                };
+                if is_nested_mirror_boundary(candidate_full, nested_mirror_paths) {
+                    trace!(
+                        "Skipping `{}` during flat cleanup: nested mirror root for `{candidate_full}`",
+                        entry.path().display(),
+                    );
+                    continue;
+                }
+
+                stack.push((entry.path(), child_rel));
+                continue;
+            }
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            if !is_deb_package(name_str) {
+                continue;
+            }
+
+            let key = if rel_prefix.is_empty() {
+                name_str.to_owned()
+            } else {
+                format!("{rel_prefix}/{name_str}")
+            };
+            ret.insert(key, entry.path());
         }
     }
 
     Ok(ret)
-}
-
-/// Fetch the flat Packages file for a mirror, trying `Packages.xz`,
-/// `Packages.gz`, then raw `Packages`.  Mirrors `get_package_file` but for the
-/// dist/comp/arch-less flat layout.
-async fn get_flat_packages_file(
-    mirror: &Mirror,
-    appstate: &AppState,
-) -> Result<(Response<ProxyCacheBody>, PackageFormat), StatusCode> {
-    let authority = mirror.format_authority();
-    let mirror_path = mirror.path();
-    let base_uri = format!("http://{authority}/{mirror_path}/Packages");
-
-    let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
-
-    for pkgfmt in [PackageFormat::Xz, PackageFormat::Gz, PackageFormat::Raw] {
-        uri_buffer.clear();
-        uri_buffer.push_str(&base_uri);
-        uri_buffer.push_str(pkgfmt.extension());
-        let uri = uri_buffer.as_str();
-
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .header(CACHE_CONTROL, "max-age=604800") // 1 week
-            .body(Empty::new())
-            .expect("Request should be valid");
-
-        let conn_details = ConnectionDetails {
-            client: ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(127, 0, 0, 2),
-                0,
-            ))),
-            mirror: mirror.clone(),
-            aliased_host: None,
-            debname: format!("Packages{}", pkgfmt.extension()),
-            cached_flavor: CachedFlavor::Volatile,
-            layout: CacheLayout::Flat,
-        };
-
-        let response = process_cache_request(conn_details, req, appstate.clone()).await;
-
-        if response.status() == StatusCode::NOT_FOUND {
-            debug!("Cleanup request {uri} not found");
-            continue;
-        }
-
-        if response.status() != StatusCode::OK {
-            warn!(
-                "Cleanup request {uri} failed with status code {}:  {response:?}",
-                response.status(),
-            );
-            return Err(response.status());
-        }
-
-        return Ok((response, pkgfmt));
-    }
-
-    Err(StatusCode::NOT_FOUND)
 }
 
 /// Remove cached deb files in `cached_files` that are older than `keep_span`,
@@ -1078,7 +1241,7 @@ async fn get_flat_packages_file(
 /// when the Packages index is unfetchable (long span, since we cannot tell
 /// which entries are still referenced).
 async fn sweep_aged_cached_debs(
-    cached_files: &HashMap<OsString, PathBuf>,
+    cached_files: &HashMap<String, PathBuf>,
     keep_span: Duration,
     mirror: &Mirror,
     layout: CacheLayout,
@@ -1130,21 +1293,14 @@ async fn sweep_aged_cached_debs(
             }
         }
 
-        let size = match &data {
-            Some(d) => d.len(),
-            None => 0,
-        };
+        let size = data.as_ref().map_or(0, std::fs::Metadata::len);
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
             error!("Error removing cached file `{}`:  {err}", path.display());
             continue;
         }
 
-        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
-                mirror, debname, layout,
-            ));
-        }
+        invalidate_metadata_for(path, mirror, layout);
 
         debug!("Removed cached file `{}`", path.display());
 
@@ -1157,31 +1313,24 @@ async fn sweep_aged_cached_debs(
 
 async fn cleanup_mirror_flat_files(
     mirror: MirrorEntry,
+    nested_mirror_paths: Vec<String>,
     appstate: AppState,
     config: &Config,
 ) -> Result<CleanupDone, ProxyCacheError> {
-    let mirror_cache_path = mirror.cache_path();
-    let flat_path: PathBuf = [
-        &config.cache_directory,
-        &mirror_cache_path,
-        Path::new(SUBDIR_FLAT),
-    ]
-    .iter()
-    .collect();
+    // Under the host-anchored flat layout, a mirror's flat root lives at
+    // `<cache>/<host>/flat/<mirror_path>/` — sibling of the host-level
+    // structured tree at `<cache>/<host>/<mirror_path>/`.  `flat_root_path`
+    // resolves the alias-main host, matching `ConnectionDetails::cache_dir_path`.
+    let flat_path = mirror.flat_root_path(&config.cache_directory);
 
-    // Probe: skip mirrors that have no flat subtree.  Flat-only mirrors are
-    // discovered through the regular `get_mirrors` query because every served
-    // file (including the first flat .deb) writes a Delivery row that
-    // upserts the mirror id.
-    match tokio::fs::metadata(&flat_path).await {
-        Ok(_) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            return Ok(CleanupDone {
-                mirror: mirror.into(),
-                files_retained: 0,
-                files_removed: 0,
-                bytes_removed: 0,
-            });
+    // Probe: skip mirrors that have no flat subtree.  Most `mirrors_v2`
+    // rows are structured-only; touching them every cleanup cycle would
+    // be wasted work.  Only mirrors that have served at least one flat
+    // resource have a `<host>/flat/<mirror_path>/` dir on disk.
+    match probe_dir(&flat_path, "flat cleanup").await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(CleanupDone::empty(mirror.into()));
         }
         Err(err) => {
             error!(
@@ -1192,7 +1341,7 @@ async fn cleanup_mirror_flat_files(
         }
     }
 
-    let mut cached_files = collect_flat_cached_debs(&flat_path)
+    let mut cached_files = collect_flat_cached_debs(&flat_path, &mirror.path, &nested_mirror_paths)
         .await
         .inspect_err(|err| {
             error!("Error listing files in `{}`:  {err}", flat_path.display());
@@ -1208,15 +1357,23 @@ async fn cleanup_mirror_flat_files(
     );
 
     if cached_files.is_empty() {
-        return Ok(CleanupDone {
-            mirror,
-            files_retained: num_total_files,
-            files_removed: 0,
-            bytes_removed: 0,
-        });
+        return Ok(CleanupDone::retained_only(mirror, num_total_files));
     }
 
-    let (mut response, pkgfmt) = match get_flat_packages_file(&mirror, &appstate).await {
+    let base_uri = format!(
+        "http://{}/{}/Packages",
+        mirror.format_authority(),
+        mirror.path()
+    );
+    let (mut response, pkgfmt) = match try_fetch_packages_file(
+        &mirror,
+        &base_uri,
+        CacheLayout::Flat,
+        |pkgfmt| format!("Packages{}", pkgfmt.extension()),
+        &appstate,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(status) => {
             // Flat caching can mint a `MirrorEntry` for any nested deb URL
@@ -1236,29 +1393,18 @@ async fn cleanup_mirror_flat_files(
                 "Removed {files_removed} aged flat deb files for mirror {mirror} ({})",
                 HumanFmt::Size(bytes_removed)
             );
-            return Ok(CleanupDone {
+            return Ok(CleanupDone::tally(
                 mirror,
-                files_retained: num_total_files - files_removed,
+                num_total_files,
                 files_removed,
                 bytes_removed,
-            });
+            ));
         }
     };
 
     let memfdname = format!("flat_packages{}", pkgfmt.extension());
 
-    let memfd = MemfdOptions::new().create(&memfdname).map_err(|err| {
-        error!("Error creating in-memory file `{memfdname}`:  {err}");
-        ProxyCacheError::Memfd(err)
-    })?;
-
-    let file = tokio::fs::File::from_std(memfd.into_file());
-
-    let file = body_to_file(response.body_mut(), file, config)
-        .await
-        .inspect_err(|err| {
-            error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
-        })?;
+    let file = packages_body_to_memfd(&memfdname, response.body_mut(), config).await?;
 
     let mut mismatch_files: u64 = 0;
     let mut mismatch_bytes: u64 = 0;
@@ -1275,12 +1421,12 @@ async fn cleanup_mirror_flat_files(
     }
 
     if cached_files.is_empty() {
-        return Ok(CleanupDone {
+        return Ok(CleanupDone::tally(
             mirror,
-            files_retained: num_total_files - mismatch_files,
-            files_removed: mismatch_files,
-            bytes_removed: mismatch_bytes,
-        });
+            num_total_files,
+            mismatch_files,
+            mismatch_bytes,
+        ));
     }
 
     let (aged_files, aged_bytes) = sweep_aged_cached_debs(
@@ -1291,20 +1437,17 @@ async fn cleanup_mirror_flat_files(
     )
     .await;
 
-    let files_removed = mismatch_files + aged_files;
-    let bytes_removed = mismatch_bytes + aged_bytes;
-
     info!(
         "Removed {aged_files} unreferenced flat deb files for mirror {mirror} ({})",
         HumanFmt::Size(aged_bytes)
     );
 
-    Ok(CleanupDone {
+    Ok(CleanupDone::tally(
         mirror,
-        files_retained: num_total_files - files_removed,
-        files_removed,
-        bytes_removed,
-    })
+        num_total_files,
+        mismatch_files + aged_files,
+        mismatch_bytes + aged_bytes,
+    ))
 }
 
 /// Result of a single by-hash directory walk.
@@ -1313,6 +1456,18 @@ struct ByHashStats {
     files_retained: u64,
     files_removed: u64,
     bytes_removed: u64,
+}
+
+impl ByHashStats {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "other is not needed after accumulation"
+    )]
+    fn accumulate(&mut self, other: Self) {
+        self.files_retained += other.files_retained;
+        self.files_removed += other.files_removed;
+        self.bytes_removed += other.bytes_removed;
+    }
 }
 
 /// Walk a single by-hash directory, removing entries older than `keep_span`.
@@ -1331,15 +1486,18 @@ async fn cleanup_byhash_dir(
 ) -> Result<ByHashStats, ProxyCacheError> {
     let mut stats = ByHashStats::default();
 
+    // No upfront `probe_dir`: `read_dir` returns NotFound when the per-
+    // layout by-hash root is absent (the common case for structured-only
+    // or flat-only mirrors), so the cheap path is one syscall.  Symlink
+    // hardening is performed per-entry inside the loop, which already
+    // uses `file_type()` (lstat semantics); the only difference would be
+    // a symlinked *root*, which is one directory shallower than where an
+    // attacker could plant anything useful given the cache tree's
+    // invariants (mirror_path is validated and the parent dirs are
+    // created by the daemon).
     let mut byhash_dir = match tokio::fs::read_dir(byhash_path).await {
         Ok(d) => d,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            debug!(
-                "Directory `{}` not found. Cleanup skipped.",
-                byhash_path.display()
-            );
-            return Ok(stats);
-        }
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(stats),
         Err(err) => {
             error!(
                 "Error traversing directory `{}`:  {}",
@@ -1354,6 +1512,24 @@ async fn cleanup_byhash_dir(
         let path = entry.path();
 
         if path.file_name().is_none() {
+            continue;
+        }
+
+        // Inner-loop lstat: a symlink in a by-hash dir is suspicious
+        // since these files are content-addressed; skip without
+        // following.
+        let file_type = match entry.file_type().await {
+            Ok(ft) => ft,
+            Err(err) => {
+                error!("Failed to get file type of `{}`:  {err}", path.display());
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            warn!(
+                "Skipping symlink in by-hash directory: `{}`",
+                path.display()
+            );
             continue;
         }
 
@@ -1408,11 +1584,7 @@ async fn cleanup_byhash_dir(
             continue;
         }
 
-        if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-            cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
-                mirror, debname, layout,
-            ));
-        }
+        invalidate_metadata_for(&path, mirror, layout);
 
         stats.bytes_removed += metadata.len();
         stats.files_removed += 1;
@@ -1428,27 +1600,47 @@ async fn cleanup_mirror_byhash_files(
 ) -> Result<CleanupDone, ProxyCacheError> {
     let now = SystemTime::now();
     let keep_span = Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get());
-    let mirror_cache_path = mirror.cache_path();
+
+    // Build both by-hash paths up front so the subsequent `mirror.into()`
+    // move can hand the owned `Mirror` to `cleanup_byhash_dir` without
+    // forcing extra owned-copy/clone of derived path data.
+    let dists_byhash: PathBuf = [
+        config.cache_directory.as_path(),
+        mirror.cache_path().as_path(),
+        Path::new(SUBDIR_DISTS_BYHASH),
+    ]
+    .iter()
+    .collect();
+    let flat_byhash = mirror
+        .flat_root_path(&config.cache_directory)
+        .join(SUBDIR_FLAT_BYHASH);
     let mirror: Mirror = mirror.into();
 
     let mut total = ByHashStats::default();
 
-    // Walk both the structured (`dists/by-hash`) and flat (`flat/by-hash`)
-    // layouts.  Each call short-circuits on `NotFound`, so a mirror with only
-    // one layout pays only a stat call for the missing one.
-    for (sub, layout) in [
-        (SUBDIR_DISTS_BYHASH, CacheLayout::DistsByHash),
-        (SUBDIR_FLAT_BYHASH, CacheLayout::FlatByHash),
-    ] {
-        let path: PathBuf = [&config.cache_directory, &mirror_cache_path, Path::new(sub)]
-            .iter()
-            .collect();
+    // Walk the structured (`<host>/<mirror>/dists/by-hash/`) by-hash tree.
+    total.accumulate(
+        cleanup_byhash_dir(
+            &dists_byhash,
+            keep_span,
+            now,
+            &mirror,
+            CacheLayout::DistsByHash,
+        )
+        .await?,
+    );
 
-        let stats = cleanup_byhash_dir(&path, keep_span, now, &mirror, layout).await?;
-        total.files_retained += stats.files_retained;
-        total.files_removed += stats.files_removed;
-        total.bytes_removed += stats.bytes_removed;
-    }
+    // Walk the flat (`<host>/flat/<mirror_path>/by-hash/`) by-hash tree.
+    total.accumulate(
+        cleanup_byhash_dir(
+            &flat_byhash,
+            keep_span,
+            now,
+            &mirror,
+            CacheLayout::FlatByHash,
+        )
+        .await?,
+    );
 
     info!(
         "Removed {} files acquired by-hash for mirror {mirror} ({})",
@@ -1468,17 +1660,28 @@ async fn cleanup_mirror_byhash_files(
 ///
 /// Iterates known mirror directories directly (rather than walking the entire
 /// cache tree) and delegates to [`cleanup_tmp_dir`] for the per-directory
-/// policy.
+/// policy.  Both layout branches are probed — structured at
+/// `<cache>/<host>/<mirror_path>/tmp/` and flat at
+/// `<cache>/<host>/flat/<mirror_path>/tmp/` — unconditionally rather than
+/// gated on the row's `kind` column: that column latches to `Structured`
+/// once any structured request arrives for a row, so a `kind = Structured`
+/// row can still own legacy flat partials from before the collision was
+/// seen.
+/// Each branch short-circuits on `NotFound`, so the wasted-stat cost on
+/// single-shape mirrors is one syscall per cleanup cycle.
 async fn cleanup_stale_partials(cache_dir: &Path, mirrors: &[MirrorEntry]) {
     let now = SystemTime::now();
     let mut removed = 0u64;
 
     for mirror in mirrors {
-        let mirror_dir = mirror_cache_path_impl(&mirror.host, mirror.port(), &mirror.path);
-        let tmp_dir: PathBuf = [cache_dir, mirror_dir.as_path(), Path::new("tmp")]
+        let mirror_dir = mirror_cache_path_impl(mirror.cache_host(), mirror.port(), &mirror.path);
+        let structured_tmp: PathBuf = [cache_dir, mirror_dir.as_path(), Path::new(SUBDIR_TMP)]
             .iter()
             .collect();
-        removed += cleanup_tmp_dir(&tmp_dir, now).await;
+        removed += cleanup_tmp_dir(&structured_tmp, now).await;
+
+        let flat_tmp = mirror.flat_root_path(cache_dir).join(SUBDIR_TMP);
+        removed += cleanup_tmp_dir(&flat_tmp, now).await;
     }
 
     if removed > 0 {
@@ -1600,13 +1803,88 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
+
+    fn sorted(paths: &[&'static str]) -> Vec<&'static str> {
+        let mut v = paths.to_vec();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn derive_nested_paths_basic_nesting() {
+        let host = sorted(&["debian", "debian/security", "debian/x/y", "unrelated"]);
+        assert_eq!(
+            derive_nested_paths("debian", &host),
+            vec!["debian/security".to_owned(), "debian/x/y".to_owned()]
+        );
+    }
+
+    #[test]
+    fn derive_nested_paths_skips_non_segment_aligned_prefix_neighbour() {
+        // `debian-security` sorts between `debian` and `debian/...` (`-` < `/`)
+        // but is not a nested child; the segment-alignment filter must keep
+        // the take_while running past it instead of stopping early.
+        let host = sorted(&["debian", "debian-security", "debian/foo", "debian/security"]);
+        assert_eq!(
+            derive_nested_paths("debian", &host),
+            vec!["debian/foo".to_owned(), "debian/security".to_owned()]
+        );
+    }
+
+    #[test]
+    fn derive_nested_paths_empty_mirror_path_nests_all_others() {
+        let host = sorted(&["", "debian", "debian/security"]);
+        assert_eq!(
+            derive_nested_paths("", &host),
+            vec!["debian".to_owned(), "debian/security".to_owned()]
+        );
+    }
+
+    #[test]
+    fn derive_nested_paths_excludes_self() {
+        let host = sorted(&["debian"]);
+        assert!(derive_nested_paths("debian", &host).is_empty());
+    }
+
+    #[test]
+    fn derive_nested_paths_no_match() {
+        let host = sorted(&["apt", "debian"]);
+        assert!(derive_nested_paths("ubuntu", &host).is_empty());
+    }
+
+    #[test]
+    fn is_nested_mirror_boundary_equality_match() {
+        let nested = vec!["apt/amd64".to_owned()];
+        assert!(is_nested_mirror_boundary("apt/amd64", &nested));
+    }
+
+    #[test]
+    fn is_nested_mirror_boundary_descendant_inside_nested_subtree() {
+        let nested = vec!["apt/amd64".to_owned()];
+        assert!(is_nested_mirror_boundary("apt/amd64/foo", &nested));
+    }
+
+    #[test]
+    fn is_nested_mirror_boundary_ancestor_must_recurse() {
+        // Regression guard against the reversed-argument bug: a candidate
+        // that is a strict ancestor of a registered nested root is NOT a
+        // boundary — the walker has to continue down to reach the real
+        // nested root.
+        let nested = vec!["apt/amd64/special".to_owned()];
+        assert!(!is_nested_mirror_boundary("apt/amd64", &nested));
+    }
+
+    #[test]
+    fn is_nested_mirror_boundary_segment_aligned_non_match() {
+        let nested = vec!["apt".to_owned()];
+        assert!(!is_nested_mirror_boundary("apt-tools", &nested));
+    }
 
     #[test]
     fn parse_filename_field_strips_lf() {
         assert_eq!(
             parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n"),
-            Some(OsStr::new("abc_1.0_amd64.deb")),
+            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
         );
     }
 
@@ -1614,7 +1892,7 @@ mod tests {
     fn parse_filename_field_strips_crlf() {
         assert_eq!(
             parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb\r\n"),
-            Some(OsStr::new("abc_1.0_amd64.deb")),
+            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
         );
     }
 
@@ -1622,7 +1900,7 @@ mod tests {
     fn parse_filename_field_no_terminator() {
         assert_eq!(
             parse_filename_field("Filename: pool/main/a/abc/abc_1.0_amd64.deb"),
-            Some(OsStr::new("abc_1.0_amd64.deb")),
+            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
         );
     }
 
@@ -1630,7 +1908,17 @@ mod tests {
     fn parse_filename_field_handles_udeb_extension() {
         assert_eq!(
             parse_filename_field("Filename: pool/main/i/inst/inst_1.0_amd64.udeb\n"),
-            Some(OsStr::new("inst_1.0_amd64.udeb")),
+            Some("pool/main/i/inst/inst_1.0_amd64.udeb"),
+        );
+    }
+
+    #[test]
+    fn parse_filename_field_returns_nested_relpath_for_flat() {
+        // Flat repos cite paths relative to the repo root; cleanup needs
+        // to disambiguate same-basename debs across sub-directories.
+        assert_eq!(
+            parse_filename_field("Filename: amd64/twilio-cli_5.0.0_amd64.deb\n"),
+            Some("amd64/twilio-cli_5.0.0_amd64.deb"),
         );
     }
 
@@ -1639,6 +1927,47 @@ mod tests {
         assert_eq!(parse_filename_field("Package: stub\n"), None);
         assert_eq!(parse_filename_field("\n"), None);
         assert_eq!(parse_filename_field(""), None);
+    }
+
+    #[test]
+    fn parse_filename_field_rejects_traversal() {
+        // Path-traversal hardening: an attacker-controlled upstream
+        // Packages stanza must not be able to inject `..` segments or
+        // absolute paths that could later be joined to a filesystem path.
+        assert_eq!(
+            parse_filename_field("Filename: ../../../etc/passwd\n"),
+            None,
+        );
+        assert_eq!(parse_filename_field("Filename: pool/../escape.deb\n"), None);
+        assert_eq!(parse_filename_field("Filename: /etc/shadow\n"), None);
+        assert_eq!(parse_filename_field("Filename: ./foo.deb\n"), None);
+        assert_eq!(parse_filename_field("Filename: a//b.deb\n"), None);
+        assert_eq!(
+            parse_filename_field("Filename: pool\\main\\evil.deb\n"),
+            None,
+        );
+        // NUL byte rejection — Rust strings allow `\0`; rust source uses
+        // an explicit escape to materialise the test input.
+        assert_eq!(parse_filename_field("Filename: pool/x\0y.deb\n"), None,);
+        // Other ASCII control characters (tab, vertical tab, bare CR/LF
+        // embedded mid-segment, etc.) are likewise rejected so they can
+        // never reach a downstream HashMap lookup or future filesystem
+        // join.
+        assert_eq!(parse_filename_field("Filename: pool/x\ty.deb\n"), None);
+        assert_eq!(parse_filename_field("Filename: pool/x\x0by.deb\n"), None);
+        assert_eq!(parse_filename_field("Filename: pool/x\x7fy.deb\n"), None);
+    }
+
+    #[test]
+    fn structured_lookup_key_extracts_basename() {
+        assert_eq!(
+            structured_lookup_key("pool/main/a/abc/abc_1.0_amd64.deb"),
+            Some("abc_1.0_amd64.deb"),
+        );
+        assert_eq!(
+            structured_lookup_key("abc_1.0_amd64.deb"),
+            Some("abc_1.0_amd64.deb"),
+        );
     }
 
     #[test]
@@ -1702,8 +2031,11 @@ mod tests {
         let mut s = Stanza::new();
         s.ingest("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n");
         s.ingest(&format!("SHA256: {}\n", hex_encode(&[0xab; 32])));
-        assert_eq!(s.filename.as_deref(), Some(OsStr::new("abc_1.0_amd64.deb")));
-        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, vec![0xab; 32])));
+        assert_eq!(
+            s.filename.as_deref(),
+            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
+        );
+        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0xab; 32].as_slice())));
     }
 
     #[test]
@@ -1711,14 +2043,20 @@ mod tests {
         let mut s = Stanza::new();
         s.sha256 = Some([0x11u8; 32]);
         s.sha512 = Some([0x22u8; 64]);
-        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, vec![0x11u8; 32])));
+        assert_eq!(
+            s.chosen(),
+            Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
+        );
     }
 
     #[test]
     fn stanza_chosen_falls_back_to_sha512() {
         let mut s = Stanza::new();
         s.sha512 = Some([0x33u8; 64]);
-        assert_eq!(s.chosen(), Some((HashAlgo::Sha512, vec![0x33u8; 64])));
+        assert_eq!(
+            s.chosen(),
+            Some((HashAlgo::Sha512, [0x33u8; 64].as_slice()))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n              SELECT id AS \"id!: i64\", host, port AS \"port!: u16\", path\n              FROM mirrors_v2;\n            ",
+  "query": "\n              SELECT id AS \"id!: i64\", host, port AS \"port!: u16\", path, kind AS \"kind!: i64\"\n              FROM mirrors_v2;\n            ",
   "describe": {
     "columns": [
       {
@@ -22,17 +22,23 @@
         "name": "path",
         "ordinal": 3,
         "type_info": "Text"
+      },
+      {
+        "name": "kind!: i64",
+        "ordinal": 4,
+        "type_info": "Integer"
       }
     ],
     "parameters": {
       "Right": 0
     },
     "nullable": [
-      true,
+      false,
+      false,
       false,
       false,
       false
     ]
   },
-  "hash": "70ae77ca749abb29f8b95430d86ced04a470224d9d1e12204ae85b17dfba561e"
+  "hash": "28059a041ec73c34bcfa0aa99bc12b0bd2981461d13fc31b35c09f4310e82e98"
 }

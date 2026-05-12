@@ -313,6 +313,22 @@ pub(crate) struct Alias {
     pub(crate) aliases: Vec<DomainName>,
 }
 
+/// Resolve `host` through `aliases` to the on-disk host identity used by
+/// `ConnectionDetails::cache_dir_path`. Returns the alias `main` host when
+/// `host` is a registered alias, else `host` itself. State keyed on the
+/// cache-dir identity (e.g. the flat-collision blocklist) must resolve
+/// through this so multiple aliases pointing at the same `main` share keys.
+///
+/// `aliases[].aliases` is sorted at config load (see `Config::parse`), so
+/// the inner lookup is a binary search.
+#[must_use]
+pub(crate) fn resolve_cache_host<'a>(aliases: &'a [Alias], host: &'a DomainName) -> &'a DomainName {
+    aliases
+        .iter()
+        .find(|alias| alias.aliases.binary_search(host).is_ok())
+        .map_or(host, |alias| &alias.main)
+}
+
 #[derive(Debug)]
 pub(crate) enum IpNetOrAddr {
     Net(IpNet),
@@ -944,16 +960,6 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
 }
 
 #[must_use]
-pub(crate) fn is_valid_domain(domain: &str) -> bool {
-    // IPv6 addresses contain colons; everything else goes through the
-    // DNS-label fast path.
-    if domain.contains(':') {
-        return domain.parse::<std::net::Ipv6Addr>().is_ok();
-    }
-    is_valid_dns_label_string(domain)
-}
-
-#[must_use]
 pub(crate) fn is_valid_config_domain(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
@@ -1487,76 +1493,75 @@ mod test {
     }
 
     #[test]
-    fn test_is_valid_domain() {
-        assert!(is_valid_domain("debian.org"));
+    fn test_domain_name_new() {
+        // Mirrors the accept/reject set that `DomainName::new` enforces,
+        // which is the same set `cleanup_invalid_rows` uses to purge bad
+        // mirror rows before `flat_blocklist::init` runs.
+        fn accepts(s: &str) -> bool {
+            DomainName::new(s.to_owned()).is_ok()
+        }
 
-        assert!(is_valid_domain("salsa.debian.org"));
-
-        assert!(is_valid_domain("metadata.ftp-master.debian.org"));
+        assert!(accepts("debian.org"));
+        assert!(accepts("salsa.debian.org"));
+        assert!(accepts("metadata.ftp-master.debian.org"));
 
         // empty
-        assert!(!is_valid_domain(""));
+        assert!(!accepts(""));
 
         // double dots
-        assert!(!is_valid_domain("debian..org"));
+        assert!(!accepts("debian..org"));
 
         // short part
-        assert!(is_valid_domain("debian.f.org"));
+        assert!(accepts("debian.f.org"));
 
-        // too long port
-        assert!(!is_valid_domain(
+        // too long part
+        assert!(!accepts(
             "debian.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789AAA.org"
         ));
 
         // starting dash
-        assert!(!is_valid_domain("-debian.org"));
+        assert!(!accepts("-debian.org"));
 
         // ending dash
-        assert!(!is_valid_domain("debian-.org"));
+        assert!(!accepts("debian-.org"));
 
-        // dash in position 2
-        assert!(is_valid_domain("d-ebian.org"));
-
-        // dash in position 3
-        assert!(is_valid_domain("de-bian.org"));
-
-        // dash in position 4
-        assert!(is_valid_domain("deb-ian.org"));
-
-        // dash in position 5
-        assert!(is_valid_domain("debi-an.org"));
+        // dash in positions 2-5
+        assert!(accepts("d-ebian.org"));
+        assert!(accepts("de-bian.org"));
+        assert!(accepts("deb-ian.org"));
+        assert!(accepts("debi-an.org"));
 
         // invalid char
-        assert!(!is_valid_domain("deb_ian.org"));
+        assert!(!accepts("deb_ian.org"));
 
-        // special directory entry
-        assert!(!is_valid_domain("."));
-        assert!(!is_valid_domain(".."));
-        assert!(!is_valid_domain("foo/bar"));
+        // special directory entries
+        assert!(!accepts("."));
+        assert!(!accepts(".."));
+        assert!(!accepts("foo/bar"));
 
         // wild card
-        assert!(!is_valid_domain("*.debian.org"));
-        assert!(!is_valid_domain("*e.debian.org"));
-        assert!(!is_valid_domain("deb.*.debian.org"));
-        assert!(!is_valid_domain("debian.*"));
+        assert!(!accepts("*.debian.org"));
+        assert!(!accepts("*e.debian.org"));
+        assert!(!accepts("deb.*.debian.org"));
+        assert!(!accepts("debian.*"));
 
-        // IPv4 addresses
-        assert!(is_valid_domain("192.168.1.1"));
-        assert!(is_valid_domain("10.0.0.1"));
-        assert!(is_valid_domain("127.0.0.1"));
-        assert!(is_valid_domain("255.255.255.255"));
+        // IPv4 addresses (DomainName routes these through `Ipv4Addr::parse`)
+        assert!(accepts("192.168.1.1"));
+        assert!(accepts("10.0.0.1"));
+        assert!(accepts("127.0.0.1"));
+        assert!(accepts("255.255.255.255"));
 
         // IPv6 addresses
-        assert!(is_valid_domain("::1"));
-        assert!(is_valid_domain("2001:db8::1"));
-        assert!(is_valid_domain("fe80::1"));
-        assert!(is_valid_domain("::ffff:192.168.1.1"));
-        assert!(is_valid_domain("2001:0db8:0000:0000:0000:0000:0000:0001"));
+        assert!(accepts("::1"));
+        assert!(accepts("2001:db8::1"));
+        assert!(accepts("fe80::1"));
+        assert!(accepts("::ffff:192.168.1.1"));
+        assert!(accepts("2001:0db8:0000:0000:0000:0000:0000:0001"));
 
         // invalid IPv6
-        assert!(!is_valid_domain(":::1"));
-        assert!(!is_valid_domain("2001:db8::xyz"));
-        assert!(!is_valid_domain("2001:db8::1::2"));
+        assert!(!accepts(":::1"));
+        assert!(!accepts("2001:db8::xyz"));
+        assert!(!accepts("2001:db8::1::2"));
     }
 
     #[test]

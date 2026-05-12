@@ -7,8 +7,14 @@ use log::{debug, error, info, warn};
 use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 
 use crate::{
-    HumanFmt, Never, deb_mirror, global_config, guards::InitBarrier, http_etag::read_etag,
-    http_range::HttpDate, warn_once_or_debug, xattr_helpers,
+    Never,
+    cache_layout::{SUBDIR_FLAT, SUBDIR_TMP},
+    deb_mirror, global_config,
+    guards::InitBarrier,
+    http_etag::read_etag,
+    http_range::HttpDate,
+    humanfmt::HumanFmt,
+    warn_once_or_debug, xattr_helpers,
 };
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
@@ -70,6 +76,40 @@ pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) 
         cur = e.source();
     }
     false
+}
+
+/// Probe whether `path` is a real directory.
+///
+/// Uses `symlink_metadata` (lstat semantics) so a hostile symlink cannot
+/// redirect a subsequent walk outside the cache tree.  On symlink / non-dir
+/// the function logs a warning naming the operator-facing `purpose` (used to
+/// build messages like *"Skipping {purpose} because root is a symlink: …"*),
+/// and returns `Ok(false)` so the caller can treat the path as absent.
+/// `NotFound` is reported as `Ok(false)` without logging — many callers
+/// expect the path to be missing on fresh installs.
+///
+/// On any other I/O error, the error is returned untouched so the caller
+/// can choose to log + propagate or log + swallow.
+pub(crate) async fn probe_dir(path: &Path, purpose: &str) -> std::io::Result<bool> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(md) if md.file_type().is_dir() => Ok(true),
+        Ok(md) if md.file_type().is_symlink() => {
+            warn!(
+                "Skipping {purpose} because root is a symlink: `{}`",
+                path.display()
+            );
+            Ok(false)
+        }
+        Ok(_) => {
+            warn!(
+                "Skipping {purpose} because root is not a directory: `{}`",
+                path.display()
+            );
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Tri-state of an in-progress download's partial-file handling.
@@ -324,6 +364,72 @@ pub(crate) async fn tokio_tempfile(
     }
 }
 
+/// Build the deterministic on-disk path for a download's `.partial` temp
+/// file.  The tmp file lives as a *sibling* of the eventual rename target,
+/// so the atomic `rename(2)` after the download finishes stays within the
+/// same filesystem.
+///
+/// Layout (parallels [`crate::cache_layout::ConnectionDetails::cache_dir_path`]):
+///
+/// - Structured: `{cache_directory}/{host}/{mirror_path}/tmp/{debname}.partial`
+/// - Flat:        `{cache_directory}/{host}/flat/{mirror_path}/tmp/{debname}.partial`
+///
+/// `{host}` is the alias-resolved host when the request was redirected
+/// (mirroring [`ConnectionDetails::cache_dir_path`]); otherwise it is the
+/// mirror's own host.  Using the same host on both sides keeps the
+/// `.partial` co-located with its rename target so the sibling guarantee
+/// holds.
+///
+/// Disambiguation between flat-pool `.deb`s sharing a basename across
+/// different sub-directories (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`)
+/// is implicit in [`crate::deb_mirror::Mirror::path`], which equals the
+/// URL-dir verbatim under the host-anchored flat layout.
+fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
+    let mirror = ibarrier.mirror();
+    let layout = ibarrier.layout();
+    let host = ibarrier.aliased_host().unwrap_or_else(|| mirror.host());
+    let filename = format!("{debname}.partial", debname = ibarrier.debname());
+    let filename_path = Path::new(&filename);
+    assert!(
+        filename_path.is_relative(),
+        "path construction must not contain absolute components"
+    );
+
+    if layout.is_flat() {
+        let host_dir = host.format_cache_dir(mirror.port());
+        let host_path = Path::new(&*host_dir);
+        assert!(
+            host_path.is_relative(),
+            "path construction must not contain absolute components"
+        );
+        let mirror_path_relative = Path::new(mirror.path());
+        assert!(
+            mirror_path_relative.is_relative(),
+            "path construction must not contain absolute components"
+        );
+        [
+            &global_config().cache_directory,
+            host_path,
+            Path::new(SUBDIR_FLAT),
+            mirror_path_relative,
+            Path::new(SUBDIR_TMP),
+            filename_path,
+        ]
+        .iter()
+        .collect()
+    } else {
+        let mirror_dir = deb_mirror::mirror_cache_path_impl(host, mirror.port(), mirror.path());
+        [
+            &global_config().cache_directory,
+            mirror_dir.as_path(),
+            Path::new(SUBDIR_TMP),
+            filename_path,
+        ]
+        .iter()
+        .collect()
+    }
+}
+
 /// Open an existing partial file for writing at the end, returning the file, its current size,
 /// the file's modification time, and a `TempPath` guard with `keep_on_drop: true`.
 ///
@@ -357,23 +463,7 @@ pub(crate) async fn open_partial_file(
         Ok((file, size, HttpDate::from(mtime)))
     }
 
-    let mirror = ibarrier.mirror();
-    let mirror_dir =
-        deb_mirror::mirror_cache_path_impl(mirror.host(), mirror.port(), mirror.path());
-    let filename = format!("{debname}.partial", debname = ibarrier.debname());
-    let filename = Path::new(&filename);
-    assert!(
-        filename.is_relative(),
-        "path construction must not contain absolute components"
-    );
-    let path: PathBuf = [
-        &global_config().cache_directory,
-        mirror_dir.as_path(),
-        Path::new("tmp"),
-        filename,
-    ]
-    .iter()
-    .collect();
+    let path = partial_path_for_barrier(ibarrier);
 
     let guard = TempPath {
         path: Some(path),

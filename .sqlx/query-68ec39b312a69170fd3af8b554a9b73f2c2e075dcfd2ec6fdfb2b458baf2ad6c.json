@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO mirrors_v2\n            (host, port, path, kind)\n            VALUES\n            (?, ?, ?, ?)\n            ON CONFLICT\n            DO UPDATE SET\n              last_seen = unixepoch(CURRENT_TIMESTAMP),\n              kind = CASE\n                WHEN excluded.kind = 0 THEN 0\n                ELSE mirrors_v2.kind\n              END\n            RETURNING id, kind AS \"kind!: i64\", (first_seen = last_seen) AS \"was_inserted!: bool\";\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "kind!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "was_inserted!: bool",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "68ec39b312a69170fd3af8b554a9b73f2c2e075dcfd2ec6fdfb2b458baf2ad6c"
+}

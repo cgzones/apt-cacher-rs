@@ -2,11 +2,50 @@ use std::{borrow::Cow, num::NonZero, path::PathBuf, sync::OnceLock};
 
 use crate::{config::DomainName, database};
 
+/// On-disk layout family of a mirror.  Stored in the `mirrors_v2.kind`
+/// INTEGER column (added by the `20260512155314_mirror_kind` migration);
+/// the row's unique key remains `(host, port, path)`.  A single
+/// `(host, port, path)` row tracks the strictest layout ever seen for
+/// that mirror — the upsert latches `kind` to `Structured` on conflict
+/// so the flat-collision blocklist still records a structured request
+/// that arrived after a flat row already existed for the same tuple.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum MirrorKind {
+    Structured,
+    Flat,
+}
+
+impl MirrorKind {
+    /// SQL/DB encoding stored in `mirrors_v2.kind` (INTEGER).
+    /// `0` = structured, `1` = flat — fixed by the migration default and
+    /// the application-side validation in [`Self::from_db_int`].
+    #[must_use]
+    pub(crate) const fn as_db_int(self) -> i64 {
+        match self {
+            Self::Structured => 0,
+            Self::Flat => 1,
+        }
+    }
+
+    /// Reverse of [`Self::as_db_int`].  Returns `None` for any value not
+    /// matching the encoded set; the caller skips such rows so
+    /// `cleanup_invalid_rows` can drop them later.
+    #[must_use]
+    pub(crate) const fn from_db_int(i: i64) -> Option<Self> {
+        match i {
+            0 => Some(Self::Structured),
+            1 => Some(Self::Flat),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Mirror {
     host: DomainName,
     port: Option<NonZero<u16>>,
     path: String,
+    kind: MirrorKind,
     /// Lazily-populated cache of `host.format_authority(port)` when the result
     /// is owned (i.e. requires allocation: an IPv6 host or a non-empty port).
     /// Skipped from `Hash`/`Eq`/`Clone` impls because it is purely derived
@@ -16,13 +55,24 @@ pub(crate) struct Mirror {
 
 impl Mirror {
     #[must_use]
-    pub(crate) const fn new(host: DomainName, port: Option<NonZero<u16>>, path: String) -> Self {
+    pub(crate) const fn new(
+        host: DomainName,
+        port: Option<NonZero<u16>>,
+        path: String,
+        kind: MirrorKind,
+    ) -> Self {
         Self {
             host,
             port,
             path,
+            kind,
             cached_authority: OnceLock::new(),
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn kind(&self) -> MirrorKind {
+        self.kind
     }
 
     #[must_use]
@@ -61,15 +111,21 @@ impl PartialEq for Mirror {
             host,
             port,
             path,
+            kind,
             cached_authority: _,
         } = self;
         let Self {
             host: ohost,
             port: oport,
             path: opath,
+            kind: okind,
             cached_authority: _,
         } = other;
-        host == ohost && port == oport && path == opath
+        // `kind` is part of identity so the `database_task` mirror-id
+        // cache hits the DB once per kind, letting the structured upsert
+        // latch the row's `kind` column without being masked by a
+        // sibling flat cache entry.
+        host == ohost && port == oport && path == opath && kind == okind
     }
 }
 
@@ -79,12 +135,14 @@ impl Clone for Mirror {
             host,
             port,
             path,
+            kind,
             cached_authority: _,
         } = self;
         Self {
             host: host.clone(),
             port: *port,
             path: path.clone(),
+            kind: *kind,
             cached_authority: OnceLock::new(),
         }
     }
@@ -98,11 +156,13 @@ impl std::hash::Hash for Mirror {
             host,
             port,
             path,
+            kind,
             cached_authority: _,
         } = self;
         host.hash(state);
         port.hash(state);
         path.hash(state);
+        kind.hash(state);
     }
 }
 
@@ -174,7 +234,9 @@ impl Origin {
         }
 
         Some(Self {
-            mirror: Mirror::new(host, port, mirror_path.to_owned()),
+            // Origin URLs always parse from `<path>/dists/...` paths, which
+            // are exclusively a structured-layout shape.
+            mirror: Mirror::new(host, port, mirror_path.to_owned(), MirrorKind::Structured),
             distribution: distribution.to_owned(),
             component: component.to_owned(),
             architecture: architecture.to_owned(),
@@ -635,9 +697,85 @@ pub(crate) fn is_flat_deb_filename(filename: &str) -> bool {
     )
 }
 
+/// Maximum number of `/`-separated segments allowed in a mirror path.
+///
+/// Caps the on-disk directory depth a single request can carve out under
+/// `{cache}/{host}/flat/<mirror_path>/`.  Real-world flat repositories
+/// nest at most 2-3 levels (e.g. `apt/amd64/Packages.gz`); 16 is a
+/// generous ceiling that still prevents pathological readdir/inode
+/// pressure from an attacker-supplied URL with hundreds of segments.
+const MAX_MIRROR_PATH_SEGMENTS: usize = 16;
+
+/// Path-segment names reserved for the per-mirror on-disk cache layout.
+///
+/// A mirror path containing any of these as a `/`-separated segment would
+/// collide with cache plumbing — `tmp/` is the partial-download scratch
+/// dir, `by-hash/` is the content-addressed subtree under each mirror.
+/// The host-level `flat/` anchor is *not* reserved here: structured
+/// mirrors named `flat` are handled by the per-host collision blocklist
+/// (`flat_blocklist`) so that "structured wins" without permanently
+/// banning such mirror paths.
+///
+/// Shared with the startup migration scan in `main.rs`, which warns about
+/// pre-existing `mirrors_v2` rows that would now fail validation.
+pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash"];
+
+/// Whether `segment` is one of the [`RESERVED_MIRROR_PATH_SEGMENTS`].
+#[must_use]
+pub(crate) fn is_reserved_mirror_path_segment(segment: &str) -> bool {
+    RESERVED_MIRROR_PATH_SEGMENTS.contains(&segment)
+}
+
+/// Whether `path` is invalid as a mirror path because some `/`-separated
+/// segment is reserved.  Used by the startup migration warning so the
+/// daemon can flag pre-existing DB rows that the validator would now
+/// reject on insertion.
+#[must_use]
+pub(crate) fn mirror_path_has_reserved_segment(path: &str) -> bool {
+    path.split('/').any(is_reserved_mirror_path_segment)
+}
+
+/// Whether `path` is a strict descendant of `ancestor` in `/`-separated
+/// segment terms — i.e. `path == "<ancestor>/<rest>"` for non-empty
+/// `<rest>`.  Returns `false` when `path == ancestor`.
+///
+/// Segment alignment matters: `apt-tools` is not a descendant of `apt`
+/// even though it shares the prefix byte-wise.
+#[must_use]
+pub(crate) fn is_strict_path_descendant(path: &str, ancestor: &str) -> bool {
+    path.len() > ancestor.len()
+        && path.starts_with(ancestor)
+        && path.as_bytes()[ancestor.len()] == b'/'
+}
+
+/// Whether `path` equals `prefix` or is a strict descendant of it,
+/// segment-aligned.  Useful when a scan wants to treat a registered
+/// nested-mirror path as a *boundary* — either at the boundary itself
+/// or inside it.
+#[must_use]
+pub(crate) fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
+    path == prefix || is_strict_path_descendant(path, prefix)
+}
+
 #[must_use]
 pub(crate) fn valid_mirrorname(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 128 && name.split('/').all(valid_path_segment)
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    let mut segment_count: usize = 0;
+    for segment in name.split('/') {
+        segment_count += 1;
+        if segment_count > MAX_MIRROR_PATH_SEGMENTS {
+            return false;
+        }
+        if !valid_path_segment(segment) {
+            return false;
+        }
+        if is_reserved_mirror_path_segment(segment) {
+            return false;
+        }
+    }
+    true
 }
 
 #[must_use]
@@ -685,6 +823,7 @@ mod tests {
                     DomainName::new("deb.debian.org".to_string()).unwrap(),
                     None,
                     "debian".to_string(),
+                    MirrorKind::Structured,
                 ),
                 distribution: "sid".to_string(),
                 component: "main".to_string(),
@@ -713,6 +852,7 @@ mod tests {
                     DomainName::new("site.example.com".to_string()).unwrap(),
                     Some(nonzero!(80)),
                     "private/debian".to_string(),
+                    MirrorKind::Structured,
                 ),
                 distribution: "sid".to_string(),
                 component: "main".to_string(),
@@ -740,6 +880,7 @@ mod tests {
                     DomainName::new("apt.llvm.org".to_string()).unwrap(),
                     Some(nonzero!(443)),
                     "unstable".to_string(),
+                    MirrorKind::Structured,
                 ),
                 distribution: "llvm-toolchain-19".to_string(),
                 component: "main".to_string(),
@@ -767,6 +908,7 @@ mod tests {
                     DomainName::new("2001:db8::1".to_string()).unwrap(),
                     None,
                     "debian".to_string(),
+                    MirrorKind::Structured,
                 ),
                 distribution: "sid".to_string(),
                 component: "main".to_string(),
@@ -1184,6 +1326,26 @@ mod tests {
         assert!(!valid_mirrorname("~/foo"));
         assert!(!valid_mirrorname("~foo"));
         assert!(!valid_mirrorname("public%2Fubuntu"));
+
+        /* reserved segments collide with cache-layout plumbing */
+        assert!(!valid_mirrorname("tmp"));
+        assert!(!valid_mirrorname("by-hash"));
+        assert!(!valid_mirrorname("foo/tmp"));
+        assert!(!valid_mirrorname("foo/by-hash/bar"));
+        /* but non-segment occurrences are fine */
+        assert!(valid_mirrorname("tmpfile"));
+        assert!(valid_mirrorname("by-hash-deb"));
+    }
+
+    #[test]
+    fn test_mirror_path_has_reserved_segment() {
+        assert!(mirror_path_has_reserved_segment("tmp"));
+        assert!(mirror_path_has_reserved_segment("by-hash"));
+        assert!(mirror_path_has_reserved_segment("foo/tmp"));
+        assert!(mirror_path_has_reserved_segment("foo/by-hash/bar"));
+        assert!(!mirror_path_has_reserved_segment("debian"));
+        assert!(!mirror_path_has_reserved_segment("tmpfile"));
+        assert!(!mirror_path_has_reserved_segment("foo/by-hash-deb"));
     }
 
     #[test]

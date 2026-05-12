@@ -25,10 +25,26 @@ use crate::deb_mirror::Mirror;
 use crate::error::MirrorDownloadRate;
 use crate::{global_config, metrics};
 
-/// Layout-aware key for in-flight downloads.  `layout` distinguishes
-/// same-named files served from different on-disk subtrees (e.g. a flat
-/// pool `.deb` vs a structured pool `.deb` under the same mirror path)
-/// so a late joiner cannot splice from the wrong file.
+/// Layout-aware key for in-flight downloads.  Two discriminators are
+/// part of the key:
+///
+/// - [`Mirror`]'s own `kind` field separates the structured and flat
+///   mirror identities for the same `(host, port, path)` tuple — the
+///   coarse "which subtree does this row live in" axis.
+/// - `layout` carries the finer-grained on-disk shape within a subtree
+///   (e.g. `StructuredPool` vs `Dists` vs `DistsByHash` all share the
+///   same structured-`Mirror::kind`).  This is the value the cache
+///   pipeline already threads through `ConnectionDetails`, so reusing
+///   it here keeps the key uniform across the structured/flat split.
+///
+/// The two are redundant on the structured-vs-flat axis but not
+/// overall, and dropping the `layout` field would lose the structured-
+/// subtree distinctions.
+///
+/// Disambiguation between flat-pool `.deb`s living in different
+/// sub-directories (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is
+/// implicit in [`Mirror::path`], since the URL path becomes the mirror
+/// path verbatim under the host-anchored flat layout.
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct ActiveDownloadKey {
     mirror: Mirror,

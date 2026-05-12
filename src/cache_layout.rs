@@ -6,39 +6,37 @@
 //!
 //! # Layout
 //!
+//! Two branches, chosen by [`CacheLayout::is_flat`]:
+//!
 //! ```text
-//! {cache_directory}/{host[:port]}/{mirror_path}/{subdir?}/{debname}
+//! Structured: {cache_directory}/{host[:port]}/{mirror_path}/{subdir?}/{debname}
+//! Flat:       {cache_directory}/{host[:port]}/flat/{mirror_path}/{by-hash?}/{debname}
 //! ```
 //!
-//! Construction is split between two helpers:
-//!
-//! - [`crate::deb_mirror::mirror_cache_path_impl`] builds
-//!   `{host[:port]}/{mirror_path}` from a `Mirror`.
-//! - [`ConnectionDetails::cache_dir_path`] joins `{cache_directory}` and
-//!   `{subdir}` around it.
-//!
-//! The `debname` is the leaf filename and is written by the active-download
-//! machinery rather than by these helpers.
+//! Flat repositories anchor at the host-level `flat/` sibling rather than
+//! nesting beneath a per-mirror subdirectory.  The URL path becomes the
+//! on-disk path verbatim, so a request for `apt/amd64/twilio_5.0.0_amd64.deb`
+//! lands at `{cache}/{host}/flat/apt/amd64/twilio_5.0.0_amd64.deb` — no
+//! registry lookup, no longest-prefix base resolution.
 //!
 //! # Per-variant mapping
 //!
-//! | `ResourceFile` variant       | `subdir`            | `debname` shape                                | `cached_flavor` |
-//! |------------------------------|---------------------|------------------------------------------------|-----------------|
-//! | `Pool`                       | `None`              | `{filename}`                                   | `Permanent`     |
-//! | `Release`                    | `Some("dists")`     | `{distribution}_{filename}`                    | `Volatile`      |
-//! | `Packages`                   | `Some("dists")`     | `{distribution}_{component}_{architecture}_{filename}` | `Volatile` |
-//! | `Icon`/`Sources`/`Translation` | `Some("dists")`   | `{distribution}_{component}_{filename}`        | `Volatile`      |
-//! | `ByHash`                     | `Some("dists/by-hash")` | `{filename}` (hex hash)                    | `Permanent`     |
-//! | `Flat { Metadata }`          | `Some("flat")`      | `{filename}`                                   | `Volatile`      |
-//! | `Flat { Pool }`              | `Some("flat")`      | `{filename}`                                   | `Permanent`     |
-//! | `Flat { ByHash }`            | `Some("flat/by-hash")` | `{filename}` (hex hash)                     | `Permanent`     |
+//! | `ResourceFile` variant       | host-level anchor | mirror subdir            | `debname` shape                                | `cached_flavor` |
+//! |------------------------------|-------------------|--------------------------|------------------------------------------------|-----------------|
+//! | `Pool`                       | `{mirror_path}`   | `None`                   | `{filename}`                                   | `Permanent`     |
+//! | `Release`                    | `{mirror_path}`   | `Some("dists")`          | `{distribution}_{filename}`                    | `Volatile`      |
+//! | `Packages`                   | `{mirror_path}`   | `Some("dists")`          | `{distribution}_{component}_{architecture}_{filename}` | `Volatile` |
+//! | `Icon`/`Sources`/`Translation` | `{mirror_path}` | `Some("dists")`          | `{distribution}_{component}_{filename}`        | `Volatile`      |
+//! | `ByHash`                     | `{mirror_path}`   | `Some("dists/by-hash")`  | `{filename}` (hex hash)                        | `Permanent`     |
+//! | `Flat { Metadata }`          | `flat/{mirror_path}` | `None`                | `{filename}`                                   | `Volatile`      |
+//! | `Flat { Pool }`              | `flat/{mirror_path}` | `None`                | `{filename}`                                   | `Permanent`     |
+//! | `Flat { ByHash }`            | `flat/{mirror_path}` | `Some("by-hash")`     | `{filename}` (hex hash)                        | `Permanent`     |
 //!
 //! Pool flattens the deeply-nested URL path to a single filename per mirror
 //! (the URL's `pool/main/<l>/<pkg>/` components are dropped).
 //! Release/Packages/etc. prefix `debname` with `{distribution}_…` to
 //! disambiguate per-distribution copies that share the same on-disk
-//! `mirror_path`.  Flat repos use a `flat/` subdir so they coexist with
-//! structured layouts on the same mirror.
+//! `mirror_path`.
 //!
 //! # Subdir constants
 //!
@@ -46,8 +44,8 @@
 //! [`SUBDIR_FLAT_BYHASH`] anywhere a layout subdirectory is referenced —
 //! both in dispatch sites that build [`ConnectionDetails`] and in cleanup
 //! / scan tasks that walk the cache tree.  Wrap with `Path::new(...)` at
-//! the use site.  [`KNOWN_HOST_SUBDIRS`] is the list a startup scan uses
-//! to recognize legitimate child entries of a mirror directory.
+//! the use site.  [`KNOWN_MIRROR_SUBDIRS`] is the list of legitimate
+//! mirror-level subdirectories the startup scan recurses into.
 
 use std::{
     path::{Path, PathBuf},
@@ -60,8 +58,8 @@ use crate::{
     ClientInfo,
     config::DomainName,
     deb_mirror::{
-        FlatKind, Mirror, ResourceFile, is_deb_package, is_flat_deb_filename, valid_architecture,
-        valid_component, valid_distribution, valid_filename, valid_mirrorname,
+        FlatKind, Mirror, MirrorKind, ResourceFile, is_deb_package, is_flat_deb_filename,
+        valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
     },
     global_config,
 };
@@ -87,25 +85,34 @@ pub(crate) const SUBDIR_DISTS: &str = "dists";
 /// structured `dists/` layout.
 pub(crate) const SUBDIR_DISTS_BYHASH: &str = "dists/by-hash";
 
-/// Subdirectory holding all flat-repository resources (metadata + binary
-/// packages).  Co-located so a single GC walk covers both.
+/// Host-level subdirectory anchoring every flat (trivial) repository served
+/// from a given host.  The on-disk layout below it mirrors the URL path
+/// verbatim: e.g. a flat-pool request for
+/// `apt/amd64/twilio_5.0.0_amd64.deb` lands at
+/// `{cache}/{host}/flat/apt/amd64/twilio_5.0.0_amd64.deb`.
 pub(crate) const SUBDIR_FLAT: &str = "flat";
 
 /// Subdirectory holding by-hash content-addressed files belonging to a flat
-/// repository.
-pub(crate) const SUBDIR_FLAT_BYHASH: &str = "flat/by-hash";
+/// repository.  Appended below `{cache}/{host}/flat/{mirror_path}/` for a
+/// `Flat::ByHash` request.
+pub(crate) const SUBDIR_FLAT_BYHASH: &str = "by-hash";
 
-/// Layout subdirectory names that the startup cache scan should recurse
-/// into and tally under each `{cache_directory}/{host}/{mirror_path}/`
-/// directory.  Entries are the *first* path component of each `SUBDIR_*`
-/// constant above.
+/// Partial-download scratch directory.  Lives at `{cache}/tmp/`, and per-mirror
+/// at `{cache}/{host}/{mirror_path}/tmp/` (structured) and
+/// `{cache}/{host}/flat/{mirror_path}/tmp/` (flat).  Files here are owned by
+/// `cleanup_tmp_dir`, never tallied in the cache-size sweep.
+pub(crate) const SUBDIR_TMP: &str = "tmp";
+
+/// Layout subdirectory names that may legitimately appear under each
+/// `{cache_directory}/{host}/{mirror_path}/` directory.  The startup cache
+/// scan recurses into each and tallies its size; anything else triggers an
+/// "Unrecognized entry" warning.
 ///
 /// `tmp/` is intentionally **not** listed here: it is partial-download
 /// scratch space (not part of the served cache layout), is handled
 /// separately by `task_cache_scan` with its own skip branch, and is reaped
-/// by `cleanup_tmp_dir` rather than tallied.  The list is therefore
-/// "what to scan", not the broader "what may legitimately appear".
-pub(crate) const KNOWN_HOST_SUBDIRS: &[&str] = &[SUBDIR_DISTS, SUBDIR_FLAT];
+/// by `cleanup_tmp_dir` rather than tallied.
+pub(crate) const KNOWN_MIRROR_SUBDIRS: &[&str] = &[SUBDIR_DISTS];
 
 // ---------------------------------------------------------------------------
 // Cache-flavor and connection types (moved from main.rs)
@@ -133,24 +140,44 @@ pub(crate) enum CacheLayout {
     Dists,
     /// Structured by-hash tree: `<host>/<mirror>/dists/by-hash/`.
     DistsByHash,
-    /// Flat repository (metadata or pool): `<host>/<mirror>/flat/`.
+    /// Flat repository (metadata or pool): `<host>/flat/<mirror>/`.
     Flat,
-    /// Flat repository, by-hash subtree: `<host>/<mirror>/flat/by-hash/`.
+    /// Flat repository, by-hash subtree: `<host>/flat/<mirror>/by-hash/`.
     FlatByHash,
 }
 
 impl CacheLayout {
-    /// On-disk subdir below `<host>/<mirror>/` for this layout.  `None`
-    /// means the file lives directly under the mirror dir (only
-    /// `StructuredPool`).
+    /// On-disk subdir below the layout-anchored cache root for this
+    /// variant.  Returns `None` when the file lives directly under the
+    /// anchored root (structured pool, flat metadata / flat pool); the
+    /// `by-hash` segment is the only suffix represented here.
     #[must_use]
     pub(crate) fn cache_subdir(self) -> Option<&'static Path> {
         match self {
-            Self::StructuredPool => None,
+            Self::StructuredPool | Self::Flat => None,
             Self::Dists => Some(Path::new(SUBDIR_DISTS)),
             Self::DistsByHash => Some(Path::new(SUBDIR_DISTS_BYHASH)),
-            Self::Flat => Some(Path::new(SUBDIR_FLAT)),
             Self::FlatByHash => Some(Path::new(SUBDIR_FLAT_BYHASH)),
+        }
+    }
+
+    /// Whether this layout is anchored under the per-host `flat/`
+    /// subdirectory rather than directly under `{host}/{mirror_path}/`.
+    #[must_use]
+    pub(crate) const fn is_flat(self) -> bool {
+        match self {
+            Self::Flat | Self::FlatByHash => true,
+            Self::StructuredPool | Self::Dists | Self::DistsByHash => false,
+        }
+    }
+
+    /// Coarser classification used as the `mirrors_v2.kind` column value.
+    #[must_use]
+    pub(crate) const fn mirror_kind(self) -> MirrorKind {
+        if self.is_flat() {
+            MirrorKind::Flat
+        } else {
+            MirrorKind::Structured
         }
     }
 }
@@ -172,6 +199,14 @@ impl ConnectionDetails {
     /// Build the absolute directory path holding this request's cached file.
     /// The full file path is `<this>/<debname>`; the leaf is appended by the
     /// caller.
+    ///
+    /// Structured layouts → `{cache}/{host}/{mirror_path}/{subdir?}/`
+    /// Flat layouts        → `{cache}/{host}/flat/{mirror_path}/{by-hash?}/`
+    ///
+    /// The flat branch embeds the URL path verbatim under the host-level
+    /// `flat/` sibling, so disambiguation between flat-pool subdirs
+    /// (e.g. `apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is implicit in
+    /// `mirror.path()` rather than a separately threaded field.
     #[must_use]
     pub(crate) fn cache_dir_path(&self) -> PathBuf {
         let root = &global_config().cache_directory;
@@ -196,7 +231,19 @@ impl ConnectionDetails {
             "path construction must not contain absolute components"
         );
 
-        [root.as_path(), host, uri_path, subdir].iter().collect()
+        if self.layout.is_flat() {
+            [
+                root.as_path(),
+                host,
+                Path::new(SUBDIR_FLAT),
+                uri_path,
+                subdir,
+            ]
+            .iter()
+            .collect()
+        } else {
+            [root.as_path(), host, uri_path, subdir].iter().collect()
+        }
     }
 }
 

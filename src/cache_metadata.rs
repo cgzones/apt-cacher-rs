@@ -122,11 +122,14 @@ impl std::ops::Deref for UpstreamMetadataView<'_> {
 }
 
 /// Cache key.  Mirrors the keying used by `active_downloads.rs` so the
-/// in-flight and post-flight stores look up the same logical resource.
-/// `layout` discriminates files served from different on-disk subtrees
-/// (e.g. flat pool vs structured pool) — without it, two same-named
-/// `.deb` files under the same mirror path would share `ETag` /
-/// Last-Modified, leaking validators between unrelated cached files.
+/// in-flight and post-flight stores look up the same logical resource;
+/// see that module's `ActiveDownloadKey` doc for the rationale behind
+/// keeping both [`Mirror::kind`] (coarse structured-vs-flat) and
+/// `layout` (fine-grained subtree) in the key.  Disambiguation between
+/// flat-pool `.deb`s nested under different sub-directories
+/// (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is implicit in
+/// [`Mirror::path`], since the URL path becomes the mirror path
+/// verbatim under the host-anchored flat layout.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CacheMetadataKey {
     pub(crate) mirror: Mirror,
@@ -393,7 +396,7 @@ mod tests {
     use tokio::fs::File;
 
     use super::*;
-    use crate::deb_mirror::Mirror;
+    use crate::deb_mirror::{Mirror, MirrorKind};
     use crate::http_etag::write_etag;
     use crate::http_last_modified::write_last_modified;
 
@@ -403,6 +406,7 @@ mod tests {
                 String::from("example.test").into(),
                 std::num::NonZero::new(80),
                 "/debian".into(),
+                MirrorKind::Structured,
             ),
             "test.deb".into(),
             CacheLayout::StructuredPool,

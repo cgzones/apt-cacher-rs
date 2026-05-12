@@ -22,6 +22,7 @@ use crate::cache_metadata::{self, CacheMetadataKeyRef};
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{Mirror, Origin, is_unsafe_proxy_path, parse_request_path};
 use crate::error::{ErrorReport, errno_to_io_error};
+use crate::flat_blocklist;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header, find_header_end,
     write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
@@ -582,13 +583,21 @@ async fn try_sendfile_request(
         #[cfg(feature = "splice")]
         {
             use crate::{
+                deb_mirror::MirrorKind,
                 splice_conn::{SpliceProxyError, splice_simple_proxy},
                 uncacheables::record_uncacheable,
             };
 
             record_uncacheable(&requested_host, uri_path);
 
-            let mirror = Mirror::new(requested_host, requested_port, String::new());
+            // Simple-proxy path: this Mirror is used only for upstream
+            // dispatch/formatting and is never persisted; kind is arbitrary.
+            let mirror = Mirror::new(
+                requested_host,
+                requested_port,
+                String::new(),
+                MirrorKind::Structured,
+            );
 
             return match splice_simple_proxy(stream, *conn_version, conn_action, &mirror, uri_path)
                 .await
@@ -664,6 +673,17 @@ async fn try_sendfile_request(
         .find(|alias| alias.aliases.binary_search(&requested_host).is_ok())
         .map(|alias| &alias.main);
 
+    // Per-host flat collision: a structured mirror with
+    // `mirror_path == "flat"` (or `"flat/..."`) has already claimed the
+    // host-level `flat/` anchor; hand back to hyper which will pass the
+    // request through uncached. The blocklist is keyed on the alias-resolved
+    // host (matching the on-disk host directory) so sibling aliases share it.
+    if class.layout.is_flat()
+        && flat_blocklist::is_blocked(aliased_host.unwrap_or(&requested_host), requested_port)
+    {
+        return SendfileResult::NotApplicable("flat host blocked by structured collision");
+    }
+
     let aliased = match aliased_host {
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
@@ -671,7 +691,12 @@ async fn try_sendfile_request(
 
     let conn_details = ConnectionDetails {
         client,
-        mirror: Mirror::new(requested_host, requested_port, class.mirror_path),
+        mirror: Mirror::new(
+            requested_host,
+            requested_port,
+            class.mirror_path,
+            class.layout.mirror_kind(),
+        ),
         aliased_host,
         debname: class.debname,
         cached_flavor: class.cached_flavor,
