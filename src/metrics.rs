@@ -330,6 +330,16 @@ pub(crate) static UPSTREAM_HYPER_BODY_ERR: Counter = Counter::new();
 /// drift.
 pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 
+/// Cache entries observed to be non-regular files (FIFO, socket, device,
+/// directory, symlink).  Bumped by serving paths (which then return 5xx),
+/// download paths (which abort the download), and cleanup paths (which
+/// retain pool/by-hash entries unverified, but actively remove non-regular
+/// entries from `tmp/`).  A non-zero count indicates either a hostile
+/// filesystem or a misconfigured cache directory and is worth operator
+/// attention.  Disjoint from `CACHE_IO_FAILURE`: a non-regular-file
+/// detection is reported here only, not as an I/O failure.
+pub(crate) static CACHE_NON_REGULAR: Counter = Counter::new();
+
 /// Bytes copied client → upstream through the CONNECT tunnel.
 ///
 /// Counts are recorded only when the tunnel terminates cleanly:

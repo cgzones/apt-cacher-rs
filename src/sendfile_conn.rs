@@ -797,8 +797,8 @@ async fn try_sendfile_request(
         // so splice/hyper can fetch a fresh copy from upstream.
         if conn_details.cached_flavor == CachedFlavor::Volatile {
             match file.metadata().await {
-                Ok(metadata) => {
-                    let last_modified = metadata
+                Ok(md) if md.file_type().is_file() => {
+                    let last_modified = md
                         .modified()
                         .expect("Platform should support modification timestamps via setup check");
                     if let Ok(elapsed) = last_modified.elapsed() {
@@ -820,6 +820,17 @@ async fn try_sendfile_request(
                             cache_path.display()
                         );
                     }
+                }
+                Ok(_) => {
+                    metrics::CACHE_NON_REGULAR.increment();
+                    error!(
+                        "Cache file `{}` is not a regular file",
+                        cache_path.display()
+                    );
+                    return SendfileResult::Invalid {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        msg: "Cache Access Failure",
+                    };
                 }
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
@@ -1072,8 +1083,16 @@ pub(crate) async fn serve_file_via_sendfile(
     let (file, file_path) = source;
     let (conn_version, conn_action) = conn_settings;
 
-    let metadata = match file.metadata().await {
-        Ok(m) => m,
+    let mdata = match file.metadata().await {
+        Ok(m) if m.file_type().is_file() => m,
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            error!("Cache file `{}` is not a regular file", file_path.display());
+            return SendfileResult::Invalid {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                msg: "Cache Access Failure",
+            };
+        }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
@@ -1088,17 +1107,17 @@ pub(crate) async fn serve_file_via_sendfile(
         }
     };
 
-    let file_size = metadata.len();
+    let file_size = mdata.len();
 
     let cache_info = if let Some(meta) = prefetched_upstream_metadata {
-        CacheInfo::with_meta(&metadata, meta)
+        CacheInfo::with_meta(&mdata, meta)
     } else {
         let key = CacheMetadataKeyRef::new(
             &conn_details.mirror,
             &conn_details.debname,
             conn_details.layout,
         );
-        CacheInfo::resolve(&file, file_path, &metadata, &key)
+        CacheInfo::resolve(&file, file_path, &mdata, &key)
     };
 
     let (http_status, content_start, content_length, content_range, partial) =
@@ -1642,6 +1661,7 @@ pub(crate) async fn async_sendfile(
 pub(crate) async fn async_sendfile_unfinished(
     socket: &TcpStream,
     file: &tokio::fs::File,
+    file_path: &Path,
     content_start: u64,
     content_length: u64,
     mut receiver: tokio::sync::watch::Receiver<()>,
@@ -1672,12 +1692,23 @@ pub(crate) async fn async_sendfile_unfinished(
             .expect("file_offset is non-negative by construction");
 
         let file_size = match tokio::task::block_in_place(|| nix::sys::stat::fstat(file.as_fd())) {
-            Ok(stat) => stat
+            Ok(stat) if stat.st_mode & nix::libc::S_IFMT == nix::libc::S_IFREG => stat
                 .st_size
                 .try_into()
                 .expect("file size is non-negative by construction"),
+            Ok(_) => {
+                metrics::CACHE_NON_REGULAR.increment();
+                error!("Cache file `{}` is not a regular file", file_path.display());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Not a regular file",
+                ));
+            }
             Err(errno) => {
-                error!("Failed to query metadata of downloading file during sendfile:  {errno}");
+                error!(
+                    "Failed to query metadata of downloading file `{}` during sendfile:  {errno}",
+                    file_path.display()
+                );
                 offset_u64
             }
         };
@@ -1900,7 +1931,15 @@ async fn serve_unfinished_sendfile(
     };
 
     let metadata = match file.metadata().await {
-        Ok(m) => m,
+        Ok(m) if m.file_type().is_file() => m,
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            error!("Cache file `{}` is not a regular file", file_path.display());
+            return SendfileResult::Invalid {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                msg: "Cache Access Failure",
+            };
+        }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
@@ -1996,6 +2035,7 @@ async fn serve_unfinished_sendfile(
     let transfer_result = async_sendfile_unfinished(
         stream,
         &file,
+        &file_path,
         content_start,
         content_length,
         receiver,

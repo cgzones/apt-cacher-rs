@@ -2555,6 +2555,7 @@ async fn serve_remaining_from_file(
     match async_sendfile_unfinished(
         &client,
         &file,
+        &cache_path,
         content_start,
         content_length,
         receiver,
@@ -3738,12 +3739,8 @@ async fn splice_proxy_drive(
                 Err((err, guard)) if err.kind() == std::io::ErrorKind::NotFound => {
                     (0, None, None, utils::PartialDownload::Fresh(guard))
                 }
-                Err((err, guard)) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "splice proxy: failed to open partial file for {} from mirror {}:  {err}",
-                        conn_details.debname, conn_details.mirror
-                    );
+                Err((_err, guard)) => {
+                    // Error already logged in `open_partial_file()`.
                     drop(guard);
                     return Err(SpliceProxyError::CacheError);
                 }
@@ -3761,17 +3758,49 @@ async fn splice_proxy_drive(
         let cache_path = conn_details
             .cache_dir_path()
             .join(Path::new(&conn_details.debname));
-        if let Ok(file) = tokio::fs::File::options()
+
+        let file = match tokio::fs::File::options()
             .read(true)
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(&cache_path)
             .await
-            && let Ok(metadata) = file.metadata().await
         {
+            Ok(f) => Some(f),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to open volatile cached file `{}`:  {err}",
+                    cache_path.display()
+                );
+                return Err(SpliceProxyError::CacheError);
+            }
+        };
+        if let Some(file) = file {
+            let mdata = match file.metadata().await {
+                Ok(m) if m.file_type().is_file() => m,
+                Ok(_) => {
+                    metrics::CACHE_NON_REGULAR.increment();
+                    error!(
+                        "splice proxy: cache file `{}` is not a regular file",
+                        cache_path.display()
+                    );
+                    return Err(SpliceProxyError::CacheError);
+                }
+                Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to get metadata for volatile cached file `{}`:  {err}",
+                        cache_path.display()
+                    );
+                    return Err(SpliceProxyError::CacheError);
+                }
+            };
+
             // Use mtime (last revalidated time), matching the hyper backend.
             // Mtime is repurposed as "last revalidated" by touch_volatile_mtime(),
             // so it correctly tells upstream "has this changed since I last checked?".
-            let mtime = metadata
+            let mtime = mdata
                 .modified()
                 .expect("Platform should support modification timestamps via setup check");
             let if_modified_since = HttpDate::from(mtime).format();
@@ -4518,8 +4547,22 @@ async fn splice_proxy_drive(
     let prev_file_size = match conn_details.cached_flavor {
         CachedFlavor::Volatile => {
             let prev_path = dest_dir.join(filename);
-            match tokio::fs::metadata(&prev_path).await {
-                Ok(m) => m.len(),
+            match tokio::fs::symlink_metadata(&prev_path).await {
+                Ok(m) if m.file_type().is_file() => m.len(),
+                Ok(_) => {
+                    metrics::CACHE_NON_REGULAR.increment();
+                    error!(
+                        "splice proxy: previous cache file `{}` is not a regular file",
+                        prev_path.display()
+                    );
+                    // `task_cache_scan` skips non-regular entries entirely
+                    // (symlinks/FIFOs/sockets/dirs are not tallied into the
+                    // tracked cache size), so the quota never accounted for
+                    // them — there's nothing to "free" on overwrite.  0 is
+                    // correct here and does not produce a reconciliation
+                    // discrepancy.
+                    0
+                }
                 Err(err) if err.kind() == ErrorKind::NotFound => 0,
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
@@ -5440,8 +5483,16 @@ async fn handle_volatile_buffered_download(
             .cache_dir_path()
             .join(Path::new(&conn_details.debname));
 
-        match tokio::fs::metadata(&prev_path).await {
-            Ok(m) => m.len(),
+        match tokio::fs::symlink_metadata(&prev_path).await {
+            Ok(m) if m.file_type().is_file() => m.len(),
+            Ok(_) => {
+                metrics::CACHE_NON_REGULAR.increment();
+                error!(
+                    "splice proxy: previous cache file `{}` is not a regular file",
+                    prev_path.display()
+                );
+                0
+            }
             Err(err) if err.kind() == ErrorKind::NotFound => 0,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();

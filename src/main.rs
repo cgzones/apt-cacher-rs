@@ -1178,10 +1178,21 @@ async fn serve_cached_file(
         None => String::new(),
     };
 
-    let metadata = match prefetched_local_metadata {
-        Some(m) => m,
+    let mdata = match prefetched_local_metadata {
+        Some(m) => {
+            debug_assert!(
+                m.file_type().is_file(),
+                "prefetched_local_metadata must be a regular file; caller is responsible for the type check"
+            );
+            m
+        }
         None => match file.metadata().await {
-            Ok(m) => m,
+            Ok(m) if m.file_type().is_file() => m,
+            Ok(_) => {
+                metrics::CACHE_NON_REGULAR.increment();
+                error!("Cache file `{}` is not a regular file", file_path.display());
+                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            }
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -1193,7 +1204,7 @@ async fn serve_cached_file(
         },
     };
 
-    let file_size = metadata.len();
+    let file_size = mdata.len();
 
     let cache_key = cache_metadata::CacheMetadataKeyRef::new(
         &conn_details.mirror,
@@ -1229,7 +1240,7 @@ async fn serve_cached_file(
         .get(IF_MODIFIED_SINCE)
         .and_then(|v| v.to_str().ok());
 
-    let cache_info = CacheInfo::with_meta(&metadata, &resolved_meta);
+    let cache_info = CacheInfo::with_meta(&mdata, &resolved_meta);
     let serve_304 = cache_info.decide_serve_304(if_none_match_str, if_modified_since_str);
 
     let cache_conditional::CacheInfo {
@@ -1652,8 +1663,13 @@ async fn serve_volatile_file(
         "serve_volatile_file() assumes volatile flavor"
     );
 
-    let metadata = match file.metadata().await {
-        Ok(data) => data,
+    let mdata = match file.metadata().await {
+        Ok(data) if data.file_type().is_file() => data,
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            error!("Cache file `{}` is not a regular file", file_path.display());
+            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+        }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
@@ -1663,11 +1679,11 @@ async fn serve_volatile_file(
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
-    let modified_system_time = metadata
+    let modified_system_time = mdata
         .modified()
         .expect("Platform should support modification timestamps via setup check");
     let local_modification_time = HttpDate::from(modified_system_time);
-    let prev_size = metadata.size();
+    let prev_size = mdata.size();
 
     // Cache volatile files for short periods to reduce up-to-date requests.
     // Compute age from the raw SystemTime — HttpDate rounds sub-second mtimes
@@ -1686,8 +1702,7 @@ async fn serve_volatile_file(
             #[cfg(not(feature = "sendfile"))]
             metrics::VOLATILE_HIT.increment();
 
-            return serve_cached_file(conn_details, &req, file, file_path, None, Some(metadata))
-                .await;
+            return serve_cached_file(conn_details, &req, file, file_path, None, Some(mdata)).await;
         }
     } else {
         warn!(
@@ -1874,6 +1889,7 @@ async fn download_file(
     if let Err(err) = tokio::fs::create_dir_all(&dest_dir_path).await
         && err.kind() != tokio::io::ErrorKind::AlreadyExists
     {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "Failed to create destination directory `{}`:  {err}",
             dest_dir_path.display()
@@ -1923,6 +1939,7 @@ async fn download_file(
             Err(err) => {
                 drop(rbarrier);
 
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to rename file `{}` to `{}`:  {err}",
                     outpath.display(),
@@ -1984,7 +2001,12 @@ async fn serve_unfinished_file(
     let config = global_config();
 
     let md = match file.metadata().await {
-        Ok(data) => data,
+        Ok(data) if data.file_type().is_file() => data,
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            error!("Cache file `{}` is not a regular file", file_path.display());
+            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+        }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
@@ -2702,16 +2724,16 @@ async fn serve_new_file(
             .await
             {
                 Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
-                Err((err, guard)) => {
-                    // File doesn't exist or can't be opened — proceed without resume.
-                    // Match prior behavior: log non-NotFound errors but do not abort.
-                    if err.kind() != std::io::ErrorKind::NotFound {
-                        error!(
-                            "Failed to open partial file for {} from mirror {}:  {err}",
-                            conn_details.debname, conn_details.mirror
-                        );
-                    }
+                Err((err, guard)) if err.kind() == std::io::ErrorKind::NotFound => {
                     (0, None, None, utils::PartialDownload::Fresh(guard))
+                }
+                Err((_err, guard)) => {
+                    // Error already logged in `open_partial_file()`.
+                    drop(guard);
+                    return quick_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Cache Access Failure",
+                    );
                 }
             }
         } else {
@@ -4255,37 +4277,40 @@ async fn main_loop(
     {
         let database = database.clone();
         tokio::task::spawn(async move {
-            if let Ok(cache_size) = task_cache_scan(&database).await {
-                let rd = RUNTIMEDETAILS.get().expect("global set in main()");
+            match task_cache_scan(&database).await {
+                Ok(cache_size) => {
+                    let rd = RUNTIMEDETAILS.get().expect("global set in main()");
 
-                rd.cache_quota.add(cache_size);
+                    rd.cache_quota.add(cache_size);
 
-                match rd.config.disk_quota {
-                    Some(val) => {
-                        let val = val.get();
-                        if cache_size > val {
-                            warn!(
-                                "Startup cache size of {} exceeds quota {}",
-                                HumanFmt::Size(cache_size),
-                                HumanFmt::Size(val)
-                            );
-                        } else {
+                    match rd.config.disk_quota {
+                        Some(val) => {
+                            let val = val.get();
+                            if cache_size > val {
+                                warn!(
+                                    "Startup cache size of {} exceeds quota {}",
+                                    HumanFmt::Size(cache_size),
+                                    HumanFmt::Size(val)
+                                );
+                            } else {
+                                info!(
+                                    "Startup cache size: {} (quota={})",
+                                    HumanFmt::Size(cache_size),
+                                    HumanFmt::Size(val)
+                                );
+                            }
+                        }
+                        None => {
                             info!(
-                                "Startup cache size: {} (quota={})",
-                                HumanFmt::Size(cache_size),
-                                HumanFmt::Size(val)
+                                "Startup cache size: {} (quota=unlimited)",
+                                HumanFmt::Size(cache_size)
                             );
                         }
                     }
-                    None => {
-                        info!(
-                            "Startup cache size: {} (quota=unlimited)",
-                            HumanFmt::Size(cache_size)
-                        );
-                    }
                 }
-            } else {
-                warn!("Startup cache size unset");
+                Err(err) => {
+                    error!("Startup cache scan failed; cache size unset:  {err}");
+                }
             }
         });
     }

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 use hashbrown::HashMap;
 use log::{error, trace, warn};
@@ -59,8 +59,9 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
     let mut cache_dir = match tokio::fs::read_dir(cache_path).await {
         Ok(d) => d,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Error listing cache directory `{}`:  {err}",
+                "Failed to read cache directory `{}`:  {err}",
                 cache_path.display()
             );
             return Err(ProxyCacheError::Io(err));
@@ -95,37 +96,65 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Error iterating cache directory `{}`:  {err}",
+                    "Failed to iterate cache directory `{}`:  {err}",
                     cache_path.display()
                 );
                 return Err(ProxyCacheError::Io(err));
             }
         };
-        if let Ok(mdata) = entry.metadata().await
-            && !mdata.is_dir()
-        {
-            cache_size += mdata.len();
+
+        match entry.metadata().await {
+            Ok(mdata) if mdata.is_dir() => {}
+            Ok(mdata) if mdata.file_type().is_symlink() => {
+                warn!(
+                    "Unrecognized symlink entry in cache directory: `{}`",
+                    entry.path().display()
+                );
+                continue;
+            }
+            Ok(_) => {
+                metrics::CACHE_NON_REGULAR.increment();
+                warn!(
+                    "Unrecognized non-directory entry in cache directory: `{}`",
+                    entry.path().display()
+                );
+                continue;
+            }
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to get metadata of `{}`:  {err}",
+                    entry.path().display()
+                );
+                // Fall through to mirror lookup — opendir on this entry may
+                // still succeed even if stat failed, and a registered mirror
+                // shouldn't be skipped silently on a transient error.
+            }
         }
 
-        let filename = entry.file_name();
-        if filename == SUBDIR_TMP {
+        let dir_name = entry.file_name();
+        if dir_name == SUBDIR_TMP {
             continue;
         }
 
         // HashMap lookup needs a UTF-8 key.  A non-UTF-8 entry could never
         // match a registered mirror dir (mirror hosts are validated as
         // ASCII), so fall through to the unrecognized-entry warn.
-        let Some(name_str) = filename.to_str() else {
+        let Some(name_str) = dir_name.to_str() else {
             warn!(
-                "Unrecognized entry in cache directory: `{}`",
-                filename.to_string_lossy()
+                "Unrecognized directory entry in cache directory: `{}`",
+                entry.path().display()
             );
             continue;
         };
 
         let Some(mirrors_here) = mirrors_by_dir.get(name_str) else {
-            warn!("Unrecognized entry in cache directory: `{name_str}`");
+            warn!(
+                "Unrecognized directory entry in cache directory: `{}`",
+                entry.path().display()
+            );
             continue;
         };
 
@@ -192,8 +221,9 @@ async fn scan_mirror_dir(
     let mut mirror_dir = match tokio::fs::read_dir(&mirror_path).await {
         Ok(d) => d,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Error listing mirror directory `{}`:  {err}",
+                "Failed to read mirror directory `{}`:  {err}",
                 mirror_path.display()
             );
             return 0;
@@ -207,22 +237,24 @@ async fn scan_mirror_dir(
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Error iterating mirror directory `{}`:  {err}",
+                    "Failed to iterate mirror directory `{}`:  {err}",
                     mirror_path.display()
                 );
                 return dir_size;
             }
         };
-        // Use `file_type()` (lstat semantics) so a symlink planted in
-        // the cache by a hostile filesystem doesn't lead the scan
-        // outside the cache tree. Symlinks (and FIFOs/sockets/devices)
-        // are skipped with a warning.
-        let file_type = match entry.file_type().await {
-            Ok(ft) => ft,
+
+        let (mdata, file_type) = match entry.metadata().await {
+            Ok(m) => {
+                let ft = m.file_type();
+                (m, ft)
+            }
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to get file type of `{}`:  {err}",
+                    "Failed to get metadata of `{}`:  {err}",
                     entry.path().display()
                 );
                 continue;
@@ -233,16 +265,15 @@ async fn scan_mirror_dir(
 
         if file_type.is_symlink() {
             warn!(
-                "Skipping symlink in mirror directory: `{}`",
+                "Unrecognized symlink entry in mirror directory: `{}`",
                 entry.path().display()
             );
             continue;
         }
 
         if file_type.is_file() {
-            if let Ok(mdata) = entry.metadata().await {
-                dir_size += mdata.len();
-            }
+            dir_size += mdata.len();
+
             if name.to_str().is_some_and(is_deb_package) {
                 continue;
             }
@@ -263,29 +294,37 @@ async fn scan_mirror_dir(
             if name == SUBDIR_TMP {
                 continue;
             }
-            if let Some(name_str) = name.to_str() {
-                let expected = if mirror.path.is_empty() {
-                    name_str.to_owned()
-                } else {
-                    format!("{}/{}", mirror.path, name_str)
-                };
-                if is_registered_mirror_path(&expected, other_mirror_paths) {
-                    trace!(
-                        "Skipping `{}` - it is a sub-mirror of `{}`",
-                        entry.path().display(),
-                        mirror.path
-                    );
-                    continue;
-                }
-                if contains_nested_mirror_path(&expected, other_mirror_paths) {
-                    trace!(
-                        "Skipping `{}` - intermediate dir for a nested sub-mirror under `{}`",
-                        entry.path().display(),
-                        mirror.path
-                    );
-                    continue;
-                }
+
+            let Some(name_str) = name.to_str() else {
+                warn!(
+                    "Unrecognized directory entry in mirror directory: `{}`",
+                    entry.path().display()
+                );
+                continue;
+            };
+
+            let expected = if mirror.path.is_empty() {
+                Cow::Borrowed(name_str)
+            } else {
+                Cow::Owned(format!("{}/{}", mirror.path, name_str))
+            };
+            if is_registered_mirror_path(&expected, other_mirror_paths) {
+                trace!(
+                    "Skipping `{}` - it is a sub-mirror of `{}`",
+                    entry.path().display(),
+                    mirror.path
+                );
+                continue;
             }
+            if contains_nested_mirror_path(&expected, other_mirror_paths) {
+                trace!(
+                    "Skipping `{}` - intermediate dir for a nested sub-mirror under `{}`",
+                    entry.path().display(),
+                    mirror.path
+                );
+                continue;
+            }
+
             // unrecognized directory falls through to the warn below
         }
 
@@ -343,8 +382,9 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
         let mut subdir_dir = match tokio::fs::read_dir(&current).await {
             Ok(d) => d,
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Error listing {} `{}`:  {err}",
+                    "Failed to read {} directory `{}`:  {err}",
                     mode.purpose(),
                     current.display()
                 );
@@ -357,8 +397,9 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
                 Ok(Some(e)) => e,
                 Ok(None) => continue 'outer,
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Error iterating {} `{}`:  {err}",
+                        "Failed to iterate {} directory `{}`:  {err}",
                         mode.purpose(),
                         current.display()
                     );
@@ -366,13 +407,15 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
                 }
             };
 
-            // `file_type()` uses lstat semantics — don't follow
-            // symlinks out of the cache tree.
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
+            let (mdata, file_type) = match entry.metadata().await {
+                Ok(m) => {
+                    let ft = m.file_type();
+                    (m, ft)
+                }
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get file type of `{}`:  {err}",
+                        "Failed to get metadata of `{}`:  {err}",
                         entry.path().display()
                     );
                     continue;
@@ -381,7 +424,7 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
 
             if file_type.is_symlink() {
                 warn!(
-                    "Skipping symlink in {}: `{}`",
+                    "Unrecognized symlink entry in {}: `{}`",
                     mode.purpose(),
                     entry.path().display()
                 );
@@ -389,9 +432,7 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
             }
 
             if file_type.is_file() {
-                if let Ok(mdata) = entry.metadata().await {
-                    dir_size += mdata.len();
-                }
+                dir_size += mdata.len();
                 continue;
             }
 

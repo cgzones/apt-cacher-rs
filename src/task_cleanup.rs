@@ -121,12 +121,32 @@ async fn collect_cached_files(
     let mut host_dir = match tokio::fs::read_dir(host_path).await {
         Ok(d) => d,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(ret),
-        Err(err) => return Err(ProxyCacheError::Io(err)),
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!("Failed to read directory `{}`:  {err}", host_path.display());
+            return Err(ProxyCacheError::Io(err));
+        }
     };
 
-    while let Some(entry) = host_dir.next_entry().await? {
+    loop {
+        let entry = match host_dir.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to iterate directory `{}`:  {err}",
+                    host_path.display()
+                );
+                return Err(ProxyCacheError::Io(err));
+            }
+        };
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
+            warn!(
+                "Unrecognized entry in mirror pool directory: `{}`",
+                entry.path().display()
+            );
             continue;
         };
         // Mirror `collect_flat_cached_debs`: structured Pool admits
@@ -136,13 +156,10 @@ async fn collect_cached_files(
             continue;
         }
 
-        // Use `file_type()` (lstat semantics) so a symlink planted in
-        // the cache by a hostile filesystem doesn't trick later
-        // `metadata()`/hash verification into following it outside the
-        // cache tree.  Matches `collect_flat_cached_debs`.
         let file_type = match entry.file_type().await {
             Ok(ft) => ft,
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to get file type of `{}`:  {err}",
                     entry.path().display()
@@ -151,6 +168,11 @@ async fn collect_cached_files(
             }
         };
         if !file_type.is_file() {
+            metrics::CACHE_NON_REGULAR.increment();
+            warn!(
+                "Skipping non-regular entry in mirror pool directory: `{}`",
+                entry.path().display()
+            );
             continue;
         }
 
@@ -172,7 +194,7 @@ async fn collect_cached_files(
 /// joins it to a filesystem path.
 fn parse_filename_field(line: &str) -> Option<&str> {
     let line = line.trim();
-    let filepath = line.strip_prefix("Filename: ")?;
+    let filepath = line.strip_prefix("Filename: ")?.trim_start();
     if !is_safe_filename_relpath(filepath) {
         return None;
     }
@@ -387,11 +409,24 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
         .open(path)
     {
         Ok(f) => f,
-        Err(err) => return Verdict::IoError(err),
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            return Verdict::IoError(err);
+        }
     };
     let pre_meta = match file.metadata() {
-        Ok(m) => m,
-        Err(err) => return Verdict::IoError(err),
+        Ok(m) if m.file_type().is_file() => m,
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            return Verdict::IoError(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Not a regular file",
+            ));
+        }
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            return Verdict::IoError(err);
+        }
     };
     let pre_ino = pre_meta.ino();
     let pre_size = pre_meta.len();
@@ -399,11 +434,17 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     let computed = match algo {
         HashAlgo::Sha256 => match hash_open_file::<sha2::Sha256>(&mut file) {
             Ok(h) => h,
-            Err(err) => return Verdict::IoError(err),
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                return Verdict::IoError(err);
+            }
         },
         HashAlgo::Sha512 => match hash_open_file::<sha2::Sha512>(&mut file) {
             Ok(h) => h,
-            Err(err) => return Verdict::IoError(err),
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                return Verdict::IoError(err);
+            }
         },
     };
 
@@ -414,7 +455,11 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     // Race check: a fresh download finishing mid-hash either replaces the
     // file via rename (different inode) or rewrites it in place (size change).
     // Either way our digest is for content no longer at `path`, so bail.
-    if let Ok(post_meta) = std::fs::metadata(path)
+    // Use `symlink_metadata` (lstat): a hostile symlink planted at `path`
+    // after the open could otherwise point at a file whose inode/size
+    // happen to match `pre_ino` / `pre_size`, masking the race.  lstat
+    // compares the symlink itself, so a swap is always detected.
+    if let Ok(post_meta) = std::fs::symlink_metadata(path)
         && (post_meta.ino() != pre_ino || post_meta.len() != pre_size)
     {
         return Verdict::Raced;
@@ -481,9 +526,24 @@ async fn process_stanza(
             file_list.remove(lookup_key);
         }
         Some((algo, expected)) => {
-            let pre_size = match tokio::fs::metadata(&path).await {
-                Ok(m) => m.len(),
+            // lstat (not stat) so a hostile symlink planted between
+            // `collect_cached_files` (which filters via `file_type()`,
+            // lstat-semantics) and now is detected here rather than
+            // followed.  A non-regular result therefore indicates a
+            // concurrent type swap.
+            let pre_size = match tokio::fs::symlink_metadata(&path).await {
+                Ok(m) if m.file_type().is_file() => m.len(),
+                Ok(_) => {
+                    metrics::CACHE_NON_REGULAR.increment();
+                    warn!(
+                        "Cache file `{}` changed to non-regular between cleanup-collect and verify (concurrent swap); retaining without verification",
+                        path.display(),
+                    );
+                    file_list.remove(lookup_key);
+                    return;
+                }
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "Failed to stat cache file `{}` before {} verification:  {err}; retaining",
                         path.display(),
@@ -504,6 +564,7 @@ async fn process_stanza(
                         hex_encode(&computed),
                     );
                     if let Err(err) = tokio::fs::remove_file(&path).await {
+                        metrics::CACHE_IO_FAILURE.increment();
                         error!(
                             "Error removing checksum-mismatched cache file `{}`:  {err}",
                             path.display()
@@ -852,21 +913,29 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         bytes_removed += cleanup_result.bytes_removed;
     }
 
-    if let Ok(actual_cache_size) = task_cache_scan(&appstate.database).await {
-        let active_downloading_size = appstate.active_downloads.download_size();
+    match task_cache_scan(&appstate.database).await {
+        Ok(actual_cache_size) => {
+            let active_downloading_size = appstate.active_downloads.download_size();
 
-        let quota = global_cache_quota();
-        let (stored, csize, difference) =
-            quota.subtract_and_reconcile(bytes_removed, actual_cache_size, active_downloading_size);
+            let quota = global_cache_quota();
+            let (stored, csize, difference) = quota.subtract_and_reconcile(
+                bytes_removed,
+                actual_cache_size,
+                active_downloading_size,
+            );
 
-        if difference != 0 {
-            warn!(
-                "Repaired cache size discrepancy of {difference}: actual={actual_cache_size} stored={stored} corrected={csize} active={active_downloading_size}"
-            );
-        } else {
-            debug!(
-                "actual cache size: {actual_cache_size}; stored cache size: {stored}; active download size: {active_downloading_size}"
-            );
+            if difference != 0 {
+                warn!(
+                    "Repaired cache size discrepancy of {difference}: actual={actual_cache_size} stored={stored} corrected={csize} active={active_downloading_size}"
+                );
+            } else {
+                debug!(
+                    "actual cache size: {actual_cache_size}; stored cache size: {stored}; active download size: {active_downloading_size}"
+                );
+            }
+        }
+        Err(err) => {
+            error!("Skipping cache-size reconciliation after cleanup:  {err}");
         }
     }
 
@@ -1149,12 +1218,29 @@ async fn collect_flat_cached_debs(
         let mut dir = match tokio::fs::read_dir(&current).await {
             Ok(d) => d,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => return Err(ProxyCacheError::Io(err)),
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!("Failed to read directory `{}`:  {err}", current.display());
+                return Err(ProxyCacheError::Io(err));
+            }
         };
 
-        while let Some(entry) = dir.next_entry().await? {
+        loop {
+            let entry = match dir.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to iterate directory `{}`:  {err}",
+                        current.display()
+                    );
+                    return Err(ProxyCacheError::Io(err));
+                }
+            };
             let name = entry.file_name();
             let Some(name_str) = name.to_str() else {
+                warn!("Skipping unrecognized entry `{}`", entry.path().display());
                 continue;
             };
 
@@ -1164,6 +1250,7 @@ async fn collect_flat_cached_debs(
             let file_type = match entry.file_type().await {
                 Ok(ft) => ft,
                 Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "Failed to get file type of `{}`:  {err}",
                         entry.path().display()
@@ -1173,6 +1260,11 @@ async fn collect_flat_cached_debs(
             };
 
             if file_type.is_symlink() {
+                metrics::CACHE_NON_REGULAR.increment();
+                warn!(
+                    "Skipping unrecognized symlink entry in cache: `{}`",
+                    entry.path().display()
+                );
                 continue;
             }
 
@@ -1214,6 +1306,11 @@ async fn collect_flat_cached_debs(
             }
 
             if !file_type.is_file() {
+                metrics::CACHE_NON_REGULAR.increment();
+                warn!(
+                    "Skipping unrecognized entry in cache: `{}`",
+                    entry.path().display()
+                );
                 continue;
             }
 
@@ -1251,10 +1348,22 @@ async fn sweep_aged_cached_debs(
     let now = SystemTime::now();
 
     for path in cached_files.values() {
-        let data = match tokio::fs::metadata(path).await {
-            Ok(d) => Some(d),
+        let data = match tokio::fs::symlink_metadata(path).await {
+            Ok(d) if d.file_type().is_file() => Some(d),
+            Ok(_) => {
+                metrics::CACHE_NON_REGULAR.increment();
+                warn!(
+                    "Cache file `{}` is not a regular file; retaining",
+                    path.display(),
+                );
+                None
+            }
             Err(err) => {
-                error!("Error inspecting cached file `{}`:  {err}", path.display());
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Error inspecting cached file `{}`:  {err}; retaining",
+                    path.display()
+                );
                 None
             }
         };
@@ -1270,6 +1379,7 @@ async fn sweep_aged_cached_debs(
                     match data.modified() {
                         Ok(d) => d,
                         Err(modified_err) => {
+                            metrics::CACHE_IO_FAILURE.increment();
                             error!(
                                 "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
                                 path.display()
@@ -1296,6 +1406,7 @@ async fn sweep_aged_cached_debs(
         let size = data.as_ref().map_or(0, std::fs::Metadata::len);
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
+            metrics::CACHE_IO_FAILURE.increment();
             error!("Error removing cached file `{}`:  {err}", path.display());
             continue;
         }
@@ -1333,6 +1444,7 @@ async fn cleanup_mirror_flat_files(
             return Ok(CleanupDone::empty(mirror.into()));
         }
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Error probing flat directory `{}`:  {err}",
                 flat_path.display()
@@ -1499,8 +1611,9 @@ async fn cleanup_byhash_dir(
         Ok(d) => d,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(stats),
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Error traversing directory `{}`:  {}",
+                "Failed to read directory `{}`:  {}",
                 byhash_path.display(),
                 err
             );
@@ -1508,26 +1621,37 @@ async fn cleanup_byhash_dir(
         }
     };
 
-    while let Some(entry) = byhash_dir.next_entry().await? {
+    loop {
+        let entry = match byhash_dir.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to iterate directory `{}`:  {err}",
+                    byhash_path.display()
+                );
+                return Err(ProxyCacheError::Io(err));
+            }
+        };
         let path = entry.path();
 
-        if path.file_name().is_none() {
-            continue;
-        }
-
-        // Inner-loop lstat: a symlink in a by-hash dir is suspicious
-        // since these files are content-addressed; skip without
-        // following.
-        let file_type = match entry.file_type().await {
-            Ok(ft) => ft,
+        let (mdata, file_type) = match entry.metadata().await {
+            Ok(d) => {
+                let ft = d.file_type();
+                (d, ft)
+            }
             Err(err) => {
-                error!("Failed to get file type of `{}`:  {err}", path.display());
+                metrics::CACHE_IO_FAILURE.increment();
+                error!("Error inspecting file `{}`:  {err}", path.display());
                 continue;
             }
         };
-        if file_type.is_symlink() {
+
+        if !file_type.is_file() {
+            metrics::CACHE_NON_REGULAR.increment();
             warn!(
-                "Skipping symlink in by-hash directory: `{}`",
+                "Skipping unrecognized non-regular file in by-hash directory: `{}`",
                 path.display()
             );
             continue;
@@ -1535,17 +1659,10 @@ async fn cleanup_byhash_dir(
 
         stats.files_retained += 1;
 
-        let metadata = match entry.metadata().await {
-            Ok(d) => d,
-            Err(err) => {
-                error!("Error inspecting file `{}`:  {err}", path.display());
-                continue;
-            }
-        };
-
-        let modified = match metadata.modified() {
+        let modified = match mdata.modified() {
             Ok(m) => m,
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!("Failed to get mtime of file `{}`:  {err}", path.display());
                 continue;
             }
@@ -1580,13 +1697,14 @@ async fn cleanup_byhash_dir(
         );
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
+            metrics::CACHE_IO_FAILURE.increment();
             error!("Error removing file `{}`:  {err}", path.display());
             continue;
         }
 
         invalidate_metadata_for(&path, mirror, layout);
 
-        stats.bytes_removed += metadata.len();
+        stats.bytes_removed += mdata.len();
         stats.files_removed += 1;
         stats.files_retained -= 1;
     }
@@ -1709,6 +1827,7 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
             return 0;
         }
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to read tmp directory `{}`:  {err}",
                 tmp_dir.display()
@@ -1724,6 +1843,7 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
             Ok(Some(e)) => e,
             Ok(None) => break,
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to iterate tmp directory `{}`:  {err}",
                     tmp_dir.display()
@@ -1732,41 +1852,41 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
             }
         };
 
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            error!("Failed to decode name of tmp file `{}`", name.display());
-            continue;
-        };
-
-        let file_type = match entry.file_type().await {
-            Ok(ft) => ft,
+        let (mdata, file_type) = match entry.metadata().await {
+            Ok(m) => {
+                let ft = m.file_type();
+                (m, ft)
+            }
             Err(err) => {
-                error!("Failed to get file type of tmp entry `{name_str}`:  {err}");
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to stat tmp entry `{}`:  {err}",
+                    entry.path().display()
+                );
                 continue;
             }
         };
 
-        let md = match entry.metadata().await {
-            Ok(m) => m,
-            Err(err) => {
-                error!("Failed to stat tmp file `{name_str}`:  {err}");
-                continue;
-            }
-        };
-
-        let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime = mdata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         // Apply the per-suffix `.partial` policy only to regular files: a
         // symlink-to-dir or a stray directory named `*.partial` should not
         // be measured by `len()` (zero for a symlink) and should be reaped
         // under the longer foreign cutoff instead.
-        let is_partial = file_type.is_file() && name_str.ends_with(".partial");
+        let is_partial = file_type.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".partial"));
         let should_remove = if is_partial {
             // Zero-byte partials carry no resume state; aged partials are stale.
-            md.len() == 0 || mtime < partial_cutoff
+            mdata.len() == 0 || mtime < partial_cutoff
         } else if mtime < foreign_cutoff {
             true
         } else {
-            debug!("Keeping unexpected tmp entry `{name_str}` (not yet past foreign cutoff)");
+            debug!(
+                "Keeping unexpected tmp entry `{}` (not yet past foreign cutoff)",
+                entry.path().display()
+            );
             continue;
         };
 
@@ -1781,11 +1901,21 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
             // a symlink-to-dir is unlinked via `remove_file` rather than
             // having `remove_dir_all` traverse its target.
             let removal = if file_type.is_dir() {
+                metrics::CACHE_NON_REGULAR.increment();
+                warn!("Removing directory tmp entry `{}`", entry.path().display());
                 tokio::fs::remove_dir_all(&path).await
+            } else if !file_type.is_file() {
+                metrics::CACHE_NON_REGULAR.increment();
+                warn!(
+                    "Removing non-regular tmp entry `{}`",
+                    entry.path().display()
+                );
+                tokio::fs::remove_file(&path).await
             } else {
                 tokio::fs::remove_file(&path).await
             };
             if let Err(err) = removal {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to remove stale tmp entry `{}`:  {err}",
                     path.display()

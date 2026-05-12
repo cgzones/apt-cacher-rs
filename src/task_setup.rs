@@ -1,5 +1,8 @@
+use std::os::unix::fs::OpenOptionsExt as _;
+
 use anyhow::Context as _;
 use log::{debug, error, info, warn};
+use xattr::FileExt as _;
 
 use crate::{cache_layout::SUBDIR_TMP, global_config};
 
@@ -22,6 +25,12 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
     // Check for creation and modification timestamp support
     let mdata = std::fs::metadata(cache_path)
         .with_context(|| format!("Failed to inspect directory `{}`", cache_path.display()))?;
+    if !mdata.file_type().is_dir() {
+        anyhow::bail!(
+            "Cache directory `{}` is not a directory",
+            cache_path.display()
+        );
+    }
     mdata
         .modified()
         .context("No file modification timestamp (mtime) support")?;
@@ -38,16 +47,23 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
 
         let etag_probe_path = cache_path.join(".etag_probe");
 
-        let _etag_probe_file = std::fs::File::create(&etag_probe_path).with_context(|| {
-            format!(
-                "Failed to create extended attribute probe file `{}`",
-                etag_probe_path.display()
-            )
-        })?;
+        let etag_probe_file = std::fs::File::options()
+            .write(true)
+            .create(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&etag_probe_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create extended attribute probe file `{}`",
+                    etag_probe_path.display()
+                )
+            })?;
 
-        let etag_result = xattr::set(&etag_probe_path, ETAG_PROBE, ETAG_PROBE_VALUE)
-            .and_then(|()| xattr::get(&etag_probe_path, ETAG_PROBE))
-            .and_then(|val| xattr::remove(&etag_probe_path, ETAG_PROBE).map(|()| val));
+        let etag_result = etag_probe_file
+            .set_xattr(ETAG_PROBE, ETAG_PROBE_VALUE)
+            .and_then(|()| etag_probe_file.get_xattr(ETAG_PROBE))
+            .and_then(|val| etag_probe_file.remove_xattr(ETAG_PROBE).map(|()| val));
+        drop(etag_probe_file);
         if let Err(err) = std::fs::remove_file(&etag_probe_path) {
             error!(
                 "Failed to remove extended attribute probe file `{}`:  {err}",

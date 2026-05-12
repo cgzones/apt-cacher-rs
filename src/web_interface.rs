@@ -1887,6 +1887,11 @@ fn build_metrics_html() -> String {
         AlertNonzero(metrics::CACHE_IO_FAILURE.get()),
     );
     t.row_tip(
+        "Cache Non-Regular Files",
+        "Cache entries observed as non-regular files (FIFO, socket, device, directory, symlink). Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which retain pool/by-hash entries unverified, but actively remove non-regular entries from tmp/).",
+        AlertNonzero(metrics::CACHE_NON_REGULAR.get()),
+    );
+    t.row_tip(
         "Logstore Evictions",
         "Important-log ring-buffer evictions due to overflow.",
         WarnNonzero(metrics::LOGSTORE_EVICTIONS.get()),

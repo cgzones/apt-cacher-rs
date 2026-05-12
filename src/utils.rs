@@ -14,7 +14,7 @@ use crate::{
     http_etag::read_etag,
     http_range::HttpDate,
     humanfmt::HumanFmt,
-    warn_once_or_debug, xattr_helpers,
+    metrics, warn_once_or_debug, xattr_helpers,
 };
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
@@ -190,9 +190,9 @@ pub(crate) async fn prepare_partial_resume(
     ibarrier: &InitBarrier<'_>,
     debname: &str,
     mirror: &deb_mirror::Mirror,
-    log_prefix: &str,
+    log_prefix: &'static str,
 ) -> Result<PartialResume, (std::io::Error, TempPath)> {
-    match open_partial_file(ibarrier).await {
+    match open_partial_file(ibarrier, log_prefix).await {
         Ok((file, size, _mtime, guard)) if size > 0 => {
             if let Some(if_range) = read_etag(&file, &guard) {
                 let expected_total = xattr_helpers::read_expected_size(&file, &guard);
@@ -438,25 +438,67 @@ fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
 ///
 /// By opening the file and querying size + mtime from the same file handle, this avoids
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
-pub(crate) async fn open_partial_file(
+async fn open_partial_file(
     ibarrier: &InitBarrier<'_>,
+    log_prefix: &'static str,
 ) -> Result<(tokio::fs::File, u64, HttpDate, TempPath), (tokio::io::Error, TempPath)> {
     use tokio::io::AsyncSeekExt as _;
 
-    async fn file_ops(path: &Path) -> Result<(tokio::fs::File, u64, HttpDate), tokio::io::Error> {
+    async fn file_ops(
+        path: &Path,
+        log_prefix: &'static str,
+    ) -> Result<(tokio::fs::File, u64, HttpDate), tokio::io::Error> {
         let mut file = tokio::fs::File::options()
             .write(true)
             .read(true)
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)
-            .await?;
+            .await
+            .inspect_err(|err| {
+                // NotFound is the normal "no partial file" case; the caller
+                // turns it into a fresh download.  Don't pollute the failure
+                // metric or logs with it.
+                if err.kind() != tokio::io::ErrorKind::NotFound {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "{log_prefix}failed to open partial file `{}`:  {err}",
+                        path.display()
+                    );
+                }
+            })?;
+
+        let mdata = file.metadata().await.inspect_err(|err| {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "{log_prefix}failed to get metadata of partial file `{}`:  {err}",
+                path.display()
+            );
+        })?;
+        if !mdata.file_type().is_file() {
+            metrics::CACHE_NON_REGULAR.increment();
+            warn!(
+                "{log_prefix}partial file `{}` is not a regular file",
+                path.display()
+            );
+            return Err(tokio::io::Error::new(
+                tokio::io::ErrorKind::InvalidData,
+                "Not a regular file",
+            ));
+        }
 
         // Seek to the end so subsequent writes append correctly.
-        let size = file.seek(std::io::SeekFrom::End(0)).await?;
+        let size = file
+            .seek(std::io::SeekFrom::End(0))
+            .await
+            .inspect_err(|err| {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "{log_prefix}failed to seek partial file `{}`:  {err}",
+                    path.display()
+                );
+            })?;
 
-        let mtime = file
-            .metadata()
-            .await?
+        let mtime = mdata
             .modified()
             .expect("Platform should support modification timestamps via setup check");
 
@@ -469,7 +511,7 @@ pub(crate) async fn open_partial_file(
         path: Some(path),
         keep_on_drop: true,
     };
-    match file_ops(&guard).await {
+    match file_ops(&guard, log_prefix).await {
         Ok((file, size, mtime)) => Ok((file, size, mtime, guard)),
         Err(e) => Err((e, guard)),
     }
@@ -522,8 +564,8 @@ pub(crate) async fn touch_volatile_mtime(
     file: tokio::fs::File,
     display_path: &Path,
 ) -> tokio::fs::File {
-    let metadata = match file.metadata().await {
-        Ok(metadata) => metadata,
+    let mdata = match file.metadata().await {
+        Ok(m) => m,
         Err(err) => {
             error!(
                 "Failed to get metadata of file `{}`:  {err}",
@@ -536,7 +578,7 @@ pub(crate) async fn touch_volatile_mtime(
     // represents the actual content age.  Mtime is repurposed as a "last revalidated"
     // timestamp.  If the filesystem does not support btime, updating mtime would destroy
     // the only content-age signal, so skip the update in that case.
-    if metadata.created().is_err() {
+    if mdata.created().is_err() {
         return file;
     }
 
