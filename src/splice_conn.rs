@@ -1963,6 +1963,16 @@ async fn splice_proxy_body(
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
 
+        // Feed the upstream RC up-front (the bytes have already arrived) so
+        // any subsequent `check_fail` in this iteration — in particular the
+        // `DemoteRequested → check_upstream_rate` adjudication below — sees
+        // the freshest window. Without this the upstream RC would still be
+        // one chunk behind the client RC at the moment a slow upstream
+        // causes the client check inside `tee_and_splice` to trip.
+        if let Some(ref mut rate_checker) = rate_checker {
+            rate_checker.add(got);
+        }
+
         // Determine how this chunk overlaps with the client range.
         let chunk_start = bytes_done;
         let chunk_end = bytes_done + got as u64;
@@ -1992,11 +2002,27 @@ async fn splice_proxy_body(
             )
             .await?;
 
-            if let ClientStatus::Demoted {
-                client_file_pos,
-                client_remaining,
+            if let ClientStatus::DemoteRequested {
+                client_file_pos: demote_pos,
+                client_remaining: demote_remaining,
             } = client_status
             {
+                // Slow upstream is the most common reason the client RC trips;
+                // surface that root cause via the existing MirrorDownloadRate
+                // abort before spinning up a doomed demoted file-serve task.
+                dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
+
+                // Upstream is healthy — client really is the bottleneck.
+                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+                let demote_remaining_percent =
+                    100.0 * demote_remaining as f32 / range_filter.send as f32;
+                info!(
+                    "splice proxy: demoting slow client to file-serve at cache offset {} with {} remaining out of {} ({:.1}%)",
+                    HumanFmt::Size(demote_pos),
+                    HumanFmt::Size(demote_remaining),
+                    HumanFmt::Size(range_filter.send),
+                    demote_remaining_percent,
+                );
                 // Hand accounting off to the spawned demoted-serve task — its
                 // `async_sendfile_unfinished` creates its own `ClientDownload`
                 // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
@@ -2004,10 +2030,11 @@ async fn splice_proxy_body(
                 demoted_handle = Some(spawn_file_serve_task(
                     client,
                     cache_path,
-                    client_file_pos,
-                    client_remaining,
+                    demote_pos,
+                    demote_remaining,
                     &dbarrier,
                 )?);
+                client_status = ClientStatus::Demoted;
             }
         } else {
             // Boundary chunk — read into userspace, slice for client, pwrite for cache
@@ -2069,10 +2096,6 @@ async fn splice_proxy_body(
         }
 
         bytes_done = chunk_end;
-
-        if let Some(ref mut rate_checker) = rate_checker {
-            rate_checker.add(got);
-        }
 
         remaining = remaining
             .checked_sub(got as u64)
@@ -2307,6 +2330,12 @@ async fn splice_proxy_body_tls(
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
 
+        // See `splice_proxy_body` for the rationale on feeding the upstream
+        // RC up-front rather than at the end of the iteration.
+        if let Some(ref mut rate_checker) = rate_checker {
+            rate_checker.add(got);
+        }
+
         // Determine how this chunk overlaps with the client range.
         let chunk_start = bytes_done;
         let chunk_end = bytes_done + got as u64;
@@ -2338,11 +2367,27 @@ async fn splice_proxy_body_tls(
             )
             .await?;
 
-            if let ClientStatus::Demoted {
-                client_file_pos,
-                client_remaining,
+            if let ClientStatus::DemoteRequested {
+                client_file_pos: demote_pos,
+                client_remaining: demote_remaining,
             } = client_status
             {
+                // Slow upstream is the most common reason the client RC trips;
+                // surface that root cause via the existing MirrorDownloadRate
+                // abort before spinning up a doomed demoted file-serve task.
+                dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
+
+                // Upstream is healthy — client really is the bottleneck.
+                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+                let demote_remaining_percent =
+                    100.0 * demote_remaining as f32 / range_filter.send as f32;
+                info!(
+                    "splice proxy: demoting slow client to file-serve at cache offset {} with {} remaining out of {} ({:.1}%)",
+                    HumanFmt::Size(demote_pos),
+                    HumanFmt::Size(demote_remaining),
+                    HumanFmt::Size(range_filter.send),
+                    demote_remaining_percent,
+                );
                 // Hand accounting off to the spawned demoted-serve task — its
                 // `async_sendfile_unfinished` creates its own `ClientDownload`
                 // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
@@ -2350,10 +2395,11 @@ async fn splice_proxy_body_tls(
                 demoted_handle = Some(spawn_file_serve_task(
                     client,
                     cache_path,
-                    client_file_pos,
-                    client_remaining,
+                    demote_pos,
+                    demote_remaining,
                     &dbarrier,
                 )?);
+                client_status = ClientStatus::Demoted;
             }
         } else {
             // Boundary chunk — data is already in read_buf, handle in userspace.
@@ -2418,10 +2464,6 @@ async fn splice_proxy_body_tls(
         }
 
         bytes_done = chunk_end;
-
-        if let Some(ref mut rate_checker) = rate_checker {
-            rate_checker.add(got);
-        }
 
         remaining = remaining
             .checked_sub(got as u64)
@@ -2550,17 +2592,27 @@ enum ClientStatus {
     Active,
     /// Client disconnected mid-transfer.
     Disconnected,
-    /// Client send rate dropped below the minimum threshold.
-    /// The caller should spawn a file-serve task to continue serving
-    /// the client from the cache file starting at `client_file_pos`
-    /// for `client_remaining` bytes.
-    Demoted {
+    /// Client send rate dropped below the minimum threshold during the
+    /// inner tee+splice loop and the teed bytes still in `pipe_A` have
+    /// been drained. The caller adjudicates whether to actually demote
+    /// (transitioning to [`ClientStatus::Demoted`]) or to abort the
+    /// whole splice with an upstream-rate timeout: when the upstream
+    /// rate has also fallen below threshold the client RC is observing
+    /// the upstream bottleneck, so the caller surfaces the upstream
+    /// failure instead of spawning a doomed file-serve task.
+    DemoteRequested {
         /// Absolute cache file offset of the next byte the client expects.
         client_file_pos: u64,
         /// Bytes still owed to the client (matches the response Content-Length
         /// minus what was already written before/during the splice loop).
         client_remaining: u64,
     },
+    /// Caller has accepted the demote: a file-serve task has been spawned
+    /// and is now responsible for the client. Subsequent iterations of the
+    /// splice loop treat this identically to `Disconnected` (cache-only
+    /// path), and the byte counts the spawned task needs were already
+    /// passed in via the preceding `DemoteRequested`.
+    Demoted,
 }
 
 /// Shared tee+splice fan-out: consume `got` bytes from `pipe_A`, duplicate to `pipe_B`,
@@ -2570,8 +2622,10 @@ enum ClientStatus {
 /// write to the cache file so concurrent hyper clients can still complete.
 ///
 /// If the client send rate drops below the configured minimum, remaining bytes are
-/// drained and `ClientStatus::Demoted` is returned so the caller can transition the
-/// client to file-serve.
+/// drained and `ClientStatus::DemoteRequested` is returned so the caller can
+/// either promote it to `ClientStatus::Demoted` (spawn a file-serve task) or
+/// abort the splice with an upstream-rate timeout when the upstream is the
+/// actual bottleneck.
 #[expect(clippy::too_many_arguments, reason = "function has only 2 callers")]
 async fn tee_and_splice(
     upstream_pipe_rx: &pipe::Receiver,
@@ -2686,28 +2740,19 @@ async fn tee_and_splice(
                         if let Some(rc) = client_rate_checker {
                             rc.add(n);
                             if rc.check_fail(RateCheckDirection::Client).is_some() {
-                                // Client is too slow — drain remaining teed bytes
-                                // (cache already has them) and signal demotion
-                                #[expect(
-                                    clippy::cast_precision_loss,
-                                    reason = "only for display purpose"
-                                )]
-                                let client_remaining_percent =
-                                    100.0 * *client_remaining as f32 / client_total as f32;
-                                info!(
-                                    "splice proxy: demoting slow client to file-serve at cache offset {} with {} remaining out of {} ({:.1}%)",
-                                    HumanFmt::Size(*client_file_pos),
-                                    HumanFmt::Size(*client_remaining),
-                                    HumanFmt::Size(client_total),
-                                    client_remaining_percent
-                                );
+                                // Client RC tripped — drain remaining teed bytes
+                                // (cache already has them) and hand off to the
+                                // caller. The outer loop decides whether to
+                                // actually demote or to abort the splice on
+                                // upstream-rate failure (slow upstream is the
+                                // most common reason the client RC also trips).
                                 // `teed_remaining` has already been decremented by `n` (the bytes
                                 // just sent to the client), so it is exactly the count of teed
                                 // bytes still sitting in pipe_A that need to be drained before
                                 // we can stop servicing the client.
                                 drain_pipe(upstream_pipe_rx, teed_remaining).await?;
 
-                                status = ClientStatus::Demoted {
+                                status = ClientStatus::DemoteRequested {
                                     client_file_pos: *client_file_pos,
                                     client_remaining: *client_remaining,
                                 };
