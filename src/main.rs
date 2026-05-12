@@ -2969,13 +2969,13 @@ async fn serve_new_file(
                 #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
                 let remaining_percent = remaining as f32 / total as f32 * 100.0;
                 info!(
-                    "Resuming download of {} from mirror {} at byte {} ({} ({:.1}%) remaining of {} total)",
+                    "Resuming download of {} from mirror {} at {} ({} ({:.1}%) remaining of {} total)",
                     conn_details.debname,
                     conn_details.mirror,
-                    resume_offset,
-                    remaining,
+                    HumanFmt::Size(resume_offset),
+                    HumanFmt::Size(remaining),
                     remaining_percent,
-                    total
+                    HumanFmt::Size(total)
                 );
                 (
                     ContentLength::Exact(total_nz),
@@ -3216,8 +3216,11 @@ async fn serve_new_file(
 
     if resume_offset > 0 {
         info!(
-            "Resuming and serving file {} from mirror {} for client {} at byte {}...",
-            conn_details.debname, conn_details.mirror, conn_details.client, resume_offset
+            "Resuming and serving file {} from mirror {} for client {} at {}...",
+            conn_details.debname,
+            conn_details.mirror,
+            conn_details.client,
+            HumanFmt::Size(resume_offset)
         );
     } else {
         info!(

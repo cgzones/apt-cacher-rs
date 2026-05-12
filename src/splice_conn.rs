@@ -427,8 +427,9 @@ impl UpstreamConn {
                     false
                 }
                 Ok(pending) => {
+                    debug_assert_eq!(pending, 1, "buffer has size of 1");
                     warn_once_or_debug!(
-                        "splice proxy: pooled connection has unexpected data ({pending} bytes pending), discarding"
+                        "splice proxy: pooled connection has unexpected data, discarding"
                     );
                     false
                 }
@@ -1980,6 +1981,7 @@ async fn splice_proxy_body(
                 &cache_pipe_sender,
                 client,
                 (cache_file, &mut file_offset),
+                range_filter.send,
                 got,
                 client_status,
                 &mut dbarrier,
@@ -2325,6 +2327,7 @@ async fn splice_proxy_body_tls(
                 &cache_pipe_sender,
                 client,
                 (cache_file, &mut file_offset),
+                range_filter.send,
                 got,
                 client_status,
                 &mut dbarrier,
@@ -2451,10 +2454,6 @@ fn spawn_file_serve_task(
     let status = Arc::clone(dbarrier.status());
     let cache_path = cache_path.to_path_buf();
 
-    warn_once_or_info!(
-        "splice proxy: demoting slow client to file-serve at cache offset {content_start} ({content_length} bytes remaining)"
-    );
-
     Ok(tokio::task::spawn(serve_remaining_from_file(
         client_stream,
         cache_path,
@@ -2482,6 +2481,10 @@ async fn serve_remaining_from_file(
     receiver: tokio::sync::watch::Receiver<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> DeliveryResult {
+    debug!(
+        "splice proxy: starting to serve remaining bytes from cache file for demoted client at offset {content_start} ({content_length} bytes remaining)",
+    );
+
     let file = match tokio::fs::File::options()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW)
@@ -2575,6 +2578,7 @@ async fn tee_and_splice(
     cache_pipe_tx: &pipe::Sender,
     client: &TcpStream,
     target: (&tokio::fs::File, &mut i64),
+    client_total: u64,
     got: usize,
     client_status: ClientStatus,
     dbarrier: &mut DownloadBarrier,
@@ -2658,7 +2662,15 @@ async fn tee_and_splice(
                         // Client disconnected — drain the remaining teed bytes from pipe_A
                         // by splicing them to /dev/null (discard)
                         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                        info!("splice proxy: client disconnected, continuing cache-only");
+                        let client_sent = client_total - *client_remaining;
+                        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+                        let client_sent_percent = 100.0 * client_sent as f32 / client_total as f32;
+                        info!(
+                            "splice proxy: client disconnected after {} out of {} ({:.1}%), continuing cache-only",
+                            HumanFmt::Size(client_sent),
+                            HumanFmt::Size(client_total),
+                            client_sent_percent,
+                        );
                         status = ClientStatus::Disconnected;
                         drain_pipe(upstream_pipe_rx, teed_remaining).await?;
                         break;
@@ -2675,8 +2687,18 @@ async fn tee_and_splice(
                             if rc.check_fail(RateCheckDirection::Client).is_some() {
                                 // Client is too slow — drain remaining teed bytes
                                 // (cache already has them) and signal demotion
+                                #[expect(
+                                    clippy::cast_precision_loss,
+                                    reason = "only for display purpose"
+                                )]
+                                let client_remaining_percent =
+                                    100.0 * *client_remaining as f32 / client_total as f32;
                                 info!(
-                                    "splice proxy: client send rate too low, demoting to file-serve"
+                                    "splice proxy: demoting slow client to file-serve at cache offset {} with {} remaining out of {} ({:.1}%)",
+                                    HumanFmt::Size(*client_file_pos),
+                                    HumanFmt::Size(*client_remaining),
+                                    HumanFmt::Size(client_total),
+                                    client_remaining_percent
                                 );
                                 // `teed_remaining` has already been decremented by `n` (the bytes
                                 // just sent to the client), so it is exactly the count of teed
@@ -4261,13 +4283,13 @@ async fn splice_proxy_drive(
                 #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
                 let remaining_percent = remaining as f32 / total as f32 * 100.0;
                 info!(
-                    "splice proxy: resuming download of {} from mirror {} at byte {} ({} ({:.1}%) remaining of {} total)",
+                    "splice proxy: resuming download of {} from mirror {} at {} ({} ({:.1}%) remaining of {} total)",
                     conn_details.debname,
                     conn_details.mirror,
-                    resume_offset,
-                    remaining,
+                    HumanFmt::Size(resume_offset),
+                    HumanFmt::Size(remaining),
                     remaining_percent,
-                    total
+                    HumanFmt::Size(total)
                 );
                 (total, remaining)
             }
