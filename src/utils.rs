@@ -3,11 +3,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use log::{debug, error};
+use log::{debug, error, info, warn};
 use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 
 use crate::{
-    Never, deb_mirror, global_config, guards::InitBarrier, http_range::HttpDate, warn_once_or_debug,
+    HumanFmt, Never, deb_mirror, global_config, guards::InitBarrier, http_etag::read_etag,
+    http_range::HttpDate, warn_once_or_debug, xattr_helpers,
 };
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
@@ -101,6 +102,82 @@ impl PartialDownload {
                 Self::Fresh(guard.renew().await)
             }
         };
+    }
+}
+
+/// Outcome of [`prepare_partial_resume`]: byte offset, expected total size
+/// from xattr, `If-Range` validator, and the file-handle/path state to thread
+/// into the download body.
+pub(crate) struct PartialResume {
+    pub(crate) offset: u64,
+    pub(crate) expected_total: Option<u64>,
+    pub(crate) if_range: Option<String>,
+    pub(crate) partial: PartialDownload,
+}
+
+impl PartialResume {
+    fn fresh(guard: TempPath) -> Self {
+        Self {
+            offset: 0,
+            expected_total: None,
+            if_range: None,
+            partial: PartialDownload::Fresh(guard),
+        }
+    }
+}
+
+/// Open any existing partial download for `ibarrier`'s target and decide
+/// whether it can be safely resumed.
+///
+/// Strong-validator requirement: a partial is only resumable when it carries
+/// a stored upstream `ETag`.  RFC 9110 §8.8.2.2 requires a strong validator
+/// for `If-Range`; `Last-Modified` / mtime are weak when the origin does not
+/// guarantee sub-second-unique change detection — Debian mirror infrastructure
+/// does not — and the stored total-size xattr is insufficient to detect a
+/// same-size replacement within the mtime granularity.  Partials without an
+/// `ETag` are therefore discarded rather than risk silent concatenation of
+/// bytes from two different upstream revisions.
+///
+/// `log_prefix` is prepended to every emitted log line (e.g. `""` for the
+/// hyper path, `"splice proxy: "` for the splice path).
+///
+/// Returns `Ok` for both the resumable and fresh outcomes; the caller
+/// distinguishes via `partial`/`offset`.  Returns `Err((io_err, guard))` only
+/// when the open syscall failed with a kind other than `NotFound` — callers
+/// decide whether to bail or fall through to a fresh download (the partial
+/// path is left untouched on the filesystem either way).
+pub(crate) async fn prepare_partial_resume(
+    ibarrier: &InitBarrier<'_>,
+    debname: &str,
+    mirror: &deb_mirror::Mirror,
+    log_prefix: &str,
+) -> Result<PartialResume, (std::io::Error, TempPath)> {
+    match open_partial_file(ibarrier).await {
+        Ok((file, size, _mtime, guard)) if size > 0 => {
+            if let Some(if_range) = read_etag(&file, &guard) {
+                let expected_total = xattr_helpers::read_expected_size(&file, &guard);
+                info!(
+                    "{log_prefix}found partial download ({} out of {}) for {debname} from mirror {mirror}, will attempt resume",
+                    HumanFmt::Size(size),
+                    expected_total
+                        .map_or_else(|| "??".to_string(), |s| HumanFmt::Size(s).to_string()),
+                );
+                Ok(PartialResume {
+                    offset: size,
+                    expected_total,
+                    if_range: Some(if_range),
+                    partial: PartialDownload::Resumable { file, guard },
+                })
+            } else {
+                warn!(
+                    "{log_prefix}partial download for {debname} from mirror {mirror} lacks a strong upstream ETag, discarding instead of resuming",
+                );
+                drop(file);
+                Ok(PartialResume::fresh(guard.renew().await))
+            }
+        }
+        Ok((_file, _size, _mtime, guard)) => Ok(PartialResume::fresh(guard)),
+        Err((err, guard)) => Err((err, guard)),
     }
 }
 

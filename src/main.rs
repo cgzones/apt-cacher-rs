@@ -170,7 +170,6 @@ use crate::error::ProxyCacheError;
 use crate::guards::DownloadBarrier;
 use crate::guards::InitBarrier;
 use crate::http_etag::is_valid_etag;
-use crate::http_etag::read_etag;
 use crate::http_etag::write_etag;
 use crate::http_last_modified::write_last_modified;
 use crate::http_range::HttpDate;
@@ -2669,65 +2668,34 @@ async fn serve_new_file(
     // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
     // Explicit guard.remove() is used only when a stale partial must be discarded
     // (200 fallback from unsupported Range, 416, invalid Content-Range).
-    let mut resume_offset: u64 = 0;
-    let mut resume_expected_total: Option<u64> = None;
-    let mut resume_if_range: Option<String> = None;
-    let mut partial = if conn_details.cached_flavor == CachedFlavor::Permanent
-        && matches!(cfstate, CacheFileStat::New)
-    {
-        match utils::open_partial_file(&ibarrier).await {
-            Ok((file, size, _mtime, guard)) if size > 0 => {
-                // Only attempt resume when the partial carries a strong upstream
-                // ETag.  RFC 9110 §8.8.2.2 requires a strong validator for If-Range
-                // and Last-Modified is only strong when the origin guarantees
-                // sub-second-unique change detection — Debian mirror infrastructure
-                // does not make that guarantee, and the stored total-size xattr is
-                // insufficient to detect a same-size replacement within the mtime
-                // granularity.  Discard the partial instead of risking silent
-                // concatenation of bytes from two different upstream revisions.
-                //
-                // `read_etag` rejects weak ETags, so any value returned here is a
-                // strong validator per RFC 9110 §8.8.3.
-                let upstream_identifier = read_etag(&file, &guard);
-                if let Some(if_range) = upstream_identifier {
-                    resume_offset = size;
-                    resume_expected_total = xattr_helpers::read_expected_size(&file, &guard);
-                    resume_if_range = Some(if_range);
-                    info!(
-                        "Found partial download ({} bytes) for {} from mirror {}, will attempt resume",
-                        resume_offset, conn_details.debname, conn_details.mirror
-                    );
-                    utils::PartialDownload::Resumable { file, guard }
-                } else {
-                    // No strong validator stored (no upstream ETag, filesystem
-                    // without xattr support, or only Last-Modified available) —
-                    // cannot validate resume safety, discard the partial.
-                    warn!(
-                        "Partial download for {} from mirror {} lacks a strong upstream ETag, discarding instead of resuming",
-                        conn_details.debname, conn_details.mirror
-                    );
-                    drop(file);
-                    utils::PartialDownload::Fresh(guard.renew().await)
+    let (mut resume_offset, mut resume_expected_total, resume_if_range, mut partial) =
+        if conn_details.cached_flavor == CachedFlavor::Permanent
+            && matches!(cfstate, CacheFileStat::New)
+        {
+            match utils::prepare_partial_resume(
+                &ibarrier,
+                &conn_details.debname,
+                &conn_details.mirror,
+                "",
+            )
+            .await
+            {
+                Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
+                Err((err, guard)) => {
+                    // File doesn't exist or can't be opened — proceed without resume.
+                    // Match prior behavior: log non-NotFound errors but do not abort.
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        error!(
+                            "Failed to open partial file for {} from mirror {}:  {err}",
+                            conn_details.debname, conn_details.mirror
+                        );
+                    }
+                    (0, None, None, utils::PartialDownload::Fresh(guard))
                 }
             }
-            Ok((_file, _size, _mtime, guard)) => {
-                // Zero-byte partial — treat as no partial
-                utils::PartialDownload::Fresh(guard)
-            }
-            Err((err, guard)) => {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    error!(
-                        "Failed to open partial file for {} from mirror {}:  {err}",
-                        conn_details.debname, conn_details.mirror
-                    );
-                }
-                // File doesn't exist or can't be opened — proceed without resume
-                utils::PartialDownload::Fresh(guard)
-            }
-        }
-    } else {
-        utils::PartialDownload::Volatile
-    };
+        } else {
+            (0, None, None, utils::PartialDownload::Volatile)
+        };
 
     let fwd_request = build_fwd_request(
         &req_uri,

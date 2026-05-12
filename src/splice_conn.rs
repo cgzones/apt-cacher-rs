@@ -33,7 +33,7 @@ use crate::database_task::{
 use crate::deb_mirror::{Mirror, Origin};
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::guards::{DownloadBarrier, InitBarrier};
-use crate::http_etag::{is_valid_etag, read_etag, write_etag};
+use crate::http_etag::{is_valid_etag, write_etag};
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, WritePhase, find_header, write_416_response,
     write_all_to_stream, write_invalid_response,
@@ -55,6 +55,7 @@ use crate::sendfile_conn::{
     SendfileResult, async_sendfile, async_sendfile_unfinished, serve_file_via_sendfile,
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
+use crate::xattr_helpers;
 
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::tcp_cork_guard::CorkGuard;
@@ -3545,6 +3546,7 @@ async fn discard_partial_and_retry(
     host_authority: &str,
     upstream_path: &str,
     resume_offset: &mut u64,
+    resume_expected_total: &mut Option<u64>,
     upstream: &mut PoolGuard,
     upstream_resp: &mut UpstreamResponse,
     header_buf: &mut BytesMut,
@@ -3552,6 +3554,7 @@ async fn discard_partial_and_retry(
 ) -> Result<(), SpliceProxyError> {
     partial.discard_resume().await;
     *resume_offset = 0;
+    *resume_expected_total = None;
     upstream.unset_poolable();
     let (up, resp, hdr_buf, hdr_end, _label, pool) =
         standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None).await?;
@@ -3647,25 +3650,21 @@ async fn splice_proxy_drive(
     // The guard uses keep_on_drop: true so the partial file survives on fallback
     // (e.g., concurrent download → hyper path picks it up for resume).
     // Explicit guard.remove() is used only when a stale partial must be discarded.
-    let mut resume_offset: u64 = 0;
-    let mut resume_if_range: Option<String> = None;
-    let mut partial = if conn_details.cached_flavor == CachedFlavor::Permanent {
-        match utils::open_partial_file(&ibarrier).await {
-            Ok((file, size, mtime, guard)) if size > 0 => {
-                resume_offset = size;
-                resume_if_range = read_etag(&file, &guard).or_else(|| Some(mtime.format()));
-                info!(
-                    "splice proxy: found partial download ({} bytes) for {} from mirror {}, will attempt resume",
-                    resume_offset, conn_details.debname, conn_details.mirror
-                );
-                utils::PartialDownload::Resumable { file, guard }
-            }
-            Ok((_file, _size, _mtime, guard)) => {
-                // Zero-byte partial — treat as no partial
-                utils::PartialDownload::Fresh(guard)
-            }
-            Err((err, guard)) => {
-                if err.kind() != std::io::ErrorKind::NotFound {
+    let (mut resume_offset, mut resume_expected_total, resume_if_range, mut partial) =
+        if conn_details.cached_flavor == CachedFlavor::Permanent {
+            match utils::prepare_partial_resume(
+                &ibarrier,
+                &conn_details.debname,
+                &conn_details.mirror,
+                "splice proxy: ",
+            )
+            .await
+            {
+                Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
+                Err((err, guard)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    (0, None, None, utils::PartialDownload::Fresh(guard))
+                }
+                Err((err, guard)) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "splice proxy: failed to open partial file for {} from mirror {}:  {err}",
@@ -3674,13 +3673,10 @@ async fn splice_proxy_drive(
                     drop(guard);
                     return Err(SpliceProxyError::CacheError);
                 }
-                // File doesn't exist — proceed without resume
-                utils::PartialDownload::Fresh(guard)
             }
-        }
-    } else {
-        utils::PartialDownload::Volatile
-    };
+        } else {
+            (0, None, None, utils::PartialDownload::Volatile)
+        };
 
     // --- Volatile revalidation: read cached file metadata for conditional headers ---
     // When a stale volatile file exists in cache, prepare If-Modified-Since / If-None-Match
@@ -3974,13 +3970,14 @@ async fn splice_proxy_drive(
         );
         partial.discard_resume().await;
         resume_offset = 0;
+        resume_expected_total = None;
     }
 
     // Handle resume: if we got 416 (stale partial), discard and retry without Range
     if resume_offset > 0 && upstream_resp.status_code == 416 {
         warn!(
-            "splice proxy: 416 for resume of {} from mirror {}, discarding stale partial and retrying",
-            conn_details.debname, conn_details.mirror
+            "splice proxy: 416 for resume of {} from mirror {} (partial {} bytes), discarding stale partial and retrying",
+            conn_details.debname, conn_details.mirror, resume_offset
         );
         discard_partial_and_retry(
             &mut partial,
@@ -3988,6 +3985,7 @@ async fn splice_proxy_drive(
             &host_authority,
             upstream_path,
             &mut resume_offset,
+            &mut resume_expected_total,
             &mut upstream,
             &mut upstream_resp,
             &mut header_buf,
@@ -4202,16 +4200,24 @@ async fn splice_proxy_drive(
 
     // Handle resume: if we got 206 but Content-Range is invalid/mismatched,
     // discard partial and retry fresh — same pattern as 416 handling above.
+    // Only accept a 206 that delivers the full remainder (start == resume_offset
+    // AND end + 1 == total) and whose total matches the size we expected; anything
+    // else means the file changed upstream or the server is misbehaving, so the
+    // stored bytes can't safely be appended to.
     if resume_offset > 0 && upstream_resp.status_code == 206 {
         let content_range_valid = upstream_resp
             .content_range
             .as_deref()
             .and_then(parse_content_range)
-            .is_some_and(|(start, _, _)| start == resume_offset);
+            .is_some_and(|(start, end, total)| {
+                start == resume_offset
+                    && end.checked_add(1) == Some(total)
+                    && resume_expected_total.is_none_or(|expected| expected == total)
+            });
 
         if !content_range_valid {
             warn!(
-                "splice proxy: invalid Content-Range for 206 response of {} from mirror {}, discarding partial and retrying fresh",
+                "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}, discarding partial and retrying fresh",
                 conn_details.debname, conn_details.mirror
             );
             discard_partial_and_retry(
@@ -4220,6 +4226,7 @@ async fn splice_proxy_drive(
                 &host_authority,
                 upstream_path,
                 &mut resume_offset,
+                &mut resume_expected_total,
                 &mut upstream,
                 &mut upstream_resp,
                 &mut header_buf,
@@ -4239,25 +4246,33 @@ async fn splice_proxy_drive(
             .and_then(parse_content_range);
 
         match content_range {
-            Some((start, _end, total)) if start == resume_offset => {
-                let Some(remaining) = total.checked_sub(resume_offset) else {
-                    warn_once_or_info!(
-                        "splice proxy: inconsistent Content-Range for 206 response of {} from mirror {}: \
-                         total {total} < resume_offset {resume_offset}",
-                        conn_details.debname,
-                        conn_details.mirror
+            Some((start, end, total))
+                if start == resume_offset
+                    && end.checked_add(1) == Some(total)
+                    && resume_expected_total.is_none_or(|expected| expected == total) =>
+            {
+                let remaining = end - start + 1;
+                // Cross-check declared Content-Length (if present) matches the range span.
+                if let Some(cl) = upstream_resp.content_length
+                    && cl != remaining
+                {
+                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                    warn!(
+                        "splice proxy: Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}",
+                        conn_details.debname, conn_details.mirror
                     );
+                    upstream.unset_poolable();
                     write_invalid_response(
                         client_stream,
                         conn_version,
                         conn_action,
                         StatusCode::BAD_GATEWAY,
-                        "upstream Content-Range total < resume offset",
+                        "Inconsistent Content-Range",
                     )
                     .await
                     .map_err(SpliceProxyError::ClientError)?;
                     return Ok(());
-                };
+                }
                 #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
                 let remaining_percent = remaining as f32 / total as f32 * 100.0;
                 info!(
@@ -4272,13 +4287,15 @@ async fn splice_proxy_drive(
                 (total, remaining)
             }
             _ => {
-                // Should not happen: invalid Content-Range was already handled above
-                // with a fresh retry. If we still get here, the retried response is
-                // also broken — return error to client.
+                // Content-Range mismatch or missing: should be handled by the
+                // pre-check above (which discards partial and retries fresh).
+                // Defensive fallback in case of unexpected state.
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn!(
                     "splice proxy: unexpected Content-Range state for 206 response of {} from mirror {}: {:?}",
                     conn_details.debname, conn_details.mirror, upstream_resp.content_range
                 );
+                upstream.unset_poolable();
                 write_invalid_response(
                     client_stream,
                     conn_version,
@@ -4527,6 +4544,8 @@ async fn splice_proxy_drive(
     if let Some(ref lm) = upstream_resp.last_modified {
         write_last_modified(&tempfile, &temppath, lm);
     }
+    // Persist expected total size so a future resume can detect upstream file changes.
+    xattr_helpers::write_expected_size(&tempfile, &temppath, total_content_length.get());
 
     let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
         upstream_resp.etag.clone(),
