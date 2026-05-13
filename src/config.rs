@@ -317,9 +317,11 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
 // expects a raw one (and vice versa) — the invariant used to rest on
 // careful variable naming alone.
 //
-// `#[repr(transparent)]` matches the layout of the inner `DomainName`; no
-// `unsafe` cast helper is exposed today, but the attribute documents the
-// invariant and leaves room for one later.
+// `#[repr(transparent)]` on both wrappers guarantees they share the
+// layout of the inner [`DomainName`].  [`ClientHost::as_cache_host`]
+// relies on this to return a zero-alloc `&CacheHost` borrow via a
+// reference cast (the only `unsafe` block introduced by these
+// newtypes).
 
 /// Host name as supplied by the client on the wire (post-validation).
 ///
@@ -363,10 +365,22 @@ impl ClientHost {
     /// the borrow would mislabel a non-canonical name as canonical.
     #[must_use]
     pub(crate) fn as_cache_host(&self) -> &CacheHost {
+        // Tripwire for a future edit that adds a second field to either
+        // wrapper or swaps the inner type for one with different
+        // align/size.  The soundness of the cast below rests on
+        // `#[repr(transparent)]` being present on both wrappers; that
+        // attribute is not directly checkable in `const`, but layout
+        // equivalence implies these two equalities.
+        const _: () = assert!(
+            std::mem::size_of::<ClientHost>() == std::mem::size_of::<CacheHost>()
+                && std::mem::align_of::<ClientHost>() == std::mem::align_of::<CacheHost>(),
+            "ClientHost and CacheHost must share layout - one of them lost its #[repr(transparent)] or gained a second field",
+        );
         // `transmute` is well-typed only when both sides share an
         // identical layout, so this additionally catches a regression
         // that changes the inner field type of either wrapper to
-        // something that happens to be the same width as `DomainName`.
+        // something that happens to be the same width as `DomainName`
+        // (size_of + align_of alone would not flag that).
         const _: fn() = || {
             let _ = std::mem::transmute::<ClientHost, DomainName>;
             let _ = std::mem::transmute::<CacheHost, DomainName>;
