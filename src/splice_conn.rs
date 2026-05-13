@@ -3006,7 +3006,11 @@ async fn send_and_read_headers(
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_RESPONSE_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
-    let resp = parse_upstream_response(&hdr_buf, hdr_end)?;
+    let resp = parse_upstream_response(&hdr_buf, hdr_end).map_err(|err| {
+        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+        warn_once_or_info!("splice proxy: upstream {host_authority} sent malformed HTTP:  {err}");
+        err
+    })?;
     // Credit body bytes that arrived bundled with the response headers
     // in the same read (the body_prefix). Done after parse so an
     // unparsable response is not credited as a successful download —
@@ -3453,12 +3457,14 @@ async fn forward_upstream_chunked_body(
                                 let line = &size_buf[..size_buf.len() - 2]; // strip \r\n
                                 let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
                                 let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_| {
+                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                     std::io::Error::new(
                                         ErrorKind::InvalidData,
                                         "chunked encoding: invalid chunk-size line",
                                     )
                                 })?;
                                 let chunk_size = usize::from_str_radix(hex_str.trim(), 16).map_err(|_| {
+                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                     std::io::Error::new(
                                         ErrorKind::InvalidData,
                                         "chunked encoding: invalid chunk-size hex",
@@ -3486,6 +3492,7 @@ async fn forward_upstream_chunked_body(
                             }
                             // Guard against absurdly long size lines
                             if size_buf.len() > 64 {
+                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                 return Err(std::io::Error::new(
                                     ErrorKind::InvalidData,
                                     "chunked encoding: chunk-size line too long",
@@ -3510,6 +3517,7 @@ async fn forward_upstream_chunked_body(
                                 if b == b'\r' {
                                     *seen_cr = true;
                                 } else {
+                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                     return Err(std::io::Error::new(
                                         ErrorKind::InvalidData,
                                         "chunked encoding: expected \\r after chunk data",
@@ -3519,6 +3527,7 @@ async fn forward_upstream_chunked_body(
                                 if b == b'\n' {
                                     state = ChunkedState::ReadingSize;
                                 } else {
+                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                     return Err(std::io::Error::new(
                                         ErrorKind::InvalidData,
                                         "chunked encoding: expected \\n after chunk data \\r",
@@ -3539,6 +3548,7 @@ async fn forward_upstream_chunked_body(
                             i += 1;
                             let expected = if *remaining == 2 { b'\r' } else { b'\n' };
                             if b != expected {
+                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                 return Err(std::io::Error::new(
                                     ErrorKind::InvalidData,
                                     "chunked encoding: expected \\r\\n after 0-length chunk \
@@ -3860,6 +3870,7 @@ async fn splice_proxy_drive(
                      falling back to standard path for buffered download"
                 );
             } else {
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 debug!("splice proxy: no usable Content-Length (from kTLS attempt), returning 502");
                 // Honoring the kTLS-parsed response: record its status before
                 // emitting our own 502 to the client. (The standard path is not
@@ -5346,6 +5357,7 @@ async fn read_dechunk_body_to_vec(
                         let line = &size_buf[..size_buf.len() - 2];
                         let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
                         let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_err| {
+                            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                             std::io::Error::new(
                                 ErrorKind::InvalidData,
                                 "chunked encoding: invalid chunk-size line",
@@ -5353,6 +5365,7 @@ async fn read_dechunk_body_to_vec(
                         })?;
                         let chunk_size =
                             usize::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
+                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                 std::io::Error::new(
                                     ErrorKind::InvalidData,
                                     "chunked encoding: invalid chunk-size hex",
@@ -5398,6 +5411,7 @@ async fn read_dechunk_body_to_vec(
                     } else if *seen_cr && b == b'\n' {
                         state = State::ReadingSize;
                     } else {
+                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                         return Err(std::io::Error::new(
                             ErrorKind::InvalidData,
                             "chunked encoding: expected CRLF after chunk data",
