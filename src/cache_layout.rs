@@ -305,15 +305,18 @@ pub(crate) struct RequestClass {
 /// into its own response shape (HTTP `quick_response` for the hyper path,
 /// `SendfileResult::Invalid` / `SendfileResult::NotApplicable` for sendfile).
 #[derive(Debug)]
-pub(crate) enum ClassifyError {
+pub(crate) enum ClassifyError<'a> {
     /// URL-decoding the field value failed.
     BadEncoding {
         kind: ValidateKind,
-        raw: String,
+        raw: &'a str,
         source: FromUtf8Error,
     },
     /// The decoded field value did not pass its `valid_*` validator.
-    InvalidValue { kind: ValidateKind, decoded: String },
+    InvalidValue {
+        kind: ValidateKind,
+        decoded: Cow<'a, str>,
+    },
     /// A structured `Pool` request had a filename whose extension is not
     /// `.deb` / `.udeb` / `.ddeb`.  Both dispatchers treat this as a
     /// non-cacheable request and fall through to the simple proxy.
@@ -325,7 +328,7 @@ pub(crate) enum ClassifyError {
     /// decoded) can pass the raw check yet decode to a name that does not
     /// match `<name>_<ver>_<arch>.<ext>`.  Re-checking the decoded form
     /// closes that bypass.
-    NonDebPool { filename: String },
+    NonDebPool { filename: Cow<'a, str> },
 }
 
 // ---------------------------------------------------------------------------
@@ -345,10 +348,10 @@ pub(crate) enum ClassifyError {
 ///
 /// `client` is borrowed only for inclusion in trace logs; nothing about the
 /// classification depends on the caller's identity.
-pub(crate) fn classify_request(
-    resource: &ResourceFile<'_>,
+pub(crate) fn classify_request<'a>(
+    resource: &'a ResourceFile<'_>,
     client: &ClientInfo,
-) -> Result<RequestClass, ClassifyError> {
+) -> Result<RequestClass, ClassifyError<'a>> {
     // Each arm decodes/validates only the fields that variant carries, then
     // assembles the (debname, cached_flavor, subdir, origin_fields) tuple.
     match resource {
@@ -360,9 +363,7 @@ pub(crate) fn classify_request(
             let filename = decode_validate(filename, ValidateKind::Filename)?;
 
             if !is_deb_package(&filename) {
-                return Err(ClassifyError::NonDebPool {
-                    filename: filename.into_owned(),
-                });
+                return Err(ClassifyError::NonDebPool { filename });
             }
 
             trace!(
@@ -539,9 +540,7 @@ pub(crate) fn classify_request(
                     // decoded filename to keep flat-pool caching limited
                     // to genuine `<name>_<ver>_<arch>.<ext>` packages.
                     if !is_flat_deb_filename(&filename) {
-                        return Err(ClassifyError::NonDebPool {
-                            filename: filename.into_owned(),
-                        });
+                        return Err(ClassifyError::NonDebPool { filename });
                     }
                     (CachedFlavor::Permanent, CacheLayout::Flat)
                 }
@@ -565,15 +564,11 @@ pub(crate) fn classify_request(
 /// the result into `format!` or a `&str`-taking validator pay no extra
 /// allocation; callers needing an owned `String` (e.g. `RequestClass.mirror_path`)
 /// call `.into_owned()` at the move site.
-fn decode_validate<'a>(raw: &'a str, kind: ValidateKind) -> Result<Cow<'a, str>, ClassifyError> {
+fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, ClassifyError<'_>> {
     let decoded = match urlencoding::decode(raw) {
         Ok(s) => s,
         Err(source) => {
-            return Err(ClassifyError::BadEncoding {
-                kind,
-                raw: raw.to_owned(),
-                source,
-            });
+            return Err(ClassifyError::BadEncoding { kind, raw, source });
         }
     };
 
@@ -586,10 +581,7 @@ fn decode_validate<'a>(raw: &'a str, kind: ValidateKind) -> Result<Cow<'a, str>,
     };
 
     if !ok {
-        return Err(ClassifyError::InvalidValue {
-            kind,
-            decoded: decoded.into_owned(),
-        });
+        return Err(ClassifyError::InvalidValue { kind, decoded });
     }
 
     Ok(decoded)
