@@ -1618,8 +1618,8 @@ fn build_metrics_html() -> String {
                     status_3xx,
                     status_3xx != status_301 + status_302 + status_304
                 ),
-                WarnNonzero(metrics::UPSTREAM_STATUS_4XX.get()),
-                AlertNonzero(metrics::UPSTREAM_STATUS_5XX.get()),
+                metrics::UPSTREAM_STATUS_4XX.get(),
+                WarnNonzero(metrics::UPSTREAM_STATUS_5XX.get()),
                 WarnNonzero(metrics::UPSTREAM_STATUS_OTHER.get()),
             ),
         );
