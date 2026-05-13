@@ -1869,8 +1869,13 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Upstream Protocol Violations",
-        "Mirror responses that broke the HTTP contract: body over- or under-ran the announced Content-Length, missing or mismatched Content-Range, missing Content-Length on a fetch.",
+        "Mirror responses that broke the HTTP contract: body over- or under-ran the announced Content-Length, missing or mismatched Content-Range, missing Content-Length on a fetch, or 206 returned without a Range request.",
         WarnNonzero(metrics::UPSTREAM_PROTOCOL_VIOLATION.get()),
+    );
+    t.row_tip(
+        "Upstream Unsolicited 206",
+        "Mirror responses that returned 206 Partial Content for a request the proxy issued without a Range header. Rejected with 502 to avoid cache poisoning. A telemetry slice of Upstream Protocol Violations.",
+        WarnNonzero(metrics::UPSTREAM_UNSOLICITED_206.get()),
     );
     t.row_tip(
         "Upstream (hyper) Failures pre-response / body",

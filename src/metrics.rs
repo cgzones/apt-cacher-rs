@@ -311,9 +311,18 @@ pub(crate) static REQUESTS_CHANNEL: Counter = Counter::new();
 
 /// Mirror responses that violated the HTTP contract: body exceeded or
 /// undershot the announced `Content-Length`, missing or mismatched
-/// `Content-Range`, missing `Content-Length` on a non-volatile fetch.
+/// `Content-Range`, missing `Content-Length` on a non-volatile fetch, or
+/// `206 Partial Content` returned without a Range request.
 /// Any non-zero value points to a misbehaving upstream.
 pub(crate) static UPSTREAM_PROTOCOL_VIOLATION: Counter = Counter::new();
+
+/// Mirror responses that returned `206 Partial Content` for a request the
+/// proxy issued without a `Range:` header. Treating these as 200-equivalent
+/// would write the partial body into the cache at offset 0 and mark the
+/// file complete at the partial length, so the proxy rejects them with 502
+/// instead. A specific telemetry slice of `UPSTREAM_PROTOCOL_VIOLATION`
+/// (both counters are bumped together at the reject site).
+pub(crate) static UPSTREAM_UNSOLICITED_206: Counter = Counter::new();
 
 /// Hyper-backend upstream request failures that aborted before any response
 /// headers were observed: TCP connect, TLS handshake, and post-connect

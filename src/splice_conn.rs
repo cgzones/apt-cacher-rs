@@ -4365,6 +4365,29 @@ async fn splice_proxy_drive(
         }
     }
 
+    // Reject unsolicited 206: upstream returned partial content for a request
+    // without Range. See parallel reject in main.rs (hyper path).
+    if resume_offset == 0 && upstream_resp.status_code == 206 {
+        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+        metrics::UPSTREAM_UNSOLICITED_206.increment();
+        warn_once_or_info!(
+            "splice proxy: upstream returned 206 Partial Content without a Range request for {} from mirror {}",
+            conn_details.debname,
+            conn_details.mirror
+        );
+        upstream.unset_poolable();
+        write_invalid_response(
+            client_stream,
+            conn_version,
+            conn_action,
+            StatusCode::BAD_GATEWAY,
+            "Unsolicited 206",
+        )
+        .await
+        .map_err(|err| SpliceProxyError::Client(err, "unsolicited 206 502"))?;
+        return Ok(());
+    }
+
     // Determine total file size and body size for resume vs fresh downloads
     let (total_file_size, body_content_length) = if resume_offset > 0
         && upstream_resp.status_code == 206

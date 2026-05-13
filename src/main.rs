@@ -2958,6 +2958,21 @@ async fn serve_new_file(
         };
     }
 
+    // Reject unsolicited 206: upstream returned partial content for a request
+    // without Range. Treating it as a fresh 200 would write the partial bytes
+    // into the cache at offset 0 and mark the file complete at the partial
+    // length - a cache-poisoning vector.
+    if resume_offset == 0 && fwd_response.status() == StatusCode::PARTIAL_CONTENT {
+        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+        metrics::UPSTREAM_UNSOLICITED_206.increment();
+        warn_once_or_info!(
+            "Upstream returned 206 Partial Content without a Range request for {} from mirror {}",
+            conn_details.debname,
+            conn_details.mirror
+        );
+        return quick_response(StatusCode::BAD_GATEWAY, "Unsolicited 206");
+    }
+
     // Parse total file size and body content length for resume vs fresh downloads
     let (total_content_length, body_content_length) = if resume_offset > 0
         && fwd_response.status() == StatusCode::PARTIAL_CONTENT
