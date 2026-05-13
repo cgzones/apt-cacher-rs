@@ -125,6 +125,16 @@ pub(crate) async fn handle_sendfile_connection(
                 index
             }
             Err(err) => {
+                if err.kind() == ErrorKind::TimedOut {
+                    // Web UI connections from browsers tend to idle out;
+                    // the client is gone, so don't bother writing a 400.
+                    debug!(
+                        "Client {client} timed out before request number {} was received:  {}",
+                        req_num + 1,
+                        ErrorReport(&err),
+                    );
+                    return;
+                }
                 if is_peer_disconnect(&err) {
                     metrics::REQUEST_READ_PEER_DISCONNECT.increment();
                     info!(
@@ -132,14 +142,14 @@ pub(crate) async fn handle_sendfile_connection(
                         req_num + 1,
                         ErrorReport(&err),
                     );
-                } else {
-                    metrics::REQUEST_READ_PROTOCOL_ERROR.increment();
-                    warn_once_or_info!(
-                        "Failed to read request number {} from client {client}:  {}",
-                        req_num + 1,
-                        ErrorReport(&err),
-                    );
+                    return;
                 }
+                metrics::REQUEST_READ_PROTOCOL_ERROR.increment();
+                warn_once_or_info!(
+                    "Failed to read request number {} from client {client}:  {}",
+                    req_num + 1,
+                    ErrorReport(&err),
+                );
                 // Count the attempted request so REQUESTS_TOTAL stays >=
                 // CLIENT_STATUS_*: write_invalid_response below bumps
                 // CLIENT_STATUS_400 even though parsing failed.
