@@ -65,12 +65,15 @@ pub(crate) enum HttpsUpgradeMode {
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ConfigDomainName {
+enum ConfigDomainNameInner {
     Dns(String),
     Ipv4(String, Ipv4Addr),
     Ipv6(String, Ipv6Addr),
     Wildcard(String),
 }
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ConfigDomainName(ConfigDomainNameInner);
 
 impl ConfigDomainName {
     pub(crate) fn new(domain: String) -> Result<Self, String> {
@@ -79,30 +82,47 @@ impl ConfigDomainName {
         }
 
         if let Some(d) = domain.strip_prefix('*') {
-            return Ok(Self::Wildcard(d.to_string()));
+            return Ok(Self(ConfigDomainNameInner::Wildcard(d.to_string())));
         }
 
         if domain.contains(':') {
             return domain
                 .parse::<Ipv6Addr>()
-                .map(|addr| Self::Ipv6(addr.to_string(), addr))
+                .map(|addr| Self(ConfigDomainNameInner::Ipv6(addr.to_string(), addr)))
                 .map_err(|_parse_err| domain);
         }
 
         if let Ok(addr) = domain.parse::<Ipv4Addr>() {
-            return Ok(Self::Ipv4(addr.to_string(), addr));
+            return Ok(Self(ConfigDomainNameInner::Ipv4(addr.to_string(), addr)));
         }
 
-        Ok(Self::Dns(domain))
+        Ok(Self(ConfigDomainNameInner::Dns(domain)))
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) const fn as_str(&self) -> Option<&str> {
+        match self {
+            Self(
+                ConfigDomainNameInner::Dns(s)
+                | ConfigDomainNameInner::Ipv4(s, _)
+                | ConfigDomainNameInner::Ipv6(s, _),
+            ) => Some(s.as_str()),
+            Self(ConfigDomainNameInner::Wildcard(_)) => None,
+        }
     }
 
     #[must_use]
     pub(crate) fn permits(&self, domain: &str) -> bool {
         match self {
-            Self::Wildcard(d) => domain.ends_with(d),
-            Self::Dns(d) => domain == d,
-            Self::Ipv4(s, a) => domain == s || domain.parse::<Ipv4Addr>().is_ok_and(|d| d == *a),
-            Self::Ipv6(s, a) => domain == s || domain.parse::<Ipv6Addr>().is_ok_and(|d| d == *a),
+            Self(ConfigDomainNameInner::Wildcard(d)) => domain.ends_with(d),
+            Self(ConfigDomainNameInner::Dns(d)) => domain == d,
+            Self(ConfigDomainNameInner::Ipv4(s, a)) => {
+                domain == s || domain.parse::<Ipv4Addr>().is_ok_and(|d| d == *a)
+            }
+            Self(ConfigDomainNameInner::Ipv6(s, a)) => {
+                domain == s || domain.parse::<Ipv6Addr>().is_ok_and(|d| d == *a)
+            }
         }
     }
 }
@@ -122,30 +142,33 @@ impl<'de> Deserialize<'de> for ConfigDomainName {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(crate) enum DomainName {
+enum DomainNameInner {
     Dns(String),
     Ipv4(String, Ipv4Addr),
     Ipv6(String, Ipv6Addr),
 }
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct DomainName(DomainNameInner);
 
 impl DomainName {
     pub(crate) fn new(domain: String) -> Result<Self, String> {
         if domain.contains(':') {
             return domain
                 .parse::<Ipv6Addr>()
-                .map(|addr| Self::Ipv6(addr.to_string(), addr))
+                .map(|addr| Self(DomainNameInner::Ipv6(addr.to_string(), addr)))
                 .map_err(|_parse_err| domain);
         }
 
         if let Ok(addr) = domain.parse::<Ipv4Addr>() {
-            return Ok(Self::Ipv4(addr.to_string(), addr));
+            return Ok(Self(DomainNameInner::Ipv4(addr.to_string(), addr)));
         }
 
         // At this point we've already proven there's no `:` and the string
         // is not a valid IPv4 address, so skip those branches in the
         // validator.
         if is_valid_dns_label_string(&domain) {
-            Ok(Self::Dns(domain))
+            Ok(Self(DomainNameInner::Dns(domain)))
         } else {
             Err(domain)
         }
@@ -156,8 +179,8 @@ impl DomainName {
     #[inline]
     pub(crate) const fn is_ipv6(&self) -> bool {
         match self {
-            Self::Dns(_) | Self::Ipv4(..) => false,
-            Self::Ipv6(..) => true,
+            Self(DomainNameInner::Dns(_) | DomainNameInner::Ipv4(..)) => false,
+            Self(DomainNameInner::Ipv6(..)) => true,
         }
     }
 
@@ -165,7 +188,9 @@ impl DomainName {
     #[inline]
     pub(crate) const fn as_str(&self) -> &str {
         match self {
-            Self::Dns(s) | Self::Ipv4(s, _) | Self::Ipv6(s, _) => s.as_str(),
+            Self(
+                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
+            ) => s.as_str(),
         }
     }
 
@@ -257,7 +282,9 @@ impl AsRef<std::ffi::OsStr> for DomainName {
 impl From<DomainName> for String {
     fn from(val: DomainName) -> Self {
         match val {
-            DomainName::Dns(s) | DomainName::Ipv4(s, _) | DomainName::Ipv6(s, _) => s,
+            DomainName(
+                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
+            ) => s,
         }
     }
 }
@@ -265,7 +292,9 @@ impl From<DomainName> for String {
 impl<'a> From<&'a DomainName> for &'a String {
     fn from(val: &'a DomainName) -> Self {
         match val {
-            DomainName::Dns(s) | DomainName::Ipv4(s, _) | DomainName::Ipv6(s, _) => s,
+            DomainName(
+                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
+            ) => s,
         }
     }
 }
@@ -1450,12 +1479,10 @@ impl Config {
 
         if !self.allowed_mirrors.is_empty() {
             for mirror in &self.http_only_mirrors {
-                let mirror_str = match mirror {
-                    ConfigDomainName::Dns(s)
-                    | ConfigDomainName::Ipv4(s, _)
-                    | ConfigDomainName::Ipv6(s, _) => s.as_str(),
-                    ConfigDomainName::Wildcard(_) => continue,
+                let Some(mirror_str) = mirror.as_str() else {
+                    continue;
                 };
+
                 if !self.allowed_mirrors.iter().any(|a| a.permits(mirror_str)) {
                     warnings.push(format!(
                         "http_only_mirrors entry `{mirror_str}` is not permitted by allowed_mirrors"
