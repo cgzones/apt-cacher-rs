@@ -3098,8 +3098,8 @@ async fn standard_upstream_connect(
     metrics::POOL_NEW.increment();
 
     let (mut up, scheme) = connect_upstream(mirror).await.map_err(|err| {
-        debug!("splice proxy: failed to connect to upstream {host_authority}:  {err}");
-        SpliceProxyError::UpstreamError(err)
+        warn!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
+        SpliceProxyError::UpstreamError
     })?;
     cache_scheme(mirror, scheme);
 
@@ -3115,8 +3115,10 @@ async fn standard_upstream_connect(
     )
     .await
     .map_err(|err| {
-        warn!("splice proxy: failed upstream request to {host_authority}:  {err}");
-        SpliceProxyError::UpstreamError(err)
+        warn!(
+            "splice proxy: failed upstream request to {host_authority} for {upstream_path}:  {err}"
+        );
+        SpliceProxyError::UpstreamError
     })?;
 
     let label = if is_tls { " (TLS)" } else { "" };
@@ -4033,7 +4035,11 @@ async fn splice_proxy_drive(
             // inside `try_unbuffered_ktls_connect` carries the kTLS-layer
             // error for trace-level visibility.
             if resolve_mirror_scheme(mirror) == Some(Scheme::Https) {
-                return Err(SpliceProxyError::UpstreamError(err));
+                warn!(
+                    "splice proxy: upstream TCP error for {} from mirror {}:  {err}",
+                    conn_details.debname, conn_details.mirror
+                );
+                return Err(SpliceProxyError::UpstreamError);
             }
             let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
                 mirror,
@@ -5968,8 +5974,11 @@ pub(crate) async fn splice_simple_proxy(
     ) {
         Ok(s) => s,
         Err(err) => {
+            warn!(
+                "splice proxy: failed to rewrite headers for {upstream_path} from {host_authority}:  {err}"
+            );
             upstream.unset_poolable();
-            return Err(SpliceProxyError::UpstreamError(err));
+            return Err(SpliceProxyError::UpstreamError);
         }
     };
 
@@ -6083,7 +6092,7 @@ pub(crate) enum SpliceProxyError {
     /// Not applicable for splice proxy; fall back to hyper
     NotApplicable(&'static str),
     /// Error communicating with upstream
-    UpstreamError(std::io::Error),
+    UpstreamError,
     /// Error writing to client
     ClientError(std::io::Error),
     /// Error with cache file operations

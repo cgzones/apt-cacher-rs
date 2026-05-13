@@ -604,16 +604,10 @@ async fn try_sendfile_request(
                 .await
             {
                 Ok(()) => SendfileResult::Served(conn_action),
-                Err(SpliceProxyError::UpstreamError(err)) => {
-                    warn!(
-                        "simple proxy: upstream error for {uri_path} from host {}:  {err}",
-                        mirror.format_authority()
-                    );
-                    SendfileResult::Invalid {
-                        status: StatusCode::BAD_GATEWAY,
-                        msg: "Upstream Error",
-                    }
-                }
+                Err(SpliceProxyError::UpstreamError) => SendfileResult::Invalid {
+                    status: StatusCode::BAD_GATEWAY,
+                    msg: "Upstream Error",
+                },
                 Err(SpliceProxyError::TransferError) => SendfileResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     msg: "Transfer Error",
@@ -921,16 +915,10 @@ async fn try_sendfile_request(
                 );
                 SendfileResult::NotApplicable(reason)
             }
-            Err(SpliceProxyError::UpstreamError(err)) => {
-                warn!(
-                    "splice proxy: upstream error for {} from mirror {}{}:  {err}",
-                    conn_details.debname, conn_details.mirror, aliased
-                );
-                SendfileResult::Invalid {
-                    status: StatusCode::BAD_GATEWAY,
-                    msg: "Upstream Error",
-                }
-            }
+            Err(SpliceProxyError::UpstreamError) => SendfileResult::Invalid {
+                status: StatusCode::BAD_GATEWAY,
+                msg: "Upstream Error",
+            },
             Err(SpliceProxyError::CacheError) => SendfileResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",
