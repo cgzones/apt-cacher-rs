@@ -635,7 +635,23 @@ async fn try_sendfile_request(
                     }
                     ZeroCopyResult::ClientError
                 }
-                Err(SpliceProxyError::AfterHeader) => ZeroCopyResult::AfterHeaderError,
+                Err(SpliceProxyError::AfterHeaderClient(err, location)) => {
+                    if is_peer_disconnect(&err) {
+                        info!(
+                            "simple proxy: client response delivery aborted in {location} (peer disconnect) for {uri_path} from host {}:  {}",
+                            mirror.format_authority(),
+                            ErrorReport(&err)
+                        );
+                    } else {
+                        warn!(
+                            "simple proxy: client response delivery failed in {location} for {uri_path} from host {}:  {}",
+                            mirror.format_authority(),
+                            ErrorReport(&err)
+                        );
+                    }
+                    ZeroCopyResult::AfterHeaderError
+                }
+                Err(SpliceProxyError::AfterHeaderIo) => ZeroCopyResult::AfterHeaderError,
                 Err(SpliceProxyError::Cache) => ZeroCopyResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     msg: "Cache Access Failure",
@@ -949,7 +965,27 @@ async fn try_sendfile_request(
                 }
                 ZeroCopyResult::ClientError
             }
-            Err(SpliceProxyError::AfterHeader) => ZeroCopyResult::AfterHeaderError,
+            Err(SpliceProxyError::AfterHeaderClient(err, location)) => {
+                if is_peer_disconnect(&err) {
+                    info!(
+                        "splice proxy: client response delivery aborted in {location} (peer disconnect) for {} from mirror {}{}:  {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        aliased,
+                        ErrorReport(&err)
+                    );
+                } else {
+                    warn!(
+                        "splice proxy: client response delivery failed in {location} for {} from mirror {}{}:  {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        aliased,
+                        ErrorReport(&err)
+                    );
+                }
+                ZeroCopyResult::AfterHeaderError
+            }
+            Err(SpliceProxyError::AfterHeaderIo) => ZeroCopyResult::AfterHeaderError,
         }
     }
 

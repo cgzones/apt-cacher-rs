@@ -4256,11 +4256,7 @@ async fn splice_proxy_drive(
                 )
                 .await
                 .map_err(|err| {
-                    info!(
-                        "splice proxy: failed to send body prefix to client {}:  {err}",
-                        conn_details.client
-                    );
-                    SpliceProxyError::AfterHeader
+                    SpliceProxyError::AfterHeaderClient(err, "passthrough body prefix (CL)")
                 })?;
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
@@ -4270,11 +4266,7 @@ async fn splice_proxy_drive(
                 forward_upstream_body(&mut upstream, client_stream, remaining)
                     .await
                     .map_err(|err| {
-                        info!(
-                            "splice proxy: failed to send remaining body to client {}:  {err}",
-                            conn_details.client
-                        );
-                        SpliceProxyError::AfterHeader
+                        SpliceProxyError::AfterHeaderClient(err, "passthrough remaining body")
                     })?;
             }
         } else if upstream_resp.is_chunked {
@@ -4286,13 +4278,7 @@ async fn splice_proxy_drive(
                 VOLATILE_BODY_MAX,
             )
             .await
-            .map_err(|err| {
-                info!(
-                    "splice proxy: failed to send body prefix to client {}:  {err}",
-                    conn_details.client
-                );
-                SpliceProxyError::AfterHeader
-            })?;
+            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "passthrough chunked body"))?;
         } else {
             // No Content-Length and not chunked: read until EOF
             if !body_prefix.is_empty() {
@@ -4305,11 +4291,7 @@ async fn splice_proxy_drive(
                 )
                 .await
                 .map_err(|err| {
-                    info!(
-                        "splice proxy: failed to send body prefix to client {}:  {err}",
-                        conn_details.client
-                    );
-                    SpliceProxyError::AfterHeader
+                    SpliceProxyError::AfterHeaderClient(err, "passthrough body prefix (EOF)")
                 })?;
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
@@ -4317,11 +4299,7 @@ async fn splice_proxy_drive(
             forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
                 .await
                 .map_err(|err| {
-                    info!(
-                        "splice proxy: failed to forward body to client {}:  {err}",
-                        conn_details.client
-                    );
-                    SpliceProxyError::AfterHeader
+                    SpliceProxyError::AfterHeaderClient(err, "passthrough body until EOF")
                 })?;
         }
 
@@ -4878,8 +4856,11 @@ async fn splice_proxy_drive(
                 .await
                 .map_err(|err| {
                     metrics::CACHE_IO_FAILURE.increment();
-                    error!("splice proxy: failed to open partial file for reading:  {err}");
-                    SpliceProxyError::AfterHeader
+                    error!(
+                        "splice proxy: failed to reopen partial file `{}` for resume:  {err}",
+                        temppath.display()
+                    );
+                    SpliceProxyError::AfterHeaderIo
                 })?;
 
             async_sendfile(
@@ -4889,10 +4870,7 @@ async fn splice_proxy_drive(
                 send_end - send_start,
             )
             .await
-            .map_err(|err| {
-                info!("splice proxy: failed to sendfile partial data to client:  {err}");
-                SpliceProxyError::AfterHeader
-            })?;
+            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "resume sendfile to client"))?;
         }
     }
 
@@ -4926,7 +4904,7 @@ async fn splice_proxy_drive(
                 "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
                 temppath.display()
             );
-            SpliceProxyError::AfterHeader
+            SpliceProxyError::AfterHeaderIo
         })?;
 
         let client_slice = range_slice(
@@ -4981,7 +4959,7 @@ async fn splice_proxy_drive(
                 "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
                 temppath.display()
             );
-            SpliceProxyError::AfterHeader
+            SpliceProxyError::AfterHeaderIo
         })?;
 
         let client_slice = range_slice(
@@ -5089,13 +5067,7 @@ async fn splice_proxy_drive(
                 )
                 .await
             }
-            .map_err(|err| {
-                info!(
-                    "splice proxy: body transfer failed for {} from mirror {}:  {err}",
-                    conn_details.debname, conn_details.mirror
-                );
-                SpliceProxyError::AfterHeader
-            })?;
+            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "splice body transfer"))?;
         dbarrier = returned_dbarrier;
         (demoted_handle, body_client_disconnected)
     } else {
@@ -5137,7 +5109,14 @@ async fn splice_proxy_drive(
                 temppath.display(),
                 dest_file_path.display()
             );
-            return Err(SpliceProxyError::AfterHeader);
+            // The body was already fully delivered to the client; this
+            // failure only leaves the cache in an inconsistent state
+            // (the temp file will be cleaned up by its Drop guard, and
+            // future requests will re-download).  Report success to the
+            // caller so the connection stays alive and skip the DB
+            // Download/Delivery/Origin records that would otherwise
+            // claim the file is cached.
+            return Ok(());
         }
     }
 
@@ -5213,11 +5192,11 @@ async fn splice_proxy_drive(
     );
 
     if !client_succeeded {
-        debug!(
-            "splice proxy: closing connection to client {}",
-            conn_details.client
-        );
-        return Err(SpliceProxyError::AfterHeader);
+        // The actual failure (prefix-write, body splice, or demoted task)
+        // was already logged at its source.  Route through `AfterHeaderIo`
+        // so the outer arm silently closes the connection rather than
+        // emitting a duplicate client-error log line.
+        return Err(SpliceProxyError::AfterHeaderIo);
     }
 
     let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -5721,27 +5700,26 @@ async fn handle_volatile_buffered_download(
             config.http_timeout,
         )
         .await
-        .map_err(|err| {
-            info!(
-                "splice proxy: failed to write response body to client {}:  {err}",
-                conn_details.client
-            );
-            SpliceProxyError::AfterHeader
-        })?;
+        .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "volatile body to client"))?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
 
     drop(cork);
 
     // Write full body to cache file.
-    tempfile.write_all(&body).await.map_err(|err| {
+    if let Err(err) = tempfile.write_all(&body).await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
             "splice proxy: failed to write volatile body to cache file `{}`:  {err}",
             temppath.display()
         );
-        SpliceProxyError::AfterHeader
-    })?;
+        // Body was already fully delivered to the client; this failure
+        // only leaves cache state inconsistent.  Report success to the
+        // caller so the connection stays alive; skip the rename and
+        // the DB Download/Delivery/Origin records that would otherwise
+        // claim the file is cached.
+        return Ok(());
+    }
 
     dbarrier.ping();
 
@@ -5772,7 +5750,9 @@ async fn handle_volatile_buffered_download(
                 temppath.display(),
                 dest_file_path.display()
             );
-            return Err(SpliceProxyError::AfterHeader);
+            // As above: client already has the body; cache state is
+            // inconsistent.  Stay alive and skip DB records.
+            return Ok(());
         }
     }
 
@@ -5987,10 +5967,7 @@ pub(crate) async fn splice_simple_proxy(
         // Chunked encoding: forward raw framing, detect termination
         forward_upstream_chunked_body(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
             .await
-            .map_err(|err| {
-                info!("splice proxy: failed to forward chunked body to client:  {err}");
-                SpliceProxyError::AfterHeader
-            })?;
+            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "simple-proxy chunked body"))?;
     } else if let Some(cl) = resp.content_length {
         if !body_prefix.is_empty() {
             write_all_to_stream_rated(
@@ -6002,8 +5979,7 @@ pub(crate) async fn splice_simple_proxy(
             )
             .await
             .map_err(|err| {
-                info!("splice proxy: failed to write body prefix to client:  {err}");
-                SpliceProxyError::AfterHeader
+                SpliceProxyError::AfterHeaderClient(err, "simple-proxy body prefix (CL)")
             })?;
             metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
@@ -6013,8 +5989,7 @@ pub(crate) async fn splice_simple_proxy(
             forward_upstream_body(&mut upstream, client_stream, remaining)
                 .await
                 .map_err(|err| {
-                    info!("splice proxy: failed to forward body to client:  {err}");
-                    SpliceProxyError::AfterHeader
+                    SpliceProxyError::AfterHeaderClient(err, "simple-proxy remaining body")
                 })?;
         }
     } else {
@@ -6029,8 +6004,7 @@ pub(crate) async fn splice_simple_proxy(
             )
             .await
             .map_err(|err| {
-                info!("splice proxy: failed to write body prefix to client:  {err}");
-                SpliceProxyError::AfterHeader
+                SpliceProxyError::AfterHeaderClient(err, "simple-proxy body prefix (EOF)")
             })?;
             metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
@@ -6038,8 +6012,7 @@ pub(crate) async fn splice_simple_proxy(
         forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
             .await
             .map_err(|err| {
-                info!("splice proxy: failed to forward body to client:  {err}");
-                SpliceProxyError::AfterHeader
+                SpliceProxyError::AfterHeaderClient(err, "simple-proxy body until EOF")
             })?;
     }
 
@@ -6072,9 +6045,20 @@ pub(crate) enum SpliceProxyError {
     Client(std::io::Error, &'static str),
     /// Error with cache file operations
     Cache,
-    /// Error occurring after response headers were already written to the client.
-    /// The caller must close the connection without emitting a new HTTP status.
-    AfterHeader,
+    /// Client-side I/O failure after response headers were written.  The
+    /// caller must close the connection without emitting a new HTTP status.
+    /// `&'static str` is a short code-location tag (e.g. "passthrough
+    /// chunked body", "volatile body to client") that the outer arm
+    /// includes in the log so the operator sees which delivery phase
+    /// broke.  Logged at the outer arm with `is_peer_disconnect`-based
+    /// severity (INFO for peer disconnects, WARN otherwise).
+    AfterHeaderClient(std::io::Error, &'static str),
+    /// Cache-side I/O failure after response headers were written
+    /// (tempfile write, rename, partial-file reopen, etc.).  The caller
+    /// must close the connection.  Unlike `AfterHeaderClient`, the log
+    /// is emitted at the inner throw site - which has the on-disk
+    /// path(s) in scope - and the outer arm matches silently.
+    AfterHeaderIo,
 }
 
 #[cfg(test)]
