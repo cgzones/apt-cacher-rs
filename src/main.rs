@@ -1730,8 +1730,13 @@ async fn serve_volatile_file(
 
             // Gated on `not(sendfile)`: when the sendfile backend is enabled,
             // it has already bumped VOLATILE_HIT before any fallback into hyper.
+            // Cleanup-synthetic probes (task_cleanup's `.xz → .gz → raw` walk)
+            // bypass sendfile and would otherwise inflate the user-facing
+            // counter — exclude them.
             #[cfg(not(feature = "sendfile"))]
-            metrics::VOLATILE_HIT.increment();
+            if !conn_details.client.is_cleanup_synthetic() {
+                metrics::VOLATILE_HIT.increment();
+            }
 
             return serve_cached_file(conn_details, &req, file, file_path, None, Some(mdata)).await;
         }
@@ -1744,9 +1749,13 @@ async fn serve_volatile_file(
 
     // Gated on `not(sendfile)`: when the sendfile backend is enabled, it has
     // already bumped VOLATILE_REFETCHED for this stale-volatile path before
-    // any fallback into hyper.
+    // any fallback into hyper. Cleanup-synthetic probes bypass sendfile and
+    // are operator bookkeeping, not user traffic — exclude them so the
+    // dashboard ratio reflects real client behavior only.
     #[cfg(not(feature = "sendfile"))]
-    metrics::VOLATILE_REFETCHED.increment();
+    if !conn_details.client.is_cleanup_synthetic() {
+        metrics::VOLATILE_REFETCHED.increment();
+    }
 
     match appstate.active_downloads.insert(
         &conn_details.mirror,
@@ -2856,7 +2865,13 @@ async fn serve_new_file(
     } = cfstate
     {
         if fwd_response.status() == StatusCode::NOT_MODIFIED {
-            metrics::VOLATILE_REFETCHED_UPTODATE.increment();
+            // Skip the counter for cleanup-synthetic probes: they bypass
+            // sendfile and never bump VOLATILE_REFETCHED in the default build,
+            // so counting their 304s here would let the subset run ahead of
+            // the parent.
+            if !conn_details.client.is_cleanup_synthetic() {
+                metrics::VOLATILE_REFETCHED_UPTODATE.increment();
+            }
             file = touch_volatile_mtime(file, &file_path).await;
 
             ibarrier.finished(file_path.clone()).await;
@@ -2872,7 +2887,17 @@ async fn serve_new_file(
             .await;
         }
 
-        metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
+        // Only count "out of date" when upstream actually returned fresh
+        // content (mirrors the splice path's non-200/non-206 passthrough at
+        // splice_conn.rs:4264-4348); a 4xx/5xx revalidation is not a fresh
+        // body. Cleanup-synthetic probes bypass the parent counter and are
+        // excluded for the same reason as the UPTODATE site above.
+        let status = fwd_response.status();
+        if (status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT)
+            && !conn_details.client.is_cleanup_synthetic()
+        {
+            metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
+        }
         debug!(
             "File `{}` is outdated (status={}), downloading new version",
             file_path.display(),
@@ -3484,7 +3509,14 @@ pub(crate) async fn process_cache_request(
             #[cfg(not(feature = "sendfile"))]
             match conn_details.cached_flavor {
                 CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
-                CachedFlavor::Volatile => metrics::VOLATILE_REFETCHED.increment(),
+                CachedFlavor::Volatile => {
+                    // Cleanup-synthetic probes bypass sendfile's pre-bump on
+                    // the volatile-not-found path; exclude them so the
+                    // dashboard ratio reflects real client behavior only.
+                    if !conn_details.client.is_cleanup_synthetic() {
+                        metrics::VOLATILE_REFETCHED.increment();
+                    }
+                }
             }
 
             match appstate.active_downloads.insert(
