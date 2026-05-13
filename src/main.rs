@@ -4289,7 +4289,7 @@ async fn main_loop(
     // directories are now unreachable disk waste.  Probe each registered
     // mirror's legacy flat dir and warn so the operator can reclaim
     // space; we deliberately do not remove anything automatically because
-    // a mis-configured alias change could otherwise wipe live cache.
+    // a misconfigured alias change could otherwise wipe live cache.
     for mirror in &mirrors {
         let legacy_flat = config
             .cache_directory
