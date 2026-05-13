@@ -453,12 +453,6 @@ impl From<DomainName> for ClientHost {
     }
 }
 
-impl From<DomainName> for CacheHost {
-    fn from(value: DomainName) -> Self {
-        Self(value)
-    }
-}
-
 impl<'de> Deserialize<'de> for ClientHost {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1870,17 +1864,21 @@ mod test {
         DomainName::new(s.to_owned()).expect("test input must be a valid domain")
     }
 
-    fn ch(s: &str) -> ClientHost {
+    fn clh(s: &str) -> ClientHost {
         ClientHost::new(s.to_owned()).expect("test input must be a valid domain")
+    }
+
+    fn cah(s: &str) -> CacheHost {
+        CacheHost(dn(s))
     }
 
     /// Build an `Alias` group with the alias list pre-sorted, matching
     /// the invariant `Config::validate` enforces at load time.
     fn alias_group(main: &str, aliases: &[&str]) -> Alias {
-        let mut aliases: Vec<ClientHost> = aliases.iter().map(|s| ch(s)).collect();
+        let mut aliases: Vec<ClientHost> = aliases.iter().map(|s| clh(s)).collect();
         aliases.sort_unstable();
         Alias {
-            main: CacheHost::from(dn(main)),
+            main: cah(main),
             aliases,
         }
     }
@@ -1888,7 +1886,7 @@ mod test {
     #[test]
     fn resolve_alias_empty_slice_returns_none() {
         let aliases: [Alias; 0] = [];
-        assert!(resolve_alias(&aliases, &ch("deb.debian.org")).is_none());
+        assert!(resolve_alias(&aliases, &clh("deb.debian.org")).is_none());
     }
 
     #[test]
@@ -1901,7 +1899,7 @@ mod test {
                 "ftp.fr.debian.org",
             ],
         )];
-        let resolved = resolve_alias(&aliases, &ch("ftp.us.debian.org")).expect("alias matches");
+        let resolved = resolve_alias(&aliases, &clh("ftp.us.debian.org")).expect("alias matches");
         assert_eq!(resolved.as_str(), "deb.debian.org");
     }
 
@@ -1911,7 +1909,7 @@ mod test {
         // a request *to* the main returns `None` so the cache identity
         // falls back to the client host (which equals the main here).
         let aliases = [alias_group("deb.debian.org", &["ftp.de.debian.org"])];
-        assert!(resolve_alias(&aliases, &ch("deb.debian.org")).is_none());
+        assert!(resolve_alias(&aliases, &clh("deb.debian.org")).is_none());
     }
 
     #[test]
@@ -1921,7 +1919,7 @@ mod test {
             alias_group("archive.ubuntu.com", &["de.archive.ubuntu.com"]),
         ];
         let resolved =
-            resolve_alias(&aliases, &ch("de.archive.ubuntu.com")).expect("alias matches");
+            resolve_alias(&aliases, &clh("de.archive.ubuntu.com")).expect("alias matches");
         assert_eq!(resolved.as_str(), "archive.ubuntu.com");
     }
 
@@ -1933,20 +1931,20 @@ mod test {
             alias_group("solo.example.com", &[]),
             alias_group("deb.debian.org", &["ftp.de.debian.org"]),
         ];
-        assert!(resolve_alias(&aliases, &ch("solo.example.com")).is_none());
-        let hit = resolve_alias(&aliases, &ch("ftp.de.debian.org")).expect("alias matches");
+        assert!(resolve_alias(&aliases, &clh("solo.example.com")).is_none());
+        let hit = resolve_alias(&aliases, &clh("ftp.de.debian.org")).expect("alias matches");
         assert_eq!(hit.as_str(), "deb.debian.org");
     }
 
     #[test]
     fn resolve_alias_unknown_host_returns_none() {
         let aliases = [alias_group("deb.debian.org", &["ftp.de.debian.org"])];
-        assert!(resolve_alias(&aliases, &ch("apt.llvm.org")).is_none());
+        assert!(resolve_alias(&aliases, &clh("apt.llvm.org")).is_none());
     }
 
     #[test]
     fn client_host_into_cache_host_preserves_inner() {
-        let client = ch("example.test");
+        let client = clh("example.test");
         let cache = client.clone().into_cache_host();
         assert_eq!(cache.as_str(), "example.test");
         assert_eq!(client.as_str(), cache.as_str());
@@ -1956,7 +1954,7 @@ mod test {
     fn client_host_as_cache_host_zero_alloc_view() {
         // Both wrappers are `#[repr(transparent)]` around `DomainName`,
         // so `as_cache_host` returns a borrow with identical bytes.
-        let client = ch("example.test");
+        let client = clh("example.test");
         let cache_view = client.as_cache_host();
         assert_eq!(client.as_str(), cache_view.as_str());
         assert_eq!(
@@ -1967,9 +1965,9 @@ mod test {
 
     #[test]
     fn client_host_cross_kind_equality() {
-        let client = ch("example.test");
-        let cache = CacheHost::from(dn("example.test"));
-        let other = CacheHost::from(dn("other.test"));
+        let client = clh("example.test");
+        let cache = cah("example.test");
+        let other = cah("other.test");
         assert_eq!(*client, *cache);
         assert_eq!(*cache, *client);
         assert_ne!(*client, *other);
@@ -1980,8 +1978,8 @@ mod test {
     fn host_wrapper_deref_exposes_format_helpers() {
         // `Deref<Target = DomainName>` is the contract every caller
         // relies on for `as_str` / `format_cache_dir` / `format_authority`.
-        let client = ch("example.test");
-        let cache = CacheHost::from(dn("example.test"));
+        let client = clh("example.test");
+        let cache = cah("example.test");
         let port = NonZero::new(8080);
         assert_eq!(client.format_cache_dir(port).as_ref(), "example.test:8080");
         assert_eq!(cache.format_cache_dir(port).as_ref(), "example.test:8080");
