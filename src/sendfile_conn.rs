@@ -605,7 +605,7 @@ async fn try_sendfile_request(
             {
                 Ok(()) => SendfileResult::Served(conn_action),
                 Err(SpliceProxyError::UpstreamError(err)) => {
-                    info!(
+                    warn!(
                         "simple proxy: upstream error for {uri_path} from host {}:  {err}",
                         mirror.format_authority()
                     );
@@ -922,7 +922,7 @@ async fn try_sendfile_request(
                 SendfileResult::NotApplicable(reason)
             }
             Err(SpliceProxyError::UpstreamError(err)) => {
-                info!(
+                warn!(
                     "splice proxy: upstream error for {} from mirror {}{}:  {err}",
                     conn_details.debname, conn_details.mirror, aliased
                 );

@@ -759,6 +759,12 @@ enum KtlsResult {
     /// Carries only the parsed response so the caller can choose to serve cached
     /// data (304) or reconnect via the standard path for a clean full fetch.
     ResponseNotSpliceable { response: UpstreamResponse },
+    /// TCP connect failed before TLS was attempted. Carries the wrapped
+    /// `io::Error` from `tcp_connect` so the caller can short-circuit
+    /// (skip the redundant userspace-TLS retry, which would re-run the same
+    /// DNS/TCP attempt and fail identically) and surface the error once at
+    /// the outer handler.
+    TcpFailed(std::io::Error),
     /// Failed — must reconnect. `tls_succeeded` indicates whether HTTPS works
     /// for this mirror, so scheme can be cached to avoid double-HTTPS in auto mode.
     Failed { tls_succeeded: bool },
@@ -939,10 +945,8 @@ async fn try_unbuffered_ktls_connect(
     let mut tcp = match tcp_connect(host, port).await {
         Ok(tcp) => tcp,
         Err(err) => {
-            warn!("kTLS: TCP connect to upstream {host}:{port} failed:  {err}");
-            return KtlsResult::Failed {
-                tls_succeeded: false,
-            };
+            debug!("kTLS: TCP connect to upstream {host}:{port} failed:  {err}");
+            return KtlsResult::TcpFailed(err);
         }
     };
 
@@ -3094,7 +3098,7 @@ async fn standard_upstream_connect(
     metrics::POOL_NEW.increment();
 
     let (mut up, scheme) = connect_upstream(mirror).await.map_err(|err| {
-        warn!("splice proxy: failed to connect to upstream {host_authority}:  {err}");
+        debug!("splice proxy: failed to connect to upstream {host_authority}:  {err}");
         SpliceProxyError::UpstreamError(err)
     })?;
     cache_scheme(mirror, scheme);
@@ -3998,6 +4002,39 @@ async fn splice_proxy_drive(
         KtlsResult::ResponseNotSpliceable { .. } => {
             // Normally handled above, but during resume 206/416 fall through here
             // to use the standard buffered path for proper resume handling.
+            let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
+                mirror,
+                &host_authority,
+                upstream_path,
+                resume_offset,
+                resume_if_range.as_deref(),
+                volatile_cond.as_ref(),
+            )
+            .await?;
+            let port = mirror_port(mirror, up.is_tls());
+            (
+                PoolGuard::new(up, pool_host, port, poolable),
+                resp,
+                hdr_buf,
+                hdr_end,
+                Vec::new(),
+                label,
+            )
+        }
+        KtlsResult::TcpFailed(err) => {
+            // Short-circuit only when the scheme is locked to HTTPS - in that
+            // case `standard_upstream_connect` would re-run the same DNS/TCP
+            // to port 443 and fail identically.  In auto mode
+            // (`resolve_mirror_scheme(mirror) == None`) the standard path
+            // falls back from port 443 to port 80, a different TCP target,
+            // so let it run to preserve the HTTPS->HTTP fallback for
+            // HTTP-only upstreams that the operator has not listed in
+            // `http_only_mirrors`.  The kTLS-side DEBUG already emitted
+            // inside `try_unbuffered_ktls_connect` carries the kTLS-layer
+            // error for trace-level visibility.
+            if resolve_mirror_scheme(mirror) == Some(Scheme::Https) {
+                return Err(SpliceProxyError::UpstreamError(err));
+            }
             let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
                 mirror,
                 &host_authority,
