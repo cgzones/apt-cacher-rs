@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter};
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{
-    AppState, ClientInfo, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
+    AppState, ClientInfo, Never, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
     cache_layout::{
         CacheLayout, CachedFlavor, ConnectionDetails, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH,
         SUBDIR_TMP,
@@ -30,8 +30,8 @@ use crate::{
     config::{CacheHost, Config, resolve_alias},
     database::MirrorEntry,
     deb_mirror::{
-        Mirror, UriFormat as _, is_deb_package, is_strict_path_descendant, mirror_cache_path_impl,
-        path_starts_with_segment,
+        Mirror, MirrorKind, UriFormat as _, is_deb_package, is_strict_path_descendant,
+        mirror_cache_path_impl, path_starts_with_segment,
     },
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
@@ -1050,6 +1050,21 @@ async fn cleanup_mirror_deb_files(
     appstate: AppState,
     config: &Config,
 ) -> Result<CleanupDone, ProxyCacheError> {
+    // Flat-only rows have never seen a structured request — the `kind`
+    // column latches to `Structured` on the first such request (see
+    // `upsert_mirror_get_id`), so a `Flat` row is guaranteed to have no
+    // `<host>/<mirror_path>` pool tree on disk and no `origins` rows for
+    // this mirror. The structured-pool cleanup would just emit a
+    // "Found 0 active origins and 0 cached deb files" line and return —
+    // skip it outright. By-hash and flat-pool cleanup run separately.
+    if mirror.kind() == MirrorKind::Flat {
+        trace!(
+            "Skipping structured-pool cleanup for flat mirror {}",
+            mirror.cache_path().display()
+        );
+        return Ok(CleanupDone::empty(mirror.into()));
+    }
+
     let origins = appstate
         .database
         .get_origins_by_mirror(&mirror.host, mirror.port(), &mirror.path)

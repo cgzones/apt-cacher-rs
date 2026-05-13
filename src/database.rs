@@ -55,6 +55,15 @@ impl MirrorEntry {
         NonZero::new(self.port)
     }
 
+    /// Decoded layout kind. `cleanup_invalid_rows` purges out-of-range
+    /// encodings before any reader observes them, so the `unwrap_or`
+    /// fallback to `Structured` is purely defensive — mirrors the same
+    /// fallback used by `From<MirrorEntry> for Mirror`.
+    #[must_use]
+    pub(crate) fn kind(&self) -> MirrorKind {
+        MirrorKind::from_db_int(self.kind).unwrap_or(MirrorKind::Structured)
+    }
+
     #[must_use]
     pub(crate) fn format_authority(&self) -> Cow<'_, str> {
         self.host.format_authority(self.port())

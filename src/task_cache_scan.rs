@@ -1,13 +1,13 @@
 use std::{borrow::Cow, path::Path};
 
 use hashbrown::HashMap;
-use log::{error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use tokio::fs::DirEntry;
 
 use crate::{
     cache_layout::{KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
     database::{Database, MirrorEntry},
-    deb_mirror::{is_deb_package, is_strict_path_descendant},
+    deb_mirror::{MirrorKind, is_deb_package, is_strict_path_descendant},
     error::ProxyCacheError,
     global_config, metrics,
     utils::probe_dir,
@@ -220,6 +220,22 @@ async fn scan_mirror_dir(
 
     let mut mirror_dir = match tokio::fs::read_dir(&mirror_path).await {
         Ok(d) => d,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // For a `Flat`-kind row the structured-pool path is expected
+            // not to exist — `kind` latches to `Structured` on the very
+            // first structured request (see `upsert_mirror_get_id`), so a
+            // `Flat` row has by construction never written to
+            // `<host>/<mirror_path>/`. Logging at info here just adds
+            // noise on every startup / SIGUSR2 cleanup. For `Structured`
+            // rows the absence is potentially a real inconsistency, so
+            // keep the info-level call there.
+            if mirror.kind() == MirrorKind::Flat {
+                debug!("Mirror directory `{}` not found", mirror_path.display());
+            } else {
+                info!("Mirror directory `{}` not found", mirror_path.display());
+            }
+            return 0;
+        }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
