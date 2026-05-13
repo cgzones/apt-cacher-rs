@@ -48,6 +48,7 @@
 //! mirror-level subdirectories the startup scan recurses into.
 
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
     string::FromUtf8Error,
 };
@@ -359,7 +360,9 @@ pub(crate) fn classify_request(
             let filename = decode_validate(filename, ValidateKind::Filename)?;
 
             if !is_deb_package(&filename) {
-                return Err(ClassifyError::NonDebPool { filename });
+                return Err(ClassifyError::NonDebPool {
+                    filename: filename.into_owned(),
+                });
             }
 
             trace!(
@@ -367,8 +370,8 @@ pub(crate) fn classify_request(
             );
 
             Ok(RequestClass {
-                mirror_path,
-                debname: filename,
+                mirror_path: mirror_path.into_owned(),
+                debname: filename.into_owned(),
                 cached_flavor: CachedFlavor::Permanent,
                 layout: CacheLayout::StructuredPool,
                 origin_fields: None,
@@ -388,7 +391,7 @@ pub(crate) fn classify_request(
             );
 
             Ok(RequestClass {
-                mirror_path,
+                mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{filename}"),
                 cached_flavor: CachedFlavor::Volatile,
                 layout: CacheLayout::Dists,
@@ -407,8 +410,8 @@ pub(crate) fn classify_request(
             );
 
             Ok(RequestClass {
-                mirror_path,
-                debname: filename,
+                mirror_path: mirror_path.into_owned(),
+                debname: filename.into_owned(),
                 cached_flavor: CachedFlavor::Permanent,
                 layout: CacheLayout::DistsByHash,
                 origin_fields: None,
@@ -442,7 +445,7 @@ pub(crate) fn classify_request(
             );
 
             Ok(RequestClass {
-                mirror_path,
+                mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{component}_{filename}"),
                 cached_flavor: CachedFlavor::Volatile,
                 layout: CacheLayout::Dists,
@@ -470,7 +473,7 @@ pub(crate) fn classify_request(
             // recorded as a per-binary origin (those come from the .deb
             // fetch path), so `origin_fields` is unconditionally `None`.
             Ok(RequestClass {
-                mirror_path,
+                mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{component}_{architecture}_{filename}"),
                 cached_flavor: CachedFlavor::Volatile,
                 layout: CacheLayout::Dists,
@@ -496,17 +499,17 @@ pub(crate) fn classify_request(
 
             // dep11 / i18n / source aren't real architectures and don't map
             // to per-binary origins.
-            let origin_fields = match architecture.as_str() {
+            let origin_fields = match &*architecture {
                 "dep11" | "i18n" | "source" => None,
                 _ => Some(OriginFields {
-                    distribution: distribution.clone(),
-                    component: component.clone(),
-                    architecture: architecture.clone(),
+                    distribution: distribution.clone().into_owned(),
+                    component: component.clone().into_owned(),
+                    architecture: architecture.clone().into_owned(),
                 }),
             };
 
             Ok(RequestClass {
-                mirror_path,
+                mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{component}_{architecture}_{filename}"),
                 cached_flavor: CachedFlavor::Volatile,
                 layout: CacheLayout::Dists,
@@ -536,7 +539,9 @@ pub(crate) fn classify_request(
                     // decoded filename to keep flat-pool caching limited
                     // to genuine `<name>_<ver>_<arch>.<ext>` packages.
                     if !is_flat_deb_filename(&filename) {
-                        return Err(ClassifyError::NonDebPool { filename });
+                        return Err(ClassifyError::NonDebPool {
+                            filename: filename.into_owned(),
+                        });
                     }
                     (CachedFlavor::Permanent, CacheLayout::Flat)
                 }
@@ -544,8 +549,8 @@ pub(crate) fn classify_request(
             };
 
             Ok(RequestClass {
-                mirror_path,
-                debname: filename,
+                mirror_path: mirror_path.into_owned(),
+                debname: filename.into_owned(),
                 cached_flavor,
                 layout,
                 origin_fields: None,
@@ -555,11 +560,14 @@ pub(crate) fn classify_request(
 }
 
 /// URL-decode `raw` and check the result with the validator selected by
-/// `kind`.  Returns the *owned* decoded string on success so the caller can
-/// move it into a `RequestClass` field without lifetime gymnastics.
-fn decode_validate(raw: &str, kind: ValidateKind) -> Result<String, ClassifyError> {
+/// `kind`.  Returns a `Cow` borrowing the input when no percent-escape was
+/// present (the common case for ASCII Debian paths), so callers that feed
+/// the result into `format!` or a `&str`-taking validator pay no extra
+/// allocation; callers needing an owned `String` (e.g. `RequestClass.mirror_path`)
+/// call `.into_owned()` at the move site.
+fn decode_validate<'a>(raw: &'a str, kind: ValidateKind) -> Result<Cow<'a, str>, ClassifyError> {
     let decoded = match urlencoding::decode(raw) {
-        Ok(s) => s.into_owned(),
+        Ok(s) => s,
         Err(source) => {
             return Err(ClassifyError::BadEncoding {
                 kind,
@@ -578,7 +586,10 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<String, ClassifyErro
     };
 
     if !ok {
-        return Err(ClassifyError::InvalidValue { kind, decoded });
+        return Err(ClassifyError::InvalidValue {
+            kind,
+            decoded: decoded.into_owned(),
+        });
     }
 
     Ok(decoded)
