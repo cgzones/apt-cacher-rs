@@ -219,6 +219,7 @@ impl Origin {
     ) -> Option<Self> {
         /* /debian/dists/sid/main/binary-amd64/Packages{,.diff,.gz,.xz} */
 
+        let path = normalize_uri_path(path);
         let path = path.trim_start_matches('/');
 
         let (mirror_path, origin_path) = path.rsplit_once("/dists/")?;
@@ -323,6 +324,18 @@ pub(crate) enum ResourceFile<'a> {
         distribution: &'a str,
         filename: &'a str,
     },
+    /// A per-component, per-architecture `Release` index sibling to the
+    /// `Packages*` file: `dists/<dist>/<component>/(binary-<arch>|source)/Release`.
+    /// The `architecture` field carries the `binary-<arch>` token or the
+    /// literal `source` for source-component releases.  `InRelease` has no
+    /// per-component form in the Debian spec.
+    ComponentRelease {
+        mirror_path: &'a str,
+        distribution: &'a str,
+        component: &'a str,
+        architecture: &'a str,
+        filename: &'a str,
+    },
     /// A packages file
     Packages {
         mirror_path: &'a str,
@@ -364,6 +377,39 @@ pub(crate) enum ResourceFile<'a> {
         mirror_path: &'a str,
         filename: &'a str,
     },
+}
+
+/// Collapse runs of consecutive ASCII forward-slashes in a URL path to a
+/// single `/`.
+///
+/// APT clients with a trailing slash in their `sources.list` mirror URI
+/// produce request paths like `/debian//dists/...`; without normalisation
+/// the `//` pollutes the parsed `mirror_path`.  The fast path returns
+/// `Cow::Borrowed` (zero allocation) when no `//` is present; the slow
+/// path allocates a single normalised `String`.  Idempotent and safe to
+/// call twice.  Iterates `chars()` so non-ASCII codepoints are preserved
+/// verbatim; later percent-decoding and non-ASCII rejection in
+/// `decode_validate` / `is_unsafe_proxy_path` get the original byte
+/// sequence.
+#[must_use]
+pub(crate) fn normalize_uri_path(path: &str) -> Cow<'_, str> {
+    if !path.contains("//") {
+        return Cow::Borrowed(path);
+    }
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for c in path.chars() {
+        if c == '/' {
+            if !prev_slash {
+                out.push('/');
+            }
+            prev_slash = true;
+        } else {
+            out.push(c);
+            prev_slash = false;
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// Parses a request path into the mirror path and the filename.
@@ -422,17 +468,46 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             reason = "filename is case-sensitive in Debian dists"
         )]
         if filename == "Release" || filename == "InRelease" {
-            let distribution = parts.next()?;
+            // `rsplit` walks segments right-to-left.  The first segment may
+            // be either the distribution (top-level Release/InRelease) or
+            // the `binary-<arch>` / `source` scope of a per-component
+            // Release.
+            let next = parts.next()?;
 
-            if parts.next().is_some() {
-                return None;
+            match parts.next() {
+                None => {
+                    return Some(ResourceFile::Release {
+                        mirror_path,
+                        distribution: next,
+                        filename,
+                    });
+                }
+                Some(component) => {
+                    // Per-component Release: dists/<dist>/<component>/(binary-<arch>|source)/Release.
+                    // `InRelease` has no per-component form.
+                    if filename != "Release" {
+                        return None;
+                    }
+                    let architecture = next;
+                    let valid_binary = architecture
+                        .strip_prefix("binary-")
+                        .is_some_and(|arch| !arch.is_empty());
+                    if !valid_binary && architecture != "source" {
+                        return None;
+                    }
+                    let distribution = parts.next()?;
+                    if parts.next().is_some() {
+                        return None;
+                    }
+                    return Some(ResourceFile::ComponentRelease {
+                        mirror_path,
+                        distribution,
+                        component,
+                        architecture,
+                        filename,
+                    });
+                }
             }
-
-            return Some(ResourceFile::Release {
-                mirror_path,
-                distribution,
-                filename,
-            });
         } else if filename == "Packages.gz" || filename == "Packages.xz" || filename == "Packages" {
             let architecture = parts.next()?;
             let component = parts.next()?;
@@ -1004,6 +1079,40 @@ mod tests {
             })
         );
 
+        // Per-component per-architecture Release files (sibling to Packages*).
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/binary-amd64/Release"),
+            Some(ResourceFile::ComponentRelease {
+                mirror_path: "debian",
+                distribution: "trixie",
+                component: "main",
+                architecture: "binary-amd64",
+                filename: "Release"
+            })
+        );
+
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/source/Release"),
+            Some(ResourceFile::ComponentRelease {
+                mirror_path: "debian",
+                distribution: "trixie",
+                component: "main",
+                architecture: "source",
+                filename: "Release"
+            })
+        );
+
+        assert_eq!(
+            parse_request_path("debian/dists/bookworm/contrib/binary-arm64/Release"),
+            Some(ResourceFile::ComponentRelease {
+                mirror_path: "debian",
+                distribution: "bookworm",
+                component: "contrib",
+                architecture: "binary-arm64",
+                filename: "Release"
+            })
+        );
+
         assert_eq!(
             parse_request_path("debs/dists/vscodium/main/binary-amd64/Packages.gz"),
             Some(ResourceFile::Packages {
@@ -1229,6 +1338,34 @@ mod tests {
 
         assert_eq!(parse_request_path("debian/dists/a/b/InRelease"), None);
 
+        // Per-component Release: `InRelease` has no per-component form.
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/binary-amd64/InRelease"),
+            None
+        );
+
+        // Per-component Release: scope must be `binary-*` or `source`.
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/dep11/Release"),
+            None
+        );
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/i18n/Release"),
+            None
+        );
+
+        // Per-component Release: `binary-` with empty architecture is rejected.
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/binary-/Release"),
+            None
+        );
+
+        // Per-component Release: rejected if deeper than the canonical depth.
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/binary-amd64/extra/Release"),
+            None
+        );
+
         assert_eq!(
             parse_request_path("debian/dists/trixie/main/by-hash/SHA256/Packages"),
             None
@@ -1422,6 +1559,128 @@ mod tests {
         assert!(!valid_architecture("/debian"));
         assert!(!valid_architecture("~/foo"));
         assert!(!valid_architecture("~foo"));
+    }
+
+    #[test]
+    fn test_normalize_uri_path() {
+        use std::borrow::Cow;
+
+        // Fast path: no `//` → borrowed, no allocation.
+        let p = "/debian/dists/sid/InRelease";
+        let out = normalize_uri_path(p);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out, "/debian/dists/sid/InRelease");
+
+        assert!(matches!(normalize_uri_path(""), Cow::Borrowed(_)));
+        assert!(matches!(normalize_uri_path("/"), Cow::Borrowed(_)));
+
+        // Slow path: collapse internal `//`.
+        let out = normalize_uri_path("/debian//dists/trixie/Release");
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out, "/debian/dists/trixie/Release");
+
+        // Triple and longer slash runs collapse to one.
+        assert_eq!(
+            normalize_uri_path("/debian///dists/trixie/Release"),
+            "/debian/dists/trixie/Release"
+        );
+        assert_eq!(
+            normalize_uri_path("/debian/////dists/trixie/Release"),
+            "/debian/dists/trixie/Release"
+        );
+
+        // Multiple separate `//` clusters each collapse independently.
+        assert_eq!(
+            normalize_uri_path("/foo//bar///baz//qux"),
+            "/foo/bar/baz/qux"
+        );
+
+        // Trailing and leading runs.
+        assert_eq!(normalize_uri_path("//"), "/");
+        assert_eq!(normalize_uri_path("///"), "/");
+        assert_eq!(normalize_uri_path("/foo//"), "/foo/");
+        assert_eq!(normalize_uri_path("//foo"), "/foo");
+
+        // Idempotent.
+        let once = normalize_uri_path("/debian//dists/trixie/Release");
+        let twice = normalize_uri_path(&once);
+        assert_eq!(once, twice);
+
+        // Non-ASCII codepoints in the slow path survive verbatim.  In
+        // practice hyper rejects raw non-ASCII bytes in request paths, but
+        // the helper must not corrupt UTF-8 if it ever sees them.
+        assert_eq!(
+            normalize_uri_path("/foo//\u{00e9}/bar"),
+            "/foo/\u{00e9}/bar"
+        );
+        assert_eq!(
+            normalize_uri_path("/foo//\u{1f600}//bar").as_bytes(),
+            "/foo/\u{1f600}/bar".as_bytes()
+        );
+
+        // End-to-end: helper + parser handles the original bug-report URL.
+        let normalized = normalize_uri_path("/debian//dists/trixie/main/binary-amd64/Release");
+        assert_eq!(
+            parse_request_path(&normalized),
+            Some(ResourceFile::ComponentRelease {
+                mirror_path: "debian",
+                distribution: "trixie",
+                component: "main",
+                architecture: "binary-amd64",
+                filename: "Release"
+            })
+        );
+
+        // End-to-end: helper + parser handles `//` in the pool path.
+        let normalized = normalize_uri_path(
+            "/debian//pool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb",
+        );
+        assert_eq!(
+            parse_request_path(&normalized),
+            Some(ResourceFile::Pool {
+                mirror_path: "debian",
+                filename: "firefox-esr_115.9.1esr-1_amd64.deb"
+            })
+        );
+
+        // End-to-end: helper + parser handles `///` in the mirror path.
+        let normalized = normalize_uri_path("/debian///dists/trixie/InRelease");
+        assert_eq!(
+            parse_request_path(&normalized),
+            Some(ResourceFile::Release {
+                mirror_path: "debian",
+                distribution: "trixie",
+                filename: "InRelease"
+            })
+        );
+    }
+
+    #[test]
+    fn test_origin_from_path_double_slash() {
+        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+
+        // `//` in the mirror path resolves to the same Origin as the
+        // un-doubled form thanks to internal normalisation.
+        let raw = Origin::from_path("/debian/dists/sid/main/binary-amd64/Packages", host(), None)
+            .expect("baseline parse");
+        let doubled = Origin::from_path(
+            "/debian//dists/sid/main/binary-amd64/Packages",
+            host(),
+            None,
+        )
+        .expect("`//` in mirror path should still parse after normalisation");
+        assert_eq!(raw.distribution, doubled.distribution);
+        assert_eq!(raw.component, doubled.component);
+        assert_eq!(raw.architecture, doubled.architecture);
+
+        // Triple slash is collapsed too.
+        let tripled = Origin::from_path(
+            "/debian///dists/sid/main/binary-amd64/Packages",
+            host(),
+            None,
+        )
+        .expect("`///` in mirror path should still parse after normalisation");
+        assert_eq!(raw.architecture, tripled.architecture);
     }
 
     #[test]

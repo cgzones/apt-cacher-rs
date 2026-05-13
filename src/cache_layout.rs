@@ -449,6 +449,34 @@ pub(crate) fn classify_request(
                 origin_fields: None,
             })
         }
+        ResourceFile::ComponentRelease {
+            mirror_path,
+            distribution,
+            component,
+            architecture,
+            filename,
+        } => {
+            let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
+            let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
+            let component = decode_validate(component, ValidateKind::Component)?;
+            let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
+            let filename = decode_validate(filename, ValidateKind::Filename)?;
+
+            trace!(
+                "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded architecture: `{architecture}`; Decoded filename: `{filename}` (client {client})"
+            );
+
+            // Per-component Release is metadata about Packages; it is never
+            // recorded as a per-binary origin (those come from the .deb
+            // fetch path), so `origin_fields` is unconditionally `None`.
+            Ok(RequestClass {
+                mirror_path,
+                debname: format!("{distribution}_{component}_{architecture}_{filename}"),
+                cached_flavor: CachedFlavor::Volatile,
+                layout: CacheLayout::Dists,
+                origin_fields: None,
+            })
+        }
         ResourceFile::Packages {
             mirror_path,
             distribution,

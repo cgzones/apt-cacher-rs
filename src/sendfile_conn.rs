@@ -21,7 +21,9 @@ use crate::cache_layout::{self, CachedFlavor, ConnectionDetails};
 use crate::cache_metadata::{self, CacheMetadataKeyRef};
 use crate::config::{CacheHost, resolve_alias};
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
-use crate::deb_mirror::{Mirror, Origin, is_unsafe_proxy_path, parse_request_path};
+use crate::deb_mirror::{
+    Mirror, Origin, is_unsafe_proxy_path, normalize_uri_path, parse_request_path,
+};
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::flat_blocklist;
 use crate::http_helpers::{
@@ -574,9 +576,14 @@ async fn try_sendfile_request(
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
-    // Match all cacheable resource types for sendfile/splice serving
+    // Match all cacheable resource types for sendfile/splice serving.
+    // Collapse `//` runs before parsing — clients with a trailing slash in
+    // their `sources.list` URI emit `/debian//dists/...`; raw `uri_path` is
+    // preserved for logs and upstream simple-proxy passthrough so the
+    // client request still flows verbatim when the parser declines it.
     let uri_path = uri.path();
-    let Some(resource) = parse_request_path(uri_path) else {
+    let normalized_uri_path = normalize_uri_path(uri_path);
+    let Some(resource) = parse_request_path(&normalized_uri_path) else {
         if global_config().reject_pdiff_requests && is_diff_request_path(uri_path) {
             info!("Rejecting diff request {uri_path} for client {client}");
 

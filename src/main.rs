@@ -3818,7 +3818,11 @@ async fn pre_process_client_request(
         "Requested host: `{requested_host}`; Aliased host: `{aliased_host:?}`; Requested path: `{requested_path}`"
     );
 
-    if let Some(resource) = parse_request_path(requested_path) {
+    // Collapse `//` runs before parsing — clients with a trailing slash in
+    // their `sources.list` URI emit `/debian//dists/...`; raw
+    // `requested_path` is kept for logging and uncached upstream proxying.
+    let normalized_path = deb_mirror::normalize_uri_path(requested_path);
+    if let Some(resource) = parse_request_path(&normalized_path) {
         match cache_layout::classify_request(&resource, &client) {
             Ok(class) => {
                 // Per-host flat collision: if a structured mirror with
