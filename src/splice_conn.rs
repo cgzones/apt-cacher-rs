@@ -3099,7 +3099,7 @@ async fn standard_upstream_connect(
 
     let (mut up, scheme) = connect_upstream(mirror).await.map_err(|err| {
         warn!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
-        SpliceProxyError::UpstreamError
+        SpliceProxyError::Upstream
     })?;
     cache_scheme(mirror, scheme);
 
@@ -3118,7 +3118,7 @@ async fn standard_upstream_connect(
         warn!(
             "splice proxy: failed upstream request to {host_authority} for {upstream_path}:  {err}"
         );
-        SpliceProxyError::UpstreamError
+        SpliceProxyError::Upstream
     })?;
 
     let label = if is_tls { " (TLS)" } else { "" };
@@ -3748,7 +3748,7 @@ async fn splice_proxy_drive(
                 Err((_err, guard)) => {
                     // Error already logged in `open_partial_file()`.
                     drop(guard);
-                    return Err(SpliceProxyError::CacheError);
+                    return Err(SpliceProxyError::Cache);
                 }
             }
         } else {
@@ -3779,7 +3779,7 @@ async fn splice_proxy_drive(
                     "Failed to open volatile cached file `{}`:  {err}",
                     cache_path.display()
                 );
-                return Err(SpliceProxyError::CacheError);
+                return Err(SpliceProxyError::Cache);
             }
         };
         if let Some(file) = file {
@@ -3791,7 +3791,7 @@ async fn splice_proxy_drive(
                         "splice proxy: cache file `{}` is not a regular file",
                         cache_path.display()
                     );
-                    return Err(SpliceProxyError::CacheError);
+                    return Err(SpliceProxyError::Cache);
                 }
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
@@ -3799,7 +3799,7 @@ async fn splice_proxy_drive(
                         "Failed to get metadata for volatile cached file `{}`:  {err}",
                         cache_path.display()
                     );
-                    return Err(SpliceProxyError::CacheError);
+                    return Err(SpliceProxyError::Cache);
                 }
             };
 
@@ -3873,7 +3873,7 @@ async fn splice_proxy_drive(
                     "no Content-Length",
                 )
                 .await
-                .map_err(SpliceProxyError::ClientError)?;
+                .map_err(SpliceProxyError::Client)?;
                 return Ok(());
             }
         }
@@ -3916,7 +3916,7 @@ async fn splice_proxy_drive(
                         "splice proxy: failed to open cached file `{}` after 304:  {err}",
                         cache_path.display()
                     );
-                    return Err(SpliceProxyError::CacheError);
+                    return Err(SpliceProxyError::Cache);
                 }
             };
             let file = touch_volatile_mtime(file, &cache_path).await;
@@ -3936,15 +3936,11 @@ async fn splice_proxy_drive(
                 SendfileResult::Served(_)
                 | SendfileResult::ClientError
                 | SendfileResult::AfterHeaderError => Ok(()),
-                SendfileResult::Invalid { status, msg }
-                | SendfileResult::Rejection { status, msg, .. } => {
+                SendfileResult::Invalid { status, msg } => {
                     write_invalid_response(client_stream, conn_version, conn_action, status, msg)
                         .await
-                        .map_err(SpliceProxyError::ClientError)?;
+                        .map_err(SpliceProxyError::Client)?;
                     Ok(())
-                }
-                SendfileResult::NotApplicable(reason) => {
-                    Err(SpliceProxyError::NotApplicable(reason))
                 }
             };
         } else {
@@ -4039,7 +4035,7 @@ async fn splice_proxy_drive(
                     "splice proxy: upstream TCP error for {} from mirror {}:  {err}",
                     conn_details.debname, conn_details.mirror
                 );
-                return Err(SpliceProxyError::UpstreamError);
+                return Err(SpliceProxyError::Upstream);
             }
             let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
                 mirror,
@@ -4172,7 +4168,7 @@ async fn splice_proxy_drive(
                     "splice proxy: failed to open cached file `{}` after 304:  {err}",
                     cache_path.display()
                 );
-                return Err(SpliceProxyError::CacheError);
+                return Err(SpliceProxyError::Cache);
             }
         };
         let file = touch_volatile_mtime(file, &cache_path).await;
@@ -4192,15 +4188,11 @@ async fn splice_proxy_drive(
             SendfileResult::Served(_)
             | SendfileResult::ClientError
             | SendfileResult::AfterHeaderError => return Ok(()),
-            SendfileResult::Invalid { status, msg }
-            | SendfileResult::Rejection { status, msg, .. } => {
+            SendfileResult::Invalid { status, msg } => {
                 write_invalid_response(client_stream, conn_version, conn_action, status, msg)
                     .await
-                    .map_err(SpliceProxyError::ClientError)?;
+                    .map_err(SpliceProxyError::Client)?;
                 return Ok(());
-            }
-            SendfileResult::NotApplicable(reason) => {
-                return Err(SpliceProxyError::NotApplicable(reason));
             }
         }
     }
@@ -4240,7 +4232,7 @@ async fn splice_proxy_drive(
         // Forward raw response headers to client
         write_all_to_stream(client_stream, &header_buf[..header_end], WritePhase::Header)
             .await
-            .map_err(SpliceProxyError::ClientError)?;
+            .map_err(SpliceProxyError::Client)?;
 
         // Forward any body data that arrived with the headers
         let body_prefix = &header_buf[header_end..];
@@ -4266,7 +4258,7 @@ async fn splice_proxy_drive(
                         "splice proxy: failed to send body prefix to client {}:  {err}",
                         conn_details.client
                     );
-                    SpliceProxyError::AfterHeaderError
+                    SpliceProxyError::AfterHeader
                 })?;
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
@@ -4280,7 +4272,7 @@ async fn splice_proxy_drive(
                             "splice proxy: failed to send remaining body to client {}:  {err}",
                             conn_details.client
                         );
-                        SpliceProxyError::AfterHeaderError
+                        SpliceProxyError::AfterHeader
                     })?;
             }
         } else if upstream_resp.is_chunked {
@@ -4297,7 +4289,7 @@ async fn splice_proxy_drive(
                     "splice proxy: failed to send body prefix to client {}:  {err}",
                     conn_details.client
                 );
-                SpliceProxyError::AfterHeaderError
+                SpliceProxyError::AfterHeader
             })?;
         } else {
             // No Content-Length and not chunked: read until EOF
@@ -4315,7 +4307,7 @@ async fn splice_proxy_drive(
                         "splice proxy: failed to send body prefix to client {}:  {err}",
                         conn_details.client
                     );
-                    SpliceProxyError::AfterHeaderError
+                    SpliceProxyError::AfterHeader
                 })?;
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
@@ -4327,7 +4319,7 @@ async fn splice_proxy_drive(
                         "splice proxy: failed to forward body to client {}:  {err}",
                         conn_details.client
                     );
-                    SpliceProxyError::AfterHeaderError
+                    SpliceProxyError::AfterHeader
                 })?;
         }
 
@@ -4416,7 +4408,7 @@ async fn splice_proxy_drive(
                         "Inconsistent Content-Range",
                     )
                     .await
-                    .map_err(SpliceProxyError::ClientError)?;
+                    .map_err(SpliceProxyError::Client)?;
                     return Ok(());
                 }
                 #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
@@ -4450,7 +4442,7 @@ async fn splice_proxy_drive(
                     "unexpected Content-Range",
                 )
                 .await
-                .map_err(SpliceProxyError::ClientError)?;
+                .map_err(SpliceProxyError::Client)?;
                 return Ok(());
             }
         }
@@ -4492,7 +4484,7 @@ async fn splice_proxy_drive(
                 "no Content-Length",
             )
             .await
-            .map_err(SpliceProxyError::ClientError)?;
+            .map_err(SpliceProxyError::Client)?;
             return Ok(());
         };
         (cl, cl)
@@ -4515,7 +4507,7 @@ async fn splice_proxy_drive(
             "zero total file size",
         )
         .await
-        .map_err(SpliceProxyError::ClientError)?;
+        .map_err(SpliceProxyError::Client)?;
         return Ok(());
     };
     let Some(body_content_length) = NonZero::new(body_content_length) else {
@@ -4533,7 +4525,7 @@ async fn splice_proxy_drive(
             "zero body Content-Length",
         )
         .await
-        .map_err(SpliceProxyError::ClientError)?;
+        .map_err(SpliceProxyError::Client)?;
         return Ok(());
     };
 
@@ -4561,7 +4553,7 @@ async fn splice_proxy_drive(
             total_content_length.get(),
         )
         .await
-        .map_err(SpliceProxyError::ClientError)?;
+        .map_err(SpliceProxyError::Client)?;
         return Ok(());
     }
     let (content_range_hdr, client_range_start, client_range_len, is_partial) =
@@ -4578,7 +4570,7 @@ async fn splice_proxy_drive(
             "splice proxy: failed to create cache directory `{}`:  {err}",
             dest_dir.display()
         );
-        return Err(SpliceProxyError::CacheError);
+        return Err(SpliceProxyError::Cache);
     }
 
     let filename = Path::new(&conn_details.debname);
@@ -4613,7 +4605,7 @@ async fn splice_proxy_drive(
                         "splice proxy: failed to stat existing volatile file `{}`:  {err}",
                         prev_path.display()
                     );
-                    return Err(SpliceProxyError::CacheError);
+                    return Err(SpliceProxyError::Cache);
                 }
             }
         }
@@ -4638,7 +4630,7 @@ async fn splice_proxy_drive(
                 "Disk quota reached",
             )
             .await
-            .map_err(SpliceProxyError::ClientError)?;
+            .map_err(SpliceProxyError::Client)?;
             return Ok(());
         }
     };
@@ -4666,7 +4658,7 @@ async fn splice_proxy_drive(
                     "Cache Access Failure",
                 )
                 .await
-                .map_err(SpliceProxyError::ClientError)?;
+                .map_err(SpliceProxyError::Client)?;
                 return Ok(());
             }
             (file, guard)
@@ -4679,7 +4671,7 @@ async fn splice_proxy_drive(
                     "splice proxy: failed to create partial file `{}`:  {err}",
                     path.display()
                 );
-                SpliceProxyError::CacheError
+                SpliceProxyError::Cache
             })?,
         utils::PartialDownload::Volatile => {
             let tmppath: PathBuf = [
@@ -4695,7 +4687,7 @@ async fn splice_proxy_drive(
                     "splice proxy: failed to create temp file `{}`:  {err}",
                     tmppath.display()
                 );
-                SpliceProxyError::CacheError
+                SpliceProxyError::Cache
             })?
         }
     };
@@ -4752,7 +4744,7 @@ async fn splice_proxy_drive(
             "body Content-Length mismatch",
         )
         .await
-        .map_err(SpliceProxyError::ClientError)?;
+        .map_err(SpliceProxyError::Client)?;
         return Ok(());
     };
 
@@ -4778,7 +4770,7 @@ async fn splice_proxy_drive(
                 "body Content-Length mismatch",
             )
             .await
-            .map_err(SpliceProxyError::ClientError)?;
+            .map_err(SpliceProxyError::Client)?;
             return Ok(());
         };
     }
@@ -4876,7 +4868,7 @@ async fn splice_proxy_drive(
             "splice proxy: failed to write response headers to client:  {err}"
         );
 
-        SpliceProxyError::ClientError(err)
+        SpliceProxyError::Client(err)
     })?;
 
     // For resumed downloads, send the existing partial file content to the client first
@@ -4895,7 +4887,7 @@ async fn splice_proxy_drive(
                 .map_err(|err| {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!("splice proxy: failed to open partial file for reading:  {err}");
-                    SpliceProxyError::AfterHeaderError
+                    SpliceProxyError::AfterHeader
                 })?;
 
             async_sendfile(
@@ -4907,7 +4899,7 @@ async fn splice_proxy_drive(
             .await
             .map_err(|err| {
                 info!("splice proxy: failed to sendfile partial data to client:  {err}");
-                SpliceProxyError::AfterHeaderError
+                SpliceProxyError::AfterHeader
             })?;
         }
     }
@@ -4942,7 +4934,7 @@ async fn splice_proxy_drive(
                 "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
                 temppath.display()
             );
-            SpliceProxyError::AfterHeaderError
+            SpliceProxyError::AfterHeader
         })?;
 
         let client_slice = range_slice(
@@ -4997,7 +4989,7 @@ async fn splice_proxy_drive(
                 "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
                 temppath.display()
             );
-            SpliceProxyError::AfterHeaderError
+            SpliceProxyError::AfterHeader
         })?;
 
         let client_slice = range_slice(
@@ -5110,7 +5102,7 @@ async fn splice_proxy_drive(
                     "splice proxy: body transfer failed for {} from mirror {}:  {err}",
                     conn_details.debname, conn_details.mirror
                 );
-                SpliceProxyError::AfterHeaderError
+                SpliceProxyError::AfterHeader
             })?;
         dbarrier = returned_dbarrier;
         (demoted_handle, body_client_disconnected)
@@ -5153,7 +5145,7 @@ async fn splice_proxy_drive(
                 temppath.display(),
                 dest_file_path.display()
             );
-            return Err(SpliceProxyError::AfterHeaderError);
+            return Err(SpliceProxyError::AfterHeader);
         }
     }
 
@@ -5233,7 +5225,7 @@ async fn splice_proxy_drive(
             "splice proxy: closing connection to client {}",
             conn_details.client
         );
-        return Err(SpliceProxyError::AfterHeaderError);
+        return Err(SpliceProxyError::AfterHeader);
     }
 
     let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -5493,7 +5485,7 @@ async fn handle_volatile_buffered_download(
             "splice proxy: volatile buffered download failed for {}:  {err}",
             conn_details.debname
         );
-        SpliceProxyError::TransferError
+        SpliceProxyError::Upstream
     })?;
 
     // Drop upstream early to free the socket.
@@ -5512,7 +5504,7 @@ async fn handle_volatile_buffered_download(
             "zero-length body",
         )
         .await
-        .map_err(SpliceProxyError::ClientError)?;
+        .map_err(SpliceProxyError::Client)?;
         return Ok(());
     };
 
@@ -5543,7 +5535,7 @@ async fn handle_volatile_buffered_download(
                     "splice proxy: failed to stat existing volatile file `{}`:  {err}",
                     prev_path.display()
                 );
-                return Err(SpliceProxyError::CacheError);
+                return Err(SpliceProxyError::Cache);
             }
         }
     };
@@ -5564,7 +5556,7 @@ async fn handle_volatile_buffered_download(
                 "Disk quota reached",
             )
             .await
-            .map_err(SpliceProxyError::ClientError)?;
+            .map_err(SpliceProxyError::Client)?;
             return Ok(());
         }
     };
@@ -5590,7 +5582,7 @@ async fn handle_volatile_buffered_download(
             total_content_length.get(),
         )
         .await
-        .map_err(SpliceProxyError::ClientError)?;
+        .map_err(SpliceProxyError::Client)?;
         return Ok(());
     }
 
@@ -5611,7 +5603,7 @@ async fn handle_volatile_buffered_download(
             "splice proxy: failed to create cache directory `{}`:  {err}",
             dest_dir.display()
         );
-        return Err(SpliceProxyError::CacheError);
+        return Err(SpliceProxyError::Cache);
     }
 
     let filename = Path::new(&conn_details.debname);
@@ -5633,7 +5625,7 @@ async fn handle_volatile_buffered_download(
             "splice proxy: failed to create temp file `{}`:  {err}",
             tmppath.display()
         );
-        SpliceProxyError::CacheError
+        SpliceProxyError::Cache
     })?;
 
     // Write ETag xattr if present.
@@ -5730,7 +5722,7 @@ async fn handle_volatile_buffered_download(
             level,
             "splice proxy: failed to write response headers to client:  {err}"
         );
-        SpliceProxyError::ClientError(err)
+        SpliceProxyError::Client(err)
     })?;
 
     // Send body (range-filtered if needed) to client.
@@ -5753,7 +5745,7 @@ async fn handle_volatile_buffered_download(
                 "splice proxy: failed to write response body to client {}:  {err}",
                 conn_details.client
             );
-            SpliceProxyError::AfterHeaderError
+            SpliceProxyError::AfterHeader
         })?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
@@ -5767,7 +5759,7 @@ async fn handle_volatile_buffered_download(
             "splice proxy: failed to write volatile body to cache file `{}`:  {err}",
             temppath.display()
         );
-        SpliceProxyError::AfterHeaderError
+        SpliceProxyError::AfterHeader
     })?;
 
     dbarrier.ping();
@@ -5799,7 +5791,7 @@ async fn handle_volatile_buffered_download(
                 temppath.display(),
                 dest_file_path.display()
             );
-            return Err(SpliceProxyError::AfterHeaderError);
+            return Err(SpliceProxyError::AfterHeader);
         }
     }
 
@@ -5978,7 +5970,7 @@ pub(crate) async fn splice_simple_proxy(
                 "splice proxy: failed to rewrite headers for {upstream_path} from {host_authority}:  {err}"
             );
             upstream.unset_poolable();
-            return Err(SpliceProxyError::UpstreamError);
+            return Err(SpliceProxyError::Upstream);
         }
     };
 
@@ -5992,7 +5984,7 @@ pub(crate) async fn splice_simple_proxy(
         WritePhase::Header,
     )
     .await
-    .map_err(SpliceProxyError::ClientError)?;
+    .map_err(SpliceProxyError::Client)?;
 
     // Forward any body data that arrived with the headers
     let body_prefix = &hdr_buf[hdr_end..];
@@ -6016,7 +6008,7 @@ pub(crate) async fn splice_simple_proxy(
             .await
             .map_err(|err| {
                 info!("splice proxy: failed to forward chunked body to client:  {err}");
-                SpliceProxyError::AfterHeaderError
+                SpliceProxyError::AfterHeader
             })?;
     } else if let Some(cl) = resp.content_length {
         if !body_prefix.is_empty() {
@@ -6030,7 +6022,7 @@ pub(crate) async fn splice_simple_proxy(
             .await
             .map_err(|err| {
                 info!("splice proxy: failed to write body prefix to client:  {err}");
-                SpliceProxyError::AfterHeaderError
+                SpliceProxyError::AfterHeader
             })?;
             metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
@@ -6041,7 +6033,7 @@ pub(crate) async fn splice_simple_proxy(
                 .await
                 .map_err(|err| {
                     info!("splice proxy: failed to forward body to client:  {err}");
-                    SpliceProxyError::AfterHeaderError
+                    SpliceProxyError::AfterHeader
                 })?;
         }
     } else {
@@ -6057,7 +6049,7 @@ pub(crate) async fn splice_simple_proxy(
             .await
             .map_err(|err| {
                 info!("splice proxy: failed to write body prefix to client:  {err}");
-                SpliceProxyError::AfterHeaderError
+                SpliceProxyError::AfterHeader
             })?;
             metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
@@ -6066,7 +6058,7 @@ pub(crate) async fn splice_simple_proxy(
             .await
             .map_err(|err| {
                 info!("splice proxy: failed to forward body to client:  {err}");
-                SpliceProxyError::AfterHeaderError
+                SpliceProxyError::AfterHeader
             })?;
     }
 
@@ -6089,19 +6081,15 @@ pub(crate) enum SpliceProxyOutcome {
 
 /// Errors that can occur during splice proxy.
 pub(crate) enum SpliceProxyError {
-    /// Not applicable for splice proxy; fall back to hyper
-    NotApplicable(&'static str),
     /// Error communicating with upstream
-    UpstreamError,
+    Upstream,
     /// Error writing to client
-    ClientError(std::io::Error),
+    Client(std::io::Error),
     /// Error with cache file operations
-    CacheError,
-    /// Error during body transfer
-    TransferError,
+    Cache,
     /// Error occurring after response headers were already written to the client.
     /// The caller must close the connection without emitting a new HTTP status.
-    AfterHeaderError,
+    AfterHeader,
 }
 
 #[cfg(test)]

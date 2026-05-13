@@ -50,7 +50,7 @@ const INITIAL_HEADER_SIZE: usize = 2048;
 const MAX_HEADERS: usize = 100;
 
 /// Represents the result of a sendfile operation.
-pub(crate) enum SendfileResult {
+pub(crate) enum ZeroCopyResult {
     /// Request was served via sendfile
     Served(ConnectionAction),
 
@@ -77,6 +77,17 @@ pub(crate) enum SendfileResult {
     /// An error occurred after successfully sending the http header.
     /// Close the connection without any further action.
     AfterHeaderError,
+}
+
+impl From<SendfileResult> for ZeroCopyResult {
+    fn from(value: SendfileResult) -> Self {
+        match value {
+            SendfileResult::Served(ca) => Self::Served(ca),
+            SendfileResult::Invalid { status, msg } => Self::Invalid { status, msg },
+            SendfileResult::ClientError => Self::ClientError,
+            SendfileResult::AfterHeaderError => Self::AfterHeaderError,
+        }
+    }
 }
 
 /// Handle a client connection using sendfile(2) for cached file delivery.
@@ -148,23 +159,23 @@ pub(crate) async fn handle_sendfile_connection(
         let result =
             try_sendfile_request(&buf, &stream, client, &appstate, &mut conn_version).await;
 
-        if !matches!(result, SendfileResult::NotApplicable(_)) {
+        if !matches!(result, ZeroCopyResult::NotApplicable(_)) {
             metrics::REQUESTS_TOTAL.increment();
         }
 
         // Parse the request and try to handle it with sendfile
         #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
         let _: Never = match result {
-            SendfileResult::Served(ConnectionAction::KeepAlive) => {
+            ZeroCopyResult::Served(ConnectionAction::KeepAlive) => {
                 // Request served via sendfile with keep-alive; continue to next request
                 buf.advance(next_header_index);
                 continue;
             }
-            SendfileResult::Served(ConnectionAction::Close) => {
+            ZeroCopyResult::Served(ConnectionAction::Close) => {
                 // Request served via sendfile; close the connection as requested
                 return;
             }
-            SendfileResult::NotApplicable(reason) => {
+            ZeroCopyResult::NotApplicable(reason) => {
                 // Fall back to hyper for this and all subsequent requests
                 debug!(
                     "Falling back to hyper for client {client} after {req_num} requests due to: {reason} ({} bytes buffered)",
@@ -175,7 +186,7 @@ pub(crate) async fn handle_sendfile_connection(
 
                 return handle_hyper_connection(stream, client, appstate).await;
             }
-            SendfileResult::Invalid { status, msg } => {
+            ZeroCopyResult::Invalid { status, msg } => {
                 if let Err(err) = write_invalid_response(
                     &stream,
                     conn_version,
@@ -190,7 +201,7 @@ pub(crate) async fn handle_sendfile_connection(
 
                 return;
             }
-            SendfileResult::Rejection {
+            ZeroCopyResult::Rejection {
                 status,
                 conn_action,
                 msg,
@@ -210,7 +221,7 @@ pub(crate) async fn handle_sendfile_connection(
                     ConnectionAction::Close => return,
                 }
             }
-            SendfileResult::AfterHeaderError | SendfileResult::ClientError => {
+            ZeroCopyResult::AfterHeaderError | ZeroCopyResult::ClientError => {
                 // Error occurred, should have been already logged.
                 // The connection should be closed
                 return;
@@ -287,7 +298,7 @@ async fn serve_webui(
     client: &ClientInfo,
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
-) -> SendfileResult {
+) -> ZeroCopyResult {
     let cfg = global_config();
     let allowed_webif_clients = cfg
         .allowed_webif_clients
@@ -301,7 +312,7 @@ async fn serve_webui(
     {
         warn_once_or_info!("Unauthorized web-interface access by client {client}");
         metrics::AUTHZ_REJECTED_WEBUI.increment();
-        return SendfileResult::Rejection {
+        return ZeroCopyResult::Rejection {
             status: StatusCode::FORBIDDEN,
             conn_action,
             msg: "Unauthorized client",
@@ -312,9 +323,9 @@ async fn serve_webui(
 
     if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
         info!("Failed to write web-interface response to client {client}:  {err}");
-        return SendfileResult::AfterHeaderError;
+        return ZeroCopyResult::AfterHeaderError;
     }
-    SendfileResult::Served(conn_action)
+    ZeroCopyResult::Served(conn_action)
 }
 
 /// Format and write a [`WebResponse`] onto the raw stream.
@@ -422,7 +433,7 @@ async fn try_sendfile_request(
     client: ClientInfo,
     appstate: &AppState,
     conn_version: &mut ConnectionVersion,
-) -> SendfileResult {
+) -> ZeroCopyResult {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     static_assert!(
         size_of::<httparse::Header<'_>>() <= 32 && MAX_HEADERS == 100,
@@ -437,7 +448,7 @@ async fn try_sendfile_request(
             0 => *conn_version = ConnectionVersion::Http10,
             v => {
                 warn_once_or_info!("Unsupported HTTP/1.{v} from client {client}");
-                return SendfileResult::Invalid {
+                return ZeroCopyResult::Invalid {
                     status: StatusCode::HTTP_VERSION_NOT_SUPPORTED,
                     msg: "HTTP version not supported",
                 };
@@ -451,21 +462,21 @@ async fn try_sendfile_request(
             }
 
             warn_once_or_info!("Incomplete HTTP request from client {client}");
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Incomplete request header",
             };
         }
         Err(httparse::Error::Version) => {
             warn_once_or_info!("Unsupported HTTP version from client {client}");
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::HTTP_VERSION_NOT_SUPPORTED,
                 msg: "HTTP version not supported",
             };
         }
         Err(err) => {
             warn_once_or_info!("Failed to parse HTTP request from client {client}:  {err}");
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Invalid request header",
             };
@@ -478,13 +489,13 @@ async fn try_sendfile_request(
     // Only handle GET requests via sendfile
     match req.method.expect("complete header parsed") {
         "GET" => {}
-        "CONNECT" => return SendfileResult::NotApplicable("CONNECT method not supported"),
+        "CONNECT" => return ZeroCopyResult::NotApplicable("CONNECT method not supported"),
         m => {
             warn_once_or_info!(
                 "Unsupported request method from client {client}: {}",
                 m.escape_debug(),
             );
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::METHOD_NOT_ALLOWED,
                 msg: "Method not supported",
             };
@@ -499,7 +510,7 @@ async fn try_sendfile_request(
         Ok(uri) => uri,
         Err(err) => {
             info!("Failed to parse URI from client {client}:  {err}");
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Invalid URI",
             };
@@ -512,7 +523,7 @@ async fn try_sendfile_request(
         && *scheme != http::uri::Scheme::HTTP
     {
         warn_once_or_info!("Unsupported URI scheme from client {client}: {scheme}");
-        return SendfileResult::Invalid {
+        return ZeroCopyResult::Invalid {
             status: StatusCode::BAD_REQUEST,
             msg: "Unsupported URI scheme",
         };
@@ -523,7 +534,7 @@ async fn try_sendfile_request(
         // HTTP/1.1 request that lacks a Host header field.
         if *conn_version == ConnectionVersion::Http11 && find_header(req.headers, &HOST).is_none() {
             debug!("Missing Host header from HTTP/1.1 request from client {client}");
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Missing Host header",
             };
@@ -535,13 +546,13 @@ async fn try_sendfile_request(
 
     let requested_host = match authorize_cache_access(&client, authority.host()) {
         Ok(rh) => rh,
-        Err((status, msg)) => return SendfileResult::Invalid { status, msg },
+        Err((status, msg)) => return ZeroCopyResult::Invalid { status, msg },
     };
     let requested_port = match authority.port_u16() {
         Some(port) => {
             let Some(port) = NonZero::new(port) else {
                 warn_once_or_info!("Unsupported request port 0 from client {client}");
-                return SendfileResult::Invalid {
+                return ZeroCopyResult::Invalid {
                     status: StatusCode::BAD_REQUEST,
                     msg: "Invalid port",
                 };
@@ -560,7 +571,7 @@ async fn try_sendfile_request(
             info!("Rejecting diff request {uri_path} for client {client}");
 
             metrics::PDIFF_REJECTED.increment();
-            return SendfileResult::Rejection {
+            return ZeroCopyResult::Rejection {
                 status: StatusCode::GONE,
                 conn_action,
                 msg: "Diff requests are not supported",
@@ -575,7 +586,7 @@ async fn try_sendfile_request(
             warn_once_or_info!(
                 "Rejecting unsafe unrecognized path from client {client}: {uri_path}"
             );
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Unsupported request",
             };
@@ -603,36 +614,28 @@ async fn try_sendfile_request(
             return match splice_simple_proxy(stream, *conn_version, conn_action, &mirror, uri_path)
                 .await
             {
-                Ok(()) => SendfileResult::Served(conn_action),
-                Err(SpliceProxyError::UpstreamError) => SendfileResult::Invalid {
+                Ok(()) => ZeroCopyResult::Served(conn_action),
+                Err(SpliceProxyError::Upstream) => ZeroCopyResult::Invalid {
                     status: StatusCode::BAD_GATEWAY,
                     msg: "Upstream Error",
                 },
-                Err(SpliceProxyError::TransferError) => SendfileResult::Invalid {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    msg: "Transfer Error",
-                },
-                Err(SpliceProxyError::ClientError(err)) => {
+                Err(SpliceProxyError::Client(err)) => {
                     debug!(
                         "simple proxy: client error for {uri_path} from host {}:  {err}",
                         mirror.format_authority()
                     );
-                    SendfileResult::ClientError
+                    ZeroCopyResult::ClientError
                 }
-                Err(SpliceProxyError::AfterHeaderError) => SendfileResult::AfterHeaderError,
-                Err(SpliceProxyError::CacheError) => SendfileResult::Invalid {
+                Err(SpliceProxyError::AfterHeader) => ZeroCopyResult::AfterHeaderError,
+                Err(SpliceProxyError::Cache) => ZeroCopyResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     msg: "Cache Access Failure",
                 },
-                Err(SpliceProxyError::NotApplicable(err)) => {
-                    debug!("simple proxy: {uri_path} not applicable:  {err}");
-                    SendfileResult::NotApplicable(err)
-                }
             };
         }
 
         #[cfg(not(feature = "splice"))]
-        return SendfileResult::NotApplicable("unrecognized resource path");
+        return ZeroCopyResult::NotApplicable("unrecognized resource path");
     };
 
     let class = match cache_layout::classify_request(&resource, &client) {
@@ -642,14 +645,14 @@ async fn try_sendfile_request(
                 "Failed to decode {kind} `{}` from client {client}:  {source}",
                 raw.escape_debug()
             );
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Unsupported URL encoding",
             };
         }
         Err(cache_layout::ClassifyError::InvalidValue { kind, decoded }) => {
             warn_once_or_info!("Unsupported {kind} `{decoded}` from client {client}");
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Unsupported request",
             };
@@ -658,7 +661,7 @@ async fn try_sendfile_request(
             // Pool filename failed the deb extension check (structured
             // Pool) or the strict flat-pool shape check; hand back to
             // hyper so the simple proxy can handle it without caching.
-            return SendfileResult::NotApplicable("unsupported pool filename");
+            return ZeroCopyResult::NotApplicable("unsupported pool filename");
         }
     };
 
@@ -674,7 +677,7 @@ async fn try_sendfile_request(
         None => requested_host.as_cache_host(),
     };
     if class.layout.is_flat() && flat_blocklist::is_blocked(cache_id, requested_port) {
-        return SendfileResult::NotApplicable("flat host blocked by structured collision");
+        return ZeroCopyResult::NotApplicable("flat host blocked by structured collision");
     }
 
     let aliased = match aliased_host {
@@ -737,7 +740,7 @@ async fn try_sendfile_request(
         // `NotApplicable` falls back to hyper, which bumps `CACHE_MISSES`
         // itself on its own miss path; the volatile case is accounted for via
         // `VOLATILE_REFETCHED` by the originator.
-        if !matches!(result, SendfileResult::NotApplicable(_))
+        if !matches!(result, ZeroCopyResult::NotApplicable(_))
             && conn_details.cached_flavor == CachedFlavor::Permanent
         {
             metrics::CACHE_MISSES.increment();
@@ -779,7 +782,7 @@ async fn try_sendfile_request(
                     "Failed to open cached file `{}` for client {client}:  {err}",
                     cache_path.display()
                 );
-                return SendfileResult::Invalid {
+                return ZeroCopyResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     msg: "Cache Access Failure",
                 };
@@ -820,7 +823,7 @@ async fn try_sendfile_request(
                         "Cache file `{}` is not a regular file",
                         cache_path.display()
                     );
-                    return SendfileResult::Invalid {
+                    return ZeroCopyResult::Invalid {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
                         msg: "Cache Access Failure",
                     };
@@ -831,7 +834,7 @@ async fn try_sendfile_request(
                         "Failed to get metadata of cached file `{}` for client {client}:  {err}",
                         cache_path.display()
                     );
-                    return SendfileResult::Invalid {
+                    return ZeroCopyResult::Invalid {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
                         msg: "Cache Access Failure",
                     };
@@ -858,7 +861,8 @@ async fn try_sendfile_request(
             RangeRequestHeaders::extract(req.headers),
             None,
         )
-        .await;
+        .await
+        .into();
     }
 
     // Cache miss or stale volatile file — try splice proxy, then hyper fallback.
@@ -886,7 +890,7 @@ async fn try_sendfile_request(
         )
         .await
         {
-            Ok(SpliceProxyOutcome::Served) => SendfileResult::Served(conn_action),
+            Ok(SpliceProxyOutcome::Served) => ZeroCopyResult::Served(conn_action),
             Ok(SpliceProxyOutcome::Concurrent { status: dl_status }) => {
                 // Race-loser path: another connection registered the
                 // download between our earlier `attach()` (which saw
@@ -908,38 +912,27 @@ async fn try_sendfile_request(
                 )
                 .await
             }
-            Err(SpliceProxyError::NotApplicable(reason)) => {
-                debug!(
-                    "splice proxy not applicable for {} from mirror {}{}: {reason}",
-                    conn_details.debname, conn_details.mirror, aliased
-                );
-                SendfileResult::NotApplicable(reason)
-            }
-            Err(SpliceProxyError::UpstreamError) => SendfileResult::Invalid {
+            Err(SpliceProxyError::Upstream) => ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_GATEWAY,
                 msg: "Upstream Error",
             },
-            Err(SpliceProxyError::CacheError) => SendfileResult::Invalid {
+            Err(SpliceProxyError::Cache) => ZeroCopyResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",
             },
-            Err(SpliceProxyError::TransferError) => SendfileResult::Invalid {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                msg: "Transfer Error",
-            },
-            Err(SpliceProxyError::ClientError(err)) => {
+            Err(SpliceProxyError::Client(err)) => {
                 debug!(
                     "splice proxy: client error for {} from mirror {}{}:  {err}",
                     conn_details.debname, conn_details.mirror, aliased
                 );
-                SendfileResult::ClientError
+                ZeroCopyResult::ClientError
             }
-            Err(SpliceProxyError::AfterHeaderError) => SendfileResult::AfterHeaderError,
+            Err(SpliceProxyError::AfterHeader) => ZeroCopyResult::AfterHeaderError,
         }
     }
 
     #[cfg(not(feature = "splice"))]
-    SendfileResult::NotApplicable("file not found in cache")
+    ZeroCopyResult::NotApplicable("file not found in cache")
 }
 
 /// Outcome of [`evaluate_conditional_and_range`].
@@ -1051,6 +1044,16 @@ async fn evaluate_conditional_and_range(
         content_range: None,
         partial: false,
     })
+}
+
+pub(crate) enum SendfileResult {
+    Invalid {
+        status: StatusCode,
+        msg: &'static str,
+    },
+    Served(ConnectionAction),
+    AfterHeaderError,
+    ClientError,
 }
 
 /// Serve a file via sendfile(2), handling conditional requests (304),
@@ -1791,7 +1794,7 @@ async fn serve_unfinished_sendfile(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     headers: RangeRequestHeaders<'_>,
-) -> SendfileResult {
+) -> ZeroCopyResult {
     // Wait for the download to leave the Init state and learn the file path,
     // content length, notification receiver, and the upstream metadata
     // captured on the status (so we don't need to xattr-read the temp file
@@ -1809,7 +1812,7 @@ async fn serve_unfinished_sendfile(
                             "download state still Init after waiting for {} from mirror {}{aliased}",
                             conn_details.debname, conn_details.mirror
                         );
-                        return SendfileResult::Invalid {
+                        return ZeroCopyResult::Invalid {
                             status: StatusCode::INTERNAL_SERVER_ERROR,
                             msg: "Download State Corrupted",
                         };
@@ -1839,7 +1842,7 @@ async fn serve_unfinished_sendfile(
                                 path.display(),
                                 conn_details.client
                             );
-                            return SendfileResult::Invalid {
+                            return ZeroCopyResult::Invalid {
                                 status: StatusCode::INTERNAL_SERVER_ERROR,
                                 msg: "Cache Access Failure",
                             };
@@ -1874,7 +1877,7 @@ async fn serve_unfinished_sendfile(
                                 finished_path.display(),
                                 conn_details.client
                             );
-                            return SendfileResult::Invalid {
+                            return ZeroCopyResult::Invalid {
                                 status: StatusCode::INTERNAL_SERVER_ERROR,
                                 msg: "Cache Access Failure",
                             };
@@ -1890,7 +1893,8 @@ async fn serve_unfinished_sendfile(
                         headers,
                         prefetched.as_deref(),
                     )
-                    .await;
+                    .await
+                    .into();
                 }
                 ActiveDownloadStatus::Aborted(_) => {
                     drop(st);
@@ -1898,7 +1902,7 @@ async fn serve_unfinished_sendfile(
                         "Download of {} from mirror {}{aliased} was aborted, cannot serve joining client {}",
                         conn_details.debname, conn_details.mirror, conn_details.client
                     );
-                    return SendfileResult::Invalid {
+                    return ZeroCopyResult::Invalid {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
                         msg: "Download Aborted",
                     };
@@ -1914,7 +1918,7 @@ async fn serve_unfinished_sendfile(
             conn_details.debname,
             conn_details.mirror,
         );
-        return SendfileResult::NotApplicable("unknown content length for in-progress download");
+        return ZeroCopyResult::NotApplicable("unknown content length for in-progress download");
     };
 
     let metadata = match file.metadata().await {
@@ -1922,7 +1926,7 @@ async fn serve_unfinished_sendfile(
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
             error!("Cache file `{}` is not a regular file", file_path.display());
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",
             };
@@ -1934,7 +1938,7 @@ async fn serve_unfinished_sendfile(
                 file_path.display(),
                 conn_details.client
             );
-            return SendfileResult::Invalid {
+            return ZeroCopyResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",
             };
@@ -1964,10 +1968,10 @@ async fn serve_unfinished_sendfile(
                     "Serving 304 Not Modified for downloading file {} from mirror {}{aliased} for joining client {} via sendfile",
                     conn_details.debname, conn_details.mirror, conn_details.client
                 );
-                return SendfileResult::Served(ca);
+                return ZeroCopyResult::Served(ca);
             }
             Ok(ConditionalOutcome::RangeNotSatisfiable(ca)) => {
-                return SendfileResult::Served(ca);
+                return ZeroCopyResult::Served(ca);
             }
             Ok(ConditionalOutcome::Serve {
                 http_status,
@@ -1982,7 +1986,7 @@ async fn serve_unfinished_sendfile(
                 content_range,
                 partial,
             ),
-            Err(result) => return result,
+            Err(result) => return result.into(),
         };
 
     info!(
@@ -2012,7 +2016,7 @@ async fn serve_unfinished_sendfile(
             "Failed to write response headers to joining client {}:  {err}",
             conn_details.client
         );
-        return SendfileResult::ClientError;
+        return ZeroCopyResult::ClientError;
     }
 
     let start = Instant::now();
@@ -2053,7 +2057,7 @@ async fn serve_unfinished_sendfile(
             });
             send_db_command(cmd).await;
 
-            SendfileResult::Served(conn_action)
+            ZeroCopyResult::Served(conn_action)
         }
         Err(err) => {
             if is_peer_disconnect(&err) {
@@ -2074,7 +2078,7 @@ async fn serve_unfinished_sendfile(
                     ErrorReport(&err)
                 );
             }
-            SendfileResult::AfterHeaderError
+            ZeroCopyResult::AfterHeaderError
         }
     }
 }
