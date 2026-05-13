@@ -1,6 +1,5 @@
 use std::{
     io::ErrorKind,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     sync::{
@@ -754,10 +753,7 @@ where
             .expect("Request should be valid");
 
         let conn_details = ConnectionDetails {
-            client: ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(127, 0, 0, 2),
-                0,
-            ))),
+            client: ClientInfo::new_cleanup(),
             mirror: mirror.clone(),
             aliased_host: None,
             debname: debname_for(pkgfmt),

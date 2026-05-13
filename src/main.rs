@@ -63,7 +63,7 @@ use std::error::Error as _;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZero;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -269,18 +269,48 @@ pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ClientInfo {
     addr: SocketAddr,
+    is_cleanup: bool,
 }
+
+/// Address attached to in-process requests synthesised by `task_cleanup`
+/// (Packages fetches for the GC reference set).  Distinct from `127.0.0.1`
+/// so logging and metrics can distinguish real loopback clients from the
+/// cleanup-driven probes.
+const CLEANUP_CLIENT_ADDR: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0));
 
 impl ClientInfo {
     #[must_use]
     pub(crate) fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        Self {
+            addr,
+            is_cleanup: false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn new_cleanup() -> Self {
+        Self {
+            addr: CLEANUP_CLIENT_ADDR,
+            is_cleanup: true,
+        }
     }
 
     #[must_use]
     #[inline]
     pub(crate) fn ip(&self) -> IpAddr {
         self.addr.ip().to_canonical()
+    }
+
+    /// `true` when this client is the in-process sentinel used by
+    /// `task_cleanup` to fetch a Packages index — never a real client.
+    /// Used by upstream-error logging to demote a routine 4xx during a
+    /// cleanup probe (e.g. the deliberate `.xz → .gz → raw` walk) from
+    /// WARN to DEBUG.
+    #[must_use]
+    #[inline]
+    pub(crate) fn is_cleanup_synthetic(&self) -> bool {
+        self.is_cleanup
     }
 }
 
@@ -3011,7 +3041,15 @@ async fn serve_new_file(
         resume_offset = 0;
 
         if fwd_response.status() != StatusCode::OK {
-            let log_level = if fwd_response.status() == StatusCode::NOT_FOUND {
+            // Demote routine 4xx for cleanup-synthetic clients to DEBUG:
+            // `try_fetch_packages_file` deliberately walks `.xz → .gz → raw`,
+            // and on S3-hosted flat repos every miss surfaces as 403 (not
+            // 404). At WARN that's three loud lines per cleanup cycle for
+            // a benign probe sequence — the cleanup's own DEBUG line on
+            // each miss is the operator-visible record.
+            let log_level = if fwd_response.status() == StatusCode::NOT_FOUND
+                || conn_details.client.is_cleanup_synthetic()
+            {
                 Level::Debug
             } else {
                 Level::Warn
