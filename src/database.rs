@@ -570,6 +570,29 @@ impl Database {
         .fetch_all(&self.conn).await
     }
 
+    /// `true` iff a `mirrors_v2` row exists for the given identity tuple.
+    /// Used by `task_cleanup` to gate the flat-cleanup root fallback: a
+    /// mint-and-fetch path that would otherwise insert a fresh row on
+    /// miss.  Reusing only pre-existing rows keeps the DB free of
+    /// cleanup-synthesised mirror entries.
+    pub(crate) async fn mirror_exists(
+        &self,
+        host: &ClientHost,
+        port: Option<NonZero<u16>>,
+        path: &str,
+    ) -> Result<bool, Error> {
+        let port = port.map_or(0, std::num::NonZero::get);
+        let row = query!(
+            r#"SELECT id AS "id!: i64" FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ? LIMIT 1;"#,
+            host,
+            port,
+            path
+        )
+        .fetch_optional(&self.conn)
+        .await?;
+        Ok(row.is_some())
+    }
+
     pub(crate) async fn mirror_cleanup(&self, mirror: &Mirror) -> Result<(), Error> {
         let host = mirror.host();
         let port = mirror.port().map_or(0, std::num::NonZero::get);

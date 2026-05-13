@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!: i64\" FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ? LIMIT 1;",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "2a1f8fac8211d6db96ec0d69a3dabb4f2976fd7467d6f7f040999da5563e9e69"
+}

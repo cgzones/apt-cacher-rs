@@ -331,6 +331,14 @@ struct ReduceContext<'a> {
     layout: CacheLayout,
     mismatch_files: &'a mut u64,
     mismatch_bytes: &'a mut u64,
+    /// Path prefix (with trailing `/`) to strip from `Filename:` values
+    /// before looking up cached files. Non-empty only for the flat-cleanup
+    /// walk-up case where the Packages index lives at an ancestor of the
+    /// current mirror's path (e.g. flat mirror `apt/amd64` whose Packages
+    /// lives at `apt/Packages` — `Filename: amd64/<deb>` strips to `<deb>`
+    /// to match the basename-keyed `cached_files`). Filenames that don't
+    /// start with the prefix belong to a sibling subtree and are ignored.
+    flat_lookup_prefix: &'a str,
 }
 
 /// Accumulated state of the current Debian `Packages` stanza.
@@ -524,7 +532,20 @@ async fn process_stanza(
     };
 
     let lookup_key: &str = if ctx.layout.is_flat() {
-        filename
+        if ctx.flat_lookup_prefix.is_empty() {
+            filename
+        } else {
+            // Packages was fetched from an ancestor (currently only the
+            // host root) — `Filename:` values are relative to that
+            // ancestor, not to the current mirror's flat root. Drop
+            // entries that fall outside our subtree (they belong to a
+            // sibling); strip the prefix to recover the basename-keyed
+            // lookup key for entries inside our subtree.
+            let Some(stripped) = filename.strip_prefix(ctx.flat_lookup_prefix) else {
+                return;
+            };
+            stripped
+        }
     } else {
         let Some(key) = structured_lookup_key(filename) else {
             return;
@@ -1172,6 +1193,7 @@ async fn cleanup_mirror_deb_files(
                 layout: CacheLayout::StructuredPool,
                 mismatch_files: &mut mismatch_files,
                 mismatch_bytes: &mut mismatch_bytes,
+                flat_lookup_prefix: "",
             };
             pkgfmt
                 .reduce_file_list(file, &memfdname, &mut cached_files, &mut ctx, config)
@@ -1567,46 +1589,178 @@ async fn cleanup_mirror_flat_files(
         mirror.format_authority(),
         mirror.path()
     );
-    let (mut response, pkgfmt) = match try_fetch_packages_file(
+
+    // Try `<mirror.path>/Packages*` first.  On miss, fall back to the
+    // flat-repo root: the first segment of `mirror.path` (e.g. `apt` for
+    // mirror `apt/amd64`).  Real-world example is an S3-hosted apt repo
+    // that serves debs under `apt/<arch>/*.deb` but keeps a single
+    // Packages file at `apt/Packages` whose `Filename:` values are
+    // `<arch>/<deb>`.  The minted root mirror routes through the normal
+    // cache pipeline, so the Packages lands at
+    // `<host>/flat/<first_segment>/Packages*` — the same place it would
+    // live if a client had fetched it directly.
+    //
+    // A mirror whose path is already a single segment has no flat-repo
+    // ancestor distinct from itself; skip the fallback in that case.
+    // `trim_end_matches('/')` guards against a stray trailing slash on
+    // `mirror.path()` (e.g. `"apt/"`) that would otherwise split into
+    // `("apt", "")` and route the fallback at the same URL as the
+    // primary fetch.
+    //
+    // Deeper paths fall back to the outermost segment, not the
+    // immediate parent: for `mirror.path = "repo/dists/amd64/sub"` the
+    // fallback targets `repo/Packages`, not `repo/dists/amd64/Packages`.
+    // That matches the typical "one Packages at the repo root" S3
+    // layout; a layout with intermediate Packages files would need a
+    // multi-level walk-up not covered here.
+    let root_segment: Option<&str> = mirror
+        .path()
+        .trim_end_matches('/')
+        .split_once('/')
+        .map(|(head, _)| head);
+
+    // The flat lookup-key prefix that has to be stripped from `Filename:`
+    // values before matching against `cached_files`.  Empty when we read
+    // the Packages co-located with the mirror; non-empty (the mirror's
+    // sub-path under the flat root) when we read the root Packages.
+    let mut flat_lookup_prefix = String::new();
+
+    let primary_fetch = try_fetch_packages_file(
         &mirror,
         &base_uri,
         CacheLayout::Flat,
         |pkgfmt| format!("Packages{}", pkgfmt.extension()),
         &appstate,
     )
-    .await
-    {
-        Ok(r) => r,
-        Err(status) => {
-            // Flat caching can mint a `MirrorEntry` for any nested deb URL
-            // (e.g. `apt/sub/pkg_..._amd64.deb`), which means a mirror path
-            // may legitimately have cached debs but no co-located Packages
-            // index. Without a fallback those debs would never be GC'd. Fall
-            // back to a long time-based retention so abandoned/typo'd flat
-            // mirror paths eventually drain instead of accumulating forever.
-            warn!(
-                "Could not fetch flat Packages file for mirror {mirror} ({status}); falling back to {} time-based retention",
-                HumanFmt::Time(RETENTION_TIME),
-            );
-            let (files_removed, bytes_removed) =
-                sweep_aged_cached_debs(&cached_files, RETENTION_TIME, &mirror, CacheLayout::Flat)
+    .await;
+
+    let (file, pkgfmt, memfdname) = match primary_fetch {
+        Ok((mut response, pkgfmt)) => {
+            let memfdname = format!("flat_packages{}", pkgfmt.extension());
+            let file = packages_body_to_memfd(&memfdname, response.body_mut(), config).await?;
+            (file, pkgfmt, memfdname)
+        }
+        Err(primary_status) => {
+            // Only fall back to the flat-repo root when a `mirrors_v2` row
+            // already exists for that root.  Routing through
+            // `process_cache_request` against a freshly-minted root mirror
+            // would otherwise upsert it on the spot, polluting the table
+            // with cleanup-synthesised entries.  In practice a real client
+            // doing `apt update` against the flat repo will have fetched
+            // the root Packages first (registering the row) before any
+            // deb URL ever lands here, so the gate is "open" exactly when
+            // there is a real flat-repo root to consult.
+            let root_attempt = match root_segment {
+                Some(seg) => {
+                    match appstate
+                        .database
+                        .mirror_exists(mirror.host(), mirror.port(), seg)
+                        .await
+                    {
+                        Ok(true) => {
+                            let root_mirror = Mirror::new(
+                                mirror.host().clone(),
+                                mirror.port(),
+                                seg.to_owned(),
+                                MirrorKind::Flat,
+                            );
+                            let root_base_uri = format!(
+                                "http://{}/{}/Packages",
+                                root_mirror.format_authority(),
+                                root_mirror.path()
+                            );
+                            try_fetch_packages_file(
+                                &root_mirror,
+                                &root_base_uri,
+                                CacheLayout::Flat,
+                                |pkgfmt| format!("Packages{}", pkgfmt.extension()),
+                                &appstate,
+                            )
+                            .await
+                        }
+                        Ok(false) => {
+                            info!(
+                                "Flat mirror {mirror}: no `mirrors_v2` row for flat-repo root `{seg}`; skipping root fallback"
+                            );
+                            Err(primary_status)
+                        }
+                        Err(err) => {
+                            metrics::DB_OPERATION_FAILED.increment();
+                            error!(
+                                "Error checking for flat-repo root `{seg}` mirror row:  {err}"
+                            );
+                            Err(primary_status)
+                        }
+                    }
+                }
+                None => Err(primary_status),
+            };
+
+            match root_attempt {
+                Ok((mut response, pkgfmt)) => {
+                    let seg = root_segment.expect("Ok implies root_segment was Some");
+                    // `trim_matches('/')` strips both the leading `/`
+                    // left by `strip_prefix` and any trailing slash on
+                    // `mirror.path()` so the pushed `/` below doesn't
+                    // double up.
+                    flat_lookup_prefix = mirror
+                        .path()
+                        .strip_prefix(seg)
+                        .unwrap_or("")
+                        .trim_matches('/')
+                        .to_owned();
+                    if !flat_lookup_prefix.is_empty() {
+                        flat_lookup_prefix.push('/');
+                    }
+                    debug!(
+                        "Flat mirror {mirror}: Packages at `{base_uri}*` unavailable ({primary_status}); using flat-root Packages at `http://{}/{seg}/Packages*` with prefix `{flat_lookup_prefix}`",
+                        mirror.format_authority(),
+                    );
+                    let memfdname = format!("flat_packages{}", pkgfmt.extension());
+                    let file =
+                        packages_body_to_memfd(&memfdname, response.body_mut(), config).await?;
+                    (file, pkgfmt, memfdname)
+                }
+                Err(root_status) => {
+                    // Flat caching can mint a `MirrorEntry` for any nested
+                    // deb URL (e.g. `apt/sub/pkg_..._amd64.deb`), which means
+                    // a mirror path may legitimately have cached debs but no
+                    // co-located or flat-root Packages index. Without a
+                    // fallback those debs would never be GC'd. Fall back to
+                    // a long time-based retention so abandoned/typo'd flat
+                    // mirror paths eventually drain instead of accumulating
+                    // forever.
+                    let suffix = match root_segment {
+                        Some(seg) if root_status != primary_status => {
+                            format!(", flat-root `{seg}` {root_status}")
+                        }
+                        Some(_) | None => String::new(),
+                    };
+                    warn!(
+                        "Could not fetch flat Packages file for mirror {mirror} ({primary_status}{suffix}); falling back to {} time-based retention",
+                        HumanFmt::Time(RETENTION_TIME),
+                    );
+                    let (files_removed, bytes_removed) = sweep_aged_cached_debs(
+                        &cached_files,
+                        RETENTION_TIME,
+                        &mirror,
+                        CacheLayout::Flat,
+                    )
                     .await;
-            info!(
-                "Removed {files_removed} aged flat deb files for mirror {mirror} ({})",
-                HumanFmt::Size(bytes_removed)
-            );
-            return Ok(CleanupDone::tally(
-                mirror,
-                num_total_files,
-                files_removed,
-                bytes_removed,
-            ));
+                    info!(
+                        "Removed {files_removed} aged flat deb files for mirror {mirror} ({})",
+                        HumanFmt::Size(bytes_removed)
+                    );
+                    return Ok(CleanupDone::tally(
+                        mirror,
+                        num_total_files,
+                        files_removed,
+                        bytes_removed,
+                    ));
+                }
+            }
         }
     };
-
-    let memfdname = format!("flat_packages{}", pkgfmt.extension());
-
-    let file = packages_body_to_memfd(&memfdname, response.body_mut(), config).await?;
 
     let mut mismatch_files: u64 = 0;
     let mut mismatch_bytes: u64 = 0;
@@ -1616,6 +1770,7 @@ async fn cleanup_mirror_flat_files(
             layout: CacheLayout::Flat,
             mismatch_files: &mut mismatch_files,
             mismatch_bytes: &mut mismatch_bytes,
+            flat_lookup_prefix: flat_lookup_prefix.as_str(),
         };
         pkgfmt
             .reduce_file_list(file, &memfdname, &mut cached_files, &mut ctx, config)
@@ -2344,6 +2499,70 @@ mod tests {
             verify_file_sync(&path, HashAlgo::Sha512, &expected_sha512),
             Verdict::Match
         ));
+    }
+
+    #[tokio::test]
+    async fn process_stanza_flat_prefix_strips_in_subtree_and_drops_siblings() {
+        // Regression guard for the walk-up flat-cleanup case: when a flat
+        // mirror at `apt/amd64` reuses a Packages index fetched at the
+        // ancestor `apt/`, `Filename:` values are relative to `apt/`. The
+        // process_stanza prefix logic must (a) ignore sibling-subtree
+        // entries (`arm64/*`), and (b) strip the `amd64/` prefix to find
+        // the basename-keyed entry inside our subtree.
+        use std::num::NonZero;
+
+        use crate::config::ClientHost;
+
+        let mut file_list: HashMap<String, PathBuf> = HashMap::new();
+        file_list.insert("pkg.deb".to_owned(), PathBuf::from("/tmp/cache/pkg.deb"));
+        file_list.insert(
+            "other.deb".to_owned(),
+            PathBuf::from("/tmp/cache/other.deb"),
+        );
+
+        let mirror = Mirror::new(
+            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            None::<NonZero<u16>>,
+            "apt/amd64".to_owned(),
+            MirrorKind::Flat,
+        );
+        let mut mismatch_files = 0u64;
+        let mut mismatch_bytes = 0u64;
+
+        // Sibling subtree: `arm64/sibling.deb` does not start with the
+        // `amd64/` prefix — must be a no-op on file_list.
+        {
+            let mut ctx = ReduceContext {
+                mirror: &mirror,
+                layout: CacheLayout::Flat,
+                mismatch_files: &mut mismatch_files,
+                mismatch_bytes: &mut mismatch_bytes,
+                flat_lookup_prefix: "amd64/",
+            };
+            let mut stanza = Stanza::new();
+            stanza.ingest("Filename: arm64/sibling.deb\n");
+            process_stanza(&stanza, &mut file_list, &mut ctx).await;
+        }
+        assert_eq!(file_list.len(), 2);
+        assert!(file_list.contains_key("pkg.deb"));
+        assert!(file_list.contains_key("other.deb"));
+
+        // In-subtree: `amd64/pkg.deb` strips to `pkg.deb`; with no SHA
+        // advertised, the stanza warn-retains and removes the lookup key.
+        {
+            let mut ctx = ReduceContext {
+                mirror: &mirror,
+                layout: CacheLayout::Flat,
+                mismatch_files: &mut mismatch_files,
+                mismatch_bytes: &mut mismatch_bytes,
+                flat_lookup_prefix: "amd64/",
+            };
+            let mut stanza = Stanza::new();
+            stanza.ingest("Filename: amd64/pkg.deb\n");
+            process_stanza(&stanza, &mut file_list, &mut ctx).await;
+        }
+        assert!(!file_list.contains_key("pkg.deb"));
+        assert!(file_list.contains_key("other.deb"));
     }
 
     #[test]
