@@ -345,7 +345,14 @@ async fn scan_mirror_dir(
         }
 
         warn!(
-            "Unrecognized entry in mirror directory: `{}`",
+            "Unrecognized {} entry in mirror directory: `{}`",
+            if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_file() {
+                "file"
+            } else {
+                "non-regular file"
+            },
             entry.path().display()
         );
     }
