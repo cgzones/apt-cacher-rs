@@ -710,6 +710,14 @@ where
     F: Fn(PackageFormat) -> String,
 {
     let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
+    // Remember a representative missing-ish status to surface after every
+    // format fails. AWS S3 returns 403 (not 404) for a missing object when
+    // the requester lacks `s3:ListBucket`, so we must not abort the
+    // fallback chain on the first non-200 response — but the caller's
+    // diagnostic log should still see the most informative upstream status
+    // rather than a synthetic 404. Preference order: 403/410 (specific)
+    // beat 404 (generic); among non-404 statuses, the first one seen wins.
+    let mut last_missing: Option<StatusCode> = None;
 
     for pkgfmt in [PackageFormat::Xz, PackageFormat::Gz, PackageFormat::Raw] {
         uri_buffer.clear();
@@ -738,23 +746,40 @@ where
 
         let response = process_cache_request(conn_details, req, appstate.clone()).await;
 
-        if response.status() == StatusCode::NOT_FOUND {
-            debug!("Cleanup request {uri} not found");
-            continue;
+        let status = response.status();
+
+        if status == StatusCode::OK {
+            return Ok((response, pkgfmt));
         }
 
-        if response.status() != StatusCode::OK {
-            warn!(
-                "Cleanup request {uri} failed with status code {}:  {response:?}",
-                response.status(),
-            );
-            return Err(response.status());
-        }
-
-        return Ok((response, pkgfmt));
+        // Treat "missing-ish" upstream statuses as "try the next format":
+        // 404 Not Found, 403 Forbidden (S3 on missing object without
+        // ListBucket), 410 Gone. Anything else (5xx, 401, network failure
+        // mapped to 502 by process_cache_request) is fatal for this format
+        // chain — surface it immediately rather than silently masking it.
+        let _: Never = match status {
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE => {
+                debug!("Cleanup request {uri} unavailable ({status})");
+                // Promote 404 to a more specific status (403/410) when one
+                // shows up later in the chain; otherwise stick with the
+                // first non-404 we saw.
+                let promote = match last_missing {
+                    None => true,
+                    Some(prev) => prev == StatusCode::NOT_FOUND && status != StatusCode::NOT_FOUND,
+                };
+                if promote {
+                    last_missing = Some(status);
+                }
+                continue;
+            }
+            _ => {
+                warn!("Cleanup request {uri} failed with status code {status}:  {response:?}");
+                return Err(status);
+            }
+        };
     }
 
-    Err(StatusCode::NOT_FOUND)
+    Err(last_missing.unwrap_or(StatusCode::NOT_FOUND))
 }
 
 /// RAII guard that releases the `task_cleanup` active flag on drop, so a
