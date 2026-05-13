@@ -1263,6 +1263,8 @@ pub(crate) async fn serve_file_via_sendfile(
 
     match transfer_result {
         Ok(()) => {
+            metrics::SERVED_SENDFILE.increment();
+            metrics::SERVED_TOTAL.increment();
             let elapsed = start.elapsed();
             info!(
                 "Served cached file {} from mirror {}{aliased} for client {} in {} via sendfile (size={}, rate={})",
@@ -2111,6 +2113,8 @@ async fn serve_unfinished_sendfile(
 
     match transfer_result {
         Ok(()) => {
+            metrics::SERVED_SENDFILE.increment();
+            metrics::SERVED_TOTAL.increment();
             let elapsed = start.elapsed();
             info!(
                 "Served downloading file {} from mirror {}{aliased} for joining client {} in {} via sendfile (size={}, rate={})",

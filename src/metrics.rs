@@ -95,9 +95,16 @@ impl StateU64 {
 /// Total client requests handled, including web-interface requests.
 /// Subtract `WEBUI_REQUESTS` to get proxy-only requests.
 pub(crate) static REQUESTS_TOTAL: Counter = Counter::new();
+/// Requests for which a response body was fully delivered to the client
+/// (subset of `REQUESTS_TOTAL`; sum of per-delivery-path `SERVED_*` plus
+/// `SERVED_WEBUI`).
+pub(crate) static SERVED_TOTAL: Counter = Counter::new();
 /// Web interface requests entering `serve_web_interface`. Subset of
 /// `REQUESTS_TOTAL` (every `WebUI` request bumps both counters).
 pub(crate) static WEBUI_REQUESTS: Counter = Counter::new();
+/// Web interface responses fully delivered (subset of `WEBUI_REQUESTS`
+/// and `SERVED_TOTAL`).
+pub(crate) static SERVED_WEBUI: Counter = Counter::new();
 /// TCP connections accepted by the listener (counted at `accept()`,
 /// before the per-IP cap check). Connections subsequently rejected by
 /// `max_connections_per_client_ip` are included here and also counted
@@ -248,6 +255,9 @@ pub(crate) static BYTES_SERVED_CHANNEL: Accumulator = Accumulator::new();
 pub(crate) static BYTES_SERVED_PASSTHROUGH: Accumulator = Accumulator::new();
 /// Passthrough requests served (companion to `BYTES_SERVED_PASSTHROUGH`).
 pub(crate) static REQUESTS_PASSTHROUGH: Counter = Counter::new();
+/// Passthrough responses fully relayed to the client (subset of
+/// `REQUESTS_PASSTHROUGH`).
+pub(crate) static SERVED_PASSTHROUGH: Counter = Counter::new();
 
 /// Splice-path upstream connect failures (TCP setup).
 pub(crate) static UPSTREAM_CONNECT_FAILED: Counter = Counter::new();
@@ -299,15 +309,26 @@ pub(crate) static CACHE_MISSES: Counter = Counter::new();
 
 /// Cached responses served via mmap (companion to `BYTES_SERVED_MMAP`).
 pub(crate) static REQUESTS_MMAP: Counter = Counter::new();
+/// Cached responses fully delivered via mmap (subset of `REQUESTS_MMAP`).
+pub(crate) static SERVED_MMAP: Counter = Counter::new();
 /// Cached responses served via sendfile (companion to `BYTES_SERVED_SENDFILE`).
 pub(crate) static REQUESTS_SENDFILE: Counter = Counter::new();
+/// Cached responses fully delivered via sendfile (subset of `REQUESTS_SENDFILE`).
+pub(crate) static SERVED_SENDFILE: Counter = Counter::new();
 /// Responses served via splice (companion to `BYTES_SERVED_SPLICE`).
 pub(crate) static REQUESTS_SPLICE: Counter = Counter::new();
+/// Responses fully delivered via splice (subset of `REQUESTS_SPLICE`).
+pub(crate) static SERVED_SPLICE: Counter = Counter::new();
 /// Cached responses served via plain copy (companion to `BYTES_SERVED_COPY`).
 pub(crate) static REQUESTS_COPY: Counter = Counter::new();
+/// Cached responses fully delivered via plain copy (subset of `REQUESTS_COPY`).
+pub(crate) static SERVED_COPY: Counter = Counter::new();
 /// Late-joiner responses streamed via `ChannelBody` (companion to
 /// `BYTES_SERVED_CHANNEL`).
 pub(crate) static REQUESTS_CHANNEL: Counter = Counter::new();
+/// Late-joiner responses fully delivered via `ChannelBody` (subset of
+/// `REQUESTS_CHANNEL`).
+pub(crate) static SERVED_CHANNEL: Counter = Counter::new();
 
 /// Mirror responses that violated the HTTP contract: body exceeded or
 /// undershot the announced `Content-Length`, missing or mismatched

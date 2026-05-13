@@ -788,6 +788,8 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                 None => String::new(),
             };
             if transferred_bytes == size {
+                metrics::SERVED_COPY.increment();
+                metrics::SERVED_TOTAL.increment();
                 info!(
                     "Served cached file {} from mirror {}{} for client {} in {} via stream (size={}, rate={})",
                     cd.debname,
@@ -946,10 +948,24 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
 /// Body wrapper for the hyper simple-proxy path: counts data bytes into
 /// [`metrics::BYTES_SERVED_PASSTHROUGH`] at poll time (hyper's body model
 /// exposes no post-write hook). Splice/sendfile count post-write directly.
-#[pin_project]
+///
+/// On Drop, bumps `SERVED_PASSTHROUGH` + `SERVED_TOTAL` iff the inner body
+/// reached clean end-of-stream (`poll_frame` returned `Ready(None)`) — so
+/// aborted clients do not increment the served counter.
+#[pin_project(PinnedDrop)]
 struct PassthroughBody<B: Body> {
     #[pin]
     inner: B,
+    end_of_stream: bool,
+}
+
+impl<B: Body> PassthroughBody<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            end_of_stream: false,
+        }
+    }
 }
 
 impl<B> Body for PassthroughBody<B>
@@ -964,11 +980,18 @@ where
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let result = self.project().inner.poll_frame(cx);
-        if let Ready(Some(Ok(ref frame))) = result
-            && let Some(data) = frame.data_ref()
-        {
-            metrics::BYTES_SERVED_PASSTHROUGH.increment_by(data.remaining() as u64);
+        let this = self.project();
+        let result = this.inner.poll_frame(cx);
+        match &result {
+            Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    metrics::BYTES_SERVED_PASSTHROUGH.increment_by(data.remaining() as u64);
+                }
+            }
+            Ready(None) => {
+                *this.end_of_stream = true;
+            }
+            Ready(Some(Err(_))) | Pending => {}
         }
         result
     }
@@ -981,6 +1004,16 @@ where
     #[inline]
     fn is_end_stream(&self) -> bool {
         self.inner.is_end_stream()
+    }
+}
+
+#[pinned_drop]
+impl<B: Body> PinnedDrop for PassthroughBody<B> {
+    fn drop(self: Pin<&mut Self>) {
+        if self.end_of_stream {
+            metrics::SERVED_PASSTHROUGH.increment();
+            metrics::SERVED_TOTAL.increment();
+        }
     }
 }
 
@@ -1076,6 +1109,8 @@ impl Drop for MmapBody {
                 None => String::new(),
             };
             if transferred_bytes == size {
+                metrics::SERVED_MMAP.increment();
+                metrics::SERVED_TOTAL.increment();
                 info!(
                     "Served cached file {} from mirror {}{} for client {} in {} via mmap (size={}, rate={})",
                     cd.debname,
@@ -3106,7 +3141,7 @@ async fn serve_new_file(
             let (parts, body) = fwd_response.into_parts();
 
             metrics::REQUESTS_PASSTHROUGH.increment();
-            let counted = ClientCountedBody::new(PassthroughBody { inner: body });
+            let counted = ClientCountedBody::new(PassthroughBody::new(body));
 
             let rated = MaybeRated::new(
                 counted,
@@ -4007,7 +4042,7 @@ async fn pre_process_client_request(
             let (parts, body) = redirected_response.into_parts();
 
             metrics::REQUESTS_PASSTHROUGH.increment();
-            let counted = ClientCountedBody::new(PassthroughBody { inner: body });
+            let counted = ClientCountedBody::new(PassthroughBody::new(body));
 
             let rated = MaybeRated::new(
                 counted,
@@ -4037,7 +4072,7 @@ async fn pre_process_client_request(
     let (parts, body) = fwd_response.into_parts();
 
     metrics::REQUESTS_PASSTHROUGH.increment();
-    let counted = ClientCountedBody::new(PassthroughBody { inner: body });
+    let counted = ClientCountedBody::new(PassthroughBody::new(body));
 
     let rated = MaybeRated::new(
         counted,

@@ -288,6 +288,26 @@ impl<T: Display> Display for WarnIf<T> {
     }
 }
 
+/// Render `inner` as-is; if `predicate` is true, wrap it in `<span class="alert">`.
+struct AlertIf<T: Display> {
+    inner: T,
+    predicate: bool,
+}
+impl<T: Display> AlertIf<T> {
+    fn new(inner: T, predicate: bool) -> Self {
+        Self { inner, predicate }
+    }
+}
+impl<T: Display> Display for AlertIf<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.predicate {
+            write!(f, "<span class=\"alert\">{}</span>", self.inner)
+        } else {
+            Display::fmt(&self.inner, f)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared cell-value Display helpers — used across multiple section builders.
 // ---------------------------------------------------------------------------
@@ -1524,15 +1544,27 @@ fn build_metrics_html() -> String {
     let proc_cache_misses = metrics::CACHE_MISSES.get();
     let proc_cache_lookups = proc_cache_hits + proc_cache_misses;
     let requests_total = metrics::REQUESTS_TOTAL.get();
+    let served_total = metrics::SERVED_TOTAL.get();
     let webui_requests = metrics::WEBUI_REQUESTS.get();
+    let served_webui = metrics::SERVED_WEBUI.get();
     let connections_accepted = metrics::CONNECTIONS_ACCEPTED.get();
 
     let mut t = DetailsTable::new();
     t.row_tip(
-        "Total Requests (Web UI Requests) / Connections Accepted",
-        "Total HTTP requests and Web interface requests handled and TCP connections accepted from clients since the daemon started.",
+        "Total Requests \u{2192} Served (Web UI Requests \u{2192} Served) / Connections Accepted",
+        "Total HTTP requests handled \u{2192} requests whose response body was fully delivered to the client; same split for the web interface. Plus TCP connections accepted from clients since the daemon started.",
         format_args!(
-            "{requests_total} ({webui_requests}) / {connections_accepted}{}",
+            "{requests_total} \u{2192} {}{} ({webui_requests} \u{2192} {}{}) / {connections_accepted}{}",
+            AlertIf::new(served_total, served_total > requests_total),
+            OptPctSuffix {
+                num: served_total,
+                total: requests_total,
+            },
+            AlertIf::new(served_webui, served_webui > webui_requests),
+            OptPctSuffix {
+                num: served_webui,
+                total: webui_requests,
+            },
             OptReqPerConn {
                 requests: requests_total,
                 connections: connections_accepted,
@@ -1674,60 +1706,108 @@ fn build_metrics_html() -> String {
             WarnNonzero(metrics::UPSTREAM_TLS_FAILED.get())
         ),
     );
-    t.row_tip(
-        "Delivery (mmap) requests / bytes",
-        "Cached responses served via memory-mapped file I/O.",
-        format_args!(
-            "{} / {}",
-            metrics::REQUESTS_MMAP.get(),
-            HumanFmt::Size(metrics::BYTES_SERVED_MMAP.get())
-        ),
-    );
-    t.row_tip(
-        "Delivery (sendfile) requests / bytes",
-        "Cached responses served via Linux sendfile(2) zero-copy.",
-        format_args!(
-            "{} / {}",
-            metrics::REQUESTS_SENDFILE.get(),
-            HumanFmt::Size(metrics::BYTES_SERVED_SENDFILE.get())
-        ),
-    );
-    t.row_tip(
-        "Delivery (splice) requests / bytes",
-        "Responses streamed from upstream to client via Linux splice(2) zero-copy without ever touching userspace.",
-        format_args!(
-            "{} / {}",
-            metrics::REQUESTS_SPLICE.get(),
-            HumanFmt::Size(metrics::BYTES_SERVED_SPLICE.get())
-        ),
-    );
-    t.row_tip(
-        "Delivery (copy) requests / bytes",
-        "Cached responses served via plain userspace read/write copy.",
-        format_args!(
-            "{} / {}",
-            metrics::REQUESTS_COPY.get(),
-            HumanFmt::Size(metrics::BYTES_SERVED_COPY.get())
-        ),
-    );
-    t.row_tip(
-        "Delivery (channel, late-joiner) requests / bytes",
-        "Late-joiner responses streamed via the hyper ChannelBody path while an upstream download is still in flight.",
-        format_args!(
-            "{} / {}",
-            metrics::REQUESTS_CHANNEL.get(),
-            HumanFmt::Size(metrics::BYTES_SERVED_CHANNEL.get())
-        ),
-    );
-    t.row_tip(
-        "Delivery (passthrough, uncached) requests / bytes",
-        "Uncached responses proxied through to clients without storing anything on disk.",
-        format_args!(
-            "{} / {}",
-            metrics::REQUESTS_PASSTHROUGH.get(),
-            HumanFmt::Size(metrics::BYTES_SERVED_PASSTHROUGH.get())
-        ),
-    );
+    {
+        let requests = metrics::REQUESTS_MMAP.get();
+        let served = metrics::SERVED_MMAP.get();
+        t.row_tip(
+            "Delivery (mmap) requests \u{2192} served / bytes",
+            "Cached responses served via memory-mapped file I/O: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
+            format_args!(
+                "{requests} \u{2192} {}{} / {}",
+                AlertIf::new(served, served > requests),
+                OptPctSuffix {
+                    num: served,
+                    total: requests,
+                },
+                HumanFmt::Size(metrics::BYTES_SERVED_MMAP.get())
+            ),
+        );
+    }
+    {
+        let requests = metrics::REQUESTS_SENDFILE.get();
+        let served = metrics::SERVED_SENDFILE.get();
+        t.row_tip(
+            "Delivery (sendfile) requests \u{2192} served / bytes",
+            "Cached responses served via Linux sendfile(2) zero-copy: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
+            format_args!(
+                "{requests} \u{2192} {}{} / {}",
+                AlertIf::new(served, served > requests),
+                OptPctSuffix {
+                    num: served,
+                    total: requests,
+                },
+                HumanFmt::Size(metrics::BYTES_SERVED_SENDFILE.get())
+            ),
+        );
+    }
+    {
+        let requests = metrics::REQUESTS_SPLICE.get();
+        let served = metrics::SERVED_SPLICE.get();
+        t.row_tip(
+            "Delivery (splice) requests \u{2192} served / bytes",
+            "Responses streamed from upstream to client via Linux splice(2) zero-copy without ever touching userspace: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
+            format_args!(
+                "{requests} \u{2192} {}{} / {}",
+                AlertIf::new(served, served > requests),
+                OptPctSuffix {
+                    num: served,
+                    total: requests,
+                },
+                HumanFmt::Size(metrics::BYTES_SERVED_SPLICE.get())
+            ),
+        );
+    }
+    {
+        let requests = metrics::REQUESTS_COPY.get();
+        let served = metrics::SERVED_COPY.get();
+        t.row_tip(
+            "Delivery (copy) requests \u{2192} served / bytes",
+            "Cached responses served via plain userspace read/write copy: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
+            format_args!(
+                "{requests} \u{2192} {}{} / {}",
+                AlertIf::new(served, served > requests),
+                OptPctSuffix {
+                    num: served,
+                    total: requests,
+                },
+                HumanFmt::Size(metrics::BYTES_SERVED_COPY.get())
+            ),
+        );
+    }
+    {
+        let requests = metrics::REQUESTS_CHANNEL.get();
+        let served = metrics::SERVED_CHANNEL.get();
+        t.row_tip(
+            "Delivery (channel, late-joiner) requests \u{2192} served / bytes",
+            "Late-joiner responses streamed via the hyper ChannelBody path while an upstream download is still in flight: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
+            format_args!(
+                "{requests} \u{2192} {}{} / {}",
+                AlertIf::new(served, served > requests),
+                OptPctSuffix {
+                    num: served,
+                    total: requests,
+                },
+                HumanFmt::Size(metrics::BYTES_SERVED_CHANNEL.get())
+            ),
+        );
+    }
+    {
+        let requests = metrics::REQUESTS_PASSTHROUGH.get();
+        let served = metrics::SERVED_PASSTHROUGH.get();
+        t.row_tip(
+            "Delivery (passthrough, uncached) requests \u{2192} served / bytes",
+            "Uncached responses proxied through to clients without storing anything on disk: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
+            format_args!(
+                "{requests} \u{2192} {}{} / {}",
+                AlertIf::new(served, served > requests),
+                OptPctSuffix {
+                    num: served,
+                    total: requests,
+                },
+                HumanFmt::Size(metrics::BYTES_SERVED_PASSTHROUGH.get())
+            ),
+        );
+    }
     t.row_tip(
         "Clients Demoted (splice \u{2192} file-serve)",
         "Splice clients demoted to ordinary cached-file delivery, e.g. because they joined an in-progress download.",
@@ -2204,6 +2284,9 @@ pub(crate) async fn serve_web_interface(uri: &http::Uri, appstate: &AppState) ->
         response.content_type(),
         response.body.len()
     );
+
+    metrics::SERVED_WEBUI.increment();
+    metrics::SERVED_TOTAL.increment();
 
     response
 }

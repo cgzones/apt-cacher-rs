@@ -4316,6 +4316,8 @@ async fn splice_proxy_drive(
 
         // InitBarrier fires on return, which is correct: nothing was cached
         // PoolGuard::drop handles returning the connection to pool if poolable
+        metrics::SERVED_PASSTHROUGH.increment();
+        metrics::SERVED_TOTAL.increment();
         return Ok(());
     }
 
@@ -5233,6 +5235,9 @@ async fn splice_proxy_drive(
         return Err(SpliceProxyError::AfterHeaderIo);
     }
 
+    metrics::SERVED_SPLICE.increment();
+    metrics::SERVED_TOTAL.increment();
+
     let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
         mirror: conn_details.mirror.clone(),
         debname: conn_details.debname.clone(),
@@ -5740,6 +5745,8 @@ async fn handle_volatile_buffered_download(
         .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "volatile body to client"))?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
+    metrics::SERVED_SPLICE.increment();
+    metrics::SERVED_TOTAL.increment();
 
     drop(cork);
 
@@ -6052,6 +6059,9 @@ pub(crate) async fn splice_simple_proxy(
                 SpliceProxyError::AfterHeaderClient(err, "simple-proxy body until EOF")
             })?;
     }
+
+    metrics::SERVED_PASSTHROUGH.increment();
+    metrics::SERVED_TOTAL.increment();
 
     // PoolGuard::drop handles returning the connection to pool if poolable
     Ok(())

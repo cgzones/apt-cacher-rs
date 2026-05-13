@@ -39,6 +39,15 @@ impl ChannelBody {
     }
 }
 
+impl Drop for ChannelBody {
+    fn drop(&mut self) {
+        if self.complete {
+            metrics::SERVED_CHANNEL.increment();
+            metrics::SERVED_TOTAL.increment();
+        }
+    }
+}
+
 impl Body for ChannelBody {
     type Data = bytes::Bytes;
     type Error = Box<ProxyCacheError>;
