@@ -619,11 +619,20 @@ async fn try_sendfile_request(
                     status: StatusCode::BAD_GATEWAY,
                     msg: "Upstream Error",
                 },
-                Err(SpliceProxyError::Client(err)) => {
-                    debug!(
-                        "simple proxy: client error for {uri_path} from host {}:  {err}",
-                        mirror.format_authority()
-                    );
+                Err(SpliceProxyError::Client(err, location)) => {
+                    if is_peer_disconnect(&err) {
+                        info!(
+                            "simple proxy: client error writing {location} (peer disconnect) for {uri_path} from host {}:  {}",
+                            mirror.format_authority(),
+                            ErrorReport(&err)
+                        );
+                    } else {
+                        warn!(
+                            "simple proxy: client error writing {location} for {uri_path} from host {}:  {}",
+                            mirror.format_authority(),
+                            ErrorReport(&err)
+                        );
+                    }
                     ZeroCopyResult::ClientError
                 }
                 Err(SpliceProxyError::AfterHeader) => ZeroCopyResult::AfterHeaderError,
@@ -920,11 +929,24 @@ async fn try_sendfile_request(
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",
             },
-            Err(SpliceProxyError::Client(err)) => {
-                debug!(
-                    "splice proxy: client error for {} from mirror {}{}:  {err}",
-                    conn_details.debname, conn_details.mirror, aliased
-                );
+            Err(SpliceProxyError::Client(err, location)) => {
+                if is_peer_disconnect(&err) {
+                    info!(
+                        "splice proxy: client error writing {location} (peer disconnect) for {} from mirror {}{}:  {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        aliased,
+                        ErrorReport(&err)
+                    );
+                } else {
+                    warn!(
+                        "splice proxy: client error writing {location} for {} from mirror {}{}:  {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        aliased,
+                        ErrorReport(&err)
+                    );
+                }
                 ZeroCopyResult::ClientError
             }
             Err(SpliceProxyError::AfterHeader) => ZeroCopyResult::AfterHeaderError,

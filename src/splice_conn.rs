@@ -3873,7 +3873,7 @@ async fn splice_proxy_drive(
                     "no Content-Length",
                 )
                 .await
-                .map_err(SpliceProxyError::Client)?;
+                .map_err(|err| SpliceProxyError::Client(err, "kTLS no-CL 502"))?;
                 return Ok(());
             }
         }
@@ -3939,7 +3939,9 @@ async fn splice_proxy_drive(
                 SendfileResult::Invalid { status, msg } => {
                     write_invalid_response(client_stream, conn_version, conn_action, status, msg)
                         .await
-                        .map_err(SpliceProxyError::Client)?;
+                        .map_err(|err| {
+                            SpliceProxyError::Client(err, "kTLS post-304 invalid response")
+                        })?;
                     Ok(())
                 }
             };
@@ -4191,7 +4193,7 @@ async fn splice_proxy_drive(
             SendfileResult::Invalid { status, msg } => {
                 write_invalid_response(client_stream, conn_version, conn_action, status, msg)
                     .await
-                    .map_err(SpliceProxyError::Client)?;
+                    .map_err(|err| SpliceProxyError::Client(err, "post-304 invalid response"))?;
                 return Ok(());
             }
         }
@@ -4232,7 +4234,7 @@ async fn splice_proxy_drive(
         // Forward raw response headers to client
         write_all_to_stream(client_stream, &header_buf[..header_end], WritePhase::Header)
             .await
-            .map_err(SpliceProxyError::Client)?;
+            .map_err(|err| SpliceProxyError::Client(err, "passthrough headers"))?;
 
         // Forward any body data that arrived with the headers
         let body_prefix = &header_buf[header_end..];
@@ -4408,7 +4410,9 @@ async fn splice_proxy_drive(
                         "Inconsistent Content-Range",
                     )
                     .await
-                    .map_err(SpliceProxyError::Client)?;
+                    .map_err(|err| {
+                        SpliceProxyError::Client(err, "inconsistent Content-Range 502")
+                    })?;
                     return Ok(());
                 }
                 #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
@@ -4442,7 +4446,7 @@ async fn splice_proxy_drive(
                     "unexpected Content-Range",
                 )
                 .await
-                .map_err(SpliceProxyError::Client)?;
+                .map_err(|err| SpliceProxyError::Client(err, "unexpected Content-Range 502"))?;
                 return Ok(());
             }
         }
@@ -4484,7 +4488,7 @@ async fn splice_proxy_drive(
                 "no Content-Length",
             )
             .await
-            .map_err(SpliceProxyError::Client)?;
+            .map_err(|err| SpliceProxyError::Client(err, "no-CL 502"))?;
             return Ok(());
         };
         (cl, cl)
@@ -4507,7 +4511,7 @@ async fn splice_proxy_drive(
             "zero total file size",
         )
         .await
-        .map_err(SpliceProxyError::Client)?;
+        .map_err(|err| SpliceProxyError::Client(err, "zero total-size 502"))?;
         return Ok(());
     };
     let Some(body_content_length) = NonZero::new(body_content_length) else {
@@ -4525,7 +4529,7 @@ async fn splice_proxy_drive(
             "zero body Content-Length",
         )
         .await
-        .map_err(SpliceProxyError::Client)?;
+        .map_err(|err| SpliceProxyError::Client(err, "zero body-CL 502"))?;
         return Ok(());
     };
 
@@ -4553,7 +4557,7 @@ async fn splice_proxy_drive(
             total_content_length.get(),
         )
         .await
-        .map_err(SpliceProxyError::Client)?;
+        .map_err(|err| SpliceProxyError::Client(err, "416 response"))?;
         return Ok(());
     }
     let (content_range_hdr, client_range_start, client_range_len, is_partial) =
@@ -4630,7 +4634,7 @@ async fn splice_proxy_drive(
                 "Disk quota reached",
             )
             .await
-            .map_err(SpliceProxyError::Client)?;
+            .map_err(|err| SpliceProxyError::Client(err, "quota 503"))?;
             return Ok(());
         }
     };
@@ -4658,7 +4662,7 @@ async fn splice_proxy_drive(
                     "Cache Access Failure",
                 )
                 .await
-                .map_err(SpliceProxyError::Client)?;
+                .map_err(|err| SpliceProxyError::Client(err, "partial-size mismatch 500"))?;
                 return Ok(());
             }
             (file, guard)
@@ -4744,7 +4748,7 @@ async fn splice_proxy_drive(
             "body Content-Length mismatch",
         )
         .await
-        .map_err(SpliceProxyError::Client)?;
+        .map_err(|err| SpliceProxyError::Client(err, "body-CL mismatch 502"))?;
         return Ok(());
     };
 
@@ -4770,7 +4774,7 @@ async fn splice_proxy_drive(
                 "body Content-Length mismatch",
             )
             .await
-            .map_err(SpliceProxyError::Client)?;
+            .map_err(|err| SpliceProxyError::Client(err, "kTLS extra-body mismatch 502"))?;
             return Ok(());
         };
     }
@@ -4857,19 +4861,7 @@ async fn splice_proxy_drive(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| {
-        let level = if is_peer_disconnect(&err) {
-            log::Level::Info
-        } else {
-            log::Level::Warn
-        };
-        log::log!(
-            level,
-            "splice proxy: failed to write response headers to client:  {err}"
-        );
-
-        SpliceProxyError::Client(err)
-    })?;
+    .map_err(|err| SpliceProxyError::Client(err, "response headers"))?;
 
     // For resumed downloads, send the existing partial file content to the client first
     // using sendfile(2) for zero-copy transfer from the cache file to the client socket.
@@ -5504,7 +5496,7 @@ async fn handle_volatile_buffered_download(
             "zero-length body",
         )
         .await
-        .map_err(SpliceProxyError::Client)?;
+        .map_err(|err| SpliceProxyError::Client(err, "volatile zero-body 502"))?;
         return Ok(());
     };
 
@@ -5556,7 +5548,7 @@ async fn handle_volatile_buffered_download(
                 "Disk quota reached",
             )
             .await
-            .map_err(SpliceProxyError::Client)?;
+            .map_err(|err| SpliceProxyError::Client(err, "volatile quota 503"))?;
             return Ok(());
         }
     };
@@ -5582,7 +5574,7 @@ async fn handle_volatile_buffered_download(
             total_content_length.get(),
         )
         .await
-        .map_err(SpliceProxyError::Client)?;
+        .map_err(|err| SpliceProxyError::Client(err, "volatile 416 response"))?;
         return Ok(());
     }
 
@@ -5712,18 +5704,7 @@ async fn handle_volatile_buffered_download(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| {
-        let level = if is_peer_disconnect(&err) {
-            log::Level::Info
-        } else {
-            log::Level::Warn
-        };
-        log::log!(
-            level,
-            "splice proxy: failed to write response headers to client:  {err}"
-        );
-        SpliceProxyError::Client(err)
-    })?;
+    .map_err(|err| SpliceProxyError::Client(err, "volatile response headers"))?;
 
     // Send body (range-filtered if needed) to client.
     let body_slice = &body[client_range_start..client_range_start + client_range_len];
@@ -5984,7 +5965,7 @@ pub(crate) async fn splice_simple_proxy(
         WritePhase::Header,
     )
     .await
-    .map_err(SpliceProxyError::Client)?;
+    .map_err(|err| SpliceProxyError::Client(err, "simple-proxy headers"))?;
 
     // Forward any body data that arrived with the headers
     let body_prefix = &hdr_buf[hdr_end..];
@@ -6083,8 +6064,12 @@ pub(crate) enum SpliceProxyOutcome {
 pub(crate) enum SpliceProxyError {
     /// Error communicating with upstream
     Upstream,
-    /// Error writing to client
-    Client(std::io::Error),
+    /// Error writing to client.  `&'static str` is a short code-location
+    /// tag (e.g. "response headers", "416 response", "passthrough headers")
+    /// that the outer arm in `sendfile_conn::try_sendfile_request` includes
+    /// in the log so the operator sees which response phase broke without
+    /// grep-walking the source.
+    Client(std::io::Error, &'static str),
     /// Error with cache file operations
     Cache,
     /// Error occurring after response headers were already written to the client.
