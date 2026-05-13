@@ -1430,11 +1430,11 @@ impl Config {
                     ialias.main == alias.main
                         || ialias
                             .aliases
-                            .binary_search_by(|a| a.as_str().cmp(alias.main.as_str()))
+                            .binary_search_by_key(&alias.main.as_str(), |a| a.as_str())
                             .is_ok()
                         || alias
                             .aliases
-                            .binary_search_by(|a| a.as_str().cmp(ialias.main.as_str()))
+                            .binary_search_by_key(&ialias.main.as_str(), |a| a.as_str())
                             .is_ok()
                         || intersect(&ialias.aliases, &alias.aliases)
                 }) {
