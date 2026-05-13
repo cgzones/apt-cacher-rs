@@ -3188,7 +3188,7 @@ async fn follow_redirect(
         }
     });
     let original_port_effective = mirror_port(&conn_details.mirror, upstream.is_tls());
-    if moved_host == conn_details.mirror.host().as_str()
+    if moved_host == conn_details.mirror.host()
         && moved_port_effective == original_port_effective
         && moved_path == original_path
     {

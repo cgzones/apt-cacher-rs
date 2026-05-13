@@ -418,6 +418,21 @@ impl AsRef<std::ffi::OsStr> for CacheHost {
     }
 }
 
+// Symmetric `PartialEq<str>` / `PartialEq<ClientHost> for str` mirror
+// the impls on `DomainName` so call sites comparing a raw `&str` (e.g.
+// `Uri::host()`) against a `ClientHost` need not reach for `.as_str()`.
+impl PartialEq<str> for ClientHost {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<ClientHost> for str {
+    fn eq(&self, other: &ClientHost) -> bool {
+        *self == other.0
+    }
+}
+
 impl From<DomainName> for ClientHost {
     fn from(value: DomainName) -> Self {
         Self(value)
