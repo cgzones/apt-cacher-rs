@@ -1096,6 +1096,11 @@ async fn cleanup_mirror_deb_files(
 
     trace!("Now: {now:?}");
 
+    let origins_count = origins.len();
+    // Most-recent last_seen across all origin rows (in epoch seconds).
+    // Used purely for the diagnostic log below when every row is stale.
+    let most_recent_origin: i64 = origins.iter().map(|o| o.last_seen).max().unwrap_or(0);
+
     let active_origins = origins
         .into_iter()
         .filter(|origin| {
@@ -1125,6 +1130,32 @@ async fn cleanup_mirror_deb_files(
         cached_files.len(),
         mirror.cache_path().display(),
     );
+
+    // Diagnostic: cached debs exist but cleanup will fetch no Packages
+    // index (no active origins).  Surface enough context to disambiguate
+    // "no recent .deb traffic" (origins present but stale) from "origins
+    // never recorded" (origins_count == 0).  Cheap: one extra info line
+    // per cleanup cycle, only when the smelly state actually fires.
+    if !cached_files.is_empty() && active_origins.is_empty() {
+        if origins_count == 0 {
+            info!(
+                "Mirror {}: no origin records - cached debs cannot be reconciled against any Packages index; aging out via the {} grace window",
+                mirror.cache_path().display(),
+                HumanFmt::Time(UNREFERENCED_KEEP_SPAN),
+            );
+        } else {
+            let now_secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+            let age_secs = u64::try_from(now_secs.saturating_sub(most_recent_origin)).unwrap_or(0);
+            let most_recent_age = Duration::from_secs(age_secs);
+            info!(
+                "Mirror {}: all {origins_count} origin records stale (most recent seen {} ago, retention window {}); cached debs will age out via the {} grace window",
+                mirror.cache_path().display(),
+                HumanFmt::Time(most_recent_age),
+                HumanFmt::Time(RETENTION_TIME),
+                HumanFmt::Time(UNREFERENCED_KEEP_SPAN),
+            );
+        }
+    }
 
     let mirror = mirror.into();
 
@@ -1197,6 +1228,7 @@ async fn cleanup_mirror_deb_files(
         }
 
         if cached_files.is_empty() {
+            debug!("All cached deb files for mirror {mirror} are referenced by the Packages index");
             return Ok(CleanupDone::tally(
                 mirror,
                 num_total_files,
@@ -1682,9 +1714,7 @@ async fn cleanup_mirror_flat_files(
                         }
                         Err(err) => {
                             metrics::DB_OPERATION_FAILED.increment();
-                            error!(
-                                "Error checking for flat-repo root `{seg}` mirror row:  {err}"
-                            );
+                            error!("Error checking for flat-repo root `{seg}` mirror row:  {err}");
                             Err(primary_status)
                         }
                     }
@@ -1774,6 +1804,9 @@ async fn cleanup_mirror_flat_files(
     }
 
     if cached_files.is_empty() {
+        debug!(
+            "All cached flat deb files for mirror {mirror} are referenced by the Packages index"
+        );
         return Ok(CleanupDone::tally(
             mirror,
             num_total_files,
