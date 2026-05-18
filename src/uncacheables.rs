@@ -14,10 +14,9 @@ pub(crate) fn record_uncacheable(host: &ClientHost, path: &str) {
     let uncacheables = &mut *UNCACHEABLES.write();
 
     // Remove and re-add existing entries to keep them recent.
-    if let Some((idx, (_h, _p))) = uncacheables
+    if let Some(idx) = uncacheables
         .iter()
-        .enumerate()
-        .find(|(_idx, (h, p))| *h == *host && *p == path)
+        .position(|(h, p)| h == host && p == path)
     {
         let entry = uncacheables.remove(idx).expect("entry exists");
         debug_assert_eq!(entry.0, *host, "host was used as lookup key");
