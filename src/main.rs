@@ -2318,7 +2318,9 @@ async fn serve_downloading_file(
 
                 // Either the state changed manually by the downloading task,
                 // or the downloading task just dropped the sender.
-                let _ignore = init_rx.changed().await;
+                if let Err(_err @ tokio::sync::watch::error::RecvError { .. }) =
+                    init_rx.changed().await
+                {}
                 init_waited = true;
             }
             ActiveDownloadStatus::Finished { path, meta } => {

@@ -1894,7 +1894,9 @@ async fn serve_unfinished_sendfile(
                             msg: "Download State Corrupted",
                         };
                     }
-                    let _ignore = init_rx.changed().await;
+                    if let Err(_err @ tokio::sync::watch::error::RecvError { .. }) =
+                        init_rx.changed().await
+                    {}
                     init_waited = true;
 
                     continue;
