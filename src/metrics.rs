@@ -36,16 +36,7 @@ impl Peak {
     }
 
     pub(crate) fn update(&self, value: u64) {
-        let mut current = self.0.load(Ordering::Relaxed);
-        while current < value {
-            match self
-                .0
-                .compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(val) => current = val,
-            }
-        }
+        self.0.fetch_max(value, Ordering::Relaxed);
     }
 
     #[must_use]
