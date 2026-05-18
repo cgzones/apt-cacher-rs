@@ -16,9 +16,8 @@ use sqlx::{
 use crate::{
     cache_layout::SUBDIR_FLAT,
     config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
-    deb_mirror,
-    deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
-    flat_blocklist, global_config,
+    deb_mirror::{self, Mirror, MirrorKind, mirror_cache_path_impl},
+    flat_blocklist, global_config, warn_once_or_info,
 };
 
 /// Resolve `host` through the configured aliases and return a reference to the
@@ -765,15 +764,31 @@ impl Database {
             .into_iter()
             .filter_map(|r| {
                 // Reconstruct DomainName via its parser so an Ipv4/Ipv6 row
-                // round-trips to the right enum variant. `cleanup_invalid_rows`
+                // round-trips to the right enum variant. cleanup_invalid_rows
                 // ran at startup and rejects exactly the same hosts (via
-                // `DomainName::new`) plus any out-of-range `kind` values, so
-                // both `?`s below are defense-in-depth — a hit here would mean
-                // an on-disk corruption that bypassed cleanup.
-                let host = DomainName::new(r.host).ok()?;
-                let kind = MirrorKind::from_db_int(r.kind)?;
+                // DomainName::new) plus any out-of-range kind values, so a
+                // hit on either guard below would mean on-disk corruption
+                // that bypassed cleanup.
+                let row_id = r.id;
+                let host = match DomainName::new(r.host) {
+                    Ok(h) => h,
+                    Err(invalid) => {
+                        warn_once_or_info!(
+                            "load_all_mirror_ids: dropping row id={row_id} with invalid host `{}`",
+                            invalid.escape_debug()
+                        );
+                        return None;
+                    }
+                };
+                let Some(kind) = MirrorKind::from_db_int(r.kind) else {
+                    warn_once_or_info!(
+                        "load_all_mirror_ids: dropping row id={row_id} with out-of-range kind value {}",
+                        r.kind
+                    );
+                    return None;
+                };
                 Some((
-                    r.id,
+                    row_id,
                     Mirror::new(ClientHost::from(host), NonZero::new(r.port), r.path, kind),
                 ))
             })
