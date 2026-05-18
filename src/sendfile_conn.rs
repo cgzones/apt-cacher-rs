@@ -1010,6 +1010,15 @@ async fn try_sendfile_request(
     ZeroCopyResult::NotApplicable("file not found in cache")
 }
 
+/// Range and status parameters for a successful conditional evaluation.
+struct ServeParams {
+    http_status: StatusCode,
+    content_start: u64,
+    content_length: u64,
+    content_range: Option<String>,
+    partial: bool,
+}
+
 /// Outcome of [`evaluate_conditional_and_range`].
 enum ConditionalOutcome {
     /// Caller should send a 304 Not Modified (already written to the stream).
@@ -1017,13 +1026,7 @@ enum ConditionalOutcome {
     /// Caller should send a 416 Range Not Satisfiable (already written to the stream).
     RangeNotSatisfiable(ConnectionAction),
     /// Proceed with serving the file using these range parameters.
-    Serve {
-        http_status: StatusCode,
-        content_start: u64,
-        content_length: u64,
-        content_range: Option<String>,
-        partial: bool,
-    },
+    Serve(ServeParams),
 }
 
 /// Raw Range / If-Range / conditional headers from a http client request.
@@ -1090,13 +1093,13 @@ async fn evaluate_conditional_and_range(
             cache_info.file_etag.as_deref(),
         ) {
             ParsedRange::Satisfiable(content_range, start, cl) => {
-                return Ok(ConditionalOutcome::Serve {
+                return Ok(ConditionalOutcome::Serve(ServeParams {
                     http_status: StatusCode::PARTIAL_CONTENT,
                     content_start: start,
                     content_length: cl,
                     content_range: Some(content_range),
                     partial: true,
-                });
+                }));
             }
             ParsedRange::NotSatisfiable => {
                 if let Err(err) =
@@ -1112,13 +1115,13 @@ async fn evaluate_conditional_and_range(
         }
     }
 
-    Ok(ConditionalOutcome::Serve {
+    Ok(ConditionalOutcome::Serve(ServeParams {
         http_status: StatusCode::OK,
         content_start: 0,
         content_length: file_size,
         content_range: None,
         partial: false,
-    })
+    }))
 }
 
 pub(crate) enum SendfileResult {
@@ -1185,43 +1188,36 @@ pub(crate) async fn serve_file_via_sendfile(
         CacheInfo::resolve(&file, file_path, &mdata, &key)
     };
 
-    let (http_status, content_start, content_length, content_range, partial) =
-        match evaluate_conditional_and_range(
-            stream,
-            &conn_details.client,
-            conn_version,
-            conn_action,
-            &cache_info,
-            file_size,
-            headers,
-        )
-        .await
-        {
-            Ok(ConditionalOutcome::NotModified(ca)) => {
-                info!(
-                    "Serving 304 Not Modified for cached file {} from mirror {}{aliased} for client {} via sendfile",
-                    conn_details.debname, conn_details.mirror, conn_details.client
-                );
-                return SendfileResult::Served(ca);
-            }
-            Ok(ConditionalOutcome::RangeNotSatisfiable(ca)) => {
-                return SendfileResult::Served(ca);
-            }
-            Ok(ConditionalOutcome::Serve {
-                http_status,
-                content_start,
-                content_length,
-                content_range,
-                partial,
-            }) => (
-                http_status,
-                content_start,
-                content_length,
-                content_range,
-                partial,
-            ),
-            Err(result) => return result,
-        };
+    let ServeParams {
+        http_status,
+        content_start,
+        content_length,
+        content_range,
+        partial,
+    } = match evaluate_conditional_and_range(
+        stream,
+        &conn_details.client,
+        conn_version,
+        conn_action,
+        &cache_info,
+        file_size,
+        headers,
+    )
+    .await
+    {
+        Ok(ConditionalOutcome::NotModified(ca)) => {
+            info!(
+                "Serving 304 Not Modified for cached file {} from mirror {}{aliased} for client {} via sendfile",
+                conn_details.debname, conn_details.mirror, conn_details.client
+            );
+            return SendfileResult::Served(ca);
+        }
+        Ok(ConditionalOutcome::RangeNotSatisfiable(ca)) => {
+            return SendfileResult::Served(ca);
+        }
+        Ok(ConditionalOutcome::Serve(params)) => params,
+        Err(result) => return result,
+    };
 
     debug!(
         "Serving cached file {} from mirror {}{aliased} for client {} via sendfile...",
@@ -2032,43 +2028,36 @@ async fn serve_unfinished_sendfile(
     let cache_info = CacheInfo::with_meta(&metadata, &status_meta);
 
     // Range handling uses the total upstream size (not the current partial size on disk).
-    let (http_status, content_start, content_length, content_range, partial) =
-        match evaluate_conditional_and_range(
-            stream,
-            &conn_details.client,
-            conn_version,
-            conn_action,
-            &cache_info,
-            exact_size.get(),
-            headers,
-        )
-        .await
-        {
-            Ok(ConditionalOutcome::NotModified(ca)) => {
-                info!(
-                    "Serving 304 Not Modified for downloading file {} from mirror {}{aliased} for joining client {} via sendfile",
-                    conn_details.debname, conn_details.mirror, conn_details.client
-                );
-                return ZeroCopyResult::Served(ca);
-            }
-            Ok(ConditionalOutcome::RangeNotSatisfiable(ca)) => {
-                return ZeroCopyResult::Served(ca);
-            }
-            Ok(ConditionalOutcome::Serve {
-                http_status,
-                content_start,
-                content_length,
-                content_range,
-                partial,
-            }) => (
-                http_status,
-                content_start,
-                content_length,
-                content_range,
-                partial,
-            ),
-            Err(result) => return result.into(),
-        };
+    let ServeParams {
+        http_status,
+        content_start,
+        content_length,
+        content_range,
+        partial,
+    } = match evaluate_conditional_and_range(
+        stream,
+        &conn_details.client,
+        conn_version,
+        conn_action,
+        &cache_info,
+        exact_size.get(),
+        headers,
+    )
+    .await
+    {
+        Ok(ConditionalOutcome::NotModified(ca)) => {
+            info!(
+                "Serving 304 Not Modified for downloading file {} from mirror {}{aliased} for joining client {} via sendfile",
+                conn_details.debname, conn_details.mirror, conn_details.client
+            );
+            return ZeroCopyResult::Served(ca);
+        }
+        Ok(ConditionalOutcome::RangeNotSatisfiable(ca)) => {
+            return ZeroCopyResult::Served(ca);
+        }
+        Ok(ConditionalOutcome::Serve(params)) => params,
+        Err(result) => return result.into(),
+    };
 
     info!(
         "Serving downloading file {} from mirror {}{aliased} for joining client {} via sendfile...",
