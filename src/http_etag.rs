@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use log::{info, warn};
+use log::warn;
 
 use crate::xattr_helpers;
 
@@ -76,7 +76,7 @@ pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<S
 /// Malformed values are skipped. Logs warnings on failure but never propagates errors.
 pub(crate) fn write_etag(file: &tokio::fs::File, display_path: &Path, etag: &str) {
     if !is_valid_etag(etag) {
-        info!(
+        warn!(
             "Skipping write of malformed ETag to `{}`: {}",
             display_path.display(),
             etag.escape_debug()
