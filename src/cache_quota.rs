@@ -98,8 +98,8 @@ impl CacheQuota {
         // Clamp to 10_000 (= 100.00 %) so over-quota states do not produce a
         // misleading sentinel; `quota` is NonZero so no div-by-zero.
         let bps = u128::from(current).saturating_mul(10_000) / std::num::NonZeroU128::from(quota);
-        let bps = usize::try_from(bps.min(10_000)).expect("10_000 fits in u64");
-        metrics::CACHE_QUOTA_UTIL_PEAK_BPS.update(bps as u64);
+        let bps = u64::try_from(bps.min(10_000)).expect("10_000 fits in u64");
+        metrics::CACHE_QUOTA_UTIL_PEAK_BPS.update(bps);
     }
 
     /// Atomically subtract `removed` bytes and reconcile against the actual
