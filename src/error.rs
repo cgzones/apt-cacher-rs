@@ -140,7 +140,7 @@ pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> 
         }
     }
 
-    let err = std::io::Error::from_raw_os_error(errno as i32);
+    let err = std::io::Error::from(errno);
     let kind = err.kind();
     std::io::Error::new(kind, ErrnoIoError { msg, source: err })
 }
