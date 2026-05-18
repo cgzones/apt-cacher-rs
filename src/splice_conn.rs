@@ -3175,7 +3175,7 @@ async fn standard_upstream_connect(
     Ok((up, resp, hdr_buf, hdr_end, label, poolable))
 }
 
-/// Follow a 301 redirect if the Location target is valid and allowed.
+/// Follow a 3xx redirect if the Location target is valid and allowed.
 ///
 /// On success, replaces the upstream connection, response, header buffer, and TLS label
 /// with those from the redirected request, and returns `Some(redirected_path)`.
@@ -3199,18 +3199,19 @@ async fn follow_redirect(
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
 ) -> Result<Option<String>, SpliceProxyError> {
+    let status = upstream_resp.status_code;
     let Some(location) = upstream_resp.location.as_deref() else {
         return Ok(None);
     };
     let Ok(moved_uri) = location.parse::<http::Uri>() else {
-        debug!("splice proxy: 301 with unparsable Location `{location}`, not following");
+        debug!("splice proxy: {status} with unparsable Location `{location}`, not following");
         return Ok(None);
     };
     if !moved_uri
         .scheme()
         .is_some_and(|s| *s == http::uri::Scheme::HTTP || *s == http::uri::Scheme::HTTPS)
     {
-        debug!("splice proxy: 301 redirect to non-HTTP scheme `{moved_uri}`, not following");
+        debug!("splice proxy: {status} redirect to non-HTTP scheme `{moved_uri}`, not following");
         return Ok(None);
     }
     let Some(moved_host) = moved_uri.host() else {
@@ -3218,13 +3219,13 @@ async fn follow_redirect(
     };
     if !is_host_allowed_cached(moved_host) {
         debug!(
-            "splice proxy: 301 redirect host `{moved_host}` not in allowed_mirrors, not following"
+            "splice proxy: {status} redirect host `{moved_host}` not in allowed_mirrors, not following"
         );
         return Ok(None);
     }
     let Ok(moved_domain) = ClientHost::new(moved_host.to_owned()) else {
         warn!(
-            "splice proxy: 301 redirect host `{moved_host}` is not a valid domain, not following"
+            "splice proxy: {status} redirect host `{moved_host}` is not a valid domain, not following"
         );
         return Ok(None);
     };
@@ -3248,13 +3249,13 @@ async fn follow_redirect(
         && moved_path == original_path
     {
         debug!(
-            "splice proxy: 301 redirect target `{moved_uri}` matches original request, not following"
+            "splice proxy: {status} redirect target `{moved_uri}` matches original request, not following"
         );
         return Ok(None);
     }
 
     debug!(
-        "splice proxy: following 301 redirect from {} to {moved_uri}",
+        "splice proxy: following {status} redirect from {} to {moved_uri}",
         conn_details.mirror
     );
 
@@ -4255,9 +4256,15 @@ async fn splice_proxy_drive(
         .await;
     }
 
-    // Handle 301 Moved Permanently: follow the redirect if the target host is allowed.
+    // Handle 3xx redirects (301/302/307/308): follow if the target host is allowed.
     // Only follows one redirect (no loops), matching hyper behavior.
-    let redirected_path_owned = if upstream_resp.status_code == 301 {
+    let redirected_path_owned = if matches!(
+        upstream_resp.status_code,
+        http::StatusCode::MOVED_PERMANENTLY
+            | http::StatusCode::FOUND
+            | http::StatusCode::TEMPORARY_REDIRECT
+            | http::StatusCode::PERMANENT_REDIRECT
+    ) {
         follow_redirect(
             &mut upstream_resp,
             &mut upstream,
