@@ -1116,7 +1116,7 @@ async fn cleanup_mirror_deb_files(
     // yet observed by the proxy (e.g. `apt update` run un-proxied), so a
     // grace period of `UNREFERENCED_KEEP_SPAN` keeps young files in place;
     // older unreferenced files are reaped.
-    let (aged_files, aged_bytes) = sweep_aged_cached_debs(
+    let swept = sweep_aged_cached_debs(
         &cached_files,
         UNREFERENCED_KEEP_SPAN,
         &mirror,
@@ -1125,15 +1125,16 @@ async fn cleanup_mirror_deb_files(
     .await;
 
     info!(
-        "Removed {aged_files} unreferenced deb files for mirror {mirror} ({})",
-        HumanFmt::Size(aged_bytes)
+        "Removed {} unreferenced deb files for mirror {mirror} ({})",
+        swept.files_removed,
+        HumanFmt::Size(swept.bytes_removed)
     );
 
     Ok(CleanupDone::tally(
         mirror,
         num_total_files,
-        mismatch_files + aged_files,
-        mismatch_bytes + aged_bytes,
+        mismatch_files + swept.files_removed,
+        mismatch_bytes + swept.bytes_removed,
     ))
 }
 
@@ -1343,6 +1344,12 @@ async fn scan_flat_cached_debs(
     Ok(ret)
 }
 
+/// Return value of [`sweep_aged_cached_debs`].
+struct SweepResult {
+    files_removed: u64,
+    bytes_removed: u64,
+}
+
 /// Remove cached deb files in `cached_files` that are older than `keep_span`,
 /// dropping any matching `cache_metadata` entries on success.
 ///
@@ -1355,7 +1362,7 @@ async fn sweep_aged_cached_debs(
     keep_span: Duration,
     mirror: &Mirror,
     layout: CacheLayout,
-) -> (u64, u64) {
+) -> SweepResult {
     let mut bytes_removed = 0u64;
     let mut files_removed = 0u64;
     let now = SystemTime::now();
@@ -1381,42 +1388,44 @@ async fn sweep_aged_cached_debs(
             }
         };
 
-        if let Some(data) = &data {
-            let created = match data.created() {
-                Ok(d) => d,
-                Err(created_err) => {
-                    info_once!(
-                        "Failed to get create timestamp for file `{}`:  {created_err}",
-                        path.display()
-                    );
-                    match data.modified() {
-                        Ok(d) => d,
-                        Err(modified_err) => {
-                            metrics::CACHE_IO_FAILURE.increment();
-                            error!(
-                                "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
-                                path.display()
-                            );
-                            continue;
-                        }
+        let Some(data) = data else {
+            continue;
+        };
+
+        let created = match data.created() {
+            Ok(d) => d,
+            Err(created_err) => {
+                info_once!(
+                    "Failed to get create timestamp for file `{}`:  {created_err}",
+                    path.display()
+                );
+                match data.modified() {
+                    Ok(d) => d,
+                    Err(modified_err) => {
+                        metrics::CACHE_IO_FAILURE.increment();
+                        error!(
+                            "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
+                            path.display()
+                        );
+                        continue;
                     }
                 }
-            };
-
-            if let Ok(existing_for) = now.duration_since(created)
-                && existing_for < keep_span
-            {
-                debug!(
-                    "Keeping cached file `{}` since it is too new ({}, threshold={})",
-                    path.display(),
-                    HumanFmt::Time(existing_for),
-                    HumanFmt::Time(keep_span)
-                );
-                continue;
             }
+        };
+
+        if let Ok(existing_for) = now.duration_since(created)
+            && existing_for < keep_span
+        {
+            debug!(
+                "Keeping cached file `{}` since it is too new ({}, threshold={})",
+                path.display(),
+                HumanFmt::Time(existing_for),
+                HumanFmt::Time(keep_span)
+            );
+            continue;
         }
 
-        let size = data.as_ref().map_or(0, std::fs::Metadata::len);
+        let size = data.len();
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
             metrics::CACHE_IO_FAILURE.increment();
@@ -1432,7 +1441,10 @@ async fn sweep_aged_cached_debs(
         files_removed += 1;
     }
 
-    (files_removed, bytes_removed)
+    SweepResult {
+        files_removed,
+        bytes_removed,
+    }
 }
 
 async fn cleanup_mirror_flat_files(
@@ -1639,7 +1651,7 @@ async fn cleanup_mirror_flat_files(
                         "Could not fetch flat Packages file for mirror {mirror} ({primary_status}{suffix}); falling back to {} time-based retention",
                         HumanFmt::Time(RETENTION_TIME),
                     );
-                    let (files_removed, bytes_removed) = sweep_aged_cached_debs(
+                    let swept = sweep_aged_cached_debs(
                         &cached_files,
                         RETENTION_TIME,
                         &mirror,
@@ -1647,14 +1659,15 @@ async fn cleanup_mirror_flat_files(
                     )
                     .await;
                     info!(
-                        "Removed {files_removed} aged flat deb files for mirror {mirror} ({})",
-                        HumanFmt::Size(bytes_removed)
+                        "Removed {} aged flat deb files for mirror {mirror} ({})",
+                        swept.files_removed,
+                        HumanFmt::Size(swept.bytes_removed)
                     );
                     return Ok(CleanupDone::tally(
                         mirror,
                         num_total_files,
-                        files_removed,
-                        bytes_removed,
+                        swept.files_removed,
+                        swept.bytes_removed,
                     ));
                 }
             }
@@ -1688,7 +1701,7 @@ async fn cleanup_mirror_flat_files(
         ));
     }
 
-    let (aged_files, aged_bytes) = sweep_aged_cached_debs(
+    let swept = sweep_aged_cached_debs(
         &cached_files,
         UNREFERENCED_KEEP_SPAN,
         &mirror,
@@ -1697,15 +1710,16 @@ async fn cleanup_mirror_flat_files(
     .await;
 
     info!(
-        "Removed {aged_files} unreferenced flat deb files for mirror {mirror} ({})",
-        HumanFmt::Size(aged_bytes)
+        "Removed {} unreferenced flat deb files for mirror {mirror} ({})",
+        swept.files_removed,
+        HumanFmt::Size(swept.bytes_removed)
     );
 
     Ok(CleanupDone::tally(
         mirror,
         num_total_files,
-        mismatch_files + aged_files,
-        mismatch_bytes + aged_bytes,
+        mismatch_files + swept.files_removed,
+        mismatch_bytes + swept.bytes_removed,
     ))
 }
 
