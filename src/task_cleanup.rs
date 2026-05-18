@@ -780,11 +780,9 @@ where
                 // Promote 404 to a more specific status (403/410) when one
                 // shows up later in the chain; otherwise stick with the
                 // first non-404 we saw.
-                let promote = match last_missing {
-                    None => true,
-                    Some(prev) => prev == StatusCode::NOT_FOUND && status != StatusCode::NOT_FOUND,
-                };
-                if promote {
+                if last_missing.is_none_or(|prev| {
+                    prev == StatusCode::NOT_FOUND && status != StatusCode::NOT_FOUND
+                }) {
                     last_missing = Some(status);
                 }
                 continue;
