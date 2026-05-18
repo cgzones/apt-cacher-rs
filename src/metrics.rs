@@ -109,11 +109,13 @@ pub(crate) static UPSTREAM_STATUS_4XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_5XX: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_OTHER: Counter = Counter::new();
 
-/// Selected upstream status codes tracked individually (200/301/302/304).
+/// Selected upstream status codes tracked individually (200/301/302/304/307/308).
 pub(crate) static UPSTREAM_STATUS_200: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_301: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_302: Counter = Counter::new();
 pub(crate) static UPSTREAM_STATUS_304: Counter = Counter::new();
+pub(crate) static UPSTREAM_STATUS_307: Counter = Counter::new();
+pub(crate) static UPSTREAM_STATUS_308: Counter = Counter::new();
 
 /// Client response class buckets (2xx/3xx/4xx/5xx/other).
 pub(crate) static CLIENT_STATUS_2XX: Counter = Counter::new();
@@ -621,6 +623,8 @@ pub(crate) fn record_upstream_status(status: StatusCode) {
         StatusCode::MOVED_PERMANENTLY => UPSTREAM_STATUS_301.increment(),
         StatusCode::FOUND => UPSTREAM_STATUS_302.increment(),
         StatusCode::NOT_MODIFIED => UPSTREAM_STATUS_304.increment(),
+        StatusCode::TEMPORARY_REDIRECT => UPSTREAM_STATUS_307.increment(),
+        StatusCode::PERMANENT_REDIRECT => UPSTREAM_STATUS_308.increment(),
         _ => {}
     }
 }

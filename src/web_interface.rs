@@ -1630,6 +1630,9 @@ fn build_metrics_html() -> String {
         let status_301 = metrics::UPSTREAM_STATUS_301.get();
         let status_302 = metrics::UPSTREAM_STATUS_302.get();
         let status_304 = metrics::UPSTREAM_STATUS_304.get();
+        let status_307 = metrics::UPSTREAM_STATUS_307.get();
+        let status_308 = metrics::UPSTREAM_STATUS_308.get();
+
         t.row_tip(
             "Upstream Status (2xx / 3xx / 4xx / 5xx / other)",
             "Response status classes received from upstream mirrors.",
@@ -1638,7 +1641,7 @@ fn build_metrics_html() -> String {
                 warn_if(status_2xx, status_2xx != status_200),
                 warn_if(
                     status_3xx,
-                    status_3xx != status_301 + status_302 + status_304
+                    status_3xx != status_301 + status_302 + status_304 + status_307 + status_308
                 ),
                 metrics::UPSTREAM_STATUS_4XX.get(),
                 WarnNonzero(metrics::UPSTREAM_STATUS_5XX.get()),
@@ -1646,9 +1649,9 @@ fn build_metrics_html() -> String {
             ),
         );
         t.row_tip(
-            "Upstream 200 OK / 301 Moved Permanently / 302 Found / 304 Not Modified",
+            "Upstream 200 OK / 301 Moved Permanently / 302 Found / 304 Not Modified / 307 Temporary Redirect / 308 Permanent Redirect",
             "Selected response status codes received from upstream mirrors.",
-            format_args!("{status_200} / {status_301} / {status_302} / {status_304}"),
+            format_args!("{status_200} / {status_301} / {status_302} / {status_304} / {status_307} / {status_308}"),
         );
     }
     t.row_tip(
