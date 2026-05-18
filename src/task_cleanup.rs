@@ -1,5 +1,6 @@
 use std::{
     io::ErrorKind,
+    num::NonZero,
     os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     sync::{
@@ -16,7 +17,7 @@ use http_body_util::{BodyExt as _, Empty};
 use hyper::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
 use log::{debug, error, info, trace, warn};
 use memfd::MemfdOptions;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufWriter};
+use tokio::io::{AsyncBufRead, BufWriter};
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{
@@ -34,7 +35,13 @@ use crate::{
     },
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
-    info_once, metrics, process_cache_request, task_cache_scan,
+    index_parser::{HashAlgo, Stanza, hash_open_file, hex_encode, structured_lookup_key},
+    info_once,
+    limits::{
+        CappedLine, LimitedReader, MAX_DECOMPRESSED_PACKAGES_SIZE, MAX_DECOMPRESSION_RATIO,
+        MAX_METADATA_LINE_LEN, read_line_capped,
+    },
+    metrics, process_cache_request, task_cache_scan,
     utils::probe_dir,
 };
 
@@ -200,113 +207,6 @@ async fn scan_cached_files(host_path: &Path) -> Result<HashMap<String, PathBuf>,
     Ok(ret)
 }
 
-/// Extract the `Filename:` field's relative-path value from a Debian
-/// `Packages` stanza line.  Returns the path verbatim (e.g.
-/// `pool/main/a/abc/abc_1.0_amd64.deb` for a structured archive, or
-/// `amd64/twilio_5.0.0_amd64.deb` for a flat repo with a sub-arch layout).
-///
-/// **Security**: rejects empty values, absolute paths, NUL bytes, backslash,
-/// and any segment equal to `..` or `.`.  An attacker-controlled upstream
-/// Packages stanza could otherwise inject a traversal sequence; rejecting
-/// here keeps the downstream `HashMap` key honest even if a later refactor
-/// joins it to a filesystem path.
-fn parse_filename_field(line: &str) -> Option<&str> {
-    let line = line.trim();
-    let filepath = line.strip_prefix("Filename: ")?.trim_start();
-    if !is_safe_filename_relpath(filepath) {
-        return None;
-    }
-    Some(filepath)
-}
-
-/// `true` iff `s` is a safe relative path: non-empty, no leading `/`, no
-/// backslash, no ASCII control character (`< 0x20`, plus `0x7f` DEL), and
-/// every `/`-separated segment is non-empty and not `.` or `..`.
-fn is_safe_filename_relpath(s: &str) -> bool {
-    if s.is_empty() || s.starts_with('/') {
-        return false;
-    }
-    if s.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'\\') {
-        return false;
-    }
-    s.split('/')
-        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
-}
-
-/// Derive the on-disk cache key for a structured-pool entry.  Structured
-/// pool URLs flatten the long `pool/main/<l>/<pkg>/` URL path to just the
-/// `.deb` basename on disk, so cleanup matches `Filename:` stanzas by the
-/// basename portion only.  Borrows from `relpath` to avoid allocating a
-/// fresh `String` per matched stanza.
-fn structured_lookup_key(relpath: &str) -> Option<&str> {
-    Path::new(relpath).file_name().and_then(|n| n.to_str())
-}
-
-/// Decode `hex` into exactly `N` bytes. Returns `None` on wrong length or any
-/// non-hexadecimal byte. Accepts upper- and lower-case (Debian uses lowercase
-/// but real-world Packages indices have occasionally mixed case).
-fn hex_decode_exact<const N: usize>(hex: &str) -> Option<[u8; N]> {
-    if hex.len() != N * 2 {
-        return None;
-    }
-    let bytes = hex.as_bytes();
-    let mut out = [0u8; N];
-    let mut i = 0;
-    while i < N {
-        let hi = hex_digit(bytes[2 * i])?;
-        let lo = hex_digit(bytes[2 * i + 1])?;
-        out[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    Some(out)
-}
-
-const fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Parse a Packages stanza line of the form `"<prefix><hex>"` into a fixed-size
-/// byte array. Returns `None` if the line does not carry the expected prefix
-/// or the hex payload is malformed.
-fn parse_hex_field<const N: usize>(line: &str, prefix: &str) -> Option<[u8; N]> {
-    let rest = line.trim().strip_prefix(prefix)?.trim_start();
-    hex_decode_exact::<N>(rest)
-}
-
-/// Lowercase-hex encoding suitable for log messages.
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from(HEX[(*b >> 4) as usize]));
-        out.push(char::from(HEX[(*b & 0x0f) as usize]));
-    }
-    out
-}
-
-/// Hash algorithm we accept from Debian `Packages` stanzas. SHA256 is the
-/// universal default in modern indices; SHA512 is used as a fallback when
-/// SHA256 is missing.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum HashAlgo {
-    Sha256,
-    Sha512,
-}
-
-impl HashAlgo {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sha256 => "SHA256",
-            Self::Sha512 => "SHA512",
-        }
-    }
-}
-
 /// Outcome of verifying a cache file against an expected digest.
 #[derive(Debug)]
 enum Verdict {
@@ -338,90 +238,6 @@ struct ReduceContext<'a> {
     /// to match the basename-keyed `cached_files`). Filenames that don't
     /// start with the prefix belong to a sibling subtree and are ignored.
     flat_lookup_prefix: &'a str,
-}
-
-/// Accumulated state of the current Debian `Packages` stanza.
-#[derive(Debug)]
-struct Stanza {
-    /// Full relative-path value from the `Filename:` field, validated by
-    /// [`is_safe_filename_relpath`].  Structured cleanup derives the on-
-    /// disk lookup key from this via [`structured_lookup_key`]; flat
-    /// cleanup uses it verbatim.
-    filename: Option<String>,
-    sha256: Option<[u8; 32]>,
-    sha512: Option<[u8; 64]>,
-}
-
-impl Stanza {
-    const fn new() -> Self {
-        Self {
-            filename: None,
-            sha256: None,
-            sha512: None,
-        }
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.filename.is_none() && self.sha256.is_none() && self.sha512.is_none()
-    }
-
-    fn reset(&mut self) {
-        self.filename = None;
-        self.sha256 = None;
-        self.sha512 = None;
-    }
-
-    fn ingest(&mut self, line: &str) {
-        if self.filename.is_none()
-            && let Some(name) = parse_filename_field(line)
-        {
-            self.filename = Some(name.to_owned());
-            return;
-        }
-        if self.sha256.is_none()
-            && let Some(h) = parse_hex_field::<32>(line, "SHA256: ")
-        {
-            self.sha256 = Some(h);
-            return;
-        }
-        if self.sha512.is_none()
-            && let Some(h) = parse_hex_field::<64>(line, "SHA512: ")
-        {
-            self.sha512 = Some(h);
-        }
-    }
-
-    /// Preferred (algo, expected-digest) pair: SHA256 wins, SHA512 is the
-    /// fallback, `None` means the stanza advertised no usable checksum.
-    /// Returns a borrow into the stanza so a hot Packages scan does not
-    /// allocate a fresh `Vec<u8>` per matched stanza.
-    fn chosen(&self) -> Option<(HashAlgo, &[u8])> {
-        if let Some(h) = self.sha256.as_ref() {
-            Some((HashAlgo::Sha256, h.as_slice()))
-        } else {
-            self.sha512
-                .as_ref()
-                .map(|h| (HashAlgo::Sha512, h.as_slice()))
-        }
-    }
-}
-
-/// Hash the contents of an open file using the given digest algorithm.
-/// Synchronous code, blocking the current thread.
-fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-
-    let mut hasher = D::new();
-    #[expect(clippy::large_stack_arrays, reason = "ensure efficient file hashing")]
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().to_vec())
 }
 
 /// Blocking digest-and-compare with an inode/size race check after hashing.
@@ -635,6 +451,14 @@ async fn process_stanza(
     }
 }
 
+/// Compute the effective decompressed-output ceiling for a `Packages` file of
+/// `compressed_size` bytes: the smaller of the absolute cap and the
+/// compression-ratio cap.
+#[must_use]
+fn decompressed_limit(compressed_size: NonZero<u64>) -> NonZero<u64> {
+    MAX_DECOMPRESSED_PACKAGES_SIZE.min(compressed_size.saturating_mul(MAX_DECOMPRESSION_RATIO))
+}
+
 #[derive(Clone, Copy)]
 enum PackageFormat {
     Raw,
@@ -667,28 +491,75 @@ impl PackageFormat {
 
         let buffer_size = config.buffer_size;
 
-        let mut file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
+        let mdata = match file.metadata().await {
+            Ok(m) => m,
+            Err(err) => {
+                error!(
+                    "Failed to stat Packages file `{filename}` for decompression-ratio guard:  {err}"
+                );
+                return Err(ProxyCacheError::Io(err));
+            }
+        };
+
+        let Some(compressed_size) = NonZero::new(mdata.len()) else {
+            return match self {
+                // A raw Packages file with zero stanzas is legal (e.g.
+                // a freshly-created component with no published debs); the
+                // read loop would hit EOF immediately and treat
+                // file_list as the empty reference set, which is the
+                // correct cleanup behaviour. Avoid turning that into a
+                // mirror-cleanup failure.
+                Self::Raw => Ok(()),
+                // For compressed formats an empty file is malformed:
+                // both gzip and xz require at least a header.
+                Self::Gz | Self::Xz => {
+                    warn!("Packages file `{filename}` has zero size");
+                    Err(ProxyCacheError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "zero size",
+                    )))
+                }
+            };
+        };
+
+        let decompressed_limit = decompressed_limit(compressed_size);
 
         let reader: &mut (dyn AsyncBufRead + Unpin + Send) = match self {
-            Self::Raw => &mut file_reader,
-            Self::Gz => {
-                let decoder = async_compression::tokio::bufread::GzipDecoder::new(file_reader);
+            Self::Raw => {
+                let limited = LimitedReader::new(file, decompressed_limit);
 
-                &mut tokio::io::BufReader::with_capacity(buffer_size, decoder)
+                &mut tokio::io::BufReader::with_capacity(buffer_size, limited)
+            }
+            Self::Gz => {
+                let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
+                let decoder = async_compression::tokio::bufread::GzipDecoder::new(file_reader);
+                let limited = LimitedReader::new(decoder, decompressed_limit);
+
+                &mut tokio::io::BufReader::with_capacity(buffer_size, limited)
             }
             Self::Xz => {
+                let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
                 let decoder = async_compression::tokio::bufread::XzDecoder::new(file_reader);
+                let limited = LimitedReader::new(decoder, decompressed_limit);
 
-                &mut tokio::io::BufReader::with_capacity(buffer_size, decoder)
+                &mut tokio::io::BufReader::with_capacity(buffer_size, limited)
             }
         };
 
         let mut buffer = String::with_capacity(128);
+        let mut line_buf: Vec<u8> = Vec::with_capacity(128);
         let mut stanza = Stanza::new();
         loop {
             buffer.clear();
-            match reader.read_line(&mut buffer).await {
-                Ok(0) => {
+            match read_line_capped(
+                &mut *reader,
+                &mut buffer,
+                &mut line_buf,
+                MAX_METADATA_LINE_LEN,
+            )
+            .await
+            {
+                Ok(CappedLine::Eof) => {
                     // Flush the final stanza if the Packages file doesn't end
                     // with a blank line.
                     if !stanza.is_empty() {
@@ -697,10 +568,20 @@ impl PackageFormat {
                     return Ok(());
                 }
                 Err(err) => {
-                    error!("Failed to read in-memory file `{filename}`:  {err}");
+                    error!(
+                        "Failed to read Packages file `{filename}` (may exceed size limit):  {err}"
+                    );
                     return Err(err.into());
                 }
-                Ok(_bytes_read) => {
+                Ok(CappedLine::Skipped) => {
+                    // A line longer than MAX_METADATA_LINE_LEN can't be one
+                    // of the fields the stanza parser cares about (Filename,
+                    // SHA256, SHA512 are all well under the cap); some
+                    // packages legitimately ship multi-kilobyte `Provides:`
+                    // or `Depends:` fields. Treat it as a non-blank line so
+                    // the stanza isn't flushed prematurely.
+                }
+                Ok(CappedLine::Line { .. }) => {
                     if buffer.trim().is_empty() {
                         flush_stanza(&mut stanza, file_list, ctx).await;
                         if file_list.is_empty() {
@@ -2229,6 +2110,11 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
 mod tests {
     use super::*;
 
+    use crate::{
+        index_parser::{hex_decode_exact, parse_filename_field, parse_hex_field},
+        nonzero,
+    };
+
     fn sorted(paths: &[&'static str]) -> Vec<&'static str> {
         let mut v = paths.to_vec();
         v.sort_unstable();
@@ -2424,13 +2310,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_hex_field_sha256() {
-        let hash = [0x11u8; 32];
-        let line = format!("SHA256: {}\n", hex_encode(&hash));
-        assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), Some(hash));
-    }
-
-    #[test]
     fn parse_hex_field_sha512() {
         let hash = [0x22u8; 64];
         let line = format!("SHA512:  {}\r\n", hex_encode(&hash));
@@ -2449,29 +2328,6 @@ mod tests {
         let payload = "0".repeat(63);
         let line = format!("SHA256: {payload}\n");
         assert_eq!(parse_hex_field::<32>(&line, "SHA256: "), None);
-    }
-
-    #[test]
-    fn stanza_ingest_collects_filename_and_sha256() {
-        let mut s = Stanza::new();
-        s.ingest("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n");
-        s.ingest(&format!("SHA256: {}\n", hex_encode(&[0xab; 32])));
-        assert_eq!(
-            s.filename.as_deref(),
-            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
-        );
-        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0xab; 32].as_slice())));
-    }
-
-    #[test]
-    fn stanza_chosen_prefers_sha256_over_sha512() {
-        let mut s = Stanza::new();
-        s.sha256 = Some([0x11u8; 32]);
-        s.sha512 = Some([0x22u8; 64]);
-        assert_eq!(
-            s.chosen(),
-            Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
-        );
     }
 
     #[test]
@@ -2604,5 +2460,200 @@ mod tests {
             verify_file_sync(&missing, HashAlgo::Sha256, &[0u8; 32]),
             Verdict::IoError(_)
         ));
+    }
+
+    #[test]
+    fn decompressed_limit_ratio_caps_small_input() {
+        // A tiny compressed file: the ratio cap (size * MAX_DECOMPRESSION_RATIO) dominates.
+        assert_eq!(
+            decompressed_limit(nonzero!(1000)),
+            MAX_DECOMPRESSION_RATIO.checked_mul(nonzero!(1000)).unwrap()
+        );
+    }
+
+    #[test]
+    fn decompressed_limit_absolute_caps_large_input() {
+        // A huge compressed file: the absolute cap dominates.
+        assert_eq!(
+            decompressed_limit(nonzero!(u64::MAX)),
+            MAX_DECOMPRESSED_PACKAGES_SIZE
+        );
+    }
+
+    #[tokio::test]
+    async fn reduce_file_list_rejects_decompression_bomb() {
+        use std::num::NonZero;
+
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt as _;
+
+        use crate::config::ClientHost;
+
+        // 4 MiB of newlines compresses to a few KiB -- a ratio far above the cap.
+        let raw = vec![b'\n'; 4 * 1024 * 1024];
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder.write_all(&raw).await.expect("gzip write");
+        encoder.shutdown().await.expect("gzip finish");
+        let compressed = encoder.into_inner();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Packages.gz");
+        tokio::fs::write(&path, &compressed)
+            .await
+            .expect("write fixture");
+        let file = tokio::fs::File::open(&path).await.expect("open fixture");
+
+        let config: crate::config::Config = toml::from_str("").expect("default config");
+        // Mirror the EXACT Mirror / ReduceContext construction used by the
+        // existing process_stanza_flat_prefix_strips_in_subtree_and_drops_siblings
+        // test in this module.
+        let mirror = Mirror::new(
+            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            None::<NonZero<u16>>,
+            "apt/amd64".to_owned(),
+            MirrorKind::Flat,
+        );
+        // A non-matching entry keeps `file_list` non-empty so the reducer
+        // streams the whole (bomb) input instead of early-returning.
+        let mut file_list: HashMap<String, PathBuf> = HashMap::new();
+        file_list.insert("never-matched.deb".to_owned(), PathBuf::from("/tmp/x.deb"));
+        let mut mismatch_files = 0u64;
+        let mut mismatch_bytes = 0u64;
+        let mut ctx = ReduceContext {
+            mirror: &mirror,
+            layout: CacheLayout::Flat,
+            mismatch_files: &mut mismatch_files,
+            mismatch_bytes: &mut mismatch_bytes,
+            flat_lookup_prefix: "amd64/",
+        };
+
+        let result = PackageFormat::Gz
+            .reduce_file_list(file, "Packages.gz", &mut file_list, &mut ctx, &config)
+            .await;
+        assert!(
+            result.is_err(),
+            "a decompression bomb must abort reduce_file_list"
+        );
+    }
+
+    #[tokio::test]
+    async fn reduce_file_list_skips_overlong_line_and_keeps_parsing() {
+        use std::num::NonZero;
+
+        use sha2::{Digest as _, Sha256};
+
+        use crate::config::ClientHost;
+        use crate::index_parser::hex_encode;
+
+        // Pre-compute SHA256(b"payload") so the stanza yields a `Match`
+        // verdict — the `Mismatch` path would call into the cache_metadata
+        // singleton which isn't initialized under `cargo test`.
+        let deb_body: &[u8] = b"payload";
+        let deb_hash: [u8; 32] = Sha256::digest(deb_body).into();
+
+        // Build a stanza whose `Provides:` field is far longer than the
+        // per-line cap (mirroring the real `experimental_main` layout where
+        // packages like `librust-ruma` carry ~19 KiB Provides lists) — the
+        // parser must skip the line and still extract Filename+SHA256.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"Package: dummy\n");
+        raw.extend_from_slice(b"Filename: pool/d/dummy/dummy_1.0_amd64.deb\n");
+        raw.extend_from_slice(b"Provides: ");
+        raw.resize(raw.len() + MAX_METADATA_LINE_LEN + 1024, b'a');
+        raw.push(b'\n');
+        let sha_line = format!("SHA256: {}\n", hex_encode(&deb_hash));
+        raw.extend_from_slice(sha_line.as_bytes());
+        raw.extend_from_slice(b"\n");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Packages");
+        tokio::fs::write(&path, &raw).await.expect("write fixture");
+        let file = tokio::fs::File::open(&path).await.expect("open fixture");
+
+        let config: crate::config::Config = toml::from_str("").expect("default config");
+        let mirror = Mirror::new(
+            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            None::<NonZero<u16>>,
+            "debian".to_owned(),
+            MirrorKind::Structured,
+        );
+        // `dummy_1.0_amd64.deb` is the structured-lookup-key (basename) of
+        // the Filename: above; reaching `flush_stanza` with the stanza
+        // intact removes the entry from the candidate list, proving the
+        // parser kept its place through the oversize line.
+        let mut file_list: HashMap<String, PathBuf> = HashMap::new();
+        let deb_path = dir.path().join("dummy_1.0_amd64.deb");
+        tokio::fs::write(&deb_path, deb_body)
+            .await
+            .expect("write deb");
+        file_list.insert("dummy_1.0_amd64.deb".to_owned(), deb_path);
+        file_list.insert("keep-me.deb".to_owned(), PathBuf::from("/tmp/keep.deb"));
+        let mut mismatch_files = 0u64;
+        let mut mismatch_bytes = 0u64;
+        let mut ctx = ReduceContext {
+            mirror: &mirror,
+            layout: CacheLayout::StructuredPool,
+            mismatch_files: &mut mismatch_files,
+            mismatch_bytes: &mut mismatch_bytes,
+            flat_lookup_prefix: "",
+        };
+
+        PackageFormat::Raw
+            .reduce_file_list(file, "Packages", &mut file_list, &mut ctx, &config)
+            .await
+            .expect("oversize lines must be skipped, not aborted");
+
+        assert!(
+            !file_list.contains_key("dummy_1.0_amd64.deb"),
+            "matching stanza after a skipped line must still remove the file"
+        );
+        assert!(
+            file_list.contains_key("keep-me.deb"),
+            "unrelated entries must be left in place"
+        );
+    }
+
+    /// A zero-length raw `Packages` file is a valid empty stanza set
+    /// (e.g. a freshly-created component with no published debs) and
+    /// must not abort the per-mirror cleanup.
+    #[tokio::test]
+    async fn reduce_file_list_accepts_empty_raw_packages() {
+        use std::num::NonZero;
+
+        use crate::config::ClientHost;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Packages");
+        tokio::fs::write(&path, b"").await.expect("write empty");
+        let file = tokio::fs::File::open(&path).await.expect("open empty");
+
+        let config: crate::config::Config = toml::from_str("").expect("default config");
+        let mirror = Mirror::new(
+            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            None::<NonZero<u16>>,
+            "debian".to_owned(),
+            MirrorKind::Structured,
+        );
+        let mut file_list: HashMap<String, PathBuf> = HashMap::new();
+        file_list.insert("keep-me.deb".to_owned(), PathBuf::from("/tmp/keep.deb"));
+        let mut mismatch_files = 0u64;
+        let mut mismatch_bytes = 0u64;
+        let mut ctx = ReduceContext {
+            mirror: &mirror,
+            layout: CacheLayout::StructuredPool,
+            mismatch_files: &mut mismatch_files,
+            mismatch_bytes: &mut mismatch_bytes,
+            flat_lookup_prefix: "",
+        };
+
+        PackageFormat::Raw
+            .reduce_file_list(file, "Packages", &mut file_list, &mut ctx, &config)
+            .await
+            .expect("an empty raw Packages file must be treated as zero stanzas");
+
+        assert!(
+            file_list.contains_key("keep-me.deb"),
+            "empty Packages must leave the candidate list untouched"
+        );
     }
 }

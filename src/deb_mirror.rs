@@ -382,6 +382,13 @@ pub(crate) enum ResourceFile<'a> {
     },
 }
 
+/// Defensive cap on the normalised output size. A URI longer than this is
+/// already rejected upstream by the request-line size limit
+/// (`sendfile_conn::MAX_HEADER_SIZE` = 8 KiB on the sendfile path, hyper's
+/// default header limits on the rustls path); this is belt-and-suspenders
+/// against any code path that could reach here without that bound.
+pub(crate) const MAX_NORMALIZED_PATH_LEN: usize = 16 * 1024;
+
 /// Collapse runs of consecutive ASCII forward-slashes in a URL path to a
 /// single `/`.
 ///
@@ -394,9 +401,22 @@ pub(crate) enum ResourceFile<'a> {
 /// verbatim; later percent-decoding and non-ASCII rejection in
 /// `decode_validate` / `is_unsafe_proxy_path` get the original byte
 /// sequence.
+///
+/// Inputs longer than [`MAX_NORMALIZED_PATH_LEN`] are returned verbatim as
+/// `Cow::Borrowed`.  Truncating the output would create a validator-bypass
+/// primitive: a trailing `..` segment that the cap silently elides would
+/// allow `is_unsafe_proxy_path` to score the input safe.  Passing the
+/// oversize input through unchanged lets the downstream parser reject it.
 #[must_use]
 pub(crate) fn normalize_uri_path(path: &str) -> Cow<'_, str> {
     if !path.contains("//") {
+        return Cow::Borrowed(path);
+    }
+    // Fast path bailed; the input contains at least one `//` run. Cap the
+    // allocation at MAX_NORMALIZED_PATH_LEN to bound work; over-cap inputs
+    // bail unchanged rather than risk truncating away a `..` traversal
+    // segment.
+    if path.len() > MAX_NORMALIZED_PATH_LEN {
         return Cow::Borrowed(path);
     }
     let mut out = String::with_capacity(path.len());
@@ -712,7 +732,7 @@ fn contains_translation_diff(uri_path: &str) -> bool {
         if let Some(diff_idx) = rest.find(SUFFIX) {
             let lang = rest.split_at(diff_idx).0;
             // Language tags in Debian translations are of the form `en`, `de`,
-            // `zh_CN`, `pt_BR` — alphanumeric with optional underscore.  Reject
+            // `zh_CN`, `pt_BR` - alphanumeric with optional underscore.  Reject
             // arbitrary separator runs (e.g. `---`) that the previous matcher
             // accepted.
             if !lang.is_empty() && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -1937,5 +1957,84 @@ mod tests {
                 filename: "Translation-en",
             })
         );
+    }
+
+    #[test]
+    fn valid_mirrorname_rejects_name_over_length_cap() {
+        let oversized = "x".repeat(MAX_SEGMENT_LEN + 1);
+        assert!(!valid_mirrorname(&oversized));
+    }
+
+    #[test]
+    fn valid_mirrorname_accepts_name_at_length_cap() {
+        let at_cap = "x".repeat(MAX_SEGMENT_LEN);
+        assert!(valid_mirrorname(&at_cap));
+    }
+
+    #[test]
+    fn valid_mirrorname_rejects_segment_count_over_cap() {
+        let over_count = std::iter::repeat_n("x", MAX_MIRROR_PATH_SEGMENTS + 1)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(!valid_mirrorname(&over_count));
+    }
+
+    #[test]
+    fn valid_mirrorname_accepts_segment_count_at_cap() {
+        let at_count = std::iter::repeat_n("x", MAX_MIRROR_PATH_SEGMENTS)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(valid_mirrorname(&at_count));
+    }
+
+    #[test]
+    fn valid_mirrorname_rejects_traversal_segments() {
+        assert!(!valid_mirrorname("debian/../etc"));
+        assert!(!valid_mirrorname("./debian"));
+    }
+
+    #[test]
+    fn is_flat_deb_filename_strict_shape() {
+        assert!(is_flat_deb_filename("abc_1.0_amd64.deb"));
+        assert!(!is_flat_deb_filename("abc_1.0.deb")); // missing arch
+        assert!(!is_flat_deb_filename("abc.deb")); // missing version+arch
+        assert!(!is_flat_deb_filename("_1.0_amd64.deb")); // empty name
+    }
+
+    #[test]
+    fn parse_request_path_rejects_traversal_after_normalize() {
+        // Even with `//` collapsed, traversal segments still get caught.
+        assert!(parse_request_path("debian/dists/../passwd").is_none());
+    }
+
+    #[test]
+    fn parse_request_path_handles_double_slash() {
+        let raw = "debian//dists/sid/InRelease";
+        let normalized = normalize_uri_path(raw);
+        assert!(matches!(normalized, Cow::Owned(_)));
+        let parsed = parse_request_path(&normalized);
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn normalize_uri_path_oversized_bails_safely() {
+        // Build an input longer than MAX_NORMALIZED_PATH_LEN containing a `//`
+        // run - would normally take the slow path, but oversize triggers the
+        // bailout.
+        let huge = format!("/{}/", "a/".repeat(MAX_NORMALIZED_PATH_LEN));
+        let normalized = normalize_uri_path(&huge);
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+        assert_eq!(normalized.as_ref(), huge.as_str());
+    }
+
+    #[test]
+    fn normalize_uri_path_at_cap_normalizes() {
+        let at_cap = format!("/{}/", "a/".repeat(MAX_NORMALIZED_PATH_LEN / 3));
+        assert!(at_cap.len() <= MAX_NORMALIZED_PATH_LEN);
+        let normalized = normalize_uri_path(&at_cap);
+        assert!(matches!(normalized, Cow::Owned(_)));
+        if at_cap.contains("//") {
+            assert!(!normalized.contains("//"));
+        }
     }
 }

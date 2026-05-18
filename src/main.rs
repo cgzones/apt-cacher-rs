@@ -32,10 +32,12 @@ mod http_helpers;
 mod http_last_modified;
 mod http_range;
 mod humanfmt;
+mod index_parser;
 #[cfg(feature = "ktls")]
 mod ktls;
 #[cfg(feature = "ktls")]
 mod ktls_handshake;
+mod limits;
 mod log_once;
 mod logstore;
 mod metrics;
@@ -177,6 +179,7 @@ use crate::http_last_modified::write_last_modified;
 use crate::http_range::HttpDate;
 use crate::http_range::format_http_date;
 use crate::humanfmt::HumanFmt;
+use crate::limits::MAX_AUTHORITY_LEN;
 use crate::logstore::LogStore;
 use crate::permitted_host_cache::authorize_cache_access;
 use crate::permitted_host_cache::is_host_allowed_cached;
@@ -3681,6 +3684,19 @@ fn connect_response(
      * `on_upgrade` future.
      */
 
+    // Bound the authority length before any further work. hyper already
+    // bounds the request line, but defending here keeps the CONNECT path
+    // self-contained against any future relaxation of those limits.
+    if let Some(auth) = req.uri().authority()
+        && auth.as_str().len() > MAX_AUTHORITY_LEN
+    {
+        warn_once_or_info!(
+            "Oversized CONNECT authority from client {client}: {} bytes",
+            auth.as_str().len()
+        );
+        return quick_response(StatusCode::BAD_REQUEST, "Invalid CONNECT address");
+    }
+
     let Some((host, port)) = req.uri().authority().and_then(|a| {
         a.port_u16()
             .and_then(NonZero::new)
@@ -5192,6 +5208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         timeout_connector.set_write_timeout(http_timeout);
 
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .http1_max_headers(limits::MAX_UPSTREAM_HEADERS)
             .build(timeout_connector)
     };
 

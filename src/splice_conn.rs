@@ -25,6 +25,8 @@ use tokio::{
     net::{TcpStream, unix::pipe},
 };
 
+use crate::cache_layout;
+use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_quota::QuotaExceeded;
 use crate::config::{ClientHost, HttpsUpgradeMode};
 use crate::database_task::{
@@ -47,6 +49,7 @@ use crate::humanfmt::HumanFmt;
 use crate::ktls;
 #[cfg(feature = "ktls")]
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
+use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;
@@ -55,13 +58,11 @@ use crate::sendfile_conn::{
     SendfileResult, async_sendfile, async_sendfile_unfinished, serve_file_via_sendfile,
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
-use crate::{cache_layout, xattr_helpers};
-
-use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{
     self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_tempfile, touch_volatile_mtime,
 };
+use crate::xattr_helpers;
 use crate::{
     APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, ContentLength, Never,
     OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
@@ -108,12 +109,6 @@ const POOL_IDLE_TIMEOUT: coarsetime::Duration = coarsetime::Duration::from_secs(
 
 /// Maximum number of idle connections kept per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 4;
-
-/// Maximum size for HTTP response headers buffer.
-const MAX_RESPONSE_HEADER_SIZE: usize = 8192;
-
-/// Maximum number of HTTP response headers to parse.
-const MAX_RESPONSE_HEADERS: usize = 32;
 
 /// Buffer size for TLS upstream reads (matches pipe buffer size).
 const TLS_READ_BUF_SIZE: usize = 64 * 1024;
@@ -1247,7 +1242,7 @@ async fn unbuffered_ktls_request(
     }
 
     // --- Phase 3 of 5: Read Response Headers ---
-    let mut header_buf = BytesMut::with_capacity(MAX_RESPONSE_HEADER_SIZE);
+    let mut header_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let mut extra_body = Vec::new();
     let mut header_end = 0usize;
     let mut headers_complete = false;
@@ -1318,11 +1313,11 @@ async fn unbuffered_ktls_request(
                     }
                     // Next search can skip bytes we've already checked
                     header_search_offset = header_buf.len().saturating_sub(3);
-                    if header_buf.len() > MAX_RESPONSE_HEADER_SIZE {
+                    if header_buf.len() > MAX_UPSTREAM_HEADER_SIZE {
                         warn_once_or_info!(
                             "splice proxy: upstream response header size of {} bytes exceeds {} bytes",
                             header_buf.len(),
-                            MAX_RESPONSE_HEADER_SIZE
+                            MAX_UPSTREAM_HEADER_SIZE
                         );
                         return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
                             ErrorKind::InvalidData,
@@ -1744,11 +1739,11 @@ async fn read_upstream_response_headers(
         }
         search_offset = buf.len();
 
-        if buf.len() > MAX_RESPONSE_HEADER_SIZE {
+        if buf.len() > MAX_UPSTREAM_HEADER_SIZE {
             warn_once_or_info!(
                 "splice proxy: upstream response header size of {} bytes exceeds {} bytes",
                 buf.len(),
-                MAX_RESPONSE_HEADER_SIZE
+                MAX_UPSTREAM_HEADER_SIZE
             );
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
@@ -1779,7 +1774,7 @@ struct UpstreamResponse {
 /// away in favor of a standard-path reconnect (`ResponseNotSpliceable`); a
 /// metric bump here would double-count for that flow.
 fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<UpstreamResponse> {
-    let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+    let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
 
     match resp.parse(&buf[..header_end]) {
@@ -3013,7 +3008,7 @@ async fn send_and_read_headers(
     )
     .await?;
 
-    let mut hdr_buf = BytesMut::with_capacity(MAX_RESPONSE_HEADER_SIZE);
+    let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
     let resp = parse_upstream_response(&hdr_buf, hdr_end).map_err(|err| {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
@@ -5902,7 +5897,7 @@ fn rewrite_simple_proxy_headers(
     conn_action: ConnectionAction,
     status_code: http::StatusCode,
 ) -> std::io::Result<String> {
-    let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+    let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut parsed = httparse::Response::new(&mut headers);
     if parsed.parse(raw_headers).is_err() {
         return Err(std::io::Error::new(
