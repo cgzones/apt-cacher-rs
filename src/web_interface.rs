@@ -269,42 +269,26 @@ impl Display for WarnNonzero {
 }
 
 /// Render `inner` as-is; if `predicate` is true, wrap it in `<span class="warn">`.
-struct WarnIf<T: Display> {
-    inner: T,
-    predicate: bool,
-}
-impl<T: Display> WarnIf<T> {
-    fn new(inner: T, predicate: bool) -> Self {
-        Self { inner, predicate }
-    }
-}
-impl<T: Display> Display for WarnIf<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if self.predicate {
-            write!(f, "<span class=\"warn\">{}</span>", self.inner)
+fn warn_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
+    Colorize {
+        inner,
+        class: if predicate {
+            RatioClass::Warn
         } else {
-            Display::fmt(&self.inner, f)
-        }
+            RatioClass::Normal
+        },
     }
 }
 
 /// Render `inner` as-is; if `predicate` is true, wrap it in `<span class="alert">`.
-struct AlertIf<T: Display> {
-    inner: T,
-    predicate: bool,
-}
-impl<T: Display> AlertIf<T> {
-    fn new(inner: T, predicate: bool) -> Self {
-        Self { inner, predicate }
-    }
-}
-impl<T: Display> Display for AlertIf<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if self.predicate {
-            write!(f, "<span class=\"alert\">{}</span>", self.inner)
+fn alert_if<T: Display>(inner: T, predicate: bool) -> Colorize<T> {
+    Colorize {
+        inner,
+        class: if predicate {
+            RatioClass::Alert
         } else {
-            Display::fmt(&self.inner, f)
-        }
+            RatioClass::Normal
+        },
     }
 }
 
@@ -1561,12 +1545,12 @@ fn build_metrics_html() -> String {
         "Total HTTP requests handled \u{2192} requests whose response body was fully delivered to the client; same split for the web interface. Plus TCP connections accepted from clients since the daemon started.",
         format_args!(
             "{requests_total} \u{2192} {}{} ({webui_requests} \u{2192} {}{}) / {connections_accepted}{}",
-            AlertIf::new(served_total, served_total > requests_total),
+            alert_if(served_total, served_total > requests_total),
             OptPctSuffix {
                 num: served_total,
                 total: requests_total,
             },
-            AlertIf::new(served_webui, served_webui > webui_requests),
+            alert_if(served_webui, served_webui > webui_requests),
             OptPctSuffix {
                 num: served_webui,
                 total: webui_requests,
@@ -1602,7 +1586,7 @@ fn build_metrics_html() -> String {
                 // stale-but-present case; the volatile-not-found case bumps
                 // REFETCHED without either subset, so REFETCHED >= sum is the
                 // true invariant. Warn only on the impossible reverse direction.
-                WarnIf::new(refetched, refetched < refetched_uptodate + refetched_outofdate),
+                warn_if(refetched, refetched < refetched_uptodate + refetched_outofdate),
                 refetched_uptodate,
                 refetched_outofdate,
             ),
@@ -1619,8 +1603,8 @@ fn build_metrics_html() -> String {
             "Response status classes returned to clients.",
             format_args!(
                 "{} / {} / {} / {} / {}",
-                WarnIf::new(status_2xx, status_2xx != status_200 + status_206),
-                WarnIf::new(status_3xx, status_3xx != status_304),
+                warn_if(status_2xx, status_2xx != status_200 + status_206),
+                warn_if(status_3xx, status_3xx != status_304),
                 metrics::CLIENT_STATUS_4XX.get(), // do not warn due to pdiff rejections, and 404 web interface requests
                 AlertNonzero(metrics::CLIENT_STATUS_5XX.get()),
                 WarnNonzero(metrics::CLIENT_STATUS_OTHER.get()),
@@ -1651,8 +1635,8 @@ fn build_metrics_html() -> String {
             "Response status classes received from upstream mirrors.",
             format_args!(
                 "{} / {} / {} / {} / {}",
-                WarnIf::new(status_2xx, status_2xx != status_200),
-                WarnIf::new(
+                warn_if(status_2xx, status_2xx != status_200),
+                warn_if(
                     status_3xx,
                     status_3xx != status_301 + status_302 + status_304
                 ),
@@ -1720,7 +1704,7 @@ fn build_metrics_html() -> String {
             "Cached responses served via memory-mapped file I/O: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
             format_args!(
                 "{requests} \u{2192} {}{} / {}",
-                AlertIf::new(served, served > requests),
+                alert_if(served, served > requests),
                 OptPctSuffix {
                     num: served,
                     total: requests,
@@ -1737,7 +1721,7 @@ fn build_metrics_html() -> String {
             "Cached responses served via Linux sendfile(2) zero-copy: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
             format_args!(
                 "{requests} \u{2192} {}{} / {}",
-                AlertIf::new(served, served > requests),
+                alert_if(served, served > requests),
                 OptPctSuffix {
                     num: served,
                     total: requests,
@@ -1754,7 +1738,7 @@ fn build_metrics_html() -> String {
             "Responses streamed from upstream to client via Linux splice(2) zero-copy without ever touching userspace: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
             format_args!(
                 "{requests} \u{2192} {}{} / {}",
-                AlertIf::new(served, served > requests),
+                alert_if(served, served > requests),
                 OptPctSuffix {
                     num: served,
                     total: requests,
@@ -1771,7 +1755,7 @@ fn build_metrics_html() -> String {
             "Cached responses served via plain userspace read/write copy: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
             format_args!(
                 "{requests} \u{2192} {}{} / {}",
-                AlertIf::new(served, served > requests),
+                alert_if(served, served > requests),
                 OptPctSuffix {
                     num: served,
                     total: requests,
@@ -1788,7 +1772,7 @@ fn build_metrics_html() -> String {
             "Late-joiner responses streamed via the hyper ChannelBody path while an upstream download is still in flight: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
             format_args!(
                 "{requests} \u{2192} {}{} / {}",
-                AlertIf::new(served, served > requests),
+                alert_if(served, served > requests),
                 OptPctSuffix {
                     num: served,
                     total: requests,
@@ -1805,7 +1789,7 @@ fn build_metrics_html() -> String {
             "Uncached responses proxied through to clients without storing anything on disk: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
             format_args!(
                 "{requests} \u{2192} {}{} / {}",
-                AlertIf::new(served, served > requests),
+                alert_if(served, served > requests),
                 OptPctSuffix {
                     num: served,
                     total: requests,
@@ -1851,7 +1835,7 @@ fn build_metrics_html() -> String {
             format_args!(
                 "{} / {}, miss: {} / {} / {} / {}, return-evicted {}",
                 metrics::POOL_REUSED.get(),
-                WarnIf::new(
+                warn_if(
                     pool_new,
                     pool_new != miss_empty + miss_dead + miss_failed + miss_no_scheme,
                 ),
@@ -1918,7 +1902,7 @@ fn build_metrics_html() -> String {
         "HTTPS upgrade attempts on plain-HTTP requests (reverted: Auto-mode soft give-up; failed: Always-mode terminal failure), plus removals from the per-host scheme cache.",
         format_args!(
             "{} / {succeeded} / {reverted} / {failed}, {}",
-            WarnIf::new(attempted, attempted != succeeded + reverted + failed),
+            warn_if(attempted, attempted != succeeded + reverted + failed),
             metrics::SCHEME_CACHE_REMOVED.get(),
         ),
     );
