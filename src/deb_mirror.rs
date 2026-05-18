@@ -803,6 +803,13 @@ pub(crate) fn is_flat_deb_filename(filename: &str) -> bool {
 /// pressure from an attacker-supplied URL with hundreds of segments.
 const MAX_MIRROR_PATH_SEGMENTS: usize = 16;
 
+/// Maximum byte length of a single `/`-separated path segment (mirror path
+/// segment, distribution, component, architecture).
+///
+/// 128 bytes is generous for real-world Debian mirror names while providing a
+/// meaningful bound against overlong inputs.
+const MAX_SEGMENT_LEN: usize = 128;
+
 /// Path-segment names reserved for the per-mirror on-disk cache layout.
 ///
 /// A mirror path containing any of these as a `/`-separated segment would
@@ -856,7 +863,7 @@ pub(crate) fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
 
 #[must_use]
 pub(crate) fn valid_mirrorname(name: &str) -> bool {
-    if name.is_empty() || name.len() > 128 {
+    if name.is_empty() || name.len() > MAX_SEGMENT_LEN {
         return false;
     }
     let mut segment_count: usize = 0;
@@ -878,7 +885,7 @@ pub(crate) fn valid_mirrorname(name: &str) -> bool {
 #[must_use]
 fn valid_path_segment(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 128
+        && name.len() <= MAX_SEGMENT_LEN
         && name.bytes().enumerate().all(|(i, b)| {
             b.is_ascii_alphanumeric() || (i > 0 && (b == b'-' || b == b'.' || b == b'_'))
         })
