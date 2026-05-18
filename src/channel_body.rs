@@ -81,30 +81,30 @@ impl Body for ChannelBody {
                     let datalen = data.len() as u64;
 
                     match (self.remaining.exact(), self.remaining.upper()) {
-                        (Some(size), _) => match size.overflowing_sub(datalen) {
-                            (_, true) => {
+                        (Some(size), _) => match size.checked_sub(datalen) {
+                            None => {
                                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                 Err(Box::new(ProxyCacheError::ContentTooLarge {
                                     announced: self.content_length,
                                     received: self.received + datalen,
                                 }))
                             }
-                            (val, false) => {
+                            Some(val) => {
                                 self.received += datalen;
                                 self.remaining.set_exact(val);
                                 metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
                                 Ok(Frame::data(data))
                             }
                         },
-                        (None, Some(size)) => match size.overflowing_sub(datalen) {
-                            (_, true) => {
+                        (None, Some(size)) => match size.checked_sub(datalen) {
+                            None => {
                                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                 Err(Box::new(ProxyCacheError::ContentTooLarge {
                                     announced: self.content_length,
                                     received: self.received + datalen,
                                 }))
                             }
-                            (val, false) => {
+                            Some(val) => {
                                 self.received += datalen;
                                 self.remaining.set_upper(val);
                                 metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
