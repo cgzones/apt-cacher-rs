@@ -185,6 +185,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
             }
             Ok(false) => {}
             Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Error probing host-level flat root `{}`:  {err}",
                     flat_path.display()
