@@ -308,6 +308,15 @@ impl<T: Display> Display for AlertIf<T> {
     }
 }
 
+/// Convert an `i64` from a DB column to `u64` for display, clamping
+/// negative values to 0. The sqlx schemas write only non-negative values
+/// here, but i64 is the column type; this keeps the conversion site terse
+/// and consistent across the dashboard builders.
+#[must_use]
+fn as_size(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Shared cell-value Display helpers — used across multiple section builders.
 // ---------------------------------------------------------------------------
@@ -404,8 +413,8 @@ impl Display for Window {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.0 {
             Some((downloaded, delivered)) => {
-                let dl = u64::try_from(downloaded).unwrap_or(0);
-                let del = u64::try_from(delivered).unwrap_or(0);
+                let dl = as_size(downloaded);
+                let del = as_size(delivered);
                 let saved = del.saturating_sub(dl);
                 write!(
                     f,
@@ -1377,13 +1386,10 @@ fn build_maintenance_html(
     let last_rel = if last_cleanup_epoch == 0 {
         std::time::Duration::ZERO
     } else {
-        std::time::Duration::from_secs(
-            u64::try_from(now_epoch.saturating_sub(last_cleanup_epoch)).unwrap_or(0),
-        )
+        std::time::Duration::from_secs(as_size(now_epoch.saturating_sub(last_cleanup_epoch)))
     };
-    let next_rel = std::time::Duration::from_secs(
-        u64::try_from(next_cleanup_epoch.saturating_sub(now_epoch)).unwrap_or(0),
-    );
+    let next_rel =
+        std::time::Duration::from_secs(as_size(next_cleanup_epoch.saturating_sub(now_epoch)));
 
     let mut t = DetailsTable::new();
     t.row(
@@ -1423,9 +1429,9 @@ fn build_cache_stats_html(
     let total_delivery_count: i64 = mirrors.iter().map(|m| m.delivery_count).sum();
     let cache_hits = total_delivery_count.saturating_sub(total_download_count);
 
-    let total_downloaded_u = u64::try_from(total_downloaded).unwrap_or(0);
-    let total_delivered_u = u64::try_from(total_delivered).unwrap_or(0);
-    let bandwidth_saved_u = u64::try_from(bandwidth_saved).unwrap_or(0);
+    let total_downloaded_u = as_size(total_downloaded);
+    let total_delivered_u = as_size(total_delivered);
+    let bandwidth_saved_u = as_size(bandwidth_saved);
 
     let uncacheable_count = get_uncacheables().read().len();
 
@@ -2608,8 +2614,8 @@ async fn build_mirror_table(
     ]);
 
     for (mirror, dir_stat) in sorted.iter().zip(&dir_stats) {
-        let downloaded_bytes = u64::try_from(mirror.total_download_size).unwrap_or(0);
-        let delivered_bytes = u64::try_from(mirror.total_delivery_size).unwrap_or(0);
+        let downloaded_bytes = as_size(mirror.total_download_size);
+        let delivered_bytes = as_size(mirror.total_delivery_size);
 
         let (file_count, dir_size, avg_max, deb_meta) = match dir_stat {
             Some(stats) => (
@@ -2739,8 +2745,8 @@ async fn build_client_table(database: &Database, now_epoch: i64) -> (String, usi
     ]);
 
     for client in clients {
-        let downloaded = u64::try_from(client.total_downloaded).unwrap_or(0);
-        let delivered = u64::try_from(client.total_delivered).unwrap_or(0);
+        let downloaded = as_size(client.total_downloaded);
+        let delivered = as_size(client.total_delivered);
         tr!(
             table,
             client.client_ip,
@@ -2823,7 +2829,7 @@ async fn build_top_packages_table(database: &Database, view: TopPackagesView) ->
     let mut table = Table::new(headers);
 
     for pkg in packages {
-        let pkg_size = u64::try_from(pkg.package_size).unwrap_or(0);
+        let pkg_size = as_size(pkg.package_size);
         match view {
             TopPackagesView::ByCount => tr!(
                 table,
@@ -2832,7 +2838,7 @@ async fn build_top_packages_table(database: &Database, view: TopPackagesView) ->
                 HumanFmt::Size(pkg_size),
             ),
             TopPackagesView::BySize => {
-                let total = u64::try_from(pkg.total_delivered).unwrap_or(0);
+                let total = as_size(pkg.total_delivered);
                 tr!(
                     table,
                     HtmlEscape(&pkg.debname),
