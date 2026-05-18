@@ -1589,8 +1589,9 @@ async fn serve_cached_file_buf(
     if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "Error seeking cached file `{}` to {start}/{file_size}:  {err}",
-            file_path.display()
+            "Error seeking cached file `{}` to {start}/{file_size}:  {}",
+            file_path.display(),
+            crate::error::ErrorReport(&err)
         );
         return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
     }

@@ -2142,13 +2142,13 @@ async fn pwrite_buf_to_file(
         match pwrite_result {
             Ok(0) => {
                 std::mem::swap(&mut temp, buf);
-                assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
-                assert_eq!(
+                debug_assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
+                debug_assert_eq!(
                     buf.len(),
                     buf_len,
                     "buffer should have the same length as before"
                 );
-                assert!(
+                debug_assert!(
                     written < size,
                     "should have written less than the requested number of bytes"
                 );
@@ -2170,13 +2170,13 @@ async fn pwrite_buf_to_file(
             Err(nix::errno::Errno::EINTR) => {}
             Err(errno) => {
                 std::mem::swap(&mut temp, buf);
-                assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
-                assert_eq!(
+                debug_assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
+                debug_assert_eq!(
                     buf.len(),
                     buf_len,
                     "buffer should have the same length as before"
                 );
-                assert!(
+                debug_assert!(
                     written < size,
                     "should have written less than the requested number of bytes"
                 );
@@ -2186,13 +2186,13 @@ async fn pwrite_buf_to_file(
     }
 
     std::mem::swap(&mut temp, buf);
-    assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
-    assert_eq!(
+    debug_assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
+    debug_assert_eq!(
         buf.len(),
         buf_len,
         "buffer should have the same length as before"
     );
-    assert_eq!(
+    debug_assert_eq!(
         written, size,
         "should have written the requested number of bytes"
     );
