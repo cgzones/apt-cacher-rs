@@ -446,6 +446,47 @@ pub(crate) enum DrainExpect {
     MaybeIdle,
 }
 
+/// What `drain_control_messages` should do with a peeked TLS record.
+/// Pure function of the record type; the cmsg-truncation case
+/// (`MSG_CTRUNC`) is handled separately because it indicates the
+/// record-type cmsg itself could not be trusted.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainAction {
+    /// `ApplicationData` reached (or no record-type cmsg returned with the
+    /// cmsg buffer intact) -- the drain is complete.
+    Done,
+    /// Expected post-handshake control message (`NewSessionTicket`,
+    /// `KeyUpdate`); consume silently and continue the drain loop.
+    ConsumeHandshake,
+    /// Spurious post-handshake `ChangeCipherSpec` -- legal-but-unexpected
+    /// in TLS 1.3 (CCS is a legacy compat field). Consume + DEBUG-log +
+    /// continue.
+    ConsumeChangeCipherSpec,
+    /// TLS `Alert` record. Could be a fatal alert (`bad_record_mac`,
+    /// `handshake_failure`); we cannot inspect severity from the cmsg
+    /// alone. Fail-closed so the caller falls back to userspace TLS,
+    /// which can decrypt the payload and react properly.
+    AbortAlert,
+    /// Unrecognised TLS record type. Kernel parser anomaly, server
+    /// protocol violation, or future TLS extension we don't know about.
+    /// Fail-closed.
+    AbortUnknown,
+}
+
+fn classify_drain_action(record_type: Option<TlsGetRecordType>) -> DrainAction {
+    // TODO: static_assert!(std::mem::variant_count::<TlsGetRecordType>() == 5);
+    match record_type {
+        Some(TlsGetRecordType::ApplicationData) | None => DrainAction::Done,
+        Some(TlsGetRecordType::Handshake) => DrainAction::ConsumeHandshake,
+        Some(TlsGetRecordType::ChangeCipherSpec) => DrainAction::ConsumeChangeCipherSpec,
+        Some(TlsGetRecordType::Alert) => DrainAction::AbortAlert,
+        // Catches both TlsGetRecordType::Unknown(_) (unrecognised numeric
+        // record types) and any future nix variants added after this code
+        // was written (TlsGetRecordType is #[non_exhaustive]).
+        Some(_) => DrainAction::AbortUnknown,
+    }
+}
+
 /// Consume any pending TLS 1.3 control messages (e.g. `NewSessionTicket`) from a
 /// kTLS socket.
 ///
@@ -545,83 +586,109 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
         debug!("kTLS: peeked {peeked_bytes} bytes, record_type={record_type:?}, flags={flags:?}");
         drop(cmsg_buf); // Avoid accidental reuse.
 
-        match record_type {
-            Some(TlsGetRecordType::ApplicationData) => return Ok(()),
-            None => {
-                if flags.contains(MsgFlags::MSG_CTRUNC) {
-                    // Truncated cmsg means we could not read the TLS record
-                    // type; assuming application data is unsafe because a
-                    // missed control message would desync the kTLS state.
-                    warn!("kTLS: cmsg buffer truncated, aborting kTLS setup");
+        // MSG_CTRUNC is orthogonal to record-type classification: it
+        // indicates the cmsg buffer was truncated, so we cannot trust
+        // record_type even when present. Fail closed whenever the flag is
+        // set rather than letting a possibly-stale ApplicationData type
+        // pass through classify_drain_action as safe.
+        if flags.contains(MsgFlags::MSG_CTRUNC) {
+            warn!("kTLS: cmsg buffer truncated (record_type={record_type:?}); aborting kTLS setup");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kTLS: cmsg buffer truncated",
+            ));
+        }
+
+        let rt_to_consume = match classify_drain_action(record_type) {
+            DrainAction::Done => return Ok(()),
+            DrainAction::AbortAlert => {
+                warn!(
+                    "kTLS: peeked TLS Alert record ({peeked_bytes} bytes, left on socket); \
+                     aborting kTLS setup so userspace TLS can read and decode it"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "kTLS: alert in drain",
+                ));
+            }
+            DrainAction::AbortUnknown => {
+                warn!(
+                    "kTLS: peeked unknown TLS record ({peeked_bytes} bytes, \
+                     record_type={record_type:?}, left on socket); aborting kTLS setup"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "kTLS: unknown record type in drain",
+                ));
+            }
+            DrainAction::ConsumeHandshake => TlsGetRecordType::Handshake,
+            DrainAction::ConsumeChangeCipherSpec => {
+                debug!(
+                    "kTLS: draining spurious post-handshake ChangeCipherSpec \
+                     ({peeked_bytes} bytes)"
+                );
+                TlsGetRecordType::ChangeCipherSpec
+            }
+        };
+
+        // Consume the peeked record (no MSG_PEEK). Retry tightly on EINTR
+        // to avoid restarting the outer peek cycle for a record we already
+        // identified.
+        loop {
+            let mut consume_iov = [IoSliceMut::new(&mut buf)];
+            let mut consume_cmsg = nix::cmsg_space!(TlsGetRecordType);
+            let _: Never = match socket::recvmsg::<SockaddrStorage>(
+                fd.as_raw_fd(),
+                &mut consume_iov,
+                Some(&mut consume_cmsg),
+                MsgFlags::MSG_DONTWAIT,
+            ) {
+                Ok(msg) => {
+                    // Verify the consumed message matches what we peeked.
+                    // This should always hold since we are the sole consumer
+                    // on this fd, but verify as defence-in-depth.
+                    debug_assert_eq!(
+                        msg.bytes, peeked_bytes,
+                        "consumed {}, but peeked {peeked_bytes} -- \
+                         concurrent reader on kTLS socket?",
+                        msg.bytes
+                    );
+                    let consumed_rt = extract_record_type(&msg);
+                    debug_assert_eq!(
+                        consumed_rt,
+                        Some(rt_to_consume),
+                        "consumed record type {consumed_rt:?} differs from \
+                         peeked {rt_to_consume:?} -- concurrent reader on kTLS socket?"
+                    );
+                    debug!(
+                        "kTLS: consumed control message ({} bytes, type={rt_to_consume:?})",
+                        msg.bytes
+                    );
+                    break;
+                }
+                Err(nix::errno::Errno::EWOULDBLOCK) => {
+                    // EWOULDBLOCK after a successful peek means the record
+                    // was consumed between the peek and the consume --
+                    // leaving an unconsumed non-data record queued would
+                    // desync kTLS. Fail closed so the caller falls back to
+                    // userspace TLS instead of corrupting the stream.
+                    warn!(
+                        "kTLS: drain consume got EWOULDBLOCK after successful peek \
+                         ({peeked_bytes} bytes, type={rt_to_consume:?}); aborting kTLS setup"
+                    );
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "kTLS: cmsg buffer truncated",
+                        io::ErrorKind::WouldBlock,
+                        "kTLS: drain consume EWOULDBLOCK after peek",
                     ));
                 }
-                // No TLS record type reported — assume application data
-                return Ok(());
-            }
-            Some(rt) => {
-                // It's a control message (e.g., Handshake) — consume it (no MSG_PEEK).
-                // Retry in a tight loop on EINTR to avoid restarting the outer
-                // peek cycle for a record we already identified.
-                loop {
-                    let mut consume_iov = [IoSliceMut::new(&mut buf)];
-                    let mut consume_cmsg = nix::cmsg_space!(TlsGetRecordType);
-                    let _: Never = match socket::recvmsg::<SockaddrStorage>(
-                        fd.as_raw_fd(),
-                        &mut consume_iov,
-                        Some(&mut consume_cmsg),
-                        MsgFlags::MSG_DONTWAIT,
-                    ) {
-                        Ok(msg) => {
-                            // Verify the consumed message matches what we peeked.
-                            // This should always hold since we are the sole consumer
-                            // on this fd, but verify as defense-in-depth.
-                            debug_assert_eq!(
-                                msg.bytes, peeked_bytes,
-                                "consumed {}, but peeked {peeked_bytes} — \
-                                 concurrent reader on kTLS socket?",
-                                msg.bytes
-                            );
-                            let consumed_rt = extract_record_type(&msg);
-                            debug_assert_eq!(
-                                consumed_rt,
-                                Some(rt),
-                                "consumed record type {consumed_rt:?} differs from \
-                                 peeked {rt:?} — concurrent reader on kTLS socket?"
-                            );
-                            debug!(
-                                "kTLS: consumed control message ({} bytes, type={rt:?})",
-                                msg.bytes
-                            );
-                            break;
-                        }
-                        Err(nix::errno::Errno::EWOULDBLOCK) => {
-                            // EWOULDBLOCK after a successful peek means the record was
-                            // consumed between the peek and the consume — leaving an
-                            // unconsumed non-data record queued would desync kTLS.
-                            // Fail closed so the caller falls back to userspace TLS
-                            // instead of corrupting the stream.
-                            warn!(
-                                "kTLS: drain consume got EWOULDBLOCK after successful peek \
-                                 ({peeked_bytes} bytes, type={rt:?}); aborting kTLS setup"
-                            );
-                            return Err(io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                "kTLS: drain consume EWOULDBLOCK after peek",
-                            ));
-                        }
-                        Err(nix::errno::Errno::EINTR) => continue,
-                        Err(errno) => {
-                            debug!(
-                                "kTLS: drain consume error (peeked {peeked_bytes} bytes, type={rt:?}):  {errno}"
-                            );
-                            return Err(errno_to_io_error(errno, "kTLS: drain consume error"));
-                        }
-                    };
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(errno) => {
+                    debug!(
+                        "kTLS: drain consume error (peeked {peeked_bytes} bytes, type={rt_to_consume:?}):  {errno}"
+                    );
+                    return Err(errno_to_io_error(errno, "kTLS: drain consume error"));
                 }
-            }
+            };
         }
     }
 }
@@ -647,6 +714,57 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Barrier};
     use std::thread::JoinHandle;
+
+    #[test]
+    fn classify_drain_action_application_data_is_done() {
+        assert_eq!(
+            classify_drain_action(Some(TlsGetRecordType::ApplicationData)),
+            DrainAction::Done,
+        );
+    }
+
+    #[test]
+    fn classify_drain_action_missing_cmsg_is_done() {
+        // No record-type cmsg means the cmsg buffer came back intact with
+        // no TlsGetRecordType entry — treat as ApplicationData (drain
+        // complete) rather than failing closed.
+        assert_eq!(classify_drain_action(None), DrainAction::Done);
+    }
+
+    #[test]
+    fn classify_drain_action_handshake_consumes() {
+        assert_eq!(
+            classify_drain_action(Some(TlsGetRecordType::Handshake)),
+            DrainAction::ConsumeHandshake,
+        );
+    }
+
+    #[test]
+    fn classify_drain_action_change_cipher_spec_consumes() {
+        assert_eq!(
+            classify_drain_action(Some(TlsGetRecordType::ChangeCipherSpec)),
+            DrainAction::ConsumeChangeCipherSpec,
+        );
+    }
+
+    #[test]
+    fn classify_drain_action_alert_aborts() {
+        assert_eq!(
+            classify_drain_action(Some(TlsGetRecordType::Alert)),
+            DrainAction::AbortAlert,
+        );
+    }
+
+    #[test]
+    fn classify_drain_action_unknown_aborts() {
+        // Both the explicit Unknown(_) variant (recognised numeric type
+        // outside the four named cases) and any future #[non_exhaustive]
+        // variant must take the fail-closed path.
+        assert_eq!(
+            classify_drain_action(Some(TlsGetRecordType::Unknown(99))),
+            DrainAction::AbortUnknown,
+        );
+    }
 
     /// Result of setting up a kTLS test: a client socket with kTLS RX configured,
     /// two barriers (start-writing, client-done-reading) and the server thread handle.
