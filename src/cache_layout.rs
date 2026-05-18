@@ -508,9 +508,9 @@ pub(crate) fn classify_request<'a>(
             let origin_fields = match &*architecture {
                 "dep11" | "i18n" | "source" => None,
                 _ => Some(OriginFields {
-                    distribution: distribution.clone().into_owned(),
-                    component: component.clone().into_owned(),
-                    architecture: architecture.clone().into_owned(),
+                    distribution: distribution.to_string(),
+                    component: component.to_string(),
+                    architecture: architecture.to_string(),
                 }),
             };
 
