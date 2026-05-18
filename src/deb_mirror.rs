@@ -363,7 +363,7 @@ pub(crate) enum ResourceFile<'a> {
         component: &'a str,
         filename: &'a str,
     },
-    /// A translation file
+    /// A translation file (`Translation-LANG{,.bz2,.gz,.xz}`).
     Translation {
         mirror_path: &'a str,
         distribution: &'a str,
@@ -463,10 +463,6 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         let mut parts = dists_path.rsplit('/');
 
         let filename = parts.next()?;
-        #[expect(
-            clippy::case_sensitive_file_extension_comparisons,
-            reason = "filename is case-sensitive in Debian dists"
-        )]
         if filename == "Release" || filename == "InRelease" {
             // `rsplit` walks segments right-to-left.  The first segment may
             // be either the distribution (top-level Release/InRelease) or
@@ -524,7 +520,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 architecture,
                 filename,
             });
-        } else if filename == "Sources.gz" || filename == "Sources.xz" {
+        } else if filename == "Sources" || filename == "Sources.gz" || filename == "Sources.xz" {
             if parts.next()? != "source" {
                 return None;
             }
@@ -542,7 +538,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 component,
                 filename,
             });
-        } else if filename.starts_with("Translation-") && filename.ends_with(".bz2") {
+        } else if is_translation_filename(filename) {
             if parts.next()? != "i18n" {
                 return None;
             }
@@ -647,7 +643,8 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             | "Sources"
             | "Sources.gz"
             | "Sources.xz"
-    ) {
+    ) || is_translation_filename(tail)
+    {
         return Some(ResourceFile::Flat {
             kind: FlatKind::Metadata,
             mirror_path,
@@ -740,6 +737,25 @@ pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
     decoded
         .split('/')
         .any(|seg| seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control()))
+}
+
+/// Recognise any of: `Translation-LANG`, `Translation-LANG.bz2`,
+/// `Translation-LANG.gz`, `Translation-LANG.xz`. The language code is
+/// not validated beyond non-empty -- matches the existing arm's trust
+/// posture, and Debian language codes carry tags like `sr@Latn` that
+/// don't fit a simple alpha/underscore allowlist.
+#[must_use]
+pub(crate) fn is_translation_filename(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("Translation-") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    match rest.rsplit_once('.') {
+        None => true,
+        Some((_, ext)) => matches!(ext, "gz" | "xz" | "bz2"),
+    }
 }
 
 /// Valid Debian package extensions (`.deb`, `.udeb`, `.ddeb`).
@@ -1800,5 +1816,115 @@ mod tests {
         assert!(!is_flat_deb_filename("_1.0_amd64.deb"));
         assert!(!is_flat_deb_filename("foo__amd64.deb"));
         assert!(!is_flat_deb_filename("foo_1.0_.deb"));
+    }
+
+    #[test]
+    fn is_translation_filename_accepts_canonical_forms() {
+        assert!(is_translation_filename("Translation-en"));
+        assert!(is_translation_filename("Translation-en.gz"));
+        assert!(is_translation_filename("Translation-en.xz"));
+        assert!(is_translation_filename("Translation-en.bz2"));
+        assert!(is_translation_filename("Translation-en_US.xz"));
+        assert!(is_translation_filename("Translation-sr@Latn.gz"));
+    }
+
+    #[test]
+    fn is_translation_filename_rejects_bogus_inputs() {
+        assert!(!is_translation_filename("Translation-"));
+        assert!(!is_translation_filename("translation-en.gz")); // wrong case
+        assert!(!is_translation_filename("Translation"));
+        assert!(!is_translation_filename("Translation-en.zst")); // unknown ext
+        assert!(!is_translation_filename("Translation-en.diff")); // pdiff
+        assert!(!is_translation_filename("NotTranslation-en.gz"));
+    }
+
+    #[test]
+    fn parse_sources_uncompressed_structured() {
+        assert_eq!(
+            parse_request_path("debian/dists/sid/main/source/Sources"),
+            Some(ResourceFile::Sources {
+                mirror_path: "debian",
+                distribution: "sid",
+                component: "main",
+                filename: "Sources",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_translation_uncompressed_structured() {
+        assert_eq!(
+            parse_request_path("debian/dists/sid/main/i18n/Translation-en"),
+            Some(ResourceFile::Translation {
+                mirror_path: "debian",
+                distribution: "sid",
+                component: "main",
+                filename: "Translation-en",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_translation_gz_structured() {
+        assert_eq!(
+            parse_request_path("debian/dists/sid/main/i18n/Translation-en.gz"),
+            Some(ResourceFile::Translation {
+                mirror_path: "debian",
+                distribution: "sid",
+                component: "main",
+                filename: "Translation-en.gz",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_translation_xz_structured() {
+        assert_eq!(
+            parse_request_path("debian/dists/sid/main/i18n/Translation-en.xz"),
+            Some(ResourceFile::Translation {
+                mirror_path: "debian",
+                distribution: "sid",
+                component: "main",
+                filename: "Translation-en.xz",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_translation_bz2_structured() {
+        // Regression: the form that worked before F55 must keep working.
+        assert_eq!(
+            parse_request_path("debian/dists/sid/main/i18n/Translation-en.bz2"),
+            Some(ResourceFile::Translation {
+                mirror_path: "debian",
+                distribution: "sid",
+                component: "main",
+                filename: "Translation-en.bz2",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_flat_translation_gz() {
+        assert_eq!(
+            parse_request_path("apt/Translation-en.gz"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "apt",
+                filename: "Translation-en.gz",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_flat_translation_uncompressed() {
+        assert_eq!(
+            parse_request_path("apt/Translation-en"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "apt",
+                filename: "Translation-en",
+            })
+        );
     }
 }
