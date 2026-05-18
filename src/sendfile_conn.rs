@@ -1884,6 +1884,10 @@ async fn serve_unfinished_sendfile(
                 ActiveDownloadStatus::Init(init_rx) => {
                     let mut init_rx = init_rx.clone();
                     drop(st);
+                    debug_assert!(
+                        !init_waited,
+                        "state should change once a ping is received or the downloading task dropped the sender"
+                    );
                     if init_waited {
                         error!(
                             "download state still Init after waiting for {} from mirror {}{aliased}",

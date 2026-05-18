@@ -2300,10 +2300,20 @@ async fn serve_downloading_file(
                 let mut init_rx = init_rx.clone();
                 drop(st);
 
-                assert!(
+                debug_assert!(
                     !init_waited,
                     "state should change once a ping is received or the downloading task dropped the sender"
                 );
+                if init_waited {
+                    error!(
+                        "download state still Init after waiting for {} from mirror {}",
+                        conn_details.debname, conn_details.mirror
+                    );
+                    return quick_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Download State Corrupted",
+                    );
+                }
 
                 // Either the state changed manually by the downloading task,
                 // or the downloading task just dropped the sender.
