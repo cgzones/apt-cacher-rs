@@ -3678,9 +3678,7 @@ fn connect_response(
     }
 
     let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
-        if let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max) {
-            Some(guard)
-        } else {
+        let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max) else {
             info!(
                 "Rejecting https tunnel request for client {client}: \
                      concurrent connection limit ({max}) reached"
@@ -3690,7 +3688,8 @@ fn connect_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many concurrent HTTPS tunnel connections",
             );
-        }
+        };
+        Some(guard)
     } else {
         None
     };
