@@ -253,7 +253,7 @@ async fn read_request_headers(
         return Ok(Some(next_index));
     }
 
-    let deadline = tokio::time::sleep(global_config().http_timeout);
+    let deadline = tokio::time::sleep(global_config().client_idle_timeout);
     tokio::pin!(deadline);
 
     loop {

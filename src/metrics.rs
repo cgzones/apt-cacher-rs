@@ -406,10 +406,11 @@ pub(crate) static HTTP_TIMEOUT_UPSTREAM_CONNECT: Counter = Counter::new();
 /// HTTP timeout firings: client failed to send request headers in time
 /// (slow-loris-shaped, or a stalled client between keep-alive requests).
 ///
-/// Scope: only updated by the sendfile backend's `read_request_headers`;
-/// in `cfg(not(feature = "sendfile"))` builds (non-default) hyper's own
-/// (default-off) `header_read_timeout` would govern this and the counter
-/// stays at 0.
+/// Scope: only updated by the sendfile backend's `read_request_headers`.
+/// In `cfg(not(feature = "sendfile"))` builds (non-default) the hyper path's
+/// `header_read_timeout` is configured from `client_idle_timeout` and does
+/// fire on idle/slow-header clients, but it is not counted here -- it logs at
+/// debug level instead, so this counter stays at 0 on those builds.
 pub(crate) static HTTP_TIMEOUT_CLIENT_HEADER: Counter = Counter::new();
 /// HTTP timeout firings: client failed to drain the response body in time
 /// (slow reader, dropped link, or `min_download_rate` violation).

@@ -4841,7 +4841,7 @@ where
     }
 
     #[must_use]
-    fn is_timeout(err: &hyper::Error) -> Option<&ProxyCacheError> {
+    fn is_rate_timeout(err: &hyper::Error) -> Option<&ProxyCacheError> {
         let pe = err.source()?.downcast_ref::<ProxyCacheError>()?;
 
         if matches!(pe, ProxyCacheError::ClientDownloadRate { .. })
@@ -4854,6 +4854,8 @@ where
     }
 
     if let Err(err) = http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(global_config().client_idle_timeout)
         .serve_connection(
             TokioIo::new(stream),
             service_fn(move |req| {
@@ -4877,7 +4879,14 @@ where
                 "Connection to client {client} disconnected:  {}",
                 ErrorReport(&err)
             );
-        } else if let Some(perr) = is_timeout(&err) {
+        } else if err.is_timeout() {
+            // hyper's `header_read_timeout` (driven by `client_idle_timeout`)
+            // fires on idle keep-alive and slowloris-shaped clients. This is
+            // benign disconnect behaviour, not a server fault — log at debug
+            // and leave HTTP_TIMEOUT_CLIENT_HEADER untouched (the sendfile
+            // backend is the sole owner of that counter).
+            debug!("Client {client} idle-timed out before sending request headers");
+        } else if let Some(perr) = is_rate_timeout(&err) {
             info!("{perr}");
         } else {
             error!(

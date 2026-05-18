@@ -30,6 +30,7 @@ const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 KiB
 const DEFAULT_DATABASE_SLOW_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_DISK_QUOTA: Option<NonZero<u64>> = None;
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 const DEFAULT_HTTPS_UPGRADE_MODE: HttpsUpgradeMode = HttpsUpgradeMode::Auto;
 const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
 const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
@@ -653,6 +654,15 @@ pub(crate) struct Config {
     #[serde(default = "default_http_timeout", deserialize_with = "from_secs_f64")]
     pub(crate) http_timeout: Duration,
 
+    /// Timeout (in seconds) after which an inbound client connection is closed
+    /// while waiting for a complete HTTP request -- covers idle keep-alive
+    /// connections and slowloris-style partial header sends.
+    #[serde(
+        default = "default_client_idle_timeout",
+        deserialize_with = "from_secs_f64"
+    )]
+    pub(crate) client_idle_timeout: Duration,
+
     /// HTTPS upgrade mode.
     #[serde(default = "default_https_upgrade_mode")]
     pub(crate) https_upgrade_mode: HttpsUpgradeMode,
@@ -989,6 +999,10 @@ const fn default_db_slow_timeout() -> Duration {
 
 const fn default_http_timeout() -> Duration {
     DEFAULT_HTTP_TIMEOUT
+}
+
+const fn default_client_idle_timeout() -> Duration {
+    DEFAULT_CLIENT_IDLE_TIMEOUT
 }
 
 const fn default_https_upgrade_mode() -> HttpsUpgradeMode {
@@ -1328,6 +1342,23 @@ impl Config {
                 "Invalid http_timeout value of {}s: must be between 1s and 360s",
                 self.http_timeout.as_secs_f32()
             );
+        }
+
+        if self.client_idle_timeout < Duration::from_secs(1)
+            || self.client_idle_timeout > Duration::from_hours(1)
+        {
+            bail!(
+                "Invalid client_idle_timeout value of {}s: must be between 1s and 3600s",
+                self.client_idle_timeout.as_secs_f32()
+            );
+        }
+
+        if self.client_idle_timeout < self.http_timeout {
+            warnings.push(format!(
+                "client_idle_timeout ({}s) is smaller than http_timeout ({}s); slow clients may be disconnected during request-header read while comparable upstream operations are still allowed to complete",
+                self.client_idle_timeout.as_secs_f32(),
+                self.http_timeout.as_secs_f32()
+            ));
         }
 
         if self.database_slow_timeout > self.http_timeout {
