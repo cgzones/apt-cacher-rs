@@ -54,7 +54,7 @@ pub(crate) fn grow_incoming(
                 .ok_or_else(|| {
                     io::Error::new(
                         ErrorKind::InvalidData,
-                        format!("kTLS: incoming buffer exceeded 2 MiB during {phase}"),
+                        format!("kTLS: incoming buffer exceeded 2 MiB during {phase} (used={used}, cap={buf_len})"),
                     )
                 })?
         };
