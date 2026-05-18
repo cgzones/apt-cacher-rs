@@ -23,66 +23,66 @@ impl std::fmt::Display for HumanFmt {
         match *self {
             Self::Size(bytes) => {
                 if bytes < 1000 {
-                    return f.write_fmt(format_args!("{bytes}B"));
+                    return write!(f, "{bytes}B");
                 }
                 let size = bytes as f64 / 1000.0;
                 if size < 1000.0 {
-                    return f.write_fmt(format_args!("{size:.0$}kB", precision(size)));
+                    return write!(f, "{size:.0$}kB", precision(size));
                 }
                 let size = size / 1000.0;
                 if size < 1000.0 {
-                    return f.write_fmt(format_args!("{size:.0$}MB", precision(size)));
+                    return write!(f, "{size:.0$}MB", precision(size));
                 }
                 let size = size / 1000.0;
                 if size < 1000.0 {
-                    return f.write_fmt(format_args!("{size:.0$}GB", precision(size)));
+                    return write!(f, "{size:.0$}GB", precision(size));
                 }
                 let size = size / 1000.0;
-                f.write_fmt(format_args!("{size:.0$}TB", precision(size)))
+                write!(f, "{size:.0$}TB", precision(size))
             }
             Self::Rate(bytes, time) => {
                 let time = time.as_f64();
                 if time == 0.0 {
-                    return f.write_fmt(format_args!("???B/s"));
+                    return write!(f, "???B/s");
                 }
                 let rate = bytes as f64 / time;
                 if rate < 1000.0 {
-                    return f.write_fmt(format_args!("{rate:.0$}B/s", precision(rate)));
+                    return write!(f, "{rate:.0$}B/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
                 if rate < 1000.0 {
-                    return f.write_fmt(format_args!("{rate:.0$}kB/s", precision(rate)));
+                    return write!(f, "{rate:.0$}kB/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
                 if rate < 1000.0 {
-                    return f.write_fmt(format_args!("{rate:.0$}MB/s", precision(rate)));
+                    return write!(f, "{rate:.0$}MB/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
                 if rate < 1000.0 {
-                    return f.write_fmt(format_args!("{rate:.0$}GB/s", precision(rate)));
+                    return write!(f, "{rate:.0$}GB/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
-                f.write_fmt(format_args!("{rate:.0$}TB/s", precision(rate)))
+                write!(f, "{rate:.0$}TB/s", precision(rate))
             }
             Self::Time(time) => {
                 let time = time.as_nanos();
                 if time < 1000 {
-                    return f.write_fmt(format_args!("{time}ns"));
+                    return write!(f, "{time}ns");
                 }
 
                 let time = time as f64 / 1000.0;
                 if time < 1000.0 {
-                    return f.write_fmt(format_args!("{time:.0$}us", precision(time)));
+                    return write!(f, "{time:.0$}us", precision(time));
                 }
 
                 let time = time / 1000.0;
                 if time < 1000.0 {
-                    return f.write_fmt(format_args!("{time:.0$}ms", precision(time)));
+                    return write!(f, "{time:.0$}ms", precision(time));
                 }
 
                 let time = time / 1000.0;
                 if time < 600.0 {
-                    return f.write_fmt(format_args!("{time:.0$}s", precision(time)));
+                    return write!(f, "{time:.0$}s", precision(time));
                 }
 
                 #[expect(
@@ -131,7 +131,7 @@ impl std::fmt::Display for HumanFmt {
                     format_args!("")
                 };
 
-                f.write_fmt(format_args!("{days_fmt}{hours_fmt}{mins_fmt}{secs_fmt}"))
+                write!(f, "{days_fmt}{hours_fmt}{mins_fmt}{secs_fmt}")
             }
         }
     }
