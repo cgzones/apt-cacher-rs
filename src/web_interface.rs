@@ -2769,10 +2769,7 @@ fn build_uncacheable_table() -> (String, usize) {
     let mut table = Table::new(&["Requested Host", "Requested Path"]);
 
     for (host, path) in uncacheables.iter() {
-        // `host` is a DomainName-like type; route through HtmlEscape via to_string to avoid
-        // duplicating display logic.
-        let host_s = host.to_string();
-        tr!(table, HtmlEscape(&host_s), HtmlEscape(path));
+        tr!(table, HtmlEscaped(host), HtmlEscape(path));
     }
     drop(uncacheables);
 
