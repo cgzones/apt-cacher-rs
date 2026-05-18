@@ -11,7 +11,7 @@
 use std::{num::ParseIntError, path::Path};
 
 use log::warn;
-use nix::errno::Errno;
+use nix::libc;
 use xattr::FileExt as _;
 
 /// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
@@ -85,8 +85,7 @@ pub(crate) fn try_read_helper(
 
         Err(err) => {
             let kind = err.kind();
-            if kind == std::io::ErrorKind::Unsupported
-                || err.raw_os_error() == Some(Errno::ENODATA as i32)
+            if kind == std::io::ErrorKind::Unsupported || err.raw_os_error() == Some(libc::ENODATA)
             {
                 Ok(None)
             } else {
