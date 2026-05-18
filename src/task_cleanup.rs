@@ -2158,7 +2158,17 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
             }
         };
 
-        let mtime = mdata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime = match mdata.modified() {
+            Ok(m) => m,
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to read mtime of tmp entry `{}`:  {err}; treating as epoch (eligible for removal)",
+                    entry.path().display()
+                );
+                SystemTime::UNIX_EPOCH
+            }
+        };
         // Apply the per-suffix `.partial` policy only to regular files: a
         // symlink-to-dir or a stray directory named `*.partial` should not
         // be measured by `len()` (zero for a symlink) and should be reaped
