@@ -1430,8 +1430,6 @@ impl Config {
             }
         }
 
-        self.allowed_mirrors.sort_unstable();
-        self.http_only_mirrors.sort_unstable();
         self.https_tunnel_allowed_ports.sort_unstable();
         self.https_tunnel_allowed_mirrors.sort_unstable();
 
