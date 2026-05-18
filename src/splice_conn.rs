@@ -5323,17 +5323,39 @@ async fn read_body_to_vec_until_eof(
     max_bytes: usize,
 ) -> std::io::Result<Vec<u8>> {
     let config = global_config();
-    let size = (prefix.len() + 4096).min(max_bytes);
+    let size = (prefix.len() + 4096).min(max_bytes.saturating_add(1));
     let mut body = Vec::with_capacity(size);
     body.extend_from_slice(prefix);
-    let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE); // TODO: replace body Vec?
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     loop {
-        buf.clear();
-        let n = match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut buf)).await {
+        if body.len() > max_bytes {
+            warn_once_or_info!(
+                "splice proxy: volatile response body exceeded {max_bytes} byte cap"
+            );
+            return Err(std::io::Error::other(
+                "volatile response body exceeded size cap",
+            ));
+        }
+
+        // The +1 keeps the take limit strictly positive (so a 0-byte read
+        // can only mean upstream EOF, never "we hit our own cap") and lets a
+        // single over-cap byte slip through so the check above can reject it
+        // on the next iteration.
+        let remaining = (max_bytes - body.len()).saturating_add(1);
+        // Ensure ample spare capacity so each read syscall can transfer a
+        // useful chunk; `Vec::reserve` is a no-op when spare capacity
+        // already covers this.
+        body.reserve(TLS_READ_BUF_SIZE.min(remaining));
+
+        let n = match tokio::time::timeout(
+            config.http_timeout,
+            (&mut *upstream).take(remaining as u64).read_buf(&mut body),
+        )
+        .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
@@ -5347,17 +5369,6 @@ async fn read_body_to_vec_until_eof(
         };
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-
-        if body.len().checked_add(n).is_none_or(|sum| sum > max_bytes) {
-            warn_once_or_info!(
-                "splice proxy: volatile response body exceeded {max_bytes} byte cap"
-            );
-            return Err(std::io::Error::other(
-                "volatile response body exceeded size cap",
-            ));
-        }
-
-        body.extend_from_slice(&buf[..n]);
 
         if let Some(ref mut rc) = rate_checker {
             rc.add(n);
