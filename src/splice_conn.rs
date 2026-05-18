@@ -1903,7 +1903,7 @@ async fn splice_proxy_body(
     // this body fn is skipped when the entire response fits in the
     // body_prefix / kTLS extra-body and we still need to count it.
 
-    let (upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
+    let (upstream_pipe_sender, mut upstream_pipe_receiver) = create_pipe()?;
     let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
 
     let config = global_config();
@@ -2071,7 +2071,7 @@ async fn splice_proxy_body(
             }
         } else {
             // Boundary chunk — read into userspace, slice for client, pwrite for cache
-            let mut buf = read_pipe_to_buf(&upstream_pipe_receiver, got).await?;
+            let mut buf = read_pipe_to_buf(&mut upstream_pipe_receiver, got).await?;
 
             debug_assert!(
                 matches!(client_status, ClientStatus::Active),
@@ -2282,7 +2282,10 @@ async fn splice_proxy_body_tls(
 
     let mut remaining = content_length;
     let mut file_offset: i64 = file_start_offset;
-    let mut read_buf = vec![0u8; TLS_READ_BUF_SIZE]; // TODO: avoid zero initialization
+    // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
+    // writes into the spare capacity via `BufMut` so the buffer never has
+    // to be zero-initialized before being overwritten by upstream data.
+    let mut read_buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
     let mut client_status = ClientStatus::Active;
     let mut bytes_done: u64 = 0;
     // See `splice_proxy_body` for the rationale on tracking absolute client
@@ -2301,23 +2304,19 @@ async fn splice_proxy_body_tls(
         // Step 1: async read from TLS stream into userspace buffer
         // The outer http_timeout ensures a fully stalled connection is killed even if
         // rate_check_timeframe > http_timeout.
-        static_assert!(TLS_READ_BUF_SIZE < usize::MAX);
         debug_assert_eq!(
-            read_buf.len(),
+            read_buf.capacity(),
             TLS_READ_BUF_SIZE,
-            "buffer size should remain constant"
+            "buffer capacity should remain constant"
         );
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "TLS_READ_BUF_SIZE is checked to be < usize::MAX above"
-        )]
-        let to_read = std::cmp::min(remaining, read_buf.len() as u64) as usize;
+        read_buf.clear();
+        let to_read = std::cmp::min(remaining, TLS_READ_BUF_SIZE as u64);
         let read_outcome = tokio::time::timeout(config.http_timeout, async {
             if let Some(ref mut rc) = rate_checker {
                 loop {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(1),
-                        upstream.read(&mut read_buf[..to_read]),
+                        (&mut *upstream).take(to_read).read_buf(&mut read_buf),
                     )
                     .await
                     {
@@ -2332,8 +2331,9 @@ async fn splice_proxy_body_tls(
                     }
                 }
             } else {
-                upstream
-                    .read(&mut read_buf[..to_read])
+                (&mut *upstream)
+                    .take(to_read)
+                    .read_buf(&mut read_buf)
                     .await
                     .map_err(TlsReadOutcome::Io)
             }
@@ -2832,33 +2832,22 @@ async fn tee_and_splice(
 
 /// Read exactly `count` bytes from a pipe into a Vec (for boundary chunks
 /// that straddle a client range boundary and need userspace slicing).
-async fn read_pipe_to_buf(rx: &pipe::Receiver, count: usize) -> std::io::Result<Vec<u8>> {
-    let mut read_buf = vec![0u8; count]; // TODO: avoid zero initialization
-    let mut read_bytes = 0;
+async fn read_pipe_to_buf(rx: &mut pipe::Receiver, count: usize) -> std::io::Result<Vec<u8>> {
+    // Reserve uninitialized capacity; `read_buf` fills bytes via `BufMut`
+    // so no zero-init pass is performed before the data is overwritten.
+    let mut read_buf: Vec<u8> = Vec::with_capacity(count);
 
-    while read_bytes < count {
-        rx.readable().await?;
-
-        let buf = &mut read_buf[read_bytes..];
-
-        match rx.try_read(buf) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "read_pipe_to_buf: pipe closed with bytes remaining",
-                ));
-            }
-            Ok(n) => read_bytes += n,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(err) => return Err(err),
+    while read_buf.len() < count {
+        let want = (count - read_buf.len()) as u64;
+        let n = (&mut *rx).take(want).read_buf(&mut read_buf).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "read_pipe_to_buf: pipe closed with bytes remaining",
+            ));
         }
     }
 
-    debug_assert_eq!(
-        read_bytes, count,
-        "should have read the requested amount of bytes"
-    );
     debug_assert_eq!(
         read_buf.len(),
         count,
@@ -3311,7 +3300,10 @@ async fn forward_upstream_body(
     count: u64,
 ) -> std::io::Result<()> {
     let config = global_config();
-    let mut buf = vec![0u8; TLS_READ_BUF_SIZE]; // TODO: avoid zero initialization
+    // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
+    // fills bytes into the spare capacity via `BufMut`, so the buffer is
+    // never zero-initialized before being overwritten by upstream data.
+    let mut buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
     let mut remaining = count;
     let mut rate_checker = config
         .min_download_rate
@@ -3321,19 +3313,18 @@ async fn forward_upstream_body(
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
     while remaining > 0 {
-        static_assert!(TLS_READ_BUF_SIZE < usize::MAX);
         debug_assert_eq!(
-            buf.len(),
+            buf.capacity(),
             TLS_READ_BUF_SIZE,
-            "buffer size should remain constant"
+            "buffer capacity should remain constant"
         );
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "TLS_READ_BUF_SIZE is checked to be < usize::MAX above"
-        )]
-        let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-        let n = match tokio::time::timeout(config.http_timeout, upstream.read(&mut buf[..to_read]))
-            .await
+        buf.clear();
+        let to_read = std::cmp::min(remaining, TLS_READ_BUF_SIZE as u64);
+        let n = match tokio::time::timeout(
+            config.http_timeout,
+            (&mut *upstream).take(to_read).read_buf(&mut buf),
+        )
+        .await
         {
             Ok(Ok(0)) => {
                 return Err(std::io::Error::new(
@@ -3363,7 +3354,7 @@ async fn forward_upstream_body(
 
         write_all_to_stream_rated(
             client,
-            &buf[..n],
+            &buf,
             &mut client_rate_checker,
             RateCheckDirection::Client,
             config.http_timeout,
