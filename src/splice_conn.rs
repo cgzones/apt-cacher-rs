@@ -451,6 +451,31 @@ impl UpstreamConn {
     }
 }
 
+/// Process-wide write-only handle to `/dev/null` used by [`drain_pipe`] as the
+/// destination of `splice(2)` calls that discard pipe contents.
+///
+/// Opened lazily on first use; held for the lifetime of the process. The fd is
+/// `O_NONBLOCK` so `splice(2)` never parks a Tokio runtime thread when the pipe
+/// has data ready — `/dev/null` accepts any amount instantly, so the syscall
+/// either returns the bytes-moved count or `EAGAIN` (only the pipe side can
+/// stall).
+static DEV_NULL: OnceLock<std::fs::File> = OnceLock::new();
+
+/// Return a shared, lazily-opened handle to `/dev/null`. The first call opens
+/// the file; subsequent calls return the cached handle.
+fn dev_null() -> std::io::Result<&'static std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if let Some(f) = DEV_NULL.get() {
+        return Ok(f);
+    }
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+        .open("/dev/null")?;
+    Ok(DEV_NULL.get_or_init(|| f))
+}
+
 /// Create a pipe and optionally increase its buffer size.
 fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
     use nix::fcntl::{FcntlArg, fcntl};
@@ -2868,19 +2893,33 @@ fn range_slice(buf: &[u8], buf_file_start: u64, range_start: u64, range_len: u64
     &buf[local_start..local_end]
 }
 
-/// Drain `count` bytes from a pipe by reading and discarding them.
+/// Drain `count` bytes from a pipe by `splice(2)`ing them into `/dev/null`.
+///
+/// Zero-copy — no userspace buffer is allocated and the bytes never cross
+/// the kernel/userspace boundary. The destination fd is shared process-wide
+/// via [`dev_null`]; the receiver is the caller-owned pipe end.
+///
+/// Returns `UnexpectedEof` if the pipe's write end closes before `count` bytes
+/// have been moved.
 async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
-    let read_buf_size = std::cmp::min(count, 8 * 1024);
-    let mut read_buf = vec![0u8; read_buf_size]; // TODO: avoid zero initialization
+    if count == 0 {
+        return Ok(());
+    }
+    let devnull = dev_null()?;
     let mut remaining = count;
     while remaining > 0 {
         rx.readable().await?;
 
-        let to_read = std::cmp::min(remaining, read_buf_size);
-        let buf = &mut read_buf[..to_read];
+        let result = splice(
+            rx,
+            None,
+            devnull,
+            None,
+            remaining,
+            SpliceFFlags::SPLICE_F_MOVE,
+        );
 
-        // TODO: splice(2) to /dev/null ?
-        match rx.try_read(buf) {
+        let _: Never = match result {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
@@ -2890,12 +2929,25 @@ async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
             Ok(n) => {
                 remaining = remaining
                     .checked_sub(n)
-                    .expect("read should not return more than requested");
+                    .expect("splice should not return more than requested");
+                continue;
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) => return Err(err),
-        }
+            Err(nix::errno::Errno::EINTR) => continue,
+            // EAGAIN/EWOULDBLOCK: see module-level static_assert. Force Tokio
+            // to re-arm readiness so the next `readable().await` actually
+            // parks on a fresh epoll event instead of spinning on the cached
+            // ready bit.
+            Err(nix::errno::Errno::EAGAIN) => {
+                clear_pipe_readable_cache(rx);
+                continue;
+            }
+            Err(err) => {
+                return Err(errno_to_io_error(
+                    err,
+                    "drain_pipe: splice to /dev/null failed",
+                ));
+            }
+        };
     }
 
     Ok(())
@@ -6496,5 +6548,118 @@ mod tests {
         // Discard all remaining
         discard_incoming(&mut buf, &mut used, 3);
         assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn test_dev_null_accessor_returns_writable_fd() {
+        use std::os::fd::AsRawFd as _;
+        let f1 = dev_null().expect("first call should open /dev/null");
+        let f2 = dev_null().expect("second call should reuse cached fd");
+        // Same underlying fd both calls (OnceLock returns the cached File).
+        assert_eq!(f1.as_raw_fd(), f2.as_raw_fd());
+        assert!(f1.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn test_dev_null_accessor_is_nonblocking() {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use std::os::fd::AsFd as _;
+        let f = dev_null().expect("open /dev/null");
+        let flags = fcntl(f.as_fd(), FcntlArg::F_GETFL).expect("F_GETFL");
+        let flags = OFlag::from_bits_truncate(flags);
+        assert!(
+            flags.contains(OFlag::O_NONBLOCK),
+            "dev_null fd must be O_NONBLOCK so splice(2) returns EAGAIN instead of blocking the runtime, got flags = {flags:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_pipe_discards_exact_count() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut tx, rx) = create_pipe().expect("create_pipe");
+        let payload = vec![0xABu8; 4096];
+        tx.write_all(&payload).await.expect("write payload");
+
+        drain_pipe(&rx, payload.len())
+            .await
+            .expect("drain should consume all bytes");
+
+        // After draining, no more bytes are readable without further writes.
+        // Drop the writer so a subsequent read sees EOF rather than hanging.
+        drop(tx);
+        let mut probe = [0u8; 16];
+        // try_read must return Ok(0) (EOF) — the pipe is empty and the writer closed.
+        // Loop past any spurious WouldBlock that can occur before the EOF is observed.
+        loop {
+            rx.readable().await.expect("readable");
+            match rx.try_read(&mut probe) {
+                Ok(0) => break,
+                Ok(n) => {
+                    assert_eq!(n, 0, "unexpected leftover bytes after drain");
+                    break;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => unreachable!("unexpected read error: {e}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drain_pipe_zero_count_is_noop() {
+        let (_tx, rx) = create_pipe().expect("create_pipe");
+        // Must not touch the pipe and must not await readability (which would hang).
+        drain_pipe(&rx, 0)
+            .await
+            .expect("zero-count drain is a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_drain_pipe_eof_mid_drain_returns_unexpected_eof() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut tx, rx) = create_pipe().expect("create_pipe");
+        // Write only half of what we'll ask to drain, then close the writer to
+        // force EOF on the next splice attempt.
+        tx.write_all(&[0u8; 1024]).await.expect("write half");
+        drop(tx);
+
+        let err = drain_pipe(&rx, 4096)
+            .await
+            .expect_err("drain must fail when pipe closes before count satisfied");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::UnexpectedEof,
+            "expected UnexpectedEof, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_pipe_crosses_multiple_readable_rounds() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // Pick a total payload several pipe-buffers' worth so the kernel
+        // cannot deliver it all in one splice round regardless of writer
+        // scheduling: drain_pipe must loop, hitting `rx.readable().await`
+        // at least `total / pipe_size` times, with at least one round
+        // blocked until the writer task refills. The previous variant
+        // (8 KiB total, default 64 KiB pipe, `yield_now()` between batches)
+        // could pass even when drain consumed everything in a single
+        // splice — exactly the regression this test is meant to catch.
+        let (mut tx, rx) = create_pipe().expect("create_pipe");
+        let _ignore = fcntl(rx.as_fd(), FcntlArg::F_SETPIPE_SZ(4096));
+        let pipe_size = fcntl(rx.as_fd(), FcntlArg::F_GETPIPE_SZ).expect("pipe size");
+        let total: usize = (pipe_size * 4).try_into().expect("pipe_size fits usize");
+
+        let drain_handle = tokio::spawn(async move {
+            drain_pipe(&rx, total).await.expect("drain succeeds");
+            rx
+        });
+
+        let payload = vec![0xABu8; total];
+        tx.write_all(&payload).await.expect("write full payload");
+        drop(tx);
+
+        let _rx = drain_handle.await.expect("drain task completes");
     }
 }
