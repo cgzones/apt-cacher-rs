@@ -592,7 +592,8 @@ impl<'de> Deserialize<'de> for IpNetOrAddr {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(from = "String")]
 pub(crate) enum LogDestination {
     Console,
     File(PathBuf),
@@ -620,10 +621,7 @@ pub(crate) struct Config {
     /// Path to log file.
     /// The special value `console` will output to the console.
     /// Can be overridden via program options.
-    #[serde(
-        default = "default_log_file",
-        deserialize_with = "parse_log_destination"
-    )]
+    #[serde(default = "default_log_file")]
     pub(crate) log_file: LogDestination,
 
     /// Address to listen on.
@@ -947,15 +945,6 @@ where
     let u: u64 = Deserialize::deserialize(deserializer)?;
 
     Ok(NonZero::new(u))
-}
-
-fn parse_log_destination<'de, D>(deserializer: D) -> Result<LogDestination, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-
-    Ok(LogDestination::from(s))
 }
 
 const fn default_log_level() -> LevelFilter {
