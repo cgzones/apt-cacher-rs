@@ -1995,16 +1995,23 @@ async fn download_file(
         let rbarrier = dbarrier.begin_rename().await;
 
         /* Should only happen for concurrent downloads from aliased mirrors */
-        if warn_on_override
-            && tokio::fs::try_exists(&dest_file_path)
-                .await
-                .unwrap_or(false)
-        {
-            warn!(
-                "Target file `{}` already exists, overriding... (aliased={})",
-                dest_file_path.display(),
-                conn_details.aliased_host.is_some()
-            );
+        if warn_on_override {
+            match tokio::fs::try_exists(&dest_file_path).await {
+                Ok(true) => {
+                    warn!(
+                        "Target file `{}` already exists, overriding... (aliased={})",
+                        dest_file_path.display(),
+                        conn_details.aliased_host.is_some()
+                    );
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        "Failed to check if `{}` exists:  {err}",
+                        dest_file_path.display()
+                    );
+                }
+            }
         }
 
         match tokio::fs::rename(&outpath, &dest_file_path).await {
