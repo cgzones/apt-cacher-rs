@@ -548,7 +548,7 @@ pub(crate) struct Alias {
 /// blocklist) must resolve through this so multiple aliases pointing
 /// at the same `main` share keys.
 ///
-/// `aliases[].aliases` is sorted at config load (see `Config::parse`),
+/// `aliases[].aliases` is sorted at config load (see `Config::new`),
 /// so the inner lookup is a binary search.
 #[must_use]
 pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Option<&'a CacheHost> {
