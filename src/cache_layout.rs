@@ -93,6 +93,11 @@ pub(crate) const SUBDIR_DISTS_BYHASH: &str = "dists/by-hash";
 /// `{cache}/{host}/flat/apt/amd64/twilio_5.0.0_amd64.deb`.
 pub(crate) const SUBDIR_FLAT: &str = "flat";
 
+/// Prefix for mirror paths that collide with the host-level flat layout
+/// (i.e. paths starting with `"flat/"`).  Used by [`crate::flat_blocklist`]
+/// to detect collision patterns.
+pub(crate) const SUBDIR_FLAT_PREFIX: &str = "flat/";
+
 /// Subdirectory holding by-hash content-addressed files belonging to a flat
 /// repository.  Appended below `{cache}/{host}/flat/{mirror_path}/` for a
 /// `Flat::ByHash` request.

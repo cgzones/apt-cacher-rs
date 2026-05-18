@@ -42,7 +42,7 @@ use log::warn;
 use parking_lot::RwLock;
 
 use crate::{
-    cache_layout::SUBDIR_FLAT,
+    cache_layout::{SUBDIR_FLAT, SUBDIR_FLAT_PREFIX},
     config::{CacheHost, resolve_alias},
     database::Database,
     global_config,
@@ -89,7 +89,7 @@ static BLOCKLIST: OnceLock<RwLock<HashSet<BlocklistKey>>> = OnceLock::new();
 /// path apply the same predicate.
 #[must_use]
 pub(crate) fn path_collides_with_flat_layout(path: &str) -> bool {
-    path == SUBDIR_FLAT || path.starts_with("flat/")
+    path == SUBDIR_FLAT || path.starts_with(SUBDIR_FLAT_PREFIX)
 }
 
 /// Install the blocklist singleton.
