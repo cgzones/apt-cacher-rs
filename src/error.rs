@@ -129,13 +129,11 @@ pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> 
         msg: &'static str,
         source: std::io::Error,
     }
-    #[cfg(feature = "sendfile")]
     impl Display for ErrnoIoError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}: {}", self.msg, self.source)
         }
     }
-    #[cfg(feature = "sendfile")]
     impl std::error::Error for ErrnoIoError {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.source)
