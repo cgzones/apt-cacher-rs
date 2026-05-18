@@ -3712,6 +3712,71 @@ pub(crate) async fn splice_proxy(
     .map(|()| SpliceProxyOutcome::Served)
 }
 
+/// Serve a cached volatile file after an upstream `304 Not Modified`: refresh
+/// the freshness window via `touch_volatile_mtime`, release the init barrier,
+/// then deliver the file with `sendfile(2)`. Shared by the kTLS fast path and
+/// the standard upstream path in [`splice_proxy_drive`]; the per-path bits
+/// (status recording, upstream-connection pooling, `debug!` wording) stay at
+/// the call site, and `invalid_tag` carries the call-site location tag for
+/// `SpliceProxyError::Client`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared 304 tail path; splitting the args would not aid clarity"
+)]
+async fn serve_volatile_304_via_sendfile(
+    client_stream: &TcpStream,
+    conn_details: &ConnectionDetails,
+    cache_path: &Path,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    client_range: RangeRequestHeaders<'_>,
+    ibarrier: InitBarrier<'_>,
+    invalid_tag: &'static str,
+) -> Result<(), SpliceProxyError> {
+    metrics::VOLATILE_REFETCHED_UPTODATE.increment();
+
+    let file = match tokio::fs::File::options()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(cache_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "splice proxy: failed to open cached file `{}` after 304:  {err}",
+                cache_path.display()
+            );
+            return Err(SpliceProxyError::Cache);
+        }
+    };
+    let file = touch_volatile_mtime(file, cache_path).await;
+    ibarrier.finished(cache_path.to_path_buf()).await;
+
+    match serve_file_via_sendfile(
+        client_stream,
+        conn_details,
+        "",
+        (file, cache_path),
+        (conn_version, conn_action),
+        client_range,
+        None,
+    )
+    .await
+    {
+        SendfileResult::Served(_)
+        | SendfileResult::ClientError
+        | SendfileResult::AfterHeaderError => Ok(()),
+        SendfileResult::Invalid { status, msg } => {
+            write_invalid_response(client_stream, conn_version, conn_action, status, msg)
+                .await
+                .map_err(|err| SpliceProxyError::Client(err, invalid_tag))?;
+            Ok(())
+        }
+    }
+}
+
 /// Body of [`splice_proxy`] after the originate check has succeeded. Kept as
 /// a separate fn returning `Result<(), SpliceProxyError>` so the many
 /// `Ok(())` early-returns scattered through the body do not need to be
@@ -3907,12 +3972,8 @@ async fn splice_proxy_drive(
         } else if response.status_code == 304
             && let Some(cache_path) = volatile_cache_path
         {
-            // 304 from kTLS for volatile resource — serve cached file via sendfile.
-            // The standard 304 handler below (after upstream connect) handles this
-            // for the non-kTLS path; here we handle it for kTLS before falling through.
-            // Fall through to the standard path which will re-connect and get the same 304.
-            // Actually, we already have the 304 — no need to reconnect. Handle it directly.
-
+            // 304 from kTLS for volatile resource — serve the cached file directly
+            // rather than reconnecting on the standard path just to get the same 304.
             debug!(
                 "splice proxy: kTLS upstream returned 304 for {} from mirror {}, serving cached file",
                 conn_details.debname, conn_details.mirror
@@ -3921,50 +3982,18 @@ async fn splice_proxy_drive(
             // Honoring the kTLS-parsed 304: record its upstream status here
             // since no standard-path reconnect will run for this response.
             metrics::record_upstream_status(response.status_code);
-            metrics::VOLATILE_REFETCHED_UPTODATE.increment();
 
-            let file = match tokio::fs::File::options()
-                .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW)
-                .open(&cache_path)
-                .await
-            {
-                Ok(f) => f,
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "splice proxy: failed to open cached file `{}` after 304:  {err}",
-                        cache_path.display()
-                    );
-                    return Err(SpliceProxyError::Cache);
-                }
-            };
-            let file = touch_volatile_mtime(file, &cache_path).await;
-            ibarrier.finished(cache_path.clone()).await;
-
-            return match serve_file_via_sendfile(
+            return serve_volatile_304_via_sendfile(
                 client_stream,
                 conn_details,
-                "",
-                (file, &cache_path),
-                (conn_version, conn_action),
+                &cache_path,
+                conn_version,
+                conn_action,
                 client_range,
-                None,
+                ibarrier,
+                "kTLS post-304 invalid response",
             )
-            .await
-            {
-                SendfileResult::Served(_)
-                | SendfileResult::ClientError
-                | SendfileResult::AfterHeaderError => Ok(()),
-                SendfileResult::Invalid { status, msg } => {
-                    write_invalid_response(client_stream, conn_version, conn_action, status, msg)
-                        .await
-                        .map_err(|err| {
-                            SpliceProxyError::Client(err, "kTLS post-304 invalid response")
-                        })?;
-                    Ok(())
-                }
-            };
+            .await;
         } else {
             // Non-200 / no-Content-Length response from the kTLS attempt.
             // We cannot safely forward just the buffered bytes: the body may be
@@ -4169,54 +4198,23 @@ async fn splice_proxy_drive(
             conn_details.debname, conn_details.mirror
         );
 
-        metrics::VOLATILE_REFETCHED_UPTODATE.increment();
-
         // Pool the upstream connection back (304 has no body).
         if upstream_resp.connection_close {
             upstream.unset_poolable();
         }
         drop(upstream);
 
-        let file = match tokio::fs::File::options()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(&cache_path)
-            .await
-        {
-            Ok(f) => f,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "splice proxy: failed to open cached file `{}` after 304:  {err}",
-                    cache_path.display()
-                );
-                return Err(SpliceProxyError::Cache);
-            }
-        };
-        let file = touch_volatile_mtime(file, &cache_path).await;
-        ibarrier.finished(cache_path.clone()).await;
-
-        match serve_file_via_sendfile(
+        return serve_volatile_304_via_sendfile(
             client_stream,
             conn_details,
-            "",
-            (file, &cache_path),
-            (conn_version, conn_action),
+            &cache_path,
+            conn_version,
+            conn_action,
             client_range,
-            None,
+            ibarrier,
+            "post-304 invalid response",
         )
-        .await
-        {
-            SendfileResult::Served(_)
-            | SendfileResult::ClientError
-            | SendfileResult::AfterHeaderError => return Ok(()),
-            SendfileResult::Invalid { status, msg } => {
-                write_invalid_response(client_stream, conn_version, conn_action, status, msg)
-                    .await
-                    .map_err(|err| SpliceProxyError::Client(err, "post-304 invalid response"))?;
-                return Ok(());
-            }
-        }
+        .await;
     }
 
     // Handle 301 Moved Permanently: follow the redirect if the target host is allowed.
