@@ -1016,9 +1016,8 @@ impl Database {
     }
 
     pub(crate) async fn delete_usage_logs(&self, keep_date: Duration) -> Result<(), Error> {
-        let keep_epoch = i64::try_from(keep_date.as_secs()).map_err(|err| Error::TypeNotFound {
-            type_name: err.to_string(),
-        })?;
+        let keep_epoch = i64::try_from(keep_date.as_secs())
+            .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))?;
 
         let mut tx = self.conn.begin().await?;
 
