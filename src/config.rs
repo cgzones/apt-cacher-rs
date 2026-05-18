@@ -1244,51 +1244,6 @@ fn is_valid_config_domain(domain: &str) -> bool {
 }
 
 impl Config {
-    fn default() -> Self {
-        Self {
-            log_level: DEFAULT_LOG_LEVEL,
-            log_file: DEFAULT_LOG_DESTINATION,
-            bind_addr: DEFAULT_BIND_ADDRESS,
-            bind_port: DEFAULT_BIND_PORT,
-            database_path: PathBuf::from(DEFAULT_DATABASE_PATH),
-            cache_directory: PathBuf::from(DEFAULT_CACHE_DIR),
-            database_slow_timeout: DEFAULT_DATABASE_SLOW_TIMEOUT,
-            http_timeout: DEFAULT_HTTP_TIMEOUT,
-            https_upgrade_mode: DEFAULT_HTTPS_UPGRADE_MODE,
-            buffer_size: DEFAULT_BUF_SIZE,
-            aliases: Vec::new(),
-            allowed_mirrors: Vec::new(),
-            http_only_mirrors: Vec::new(),
-            disk_quota: None,
-            allowed_proxy_clients: Vec::new(),
-            allowed_webif_clients: None,
-            https_tunnel_enabled: true,
-            https_tunnel_allowed_ports: DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS.to_vec(),
-            https_tunnel_allowed_mirrors: Vec::new(),
-            https_tunnel_max_connections_per_client:
-                DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT,
-            max_connections_per_client_ip: DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP,
-            byhash_retention_days: DEFAULT_BYHASH_RETENTION_DAYS,
-            usage_retention_days: DEFAULT_USAGE_RETENTION_DAYS,
-            logstore_capacity: DEFAULT_LOGSTORE_CAPACITY,
-            min_download_rate: DEFAULT_MIN_DOWNLOAD_RATE,
-            rate_check_timeframe: DEFAULT_RATE_CHECK_TIMEFRAME,
-            max_upstream_downloads: DEFAULT_MAX_UPSTREAM_DOWNLOADS,
-            db_channel_capacity: DEFAULT_DB_CHANNEL_CAPACITY,
-            db_batch_flush_max_count: DEFAULT_DB_BATCH_FLUSH_MAX_COUNT,
-            db_batch_flush_interval_secs: DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS,
-            mmap_threshold: DEFAULT_MMAP_THRESHOLD,
-            upstream_tcp_nodelay: DEFAULT_UPSTREAM_TCP_NODELAY,
-            reject_pdiff_requests: DEFAULT_REJECT_PDIFF_REQUESTS,
-            experimental_parallel_hack_enabled: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED,
-            experimental_parallel_hack_maxparallel: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL,
-            experimental_parallel_hack_statuscode: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE,
-            experimental_parallel_hack_retryafter: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_RETRYAFTER,
-            experimental_parallel_hack_factor: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_FACTOR,
-            experimental_parallel_hack_minsize: DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MINSIZE,
-        }
-    }
-
     /// Load the configuration from the given file.
     /// Return the loaded configuration, a flag indicating whether the default
     /// configuration file was not found and the built-in defaults were used
@@ -1313,7 +1268,10 @@ impl Config {
                 if err.kind() == std::io::ErrorKind::NotFound
                     && file == Path::new(DEFAULT_CONFIGURATION_PATH) =>
             {
-                (Self::default(), true)
+                (
+                    toml::from_str::<Self>("").expect("built-in defaults must parse"),
+                    true,
+                )
             }
             Err(err) => {
                 return Err(err)
