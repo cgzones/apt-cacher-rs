@@ -17,6 +17,7 @@ use crate::warn_once_or_debug;
 pub(crate) struct SecureVec(Vec<u8>);
 
 impl SecureVec {
+    #[must_use]
     pub(crate) fn new(size: usize) -> Self {
         let v = vec![0u8; size];
 
