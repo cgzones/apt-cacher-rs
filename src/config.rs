@@ -643,12 +643,12 @@ pub(crate) struct Config {
     /// Timeout (in seconds) of database operations after which a warning is generated.
     #[serde(
         default = "default_db_slow_timeout",
-        deserialize_with = "from_secs_f32"
+        deserialize_with = "from_secs_f64"
     )]
     pub(crate) database_slow_timeout: Duration,
 
     /// Timeout (in seconds) for http operations.
-    #[serde(default = "default_http_timeout", deserialize_with = "from_secs_f32")]
+    #[serde(default = "default_http_timeout", deserialize_with = "from_secs_f64")]
     pub(crate) http_timeout: Duration,
 
     /// HTTPS upgrade mode.
@@ -825,14 +825,14 @@ where
     LevelFilter::from_str(&s).map_err(D::Error::custom)
 }
 
-fn from_secs_f32<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+fn from_secs_f64<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
     D: Deserializer<'de>,
 {
     use serde::de::Error as _;
-    let s: f32 = Deserialize::deserialize(deserializer)?;
+    let s: f64 = Deserialize::deserialize(deserializer)?;
 
-    Duration::try_from_secs_f32(s).map_err(D::Error::custom)
+    Duration::try_from_secs_f64(s).map_err(D::Error::custom)
 }
 
 fn from_usize_with_magnitude<'de, D>(deserializer: D) -> Result<usize, D::Error>
