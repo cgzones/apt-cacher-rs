@@ -233,7 +233,10 @@ impl Origin {
         let architecture = parts.next()?;
 
         let filename = parts.next()?;
-        if !filename.starts_with("Packages") && filename != "by-hash" {
+        if !matches!(
+            filename,
+            "Packages" | "Packages.gz" | "Packages.xz" | "Packages.diff" | "by-hash"
+        ) {
             return None;
         }
 
