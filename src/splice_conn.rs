@@ -1705,6 +1705,12 @@ async fn read_upstream_response_headers(
     let deadline = tokio::time::sleep(global_config().http_timeout);
     tokio::pin!(deadline);
 
+    // Incremental scan offset: bytes before this index were already checked for
+    // the \r\n\r\n terminator on a prior iteration. Subtract 3 so a terminator
+    // that straddles the read boundary is still found. Mirrors the kTLS
+    // Phase-3 header-read loop (see lines 1279, 1343).
+    let mut search_offset = 0usize;
+
     loop {
         let read_fut = upstream.read_buf(buf);
         tokio::pin!(read_fut);
@@ -1727,14 +1733,17 @@ async fn read_upstream_response_headers(
             ));
         }
 
-        // Check if we have the complete headers
-        if let Some(end) = buf
+        // Scan only the tail not yet covered (plus a 3-byte overlap to catch
+        // a \r\n\r\n that straddles the previous read boundary).
+        let scan_from = search_offset.saturating_sub(3);
+        if let Some(rel) = buf[scan_from..]
             .array_windows()
             .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 4)
         {
-            return Ok(end);
+            return Ok(scan_from + rel + 4);
         }
+        search_offset = buf.len();
+
         if buf.len() > MAX_RESPONSE_HEADER_SIZE {
             warn_once_or_info!(
                 "splice proxy: upstream response header size of {} bytes exceeds {} bytes",
