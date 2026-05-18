@@ -12,6 +12,7 @@
 //!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
 //!   module-private [`AT_CAP`] latch so each saturation episode counts once.
 
+use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -158,6 +159,23 @@ pub(crate) enum OriginateOutcome {
     },
 }
 
+/// Neutral result of [`ActiveDownloads::lookup_or_insert`], the shared
+/// body of [`ActiveDownloads::insert`] and [`ActiveDownloads::originate`].
+/// Each public method maps this onto its own outcome enum.
+///
+/// Late-joiner metrics (`LATE_JOINERS_TOTAL`, `LATE_JOINER_PEAK_PER_DOWNLOAD`)
+/// have already been bumped inside `lookup_or_insert` when this returns
+/// `LateJoiner`; the public adapters do not need to bump them.
+enum LookupResult {
+    Originator {
+        init_tx: tokio::sync::watch::Sender<()>,
+        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    },
+    LateJoiner {
+        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    },
+}
+
 /// Saturation-transition latch for `max_upstream_downloads`, used exclusively
 /// by [`record_cap_saturation`] and [`record_cap_drain`].
 static AT_CAP: AtomicBool = AtomicBool::new(false);
@@ -168,8 +186,8 @@ static AT_CAP: AtomicBool = AtomicBool::new(false);
 /// config reloads take effect. `AcqRel` pairs with `Release` in
 /// [`record_cap_drain`] so two threads racing the saturation cannot
 /// both observe `false` and double-increment the transition counter.
-fn record_cap_saturation(current_len: usize) {
-    let Some(max) = global_config().max_upstream_downloads else {
+fn record_cap_saturation(current_len: usize, max: Option<NonZero<usize>>) {
+    let Some(max) = max else {
         return;
     };
     if current_len >= max.get() && !AT_CAP.swap(true, Ordering::AcqRel) {
@@ -181,8 +199,8 @@ fn record_cap_saturation(current_len: usize) {
 /// drains to zero so the next saturation episode can be counted. A remove
 /// can only decrease `current_len`, so the latch-set branch is
 /// unreachable from here and is omitted.
-fn record_cap_drain(current_len: usize) {
-    if current_len == 0 && global_config().max_upstream_downloads.is_some() {
+fn record_cap_drain(current_len: usize, max: Option<NonZero<usize>>) {
+    if current_len == 0 && max.is_some() {
         AT_CAP.store(false, Ordering::Release);
     }
 }
@@ -200,6 +218,76 @@ impl ActiveDownloads {
         self.inner.read().len()
     }
 
+    /// Common locked-region body shared by [`Self::insert`] and
+    /// [`Self::originate`]: pre-allocate channel + status, perform the
+    /// `entry()` Occupied / Vacant transition, do the cap-saturation +
+    /// peak + late-joiner accounting, return the neutral [`LookupResult`].
+    ///
+    /// `max_upstream_downloads` is threaded in by the public callers
+    /// (which read it from `global_config()`) so this helper can be
+    /// driven from unit tests without standing up a full configuration.
+    /// The helper is not side-effect-free: it still latches the
+    /// module-private [`AT_CAP`] flag via [`record_cap_saturation`] and
+    /// bumps the `ACTIVE_UPSTREAM_DOWNLOADS_PEAK`, `LATE_JOINERS_TOTAL`,
+    /// and `LATE_JOINER_PEAK_PER_DOWNLOAD` global metrics.
+    fn lookup_or_insert(
+        &self,
+        mirror: &Mirror,
+        debname: &str,
+        layout: CacheLayout,
+        max_upstream_downloads: Option<NonZero<usize>>,
+    ) -> LookupResult {
+        let key = ActiveDownloadKey {
+            mirror: mirror.to_owned(),
+            debname: debname.to_owned(),
+            layout,
+        };
+
+        // Pre-allocate channel + status outside the write lock so the
+        // critical section stays as short as possible.
+        let (tx, rx) = tokio::sync::watch::channel(());
+        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
+
+        let mut guard = self.inner.write();
+        let (outcome, late_joiner_peak) = match guard.entry(key) {
+            Entry::Occupied(mut oentry) => {
+                let entry = oentry.get_mut();
+                entry.late_joiners += 1;
+                let peak = entry.late_joiners;
+                let existing_status = Arc::clone(&entry.status);
+                (
+                    LookupResult::LateJoiner {
+                        status: existing_status,
+                    },
+                    Some(peak),
+                )
+            }
+            Entry::Vacant(ventry) => {
+                ventry.insert(ActiveDownloadEntry {
+                    status: Arc::clone(&status),
+                    late_joiners: 0,
+                });
+                (
+                    LookupResult::Originator {
+                        init_tx: tx,
+                        status,
+                    },
+                    None,
+                )
+            }
+        };
+        let current_len = guard.len();
+        record_cap_saturation(current_len, max_upstream_downloads);
+        drop(guard);
+
+        metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(current_len as u64);
+        if let Some(peak) = late_joiner_peak {
+            metrics::LATE_JOINERS_TOTAL.increment();
+            metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
+        }
+        outcome
+    }
+
     /// Originate a new download or attach as a late joiner if one is already
     /// in flight. Late-joiner accounting (`LATE_JOINERS_TOTAL`,
     /// `LATE_JOINER_PEAK_PER_DOWNLOAD`) is performed atomically when joining,
@@ -211,63 +299,12 @@ impl ActiveDownloads {
         debname: &str,
         layout: CacheLayout,
     ) -> InsertOutcome {
-        enum LookupResult {
-            Occupied {
-                status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-                peak: usize,
-            },
-            Vacant {
-                sender: tokio::sync::watch::Sender<()>,
-                status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-            },
-        }
-
-        // Assuming concurrent requests of resources in-download are rare,
-        // pre-allocate the `ActiveDownloadKey` to avoid the likely
-        // allocation while holding the write-lock.
-        let key = ActiveDownloadKey {
-            mirror: mirror.to_owned(),
-            debname: debname.to_owned(),
-            layout,
-        };
-
-        // Create channel and status before acquiring write lock to minimize lock scope
-        let (tx, rx) = tokio::sync::watch::channel(());
-        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
-
-        let mut guard = self.inner.write();
-        let lres = match guard.entry(key) {
-            Entry::Occupied(mut oentry) => {
-                let entry = oentry.get_mut();
-                entry.late_joiners += 1;
-                LookupResult::Occupied {
-                    status: Arc::clone(&entry.status),
-                    peak: entry.late_joiners,
-                }
+        let max = global_config().max_upstream_downloads;
+        match self.lookup_or_insert(mirror, debname, layout, max) {
+            LookupResult::Originator { init_tx, status } => {
+                InsertOutcome::Originator { init_tx, status }
             }
-            Entry::Vacant(ventry) => {
-                ventry.insert(ActiveDownloadEntry {
-                    status: Arc::clone(&status),
-                    late_joiners: 0,
-                });
-                LookupResult::Vacant { sender: tx, status }
-            }
-        };
-        let current_len = guard.len();
-        record_cap_saturation(current_len);
-        drop(guard);
-
-        metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(current_len as u64);
-        match lres {
-            LookupResult::Occupied { status, peak } => {
-                metrics::LATE_JOINERS_TOTAL.increment();
-                metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
-                InsertOutcome::Joined { status }
-            }
-            LookupResult::Vacant { status, sender } => InsertOutcome::Originator {
-                init_tx: sender,
-                status,
-            },
+            LookupResult::LateJoiner { status } => InsertOutcome::Joined { status },
         }
     }
 
@@ -285,62 +322,17 @@ impl ActiveDownloads {
         debname: &str,
         layout: CacheLayout,
     ) -> OriginateOutcome {
-        let key = ActiveDownloadKey {
-            mirror: mirror.to_owned(),
-            debname: debname.to_owned(),
-            layout,
-        };
-
-        let (tx, rx) = tokio::sync::watch::channel(());
-        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
-
-        // On Occupied, mirror `attach()`: bump the late-joiner counters under
-        // the same write lock so the status we hand back to the caller comes
-        // with its accounting already settled. The caller may still encounter
-        // a `NotApplicable` from `serve_unfinished_sendfile` and fall back to
-        // hyper, where `insert()` would count a second time — same rare-and-
-        // uncorrelated overcount trade as `attach()`.
-        let mut guard = self.inner.write();
-        let (outcome, late_joiner_peak) = match guard.entry(key) {
-            Entry::Occupied(mut oentry) => {
-                let entry = oentry.get_mut();
-                entry.late_joiners += 1;
-                let peak = entry.late_joiners;
-                let existing_status = Arc::clone(&entry.status);
-                (
-                    OriginateOutcome::Concurrent {
-                        status: existing_status,
-                    },
-                    Some(peak),
-                )
+        let max = global_config().max_upstream_downloads;
+        match self.lookup_or_insert(mirror, debname, layout, max) {
+            LookupResult::Originator { init_tx, status } => {
+                OriginateOutcome::Originator { init_tx, status }
             }
-            Entry::Vacant(ventry) => {
-                ventry.insert(ActiveDownloadEntry {
-                    status: Arc::clone(&status),
-                    late_joiners: 0,
-                });
-                (
-                    OriginateOutcome::Originator {
-                        init_tx: tx,
-                        status,
-                    },
-                    None,
-                )
-            }
-        };
-        let current_len = guard.len();
-        record_cap_saturation(current_len);
-        drop(guard);
-
-        metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(current_len as u64);
-        if let Some(peak) = late_joiner_peak {
-            metrics::LATE_JOINERS_TOTAL.increment();
-            metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
+            LookupResult::LateJoiner { status } => OriginateOutcome::Concurrent { status },
         }
-        outcome
     }
 
     pub(crate) fn remove(&self, mirror: &Mirror, debname: &str, layout: CacheLayout) {
+        let max = global_config().max_upstream_downloads;
         let key = ActiveDownloadKeyRef {
             mirror,
             debname,
@@ -348,12 +340,16 @@ impl ActiveDownloads {
         };
         let mut guard = self.inner.write();
         let was_present = guard.remove(&key);
-        // Sample the post-remove length under the same write lock so the
-        // cap-transition latch can clear when the active set drains to zero.
-        // A remove can only decrease the length, so the saturation set-edge
-        // is unreachable here; only the drain reset is meaningful.
+        // Sample the post-remove length AND clear the cap-transition latch
+        // under the same write lock as the length transition. Releasing the
+        // lock first would let a new originator reach `max_upstream_downloads`
+        // and observe the stale `AT_CAP = true` (skipping its counter)
+        // before this clear runs, then we would clear the latch while the
+        // set is at cap. A remove can only decrease the length, so the
+        // saturation set-edge is unreachable here; only the drain reset is
+        // meaningful.
         let current_len = guard.len();
-        record_cap_drain(current_len);
+        record_cap_drain(current_len, max);
         drop(guard);
         assert!(
             was_present.is_some(),
@@ -438,5 +434,68 @@ impl ActiveDownloads {
 
             count
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache_layout::CacheLayout;
+    use crate::config::ClientHost;
+    use crate::deb_mirror::{Mirror, MirrorKind};
+
+    fn test_mirror() -> Mirror {
+        Mirror::new(
+            ClientHost::new("deb.debian.org".to_string()).expect("valid host"),
+            None,
+            String::new(),
+            MirrorKind::Structured,
+        )
+    }
+
+    #[test]
+    fn lookup_or_insert_originator_on_empty() {
+        let ad = ActiveDownloads::new();
+        let mirror = test_mirror();
+        let result = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        assert!(matches!(result, LookupResult::Originator { .. }));
+    }
+
+    #[test]
+    fn lookup_or_insert_late_joiner_on_existing() {
+        let ad = ActiveDownloads::new();
+        let mirror = test_mirror();
+        // First call: originator.
+        let first = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        assert!(matches!(first, LookupResult::Originator { .. }));
+        // Second call on the same key: late joiner.
+        let second = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        assert!(matches!(second, LookupResult::LateJoiner { .. }));
+    }
+
+    #[test]
+    fn lookup_or_insert_late_joiner_peak_counts_per_entry() {
+        let ad = ActiveDownloads::new();
+        let mirror = test_mirror();
+        // 1 originator + 3 late joiners. After 4 calls total, the
+        // entry's late_joiners field should equal 3.
+        let _orig = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        for _ in 0..3 {
+            let _join = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        }
+        // Read back via the inner lock (test-only access is fine).
+        // Use a short-lived scope so the read guard is released promptly.
+        let key = ActiveDownloadKeyRef {
+            mirror: &mirror,
+            debname: "foo.deb",
+            layout: CacheLayout::StructuredPool,
+        };
+        let late_joiners = ad
+            .inner
+            .read()
+            .get(&key)
+            .expect("entry exists")
+            .late_joiners;
+        assert_eq!(late_joiners, 3, "1 originator + 3 joiners -> peak 3");
     }
 }
