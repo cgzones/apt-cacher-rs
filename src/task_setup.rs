@@ -9,9 +9,24 @@ use crate::{cache_layout::SUBDIR_TMP, global_config};
 fn remove_dir_contents<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry_path = entry?.path();
-        debug!("Removing file `{}`", entry_path.display());
-        std::fs::remove_file(&entry_path)
-            .with_context(|| format!("Failed to remove entry `{}`", entry_path.display()))?;
+        let file_type = std::fs::symlink_metadata(&entry_path)
+            .with_context(|| format!("Failed to stat entry `{}`", entry_path.display()))?
+            .file_type();
+
+        if file_type.is_dir() {
+            debug!("Removing directory `{}`", entry_path.display());
+            std::fs::remove_dir_all(&entry_path).with_context(|| {
+                format!("Failed to remove directory `{}`", entry_path.display())
+            })?;
+        } else if file_type.is_symlink() {
+            debug!("Removing symlink `{}`", entry_path.display());
+            std::fs::remove_file(&entry_path)
+                .with_context(|| format!("Failed to remove symlink `{}`", entry_path.display()))?;
+        } else {
+            debug!("Removing file `{}`", entry_path.display());
+            std::fs::remove_file(&entry_path)
+                .with_context(|| format!("Failed to remove file `{}`", entry_path.display()))?;
+        }
     }
     Ok(())
 }
