@@ -87,6 +87,7 @@ use futures_util::StreamExt as _;
 use futures_util::TryStreamExt as _;
 use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
 use http::header::ALLOW;
+use http::uri::Authority;
 use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
 use http_range::{ParsedRange, http_parse_range};
 use hyper::Uri;
@@ -699,6 +700,19 @@ fn quick_response<T: Into<bytes::Bytes>>(
     }
 
     builder.body(full_body(message)).expect("Response is valid")
+}
+
+/// Build a `Host` header value matching the given authority.
+///
+/// IPv6 hosts are kept bracketed per RFC 3986 §3.2.2, and any explicit
+/// port is appended.
+fn host_header_from_uri(auth: &Authority) -> HeaderValue {
+    let host = auth.host();
+    let value = match auth.port_u16() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    HeaderValue::try_from(value).expect("host value is valid")
 }
 
 /// Box `Full<Bytes>` into [`ProxyCacheBody::Boxed`] for
@@ -2886,14 +2900,18 @@ async fn serve_new_file(
 
         if moved_uri.scheme().is_some_and(|scheme| {
             *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
-        }) && let Some(moved_host) = moved_uri.host()
-            && is_host_allowed_cached(moved_host)
+        }) && let Some(moved_auth) = moved_uri.authority()
+            && is_host_allowed_cached(moved_auth.host())
         {
+            // Derive the Host header from the redirect target so it matches
+            // the URI we're actually sending the request to.
+            let redirected_host = host_header_from_uri(moved_auth);
+
             req_uri = std::borrow::Cow::Owned(moved_uri);
 
             let redirected_request = build_fwd_request(
                 &req_uri,
-                host,
+                &redirected_host,
                 &cfstate,
                 volatile_etag,
                 resume_offset,
@@ -4091,8 +4109,14 @@ async fn pre_process_client_request(
 
         if moved_uri.scheme().is_some_and(|scheme| {
             *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
-        }) && moved_uri.host().is_some_and(is_host_allowed_cached)
+        }) && let Some(moved_auth) = moved_uri.authority()
+            && is_host_allowed_cached(moved_auth.host())
         {
+            // Update the Host header so it matches the redirect target,
+            // otherwise the cloned header from the original request would be
+            // sent to a different mirror.
+            let redirected_host = host_header_from_uri(moved_auth);
+            parts_cloned.headers.insert(HOST, redirected_host);
             parts_cloned.uri = moved_uri;
             let redirected_request = Request::from_parts(parts_cloned, Empty::new());
 
@@ -5269,7 +5293,43 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(test)]
 mod tests {
-    use super::content_type_for_cached_file;
+    use super::{Uri, content_type_for_cached_file, host_header_from_uri};
+
+    #[test]
+    fn host_header_from_uri_plain_host() {
+        let uri: Uri = "http://deb.debian.org/foo".parse().unwrap();
+        assert_eq!(
+            host_header_from_uri(uri.authority().unwrap()),
+            "deb.debian.org"
+        );
+    }
+
+    #[test]
+    fn host_header_from_uri_with_port() {
+        let uri: Uri = "http://mirror.example.com:8080/foo".parse().unwrap();
+        assert_eq!(
+            host_header_from_uri(uri.authority().unwrap()),
+            "mirror.example.com:8080"
+        );
+    }
+
+    #[test]
+    fn host_header_from_uri_ipv6_bracketed() {
+        let uri: Uri = "http://[2001:db8::1]/foo".parse().unwrap();
+        assert_eq!(
+            host_header_from_uri(uri.authority().unwrap()),
+            "[2001:db8::1]"
+        );
+    }
+
+    #[test]
+    fn host_header_from_uri_ipv6_with_port() {
+        let uri: Uri = "http://[2001:db8::1]:8080/foo".parse().unwrap();
+        assert_eq!(
+            host_header_from_uri(uri.authority().unwrap()),
+            "[2001:db8::1]:8080"
+        );
+    }
 
     #[test]
     fn content_type_for_text_manifests() {
