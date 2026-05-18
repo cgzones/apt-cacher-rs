@@ -4002,13 +4002,10 @@ async fn pre_process_client_request(
     {
         debug!("Extracted origin: {origin:?}");
 
-        match origin.architecture.as_str() {
-            // TODO: cache some of them?
-            "dep11" | "i18n" | "source" => (),
-            _ => {
-                let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                send_db_command(cmd).await;
-            }
+        // TODO: cache some of them?
+        if !cache_layout::is_pseudo_arch(&origin.architecture) {
+            let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+            send_db_command(cmd).await;
         }
     }
 

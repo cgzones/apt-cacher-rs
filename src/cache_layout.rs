@@ -294,6 +294,23 @@ pub(crate) struct OriginFields {
     pub(crate) architecture: String,
 }
 
+/// Returns `true` for Debian-archive "pseudo-architectures" — values that
+/// appear in the `architecture` position of a `Packages` URL but do not
+/// describe a real binary architecture and therefore are never recorded as
+/// per-binary origins.
+///
+/// The current pseudo-arches are `dep11` (`AppStream` component metadata),
+/// `i18n` (Translation indices), and `source` (source-package indices).
+///
+/// This helper is the single source of truth for the list; adding a future
+/// pseudo-arch (e.g. `signed-by`) is a one-line change here. Call sites:
+/// the `origin_fields` arm in [`classify_request`] and the deferred-`Origin`
+/// DB-emission filters in `main.rs` and `splice_conn.rs`.
+#[must_use]
+pub(crate) fn is_pseudo_arch(arch: &str) -> bool {
+    matches!(arch, "dep11" | "i18n" | "source")
+}
+
 /// The result of [`classify_request`]: the decoded, validated mirror path,
 /// the per-variant `(debname, cached_flavor, layout)` triple needed to build
 /// [`ConnectionDetails`], and any deferred origin record to be sent post-hoc.
@@ -505,13 +522,14 @@ pub(crate) fn classify_request<'a>(
 
             // dep11 / i18n / source aren't real architectures and don't map
             // to per-binary origins.
-            let origin_fields = match &*architecture {
-                "dep11" | "i18n" | "source" => None,
-                _ => Some(OriginFields {
+            let origin_fields = if is_pseudo_arch(&architecture) {
+                None
+            } else {
+                Some(OriginFields {
                     distribution: distribution.to_string(),
                     component: component.to_string(),
                     architecture: architecture.to_string(),
-                }),
+                })
             };
 
             Ok(RequestClass {

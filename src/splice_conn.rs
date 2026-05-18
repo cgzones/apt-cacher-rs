@@ -55,7 +55,7 @@ use crate::sendfile_conn::{
     SendfileResult, async_sendfile, async_sendfile_unfinished, serve_file_via_sendfile,
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
-use crate::xattr_helpers;
+use crate::{cache_layout, xattr_helpers};
 
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::tcp_cork_guard::CorkGuard;
@@ -5182,14 +5182,10 @@ async fn splice_proxy_drive(
         upstream_path,
         conn_details.mirror.host().clone(),
         conn_details.mirror.port(),
-    ) {
-        match origin.architecture.as_str() {
-            "dep11" | "i18n" | "source" => (),
-            _ => {
-                let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                send_db_command(cmd).await;
-            }
-        }
+    ) && !cache_layout::is_pseudo_arch(&origin.architecture)
+    {
+        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        send_db_command(cmd).await;
     }
 
     // If the first client was demoted to file-serve, wait for the
@@ -5846,14 +5842,10 @@ async fn handle_volatile_buffered_download(
         upstream_path,
         conn_details.mirror.host().clone(),
         conn_details.mirror.port(),
-    ) {
-        match origin.architecture.as_str() {
-            "dep11" | "i18n" | "source" => (),
-            _ => {
-                let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                send_db_command(cmd).await;
-            }
-        }
+    ) && !cache_layout::is_pseudo_arch(&origin.architecture)
+    {
+        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        send_db_command(cmd).await;
     }
 
     Ok(())
