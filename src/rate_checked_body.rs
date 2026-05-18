@@ -324,7 +324,7 @@ mod tests {
         let fail = rc.check_fail(RateCheckDirection::Client);
         assert!(fail.is_some(), "rate check should fail for slow transfer");
         let ir = fail.unwrap();
-        assert!(ir.transferred <= 3);
+        assert_eq!(ir.transferred, 3);
         assert_eq!(ir.min_rate, nonzero!(100));
     }
 
