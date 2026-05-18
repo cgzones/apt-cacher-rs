@@ -2870,12 +2870,17 @@ async fn serve_new_file(
 
     trace!("Forwarded response: {fwd_response:?}");
 
-    if fwd_response.status() == StatusCode::MOVED_PERMANENTLY
-        && let Some(moved_uri) = fwd_response
-            .headers()
-            .get(LOCATION)
-            .and_then(|lc| lc.to_str().ok())
-            .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
+    if matches!(
+        fwd_response.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) && let Some(moved_uri) = fwd_response
+        .headers()
+        .get(LOCATION)
+        .and_then(|lc| lc.to_str().ok())
+        .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
@@ -4067,12 +4072,17 @@ async fn pre_process_client_request(
         }
     }
 
-    if fwd_response.status() == StatusCode::MOVED_PERMANENTLY
-        && let Some(moved_uri) = fwd_response
-            .headers()
-            .get(LOCATION)
-            .and_then(|lc| lc.to_str().ok())
-            .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
+    if matches!(
+        fwd_response.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) && let Some(moved_uri) = fwd_response
+        .headers()
+        .get(LOCATION)
+        .and_then(|lc| lc.to_str().ok())
+        .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
     {
         debug!(
             "Requested URI: {}, Moved URI: {moved_uri}",
