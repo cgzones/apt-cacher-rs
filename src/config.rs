@@ -17,6 +17,7 @@ use log::LevelFilter;
 use serde::Deserialize;
 use serde::Deserializer;
 
+use crate::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::nonzero;
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
@@ -46,6 +47,7 @@ const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
 const DEFAULT_DB_BATCH_FLUSH_MAX_COUNT: NonZero<usize> = nonzero!(256);
 const DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS: NonZero<u64> = nonzero!(15);
 const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
+const DEFAULT_MAX_OBJECT_SIZE: Option<NonZero<u64>> = Some(nonzero!(2 * 1024 * 1024 * 1024));
 const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
 const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
@@ -673,6 +675,16 @@ pub(crate) struct Config {
     )]
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
+    /// Maximum size (in bytes) of a single upstream object that will be
+    /// downloaded and cached. An upstream response declaring a larger
+    /// Content-Length is rejected with 502 Bad Gateway before any bytes are
+    /// stored. Set to `0` to disable the cap.
+    #[serde(
+        default = "default_max_object_size",
+        deserialize_with = "from_nonzero_u64_with_magnitude"
+    )]
+    pub(crate) max_object_size: Option<NonZero<u64>>,
+
     /// Retention time (in days) for files acquired "by-hash".
     #[serde(default = "default_byhash_retention_days")]
     pub(crate) byhash_retention_days: NonZero<u64>,
@@ -1075,6 +1087,10 @@ const fn default_mmap_threshold() -> NonZero<u64> {
     DEFAULT_MMAP_THRESHOLD
 }
 
+const fn default_max_object_size() -> Option<NonZero<u64>> {
+    DEFAULT_MAX_OBJECT_SIZE
+}
+
 const fn default_upstream_tcp_nodelay() -> bool {
     DEFAULT_UPSTREAM_TCP_NODELAY
 }
@@ -1343,6 +1359,37 @@ impl Config {
                 "disk_quota of {} is very small; consider a larger value to avoid requests being rejected",
                 quota.get()
             ));
+        }
+
+        if let Some(max_object_size) = self.max_object_size {
+            if max_object_size < VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER {
+                bail!(
+                    "Invalid max_object_size value of {max_object_size}: must be at least the volatile unknown content length upper bound of {VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER}"
+                )
+            }
+
+            if max_object_size < self.mmap_threshold {
+                warnings.push(format!(
+                    "max_object_size of {} is smaller than mmap_threshold ({}); accepted downloads will always stay below the mmap threshold, so the mmap delivery path will never be exercised",
+                    max_object_size.get(),
+                    self.mmap_threshold.get()
+                ));
+            }
+            if max_object_size < nonzero!(100 * 1024 * 1024) {
+                warnings.push(format!(
+                    "max_object_size of {} is very small; consider a larger value to avoid requests being rejected",
+                    max_object_size.get()
+                ));
+            }
+            if let Some(quota) = self.disk_quota
+                && max_object_size > quota
+            {
+                warnings.push(format!(
+                    "max_object_size of {} exceeds disk_quota ({}); the smaller bound (disk_quota) wins",
+                    max_object_size.get(),
+                    quota.get()
+                ));
+            }
         }
 
         if self

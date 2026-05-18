@@ -1652,13 +1652,14 @@ fn build_metrics_html() -> String {
         );
     }
     t.row_tip(
-        "Rejected Requests (pdiff / unsafe path / quota hit)",
-        "Client requests rejected before serving: pdiff requests, requests with unsafe paths, and downloads denied because the configured disk quota is exhausted.",
+        "Rejected Requests (pdiff / unsafe path / quota hit / oversize)",
+        "Client requests rejected before serving: pdiff requests, requests with unsafe paths, downloads denied because the configured disk quota is exhausted, and downloads rejected because the upstream object size exceeded max_object_size.",
         format_args!(
-            "{} / {} / {}",
+            "{} / {} / {} / {}",
             metrics::PDIFF_REJECTED.get(),
             WarnNonzero(metrics::UNSAFE_PATH_REJECTED.get()),
-            WarnNonzero(metrics::DOWNLOAD_REJECTED_QUOTA.get())
+            WarnNonzero(metrics::DOWNLOAD_REJECTED_QUOTA.get()),
+            WarnNonzero(metrics::DOWNLOAD_REJECTED_OVERSIZE.get())
         ),
     );
     t.row_tip(

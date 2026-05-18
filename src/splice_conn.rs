@@ -4535,6 +4535,29 @@ async fn splice_proxy_drive(
         .map_err(|err| SpliceProxyError::Client(err, "zero total-size 502"))?;
         return Ok(());
     };
+    if !crate::limits::content_length_within_cap(
+        total_content_length.get(),
+        global_config().max_object_size,
+    ) {
+        metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
+        warn!(
+            "splice proxy: upstream object size {} for file {} from mirror {} exceeds max_object_size",
+            total_content_length.get(),
+            conn_details.debname,
+            conn_details.mirror
+        );
+        upstream.unset_poolable();
+        write_invalid_response(
+            client_stream,
+            conn_version,
+            conn_action,
+            StatusCode::BAD_GATEWAY,
+            "upstream resource too large",
+        )
+        .await
+        .map_err(|err| SpliceProxyError::Client(err, "oversize 502"))?;
+        return Ok(());
+    }
     let Some(body_content_length) = NonZero::new(body_content_length) else {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         debug!(

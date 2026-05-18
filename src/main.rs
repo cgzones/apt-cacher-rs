@@ -3087,6 +3087,21 @@ async fn serve_new_file(
                     );
                     return quick_response(StatusCode::BAD_GATEWAY, "Invalid Content-Range");
                 };
+
+                if !limits::content_length_within_cap(
+                    total_nz.get(),
+                    global_config().max_object_size,
+                ) {
+                    metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
+                    warn!(
+                        "Upstream 206 declares total size {} for file {} from mirror {} exceeds max_object_size",
+                        total_nz.get(),
+                        conn_details.debname,
+                        conn_details.mirror
+                    );
+                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream resource too large");
+                }
+
                 let Some(remaining_nz) = NonZero::new(remaining) else {
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     // File is already complete — guard drops and cleans up partial
@@ -3188,7 +3203,19 @@ async fn serve_new_file(
                 .ok()
                 .and_then(|ct| ct.parse::<NonZero<u64>>().ok())
         }) {
-            Some(size) => ContentLength::Exact(size),
+            Some(size) => {
+                if !limits::content_length_within_cap(size.get(), global_config().max_object_size) {
+                    metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
+                    warn!(
+                        "Upstream declared Content-Length {} for file {} from mirror {} exceeds max_object_size",
+                        size.get(),
+                        conn_details.debname,
+                        conn_details.mirror
+                    );
+                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream resource too large");
+                }
+                ContentLength::Exact(size)
+            }
             None if conn_details.cached_flavor == CachedFlavor::Volatile => {
                 ContentLength::Unknown(VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER)
             }

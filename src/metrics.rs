@@ -292,6 +292,9 @@ pub(crate) static POOL_RETURN_EVICTED: Counter = Counter::new();
 
 /// Downloads rejected by `CacheQuota::try_acquire` (would exceed `disk_quota`).
 pub(crate) static DOWNLOAD_REJECTED_QUOTA: Counter = Counter::new();
+/// Downloads rejected because the upstream-declared object size exceeded the
+/// configured `max_object_size`.
+pub(crate) static DOWNLOAD_REJECTED_OVERSIZE: Counter = Counter::new();
 
 /// Permanent-file cache lookup found a usable file.
 pub(crate) static CACHE_HITS: Counter = Counter::new();
