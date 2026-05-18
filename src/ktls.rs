@@ -19,6 +19,28 @@ use rustls::crypto::cipher::NONCE_LEN;
 use crate::error::errno_to_io_error;
 use crate::{Never, static_assert, warn_once};
 
+/// Overwrite every byte of a mutable POD value with zeros via `explicit_bzero`,
+/// which the compiler is not permitted to elide.
+///
+/// # Safety
+///
+/// `val` must be a live, fully-initialised value whose entire byte span
+/// (`size_of_val(val)` bytes starting at `val as *mut T`) is valid to
+/// overwrite. This is trivially satisfied for any `&mut T` passed by the
+/// caller where `T` contains no uninitialised bytes — all `libc` kTLS
+/// crypto-info structs are plain C structs that meet this requirement.
+unsafe fn zeroize_pod<T>(val: &mut T) {
+    // SAFETY: Caller guarantees `val` is a live, initialised POD value.
+    // `size_of_val` gives its exact byte span; `from_mut` yields a valid
+    // non-null pointer to that span.
+    unsafe {
+        libc::explicit_bzero(
+            core::ptr::from_mut(val).cast::<libc::c_void>(),
+            size_of_val(val),
+        );
+    }
+}
+
 /// RAII wrapper around `TlsCryptoInfo` that zeroes its payload bytes on drop.
 ///
 /// `TlsCryptoInfo` is `#[derive(Copy, Clone)]`, so each construction / move
@@ -31,32 +53,20 @@ impl Drop for ZeroizingCryptoInfo {
     fn drop(&mut self) {
         match &mut self.0 {
             TlsCryptoInfo::Aes128Gcm(d) => {
-                // SAFETY: `d` is a live, initialized POD struct owned by self.0;
-                // `size_of_val` gives its exact byte span.
-                unsafe {
-                    libc::explicit_bzero(
-                        core::ptr::from_mut(d).cast::<libc::c_void>(),
-                        size_of_val(d),
-                    );
-                }
+                // SAFETY: AES-128-GCM kTLS crypto-info is a live, initialised
+                // POD struct; satisfies `zeroize_pod`'s safety contract.
+                unsafe { zeroize_pod(d) }
             }
             TlsCryptoInfo::Aes256Gcm(d) => {
-                // SAFETY: see Aes128Gcm arm.
-                unsafe {
-                    libc::explicit_bzero(
-                        core::ptr::from_mut(d).cast::<libc::c_void>(),
-                        size_of_val(d),
-                    );
-                }
+                // SAFETY: AES-256-GCM kTLS crypto-info is a live, initialised
+                // POD struct; satisfies `zeroize_pod`'s safety contract.
+                unsafe { zeroize_pod(d) }
             }
             TlsCryptoInfo::Chacha20Poly1305(d) => {
-                // SAFETY: see Aes128Gcm arm.
-                unsafe {
-                    libc::explicit_bzero(
-                        core::ptr::from_mut(d).cast::<libc::c_void>(),
-                        size_of_val(d),
-                    );
-                }
+                // SAFETY: ChaCha20-Poly1305 kTLS crypto-info is a live,
+                // initialised POD struct; satisfies `zeroize_pod`'s safety
+                // contract.
+                unsafe { zeroize_pod(d) }
             }
         }
     }
