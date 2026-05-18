@@ -15,11 +15,26 @@ use sqlx::{
 
 use crate::{
     cache_layout::SUBDIR_FLAT,
-    config::{CacheHost, ClientHost, DomainName, resolve_alias},
+    config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
     deb_mirror,
     deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
     flat_blocklist, global_config,
 };
+
+/// Resolve `host` through the configured aliases and return a reference to the
+/// alias-resolved [`CacheHost`] (the `main` host under which files are actually
+/// stored on disk).  Falls back to `host.as_cache_host()` when no alias matches.
+///
+/// Centralises the five identical
+/// `match resolve_alias(...) { Some(c) => c, None => host.as_cache_host() }`
+/// blocks that appear across `database.rs` and `task_cleanup.rs`. F60.
+#[must_use]
+pub(crate) fn resolved_cache_host<'a>(aliases: &'a [Alias], host: &'a ClientHost) -> &'a CacheHost {
+    match resolve_alias(aliases, host) {
+        Some(c) => c,
+        None => host.as_cache_host(),
+    }
+}
 
 /// Conservative upper bound on the number of bind parameters allowed in a
 /// single `SQLite` statement.
@@ -78,10 +93,7 @@ impl MirrorEntry {
     /// alias.
     #[must_use]
     pub(crate) fn cache_host(&self) -> &CacheHost {
-        match resolve_alias(&global_config().aliases, &self.host) {
-            Some(c) => c,
-            None => self.host.as_cache_host(),
-        }
+        resolved_cache_host(&global_config().aliases, &self.host)
     }
 
     #[must_use]
@@ -171,10 +183,7 @@ impl MirrorStatEntry {
     /// Same alias-resolution semantics as [`MirrorEntry::cache_host`].
     #[must_use]
     fn cache_host(&self) -> &CacheHost {
-        match resolve_alias(&global_config().aliases, &self.host) {
-            Some(c) => c,
-            None => self.host.as_cache_host(),
-        }
+        resolved_cache_host(&global_config().aliases, &self.host)
     }
 
     #[must_use]
@@ -331,11 +340,8 @@ async fn upsert_mirror_get_id(
         // Resolve the requested host through configured aliases so the
         // blocklist key matches the on-disk host directory built by
         // `ConnectionDetails::cache_dir_path` (`aliased_host.unwrap_or(...)`).
-        let resolved_host: &CacheHost = match resolve_alias(&global_config().aliases, mirror.host())
-        {
-            Some(c) => c,
-            None => mirror.host().as_cache_host(),
-        };
+        let resolved_host: &CacheHost =
+            resolved_cache_host(&global_config().aliases, mirror.host());
         flat_blocklist::record_mirror(resolved_host, mirror.port(), mirror.path());
     }
     Ok((row.id, row.was_inserted))
@@ -433,7 +439,8 @@ impl Database {
     /// Run all pending `sqlx::migrate!` migrations against the pool.
     async fn run_migrations(&self) -> Result<(), Error> {
         trace!("Performing database migrations...");
-        sqlx::migrate!().run(&self.conn).await
+        sqlx::migrate!().run(&self.conn).await?;
+        Ok(())
     }
 
     pub(crate) async fn init_tables(&self) -> Result<(), Error> {

@@ -26,8 +26,8 @@ use crate::{
         SUBDIR_TMP,
     },
     cache_metadata,
-    config::{CacheHost, Config, resolve_alias},
-    database::MirrorEntry,
+    config::{CacheHost, Config},
+    database::{MirrorEntry, resolved_cache_host},
     deb_mirror::{
         Mirror, MirrorKind, UriFormat as _, is_deb_package, is_strict_path_descendant,
         mirror_cache_path_impl, path_starts_with_segment,
@@ -897,10 +897,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let aliases = config.aliases.as_slice();
     let mut paths_by_host: HashMap<(&CacheHost, u16), Vec<&str>> = HashMap::new();
     for entry in &mirrors {
-        let cache_host: &CacheHost = match resolve_alias(aliases, &entry.host) {
-            Some(c) => c,
-            None => entry.host.as_cache_host(),
-        };
+        let cache_host: &CacheHost = resolved_cache_host(aliases, &entry.host);
         paths_by_host
             .entry((cache_host, entry.port().map_or(0, std::num::NonZero::get)))
             .or_default()
@@ -916,10 +913,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let nested_per_mirror: Vec<Vec<String>> = mirrors
         .iter()
         .map(|mirror| {
-            let cache_host: &CacheHost = match resolve_alias(aliases, &mirror.host) {
-                Some(c) => c,
-                None => mirror.host.as_cache_host(),
-            };
+            let cache_host: &CacheHost = resolved_cache_host(aliases, &mirror.host);
             let host_paths = paths_by_host
                 .get(&(cache_host, mirror.port().map_or(0, std::num::NonZero::get)))
                 .map(Vec::as_slice)
