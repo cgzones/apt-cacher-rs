@@ -43,7 +43,7 @@ use parking_lot::RwLock;
 
 use crate::{
     cache_layout::SUBDIR_FLAT,
-    config::{CacheHost, ClientHost, resolve_alias},
+    config::{CacheHost, resolve_alias},
     database::Database,
     global_config,
 };
@@ -98,17 +98,17 @@ pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
 
     let aliases = global_config().aliases.as_slice();
     let mut set = HashSet::with_capacity(collision_rows.len());
-    for (host, port, path) in collision_rows {
-        let host = ClientHost::new(host).expect("invalid rows are cleaned up right before");
-        let port = NonZero::new(port);
+    for entry in collision_rows {
+        let port = entry.port();
+        let path = entry.path.as_str();
         // Key the blocklist on the alias-resolved host (the same identity
         // `ConnectionDetails::cache_dir_path` uses for the on-disk host
         // directory), so a structured mirror registered via one alias also
         // blocks flat requests arriving via sibling aliases of the same
         // main host.
-        let resolved: CacheHost = match resolve_alias(aliases, &host) {
+        let resolved: CacheHost = match resolve_alias(aliases, &entry.host) {
             Some(c) => c.clone(),
-            None => host.into_cache_host(),
+            None => entry.host.into_cache_host(),
         };
 
         warn!(

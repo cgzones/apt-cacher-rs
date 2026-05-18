@@ -489,27 +489,17 @@ impl Database {
     /// structured mirror at `path = 'flat'` or `path` starting with
     /// `'flat/'`.  Used at startup to seed the
     /// [`crate::flat_blocklist`].
-    pub(crate) async fn load_flat_collision_mirrors(
-        &self,
-    ) -> Result<Vec<(String, u16, String)>, Error> {
-        struct Row {
-            host: String,
-            port: u16,
-            path: String,
-        }
-
-        let rows = query_as!(
-            Row,
+    pub(crate) async fn load_flat_collision_mirrors(&self) -> Result<Vec<MirrorEntry>, Error> {
+        query_as!(
+            MirrorEntry,
             r#"
-              SELECT host, port AS "port!: u16", path
+              SELECT host AS "host: ClientHost", port AS "port: u16", path, kind AS "kind!: i64"
               FROM mirrors_v2
               WHERE kind = 0 AND (path = 'flat' OR path LIKE 'flat/%');
             "#,
         )
         .fetch_all(&self.conn)
-        .await?;
-
-        Ok(rows.into_iter().map(|r| (r.host, r.port, r.path)).collect())
+        .await
     }
 
     pub(crate) async fn get_mirrors_with_stats(&self) -> Result<Vec<MirrorStatEntry>, Error> {
