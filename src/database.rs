@@ -336,7 +336,7 @@ async fn upsert_mirror_get_id(
     // (was_inserted=false), and that transition must still be observed
     // by the blocklist.  `record_mirror`'s `path_collides_with_flat_layout`
     // check is the cheap pre-filter; the HashSet insert is idempotent.
-    if row.kind == MirrorKind::Structured.as_db_int() {
+    if MirrorKind::from_db_int(row.kind) == Some(MirrorKind::Structured) {
         // Resolve the requested host through configured aliases so the
         // blocklist key matches the on-disk host directory built by
         // `ConnectionDetails::cache_dir_path` (`aliased_host.unwrap_or(...)`).
