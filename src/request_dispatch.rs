@@ -4,12 +4,13 @@
 //! Owns the request-classification pipeline that previously appeared inline
 //! in both dispatchers:
 //!
-//!   1. [`normalize_uri_path`]     - collapse `//` runs / strip `.` segments
-//!   2. [`parse_request_path`]     - structural shape-match into `ResourceFile`
-//!   3. [`classify_request`]       - per-field URL-decode + allowlist validate
-//!   4. flat-blocklist collision   - host-level `flat/` claimed by structured
-//!   5. deferred `Origin` DB write - for `Packages` requests w/ a real arch
-//!   6. diff-request reject (410)  - for parser-rejected URLs, when configured
+//!   1. diff-request gate          - reject (410) pdiff URLs when configured,
+//!      else fall through silently as `Unrecognized`
+//!   2. [`normalize_uri_path`]     - collapse `//` runs / strip `.` segments
+//!   3. [`parse_request_path`]     - structural shape-match into `ResourceFile`
+//!   4. [`classify_request`]       - per-field URL-decode + allowlist validate
+//!   5. flat-blocklist collision   - host-level `flat/` claimed by structured
+//!   6. deferred `Origin` DB write - for `Packages` requests w/ a real arch
 //!   7. unsafe-proxy-path gate     - traversal/control bytes in passthrough
 //!
 //! Backends translate the returned [`DispatchOutcome`] into their response
@@ -206,10 +207,28 @@ fn decide_request(
 ) -> Decision {
     trace!("Dispatching request from client {client}: host=`{requested_host}` path=`{uri_path}`");
 
+    // pdiff URLs have a known shape (`/Packages.diff/T-...`, `/Sources.diff/T-...`,
+    // `/Translation-XX.diff/T-...`) that `parse_request_path` deliberately does
+    // not match — they are uncacheable in this proxy.  Detect them here so we
+    // either refuse with 410 (the default) or fall through to a silent
+    // passthrough, in both cases avoiding a misleading "Unrecognized resource
+    // path" warning for a URL shape we actually do recognise.
+    let is_diff = is_diff_request_path(uri_path);
+    if is_diff && reject_pdiff_requests {
+        info!("Rejecting diff request {uri_path} for client {client}");
+        metrics::PDIFF_REJECTED.increment();
+        return Decision {
+            outcome: DispatchOutcome::Reject(RejectReason::DiffRequest),
+            pending_origin: None,
+        };
+    }
+
     let normalized = normalize_uri_path(uri_path);
     let passthrough_reason: PassthroughReason = match parse_request_path(&normalized) {
         None => {
-            warn_once_or_debug!("Unrecognized resource path from client {client}: {uri_path}");
+            if !is_diff {
+                warn_once_or_debug!("Unrecognized resource path from client {client}: {uri_path}");
+            }
             PassthroughReason::Unrecognized
         }
         Some(resource) => match cache_layout::classify_request(&resource, client) {
@@ -278,17 +297,9 @@ fn decide_request(
     };
 
     // The cache pipeline declined.  Before forwarding upstream uncached,
-    // run the two gates that apply to all passthrough requests: refuse
-    // pdiff (if configured) and refuse traversal/control-byte paths.
-
-    if reject_pdiff_requests && is_diff_request_path(uri_path) {
-        info!("Rejecting diff request {uri_path} for client {client}");
-        metrics::PDIFF_REJECTED.increment();
-        return Decision {
-            outcome: DispatchOutcome::Reject(RejectReason::DiffRequest),
-            pending_origin: None,
-        };
-    }
+    // run the safety gate that applies to all passthrough requests: refuse
+    // traversal/control-byte paths.  (The pdiff gate already fired above,
+    // before parsing, so we don't repeat it here.)
 
     if is_unsafe_proxy_path(uri_path) {
         let passthrough_label = match passthrough_reason {
@@ -547,9 +558,10 @@ mod tests {
 
     #[test]
     fn pdiff_rejection_wins_over_unsafe_path_check() {
-        // The dispatcher runs the pdiff gate before the unsafe-path gate, so a
-        // path that triggers both is rejected as a DiffRequest.  This locks in
-        // ordering: future refactors that swap the gates will fail this test.
+        // The pdiff gate fires before parsing (and therefore before the
+        // unsafe-path gate), so a path that triggers both is rejected as a
+        // DiffRequest.  This locks in precedence: future refactors that move
+        // the pdiff gate after the unsafe-path gate will fail this test.
         let decision = decide_request(
             "/debian/dists/sid/main/binary-amd64/Packages.diff/T-../escape",
             fake_host(),
