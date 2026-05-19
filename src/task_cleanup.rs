@@ -1148,9 +1148,11 @@ async fn cleanup_mirror_deb_files(
 ///
 /// Sorted input lets the lookup skip directly to the prefix region via
 /// `partition_point`.  Within that region, lexicographic order can still
-/// interleave non-nested neighbours (e.g. `debian-security` between `debian`
-/// and `debian/...` since `-` < `/` in ASCII), so segment alignment is
-/// enforced as a filter rather than a `take_while` terminator.
+/// interleave non-segment-aligned siblings (e.g. `debian-security` between
+/// `debian` and `debian/...` since `-` < `/` in ASCII), so segment alignment
+/// is enforced via `is_strict_path_descendant`; the surrounding `take_while`
+/// is a safe termination optimisation, since entries sharing the byte prefix
+/// are contiguous in lexicographic order.
 #[must_use]
 fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<String> {
     if mirror_path.is_empty() {
@@ -1160,6 +1162,11 @@ fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<Str
             .map(|p| (*p).to_owned())
             .collect();
     }
+    // `take_while` terminates the scan once we leave the contiguous
+    // byte-prefix region.  Within that region the byte prefix alone is too
+    // loose — `debian-security` starts with `debian` but is not a
+    // segment-aligned descendant — so `is_strict_path_descendant` filters
+    // out non-aligned siblings.
     let start = host_paths_sorted.partition_point(|p| *p <= mirror_path);
     host_paths_sorted[start..]
         .iter()
@@ -2147,8 +2154,9 @@ mod tests {
     #[test]
     fn derive_nested_paths_skips_non_segment_aligned_prefix_neighbour() {
         // `debian-security` sorts between `debian` and `debian/...` (`-` < `/`)
-        // but is not a nested child; the segment-alignment filter must keep
-        // the take_while running past it instead of stopping early.
+        // but is not a nested child; the segment-alignment filter must exclude
+        // it without halting the surrounding `take_while`, so `debian/foo` and
+        // `debian/security` are still returned.
         let host = sorted(&["debian", "debian-security", "debian/foo", "debian/security"]);
         assert_eq!(
             derive_nested_paths("debian", &host),
@@ -2175,6 +2183,19 @@ mod tests {
     fn derive_nested_paths_no_match() {
         let host = sorted(&["apt", "debian"]);
         assert!(derive_nested_paths("ubuntu", &host).is_empty());
+    }
+
+    #[test]
+    fn derive_nested_paths_handles_underscore_sibling() {
+        // `debian_updates` (underscore) must not be treated as nested under
+        // `debian` even though it shares the `debian` byte prefix.
+        // Likewise `debian-security` (hyphen, sorts before `debian/...`)
+        // must be excluded.  Only `debian/foo` is a true nested child.
+        let host = sorted(&["debian", "debian-security", "debian_updates", "debian/foo"]);
+        assert_eq!(
+            derive_nested_paths("debian", &host),
+            vec!["debian/foo".to_owned()]
+        );
     }
 
     #[test]
