@@ -6537,6 +6537,50 @@ mod tests {
         assert!(!resp.connection_close);
     }
 
+    /// Builds a minimal well-formed HTTP/1.1 response: a `200 OK` status line
+    /// followed by a single `X-Pad` header whose value is `pad_len` bytes of
+    /// `'a'` (an empty value when `pad_len == 0`).
+    fn make_padded_response(pad_len: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"HTTP/1.1 200 OK\r\nX-Pad: ");
+        buf.extend(std::iter::repeat_n(b'a', pad_len));
+        buf.extend_from_slice(b"\r\n\r\n");
+        buf
+    }
+
+    /// `parse_upstream_response` accepts a response whose headers fit exactly
+    /// at `MAX_UPSTREAM_HEADER_SIZE` bytes without error.
+    #[test]
+    fn test_parse_upstream_response_at_max_header_size() {
+        // The read-loop enforces `> MAX_UPSTREAM_HEADER_SIZE`, so a response
+        // whose total header block is exactly MAX_UPSTREAM_HEADER_SIZE bytes
+        // must parse successfully.
+        let preamble = b"HTTP/1.1 200 OK\r\nX-Pad: \r\n\r\n";
+        let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len();
+        let buf = make_padded_response(pad_len);
+        assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE);
+        let result = parse_upstream_response(&buf, buf.len());
+        assert!(
+            result.is_ok(),
+            "expected Ok for response at exact cap, got Err"
+        );
+    }
+
+    /// `parse_upstream_response` does not panic on a response one byte over
+    /// `MAX_UPSTREAM_HEADER_SIZE` (the read-loop would have rejected it first,
+    /// but the parser itself must be robust).
+    #[test]
+    fn test_parse_upstream_response_one_over_max_header_size() {
+        let preamble = b"HTTP/1.1 200 OK\r\nX-Pad: \r\n\r\n";
+        let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len() + 1;
+        let buf = make_padded_response(pad_len);
+        assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE + 1);
+        // Must not panic; Ok or Err both acceptable.
+        match parse_upstream_response(&buf, buf.len()) {
+            Ok(_) | Err(_) => {}
+        }
+    }
+
     #[cfg(feature = "ktls")]
     #[test]
     fn test_discard_incoming() {
