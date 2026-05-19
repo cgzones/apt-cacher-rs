@@ -23,6 +23,42 @@ wildcards = "deny"
 skip-tree = [
     { crate = "windows-sys", depth = 3 },
 ]
+# Block re-introduction of C-binding compression crates that have audited
+# pure-Rust replacements. apt-cacher-rs decodes compressed bytes from arbitrary
+# mirrors (Packages.xz, Packages.gz, by-hash blobs, .deb payloads), i.e.
+# attacker-controlled input. CVE-2024-3094 in liblzma is the cautionary tale;
+# the broader principle is that for untrusted compressed input we prefer
+# memory-safe Rust decoders. The currently-built dependency graph contains NO
+# C compression libraries (verified via `cargo tree -e normal | grep -iE
+# 'libz|bzip|zstd|brotli|lz|snap'`); this list is defence-in-depth against a
+# future dep accidentally dragging one in.
+deny = [
+    # XZ / LZMA family — replaced by lzma-rust2 (direct dep).
+    { crate = "liblzma", reason = "Pure-Rust replacement: lzma-rust2 (already a direct dep). The `liblzma` crate is a thin wrapper around liblzma-sys (C library)." },
+    { crate = "liblzma-sys", reason = "C bindings to liblzma. Use the pure-Rust lzma-rust2 instead." },
+    { crate = "lzma-sys", reason = "C bindings to liblzma (alternative crate name). Use the pure-Rust lzma-rust2 instead." },
+    { crate = "xz2", reason = "Older xz Rust crate that pulls lzma-sys. Use the pure-Rust lzma-rust2 instead." },
+
+    # gzip / zlib family — flate2's default `rust_backend` uses miniz_oxide (pure Rust); reject every C backend.
+    { crate = "libz-sys", reason = "C bindings to zlib. Use flate2 with its default rust_backend (miniz_oxide) feature." },
+    { crate = "libz-ng-sys", reason = "C bindings to zlib-ng. Use flate2 with its default rust_backend (miniz_oxide) feature." },
+    { crate = "cloudflare-zlib-sys", reason = "C bindings to Cloudflare's zlib fork. Use flate2 with its default rust_backend (miniz_oxide) feature." },
+
+    # bzip2 — pure-Rust alternative: bzip2-rs (decoder).
+    { crate = "bzip2-sys", reason = "C bindings to libbzip2. Use bzip2-rs (pure-Rust decoder) if bzip2 support is needed." },
+
+    # zstd — pure-Rust alternative: ruzstd (decoder).
+    { crate = "zstd-sys", reason = "C bindings to libzstd. Use ruzstd (pure-Rust decoder) if zstd support is needed." },
+
+    # brotli — confusingly, the crate named `brotli` IS the pure-Rust implementation; brotli-sys is the C wrapper.
+    { crate = "brotli-sys", reason = "C bindings to Google's libbrotli. Use the `brotli` crate (which is pure-Rust) instead." },
+
+    # lz4 — pure-Rust alternative: lz4_flex.
+    { crate = "lz4-sys", reason = "C bindings to liblz4. Use lz4_flex (pure-Rust) instead." },
+
+    # snappy — pure-Rust alternative: snap.
+    { crate = "snappy", reason = "C++ snappy bindings. Use the `snap` crate (pure-Rust) instead." },
+]
 
 [sources]
 unknown-registry = "deny"
