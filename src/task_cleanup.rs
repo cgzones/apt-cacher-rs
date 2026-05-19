@@ -43,6 +43,7 @@ use crate::{
     },
     metrics, process_cache_request, task_cache_scan,
     utils::probe_dir,
+    xz_stream::xz_decoder,
 };
 
 /// Delay between daemon startup and the first scheduled cleanup run.
@@ -539,7 +540,7 @@ impl PackageFormat {
             }
             Self::Xz => {
                 let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
-                let decoder = async_compression::tokio::bufread::XzDecoder::new(file_reader);
+                let decoder = xz_decoder(file_reader);
                 let limited = LimitedReader::new(decoder, decompressed_limit);
 
                 &mut tokio::io::BufReader::with_capacity(buffer_size, limited)

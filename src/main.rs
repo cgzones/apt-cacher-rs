@@ -60,6 +60,7 @@ mod uncacheables;
 mod utils;
 mod web_interface;
 mod xattr_helpers;
+mod xz_stream;
 
 use std::convert::Infallible;
 use std::error::Error as _;
