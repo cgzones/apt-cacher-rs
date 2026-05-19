@@ -27,7 +27,7 @@
 //! [`normalize_uri_path`]: crate::deb_mirror::normalize_uri_path
 //! [`parse_request_path`]: crate::deb_mirror::parse_request_path
 
-use std::num::NonZero;
+use std::{cell::LazyCell, num::NonZero};
 
 use http::StatusCode;
 use log::{info, trace};
@@ -213,8 +213,9 @@ fn decide_request(
     // either refuse with 410 (the default) or fall through to a silent
     // passthrough, in both cases avoiding a misleading "Unrecognized resource
     // path" warning for a URL shape we actually do recognise.
-    let is_diff = is_diff_request_path(uri_path);
-    if is_diff && reject_pdiff_requests {
+    let is_diff = LazyCell::new(|| is_diff_request_path(uri_path));
+
+    if reject_pdiff_requests && *is_diff {
         info!("Rejecting diff request {uri_path} for client {client}");
         metrics::PDIFF_REJECTED.increment();
         return Decision {
@@ -226,7 +227,7 @@ fn decide_request(
     let normalized = normalize_uri_path(uri_path);
     let passthrough_reason: PassthroughReason = match parse_request_path(&normalized) {
         None => {
-            if !is_diff {
+            if !*is_diff {
                 warn_once_or_debug!("Unrecognized resource path from client {client}: {uri_path}");
             }
             PassthroughReason::Unrecognized
