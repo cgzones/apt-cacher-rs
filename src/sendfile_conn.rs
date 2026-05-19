@@ -17,15 +17,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::cache_conditional::CacheInfo;
-use crate::cache_layout::{self, CachedFlavor, ConnectionDetails};
+use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_metadata::{self, CacheMetadataKeyRef};
-use crate::config::{CacheHost, resolve_alias};
-use crate::database_task::{DatabaseCommand, DbCmdDelivery, DbCmdOrigin, send_db_command};
-use crate::deb_mirror::{
-    Mirror, Origin, is_unsafe_proxy_path, normalize_uri_path, parse_request_path,
-};
+use crate::database_task::{DatabaseCommand, DbCmdDelivery, send_db_command};
 use crate::error::{ErrorReport, errno_to_io_error};
-use crate::flat_blocklist;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header, find_header_end,
     write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
@@ -34,13 +29,14 @@ use crate::http_helpers::{
 use crate::http_range::{ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{hint_sequential_read, is_peer_disconnect};
 use crate::{
     APP_NAME, ActiveDownloadStatus, AppState, ClientInfo, ContentLength, Never,
     VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter, content_type_for_cached_file,
-    global_config, handle_hyper_connection, is_diff_request_path, metrics, static_assert,
-    warn_once_or_debug, warn_once_or_info,
+    global_config, handle_hyper_connection, metrics, static_assert, warn_once_or_debug,
+    warn_once_or_info,
     web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
 };
 
@@ -576,47 +572,55 @@ async fn try_sendfile_request(
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
-    // Match all cacheable resource types for sendfile/splice serving.
-    // Collapse `//` runs before parsing — clients with a trailing slash in
-    // their `sources.list` URI emit `/debian//dists/...`; raw `uri_path` is
-    // preserved for logs and upstream simple-proxy passthrough so the
-    // client request still flows verbatim when the parser declines it.
+    // Unified dispatch shared with main.rs: normalize -> parse -> classify
+    // -> flat-blocklist -> diff-reject -> unsafe-path gate.  Logging,
+    // metric bumping, and deferred Origin DB writes happen inside
+    // `dispatch_request`; this match only maps outcomes to ZeroCopyResult.
     let uri_path = uri.path();
-    let normalized_uri_path = normalize_uri_path(uri_path);
-    let Some(resource) = parse_request_path(&normalized_uri_path) else {
-        if global_config().reject_pdiff_requests && is_diff_request_path(uri_path) {
-            info!("Rejecting diff request {uri_path} for client {client}");
-
-            metrics::PDIFF_REJECTED.increment();
-            return ZeroCopyResult::Rejection {
-                status: StatusCode::GONE,
-                conn_action,
-                msg: "Diff requests are not supported",
+    let plan = match dispatch_request(uri_path, requested_host, requested_port, &client).await {
+        DispatchOutcome::Cache(plan) => plan,
+        DispatchOutcome::Reject(reason) => {
+            let (status, msg) = reason.response_parts();
+            // Diff-request rejections keep the connection alive; the other
+            // 4xx variants close to defend against header smuggling.
+            return match reason {
+                RejectReason::DiffRequest => ZeroCopyResult::Rejection {
+                    status,
+                    conn_action,
+                    msg,
+                },
+                RejectReason::BadEncoding
+                | RejectReason::InvalidValue
+                | RejectReason::UnsafePath => ZeroCopyResult::Invalid { status, msg },
             };
         }
-
-        warn_once_or_debug!("Unrecognized resource path from client {client}: {uri_path}");
-
-        // Reject paths with traversal sequences, control characters, or invalid encoding.
-        if is_unsafe_proxy_path(uri_path) {
-            metrics::UNSAFE_PATH_REJECTED.increment();
-            warn_once_or_info!(
-                "Rejecting unsafe unrecognized path from client {client}: {uri_path}"
-            );
-            return ZeroCopyResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported request",
-            };
-        }
-
+        // Pool filename failed the deb-extension or strict-flat-shape check;
+        // hand back to hyper so the simple proxy can handle it without caching.
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::NonDebPool,
+            requested_host: _,
+        } => return ZeroCopyResult::NotApplicable("unsupported pool filename"),
+        // Structured mirror has claimed this host's `flat/` anchor; hand back
+        // to hyper which will pass the request through uncached.
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::FlatBlocked,
+            requested_host: _,
+        } => return ZeroCopyResult::NotApplicable("flat host blocked by structured collision"),
         #[cfg(feature = "splice")]
-        {
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::Unrecognized,
+            requested_host,
+        } => {
             use crate::{
-                deb_mirror::MirrorKind,
+                deb_mirror::{Mirror, MirrorKind},
                 splice_conn::{SpliceProxyError, splice_simple_proxy},
                 uncacheables::record_uncacheable,
             };
 
+            // Splice serves this request directly; hyper won't re-enter the
+            // dispatcher, so record here.  The `NotApplicable` arms above
+            // intentionally skip this - hyper records when it re-runs the
+            // dispatcher.
             record_uncacheable(&requested_host, uri_path);
 
             // Simple-proxy path: this Mirror is used only for upstream
@@ -675,83 +679,26 @@ async fn try_sendfile_request(
                 },
             };
         }
-
         #[cfg(not(feature = "splice"))]
-        return ZeroCopyResult::NotApplicable("unrecognized resource path");
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::Unrecognized,
+            requested_host: _,
+        } => return ZeroCopyResult::NotApplicable("unrecognized resource path"),
     };
 
-    let class = match cache_layout::classify_request(&resource, &client) {
-        Ok(class) => class,
-        Err(cache_layout::ClassifyError::BadEncoding { kind, raw, source }) => {
-            warn_once_or_info!(
-                "Failed to decode {kind} `{}` from client {client}:  {source}",
-                raw.escape_debug()
-            );
-            return ZeroCopyResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported URL encoding",
-            };
-        }
-        Err(cache_layout::ClassifyError::InvalidValue { kind, decoded }) => {
-            warn_once_or_info!("Unsupported {kind} `{decoded}` from client {client}");
-            return ZeroCopyResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Unsupported request",
-            };
-        }
-        Err(cache_layout::ClassifyError::NonDebPool { filename: _ }) => {
-            // Pool filename failed the deb extension check (structured
-            // Pool) or the strict flat-pool shape check; hand back to
-            // hyper so the simple proxy can handle it without caching.
-            return ZeroCopyResult::NotApplicable("unsupported pool filename");
-        }
-    };
-
-    let aliased_host = resolve_alias(&global_config().aliases, &requested_host);
-
-    // Per-host flat collision: a structured mirror with
-    // `mirror_path == "flat"` (or `"flat/..."`) has already claimed the
-    // host-level `flat/` anchor; hand back to hyper which will pass the
-    // request through uncached. The blocklist is keyed on the alias-resolved
-    // host (matching the on-disk host directory) so sibling aliases share it.
-    let cache_id: &CacheHost = match aliased_host {
-        Some(cache) => cache,
-        None => requested_host.as_cache_host(),
-    };
-    if class.layout.is_flat() && flat_blocklist::is_blocked(cache_id, requested_port) {
-        return ZeroCopyResult::NotApplicable("flat host blocked by structured collision");
-    }
-
-    let aliased = match aliased_host {
+    let aliased = match plan.aliased_host {
         Some(alias) => format!(" aliased to host {alias}"),
         None => String::new(),
     };
 
     let conn_details = ConnectionDetails {
         client,
-        mirror: Mirror::new(
-            requested_host,
-            requested_port,
-            class.mirror_path,
-            class.layout.mirror_kind(),
-        ),
-        aliased_host,
-        debname: class.debname,
-        cached_flavor: class.cached_flavor,
-        layout: class.layout,
+        mirror: plan.mirror,
+        aliased_host: plan.aliased_host,
+        debname: plan.debname,
+        cached_flavor: plan.cached_flavor,
+        layout: plan.layout,
     };
-
-    // Record origin for Packages requests (mirrors main.rs behavior)
-    if let Some(fields) = class.origin_fields {
-        let origin = Origin {
-            mirror: conn_details.mirror.clone(),
-            distribution: fields.distribution,
-            component: fields.component,
-            architecture: fields.architecture,
-        };
-        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-        send_db_command(cmd).await;
-    }
 
     // Check if the file is currently being downloaded — if so, serve it via
     // sendfile from the growing partial file instead of falling back to hyper.
