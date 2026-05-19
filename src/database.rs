@@ -651,7 +651,16 @@ impl Database {
         Ok(rows
             .into_iter()
             .filter_map(|r| {
-                let octets: [u8; 16] = r.client_ip.try_into().ok()?;
+                let octets: [u8; 16] = match r.client_ip.try_into() {
+                    Ok(o) => o,
+                    Err(blob) => {
+                        warn!(
+                            "get_clients_with_stats: dropping row with malformed client_ip blob ({} bytes)",
+                            blob.len()
+                        );
+                        return None;
+                    }
+                };
                 let ip: Ipv6Addr = octets.into();
                 Some(ClientStatEntry {
                     client_ip: ip.to_canonical(),
