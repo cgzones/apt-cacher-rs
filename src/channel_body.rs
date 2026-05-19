@@ -6,10 +6,36 @@ pub(crate) enum ChannelBodyError {
     MirrorDownloadRate(error::MirrorDownloadRate),
 }
 
+#[derive(Clone, Copy)]
+enum Remaining {
+    Exact(u64),
+    Upper(u64),
+}
+
+impl Remaining {
+    fn try_consume(self, n: u64) -> Option<Self> {
+        match self {
+            Self::Exact(v) => v.checked_sub(n).map(Self::Exact),
+            Self::Upper(v) => v.checked_sub(n).map(Self::Upper),
+        }
+    }
+
+    fn to_size_hint(self) -> SizeHint {
+        match self {
+            Self::Exact(n) => SizeHint::with_exact(n),
+            Self::Upper(n) => {
+                let mut sz = SizeHint::new();
+                sz.set_upper(n);
+                sz
+            }
+        }
+    }
+}
+
 pub(crate) struct ChannelBody {
     receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, ChannelBodyError>>,
     content_length: ContentLength,
-    remaining: SizeHint,
+    remaining: Remaining,
     received: u64,
     complete: bool,
 }
@@ -21,12 +47,8 @@ impl ChannelBody {
         content_length: ContentLength,
     ) -> Self {
         let remaining = match content_length {
-            ContentLength::Exact(size) => SizeHint::with_exact(size.get()),
-            ContentLength::Unknown(size) => {
-                let mut sz = SizeHint::new();
-                sz.set_upper(size.get());
-                sz
-            }
+            ContentLength::Exact(size) => Remaining::Exact(size.get()),
+            ContentLength::Unknown(size) => Remaining::Upper(size.get()),
         };
 
         Self {
@@ -53,9 +75,7 @@ impl Body for ChannelBody {
     type Error = Box<ProxyCacheError>;
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        // TODO: derive Copy for hyper::body::SizeHint
-        // https://github.com/hyperium/http-body/pull/164
-        self.remaining.clone()
+        self.remaining.to_size_hint()
     }
 
     fn is_end_stream(&self) -> bool {
@@ -79,40 +99,19 @@ impl Body for ChannelBody {
             d.map(|b| match b {
                 Ok(data) => {
                     let datalen = data.len() as u64;
-
-                    match (self.remaining.exact(), self.remaining.upper()) {
-                        (Some(size), _) => match size.checked_sub(datalen) {
-                            None => {
-                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                Err(Box::new(ProxyCacheError::ContentTooLarge {
-                                    announced: self.content_length,
-                                    received: self.received + datalen,
-                                }))
-                            }
-                            Some(val) => {
-                                self.received += datalen;
-                                self.remaining.set_exact(val);
-                                metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
-                                Ok(Frame::data(data))
-                            }
-                        },
-                        (None, Some(size)) => match size.checked_sub(datalen) {
-                            None => {
-                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                Err(Box::new(ProxyCacheError::ContentTooLarge {
-                                    announced: self.content_length,
-                                    received: self.received + datalen,
-                                }))
-                            }
-                            Some(val) => {
-                                self.received += datalen;
-                                self.remaining.set_upper(val);
-                                metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
-                                Ok(Frame::data(data))
-                            }
-                        },
-                        (None, None) => {
-                            unreachable!("size hint is either exact or has an upper limit");
+                    match self.remaining.try_consume(datalen) {
+                        None => {
+                            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                            Err(Box::new(ProxyCacheError::ContentTooLarge {
+                                announced: self.content_length,
+                                received: self.received + datalen,
+                            }))
+                        }
+                        Some(updated) => {
+                            self.received += datalen;
+                            self.remaining = updated;
+                            metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
+                            Ok(Frame::data(data))
                         }
                     }
                 }
