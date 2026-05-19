@@ -767,4 +767,37 @@ mod tests {
         // Invalid: garbage
         assert_eq!(parse_content_range("bytes abc-def/ghi"), None);
     }
+
+    #[test]
+    fn parse_content_range_accepts_boundary() {
+        // The boundary case: start=0, end=u64::MAX-1, total=u64::MAX.
+        // start <= end, end < total, end - start + 1 = u64::MAX (fits in u64).
+        let s = format!("bytes 0-{}/{}", u64::MAX - 1, u64::MAX);
+        let parsed = parse_content_range(&s);
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn parse_content_range_rejects_total_smaller_than_end() {
+        // total < end -> inconsistent Content-Range, must be rejected.
+        assert!(parse_content_range("bytes 100-200/50").is_none());
+    }
+
+    #[test]
+    fn http_parse_range_rejects_inverted_range() {
+        let result = http_parse_range(
+            "bytes=500-100",
+            None,
+            1_000_000,
+            HttpDate::from_secs(0),
+            None,
+        );
+        assert!(matches!(result, ParsedRange::Invalid));
+    }
+
+    #[test]
+    fn http_parse_range_zero_file_size_returns_not_satisfiable() {
+        let result = http_parse_range("bytes=0-100", None, 0, HttpDate::from_secs(0), None);
+        assert!(matches!(result, ParsedRange::NotSatisfiable));
+    }
 }
