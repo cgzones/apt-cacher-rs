@@ -4892,7 +4892,11 @@ async fn splice_proxy_drive(
     // Write response headers to client
     let last_modified_str = upstream_resp.last_modified.as_deref();
     let content_type = content_type_for_cached_file(&conn_details.debname);
-    warn_on_content_type_mismatch(upstream_resp.content_type.as_deref(), &conn_details.debname);
+    warn_on_content_type_mismatch(
+        upstream_resp.content_type.as_deref(),
+        &conn_details.mirror,
+        &conn_details.debname,
+    );
     let date = format_http_date();
     // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
     let age: u32 = 0;
@@ -5752,7 +5756,11 @@ async fn handle_volatile_buffered_download(
     // Send response headers to client.
     let last_modified_str = upstream_resp.last_modified.as_deref().unwrap_or("");
     let content_type = content_type_for_cached_file(&conn_details.debname);
-    warn_on_content_type_mismatch(upstream_resp.content_type.as_deref(), &conn_details.debname);
+    warn_on_content_type_mismatch(
+        upstream_resp.content_type.as_deref(),
+        &conn_details.mirror,
+        &conn_details.debname,
+    );
     let date = format_http_date();
     // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
     let age: u32 = 0;

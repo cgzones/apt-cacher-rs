@@ -166,6 +166,7 @@ use crate::database_task::DbCmdDownload;
 use crate::database_task::DbCmdOrigin;
 use crate::database_task::db_loop;
 use crate::database_task::send_db_command;
+use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
 use crate::error::ErrorReport;
 use crate::error::ProxyCacheError;
@@ -234,7 +235,11 @@ const DB_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// from the cached file's basename. The non-standard `binary/octet-stream`
 /// is widely advertised by Debian mirrors and is treated as a no-op rather
 /// than a mismatch to keep the log quiet.
-pub(crate) fn warn_on_content_type_mismatch(upstream: Option<&str>, debname: &str) {
+pub(crate) fn warn_on_content_type_mismatch(
+    upstream: Option<&str>,
+    mirror: &Mirror,
+    debname: &str,
+) {
     let Some(upstream_ct) = upstream else {
         return;
     };
@@ -242,11 +247,20 @@ pub(crate) fn warn_on_content_type_mismatch(upstream: Option<&str>, debname: &st
         return;
     }
     let expected = content_type_for_cached_file(debname);
-    if !upstream_ct.eq_ignore_ascii_case(expected) {
-        warn_once_or_info!(
-            "Upstream Content-Type `{upstream_ct}` differs from expected `{expected}` for {debname}"
-        );
+    if upstream_ct.eq_ignore_ascii_case(expected) {
+        return;
     }
+    // `application/x-deb` is the legacy unregistered alias for the
+    // IANA-registered `application/vnd.debian.binary-package`; treat them
+    // as equivalent.
+    if expected == "application/vnd.debian.binary-package"
+        && upstream_ct.eq_ignore_ascii_case("application/x-deb")
+    {
+        return;
+    }
+    warn_once_or_info!(
+        "Upstream Content-Type `{upstream_ct}` differs from expected `{expected}` for {debname} from {mirror}"
+    );
 }
 
 /// Derive the Content-Type for a cached file based on its filename extension.
@@ -3335,7 +3349,11 @@ async fn serve_new_file(
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|hv| hv.to_str().ok());
-    warn_on_content_type_mismatch(upstream_content_type, &conn_details.debname);
+    warn_on_content_type_mismatch(
+        upstream_content_type,
+        &conn_details.mirror,
+        &conn_details.debname,
+    );
 
     let (_parts, body) = fwd_response.into_parts();
 
