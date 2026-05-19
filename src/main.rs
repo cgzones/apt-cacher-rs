@@ -42,6 +42,7 @@ mod log_once;
 mod logstore;
 mod metrics;
 mod rate_checked_body;
+mod request_dispatch;
 mod ringbuffer;
 #[cfg(feature = "ktls")]
 mod secure_vec;
@@ -154,11 +155,9 @@ use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::cache_metadata::UpstreamMetadataView;
 use crate::cache_quota::QuotaExceeded;
-use crate::config::CacheHost;
 use crate::config::Config;
 use crate::config::HttpsUpgradeMode;
 use crate::config::LogDestination;
-use crate::config::resolve_alias;
 use crate::database::Database;
 use crate::database_task::DatabaseCommand;
 use crate::database_task::DbCmdDelivery;
@@ -166,10 +165,7 @@ use crate::database_task::DbCmdDownload;
 use crate::database_task::DbCmdOrigin;
 use crate::database_task::db_loop;
 use crate::database_task::send_db_command;
-use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
-use crate::deb_mirror::is_diff_request_path;
-use crate::deb_mirror::parse_request_path;
 use crate::error::ErrorReport;
 use crate::error::ProxyCacheError;
 use crate::guards::DownloadBarrier;
@@ -185,6 +181,7 @@ use crate::logstore::LogStore;
 use crate::permitted_host_cache::authorize_cache_access;
 use crate::permitted_host_cache::is_host_allowed_cached;
 use crate::rate_checked_body::RateCheckDirection;
+use crate::request_dispatch::{DispatchOutcome, dispatch_request};
 use crate::task_cache_scan::task_cache_scan;
 use crate::task_cleanup::{
     CLEANUP_INTERVAL_SECS, FIRST_CLEANUP_DELAY_SECS, set_next_cleanup_epoch, task_cleanup,
@@ -3930,8 +3927,6 @@ async fn pre_process_client_request(
         Err((status, msg)) => return quick_response(status, msg),
     };
 
-    let aliased_host = resolve_alias(&config.aliases, &requested_host);
-
     if req.body().size_hint().exact() != Some(0) {
         warn_once_or_info!(
             "Request from client {client} has non empty body, not forwarding body: {req:?}"
@@ -3940,114 +3935,38 @@ async fn pre_process_client_request(
     let (parts, _body) = req.into_parts();
     let req = Request::from_parts(parts, Empty::new());
 
-    let requested_path = req.uri().path();
-
-    trace!(
-        "Requested host: `{requested_host}`; Aliased host: `{aliased_host:?}`; Requested path: `{requested_path}`"
-    );
-
-    // Collapse `//` runs before parsing — clients with a trailing slash in
-    // their `sources.list` URI emit `/debian//dists/...`; raw
-    // `requested_path` is kept for logging and uncached upstream proxying.
-    let normalized_path = deb_mirror::normalize_uri_path(requested_path);
-    if let Some(resource) = parse_request_path(&normalized_path) {
-        match cache_layout::classify_request(&resource, &client) {
-            Ok(class) => {
-                // Per-host flat collision: if a structured mirror with
-                // `mirror_path == "flat"` (or `"flat/..."`) was registered
-                // on this host, the host-level `flat/` anchor is already
-                // claimed by structured caching.  Reject flat URLs on
-                // that host and fall through to the simple-proxy
-                // passthrough.
-                let cache_id: &CacheHost = match aliased_host {
-                    Some(cache) => cache,
-                    None => requested_host.as_cache_host(),
+    let requested_host =
+        match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await {
+            DispatchOutcome::Cache(plan) => {
+                let conn_details = ConnectionDetails {
+                    client,
+                    mirror: plan.mirror,
+                    aliased_host: plan.aliased_host,
+                    debname: plan.debname,
+                    cached_flavor: plan.cached_flavor,
+                    layout: plan.layout,
                 };
-                if class.layout.is_flat() && flat_blocklist::is_blocked(cache_id, requested_port) {
-                    warn_once_or_info!(
-                        "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing `{requested_path}` through uncached"
-                    );
-                } else {
-                    let mirror = Mirror::new(
-                        requested_host,
-                        requested_port,
-                        class.mirror_path,
-                        class.layout.mirror_kind(),
-                    );
-                    let conn_details = ConnectionDetails {
-                        client,
-                        mirror,
-                        aliased_host,
-                        debname: class.debname,
-                        cached_flavor: class.cached_flavor,
-                        layout: class.layout,
-                    };
-
-                    if let Some(fields) = class.origin_fields {
-                        let origin = Origin {
-                            mirror: conn_details.mirror.clone(),
-                            distribution: fields.distribution,
-                            component: fields.component,
-                            architecture: fields.architecture,
-                        };
-                        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-                        send_db_command(cmd).await;
-                    }
-
-                    return process_cache_request(conn_details, req, appstate).await;
-                }
+                return process_cache_request(conn_details, req, appstate).await;
             }
-            Err(cache_layout::ClassifyError::BadEncoding { kind, raw, source }) => {
-                warn_once_or_info!(
-                    "Failed to decode {kind} `{}`:  {source}",
-                    raw.escape_debug()
-                );
-                return quick_response(StatusCode::BAD_REQUEST, "Unsupported URL encoding");
+            DispatchOutcome::Reject(reason) => {
+                let (status, msg) = reason.response_parts();
+                return quick_response(status, msg);
             }
-            Err(cache_layout::ClassifyError::InvalidValue { kind, decoded }) => {
-                warn_once_or_info!("Unsupported {kind} `{decoded}`");
-                return quick_response(StatusCode::BAD_REQUEST, "Unsupported request");
-            }
-            Err(cache_layout::ClassifyError::NonDebPool { filename }) => {
-                // Either a structured Pool filename without a
-                // `.deb`/`.udeb`/`.ddeb` extension, or a Flat::Pool
-                // filename whose decoded form failed the strict
-                // `<name>_<ver>_<arch>.<ext>` shape check.  Log and fall
-                // through to the simple proxy below (no caching).
-                warn_once_or_info!("Unsupported pool filename `{filename}` from client {client}");
-            }
-        }
-    }
+            DispatchOutcome::Passthrough { requested_host, .. } => requested_host,
+        };
 
     assert_eq!(req.method(), Method::GET, "Filtered at function start");
-
-    if global_config().reject_pdiff_requests && is_diff_request_path(requested_path) {
-        info!("Rejecting diff request {requested_path} for client {client}");
-
-        metrics::PDIFF_REJECTED.increment();
-        return quick_response(StatusCode::GONE, "Diff requests are not supported");
-    }
 
     //
     // Simple proxy (without any caching)
     //
-
-    // Reject paths with traversal sequences, control characters, or invalid encoding.
-    if deb_mirror::is_unsafe_proxy_path(requested_path) {
-        warn_once_or_info!(
-            "Rejecting unsafe unrecognized path {} for client {client}",
-            req.uri()
-        );
-        metrics::UNSAFE_PATH_REJECTED.increment();
-        return quick_response(StatusCode::BAD_REQUEST, "Unsupported request");
-    }
 
     warn_once_or_info!(
         "Proxying (without caching) request {} for client {client}",
         req.uri()
     );
 
-    record_uncacheable(&requested_host, requested_path);
+    record_uncacheable(&requested_host, req.uri().path());
 
     let (mut parts, _body) = req.into_parts();
     parts
