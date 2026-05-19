@@ -1786,8 +1786,6 @@ async fn serve_volatile_file(
     let modified_system_time = mdata
         .modified()
         .expect("Platform should support modification timestamps via setup check");
-    let local_modification_time = HttpDate::from(modified_system_time);
-    let prev_size = mdata.size();
 
     // Cache volatile files for short periods to reduce up-to-date requests.
     // Compute age from the raw SystemTime — HttpDate rounds sub-second mtimes
@@ -1851,8 +1849,8 @@ async fn serve_volatile_file(
                 CacheFileStat::Volatile {
                     file,
                     file_path,
-                    local_modification_time,
-                    prev_size,
+                    local_modification_time: HttpDate::from(modified_system_time),
+                    prev_size: mdata.size(),
                 },
                 appstate,
             )
