@@ -51,6 +51,7 @@ use crate::ktls;
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::rate_log;
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;
 use crate::sendfile_conn::RangeRequestHeaders;
@@ -64,7 +65,7 @@ use crate::utils::{
 };
 use crate::xattr_helpers;
 use crate::{
-    APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, ContentLength, Never,
+    APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, ClientInfo, ContentLength, Never,
     OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
     VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, cache_metadata, client_counter,
     content_type_for_cached_file, global_cache_quota, global_config, is_host_allowed_cached,
@@ -1164,6 +1165,11 @@ async fn unbuffered_ktls_request(
     // TLS 1.3 typically sends 1-2 NewSessionTicket records; a handful of iterations
     // covers the legitimate case while still catching pathological peers quickly.
     let mut post_handshake_rounds = 0u32;
+    // Instant the encrypted HTTP request was transmitted - start of the
+    // upstream-rate window. Set in the `WriteTraffic` arm below; every other
+    // arm of the request-send loop continues or returns, so the compiler can
+    // prove definite initialisation by the time the post-loop read occurs.
+    let req_sent: Option<coarsetime::Instant>;
 
     loop {
         /// Cap on state-machine rounds between handshake-complete and
@@ -1233,6 +1239,7 @@ async fn unbuffered_ktls_request(
                 write_all_to_stream(tcp, &outgoing[..enc_len], WritePhase::Header)
                     .await
                     .map_err(KtlsError::KtlsSetupFailed)?;
+                req_sent = Some(coarsetime::Instant::now());
                 break;
             }
             ConnectionState::BlockedHandshake => {
@@ -1407,12 +1414,13 @@ async fn unbuffered_ktls_request(
     // --- Parse response to check status before setting up kTLS ---
     // Malformed HTTP from the upstream is not a kTLS issue — surface it as
     // UpstreamProtocolError so the host stays eligible for kTLS retries.
-    let response = parse_upstream_response(&header_buf, header_end).map_err(|err| {
+    let mut response = parse_upstream_response(&header_buf, header_end).map_err(|err| {
         KtlsError::UpstreamProtocolError(std::io::Error::new(
             err.kind(),
             format!("kTLS upstream protocol error:  {err}"),
         ))
     })?;
+    response.request_sent_at = req_sent;
 
     if response.status_code != 200 || response.content_length.is_none_or(|ct| ct == 0) {
         // Non-spliceable response: the caller will reconnect via the standard
@@ -1789,6 +1797,9 @@ struct UpstreamResponse {
     location: Option<String>,
     connection_close: bool,
     is_chunked: bool,
+    /// Instant the upstream request was sent - start of the upstream-rate
+    /// window. `None` only on responses built by the bare parser in tests.
+    request_sent_at: Option<coarsetime::Instant>,
 }
 
 /// Parse upstream HTTP response headers.
@@ -1862,12 +1873,13 @@ fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<Ups
         location,
         connection_close,
         is_chunked,
+        request_sent_at: None,
     })
 }
 
 enum DeliveryResult {
-    Success,
-    Failure,
+    Success(u64),
+    Failure(u64),
 }
 
 /// Splice data from upstream TCP socket to client socket, with zero-copy tee to a cache file.
@@ -1890,7 +1902,7 @@ async fn splice_proxy_body(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool)> {
+) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64)> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
     // accounting cleanly — see the `ClientStatus::Demoted` branch below.
@@ -2136,7 +2148,13 @@ async fn splice_proxy_body(
     }
 
     let client_disconnected = matches!(client_status, ClientStatus::Disconnected);
-    Ok((dbarrier, demoted_handle, client_disconnected))
+    let client_bytes_written = range_filter.send - client_remaining;
+    Ok((
+        dbarrier,
+        demoted_handle,
+        client_disconnected,
+        client_bytes_written,
+    ))
 }
 
 /// Writes the entire buffer to the cache file via pwrite at the specified offset.
@@ -2254,7 +2272,7 @@ async fn splice_proxy_body_tls(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool)> {
+) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64)> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
     // accounting cleanly — see the `ClientStatus::Demoted` branch below.
@@ -2504,7 +2522,13 @@ async fn splice_proxy_body_tls(
     }
 
     let client_disconnected = matches!(client_status, ClientStatus::Disconnected);
-    Ok((dbarrier, demoted_handle, client_disconnected))
+    let client_bytes_written = range_filter.send - client_remaining;
+    Ok((
+        dbarrier,
+        demoted_handle,
+        client_disconnected,
+        client_bytes_written,
+    ))
 }
 
 /// Duplicate the client socket fd and spawn a task that serves remaining bytes
@@ -2574,7 +2598,7 @@ async fn serve_remaining_from_file(
                 "splice proxy: failed to open cache file `{}` for demoted client:  {err}",
                 cache_path.display()
             );
-            return DeliveryResult::Failure;
+            return DeliveryResult::Failure(0);
         }
     };
 
@@ -2596,13 +2620,13 @@ async fn serve_remaining_from_file(
     )
     .await
     {
-        Ok(()) => {
+        Ok(bytes) => {
             debug!(
                 "splice proxy: demoted client file-serve complete, sent {content_length} bytes from cache offset {content_start}"
             );
-            DeliveryResult::Success
+            DeliveryResult::Success(bytes)
         }
-        Err(err) => {
+        Err((bytes, err)) => {
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 debug!(
@@ -2615,7 +2639,7 @@ async fn serve_remaining_from_file(
                 );
             }
 
-            DeliveryResult::Failure
+            DeliveryResult::Failure(bytes)
         }
     }
 }
@@ -3048,10 +3072,11 @@ async fn send_and_read_headers(
         volatile_cond,
     )
     .await?;
+    let request_sent_at = coarsetime::Instant::now();
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
-    let resp = parse_upstream_response(&hdr_buf, hdr_end).map_err(|err| {
+    let mut resp = parse_upstream_response(&hdr_buf, hdr_end).map_err(|err| {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         warn_once_or_info!("splice proxy: upstream {host_authority} sent malformed HTTP:  {err}");
         err
@@ -3066,6 +3091,7 @@ async fn send_and_read_headers(
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(body_prefix_len);
     }
     metrics::record_upstream_status(resp.status_code);
+    resp.request_sent_at = Some(request_sent_at);
     Ok((resp, hdr_buf, hdr_end))
 }
 
@@ -3299,7 +3325,7 @@ async fn forward_upstream_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
     count: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let config = global_config();
     // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
     // fills bytes into the spare capacity via `BufMut`, so the buffer is
@@ -3367,7 +3393,7 @@ async fn forward_upstream_body(
             .expect("read should not return more than requested");
     }
 
-    Ok(())
+    Ok(count)
 }
 
 /// Forward body bytes from upstream to client until EOF, with a size cap.
@@ -3376,7 +3402,7 @@ async fn forward_upstream_body_until_eof(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
     max_bytes: usize,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let config = global_config();
     let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
     let mut total = 0;
@@ -3433,7 +3459,7 @@ async fn forward_upstream_body_until_eof(
         metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n as u64);
     }
 
-    Ok(())
+    Ok(total)
 }
 
 /// State for the chunked transfer-encoding decoder.
@@ -3464,7 +3490,7 @@ async fn forward_upstream_chunked_body(
     client: &TcpStream,
     body_prefix: &[u8],
     max_bytes: usize,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let config = global_config();
     let mut rate_checker = config
         .min_download_rate
@@ -3476,6 +3502,8 @@ async fn forward_upstream_chunked_body(
     let mut state = ChunkedState::ReadingSize;
     let mut size_buf = Vec::<u8>::with_capacity(32);
     let mut total = Saturating(0);
+    // Tracks raw bytes (framing + data) written to the client.
+    let mut client_total: u64 = 0;
 
     // Process a slice of bytes through the state machine, forwarding them to the
     // client.  Returns `true` when the terminal chunk has been fully consumed.
@@ -3625,6 +3653,7 @@ async fn forward_upstream_chunked_body(
                     std::io::Error::new(e.kind(), format!("chunked forward: client write:  {e}"))
                 })?;
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(data.len() as u64);
+                client_total += data.len() as u64;
             }
             done
         }};
@@ -3632,7 +3661,7 @@ async fn forward_upstream_chunked_body(
 
     // Bootstrap: process bytes that arrived with the response headers.
     if process_buf!(body_prefix) {
-        return Ok(());
+        return Ok(client_total);
     }
 
     let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
@@ -3666,7 +3695,7 @@ async fn forward_upstream_chunked_body(
         }
 
         if process_buf!(&buf[..n]) {
-            return Ok(());
+            return Ok(client_total);
         }
     }
 }
@@ -4326,7 +4355,7 @@ async fn splice_proxy_drive(
             let already_sent = body_prefix.len() as u64;
             let remaining = cl.saturating_sub(already_sent);
             if remaining > 0 {
-                forward_upstream_body(&mut upstream, client_stream, remaining)
+                let _forwarded = forward_upstream_body(&mut upstream, client_stream, remaining)
                     .await
                     .map_err(|err| {
                         SpliceProxyError::AfterHeaderClient(err, "passthrough remaining body")
@@ -4334,7 +4363,7 @@ async fn splice_proxy_drive(
             }
         } else if upstream_resp.is_chunked {
             // Chunked encoding: forward raw framing, detect termination
-            forward_upstream_chunked_body(
+            let _forwarded = forward_upstream_chunked_body(
                 &mut upstream,
                 client_stream,
                 body_prefix,
@@ -4359,11 +4388,12 @@ async fn splice_proxy_drive(
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
             upstream.unset_poolable();
-            forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
-                .await
-                .map_err(|err| {
-                    SpliceProxyError::AfterHeaderClient(err, "passthrough body until EOF")
-                })?;
+            let _forwarded =
+                forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
+                    .await
+                    .map_err(|err| {
+                        SpliceProxyError::AfterHeaderClient(err, "passthrough body until EOF")
+                    })?;
         }
 
         // InitBarrier fires on return, which is correct: nothing was cached
@@ -4870,6 +4900,25 @@ async fn splice_proxy_drive(
 
     let start = coarsetime::Instant::now();
 
+    // Per-request rate-logging timestamps.
+    //   - `t_req_sent`: start of the upstream-rate window (instant the upstream
+    //     request was sent; falls back to `start` only for bare-parser
+    //     responses, i.e. tests).
+    //   - `t_upstream_done`: end of the upstream-rate window. Initialised here
+    //     so the case where the splice loop never runs (whole body arrived with
+    //     the headers) still has a sane figure; reassigned right after the
+    //     splice body block when it does run.
+    //   - `t_client_first`: start of the client-rate window (just before the
+    //     response-header write below).
+    //   - `t_client_done`: end of the client-rate window; first set after the
+    //     prefix writes, then reassigned after the splice body block and after
+    //     the demoted file-serve task completes.
+    //   - `client_bytes_sent`: best-effort count of body bytes written toward
+    //     the client, for the disconnect segment.
+    let t_req_sent = upstream_resp.request_sent_at.unwrap_or(start);
+    let mut t_upstream_done = coarsetime::Instant::now();
+    let mut client_bytes_sent: u64 = 0;
+
     if resume_offset > 0 {
         #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
         let resume_percent = resume_offset as f32 / total_content_length.get() as f32 * 100.0;
@@ -4948,6 +4997,8 @@ async fn splice_proxy_drive(
     // ends up flowing through `splice_proxy_body{,_tls}`, the body-prefix
     // direct write, or the kTLS-extra-body direct write.
     metrics::REQUESTS_SPLICE.increment();
+    // Start of the client-rate window: the first byte heading to the client.
+    let t_client_first = coarsetime::Instant::now();
     write_all_to_stream(
         client_stream,
         response_headers.as_bytes(),
@@ -4978,14 +5029,22 @@ async fn splice_proxy_drive(
                     SpliceProxyError::AfterHeaderIo
                 })?;
 
-            async_sendfile(
+            match async_sendfile(
                 client_stream,
                 &partial_reader,
                 send_start,
                 send_end - send_start,
             )
             .await
-            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "resume sendfile to client"))?;
+            {
+                Ok(sent) => client_bytes_sent += sent,
+                Err((_sent, err)) => {
+                    return Err(SpliceProxyError::AfterHeaderClient(
+                        err,
+                        "resume sendfile to client",
+                    ));
+                }
+            }
         }
     }
 
@@ -5048,6 +5107,7 @@ async fn splice_proxy_drive(
                 prefix_client_failed = true;
             } else {
                 metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
+                client_bytes_sent += client_slice.len() as u64;
             }
         }
 
@@ -5103,6 +5163,7 @@ async fn splice_proxy_drive(
                 prefix_client_failed = true;
             } else {
                 metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
+                client_bytes_sent += client_slice.len() as u64;
             }
         }
 
@@ -5120,6 +5181,11 @@ async fn splice_proxy_drive(
 
     // Uncork before entering the splice loop, which uses SPLICE_F_MORE for coalescing
     drop(cork);
+
+    // Client-rate-window end after the prefix / kTLS-extra-body writes; covers
+    // the case where the splice loop never runs (whole body in the prefix).
+    // Reassigned after the splice body block and the demoted file-serve task.
+    let mut t_client_done = coarsetime::Instant::now();
 
     // Transfer the remaining body
     let (demoted_handle, body_client_disconnected) = if splice_count > 0 {
@@ -5154,7 +5220,7 @@ async fn splice_proxy_drive(
         // rename step; on a structured rate-timeout it's already consumed into
         // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
         // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
-        let (returned_dbarrier, demoted_handle, body_client_disconnected) =
+        let (returned_dbarrier, demoted_handle, body_client_disconnected, body_client_bytes) =
             if let Some(tcp_upstream) = upstream.as_tcp() {
                 // Zero-copy path for TCP (plain or kTLS)
                 splice_proxy_body(
@@ -5184,6 +5250,12 @@ async fn splice_proxy_drive(
             }
             .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "splice body transfer"))?;
         dbarrier = returned_dbarrier;
+        // The splice body block ran: the upstream-rate and client-rate windows
+        // both end here. The demoted-client case reassigns `t_client_done`
+        // again after the file-serve task completes.
+        t_upstream_done = coarsetime::Instant::now();
+        t_client_done = t_upstream_done;
+        client_bytes_sent += body_client_bytes;
         (demoted_handle, body_client_disconnected)
     } else {
         (None, false)
@@ -5264,9 +5336,15 @@ async fn splice_proxy_drive(
     // No demotion means the splice loop served the client itself (or there
     // was no body to splice) — that's a success, not a failure.
     let demoted_client_succeeded = if let Some(handle) = demoted_handle {
-        match handle.await {
-            Ok(DeliveryResult::Success) => true,
-            Ok(DeliveryResult::Failure) => false,
+        let succeeded = match handle.await {
+            Ok(DeliveryResult::Success(bytes)) => {
+                client_bytes_sent += bytes;
+                true
+            }
+            Ok(DeliveryResult::Failure(bytes)) => {
+                client_bytes_sent += bytes;
+                false
+            }
             Err(err) => {
                 error!(
                     "splice proxy: demoted client file-serve task panicked:  {}",
@@ -5274,7 +5352,11 @@ async fn splice_proxy_drive(
                 );
                 false
             }
-        }
+        };
+        // The demoted file-serve task is the last thing to write to the
+        // client, so the client-rate window ends here.
+        t_client_done = coarsetime::Instant::now();
+        succeeded
     } else {
         true
     };
@@ -5282,8 +5364,29 @@ async fn splice_proxy_drive(
     let client_succeeded =
         !prefix_client_failed && !body_client_disconnected && demoted_client_succeeded;
 
+    let in_time = conn_details.request_received_at.elapsed();
+    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+        "volatile "
+    } else {
+        ""
+    };
+    let upstream = rate_log::upstream_segment(
+        body_content_length.get(),
+        t_upstream_done.duration_since(t_req_sent),
+    );
+    let client = if client_succeeded {
+        rate_log::client_segment(
+            response_content_length,
+            t_client_done.duration_since(t_client_first),
+        )
+    } else {
+        rate_log::client_disconnect_segment(
+            client_bytes_sent,
+            t_client_done.duration_since(t_client_first),
+        )
+    };
     info!(
-        "Splice proxy{tls_label}: {} {} from mirror {} for client {} in {} (size={}, rate={}{})",
+        "Splice proxy{tls_label}: {} {volatile}{} from mirror {} for client {} in {} ({upstream}, {client}){}",
         if client_succeeded {
             "served and cached"
         } else {
@@ -5292,14 +5395,12 @@ async fn splice_proxy_drive(
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
-        HumanFmt::Time(elapsed.into()),
-        HumanFmt::Size(total_content_length.get()),
-        HumanFmt::Rate(body_content_length.get(), elapsed),
+        HumanFmt::Time(in_time.into()),
         if resume_offset > 0 {
             format!(", resumed from {}", HumanFmt::Size(resume_offset))
         } else {
             String::new()
-        }
+        },
     );
 
     if !client_succeeded {
@@ -5571,6 +5672,12 @@ async fn handle_volatile_buffered_download(
         .expect("constant fits"); // TODO: const conversion once stable
     let body_prefix = &header_buf[header_end..];
 
+    // Capture t_req_sent before buffering so the upstream-rate window is never
+    // inverted. The fallback is a pre-read now() so t_req_sent <= t_upstream_done.
+    let t_req_sent = upstream_resp
+        .request_sent_at
+        .unwrap_or_else(coarsetime::Instant::now);
+
     // Buffer the entire body into memory.
     let body = if upstream_resp.is_chunked {
         read_dechunk_body_to_vec(upstream, body_prefix, max_bytes).await
@@ -5586,6 +5693,8 @@ async fn handle_volatile_buffered_download(
         );
         SpliceProxyError::Upstream
     })?;
+
+    let t_upstream_done = coarsetime::Instant::now();
 
     // Drop upstream early to free the socket.
     // (PoolGuard::drop returns the connection to pool if still poolable.)
@@ -5809,6 +5918,7 @@ async fn handle_volatile_buffered_download(
         StatusCode::OK
     });
     metrics::REQUESTS_SPLICE.increment();
+    let t_client_first = coarsetime::Instant::now();
     write_all_to_stream(
         client_stream,
         response_headers.as_bytes(),
@@ -5835,6 +5945,7 @@ async fn handle_volatile_buffered_download(
         .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "volatile body to client"))?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
+    let t_client_done = coarsetime::Instant::now();
     metrics::SERVED_SPLICE.increment();
     metrics::SERVED_TOTAL.increment();
 
@@ -5892,13 +6003,26 @@ async fn handle_volatile_buffered_download(
 
     let elapsed = start.elapsed();
 
+    let in_time = conn_details.request_received_at.elapsed();
+    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+        "volatile "
+    } else {
+        ""
+    };
     info!(
-        "Splice proxy{tls_label}: served and cached {} from mirror {} for client {} in {} (size={}, buffered volatile)",
+        "Splice proxy{tls_label}: served and cached {volatile}{} from mirror {} for client {} in {} ({}, {})",
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
-        HumanFmt::Time(elapsed.into()),
-        HumanFmt::Size(total_content_length.get()),
+        HumanFmt::Time(in_time.into()),
+        rate_log::upstream_segment(
+            total_content_length.get(),
+            t_upstream_done.duration_since(t_req_sent),
+        ),
+        rate_log::client_segment(
+            response_content_length as u64,
+            t_client_done.duration_since(t_client_first),
+        ),
     );
 
     // Record download in database (mirrors download_file() in main.rs).
@@ -6032,11 +6156,17 @@ pub(crate) async fn splice_simple_proxy(
     conn_action: ConnectionAction,
     mirror: &Mirror,
     upstream_path: &str,
+    client: ClientInfo,
+    request_received_at: coarsetime::Instant,
 ) -> Result<(), SpliceProxyError> {
     let host_authority = mirror.format_authority();
 
     let (up, resp, hdr_buf, hdr_end, _label, poolable) =
         standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None).await?;
+
+    let t_req_sent = resp
+        .request_sent_at
+        .unwrap_or_else(coarsetime::Instant::now);
 
     let port = mirror_port(mirror, up.is_tls());
 
@@ -6069,6 +6199,7 @@ pub(crate) async fn splice_simple_proxy(
 
     metrics::record_client_status(resp.status_code);
     metrics::REQUESTS_PASSTHROUGH.increment();
+    let t_client_first = coarsetime::Instant::now();
     write_all_to_stream(
         client_stream,
         rewritten_headers.as_bytes(),
@@ -6093,11 +6224,12 @@ pub(crate) async fn splice_simple_proxy(
     // request/response smuggling), and the header rewrite above already
     // strips Content-Length in that case — so we must frame the body the
     // same way the client will be reading it.
-    if resp.is_chunked {
-        // Chunked encoding: forward raw framing, detect termination
+    let forwarded: u64 = if resp.is_chunked {
+        // Chunked encoding: forward raw framing, detect termination.
+        // body_prefix is passed into the helper, so its return includes the prefix.
         forward_upstream_chunked_body(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
             .await
-            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "simple-proxy chunked body"))?;
+            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "simple-proxy chunked body"))?
     } else if let Some(cl) = resp.content_length {
         if !body_prefix.is_empty() {
             write_all_to_stream_rated(
@@ -6116,14 +6248,18 @@ pub(crate) async fn splice_simple_proxy(
         let already_sent = body_prefix.len() as u64;
         let remaining = cl.saturating_sub(already_sent);
         if remaining > 0 {
-            forward_upstream_body(&mut upstream, client_stream, remaining)
+            let helper_bytes = forward_upstream_body(&mut upstream, client_stream, remaining)
                 .await
                 .map_err(|err| {
                     SpliceProxyError::AfterHeaderClient(err, "simple-proxy remaining body")
                 })?;
+            body_prefix.len() as u64 + helper_bytes
+        } else {
+            body_prefix.len() as u64
         }
     } else {
-        // No Content-Length and not chunked: read until EOF
+        // No Content-Length and not chunked: read until EOF.
+        // body_prefix is written separately before the helper call.
         if !body_prefix.is_empty() {
             write_all_to_stream_rated(
                 client_stream,
@@ -6139,12 +6275,23 @@ pub(crate) async fn splice_simple_proxy(
             metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
         upstream.unset_poolable();
-        forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
-            .await
-            .map_err(|err| {
-                SpliceProxyError::AfterHeaderClient(err, "simple-proxy body until EOF")
-            })?;
-    }
+        let helper_bytes =
+            forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
+                .await
+                .map_err(|err| {
+                    SpliceProxyError::AfterHeaderClient(err, "simple-proxy body until EOF")
+                })?;
+        body_prefix.len() as u64 + helper_bytes
+    };
+
+    let t_done = coarsetime::Instant::now();
+    let in_time = request_received_at.elapsed();
+    info!(
+        "Simple proxy: passed through {upstream_path} from host {host_authority} for client {client} in {} ({}, {})",
+        HumanFmt::Time(in_time.into()),
+        rate_log::upstream_segment(forwarded, t_done.duration_since(t_req_sent)),
+        rate_log::client_segment(forwarded, t_done.duration_since(t_client_first)),
+    );
 
     metrics::SERVED_PASSTHROUGH.increment();
     metrics::SERVED_TOTAL.increment();

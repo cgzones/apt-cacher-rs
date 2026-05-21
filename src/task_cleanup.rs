@@ -636,6 +636,7 @@ where
 
         let conn_details = ConnectionDetails {
             client: ClientInfo::new_cleanup(),
+            request_received_at: Instant::now(),
             mirror: mirror.clone(),
             aliased_host: None,
             debname: debname_for(pkgfmt),

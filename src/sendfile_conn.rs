@@ -29,6 +29,7 @@ use crate::http_helpers::{
 use crate::http_range::{ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
 use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::rate_log;
 use crate::request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request};
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{hint_sequential_read, is_peer_disconnect};
@@ -599,17 +600,20 @@ async fn try_sendfile_request(
         DispatchOutcome::Passthrough {
             reason: PassthroughReason::NonDebPool,
             requested_host: _,
+            request_received_at: _,
         } => return ZeroCopyResult::NotApplicable("unsupported pool filename"),
         // Structured mirror has claimed this host's `flat/` anchor; hand back
         // to hyper which will pass the request through uncached.
         DispatchOutcome::Passthrough {
             reason: PassthroughReason::FlatBlocked,
             requested_host: _,
+            request_received_at: _,
         } => return ZeroCopyResult::NotApplicable("flat host blocked by structured collision"),
         #[cfg(feature = "splice")]
         DispatchOutcome::Passthrough {
             reason: PassthroughReason::Unrecognized,
             requested_host,
+            request_received_at,
         } => {
             use crate::{
                 deb_mirror::{Mirror, MirrorKind},
@@ -632,8 +636,16 @@ async fn try_sendfile_request(
                 MirrorKind::Structured,
             );
 
-            return match splice_simple_proxy(stream, *conn_version, conn_action, &mirror, uri_path)
-                .await
+            return match splice_simple_proxy(
+                stream,
+                *conn_version,
+                conn_action,
+                &mirror,
+                uri_path,
+                client,
+                request_received_at,
+            )
+            .await
             {
                 Ok(()) => ZeroCopyResult::Served(conn_action),
                 Err(SpliceProxyError::Upstream) => ZeroCopyResult::Invalid {
@@ -683,6 +695,7 @@ async fn try_sendfile_request(
         DispatchOutcome::Passthrough {
             reason: PassthroughReason::Unrecognized,
             requested_host: _,
+            request_received_at: _,
         } => return ZeroCopyResult::NotApplicable("unrecognized resource path"),
     };
 
@@ -693,6 +706,7 @@ async fn try_sendfile_request(
 
     let conn_details = ConnectionDetails {
         client,
+        request_received_at: plan.request_received_at,
         mirror: plan.mirror,
         aliased_host: plan.aliased_host,
         debname: plan.debname,
@@ -1204,22 +1218,25 @@ pub(crate) async fn serve_file_via_sendfile(
     metrics::REQUESTS_SENDFILE.increment();
     let transfer_result = async_sendfile(stream, &file, content_start, content_length).await;
 
+    let in_time = conn_details.request_received_at.elapsed();
+    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+        "volatile "
+    } else {
+        ""
+    };
     match transfer_result {
-        Ok(()) => {
+        Ok(transferred) => {
             metrics::SERVED_SENDFILE.increment();
             metrics::SERVED_TOTAL.increment();
             let elapsed = start.elapsed();
             info!(
-                "Served cached file {} from mirror {}{aliased} for client {} in {} via sendfile (size={}, rate={})",
+                "Served cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({})",
                 conn_details.debname,
                 conn_details.mirror,
                 conn_details.client,
-                HumanFmt::Time(elapsed.into()),
-                HumanFmt::Size(content_length),
-                HumanFmt::Rate(content_length, elapsed)
+                HumanFmt::Time(in_time.into()),
+                rate_log::client_segment(transferred, elapsed),
             );
-
-            // Update database
             let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
                 mirror: conn_details.mirror.clone(),
                 debname: conn_details.debname.clone(),
@@ -1229,27 +1246,31 @@ pub(crate) async fn serve_file_via_sendfile(
                 client_ip: conn_details.client.ip(),
             });
             send_db_command(cmd).await;
-
             SendfileResult::Served(conn_action)
         }
-        Err(err) => {
+        Err((transferred, err)) => {
+            let elapsed = start.elapsed();
+            let segment = rate_log::client_disconnect_segment(transferred, elapsed);
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
-                    "sendfile transfer cancelled for `{}` to client {}:  {}",
-                    file_path.display(),
+                    "Served cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
+                    conn_details.debname,
+                    conn_details.mirror,
                     conn_details.client,
-                    ErrorReport(&err)
+                    HumanFmt::Time(in_time.into()),
+                    ErrorReport(&err),
                 );
             } else {
-                error!(
-                    "sendfile error serving `{}` to client {}:  {}",
-                    file_path.display(),
+                warn!(
+                    "Served cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
+                    conn_details.debname,
+                    conn_details.mirror,
                     conn_details.client,
-                    ErrorReport(&err)
+                    HumanFmt::Time(in_time.into()),
+                    ErrorReport(&err),
                 );
             }
-            // Response already sent, just close the connection
             SendfileResult::AfterHeaderError
         }
     }
@@ -1625,18 +1646,21 @@ async fn sendfile_chunk_loop(
 
 /// Perform an async sendfile(2) operation, transferring `count` bytes from `file`
 /// starting at `offset` to the TCP socket.
+///
+/// Returns `Ok(n)` when all `n` bytes were transferred.  Returns `Err((n, e))`
+/// when an error occurred after `n` bytes had been transferred.
 pub(crate) async fn async_sendfile(
     socket: &TcpStream,
     file: &tokio::fs::File,
     offset: u64,
     count: u64,
-) -> std::io::Result<()> {
+) -> Result<u64, (u64, std::io::Error)> {
     let _counter = client_counter::ClientDownload::new();
 
     let Ok(mut file_offset) = i64::try_from(offset) else {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "sendfile: offset exceeds i64::MAX",
+        return Err((
+            0,
+            std::io::Error::new(ErrorKind::InvalidInput, "sendfile: offset exceeds i64::MAX"),
         ));
     };
 
@@ -1646,12 +1670,24 @@ pub(crate) async fn async_sendfile(
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
-    match sendfile_chunk_loop(socket, file, &mut file_offset, count, &mut rate_checker).await? {
-        ChunkLoopOutcome::Complete => Ok(()),
-        ChunkLoopOutcome::Eof { transferred } => Err(std::io::Error::new(
-            ErrorKind::UnexpectedEof,
-            format!(
-                "sendfile: unexpected end of file (transferred {transferred}/{count} at offset {file_offset})"
+    match sendfile_chunk_loop(socket, file, &mut file_offset, count, &mut rate_checker)
+        .await
+        .map_err(|e| {
+            (
+                u64::try_from(file_offset)
+                    .unwrap_or(0)
+                    .saturating_sub(offset),
+                e,
+            )
+        })? {
+        ChunkLoopOutcome::Complete => Ok(count),
+        ChunkLoopOutcome::Eof { transferred } => Err((
+            transferred,
+            std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "sendfile: unexpected end of file (transferred {transferred}/{count} at offset {file_offset})"
+                ),
             ),
         )),
     }
@@ -1665,6 +1701,9 @@ pub(crate) async fn async_sendfile(
 ///
 /// `content_start` / `content_length` may describe a sub-range (HTTP Range).
 ///
+/// Returns `Ok(n)` when all `n` bytes were transferred.  Returns `Err((n, e))`
+/// when an error occurred after `n` bytes had been transferred.
+///
 /// The caller is responsible for bumping the appropriate request-count metric
 /// (`REQUESTS_SENDFILE` for the sendfile late-joiner path, no bump for the
 /// splice demoted-client path which already counted as `REQUESTS_SPLICE`).
@@ -1676,13 +1715,13 @@ pub(crate) async fn async_sendfile_unfinished(
     content_length: u64,
     mut receiver: tokio::sync::watch::Receiver<()>,
     status: std::sync::Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-) -> std::io::Result<()> {
+) -> Result<u64, (u64, std::io::Error)> {
     let _counter = client_counter::ClientDownload::new();
 
     let Ok(mut file_offset) = i64::try_from(content_start) else {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "sendfile: offset exceeds i64::MAX",
+        return Err((
+            0,
+            std::io::Error::new(ErrorKind::InvalidInput, "sendfile: offset exceeds i64::MAX"),
         ));
     };
 
@@ -1709,9 +1748,10 @@ pub(crate) async fn async_sendfile_unfinished(
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
                 error!("Cache file `{}` is not a regular file", file_path.display());
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Not a regular file",
+                let transferred = content_length - remaining;
+                return Err((
+                    transferred,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Not a regular file"),
                 ));
             }
             Err(errno) => {
@@ -1731,9 +1771,13 @@ pub(crate) async fn async_sendfile_unfinished(
             if finished {
                 // The download claims to be done but the file is shorter than
                 // expected — treat as unexpected EOF.
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "sendfile: file shorter than expected after download finished",
+                let transferred = content_length - remaining;
+                return Err((
+                    transferred,
+                    std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "sendfile: file shorter than expected after download finished",
+                    ),
                 ));
             }
             // Wait for the sender to notify us of new data on disk.
@@ -1751,14 +1795,20 @@ pub(crate) async fn async_sendfile_unfinished(
                         }
                         ActiveDownloadStatus::Aborted(_) => {
                             drop(st);
-                            return Err(std::io::Error::other(
-                                "sendfile: upstream download aborted",
+                            let transferred = content_length - remaining;
+                            return Err((
+                                transferred,
+                                std::io::Error::other("sendfile: upstream download aborted"),
                             ));
                         }
                         ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
                             drop(st);
-                            return Err(std::io::Error::other(
-                                "sendfile: unexpected download state for demoted client file-serve",
+                            let transferred = content_length - remaining;
+                            return Err((
+                                transferred,
+                                std::io::Error::other(
+                                    "sendfile: unexpected download state for demoted client file-serve",
+                                ),
                             ));
                         }
                     }
@@ -1769,7 +1819,15 @@ pub(crate) async fn async_sendfile_unfinished(
         // Transfer what is currently available via the shared sendfile loop.
         let outcome =
             sendfile_chunk_loop(socket, file, &mut file_offset, sendable, &mut rate_checker)
-                .await?;
+                .await
+                .map_err(|e| {
+                    (
+                        u64::try_from(file_offset)
+                            .unwrap_or(0)
+                            .saturating_sub(content_start),
+                        e,
+                    )
+                })?;
         let sent = match outcome {
             ChunkLoopOutcome::Complete => sendable,
             ChunkLoopOutcome::Eof { transferred } => {
@@ -1788,7 +1846,11 @@ pub(crate) async fn async_sendfile_unfinished(
                     }
                 };
                 if is_aborted {
-                    return Err(std::io::Error::other("sendfile: upstream download aborted"));
+                    let already_sent = content_length - remaining;
+                    return Err((
+                        already_sent + transferred,
+                        std::io::Error::other("sendfile: upstream download aborted"),
+                    ));
                 }
                 if is_finished {
                     finished = true;
@@ -1801,7 +1863,7 @@ pub(crate) async fn async_sendfile_unfinished(
             .expect("should not have transferred more bytes than requested");
     }
 
-    Ok(())
+    Ok(content_length)
 }
 
 /// Serve a file that is currently being downloaded by another task, using
@@ -2053,21 +2115,25 @@ async fn serve_unfinished_sendfile(
     )
     .await;
 
+    let in_time = conn_details.request_received_at.elapsed();
+    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+        "volatile "
+    } else {
+        ""
+    };
     match transfer_result {
-        Ok(()) => {
+        Ok(transferred) => {
             metrics::SERVED_SENDFILE.increment();
             metrics::SERVED_TOTAL.increment();
             let elapsed = start.elapsed();
             info!(
-                "Served downloading file {} from mirror {}{aliased} for joining client {} in {} via sendfile (size={}, rate={})",
+                "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({})",
                 conn_details.debname,
                 conn_details.mirror,
                 conn_details.client,
-                HumanFmt::Time(elapsed.into()),
-                HumanFmt::Size(content_length),
-                HumanFmt::Rate(content_length, elapsed)
+                HumanFmt::Time(in_time.into()),
+                rate_log::client_segment(transferred, elapsed),
             );
-
             let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
                 mirror: conn_details.mirror.clone(),
                 debname: conn_details.debname.clone(),
@@ -2077,26 +2143,29 @@ async fn serve_unfinished_sendfile(
                 client_ip: conn_details.client.ip(),
             });
             send_db_command(cmd).await;
-
             ZeroCopyResult::Served(conn_action)
         }
-        Err(err) => {
+        Err((transferred, err)) => {
+            let elapsed = start.elapsed();
+            let segment = rate_log::client_disconnect_segment(transferred, elapsed);
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
-                    "Joining client {} disconnected while serving downloading file {} from mirror {}{aliased}:  {}",
-                    conn_details.client,
+                    "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
                     conn_details.debname,
                     conn_details.mirror,
-                    ErrorReport(&err)
+                    conn_details.client,
+                    HumanFmt::Time(in_time.into()),
+                    ErrorReport(&err),
                 );
             } else {
                 warn!(
-                    "Failed to sendfile downloading file {} from mirror {}{aliased} to joining client {}:  {}",
+                    "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
-                    ErrorReport(&err)
+                    HumanFmt::Time(in_time.into()),
+                    ErrorReport(&err),
                 );
             }
             ZeroCopyResult::AfterHeaderError

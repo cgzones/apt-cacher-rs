@@ -29,6 +29,7 @@
 
 use std::{cell::LazyCell, num::NonZero};
 
+use coarsetime::Instant;
 use http::StatusCode;
 use log::{info, trace};
 
@@ -55,6 +56,7 @@ pub(crate) struct CachePlan {
     pub(crate) debname: String,
     pub(crate) cached_flavor: CachedFlavor,
     pub(crate) layout: CacheLayout,
+    pub(crate) request_received_at: Instant,
     _private: (),
 }
 
@@ -143,6 +145,9 @@ pub(crate) enum DispatchOutcome {
         )]
         reason: PassthroughReason,
         requested_host: ClientHost,
+        // Consumed by both backends: `splice_simple_proxy` (`splice_conn.rs`,
+        // via the sendfile dispatch) and `PassthroughBody` (`main.rs`).
+        request_received_at: Instant,
     },
 }
 
@@ -173,6 +178,7 @@ pub(crate) async fn dispatch_request(
     requested_port: Option<NonZero<u16>>,
     client: &ClientInfo,
 ) -> DispatchOutcome {
+    let request_received_at = Instant::now();
     let cfg = global_config();
     let decision = decide_request(
         uri_path,
@@ -182,6 +188,7 @@ pub(crate) async fn dispatch_request(
         &cfg.aliases,
         cfg.reject_pdiff_requests,
         flat_blocklist::is_blocked,
+        request_received_at,
     );
     if let Some(origin) = decision.pending_origin {
         send_db_command(DatabaseCommand::Origin(DbCmdOrigin { origin })).await;
@@ -196,6 +203,10 @@ pub(crate) async fn dispatch_request(
 /// expressed as a closure and a return-value field respectively, so unit
 /// tests can drive every branch without standing up the DB task channel or
 /// the `RUNTIMEDETAILS`/`BLOCKLIST` `OnceLock`s.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single production call site; grouping the params would not aid clarity"
+)]
 fn decide_request(
     uri_path: &str,
     requested_host: ClientHost,
@@ -204,6 +215,7 @@ fn decide_request(
     aliases: &'static [Alias],
     reject_pdiff_requests: bool,
     is_flat_blocked: impl FnOnce(&CacheHost, Option<NonZero<u16>>) -> bool,
+    request_received_at: Instant,
 ) -> Decision {
     trace!("Dispatching request from client {client}: host=`{requested_host}` path=`{uri_path}`");
 
@@ -267,6 +279,7 @@ fn decide_request(
                             debname: class.debname,
                             cached_flavor: class.cached_flavor,
                             layout: class.layout,
+                            request_received_at,
                             _private: (),
                         }),
                         pending_origin,
@@ -329,6 +342,7 @@ fn decide_request(
         outcome: DispatchOutcome::Passthrough {
             reason: passthrough_reason,
             requested_host,
+            request_received_at,
         },
         pending_origin: None,
     }
@@ -363,6 +377,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         let DispatchOutcome::Cache(plan) = decision.outcome else {
             unreachable!("expected Cache outcome")
@@ -382,6 +397,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         let DispatchOutcome::Cache(plan) = decision.outcome else {
             unreachable!("expected Cache outcome")
@@ -405,6 +421,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -430,6 +447,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -455,6 +473,7 @@ mod tests {
             &[],
             true,
             |_, _| true,
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -480,6 +499,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         assert!(
             matches!(decision.outcome, DispatchOutcome::Cache(_)),
@@ -498,6 +518,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -519,6 +540,7 @@ mod tests {
             &[],
             false,
             never_flat_blocked,
+            Instant::now(),
         );
         // Path is not a recognised structured shape (parser rejects), and the
         // pdiff gate is disabled, so this falls through to a plain Unrecognized
@@ -546,6 +568,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -571,6 +594,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
+            Instant::now(),
         );
         assert!(
             matches!(
