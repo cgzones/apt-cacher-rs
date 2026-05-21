@@ -53,6 +53,7 @@ use std::{
     string::FromUtf8Error,
 };
 
+use coarsetime::Instant;
 use log::trace;
 
 use crate::{
@@ -194,6 +195,9 @@ impl CacheLayout {
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionDetails {
     pub(crate) client: ClientInfo,
+    /// Monotonic instant the client request was parsed - origin of the
+    /// `in <time>` total-proxy-time figure in download/serve logs.
+    pub(crate) request_received_at: Instant,
     pub(crate) mirror: Mirror,
     pub(crate) aliased_host: Option<&'static CacheHost>,
     pub(crate) debname: String,

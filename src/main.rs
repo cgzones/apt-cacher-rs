@@ -42,6 +42,7 @@ mod log_once;
 mod logstore;
 mod metrics;
 mod rate_checked_body;
+mod rate_log;
 mod request_dispatch;
 mod ringbuffer;
 #[cfg(feature = "ktls")]
@@ -824,20 +825,24 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                 Some(alias) => format!(" aliased to host {alias}"),
                 None => String::new(),
             };
+            let in_time = cd.request_received_at.elapsed();
+            let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
+                "volatile "
+            } else {
+                ""
+            };
             if transferred_bytes == size {
                 metrics::SERVED_COPY.increment();
                 metrics::SERVED_TOTAL.increment();
                 info!(
-                    "Served cached file {} from mirror {}{} for client {} in {} via stream (size={}, rate={})",
+                    "Served cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({})",
                     cd.debname,
                     cd.mirror,
                     aliased,
                     cd.client,
-                    HumanFmt::Time(duration.into()),
-                    HumanFmt::Size(size),
-                    HumanFmt::Rate(size, duration)
+                    HumanFmt::Time(in_time.into()),
+                    rate_log::client_segment(size, duration),
                 );
-
                 let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
                     mirror: cd.mirror,
                     debname: cd.debname,
@@ -847,28 +852,16 @@ impl<S> PinnedDrop for DeliveryStreamBody<S> {
                     client_ip: cd.client.ip(),
                 });
                 send_db_command(cmd).await;
-            } else if transferred_bytes == 0 && duration < coarsetime::Duration::from_secs(1) {
-                info!(
-                    "Aborted serving cached file {} from mirror {}{} for client {} after {} via stream:  {}",
-                    cd.debname,
-                    cd.mirror,
-                    aliased,
-                    cd.client,
-                    HumanFmt::Time(duration.into()),
-                    error.unwrap_or_else(|| String::from("unknown reason")),
-                );
             } else {
+                let segment = rate_log::client_disconnect_segment(transferred_bytes, duration);
+                let reason = error.unwrap_or_else(|| String::from("unknown reason"));
                 warn!(
-                    "Failed to serve cached file {} from mirror {}{} for client {} after {} via stream (size={}, transferred={}, rate={}):  {}",
+                    "Served cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({segment}):  {reason}",
                     cd.debname,
                     cd.mirror,
                     aliased,
                     cd.client,
-                    HumanFmt::Time(duration.into()),
-                    HumanFmt::Size(size),
-                    HumanFmt::Size(transferred_bytes),
-                    HumanFmt::Rate(transferred_bytes, duration),
-                    error.unwrap_or_else(|| String::from("unknown reason")),
+                    HumanFmt::Time(in_time.into()),
                 );
             }
         });
@@ -988,19 +981,41 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
 ///
 /// On Drop, bumps `SERVED_PASSTHROUGH` + `SERVED_TOTAL` iff the inner body
 /// reached clean end-of-stream (`poll_frame` returned `Ready(None)`) — so
-/// aborted clients do not increment the served counter.
+/// aborted clients do not increment the served counter.  Also logs a
+/// per-request rate summary (total in-time, upstream rate, client rate).
 #[pin_project(PinnedDrop)]
 struct PassthroughBody<B: Body> {
     #[pin]
     inner: B,
     end_of_stream: bool,
+    transferred: u64,
+    start: Instant,
+    request_received_at: Instant,
+    request_sent: Instant,
+    host: String,
+    path: String,
+    client: ClientInfo,
 }
 
 impl<B: Body> PassthroughBody<B> {
-    fn new(inner: B) -> Self {
+    fn new(
+        inner: B,
+        request_received_at: Instant,
+        request_sent: Instant,
+        host: String,
+        path: String,
+        client: ClientInfo,
+    ) -> Self {
         Self {
             inner,
             end_of_stream: false,
+            transferred: 0,
+            start: Instant::now(),
+            request_received_at,
+            request_sent,
+            host,
+            path,
+            client,
         }
     }
 }
@@ -1022,7 +1037,9 @@ where
         match &result {
             Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    metrics::BYTES_SERVED_PASSTHROUGH.increment_by(data.remaining() as u64);
+                    let n = data.remaining() as u64;
+                    metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n);
+                    *this.transferred += n;
                 }
             }
             Ready(None) => {
@@ -1047,9 +1064,30 @@ where
 #[pinned_drop]
 impl<B: Body> PinnedDrop for PassthroughBody<B> {
     fn drop(self: Pin<&mut Self>) {
-        if self.end_of_stream {
+        let transferred = self.transferred;
+        let client_window = self.start.elapsed();
+        let in_time = self.request_received_at.elapsed();
+        let upstream_window = self.request_sent.elapsed();
+        let end_of_stream = self.end_of_stream;
+        let this = self.project();
+        let host = std::mem::take(this.host);
+        let path = std::mem::take(this.path);
+        let client = *this.client;
+        if end_of_stream {
             metrics::SERVED_PASSTHROUGH.increment();
             metrics::SERVED_TOTAL.increment();
+            info!(
+                "Simple proxy: passed through {path} from host {host} for client {client} in {} ({}, {})",
+                HumanFmt::Time(in_time.into()),
+                rate_log::upstream_segment(transferred, upstream_window),
+                rate_log::client_segment(transferred, client_window),
+            );
+        } else {
+            info!(
+                "Simple proxy: passed through {path} from host {host} for client {client} in {} ({})",
+                HumanFmt::Time(in_time.into()),
+                rate_log::client_disconnect_segment(transferred, client_window),
+            );
         }
     }
 }
@@ -1145,18 +1183,23 @@ impl Drop for MmapBody {
                 Some(alias) => format!(" aliased to host {alias}"),
                 None => String::new(),
             };
+            let in_time = cd.request_received_at.elapsed();
+            let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
+                "volatile "
+            } else {
+                ""
+            };
             if transferred_bytes == size {
                 metrics::SERVED_MMAP.increment();
                 metrics::SERVED_TOTAL.increment();
                 info!(
-                    "Served cached file {} from mirror {}{} for client {} in {} via mmap (size={}, rate={})",
+                    "Served cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({})",
                     cd.debname,
                     cd.mirror,
                     aliased,
                     cd.client,
-                    HumanFmt::Time(elapsed.into()),
-                    HumanFmt::Size(size),
-                    HumanFmt::Rate(size, elapsed)
+                    HumanFmt::Time(in_time.into()),
+                    rate_log::client_segment(size, elapsed),
                 );
 
                 let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -1168,26 +1211,15 @@ impl Drop for MmapBody {
                     client_ip: cd.client.ip(),
                 });
                 send_db_command(cmd).await;
-            } else if transferred_bytes == 0 {
-                info!(
-                    "Aborted serving cached file {} from mirror {}{} for client {} after {} via mmap",
-                    cd.debname,
-                    cd.mirror,
-                    aliased,
-                    cd.client,
-                    HumanFmt::Time(elapsed.into()),
-                );
             } else {
+                let segment = rate_log::client_disconnect_segment(transferred_bytes, elapsed);
                 warn!(
-                    "Failed to serve cached file {} from mirror {}{} for client {} after {} via mmap (size={}, transferred={}, rate={})",
+                    "Served cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({segment})",
                     cd.debname,
                     cd.mirror,
                     aliased,
                     cd.client,
-                    HumanFmt::Time(elapsed.into()),
-                    HumanFmt::Size(size),
-                    HumanFmt::Size(transferred_bytes),
-                    HumanFmt::Rate(transferred_bytes, elapsed),
+                    HumanFmt::Time(in_time.into()),
                 );
             }
         });
@@ -1866,6 +1898,7 @@ async fn download_file(
     output: (tokio::fs::File, TempPath),
     mut dbarrier: DownloadBarrier,
     resume_offset: u64,
+    request_sent: Instant,
 ) {
     let config = global_config();
 
@@ -1914,7 +1947,7 @@ async fn download_file(
                         }
                         metrics::UPSTREAM_HYPER_BODY_ERR.increment();
                         error!(
-                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, rate={}):  {}",
+                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, upstream_rate={}):  {}",
                             conn_details.debname,
                             conn_details.mirror,
                             HumanFmt::Time(start.elapsed().into()),
@@ -1988,6 +2021,8 @@ async fn download_file(
             }
         }
     }
+
+    let t_upstream_done = Instant::now();
 
     if let Err(err) = writer.flush().await {
         error!("Failed to write to file `{}`:  {err}", outpath.display());
@@ -2072,28 +2107,24 @@ async fn download_file(
 
     let total_bytes = resume_offset + bytes;
     let elapsed = start.elapsed();
-    // `rate` is computed over `bytes` (newly downloaded portion) against
-    // `elapsed`, which matches when not resuming. When resuming, label it
-    // `resume_rate` so the reader does not mistake it for an average over
-    // the full `size`.
-    let rate_label = if resume_offset > 0 {
-        "resume_rate"
+    let in_time = conn_details.request_received_at.elapsed();
+    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+        "volatile "
     } else {
-        "rate"
+        ""
     };
     info!(
-        "Finished download of file {} from mirror {} for client {} in {} (size={}, {rate_label}={}{})",
+        "Finished download of {volatile}file {} from mirror {} for client {} in {} ({}){}",
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
-        HumanFmt::Time(elapsed.into()),
-        HumanFmt::Size(total_bytes),
-        HumanFmt::Rate(bytes, elapsed),
+        HumanFmt::Time(in_time.into()),
+        rate_log::upstream_segment(bytes, t_upstream_done.duration_since(request_sent)),
         if resume_offset > 0 {
             format!(", resumed from {}", HumanFmt::Size(resume_offset))
         } else {
             String::new()
-        }
+        },
     );
 
     let cmd = DatabaseCommand::Download(DbCmdDownload {
@@ -2158,6 +2189,7 @@ async fn serve_unfinished_file(
 
         let mut finished = false;
         let mut bytes = 0;
+        let mut client_disconnected = false;
         let buf_size = config.buffer_size;
 
         // Late-joiner reads of an in-progress download are still sequential —
@@ -2166,7 +2198,7 @@ async fn serve_unfinished_file(
 
         let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
 
-        loop {
+        'stream: loop {
             loop {
                 let mut buf = bytes::BytesMut::with_capacity(buf_size);
                 let ret = match reader.read_buf(&mut buf).await {
@@ -2180,13 +2212,14 @@ async fn serve_unfinished_file(
 
                 let buf = buf.freeze();
 
-                bytes += ret as u64;
                 assert_eq!(buf.len(), ret, "buffer length must match read bytes");
 
                 if let Err(tokio::sync::mpsc::error::SendError(_err)) = tx.send(Ok(buf)).await {
-                    info!("Receiver of stream task closed; cancelling stream...");
-                    return;
+                    client_disconnected = true;
+                    break 'stream;
                 }
+
+                bytes += ret as u64;
             }
 
             if finished {
@@ -2243,25 +2276,44 @@ async fn serve_unfinished_file(
         drop(counter);
 
         let elapsed = start.elapsed();
-        info!(
-            "Served new file {} from mirror {} for client {} in {} via channel (size={}, rate={})",
-            conn_details.debname,
-            conn_details.mirror,
-            conn_details.client,
-            HumanFmt::Time(elapsed.into()),
-            HumanFmt::Size(bytes),
-            HumanFmt::Rate(bytes, elapsed)
-        );
-
-        let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
-            mirror: conn_details.mirror,
-            debname: conn_details.debname,
-            size: bytes,
-            elapsed,
-            partial: false,
-            client_ip: conn_details.client.ip(),
-        });
-        send_db_command(cmd).await;
+        let in_time = conn_details.request_received_at.elapsed();
+        let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+            "volatile "
+        } else {
+            ""
+        };
+        let aliased = match conn_details.aliased_host {
+            Some(alias) => format!(" aliased to host {alias}"),
+            None => String::new(),
+        };
+        if client_disconnected {
+            info!(
+                "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via channel ({})",
+                conn_details.debname,
+                conn_details.mirror,
+                conn_details.client,
+                HumanFmt::Time(in_time.into()),
+                rate_log::client_disconnect_segment(bytes, elapsed),
+            );
+        } else {
+            info!(
+                "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via channel ({})",
+                conn_details.debname,
+                conn_details.mirror,
+                conn_details.client,
+                HumanFmt::Time(in_time.into()),
+                rate_log::client_segment(bytes, elapsed),
+            );
+            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+                mirror: conn_details.mirror,
+                debname: conn_details.debname,
+                size: bytes,
+                elapsed,
+                partial: false,
+                client_ip: conn_details.client.ip(),
+            });
+            send_db_command(cmd).await;
+        }
     });
 
     let mut response_builder = Response::builder()
@@ -2880,6 +2932,7 @@ async fn serve_new_file(
     );
     trace!("Forwarded request: {fwd_request:?}");
 
+    let mut upstream_request_sent = Instant::now();
     let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
         Err(err) => {
@@ -2930,6 +2983,7 @@ async fn serve_new_file(
 
             trace!("Forwarded redirected request: {redirected_request:?}");
 
+            upstream_request_sent = Instant::now();
             let redirected_response =
                 match request_with_retry(&appstate.https_client, redirected_request).await {
                     Ok(r) => r,
@@ -3069,6 +3123,7 @@ async fn serve_new_file(
         let retry_request =
             build_fwd_request(&req_uri, host, &CacheFileStat::New, volatile_etag, 0, None);
 
+        upstream_request_sent = Instant::now();
         fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
             Ok(r) => r,
             Err(err) => {
@@ -3220,7 +3275,14 @@ async fn serve_new_file(
             let (parts, body) = fwd_response.into_parts();
 
             metrics::REQUESTS_PASSTHROUGH.increment();
-            let counted = ClientCountedBody::new(PassthroughBody::new(body));
+            let counted = ClientCountedBody::new(PassthroughBody::new(
+                body,
+                conn_details.request_received_at,
+                upstream_request_sent,
+                conn_details.mirror.format_authority().to_string(),
+                req_uri.path().to_owned(),
+                conn_details.client,
+            ));
 
             let rated = MaybeRated::new(
                 counted,
@@ -3468,6 +3530,7 @@ async fn serve_new_file(
                 (outfile, outpath),
                 dbarrier,
                 resume_offset,
+                upstream_request_sent,
             )
             .await;
         });
@@ -3952,11 +4015,12 @@ async fn pre_process_client_request(
     let (parts, _body) = req.into_parts();
     let req = Request::from_parts(parts, Empty::new());
 
-    let requested_host =
+    let (requested_host, passthrough_request_received_at) =
         match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await {
             DispatchOutcome::Cache(plan) => {
                 let conn_details = ConnectionDetails {
                     client,
+                    request_received_at: plan.request_received_at,
                     mirror: plan.mirror,
                     aliased_host: plan.aliased_host,
                     debname: plan.debname,
@@ -3969,7 +4033,11 @@ async fn pre_process_client_request(
                 let (status, msg) = reason.response_parts();
                 return quick_response(status, msg);
             }
-            DispatchOutcome::Passthrough { requested_host, .. } => requested_host,
+            DispatchOutcome::Passthrough {
+                reason: _,
+                requested_host,
+                request_received_at,
+            } => (requested_host, request_received_at),
         };
 
     assert_eq!(req.method(), Method::GET, "Filtered at function start");
@@ -3991,12 +4059,14 @@ async fn pre_process_client_request(
         .insert(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT));
 
     let mut parts_cloned = parts.clone();
+    let request_path = parts_cloned.uri.path().to_owned();
 
     // TODO: tweak http version?
     let fwd_request = Request::from_parts(parts, Empty::new());
 
     trace!("Forwarded request: {fwd_request:?}");
 
+    let fwd_request_sent = Instant::now();
     let fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
         Err(err) => {
@@ -4058,6 +4128,7 @@ async fn pre_process_client_request(
 
             trace!("Redirected request: {redirected_request:?}");
 
+            let redirected_request_sent = Instant::now();
             let redirected_response = match request_with_retry(
                 &appstate.https_client,
                 redirected_request,
@@ -4079,7 +4150,14 @@ async fn pre_process_client_request(
             let (parts, body) = redirected_response.into_parts();
 
             metrics::REQUESTS_PASSTHROUGH.increment();
-            let counted = ClientCountedBody::new(PassthroughBody::new(body));
+            let counted = ClientCountedBody::new(PassthroughBody::new(
+                body,
+                passthrough_request_received_at,
+                redirected_request_sent,
+                requested_host.to_string(),
+                request_path.clone(),
+                client,
+            ));
 
             let rated = MaybeRated::new(
                 counted,
@@ -4109,7 +4187,14 @@ async fn pre_process_client_request(
     let (parts, body) = fwd_response.into_parts();
 
     metrics::REQUESTS_PASSTHROUGH.increment();
-    let counted = ClientCountedBody::new(PassthroughBody::new(body));
+    let counted = ClientCountedBody::new(PassthroughBody::new(
+        body,
+        passthrough_request_received_at,
+        fwd_request_sent,
+        requested_host.to_string(),
+        request_path,
+        client,
+    ));
 
     let rated = MaybeRated::new(
         counted,
