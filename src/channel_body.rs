@@ -37,7 +37,16 @@ pub(crate) struct ChannelBody {
     content_length: ContentLength,
     remaining: Remaining,
     received: u64,
-    complete: bool,
+    // For an `Exact` announced length: set when the announced total has been
+    // delivered (`Remaining::Exact(0)`). Never set for `Upper` (unknown).
+    delivered_announced: bool,
+    // Set on the first `Ready(None)` observed from the channel.
+    channel_closed: bool,
+    // Sticky: set once `poll_frame` has yielded any `Err` (protocol violation
+    // or upstream rate error). Vetoes the Drop-time `SERVED_*` credit and
+    // short-circuits subsequent polls so the violation counter is not bumped
+    // again for the same body.
+    errored: bool,
 }
 
 impl ChannelBody {
@@ -56,14 +65,23 @@ impl ChannelBody {
             content_length,
             remaining,
             received: 0,
-            complete: false,
+            delivered_announced: false,
+            channel_closed: false,
+            errored: false,
         }
     }
 }
 
 impl Drop for ChannelBody {
     fn drop(&mut self) {
-        if self.complete {
+        // "Fully delivered" (per `metrics.rs` SERVED_TOTAL doc) requires
+        // reaching a terminal state AND never having surfaced an error. For
+        // `Exact` the announced total was delivered; for `Upper` the channel
+        // closed cleanly. A `ContentTooLarge` after the announced total (or
+        // any upstream error) vetoes the credit even when the terminal flag
+        // is set. Preserves the parent/subset invariant from `metrics.rs`:
+        // `SERVED_TOTAL` = sum of per-path `SERVED_*`.
+        if (self.delivered_announced || self.channel_closed) && !self.errored {
             metrics::SERVED_CHANNEL.increment();
             metrics::SERVED_TOTAL.increment();
         }
@@ -79,29 +97,49 @@ impl Body for ChannelBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.complete
+        // Hint per the `Body` trait. We return `true` once the announced
+        // total has been delivered so well-behaved consumers can stop early;
+        // `poll_frame` itself only short-circuits on `channel_closed`, so a
+        // consumer that keeps polling still gets `ContentTooLarge` if the
+        // upstream pushes more frames after the announced total.
+        self.delivered_announced || self.channel_closed
     }
 
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if self.is_end_stream() {
+        // `errored` short-circuit makes terminal Err idempotent: a consumer
+        // that keeps polling after a `ContentTooLarge` does not re-bump
+        // `UPSTREAM_PROTOCOL_VIOLATION` per trailing frame.
+        if self.channel_closed || self.errored {
             return std::task::Poll::Ready(None);
         }
 
         let msg = self.receiver.poll_recv(cx);
         if matches!(msg, std::task::Poll::Ready(None)) {
-            self.complete = true;
+            self.channel_closed = true;
         }
 
         msg.map(|d| {
             d.map(|b| match b {
                 Ok(data) => {
                     let datalen = data.len() as u64;
+                    // Any non-empty frame received after the announced total
+                    // has been delivered is a protocol violation. Empty frames
+                    // are tolerated as a no-op (they consume nothing).
+                    if self.delivered_announced && datalen > 0 {
+                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                        self.errored = true;
+                        return Err(Box::new(ProxyCacheError::ContentTooLarge {
+                            announced: self.content_length,
+                            received: self.received + datalen,
+                        }));
+                    }
                     match self.remaining.try_consume(datalen) {
                         None => {
                             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                            self.errored = true;
                             Err(Box::new(ProxyCacheError::ContentTooLarge {
                                 announced: self.content_length,
                                 received: self.received + datalen,
@@ -110,53 +148,18 @@ impl Body for ChannelBody {
                         Some(updated) => {
                             self.received += datalen;
                             self.remaining = updated;
-                            // For an exact announced size, reaching `Exact(0)`
-                            // means every announced byte has been delivered.
-                            // Probe the receiver one more time before flipping
-                            // `complete` so a sender that pushes additional
-                            // frames *after* the announced total is still
-                            // caught as `ContentTooLarge` - without this peek,
-                            // `is_end_stream() == true` would short-circuit
-                            // the next `poll_frame` and the extra frame would
-                            // be silently dropped. `Ready(None)` confirms a
-                            // clean close; `Pending` means no extra frame is
-                            // queued right now, in which case we still flip
-                            // `complete` so the `Drop` accounting fires even
-                            // if the body is dropped before observing the
-                            // channel close (preserving the parent/subset
-                            // invariant: `SERVED_TOTAL` = sum of per-path
-                            // `SERVED_*` documented in `metrics.rs`). The
-                            // `Upper` (unknown-length) case keeps the
-                            // channel-close signal as the only completion
-                            // indicator: `Upper(0)` only means the announced
-                            // cap has been hit, not that the sender is done.
                             if matches!(updated, Remaining::Exact(0)) {
-                                // `Ready(None)` (clean close) and `Pending`
-                                // (no extra frame queued) fall through to
-                                // setting `complete`. An empty
-                                // `Ready(Some(Ok(_)))` frame is a no-op
-                                // (no bytes, no violation). `Ready(Some(Err(_)))`
-                                // would surface as the body's error on the
-                                // next poll, but `complete` is still flipped
-                                // here so the Drop-time accounting fires.
-                                if let std::task::Poll::Ready(Some(Ok(extra))) =
-                                    self.receiver.poll_recv(cx)
-                                    && !extra.is_empty()
-                                {
-                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                    return Err(Box::new(ProxyCacheError::ContentTooLarge {
-                                        announced: self.content_length,
-                                        received: self.received + extra.len() as u64,
-                                    }));
-                                }
-                                self.complete = true;
+                                self.delivered_announced = true;
                             }
                             metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
                             Ok(Frame::data(data))
                         }
                     }
                 }
-                Err(err) => Err(Box::new(err.into())),
+                Err(err) => {
+                    self.errored = true;
+                    Err(Box::new(err.into()))
+                }
             })
         })
     }
@@ -202,16 +205,13 @@ mod tests {
 
     /// Sender pushes an additional non-empty frame after the announced
     /// `Exact(N)` total has been delivered. The defence-in-depth check
-    /// must surface this as `ContentTooLarge` instead of silently dropping
-    /// the extra bytes by short-circuiting on `is_end_stream()`.
+    /// must surface this as `ContentTooLarge` on the next poll instead of
+    /// silently dropping the extra bytes.
     #[tokio::test]
     async fn exact_over_announce_after_total_is_caught() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut body = ChannelBody::new(rx, ContentLength::Exact(nz(4)));
 
-        // Queue the announced total *and* a trailing over-announce frame
-        // before polling, so the second `poll_recv` inside `poll_frame`
-        // sees `Ready(Some(extra))`.
         tx.send(Ok(bytes::Bytes::from_static(b"abcd")))
             .await
             .expect("send");
@@ -220,6 +220,14 @@ mod tests {
             .expect("send extra");
         drop(tx);
 
+        // First poll delivers the announced total.
+        let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("frame present")
+            .expect("frame ok");
+        assert_eq!(frame.into_data().expect("data frame").as_ref(), b"abcd");
+
+        // Second poll surfaces the trailing over-announce frame.
         let result = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
             .await
             .expect("frame present");
@@ -228,6 +236,13 @@ mod tests {
             matches!(*err, ProxyCacheError::ContentTooLarge { received: 5, .. }),
             "expected ContentTooLarge {{ received: 5, .. }}, got {err:?}"
         );
+
+        // Further polls must be idempotent (`Ready(None)`) so the violation
+        // counter is not bumped again per trailing frame.
+        let next = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(next.is_none(), "expected Ready(None) after ContentTooLarge");
+        let next = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(next.is_none(), "expected Ready(None) on subsequent polls");
     }
 
     /// Over-announce within a single frame still routes through the
@@ -252,20 +267,19 @@ mod tests {
         );
     }
 
-    /// When the announced total is reached but the receiver is still
-    /// `Pending` (no extra frame queued, no close), `complete` must still
-    /// be flipped so the Drop-time metric increment fires - preserving the
-    /// parent/subset invariant from the prior fix.
+    /// When the announced total is reached but the channel has not yet
+    /// closed, `delivered_announced` must be set so `is_end_stream()`
+    /// returns `true` and the Drop-time metric increment fires -
+    /// preserving the parent/subset invariant.
     #[tokio::test]
-    async fn exact_pending_after_total_still_marks_complete() {
+    async fn exact_pending_after_total_marks_end_of_stream() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut body = ChannelBody::new(rx, ContentLength::Exact(nz(4)));
 
         tx.send(Ok(bytes::Bytes::from_static(b"abcd")))
             .await
             .expect("send");
-        // Deliberately do NOT drop `tx`; the second `poll_recv` inside
-        // `poll_frame` should observe `Pending`.
+        // Deliberately do NOT drop `tx` before polling.
 
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -274,9 +288,11 @@ mod tests {
             unreachable!("expected Ready(Some(Ok(_))) for the last announced frame");
         };
         assert_eq!(frame.into_data().expect("data frame").as_ref(), b"abcd");
-        assert!(body.is_end_stream(), "complete must be set on Exact(0)");
+        assert!(
+            body.is_end_stream(),
+            "delivered_announced must be set on Exact(0)"
+        );
 
-        // Keep `tx` alive so the test reflects the Pending branch.
         drop(tx);
     }
 }
