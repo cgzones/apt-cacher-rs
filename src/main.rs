@@ -4699,6 +4699,11 @@ async fn main_loop(
                                         "Initial scheme cache request to host {authority} returned server error {}",
                                         response.status()
                                     );
+                                } else {
+                                    // ignore response, we just care about connection success
+                                    trace!(
+                                        "Response for host {authority} of initial scheme cache request:  {response:?}"
+                                    );
                                 }
                             }
                             Err(err) => {

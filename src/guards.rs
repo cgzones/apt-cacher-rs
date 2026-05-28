@@ -1,5 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
+use log::error;
+
 use crate::{
     AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength,
     cache_layout::CacheLayout,
@@ -369,7 +371,7 @@ impl RenameBarrier {
             ActiveDownloadStatus::Init(_)
             | ActiveDownloadStatus::Finished { .. }
             | ActiveDownloadStatus::Aborted(_) => {
-                log::error!(
+                error!(
                     "RenameBarrier::release reached with non-Download status: {:?}",
                     *data.lock
                 );
