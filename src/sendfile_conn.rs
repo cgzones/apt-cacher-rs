@@ -548,8 +548,8 @@ async fn try_sendfile_request(
     }
 
     let Some(authority) = uri.authority() else {
-        // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
-        // HTTP/1.1 request that lacks a Host header field.
+        // RFC 9112 §3.2: A server MUST respond with a 400 (Bad Request) status code to any
+        // HTTP/1.1 request message that lacks a Host header field.
         if *conn_version == ConnectionVersion::Http11 && find_header(req.headers, &HOST).is_none() {
             debug!("Missing Host header from HTTP/1.1 request from client {client}");
             return ZeroCopyResult::Invalid {
@@ -582,9 +582,9 @@ async fn try_sendfile_request(
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
-    // Unified dispatch shared with main.rs: normalize -> parse -> classify
-    // -> flat-blocklist -> diff-reject -> unsafe-path gate.  Logging,
-    // metric bumping, and deferred Origin DB writes happen inside
+    // Unified dispatch shared with main.rs: diff-reject -> normalize -> parse
+    // -> classify -> flat-blocklist -> deferred-Origin-DB -> unsafe-path gate.
+    // Logging, metric bumping, and deferred Origin DB writes happen inside
     // `dispatch_request`; this match only maps outcomes to ZeroCopyResult.
     let uri_path = uri.path();
     let plan = match dispatch_request(uri_path, requested_host, requested_port, &client).await {
@@ -802,8 +802,9 @@ async fn try_sendfile_request(
             }
         };
 
-        // Volatile staleness: if file is older than 30s, treat as cache miss
-        // so splice/hyper can fetch a fresh copy from upstream.
+        // Volatile staleness: if file is older than VOLATILE_CACHE_MAX_AGE,
+        // treat as cache miss so splice/hyper can fetch a fresh copy from
+        // upstream.
         if conn_details.cached_flavor == CachedFlavor::Volatile {
             match file.metadata().await {
                 Ok(md) if md.file_type().is_file() => {
@@ -993,9 +994,11 @@ struct ServeParams {
 
 /// Outcome of [`evaluate_conditional_and_range`].
 enum ConditionalOutcome {
-    /// Caller should send a 304 Not Modified (already written to the stream).
+    /// The 304 Not Modified response has already been written to the stream;
+    /// the caller should report the request as served using this `ConnectionAction`.
     NotModified(ConnectionAction),
-    /// Caller should send a 416 Range Not Satisfiable (already written to the stream).
+    /// The 416 Range Not Satisfiable response has already been written to the stream;
+    /// the caller should report the request as served using this `ConnectionAction`.
     RangeNotSatisfiable(ConnectionAction),
     /// Proceed with serving the file using these range parameters.
     Serve(ServeParams),
@@ -2098,8 +2101,8 @@ async fn serve_unfinished_sendfile(
         conn_details.debname, conn_details.mirror, conn_details.client
     );
 
-    // Joining clients also stream the partial cache file linearly via splice
-    // chunks, so warm the kernel readahead window before the loop starts.
+    // Joining clients also stream the partial cache file linearly via sendfile,
+    // so warm the kernel readahead window before the loop starts.
     hint_sequential_read(&file, &file_path);
 
     let _cork = CorkGuard::new_optional(stream);

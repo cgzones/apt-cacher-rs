@@ -7,7 +7,11 @@ use crate::{http_range::HttpDate, xattr_helpers};
 /// The extended attribute name used to store upstream `Last-Modified` values.
 const XATTR_LAST_MODIFIED: &str = "user.apt_cacher_rs.last_modified";
 
-/// Validate that a string is a parseable HTTP-date per RFC 9110 §5.6.7.
+/// Validate that a string is a parseable HTTP-date per RFC 9110 §5.6.7
+/// IMF-fixdate form only - legacy RFC 850 and asctime are rejected as
+/// malformed.  The underlying `HttpDate::parse` only accepts IMF-fixdate
+/// (and the RFC 2822 superset); broadening that parser is a behaviour
+/// change, out of scope here.
 #[must_use]
 fn is_valid_http_date(s: &str) -> bool {
     HttpDate::parse(s).is_some()

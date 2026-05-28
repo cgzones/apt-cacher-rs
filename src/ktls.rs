@@ -227,8 +227,11 @@ fn resolve_tls_version(version: rustls::ProtocolVersion) -> io::Result<u16> {
         | rustls::ProtocolVersion::TLSv1_1
         | rustls::ProtocolVersion::DTLSv1_0
         | rustls::ProtocolVersion::DTLSv1_2
-        | rustls::ProtocolVersion::DTLSv1_3
-        | rustls::ProtocolVersion::Unknown(_) => Err(io::Error::new(
+        | rustls::ProtocolVersion::DTLSv1_3 => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("kTLS: unsupported TLS protocol version {version:#x?}"),
+        )),
+        rustls::ProtocolVersion::Unknown(_) => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("kTLS: unknown TLS protocol version {version:#x?}"),
         )),
@@ -427,7 +430,7 @@ pub(crate) fn secret_name(secrets: &ConnectionTrafficSecrets) -> &'static str {
         ConnectionTrafficSecrets::Chacha20Poly1305 { .. } => "ChaCha20-Poly1305",
         // ConnectionTrafficSecrets is #[non_exhaustive], so new variants may be added
         // by rustls in future versions. This will not cause a compile-time error, but
-        // setup_direction() will return Err for unsupported ciphers before we reach here.
+        // setup_rx() will return Err for unsupported ciphers before we reach here.
         _ => "unknown",
     }
 }

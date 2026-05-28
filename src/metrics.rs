@@ -375,7 +375,14 @@ pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 /// Disjoint from `CACHE_IO_FAILURE`: a non-regular-file detection is
 /// reported here only.  If a subsequent removal attempt's syscall itself
 /// fails, that is reported separately under `CACHE_IO_FAILURE`.  Unexpected
-/// directories are tracked separately under `CACHE_DIRECTORY_UNEXPECTED`.
+/// directories are tracked separately under `CACHE_DIRECTORY_UNEXPECTED`
+/// when detected on dedicated directory-classification paths; however a
+/// number of serving paths (`main.rs`, `sendfile_conn.rs`, `splice_conn.rs`)
+/// and TOCTOU-safe sweep paths in `task_cleanup.rs` still bump
+/// `CACHE_NON_REGULAR` for directories encountered at file locations.
+/// Treat the counter as "any non-regular entry where a regular file was
+/// expected"; if you need the strict FIFO/socket/device/symlink slice,
+/// filter at the call site.
 pub(crate) static CACHE_NON_REGULAR: Counter = Counter::new();
 
 /// Cache entries observed to be directories in places where the cache
@@ -581,7 +588,7 @@ pub(crate) static DB_BATCH_FLUSHES_BY_SIZE: Counter = Counter::new();
 pub(crate) static DB_BATCH_FLUSHES_BY_TIME: Counter = Counter::new();
 /// Batch flushes performed during graceful shutdown drain.
 pub(crate) static DB_BATCH_FLUSHES_ON_SHUTDOWN: Counter = Counter::new();
-/// Peak number of buffered commands flushed in a single batch.
+/// Peak number of buffered commands attempted in a single batch flush (includes partial failures; pair with `DB_OPERATION_FAILED` to distinguish).
 pub(crate) static DB_BATCH_SIZE_PEAK: Peak = Peak::new();
 /// Mirror-id cache hits: the `(host, port, path)` lookup found an existing id
 /// without touching the database.

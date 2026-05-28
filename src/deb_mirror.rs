@@ -750,8 +750,8 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
     }
 
     // Metadata: closed allowlist of canonical filenames documented by the
-    // flat-repo spec.  `Release.gpg` is accepted only here; the structured
-    // matcher's narrower set stays as-is.
+    // flat-repo spec.  Mirrors the structured matcher's accepted set (also
+    // including `Release.gpg`).
     if matches!(
         tail,
         "InRelease"
@@ -800,7 +800,9 @@ pub(crate) fn valid_filename(name: &str) -> bool {
 
 /// Check whether the given URI path is a diff request path.
 ///
-/// Note: calls should be guarded by the configuration setting `reject_pdiff_requests`.
+/// Dispatched both when the configuration setting `reject_pdiff_requests` is
+/// on (to refuse with 410) and when it is off (to suppress the "Unrecognized
+/// resource path" warning for a URL shape we recognise but do not cache).
 ///
 /// Example request paths:
 /// - `http://deb.debian.org/debian-debug/dists/sid-debug/main/binary-i386/Packages.diff/T-2024-09-24-2005.48-F-2024-09-23-2021.00.gz`
@@ -945,7 +947,9 @@ pub(crate) fn is_flat_deb_filename(filename: &str) -> bool {
 const MAX_MIRROR_PATH_SEGMENTS: usize = 16;
 
 /// Maximum byte length of a single `/`-separated path segment (mirror path
-/// segment, distribution, component, architecture).
+/// segment, distribution, component, architecture). Also reused by
+/// `valid_mirrorname` as a cap on the total length of a mirror name, not
+/// just one of its segments.
 ///
 /// 128 bytes is generous for real-world Debian mirror names while providing a
 /// meaningful bound against overlong inputs.
@@ -2331,7 +2335,8 @@ mod tests {
 
     #[test]
     fn parse_translation_bz2_structured() {
-        // Regression: the form that worked before F55 must keep working.
+        // Regression guard: the bz2 translation form must keep parsing as a
+        // structured Translation resource.
         assert_eq!(
             parse_request_path("debian/dists/sid/main/i18n/Translation-en.bz2"),
             Some(ResourceFile::Translation {

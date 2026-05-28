@@ -820,8 +820,9 @@ async fn transmit_tls_data(
 /// as side-effects (post-handshake messages). Stops when the buffer is empty or
 /// a terminal/blocked state is reached.
 ///
-/// This is the shared drain loop used by phases 4 and 4b of the unbuffered kTLS
-/// handshake, and the non-spliceable response fallback path.
+/// Shared drain loop used by Phase 4 of the unbuffered kTLS handshake,
+/// called once after the initial response is parsed and again per iteration
+/// of the post-response read loop until the incoming buffer is empty.
 ///
 /// Times out after the configured HTTP timeout.
 #[cfg(feature = "ktls")]
@@ -1567,7 +1568,7 @@ async fn unbuffered_ktls_request(
 
         let secret_name = ktls::secret_name(rx_secrets);
 
-        // 6b: kTLS setup order is critical: ULP must be loaded before configuring
+        // kTLS setup order is critical: ULP must be loaded before configuring
         // crypto, and RX must be set up before draining control messages (which
         // uses recvmsg on the kTLS socket). We only configure RX: the request has
         // already been written to the wire before secret extraction, the kTLS
@@ -1743,7 +1744,7 @@ async fn read_upstream_response_headers(
     // Incremental scan offset: bytes before this index were already checked for
     // the \r\n\r\n terminator on a prior iteration. Subtract 3 so a terminator
     // that straddles the read boundary is still found. Mirrors the kTLS
-    // Phase-3 header-read loop (see lines 1279, 1343).
+    // Phase-3 header-read loop (`header_search_offset` in `unbuffered_ktls_request`).
     let mut search_offset = 0usize;
 
     loop {
@@ -1896,11 +1897,17 @@ enum DeliveryResult {
 /// Splice data from upstream TCP socket to client socket, with zero-copy tee to a cache file.
 ///
 /// Data flow (all in kernel space, zero userspace copies):
-///   upstream → splice → `pipe_A` → tee → `pipe_B` → splice → `cache_file`
-///                                  ↓
-///                            splice → client
-/// The caller must `.await` the join handle after the download barrier has been
-/// consumed (so the spawned task can observe `ActiveDownloadStatus::Finished`).
+///
+/// ```text
+///   upstream -> splice -> pipe_A --tee--> pipe_B -> splice -> cache_file
+///                                  |
+///                                  `--> splice -> client
+/// ```
+///
+/// The caller must `.await` the join handle after the download barrier has
+/// been consumed (so the spawned task can observe a terminal
+/// `ActiveDownloadStatus` -- `Verifying` while integrity hashing is in
+/// flight, then `Finished` once `RenameBarrier::commit` flips the variant).
 type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
 
 #[expect(clippy::too_many_arguments, reason = "called from a single site")]
@@ -3666,7 +3673,7 @@ async fn forward_upstream_chunked_body(
                                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                     return Err(std::io::Error::new(
                                         ErrorKind::InvalidData,
-                                        "chunked encoding: expected \\r after chunk data",
+                                        "chunked encoding: expected CR after chunk data",
                                     ));
                                 }
                             } else {
@@ -3676,7 +3683,7 @@ async fn forward_upstream_chunked_body(
                                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                                     return Err(std::io::Error::new(
                                         ErrorKind::InvalidData,
-                                        "chunked encoding: expected \\n after chunk data \\r",
+                                        "chunked encoding: expected LF after chunk data CR",
                                     ));
                                 }
                                 break;
@@ -4851,7 +4858,7 @@ async fn splice_proxy_drive(
             }
         }
         CachedFlavor::Permanent => {
-            // permanent files are never overridden
+            // permanent files are never overwritten
             0
         }
     };
@@ -6275,12 +6282,17 @@ async fn handle_volatile_buffered_download(
     });
     send_db_command(cmd).await;
 
-    // Record origin in database (mirrors the hyper path in main.rs).
-    // Use the original (pre-redirect) client request path so the recorded
-    // origin layout is consistent with the hyper backend (main.rs), which
-    // extracts Origin from `parts_cloned.uri.path()` captured before any
-    // redirect. Using the redirected `upstream_path` here would poison the
-    // DB with a different origin row for the same logical download.
+    // Record origin in database for this cached (volatile-buffered)
+    // download.  As in `splice_proxy_drive`, this is an intentional
+    // asymmetry with the hyper backend: in `main.rs`, `Origin::from_path`
+    // is only called from the simple-proxy passthrough; hyper's cache
+    // paths (`download_file`/`serve_new_file`) never record an Origin row.
+    // The splice path records Origins for cached downloads too, so it is
+    // doing strictly more origin-recording work than hyper.  Use the
+    // original (pre-redirect) client request path so the recorded origin
+    // layout is stable across upstream redirects (the redirected
+    // `upstream_path` would otherwise poison the DB with a different
+    // origin row for the same logical download).
     if let Some(origin) = Origin::from_path(
         original_uri_path,
         conn_details.mirror.host().clone(),

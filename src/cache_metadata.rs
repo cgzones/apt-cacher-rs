@@ -6,7 +6,7 @@
 //! Last-Modified), and the rustix bounds-check inside the xattr crate
 //! showed up at ~0.5 % of worker samples plus drove `block_in_place` and
 //! `spawn_blocking_inner` mutex traffic. Caching the parsed values per
-//! `(mirror, debname)` lets repeat hits skip the syscalls entirely.
+//! `(mirror, debname, layout)` lets repeat hits skip the syscalls entirely.
 //!
 //! # Source-of-truth split
 //!
@@ -197,9 +197,9 @@ impl Equivalent<CacheMetadataKey> for CacheMetadataKeyRef<'_> {
     }
 }
 
-/// Process-local cache mapping `(mirror, debname)` to the most recently
-/// observed upstream metadata for the file.  Lookups return an [`Arc`] so
-/// readers drop the map lock before inspecting fields.
+/// Process-local cache mapping `(mirror, debname, layout)` to the most
+/// recently observed upstream metadata for the file.  Lookups return an
+/// [`Arc`] so readers drop the map lock before inspecting fields.
 pub(crate) struct CacheMetadataStore {
     map: parking_lot::RwLock<HashMap<CacheMetadataKey, Arc<UpstreamMetadata>>>,
 }

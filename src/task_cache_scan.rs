@@ -32,7 +32,7 @@ enum SubDirMode {
 impl SubDirMode {
     const fn purpose(self) -> &'static str {
         match self {
-            Self::Structured | Self::Flat => "mirror sub directory",
+            Self::Structured | Self::Flat => "mirror sub-directory",
             Self::ByHash => "mirror by-hash directory",
         }
     }

@@ -1371,7 +1371,7 @@ impl Config {
 
         if self.buffer_size < 1024 || self.buffer_size > 1024 * 1024 * 1024 {
             bail!(
-                "Invalid buffer_size value of {}: must be in between 1k and 1G",
+                "Invalid buffer_size value of {}: must be between 1k and 1G",
                 self.buffer_size
             );
         }
@@ -1840,7 +1840,7 @@ mod test {
         // short part
         assert!(is_valid_config_domain("debian.f.org"));
 
-        // too long port
+        // too long part
         assert!(!is_valid_config_domain(
             "debian.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789AAA.org"
         ));
