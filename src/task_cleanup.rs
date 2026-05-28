@@ -152,6 +152,7 @@ async fn scan_cached_files(host_path: &Path) -> Result<HashMap<String, PathBuf>,
         };
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
+            metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
             warn!(
                 "Unrecognized entry in mirror pool directory: `{}`",
                 entry.path().display()
@@ -177,14 +178,15 @@ async fn scan_cached_files(host_path: &Path) -> Result<HashMap<String, PathBuf>,
             }
         };
         if !file_type.is_file() {
-            metrics::CACHE_NON_REGULAR.increment();
             let path = entry.path();
             if file_type.is_dir() {
+                metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
                 warn!(
                     "Skipping unexpected directory in mirror pool directory: `{}`",
                     path.display()
                 );
             } else {
+                metrics::CACHE_NON_REGULAR.increment();
                 warn!(
                     "Removing non-regular entry in mirror pool directory: `{}`",
                     path.display()
@@ -1257,6 +1259,7 @@ async fn scan_flat_cached_debs(
             };
             let name = entry.file_name();
             let Some(name_str) = name.to_str() else {
+                metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
                 warn!("Skipping unrecognized entry `{}`", entry.path().display());
                 continue;
             };
@@ -1433,16 +1436,24 @@ async fn sweep_aged_cached_debs(
             }
         };
 
-        if let Ok(existing_for) = now.duration_since(created)
-            && existing_for < keep_span
-        {
-            debug!(
-                "Keeping cached file `{}` since it is too new ({}, threshold={})",
-                path.display(),
-                HumanFmt::Time(existing_for),
-                HumanFmt::Time(keep_span)
-            );
-            continue;
+        match now.duration_since(created) {
+            Ok(existing_for) if existing_for < keep_span => {
+                debug!(
+                    "Keeping cached file `{}` since it is too new ({}, threshold={})",
+                    path.display(),
+                    HumanFmt::Time(existing_for),
+                    HumanFmt::Time(keep_span)
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                info_once!(
+                    "File `{}` has a future timestamp, skipping removal:  {err}",
+                    path.display()
+                );
+                continue;
+            }
         }
 
         let size = data.len();
@@ -1829,13 +1840,14 @@ async fn cleanup_byhash_dir(
         };
 
         if !file_type.is_file() {
-            metrics::CACHE_NON_REGULAR.increment();
             if file_type.is_dir() {
+                metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
                 warn!(
                     "Skipping unexpected directory in by-hash directory: `{}`",
                     path.display()
                 );
             } else {
+                metrics::CACHE_NON_REGULAR.increment();
                 warn!(
                     "Removing non-regular entry in by-hash directory: `{}`",
                     path.display()
@@ -1848,7 +1860,10 @@ async fn cleanup_byhash_dir(
                     );
                 } else {
                     debug!("Removed non-regular entry `{}`", path.display());
-                    stats.bytes_removed += mdata.len();
+                    // Don't credit `mdata.len()` to `bytes_removed`: for
+                    // a symlink that's the path length, for FIFO/socket/
+                    // device the `st_size` field is unspecified.  Count
+                    // the file but credit zero bytes.
                     stats.files_removed += 1;
                 }
             }
@@ -2108,7 +2123,7 @@ async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
             // a symlink-to-dir is unlinked via `remove_file` rather than
             // having `remove_dir_all` traverse its target.
             let removal = if file_type.is_dir() {
-                metrics::CACHE_NON_REGULAR.increment();
+                metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
                 warn!("Removing directory tmp entry `{}`", entry.path().display());
                 tokio::fs::remove_dir_all(&path).await
             } else if !file_type.is_file() {

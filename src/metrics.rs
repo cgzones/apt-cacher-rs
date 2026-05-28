@@ -138,7 +138,7 @@ pub(crate) static VOLATILE_HIT: Counter = Counter::new();
 /// Mutually exclusive with `CACHE_MISSES` (which counts permanent files only).
 /// `VOLATILE_REFETCHED_UPTODATE` and `VOLATILE_REFETCHED_OUTOFDATE` are
 /// subsets covering the stale-but-present case; the volatile-not-found
-/// case bumps neither sub-bucket, so their sum is strictly less than
+/// case bumps neither sub-bucket, so their sum is less than or equal to
 /// `VOLATILE_REFETCHED`.
 pub(crate) static VOLATILE_REFETCHED: Counter = Counter::new();
 /// Subset of `VOLATILE_REFETCHED`: stale-but-present, upstream returned 304.
@@ -232,9 +232,19 @@ pub(crate) static ACTIVE_CLIENT_DOWNLOADS_PEAK: Peak = Peak::new();
 pub(crate) static BYTES_SERVED_MMAP: Accumulator = Accumulator::new();
 /// Bytes delivered via Linux `sendfile(2)` zero-copy.
 pub(crate) static BYTES_SERVED_SENDFILE: Accumulator = Accumulator::new();
-/// Bytes streamed upstream→client via Linux `splice(2)` zero-copy.
+/// Bytes delivered to the client by the splice proxy backend.  The bulk of
+/// these traverse Linux `splice(2)` zero-copy (`tee_and_splice`), but the
+/// counter also covers the small userspace-write tail that the splice path
+/// cannot avoid: the body prefix consumed by the header parser, kTLS
+/// handshake-spill plaintext, range-boundary chunks carved from a userspace
+/// drain buffer, and the volatile buffered re-fetch path that buffers the
+/// entire body in RAM before writing.  All of these sit within a request
+/// counted under `REQUESTS_SPLICE`.
 pub(crate) static BYTES_SERVED_SPLICE: Accumulator = Accumulator::new();
-/// Bytes delivered via plain userspace read/write copy.
+/// Bytes delivered via plain userspace read/write copy on the hyper backend's
+/// cache-hit streaming-file path (`DeliveryStreamBody`).  Splice-path
+/// userspace writes are reported under `BYTES_SERVED_SPLICE` instead, since
+/// they are inseparable from the request's splice accounting.
 pub(crate) static BYTES_SERVED_COPY: Accumulator = Accumulator::new();
 /// Bytes delivered to late joiners via the hyper `ChannelBody` streaming path
 /// (`serve_unfinished_file`). Counted at frame-poll time (when hyper requests
@@ -350,25 +360,47 @@ pub(crate) static UPSTREAM_HYPER_REQUEST_FAILED: Counter = Counter::new();
 /// received, while streaming the body (peer aborted / framing error).
 pub(crate) static UPSTREAM_HYPER_BODY_ERR: Counter = Counter::new();
 
-/// Local cache I/O failures: any cached-file syscall (stat/open/mmap/seek/
-/// create) that returned a 5xx to the client. Distinct from
-/// `CACHE_SIZE_CORRUPTION`, which is specific to on-disk size accounting
-/// drift.
+/// Local cache I/O failures: any cached-file syscall (write/flush/read/
+/// rename/create/stat/open/mmap/seek) that fails, regardless of whether a
+/// 5xx is returned to the client. Distinct from `CACHE_SIZE_CORRUPTION`,
+/// which is specific to on-disk size accounting drift.
 pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 
-/// Cache entries observed to be non-regular files (FIFO, socket, device,
-/// directory, symlink).  Bumped by serving paths (which then return 5xx),
-/// download paths (which abort the download), and cleanup paths (which
-/// actively unlink unexpected non-regular *files* in pool / flat / by-hash
-/// / `tmp/`, but leave unexpected *directories* in pool / flat / by-hash
-/// alone with a warn — `tmp/` is the only location where a stray directory
-/// is recursively removed).  A non-zero count indicates either a hostile
-/// filesystem or a misconfigured cache directory and is worth operator
-/// attention.  Disjoint from `CACHE_IO_FAILURE`: a non-regular-file
-/// detection is reported here only.  If a subsequent removal attempt's
-/// syscall itself fails, that is reported separately under
-/// `CACHE_IO_FAILURE`.
+/// Cache entries observed to be non-regular non-directory files (FIFO,
+/// socket, device, symlink).  Bumped by serving paths (which then return
+/// 5xx), download paths (which abort the download), and cleanup paths
+/// (which actively unlink such entries in pool / flat / by-hash / `tmp/`).
+/// A non-zero count indicates either a hostile filesystem or a
+/// misconfigured cache directory and is worth operator attention.
+/// Disjoint from `CACHE_IO_FAILURE`: a non-regular-file detection is
+/// reported here only.  If a subsequent removal attempt's syscall itself
+/// fails, that is reported separately under `CACHE_IO_FAILURE`.  Unexpected
+/// directories are tracked separately under `CACHE_DIRECTORY_UNEXPECTED`.
 pub(crate) static CACHE_NON_REGULAR: Counter = Counter::new();
+
+/// Cache entries observed to be directories in places where the cache
+/// layout only expects regular files (pool / flat / by-hash subtrees).
+/// In those subtrees cleanup leaves the directory in place and emits a
+/// warn — the cache layout has no recursive-remove semantics there and
+/// a directory typically indicates operator action (e.g. a `mv` into the
+/// cache tree).  The single exception is `tmp/`, where stray directories
+/// are recursively removed; that bump also increments this counter so
+/// the dashboard surfaces the event consistently.  Distinct from
+/// `CACHE_NON_REGULAR` because the operator response differs: a stray
+/// directory is usually benign-but-wasteful; a stray FIFO/socket/symlink
+/// is a security-relevant tampering signal.
+pub(crate) static CACHE_DIRECTORY_UNEXPECTED: Counter = Counter::new();
+
+/// Cache entries observed to be regular files at locations where only
+/// host directories are expected (currently the cache root, where the
+/// only legitimate children are alias-resolved host dirs).  Cleanup /
+/// scan leaves the file in place and emits a warn — like a stray
+/// directory at the cache root, this is typically an operator artefact
+/// (e.g. a hand-placed `.txt` note) rather than a tampering signal.
+/// Distinct from `CACHE_NON_REGULAR` (FIFO/socket/device/symlink, which
+/// are security-relevant) and `CACHE_DIRECTORY_UNEXPECTED` (the
+/// directory-shaped counterpart inside mirror subtrees).
+pub(crate) static CACHE_UNEXPECTED_REGULAR: Counter = Counter::new();
 
 /// Bytes copied client → upstream through the CONNECT tunnel.
 ///
@@ -481,11 +513,8 @@ pub(crate) static HTTPS_UPGRADE_FAILED: Counter = Counter::new();
 /// Scheme-cache entries purged after `MAX_ATTEMPTS` connection failures.
 pub(crate) static SCHEME_CACHE_REMOVED: Counter = Counter::new();
 
-/// Database operations that returned an error. Bumped from `db_loop`
-/// (background task) and from synchronous DB callers outside the
-/// loop — `init_tables`, `cleanup_invalid_rows`, `delete_usage_logs`,
-/// `mirror_cleanup`, `get_mirrors`, `get_mirrors_with_stats`. Any
-/// non-zero value indicates `SQLite` trouble worth investigating.
+/// Database operations that returned an error. Any non-zero value
+/// indicates `SQLite` trouble worth investigating.
 pub(crate) static DB_OPERATION_FAILED: Counter = Counter::new();
 
 /// Active downloads that finished in `Aborted` state (rate-limit / failure).

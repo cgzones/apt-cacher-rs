@@ -1774,6 +1774,7 @@ pub(crate) async fn async_sendfile_unfinished(
                 ));
             }
             Err(errno) => {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to query metadata of downloading file `{}` during sendfile:  {errno}",
                     file_path.display()

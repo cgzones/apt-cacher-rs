@@ -3892,7 +3892,9 @@ async fn serve_volatile_304_via_sendfile(
     ibarrier: InitBarrier<'_>,
     invalid_tag: &'static str,
 ) -> Result<(), SpliceProxyError> {
-    metrics::VOLATILE_REFETCHED_UPTODATE.increment();
+    if !conn_details.client.is_cleanup_synthetic() {
+        metrics::VOLATILE_REFETCHED_UPTODATE.increment();
+    }
 
     let file = match tokio::fs::File::options()
         .read(true)
@@ -4516,7 +4518,7 @@ async fn splice_proxy_drive(
     // (200 or 206) — counterpart to the 304 / UPTODATE case above. The
     // volatile-not-found path leaves `volatile_cache_path` as None and is
     // intentionally not split into UPTODATE/OUTOFDATE.
-    if volatile_cache_path.is_some() {
+    if volatile_cache_path.is_some() && !conn_details.client.is_cleanup_synthetic() {
         metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
     }
 
@@ -5892,6 +5894,12 @@ async fn handle_volatile_buffered_download(
         .request_sent_at
         .unwrap_or_else(coarsetime::Instant::now);
 
+    // Account this buffered serve under `ACTIVE_CLIENT_DOWNLOADS` for the
+    // duration of the function (RAII drop on every return path).  Mirrors
+    // the canonical `splice_proxy_body{,_tls}` holders; the buffered path
+    // bypasses those and would otherwise undercount.
+    let _client_count = client_counter::ClientDownload::new();
+
     // Buffer the entire body into memory.
     let body = if upstream_resp.is_chunked {
         // Chunked: on success the closing `\r\n` after the `0\r\n` terminator
@@ -6387,6 +6395,13 @@ pub(crate) async fn splice_simple_proxy(
 ) -> Result<(), SpliceProxyError> {
     let host_authority = mirror.format_authority();
     let original_uri_path = upstream_path;
+
+    // Account this passthrough under `ACTIVE_CLIENT_DOWNLOADS` for the
+    // duration of the function (RAII drop on every return path). The hyper
+    // passthrough is counted via `ClientCountedBody`; the splice passthrough
+    // serves bytes synchronously inside this frame and would otherwise be
+    // invisible to the counter.
+    let _client_count = client_counter::ClientDownload::new();
 
     let (up, resp, hdr_buf, hdr_end, _label, poolable) =
         standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None).await?;

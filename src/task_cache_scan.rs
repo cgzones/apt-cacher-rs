@@ -108,8 +108,21 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         match entry.metadata().await {
             Ok(mdata) if mdata.is_dir() => {}
             Ok(mdata) if mdata.file_type().is_symlink() => {
+                metrics::CACHE_NON_REGULAR.increment();
                 warn!(
                     "Unrecognized symlink entry in cache directory: `{}`",
+                    entry.path().display()
+                );
+                continue;
+            }
+            Ok(mdata) if mdata.is_file() => {
+                // A regular file at the cache root is an operator
+                // artefact (the cache root only ever holds host
+                // directories), not a tampering signal — bucket it
+                // separately from FIFO/socket/device entries.
+                metrics::CACHE_UNEXPECTED_REGULAR.increment();
+                warn!(
+                    "Unrecognized regular file entry in cache directory: `{}`",
                     entry.path().display()
                 );
                 continue;
@@ -117,7 +130,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
                 warn!(
-                    "Unrecognized non-directory entry in cache directory: `{}`",
+                    "Unrecognized non-regular entry in cache directory: `{}`",
                     entry.path().display()
                 );
                 continue;
@@ -141,6 +154,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         // match a registered mirror dir (mirror hosts are validated as
         // ASCII), so fall through to the unrecognized-entry warn.
         let Some(name_str) = dir_name.to_str() else {
+            metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
             warn!(
                 "Cache directory entry with non-UTF-8 name: `{}`",
                 entry.path().display()
@@ -149,6 +163,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         };
 
         let Some(mirrors_here) = mirrors_by_dir.get(name_str) else {
+            metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
             warn!(
                 "Cache directory entry not matching any mirror: `{}`",
                 entry.path().display()
@@ -285,6 +300,7 @@ async fn scan_mirror_dir(
         let name = entry.file_name();
 
         if file_type.is_symlink() {
+            metrics::CACHE_NON_REGULAR.increment();
             warn!(
                 "Unrecognized symlink entry in mirror directory: `{}`",
                 entry.path().display()
@@ -317,6 +333,7 @@ async fn scan_mirror_dir(
             }
 
             let Some(name_str) = name.to_str() else {
+                metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
                 warn!(
                     "Unrecognized directory entry in mirror directory: `{}`",
                     entry.path().display()
@@ -349,6 +366,13 @@ async fn scan_mirror_dir(
             // unrecognized directory falls through to the warn below
         }
 
+        if file_type.is_dir() {
+            metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
+        } else if file_type.is_file() {
+            metrics::CACHE_UNEXPECTED_REGULAR.increment();
+        } else {
+            metrics::CACHE_NON_REGULAR.increment();
+        }
         warn!(
             "Unrecognized {} entry in mirror directory: `{}`",
             if file_type.is_dir() {
@@ -451,6 +475,7 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
             };
 
             if file_type.is_symlink() {
+                metrics::CACHE_NON_REGULAR.increment();
                 warn!(
                     "Unrecognized symlink entry in {}: `{}`",
                     mode.purpose(),
@@ -489,6 +514,11 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
                 }
             }
 
+            if file_type.is_dir() {
+                metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
+            } else {
+                metrics::CACHE_NON_REGULAR.increment();
+            }
             warn!(
                 "Unrecognized entry in {} `{}`: `{}`",
                 mode.purpose(),

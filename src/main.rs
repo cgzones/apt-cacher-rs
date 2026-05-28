@@ -1991,6 +1991,7 @@ async fn download_file(
 
                 // Flush buffered data so partial files retain what was received
                 if let Err(err) = writer.flush().await {
+                    metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "Failed to flush partial data to `{}`:  {}",
                         outpath.display(),
@@ -2017,6 +2018,7 @@ async fn download_file(
             }
 
             if let Err(err) = writer.write_all_buf(&mut chunk).await {
+                metrics::CACHE_IO_FAILURE.increment();
                 error!(
                     "Failed to write to file `{}`:  {}",
                     outpath.display(),
@@ -2061,6 +2063,7 @@ async fn download_file(
     let t_upstream_done = Instant::now();
 
     if let Err(err) = writer.flush().await {
+        metrics::CACHE_IO_FAILURE.increment();
         error!(
             "Failed to write to file `{}`:  {}",
             outpath.display(),
@@ -2248,6 +2251,7 @@ async fn serve_unfinished_file(
                     Ok(0) => break, // EOF
                     Ok(r) => r,
                     Err(err) => {
+                        metrics::CACHE_IO_FAILURE.increment();
                         error!(
                             "Failed to read from file `{}`:  {}",
                             file_path.display(),
@@ -3987,6 +3991,7 @@ fn connect_response(
 
     let response = Response::builder()
         .header(SERVER, APP_NAME)
+        .header(VIA, APP_VIA)
         .header(DATE, format_http_date())
         .body(empty_body())
         .expect("HTTP response is valid");

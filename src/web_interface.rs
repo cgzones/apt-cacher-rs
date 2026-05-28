@@ -1967,8 +1967,18 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Cache Non-Regular Files",
-        "Cache entries observed as non-regular files (FIFO, socket, device, directory, symlink). Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which actively unlink unexpected non-regular files in pool/flat/by-hash/tmp, but leave unexpected directories outside tmp/ alone with a warn).",
+        "Cache entries observed as non-regular non-directory files (FIFO, socket, device, symlink). Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which actively unlink these in pool/flat/by-hash/tmp).",
         AlertNonzero(metrics::CACHE_NON_REGULAR.get()),
+    );
+    t.row_tip(
+        "Cache Unexpected Directories",
+        "Cache entries observed as directories where only regular files are expected (pool/flat/by-hash). Cleanup leaves the directory in place and emits a warn; the tmp/ subtree is the sole exception where the directory is recursively removed. Operator action is usually required to investigate the stray directory.",
+        WarnNonzero(metrics::CACHE_DIRECTORY_UNEXPECTED.get()),
+    );
+    t.row_tip(
+        "Cache Unexpected Regular Files",
+        "Cache entries observed as regular files at locations where only host directories are expected (the cache root). Scan leaves the file in place and emits a warn; this is typically an operator artefact (e.g. a hand-placed note) rather than a tampering signal.",
+        WarnNonzero(metrics::CACHE_UNEXPECTED_REGULAR.get()),
     );
     t.row_tip(
         "Logstore Evictions",
