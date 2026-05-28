@@ -128,9 +128,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
                     "Failed to get metadata of `{}`:  {err}",
                     entry.path().display()
                 );
-                // Fall through to mirror lookup — opendir on this entry may
-                // still succeed even if stat failed, and a registered mirror
-                // shouldn't be skipped silently on a transient error.
+                continue;
             }
         }
 
