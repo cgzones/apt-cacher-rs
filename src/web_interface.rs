@@ -1423,7 +1423,7 @@ fn build_cache_stats_html(
         Ok(v) => Some(v),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query bandwidth window:  {err}");
+            error!("Failed to query 24h bandwidth window:  {err}");
             None
         }
     };
@@ -1431,7 +1431,7 @@ fn build_cache_stats_html(
         Ok(v) => Some(v),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query bandwidth window:  {err}");
+            error!("Failed to query 7d bandwidth window:  {err}");
             None
         }
     };

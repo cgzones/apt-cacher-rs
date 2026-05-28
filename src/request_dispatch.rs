@@ -297,14 +297,20 @@ fn decide_request(
                 };
             }
             Err(ClassifyError::InvalidValue { kind, decoded }) => {
-                warn_once_or_info!("Unsupported {kind} `{decoded}` from client {client}");
+                warn_once_or_info!(
+                    "Unsupported {kind} `{}` from client {client}",
+                    decoded.escape_debug()
+                );
                 return Decision {
                     outcome: DispatchOutcome::Reject(RejectReason::InvalidValue),
                     pending_origin: None,
                 };
             }
             Err(ClassifyError::NonDebPool { filename }) => {
-                warn_once_or_info!("Unsupported pool filename `{filename}` from client {client}");
+                warn_once_or_info!(
+                    "Unsupported pool filename `{}` from client {client}",
+                    filename.escape_debug()
+                );
                 PassthroughReason::NonDebPool
             }
         },

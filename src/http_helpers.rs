@@ -152,6 +152,7 @@ pub(crate) async fn write_invalid_response(
     let response = format!(
         "{conn_version} {status}\r\n\
          Server: {APP_NAME}\r\n\
+         Via: {APP_VIA}\r\n\
          Date: {date}\r\n\
          Connection: {conn_action}\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\

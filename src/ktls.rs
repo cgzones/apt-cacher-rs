@@ -127,19 +127,19 @@ pub(crate) fn is_available() -> bool {
         ) {
             Ok(fd) => fd,
             Err(err) => {
-                warn!("kTLS: available test: Failed to create listener socket:  {err}");
+                warn!("kTLS: availability test: Failed to create listener socket:  {err}");
                 return TestResult::Error;
             }
         };
 
         let addr = SockaddrIn::new(127, 0, 0, 1, 0);
         if let Err(err) = bind(listener.as_raw_fd(), &addr) {
-            warn!("kTLS: available test: Failed to bind socket:  {err}");
+            warn!("kTLS: availability test: Failed to bind socket:  {err}");
             return TestResult::Error;
         }
 
         if let Err(err) = listen(&listener, Backlog::new(1).expect("valid backlog value")) {
-            warn!("kTLS: available test: Failed to listen on socket:  {err}");
+            warn!("kTLS: availability test: Failed to listen on socket:  {err}");
             return TestResult::Error;
         }
 
@@ -147,7 +147,7 @@ pub(crate) fn is_available() -> bool {
         let sockname: SockaddrIn = match getsockname(listener.as_raw_fd()) {
             Ok(s) => s,
             Err(err) => {
-                warn!("kTLS: available test: Failed to get sockname:  {err}");
+                warn!("kTLS: availability test: Failed to get sockname:  {err}");
                 return TestResult::Error;
             }
         };
@@ -161,13 +161,13 @@ pub(crate) fn is_available() -> bool {
         ) {
             Ok(fd) => fd,
             Err(err) => {
-                warn!("kTLS: available test: Failed to create client socket:  {err}");
+                warn!("kTLS: availability test: Failed to create client socket:  {err}");
                 return TestResult::Error;
             }
         };
 
         if let Err(err) = connect(client.as_raw_fd(), &sockname) {
-            warn!("kTLS: available test: Failed to connect client socket:  {err}");
+            warn!("kTLS: availability test: Failed to connect client socket:  {err}");
             return TestResult::Error;
         }
 
@@ -180,7 +180,7 @@ pub(crate) fn is_available() -> bool {
                 unsafe { OwnedFd::from_raw_fd(fd) }
             }
             Err(err) => {
-                warn!("kTLS: available test: Failed to accept client connection:  {err}");
+                warn!("kTLS: availability test: Failed to accept client connection:  {err}");
                 return TestResult::Error;
             }
         };
@@ -192,7 +192,7 @@ pub(crate) fn is_available() -> bool {
             Ok(()) => TestResult::Available,
             Err(nix::errno::Errno::ENOENT) => TestResult::Unavailable,
             Err(err) => {
-                warn!("kTLS: available test: Failed to set TCP_ULP:  {err}");
+                warn!("kTLS: availability test: Failed to set TCP_ULP:  {err}");
                 TestResult::Error
             }
         }
@@ -412,7 +412,7 @@ pub(crate) fn load_ulp<F: AsFd>(fd: &F) -> io::Result<()> {
     nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpUlp::default(), b"tls").map_err(
         |errno| {
             warn_once!("kTLS: failed to load TLS ULP:  {errno}");
-            errno_to_io_error(errno, "setsockopt TLS ULP failed")
+            errno_to_io_error(errno, "kTLS: setsockopt TLS ULP failed")
         },
     )
 }
@@ -574,7 +574,7 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
             }
             Err(errno) => {
                 debug!("kTLS: drain peek error:  {errno}");
-                return Err(errno_to_io_error(errno, "recvmsg peek failed"));
+                return Err(errno_to_io_error(errno, "kTLS: recvmsg peek failed"));
             }
         };
 

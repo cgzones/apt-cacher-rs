@@ -35,10 +35,10 @@ pub(crate) fn client_segment(bytes: u64, window: Duration) -> String {
 /// receiving the whole response; `bytes` is the best-effort count streamed
 /// toward it.
 #[must_use]
-pub(crate) fn client_disconnect_segment(bytes: u64, window: Duration) -> String {
+pub(crate) fn client_disconnect_segment(bytes: u64, elapsed: Duration) -> String {
     format!(
         "client disconnected after {} ({})",
-        HumanFmt::Time(window.into()),
+        HumanFmt::Time(elapsed.into()),
         HumanFmt::Size(bytes)
     )
 }

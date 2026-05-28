@@ -43,9 +43,25 @@ macro_rules! static_assert {
 }
 
 /// Returns `true` when `err` indicates the peer terminated the connection
-/// (by reset, abort, half-close, EOF, or socket-level timeout). Used to
-/// demote routine "client went away" log lines from warn to info, since
-/// they are not actionable for the operator.
+/// (by reset, abort, half-close, or EOF). Used to demote routine "client
+/// went away" log lines from warn to info, since they are not actionable
+/// for the operator.
+///
+/// `ErrorKind::TimedOut` is deliberately *not* included here: in this
+/// codebase, `TimedOut` `io::Error`s overwhelmingly originate from the
+/// proxy's own decisions — `wait_socket_rated` HTTP per-op timeouts and
+/// `rate_checked_body` rate-stalls — which already bump dedicated
+/// `HTTP_TIMEOUT_*` counters at construction. Folding them into
+/// "peer disconnect" was double-attributing them to
+/// `CLIENT_DISCONNECTED_MID_BODY`. The rare OS-level `ETIMEDOUT`
+/// (TCP keepalive / `TCP_USER_TIMEOUT`) is the only remaining caller and
+/// is acceptable to log as a warn-level timeout rather than an
+/// info-level "peer disconnect" — the wording stays accurate either way.
+///
+/// Call sites that want to demote a `TimedOut` to a different severity
+/// (e.g. the header-read idle-timeout debug path, or the splice
+/// boundary-chunk demote-on-stall path) MUST add an explicit
+/// `err.kind() == ErrorKind::TimedOut` branch before this check.
 #[must_use]
 pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
@@ -55,7 +71,6 @@ pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
             | ErrorKind::ConnectionAborted
             | ErrorKind::ConnectionReset
             | ErrorKind::NotConnected
-            | ErrorKind::TimedOut
             | ErrorKind::UnexpectedEof
     )
 }
@@ -234,24 +249,22 @@ pub(crate) struct TempPath {
 impl TempPath {
     /// Defuse the temporary path guard, returning the underlying `PathBuf`.
     pub(crate) fn defuse(mut self) -> PathBuf {
-        std::mem::take(&mut self.path).expect("path has not been destructed yet")
+        std::mem::take(&mut self.path).expect("path has not been taken yet")
     }
 
     /// Force deletion of the underlying file regardless of `keep_on_drop`.
     async fn remove(mut self) -> PathBuf {
-        let path = std::mem::take(&mut self.path).expect("path has not been destructed yet");
+        let path = std::mem::take(&mut self.path).expect("path has not been taken yet");
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
-            let level = if err.kind() == std::io::ErrorKind::NotFound {
-                log::Level::Warn
+            // NotFound is still a WARN here: the path is supposed to exist for the
+            // lifetime of the TempPath guard, so a missing file means something
+            // outside us deleted it (operator, racing cleanup, FS issue).
+            if err.kind() == std::io::ErrorKind::NotFound {
+                warn!("Failed to remove partial file `{}`:  {err}", path.display());
             } else {
-                log::Level::Error
-            };
-            log::log!(
-                level,
-                "Failed to remove partial file `{}`:  {err}",
-                path.display()
-            );
+                error!("Failed to remove partial file `{}`:  {err}", path.display());
+            }
         }
 
         path
@@ -295,17 +308,13 @@ impl Deref for TempPath {
     type Target = Path;
 
     fn deref(&self) -> &Self::Target {
-        self.path
-            .as_deref()
-            .expect("path has not been destructed yet")
+        self.path.as_deref().expect("path has not been taken yet")
     }
 }
 
 impl AsRef<Path> for TempPath {
     fn as_ref(&self) -> &Path {
-        self.path
-            .as_deref()
-            .expect("path has not been destructed yet")
+        self.path.as_deref().expect("path has not been taken yet")
     }
 }
 

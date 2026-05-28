@@ -101,7 +101,7 @@ pub(crate) async fn handle_sendfile_connection(
 ) {
     let mut buf = BytesMut::with_capacity(INITIAL_HEADER_SIZE);
 
-    trace!("Using sendfile(2) backend to handle request from client {client} ...");
+    trace!("Using sendfile(2) backend to handle request from client {client}...");
 
     let mut req_num = 0;
     let mut conn_version = ConnectionVersion::Http11; // assume more recent version 1.1 if not yet parsed from any request
@@ -205,7 +205,10 @@ pub(crate) async fn handle_sendfile_connection(
                 )
                 .await
                 {
-                    info!("Failed to write error response to client {client}:  {err}");
+                    info!(
+                        "Failed to write error response to client {client}:  {}",
+                        ErrorReport(&err)
+                    );
                 }
 
                 return;
@@ -218,7 +221,10 @@ pub(crate) async fn handle_sendfile_connection(
                 if let Err(err) =
                     write_invalid_response(&stream, conn_version, conn_action, status, msg).await
                 {
-                    info!("Failed to write rejection response to client {client}:  {err}");
+                    info!(
+                        "Failed to write rejection response to client {client}:  {}",
+                        ErrorReport(&err)
+                    );
                     return;
                 }
 
@@ -331,7 +337,10 @@ async fn serve_webui(
     let response = serve_web_interface(uri, appstate).await;
 
     if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
-        info!("Failed to write web-interface response to client {client}:  {err}");
+        info!(
+            "Failed to write web-interface response to client {client}:  {}",
+            ErrorReport(&err)
+        );
         return ZeroCopyResult::AfterHeaderError;
     }
     ZeroCopyResult::Served(conn_action)
@@ -782,8 +791,9 @@ async fn try_sendfile_request(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to open cached file `{}` for client {client}:  {err}",
-                    cache_path.display()
+                    "Failed to open cached file `{}` for client {client}:  {}",
+                    cache_path.display(),
+                    ErrorReport(&err)
                 );
                 return ZeroCopyResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -834,8 +844,9 @@ async fn try_sendfile_request(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get metadata of cached file `{}` for client {client}:  {err}",
-                        cache_path.display()
+                        "Failed to get metadata of cached file `{}` for client {client}:  {}",
+                        cache_path.display(),
+                        ErrorReport(&err)
                     );
                     return ZeroCopyResult::Invalid {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1037,7 +1048,10 @@ async fn evaluate_conditional_and_range(
         )
         .await
         {
-            info!("Failed to write 304 response to client {client}:  {err}");
+            info!(
+                "Failed to write 304 response to client {client}:  {}",
+                ErrorReport(&err)
+            );
             return Err(SendfileResult::ClientError);
         }
 
@@ -1066,7 +1080,10 @@ async fn evaluate_conditional_and_range(
                 if let Err(err) =
                     write_416_response(stream, conn_version, conn_action, file_size).await
                 {
-                    info!("Failed to write 416 response to client {client}:  {err}");
+                    info!(
+                        "Failed to write 416 response to client {client}:  {}",
+                        ErrorReport(&err)
+                    );
                     return Err(SendfileResult::ClientError);
                 }
 
@@ -1125,9 +1142,10 @@ pub(crate) async fn serve_file_via_sendfile(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to get metadata of cached file `{}` for client {}:  {err}",
+                "Failed to get metadata of cached file `{}` for client {}:  {}",
                 file_path.display(),
-                conn_details.client
+                conn_details.client,
+                ErrorReport(&err)
             );
             return SendfileResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1206,8 +1224,9 @@ pub(crate) async fn serve_file_via_sendfile(
     };
     if let Err(err) = write_response_headers(stream, headers).await {
         info!(
-            "Failed to write response headers to client {}:  {err}",
-            conn_details.client
+            "Failed to write response headers to client {}:  {}",
+            conn_details.client,
+            ErrorReport(&err)
         );
         return SendfileResult::ClientError;
     }
@@ -1254,7 +1273,7 @@ pub(crate) async fn serve_file_via_sendfile(
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
-                    "Served cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
+                    "Aborted serving cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
@@ -1263,7 +1282,7 @@ pub(crate) async fn serve_file_via_sendfile(
                 );
             } else {
                 warn!(
-                    "Served cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
+                    "Aborted serving cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
@@ -1895,7 +1914,7 @@ async fn serve_unfinished_sendfile(
                     );
                     if init_waited {
                         error!(
-                            "download state still Init after waiting for {} from mirror {}{aliased}",
+                            "Download state still Init after waiting for download of {} from mirror {}{aliased}",
                             conn_details.debname, conn_details.mirror
                         );
                         return ZeroCopyResult::Invalid {
@@ -1926,9 +1945,10 @@ async fn serve_unfinished_sendfile(
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();
                             error!(
-                                "Failed to open downloading file `{}` for joining client {}:  {err}",
+                                "Failed to open downloading file `{}` for joining client {}:  {}",
                                 path.display(),
-                                conn_details.client
+                                conn_details.client,
+                                ErrorReport(&err)
                             );
                             return ZeroCopyResult::Invalid {
                                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1961,9 +1981,10 @@ async fn serve_unfinished_sendfile(
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();
                             error!(
-                                "Failed to open finished file `{}` for joining client {}:  {err}",
+                                "Failed to open finished file `{}` for joining client {}:  {}",
                                 finished_path.display(),
-                                conn_details.client
+                                conn_details.client,
+                                ErrorReport(&err)
                             );
                             return ZeroCopyResult::Invalid {
                                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -2022,9 +2043,10 @@ async fn serve_unfinished_sendfile(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to get metadata of downloading file `{}` for joining client {}:  {err}",
+                "Failed to get metadata of downloading file `{}` for joining client {}:  {}",
                 file_path.display(),
-                conn_details.client
+                conn_details.client,
+                ErrorReport(&err)
             );
             return ZeroCopyResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -2094,8 +2116,9 @@ async fn serve_unfinished_sendfile(
     };
     if let Err(err) = write_response_headers(stream, headers).await {
         info!(
-            "Failed to write response headers to joining client {}:  {err}",
-            conn_details.client
+            "Failed to write response headers to joining client {}:  {}",
+            conn_details.client,
+            ErrorReport(&err)
         );
         return ZeroCopyResult::ClientError;
     }
