@@ -259,6 +259,11 @@ pub(crate) fn warn_on_content_type_mismatch(
     {
         return;
     }
+    // `application/x-gzip` is the legacy non-standard alias for the
+    // IANA-registered `application/gzip` (RFC 6713); treat them as equivalent.
+    if expected == "application/gzip" && upstream_ct.eq_ignore_ascii_case("application/x-gzip") {
+        return;
+    }
     warn_once_or_info!(
         "Upstream Content-Type `{upstream_ct}` differs from expected `{expected}` for {debname} from {mirror}"
     );
