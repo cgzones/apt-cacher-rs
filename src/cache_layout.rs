@@ -104,8 +104,8 @@ pub(crate) const SUBDIR_FLAT_PREFIX: &str = "flat/";
 /// `Flat::ByHash` request.
 pub(crate) const SUBDIR_FLAT_BYHASH: &str = "by-hash";
 
-/// Partial-download scratch directory.  Lives at `{cache}/tmp/`, and per-mirror
-/// at `{cache}/{host}/{mirror_path}/tmp/` (structured) and
+/// Partial-download scratch directory.  Lives per-mirror at
+/// `{cache}/{host}/{mirror_path}/tmp/` (structured) and
 /// `{cache}/{host}/flat/{mirror_path}/tmp/` (flat).  Files here are owned by
 /// `cleanup_tmp_dir`, never tallied in the cache-size sweep.
 pub(crate) const SUBDIR_TMP: &str = "tmp";

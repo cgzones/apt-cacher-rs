@@ -56,7 +56,7 @@ impl<'a> CorkGuard<'a> {
         let val: nix::libc::c_int = cork.into();
         static_assert!(std::mem::size_of::<nix::libc::c_int>() == 4);
 
-        // TODO: refactor once https://github.com/nix-rust/nix/pull/2769 got merged
+        // TODO: refactor once https://github.com/nix-rust/nix/pull/2769 is merged
         // SAFETY: stream.as_raw_fd() is a valid socket fd; val is a stack-local c_int.
         let ret = unsafe {
             nix::libc::setsockopt(

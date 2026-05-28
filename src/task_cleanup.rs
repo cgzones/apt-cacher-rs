@@ -154,7 +154,7 @@ async fn scan_cached_files(host_path: &Path) -> Result<HashMap<String, PathBuf>,
         let Some(name_str) = name.to_str() else {
             metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
             warn!(
-                "Unrecognized entry in mirror pool directory: `{}`",
+                "Unrecognized entry in mirror root directory: `{}`",
                 entry.path().display()
             );
             continue;
@@ -182,13 +182,13 @@ async fn scan_cached_files(host_path: &Path) -> Result<HashMap<String, PathBuf>,
             if file_type.is_dir() {
                 metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
                 warn!(
-                    "Skipping unexpected directory in mirror pool directory: `{}`",
+                    "Skipping unexpected directory in mirror root directory: `{}`",
                     path.display()
                 );
             } else {
                 metrics::CACHE_NON_REGULAR.increment();
                 warn!(
-                    "Removing non-regular entry in mirror pool directory: `{}`",
+                    "Removing non-regular entry in mirror root directory: `{}`",
                     path.display()
                 );
                 if let Err(err) = tokio::fs::remove_file(&path).await {
@@ -1793,12 +1793,12 @@ async fn cleanup_byhash_dir(
     // No upfront `probe_dir`: `read_dir` returns NotFound when the per-
     // layout by-hash root is absent (the common case for structured-only
     // or flat-only mirrors), so the cheap path is one syscall.  Symlink
-    // hardening is performed per-entry inside the loop, which already
-    // uses `file_type()` (lstat semantics); the only difference would be
-    // a symlinked *root*, which is one directory shallower than where an
-    // attacker could plant anything useful given the cache tree's
-    // invariants (mirror_path is validated and the parent dirs are
-    // created by the daemon).
+    // hardening is performed per-entry inside the loop via
+    // `entry.metadata().await` (which has lstat semantics on tokio's
+    // `DirEntry`); the only difference would be a symlinked *root*, which
+    // is one directory shallower than where an attacker could plant
+    // anything useful given the cache tree's invariants (mirror_path is
+    // validated and the parent dirs are created by the daemon).
     let mut byhash_dir = match tokio::fs::read_dir(byhash_path).await {
         Ok(d) => d,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(stats),
@@ -1883,7 +1883,7 @@ async fn cleanup_byhash_dir(
             Ok(x) => x,
             Err(err) => {
                 warn!(
-                    "Failed to compute modification timespan for file `{}`:  {err}",
+                    "Failed to compute modification age of file `{}`:  {err}",
                     path.display()
                 );
                 continue;
@@ -2015,7 +2015,7 @@ async fn cleanup_stale_partials(cache_dir: &Path, mirrors: &[MirrorEntry]) {
     }
 
     if removed > 0 {
-        info!("Removed {removed} stale tmp file(s)");
+        info!("Removed {removed} stale tmp entries");
     }
 }
 

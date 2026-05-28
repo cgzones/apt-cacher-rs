@@ -187,7 +187,7 @@ pub(crate) fn compute_age(metadata: &std::fs::Metadata) -> u32 {
 pub(crate) enum ParsedRange {
     /// Valid, satisfiable range: Content-Range header value, start byte, content length.
     Satisfiable(String, u64, u64),
-    /// The Range header is syntactically malformed. Per RFC 7233 §4.4, the recipient
+    /// The Range header is syntactically malformed. Per RFC 9110 §14.2, the recipient
     /// should ignore the header and serve the full entity (200).
     Invalid,
     /// The Range is syntactically valid but unsatisfiable for this file size (416).
@@ -205,7 +205,7 @@ pub(crate) fn http_parse_range(
     cache_time: HttpDate,
     file_etag: Option<&str>,
 ) -> ParsedRange {
-    /* See RFC 7233 Section 2.1: https://www.rfc-editor.org/rfc/rfc7233.html#section-2.1 */
+    /* See RFC 9110 Section 14.1.1: https://www.rfc-editor.org/rfc/rfc9110.html#section-14.1.1 */
 
     // TODO: support multiple ranges: bytes=500-600,601-999  --  bytes=500-700,601-999
 
@@ -214,7 +214,8 @@ pub(crate) fn http_parse_range(
     };
     if byte_range.contains(',') {
         warn_once_or_info!(
-            "HTTP Range Request with multiple ranges are not supported (`{byte_range}`)"
+            "HTTP Range requests with multiple ranges are not supported (`{}`)",
+            byte_range.escape_debug()
         );
         return ParsedRange::Invalid;
     }
@@ -240,7 +241,7 @@ pub(crate) fn http_parse_range(
     };
 
     if file_size == 0 {
-        // A zero-length entity admits no satisfiable byte range. Per RFC 7233 §2.1,
+        // A zero-length entity admits no satisfiable byte range. Per RFC 9110 §14.1.1,
         // a server that supports Range MAY ignore the header for zero-length content.
         return ParsedRange::NotSatisfiable;
     }
@@ -277,7 +278,7 @@ pub(crate) fn http_parse_range(
             // Strong ETag comparison
             matches!(file_etag, Some(etag) if etag_strong_match(if_range, etag))
         } else if if_range.starts_with("W/") {
-            // Weak ETags are not allowed in If-Range (RFC 7233 §3.2)
+            // Weak ETags are not allowed in If-Range (RFC 9110 §13.1.5)
             false
         } else {
             match HttpDate::parse(if_range) {
@@ -575,7 +576,7 @@ mod tests {
             ParsedRange::NotSatisfiable
         ));
 
-        /* end less than start: syntactically invalid, ignore per RFC 7233 §4.4 */
+        /* end less than start: syntactically invalid, ignore per RFC 9110 §14.2 */
         assert!(matches!(
             http_parse_range(
                 "bytes=1023-0",
@@ -617,7 +618,7 @@ mod tests {
         ));
 
         /*
-         * syntactically invalid (serve 200 per RFC 7233 §4.4)
+         * syntactically invalid (serve 200 per RFC 9110 §14.2)
          */
 
         assert!(matches!(
@@ -708,7 +709,7 @@ mod tests {
             ParsedRange::IfRangeFailed
         ));
 
-        // Weak ETag in If-Range: IfRangeFailed (RFC 7233 §3.2)
+        // Weak ETag in If-Range: IfRangeFailed (RFC 9110 §13.1.5)
         assert!(matches!(
             http_parse_range(
                 "bytes=0-1023",

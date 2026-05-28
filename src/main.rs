@@ -2110,7 +2110,7 @@ async fn download_file(
             match tokio::fs::try_exists(&dest_file_path).await {
                 Ok(true) => {
                     warn!(
-                        "Target file `{}` already exists, overriding... (aliased={})",
+                        "Target file `{}` already exists, overwriting... (aliased={})",
                         dest_file_path.display(),
                         conn_details.aliased_host.is_some()
                     );
@@ -3099,10 +3099,10 @@ async fn serve_new_file(
         }
 
         // Only count "out of date" when upstream actually returned fresh
-        // content (mirrors the splice path's non-200/non-206 passthrough at
-        // splice_conn.rs:4264-4348); a 4xx/5xx revalidation is not a fresh
-        // body. Cleanup-synthetic probes bypass the parent counter and are
-        // excluded for the same reason as the UPTODATE site above.
+        // content (mirrors the splice path's non-200/non-206 passthrough in
+        // `splice_proxy_drive`); a 4xx/5xx revalidation is not a fresh body.
+        // Cleanup-synthetic probes bypass the parent counter and are excluded
+        // for the same reason as the UPTODATE site above.
         let status = fwd_response.status();
         if (status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT)
             && !conn_details.client.is_cleanup_synthetic()
@@ -3501,7 +3501,6 @@ async fn serve_new_file(
             // The file handle has been held open since the check, so no TOCTOU race.
             // Verify the file size matches expectations (should always hold since
             // we've held the fd open, but check as defense-in-depth).
-            use tokio::io::AsyncSeekExt as _;
             let current_size = file.seek(std::io::SeekFrom::End(0)).await.unwrap_or(0);
             if current_size != resume_offset {
                 error!(
@@ -3666,7 +3665,7 @@ async fn serve_new_file(
 }
 
 /// Create a TCP connection to host:port, build a tunnel between the connection and
-/// the upgraded connection
+/// the upgraded connection.
 async fn tunnel(
     client: ClientInfo,
     upgraded: hyper::upgrade::Upgraded,
@@ -3909,7 +3908,7 @@ fn connect_response(
             .binary_search(&port)
             .is_err()
     {
-        info!("Rejecting https tunnel request for client {client} to not permitted port {port}");
+        info!("Rejecting https tunnel request for client {client} to disallowed port {port}");
         metrics::TUNNEL_REJECTED_POLICY.increment();
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunnel port not permitted");
     }
@@ -3920,9 +3919,7 @@ fn connect_response(
             .binary_search_by(|d| str::cmp(d, host.as_str()))
             .is_err()
     {
-        info!(
-            "Rejecting https tunnel request for client {client} due to not permitted host {host}"
-        );
+        info!("Rejecting https tunnel request for client {client} due to disallowed host {host}");
         metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
         return quick_response(StatusCode::FORBIDDEN, "HTTPS tunnel target not permitted");
     }
@@ -3950,7 +3947,7 @@ fn connect_response(
     let active_tunnel_guard = tunnel_limiter::ActiveTunnelGuard::new();
 
     metrics::TUNNEL_CONNECTS_TOTAL.increment();
-    info!("Using un-cached tunnel for client {client} to {host}:{port}");
+    info!("Using uncached tunnel for client {client} to {host}:{port}");
 
     tokio::task::spawn(async move {
         let _tunnel_guard = tunnel_guard;
@@ -4806,7 +4803,7 @@ async fn main_loop(
                         + i64::try_from(CLEANUP_INTERVAL_SECS).expect("CLEANUP_INTERVAL_SECS fits in i64"),
                 );
                 let appstate = appstate.clone();
-                tokio::task::spawn( async move {
+                tokio::task::spawn(async move {
                     if let Err(err) = task_cleanup(&appstate).await {
                         error!("Failed to perform daily cleanup task:  {err}");
                     }
@@ -4838,7 +4835,7 @@ async fn main_loop(
                         + i64::try_from(CLEANUP_INTERVAL_SECS).expect("CLEANUP_INTERVAL_SECS fits in i64"),
                 );
                 let appstate = appstate.clone();
-                tokio::task::spawn( async move {
+                tokio::task::spawn(async move {
                     if let Err(err) = task_cleanup(&appstate).await {
                         error!("Failed to perform SIGUSR2-triggered cleanup task:  {err}");
                     }
@@ -5480,7 +5477,7 @@ mod tests {
     }
 
     #[test]
-    fn content_type_for_extension_files_unchanged() {
+    fn compressed_manifest_keeps_compression_content_type() {
         // Compressed manifests must keep their compression Content-Type —
         // the `_Packages` suffix on `Packages.gz` must not coerce it to text.
         assert_eq!(

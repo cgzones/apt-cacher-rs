@@ -337,7 +337,7 @@ pub(crate) async fn db_loop(
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            warn!("Failed to hydrate mirror-id cache, starting empty:  {err}");
+            warn!("Failed to hydrate mirror-id cache; starting empty:  {err}");
         }
     }
     metrics::DB_MIRROR_CACHE_ENTRIES.set(cache.len() as u64);

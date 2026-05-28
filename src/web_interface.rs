@@ -389,7 +389,7 @@ impl Display for CacheHitRatio {
     }
 }
 
-/// Bandwidth-window cell, e.g. `"4.2 GB served, 1.1 GB fetched (3.1 GB saved)"`.
+/// Bandwidth-window cell, e.g. `"4.2GB served, 1.1GB fetched (3.1GB saved)"`.
 /// `None` (e.g. on a query failure already logged at the boundary) renders
 /// as `"N/A"`.
 struct Window(Option<(i64, i64)>);
@@ -1692,7 +1692,7 @@ fn build_metrics_html() -> String {
         ),
     );
     t.row_tip(
-        "Upstream Connect (splice) Failures TCP / TLS",
+        "Upstream Connect Failures (splice, TCP / TLS)",
         "Splice-path upstream connection failures, separated into TCP setup and TLS handshake failures.",
         format_args!(
             "{} / {}",
@@ -1835,7 +1835,7 @@ fn build_metrics_html() -> String {
         // mismatch — counting bug or split call site.
         t.row_tip(
             "Upstream Pool (reused / new, miss: empty / dead / failed / no-scheme, return-evicted)",
-            "Upstream connection pool counters: reused vs. newly opened connections, miss reasons (pool empty, peer-closed connection, failed health check, no cached scheme so the pool was bypassed), and connections evicted when returned.",
+            "Upstream connection pool counters: reused vs. newly opened connections, miss reasons (pool empty, peer-closed connection, in-flight request error on a pooled connection, no cached scheme so the pool was bypassed), and connections evicted when returned.",
             format_args!(
                 "{} / {}, miss: {} / {} / {} / {}, return-evicted {}",
                 metrics::POOL_REUSED.get(),
@@ -1902,14 +1902,14 @@ fn build_metrics_html() -> String {
         let reverted = metrics::HTTPS_UPGRADE_REVERTED.get();
         let failed = metrics::HTTPS_UPGRADE_FAILED.get();
         t.row_tip(
-        "HTTPS Upgrade (attempted / succeeded / reverted / failed, scheme-cache removed)",
-        "HTTPS upgrade attempts on plain-HTTP requests (reverted: Auto-mode soft give-up; failed: Always-mode terminal failure), plus removals from the per-host scheme cache.",
-        format_args!(
-            "{} / {succeeded} / {reverted} / {failed}, {}",
-            warn_if(attempted, attempted != succeeded + reverted + failed),
-            metrics::SCHEME_CACHE_REMOVED.get(),
-        ),
-    );
+            "HTTPS Upgrade (attempted / succeeded / reverted / failed, scheme-cache removed)",
+            "HTTPS upgrade attempts on plain-HTTP requests (reverted: Auto-mode soft give-up; failed: Always-mode terminal failure), plus removals from the per-host scheme cache.",
+            format_args!(
+                "{} / {succeeded} / {reverted} / {failed}, {}",
+                warn_if(attempted, attempted != succeeded + reverted + failed),
+                metrics::SCHEME_CACHE_REMOVED.get(),
+            ),
+        );
     }
     t.row_tip(
         "Authorization Rejected (mirror / client / tunnel-mirror / webui)",
@@ -1929,7 +1929,7 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Cache Reconcile (events / bytes repaired)",
-        "Cache reconciliation events that repaired on-disk size accounting and the bytes corrected.",
+        "Cache reconciliation events that repaired on-disk size accounting, and the total bytes corrected.",
         format_args!(
             "{} / {}",
             metrics::RECONCILE_EVENTS.get(),
@@ -1943,7 +1943,7 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Upstream Protocol Violations",
-        "Mirror responses that broke the HTTP contract: body over- or under-ran the announced Content-Length, missing or mismatched Content-Range, missing Content-Length on a fetch, or 206 returned without a Range request.",
+        "Mirror responses that broke the HTTP contract: body over- or under-ran the announced Content-Length, missing or mismatched Content-Range, missing Content-Length on a non-volatile fetch, or 206 returned without a Range request.",
         WarnNonzero(metrics::UPSTREAM_PROTOCOL_VIOLATION.get()),
     );
     t.row_tip(
@@ -1967,7 +1967,7 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Cache Non-Regular Files",
-        "Cache entries observed as non-regular non-directory files (FIFO, socket, device, symlink). Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which actively unlink these in pool/flat/by-hash/tmp).",
+        "Cache entries observed as non-regular non-directory files (FIFO, socket, device, symlink); also bumped for stray directories on some serving/sweep paths. Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which actively unlink these in pool/flat/by-hash/tmp).",
         AlertNonzero(metrics::CACHE_NON_REGULAR.get()),
     );
     t.row_tip(

@@ -27,7 +27,7 @@ struct InitBarrierData<'a> {
     aliased_host: Option<&'static CacheHost>,
     debname: &'a str,
     layout: CacheLayout,
-    /// Unused, receivers just needs to get notified by drop
+    /// Unused, receivers just need to get notified by drop.
     _tx: tokio::sync::watch::Sender<()>,
 }
 

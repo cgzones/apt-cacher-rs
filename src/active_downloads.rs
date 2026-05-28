@@ -112,7 +112,8 @@ pub(crate) enum ActiveDownloadStatus {
 struct ActiveDownloadEntry {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     /// Number of late joiners that have attached to this download. Updated
-    /// under `inner`'s write-lock on every late-join insert.
+    /// under `inner`'s write-lock on every late-join insert and on each
+    /// `attach()` call.
     late_joiners: usize,
 }
 

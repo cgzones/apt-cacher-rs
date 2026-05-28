@@ -11,10 +11,10 @@
 //! passthrough path.  This module owns the in-memory set of blocked
 //! `(host, port)` pairs.
 //!
-//! The blocklist replaces the deleted `flat_registry`'s role in
-//! disambiguating flat URLs, but is dramatically simpler: it's a flat set
-//! that records "this host has a colliding structured mirror" rather than
-//! a longest-prefix index that rewrites every flat-pool URL.
+//! The blocklist is a flat set that records "this host has a colliding
+//! structured mirror" — no longest-prefix index, no per-request URL
+//! rewriting, since the host-anchored layout means the URL path is the
+//! on-disk path verbatim.
 //!
 //! # Lifecycle
 //!
