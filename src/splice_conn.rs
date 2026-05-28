@@ -1134,8 +1134,15 @@ async fn unbuffered_ktls_request(
                 ConnectionState::ReadTraffic(_)
                 | ConnectionState::PeerClosed
                 | ConnectionState::Closed
-                | ConnectionState::ReadEarlyData(_)
-                | _ => {
+                | ConnectionState::ReadEarlyData(_) => {
+                    return Err(std::io::Error::other(
+                        "unexpected state during TLS handshake",
+                    ));
+                }
+                other => {
+                    warn_once!(
+                        "splice proxy: unexpected ConnectionState variant during TLS handshake: {other:?}"
+                    );
                     return Err(std::io::Error::other(
                         "unexpected state during TLS handshake",
                     ));
@@ -3812,6 +3819,7 @@ async fn discard_partial_and_retry(
     upstream_path: &str,
     resume_offset: &mut u64,
     resume_expected_total: &mut Option<u64>,
+    tls_label: &mut &'static str,
     upstream: &mut PoolGuard,
     upstream_resp: &mut UpstreamResponse,
     header_buf: &mut BytesMut,
@@ -3821,8 +3829,9 @@ async fn discard_partial_and_retry(
     *resume_offset = 0;
     *resume_expected_total = None;
     upstream.unset_poolable();
-    let (up, resp, hdr_buf, hdr_end, _label, pool) =
+    let (up, resp, hdr_buf, hdr_end, label, pool) =
         standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None).await?;
+    *tls_label = label;
     upstream.replace(up, pool);
     *upstream_resp = resp;
     *header_buf = hdr_buf;
@@ -4358,6 +4367,7 @@ async fn splice_proxy_drive(
             upstream_path,
             &mut resume_offset,
             &mut resume_expected_total,
+            &mut tls_label,
             &mut upstream,
             &mut upstream_resp,
             &mut header_buf,
@@ -4559,6 +4569,7 @@ async fn splice_proxy_drive(
                 upstream_path,
                 &mut resume_offset,
                 &mut resume_expected_total,
+                &mut tls_label,
                 &mut upstream,
                 &mut upstream_resp,
                 &mut header_buf,
@@ -5049,7 +5060,7 @@ async fn splice_proxy_drive(
         let resume_percent = resume_offset as f32 / total_content_length.get() as f32 * 100.0;
 
         debug!(
-            "splice proxy{tls_label}: resuming and serving {} from mirror {} for client {} at byte {} ({}%)...",
+            "splice proxy{tls_label}: resuming and serving {} from mirror {} for client {} at byte {} ({:.1}%)...",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client,

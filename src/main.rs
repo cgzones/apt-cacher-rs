@@ -2900,7 +2900,7 @@ async fn serve_new_file(
         Some(h) => h,
         None => {
             // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers
-            &HeaderValue::from_str(&conn_details.mirror.host().format_authority(None))
+            &HeaderValue::from_str(&conn_details.mirror.format_authority())
                 .expect("connection host should be valid")
         }
     };
@@ -5233,7 +5233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )]
             let log_file_handle = match ReopenableLogFile::new(path) {
                 Ok(file) => file,
-                Err(err) if err.kind() == std::io::ErrorKind::TooManyLinks => {
+                Err(err) if err.raw_os_error() == Some(nix::libc::ELOOP) => {
                     eprintln!(
                         "Failed to open log file `{}`:  {err}; symlinks are not supported",
                         path.display()

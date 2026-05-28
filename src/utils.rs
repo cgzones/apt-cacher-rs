@@ -13,7 +13,6 @@ use crate::{
     deb_mirror, global_config,
     guards::InitBarrier,
     http_etag::read_etag,
-    http_range::HttpDate,
     humanfmt::HumanFmt,
     metrics, warn_once_or_debug, xattr_helpers,
 };
@@ -209,7 +208,7 @@ pub(crate) async fn prepare_partial_resume(
     log_prefix: &'static str,
 ) -> Result<PartialResume, (std::io::Error, TempPath)> {
     match open_partial_file(ibarrier, log_prefix).await {
-        Ok((file, size, _mtime, guard)) if size > 0 => {
+        Ok((file, size, guard)) if size > 0 => {
             if let Some(if_range) = read_etag(&file, &guard) {
                 let expected_total = xattr_helpers::read_expected_size(&file, &guard);
                 info!(
@@ -232,7 +231,7 @@ pub(crate) async fn prepare_partial_resume(
                 Ok(PartialResume::fresh(guard.renew().await))
             }
         }
-        Ok((_file, _size, _mtime, guard)) => Ok(PartialResume::fresh(guard)),
+        Ok((_file, _size, guard)) => Ok(PartialResume::fresh(guard)),
         Err((err, guard)) => Err((err, guard)),
     }
 }
@@ -447,23 +446,23 @@ fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
 }
 
 /// Open an existing partial file for writing at the end, returning the file, its current size,
-/// the file's modification time, and a `TempPath` guard with `keep_on_drop: true`.
+/// and a `TempPath` guard with `keep_on_drop: true`.
 ///
 /// Uses `write(true)` + seek instead of `append(true)` so that splice(2) can use explicit
 /// file offsets (`O_APPEND` is incompatible with splice's offset parameter).
 ///
-/// By opening the file and querying size + mtime from the same file handle, this avoids
+/// By opening the file and querying size from the same file handle, this avoids
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
 async fn open_partial_file(
     ibarrier: &InitBarrier<'_>,
     log_prefix: &'static str,
-) -> Result<(tokio::fs::File, u64, HttpDate, TempPath), (tokio::io::Error, TempPath)> {
+) -> Result<(tokio::fs::File, u64, TempPath), (tokio::io::Error, TempPath)> {
     use tokio::io::AsyncSeekExt as _;
 
     async fn file_ops(
         path: &Path,
         log_prefix: &'static str,
-    ) -> Result<(tokio::fs::File, u64, HttpDate), tokio::io::Error> {
+    ) -> Result<(tokio::fs::File, u64), tokio::io::Error> {
         let mut file = tokio::fs::File::options()
             .write(true)
             .read(true)
@@ -514,11 +513,7 @@ async fn open_partial_file(
                 );
             })?;
 
-        let mtime = mdata
-            .modified()
-            .expect("Platform should support modification timestamps via setup check");
-
-        Ok((file, size, HttpDate::from(mtime)))
+        Ok((file, size))
     }
 
     let path = partial_path_for_barrier(ibarrier);
@@ -528,7 +523,7 @@ async fn open_partial_file(
         keep_on_drop: true,
     };
     match file_ops(&guard, log_prefix).await {
-        Ok((file, size, mtime)) => Ok((file, size, mtime, guard)),
+        Ok((file, size)) => Ok((file, size, guard)),
         Err(e) => Err((e, guard)),
     }
 }

@@ -743,6 +743,7 @@ fn build_nav_html(page: Page, options: QueryOptions) -> String {
                 ("#clients-head", "Clients"),
                 ("#packages-head", "Packages"),
                 ("#metrics-head", "Metrics"),
+                ("#uncacheables-head", "Uncacheables"),
             ] {
                 w!(html, "<a href=\"{href}\">{label}</a>");
             }
