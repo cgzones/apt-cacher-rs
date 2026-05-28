@@ -52,7 +52,7 @@ impl std::fmt::Display for ProxyCacheError {
             } => {
                 write!(
                     f,
-                    "Received data of {received} bytes larger than announced {announced}"
+                    "Upstream sent {received} bytes, exceeding the announced Content-Length of {announced}"
                 )
             }
         }

@@ -46,7 +46,7 @@ pub(crate) const MAX_METADATA_LINE_LEN: usize = 8 * 1024;
 /// authority (`<host>:<port>`).  Real-world authorities are well below
 /// this: an FQDN is capped at 253 bytes by RFC 1035 and a `:port` suffix
 /// adds at most 6 bytes.
-pub(crate) const MAX_AUTHORITY_LEN: usize = 260;
+pub(crate) const MAX_AUTHORITY_LEN: usize = 259;
 
 /// Returns `true` if a declared upstream Content-Length of `declared` bytes is
 /// within the configured `max_object_size` cap. A `None` cap disables the

@@ -26,7 +26,7 @@ use crate::{
 ///
 /// Centralises the five identical
 /// `match resolve_alias(...) { Some(c) => c, None => host.as_cache_host() }`
-/// blocks that appear across `database.rs` and `task_cleanup.rs`. F60.
+/// blocks that appear across `database.rs` and `task_cleanup.rs`.
 #[must_use]
 pub(crate) fn resolved_cache_host<'a>(aliases: &'a [Alias], host: &'a ClientHost) -> &'a CacheHost {
     match resolve_alias(aliases, host) {

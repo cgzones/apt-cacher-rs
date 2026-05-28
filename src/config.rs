@@ -831,7 +831,7 @@ pub(crate) struct Config {
     pub(crate) experimental_parallel_hack_factor: f64,
 
     #[serde(
-        default = "default_experimental_parallel_minsize",
+        default = "default_experimental_parallel_hack_minsize",
         deserialize_with = "from_nonzero_u64_with_magnitude"
     )]
     pub(crate) experimental_parallel_hack_minsize: Option<NonZero<u64>>,
@@ -1129,7 +1129,7 @@ const fn default_experimental_parallel_hack_factor() -> f64 {
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_FACTOR
 }
 
-const fn default_experimental_parallel_minsize() -> Option<NonZero<u64>> {
+const fn default_experimental_parallel_hack_minsize() -> Option<NonZero<u64>> {
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MINSIZE
 }
 
@@ -1559,7 +1559,10 @@ impl Config {
             );
         }
 
-        if !self.https_tunnel_enabled && self.https_tunnel_max_connections_per_client.is_some() {
+        if !self.https_tunnel_enabled
+            && self.https_tunnel_max_connections_per_client
+                != default_https_tunnel_max_connections_per_client()
+        {
             warnings.push(
                 "https_tunnel_max_connections_per_client is set but https_tunnel_enabled is false"
                     .to_string(),
@@ -1632,7 +1635,7 @@ impl Config {
                 || self.experimental_parallel_hack_factor
                     != default_experimental_parallel_hack_factor()
                 || self.experimental_parallel_hack_minsize
-                    != default_experimental_parallel_minsize())
+                    != default_experimental_parallel_hack_minsize())
         {
             warnings.push(
                 "experimental_parallel_hack options are set but experimental_parallel_hack_enabled is false".to_string(),
