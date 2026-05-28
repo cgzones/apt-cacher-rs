@@ -302,12 +302,22 @@ fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     // after the open could otherwise point at a file whose inode/size
     // happen to match `pre_ino` / `pre_size`, masking the race.  lstat
     // compares the symlink itself, so a swap is always detected.
-    if let Ok(post_meta) = std::fs::symlink_metadata(path)
-        && (post_meta.ino() != pre_ino || post_meta.len() != pre_size)
-    {
-        return Verdict::Raced;
+    //
+    // A stat failure here (e.g. another cleanup task already unlinked the
+    // file, or EACCES) is treated like the pre-hash stat failure: bump and
+    // return `Verdict::IoError` so the caller logs and retains.  Falling
+    // through to `Verdict::Mismatch` would emit a false checksum-corruption
+    // warn and then attempt a doomed `remove_file` on the missing path.
+    match std::fs::symlink_metadata(path) {
+        Ok(post_meta) if post_meta.ino() != pre_ino || post_meta.len() != pre_size => {
+            Verdict::Raced
+        }
+        Ok(_) => Verdict::Mismatch { computed },
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            Verdict::IoError(err)
+        }
     }
-    Verdict::Mismatch { computed }
 }
 
 async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: Vec<u8>) -> Verdict {
@@ -1845,8 +1855,6 @@ async fn cleanup_byhash_dir(
             continue;
         }
 
-        stats.files_retained += 1;
-
         let modified = match mdata.modified() {
             Ok(m) => m,
             Err(err) => {
@@ -1867,7 +1875,8 @@ async fn cleanup_byhash_dir(
             }
         };
 
-        if file_age <= keep_span {
+        if file_age < keep_span {
+            stats.files_retained += 1;
             debug!(
                 "Keeping file `{}` since it is too new ({}s, threshold={}s)",
                 path.display(),
@@ -1894,7 +1903,6 @@ async fn cleanup_byhash_dir(
 
         stats.bytes_removed += mdata.len();
         stats.files_removed += 1;
-        stats.files_retained -= 1;
     }
 
     Ok(stats)

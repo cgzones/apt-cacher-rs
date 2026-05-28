@@ -57,42 +57,48 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
 
     // Check for extended attribute support
     {
-        const ETAG_PROBE: &str = "user.etag_probe";
-        const ETAG_PROBE_VALUE: &[u8] = b"probe";
+        // Probe the same namespace the runtime uses (`user.apt_cacher_rs.*` —
+        // see `xattr_helpers.rs`, `http_etag.rs`, `http_last_modified.rs`) so a
+        // filesystem or LSM policy that allows the generic `user.*` namespace
+        // but restricts custom prefixes does not pass the probe while still
+        // blocking real reads/writes at runtime.
+        const XATTR_PROBE: &str = "user.apt_cacher_rs.probe";
+        const XATTR_PROBE_VALUE: &[u8] = b"probe";
 
-        let etag_probe_path = cache_path.join(".etag_probe");
+        let xattr_probe_path = cache_path.join(".xattr_probe");
 
-        let etag_probe_file = std::fs::File::options()
+        let xattr_probe_file = std::fs::File::options()
             .write(true)
             .create(true)
+            .truncate(true)
             .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(&etag_probe_path)
+            .open(&xattr_probe_path)
             .with_context(|| {
                 format!(
                     "Failed to create extended attribute probe file `{}`",
-                    etag_probe_path.display()
+                    xattr_probe_path.display()
                 )
             })?;
 
-        let etag_result = etag_probe_file
-            .set_xattr(ETAG_PROBE, ETAG_PROBE_VALUE)
-            .and_then(|()| etag_probe_file.get_xattr(ETAG_PROBE))
-            .and_then(|val| etag_probe_file.remove_xattr(ETAG_PROBE).map(|()| val));
-        drop(etag_probe_file);
-        if let Err(err) = std::fs::remove_file(&etag_probe_path) {
+        let xattr_result = xattr_probe_file
+            .set_xattr(XATTR_PROBE, XATTR_PROBE_VALUE)
+            .and_then(|()| xattr_probe_file.get_xattr(XATTR_PROBE))
+            .and_then(|val| xattr_probe_file.remove_xattr(XATTR_PROBE).map(|()| val));
+        drop(xattr_probe_file);
+        if let Err(err) = std::fs::remove_file(&xattr_probe_path) {
             error!(
                 "Failed to remove extended attribute probe file `{}`:  {err}",
-                etag_probe_path.display()
+                xattr_probe_path.display()
             );
         }
-        match etag_result {
-            Ok(val) if val.as_deref() == Some(ETAG_PROBE_VALUE) => {
+        match xattr_result {
+            Ok(val) if val.as_deref() == Some(XATTR_PROBE_VALUE) => {
                 debug!("Extended attribute support verified, ETags available");
             }
             Ok(val) => {
                 warn!(
                     "Extended attribute support test failed on `{}`: got {val:?}, expected `probe`",
-                    etag_probe_path.display()
+                    xattr_probe_path.display()
                 );
             }
             Err(err) => {
