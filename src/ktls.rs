@@ -569,11 +569,11 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::EMSGSIZE) => {
-                // The TLS record is larger than our peek buffer. This should
-                // not happen since the buffer is > max TLS record size, but
-                // if it does, assume it's application data and stop draining.
-                warn!("kTLS: peek buffer too small (EMSGSIZE), assuming application data");
-                return Ok(());
+                warn!("kTLS: peek buffer too small (EMSGSIZE); aborting kTLS setup");
+                return Err(errno_to_io_error(
+                    nix::errno::Errno::EMSGSIZE,
+                    "kTLS: recvmsg peek EMSGSIZE",
+                ));
             }
             Err(errno) => {
                 debug!("kTLS: drain peek error:  {errno}");
