@@ -2994,7 +2994,7 @@ async fn serve_new_file(
                 conn_details.mirror,
                 ErrorReport(&err)
             );
-            return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+            return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
         }
     };
 
@@ -3049,7 +3049,7 @@ async fn serve_new_file(
                         "Failed to proxy request to host {redirected_host:?} after redirect from {host:?}:  {}",
                         ErrorReport(&err)
                     );
-                    return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
                 }
             };
 
@@ -3189,7 +3189,7 @@ async fn serve_new_file(
                     conn_details.mirror,
                     ErrorReport(&err)
                 );
-                return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+                return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
             }
         };
     }
@@ -4161,7 +4161,7 @@ async fn pre_process_client_request(
                 "Proxy request to host {requested_host} failed for client {client}:  {}",
                 ErrorReport(&err)
             );
-            return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+            return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
         }
     };
 
@@ -4228,7 +4228,7 @@ async fn pre_process_client_request(
                         "Proxy request to host {requested_host} for client {client} failed after redirect:  {}",
                         ErrorReport(&err)
                     );
-                    return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Proxy request failed");
+                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
                 }
             };
 

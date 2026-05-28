@@ -3384,6 +3384,7 @@ async fn follow_redirect(
 
 /// Forward remaining body bytes from upstream to client (no caching).
 /// Used for non-200 responses where we just want to relay the body.
+/// On error the connection state is indeterminate -- callers must mark the upstream non-poolable.
 async fn forward_upstream_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
@@ -3548,6 +3549,12 @@ enum ChunkedState {
 /// All raw bytes (chunk-size lines, data, CRLFs) are forwarded unchanged.
 /// The state machine only tracks framing to detect the terminating zero-length
 /// chunk, so the connection can be reused afterwards.
+///
+/// On success the closing `\r\n` after the `0\r\n` terminator has been fully
+/// consumed from the upstream socket buffer, so the connection can be safely
+/// returned to the pool (mirrors the buffered variant
+/// [`read_dechunk_body_to_vec`]). On error the connection state is
+/// indeterminate -- callers must mark the upstream non-poolable.
 async fn forward_upstream_chunked_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
@@ -3702,11 +3709,18 @@ async fn forward_upstream_chunked_body(
                     }
                 }
             }
-            // Framing validated — forward the raw bytes to the client unchanged.
-            if !data.is_empty() {
+            // Framing validated -- forward the raw bytes to the client unchanged.
+            // When the terminal chunk has been consumed we forward only the
+            // validated prefix `&data[..i]`; any bytes past the closing \r\n
+            // are a framing violation (smuggling attempt, buggy upstream) and
+            // must NOT be relayed to the client. Mirrors the buffered variant
+            // `read_dechunk_body_to_vec`, which treats trailing-after-Done as
+            // a poison-connection error.
+            let forward_slice: &[u8] = if done { &data[..i] } else { data };
+            if !forward_slice.is_empty() {
                 write_all_to_stream_rated(
                     client,
-                    data,
+                    forward_slice,
                     &mut client_rate_checker,
                     RateCheckDirection::Client,
                     config.http_timeout,
@@ -3715,8 +3729,22 @@ async fn forward_upstream_chunked_body(
                 .map_err(|e| {
                     std::io::Error::new(e.kind(), format!("chunked forward: client write:  {e}"))
                 })?;
-                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(data.len() as u64);
-                client_total += data.len() as u64;
+                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(forward_slice.len() as u64);
+                client_total += forward_slice.len() as u64;
+            }
+            if done && i < data.len() {
+                // Defence in depth: well-behaved upstreams send no bytes past
+                // the closing `\r\n`. Surface this as a framing violation and
+                // drop the client connection. Callers must mark the upstream
+                // non-poolable on any error returned from this function
+                // (stray bytes in the kernel socket buffer would poison the
+                // next checkout) -- matches the buffered counterpart
+                // `read_dechunk_body_to_vec`.
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "chunked encoding: trailing bytes after 0-length chunk",
+                ));
             }
             done
         }};
@@ -3939,6 +3967,12 @@ async fn splice_proxy_drive(
 
     let mirror = &conn_details.mirror;
     let host_authority = mirror.format_authority();
+    // Capture the original (pre-redirect) client request path. A 301 redirect
+    // below shadows `upstream_path` to the redirected URL; the Origin row and
+    // `handle_volatile_buffered_download` must carry the original path so
+    // registry keys match across all backends (the hyper backend in main.rs
+    // always uses the client-request URI).
+    let original_uri_path = upstream_path;
 
     // Check for a partial download file to resume (permanent files only).
     // Opens the file upfront (if it exists and is non-empty) to get size + mtime
@@ -4425,12 +4459,18 @@ async fn splice_proxy_drive(
             if remaining > 0 {
                 let _forwarded = forward_upstream_body(&mut upstream, client_stream, remaining)
                     .await
+                    .inspect_err(|_err| upstream.unset_poolable())
                     .map_err(|err| {
                         SpliceProxyError::AfterHeaderClient(err, "passthrough remaining body")
                     })?;
             }
         } else if upstream_resp.is_chunked {
-            // Chunked encoding: forward raw framing, detect termination
+            // Chunked encoding: forward raw framing, detect termination.
+            // On success the closing `\r\n` after the `0\r\n` terminator has
+            // been fully consumed, so the connection stays poolable. On any
+            // framing error we must mark it non-poolable -- stray bytes may
+            // remain in the kernel socket buffer and would poison the next
+            // checkout.
             let _forwarded = forward_upstream_chunked_body(
                 &mut upstream,
                 client_stream,
@@ -4438,6 +4478,7 @@ async fn splice_proxy_drive(
                 VOLATILE_BODY_MAX,
             )
             .await
+            .inspect_err(|_err| upstream.unset_poolable())
             .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "passthrough chunked body"))?;
         } else {
             // No Content-Length and not chunked: read until EOF
@@ -4629,7 +4670,7 @@ async fn splice_proxy_drive(
                     conn_version,
                     conn_action,
                     conn_details,
-                    upstream_path,
+                    original_uri_path,
                     &upstream_resp,
                     &header_buf,
                     header_end,
@@ -5394,9 +5435,20 @@ async fn splice_proxy_drive(
     });
     send_db_command(cmd).await;
 
-    // Record origin in database (mirrors the hyper path in main.rs).
+    // Record origin in database for this cached download.  This is an
+    // intentional asymmetry with the hyper backend: in `main.rs`,
+    // `Origin::from_path` is only called from the hyper `simple_proxy`
+    // passthrough in `main.rs`; the hyper cache-download paths in
+    // `download_file`/`serve_new_file` never record an Origin row.  The
+    // splice path records Origins for cached downloads too, so it is doing
+    // strictly more origin-recording work than hyper.  Treat the splice
+    // origin write as the source of truth for cached-download origins for
+    // now.  Use the original (pre-redirect) client request path so the
+    // recorded origin layout is stable across upstream redirects (the
+    // redirected `upstream_path` would otherwise poison the DB with a
+    // different origin row for the same logical download).
     if let Some(origin) = Origin::from_path(
-        upstream_path,
+        original_uri_path,
         conn_details.mirror.host().clone(),
         conn_details.mirror.port(),
     ) && !cache_layout::is_pseudo_arch(&origin.architecture)
@@ -5568,31 +5620,175 @@ async fn read_body_to_vec_until_eof(
     Ok(body)
 }
 
+/// State machine for the buffered chunked-body decoder.
+///
+/// Mirrors [`ChunkedState`] used by the streaming variant
+/// [`forward_upstream_chunked_body`]; the `Done { remaining }` variant counts
+/// the still-unseen bytes of the closing `\r\n` after the `0\r\n` terminator,
+/// so the upstream socket buffer is left empty and the connection can be
+/// safely returned to the pool. Trailer header fields between `0\r\n` and the
+/// final `\r\n` are rejected (same policy as the streaming variant).
+enum BufferedDechunkState {
+    /// Accumulating the hex chunk-size line (up to `\r\n`).
+    ReadingSize,
+    /// Reading chunk data bytes; `remaining` counts undecoded payload bytes.
+    ReadingData { remaining: usize },
+    /// Expecting the `\r\n` trailer after chunk data.
+    ReadingTrailer { seen_cr: bool },
+    /// The final `0\r\n` chunk has been received; still expecting the
+    /// closing `\r\n` that terminates the (empty) trailer section.
+    /// `remaining` is the count of still-unseen bytes of that final CRLF
+    /// (starts at 2, decrements to 0 when fully consumed).
+    Done { remaining: u8 },
+}
+
+/// Pure step of [`read_dechunk_body_to_vec`]: process one buffer of upstream
+/// bytes through the state machine, appending decoded payload to `body`.
+///
+/// Returns the number of bytes consumed from `data`. When the terminal chunk
+/// and its closing CRLF have been fully consumed, `state` transitions to
+/// `Done { remaining: 0 }` and the function stops processing further bytes
+/// (so callers can detect trailing/leftover bytes if needed).
+///
+/// Factored out so the framing logic is unit-testable without setting up
+/// `RUNTIMEDETAILS` (the I/O wrapper depends on `global_config()`).
+fn buffered_dechunk_step(
+    state: &mut BufferedDechunkState,
+    size_buf: &mut Vec<u8>,
+    body: &mut Vec<u8>,
+    data: &[u8],
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    let mut i = 0usize;
+    while i < data.len() {
+        match state {
+            BufferedDechunkState::ReadingSize => {
+                let b = data[i];
+                i += 1;
+                size_buf.push(b);
+                if b == b'\n' && size_buf.len() >= 2 && size_buf[size_buf.len() - 2] == b'\r' {
+                    let line = &size_buf[..size_buf.len() - 2];
+                    let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
+                    let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_err| {
+                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "chunked encoding: invalid chunk-size line",
+                        )
+                    })?;
+                    let chunk_size = usize::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
+                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "chunked encoding: invalid chunk-size hex",
+                        )
+                    })?;
+                    size_buf.clear();
+                    if chunk_size == 0 {
+                        // Terminal chunk -- still need to consume the closing
+                        // \r\n that ends the (empty) trailer section.
+                        *state = BufferedDechunkState::Done { remaining: 2 };
+                    } else {
+                        if body
+                            .len()
+                            .checked_add(chunk_size)
+                            .is_none_or(|sum| sum > max_bytes)
+                        {
+                            warn_once_or_info!(
+                                "splice proxy: chunked volatile body exceeded {max_bytes} byte cap"
+                            );
+                            return Err(std::io::Error::other(
+                                "chunked volatile body exceeded size cap",
+                            ));
+                        }
+                        *state = BufferedDechunkState::ReadingData {
+                            remaining: chunk_size,
+                        };
+                    }
+                } else if size_buf.len() > 64 {
+                    // Guard against absurdly long size lines (matches the
+                    // streaming variant's 64-byte cap).
+                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "chunked encoding: chunk-size line too long",
+                    ));
+                }
+            }
+            BufferedDechunkState::ReadingData { remaining } => {
+                let avail = data.len() - i;
+                let taken = avail.min(*remaining);
+                body.extend_from_slice(&data[i..i + taken]);
+                *remaining -= taken;
+                i += taken;
+                if *remaining == 0 {
+                    *state = BufferedDechunkState::ReadingTrailer { seen_cr: false };
+                }
+            }
+            BufferedDechunkState::ReadingTrailer { seen_cr } => {
+                let b = data[i];
+                i += 1;
+                if !*seen_cr && b == b'\r' {
+                    *seen_cr = true;
+                } else if *seen_cr && b == b'\n' {
+                    *state = BufferedDechunkState::ReadingSize;
+                } else {
+                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "chunked encoding: expected CRLF after chunk data",
+                    ));
+                }
+            }
+            BufferedDechunkState::Done { remaining } => {
+                // Validate the closing \r\n after the 0-length chunk. Trailer
+                // header fields between `0\r\n` and the final `\r\n` are not
+                // supported (matches the streaming variant) -- reject as a
+                // framing sanity check rather than silently skipping.
+                while i < data.len() && *remaining > 0 {
+                    let b = data[i];
+                    i += 1;
+                    let expected = if *remaining == 2 { b'\r' } else { b'\n' };
+                    if b != expected {
+                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "chunked encoding: expected \\r\\n after 0-length chunk \
+                             (trailer sections are not supported)",
+                        ));
+                    }
+                    *remaining -= 1;
+                }
+                if *remaining == 0 {
+                    // Stop processing -- leave any trailing bytes in `data`
+                    // unconsumed so the caller can detect framing surprises.
+                    return Ok(i);
+                }
+            }
+        }
+    }
+    Ok(i)
+}
+
 /// Dechunk a chunked-encoded body from upstream into a `Vec<u8>`, up to `max_bytes`
 /// of decoded payload.
+///
+/// On success the closing `\r\n` after the `0\r\n` terminator has been fully
+/// consumed from the upstream socket buffer, so the connection can be safely
+/// returned to the pool (mirrors the streaming variant
+/// [`forward_upstream_chunked_body`]). On error the connection state is
+/// indeterminate -- callers must mark the upstream non-poolable.
 async fn read_dechunk_body_to_vec(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
     max_bytes: usize,
 ) -> std::io::Result<Vec<u8>> {
-    // State machine for chunked decoding.
-    enum State {
-        /// Accumulating the hex chunk-size line (up to `\r\n`).
-        ReadingSize,
-        /// Reading chunk data bytes; `remaining` counts undecoded payload bytes.
-        ReadingData { remaining: usize },
-        /// Expecting the `\r\n` trailer after chunk data.
-        ReadingTrailer { seen_cr: bool },
-        /// The final `0\r\n` chunk has been received; done.
-        Done,
-    }
-
     let config = global_config();
     let mut body = Vec::with_capacity(4096);
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-    let mut state = State::ReadingSize;
+    let mut state = BufferedDechunkState::ReadingSize;
     let mut size_buf = Vec::with_capacity(32);
     let mut read_buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
 
@@ -5636,83 +5832,23 @@ async fn read_dechunk_body_to_vec(
             pending
         };
 
-        let mut i = 0;
-        while i < data.len() {
-            match state {
-                State::ReadingSize => {
-                    let b = data[i];
-                    i += 1;
-                    size_buf.push(b);
-                    if b == b'\n' && size_buf.len() >= 2 && size_buf[size_buf.len() - 2] == b'\r' {
-                        let line = &size_buf[..size_buf.len() - 2];
-                        let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
-                        let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_err| {
-                            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                            std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                "chunked encoding: invalid chunk-size line",
-                            )
-                        })?;
-                        let chunk_size =
-                            usize::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
-                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "chunked encoding: invalid chunk-size hex",
-                                )
-                            })?;
-                        size_buf.clear();
-                        if chunk_size == 0 {
-                            state = State::Done;
-                        } else {
-                            if body
-                                .len()
-                                .checked_add(chunk_size as usize)
-                                .is_none_or(|sum| sum > max_bytes)
-                            {
-                                warn_once_or_info!(
-                                    "splice proxy: chunked volatile body exceeded {max_bytes} byte cap"
-                                );
-                                return Err(std::io::Error::other(
-                                    "chunked volatile body exceeded size cap",
-                                ));
-                            }
-                            state = State::ReadingData {
-                                remaining: chunk_size,
-                            };
-                        }
-                    }
-                }
-                State::ReadingData { ref mut remaining } => {
-                    let avail = data.len() - i;
-                    let taken = avail.min(*remaining);
-                    body.extend_from_slice(&data[i..i + taken]);
-                    *remaining -= taken;
-                    i += taken;
-                    if *remaining == 0 {
-                        state = State::ReadingTrailer { seen_cr: false };
-                    }
-                }
-                State::ReadingTrailer { ref mut seen_cr } => {
-                    let b = data[i];
-                    i += 1;
-                    if !*seen_cr && b == b'\r' {
-                        *seen_cr = true;
-                    } else if *seen_cr && b == b'\n' {
-                        state = State::ReadingSize;
-                    } else {
-                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                        return Err(std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "chunked encoding: expected CRLF after chunk data",
-                        ));
-                    }
-                }
-                State::Done => break,
-            }
-        }
+        let consumed =
+            buffered_dechunk_step(&mut state, &mut size_buf, &mut body, data, max_bytes)?;
 
-        if matches!(state, State::Done) {
+        if matches!(state, BufferedDechunkState::Done { remaining: 0 }) {
+            if consumed < data.len() {
+                // Defence in depth: well-behaved upstreams send no bytes
+                // past the closing `\r\n`. If trailing bytes are present
+                // we treat the connection as poisoned and bail. Callers
+                // must mark the upstream non-poolable on any error
+                // returned from this function (stray bytes in the kernel
+                // socket buffer would poison the next checkout).
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "chunked encoding: trailing bytes after 0-length chunk",
+                ));
+            }
             break;
         }
     }
@@ -5733,7 +5869,10 @@ async fn handle_volatile_buffered_download(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     conn_details: &ConnectionDetails,
-    upstream_path: &str,
+    // The original (pre-redirect) client request URI path. Used for
+    // `RenamePlan.raw_uri_path` and the recorded `Origin` so registry keys
+    // and DB origin rows match the hyper backend.
+    original_uri_path: &str,
     upstream_resp: &UpstreamResponse,
     header_buf: &[u8],
     header_end: usize,
@@ -5755,7 +5894,14 @@ async fn handle_volatile_buffered_download(
 
     // Buffer the entire body into memory.
     let body = if upstream_resp.is_chunked {
-        read_dechunk_body_to_vec(upstream, body_prefix, max_bytes).await
+        // Chunked: on success the closing `\r\n` after the `0\r\n` terminator
+        // has been fully consumed, so the connection stays poolable. On any
+        // framing error we must mark it non-poolable -- stray bytes may
+        // remain in the kernel socket buffer and would poison the next
+        // checkout.
+        read_dechunk_body_to_vec(upstream, body_prefix, max_bytes)
+            .await
+            .inspect_err(|_err| upstream.unset_poolable())
     } else {
         // Close-delimited: read until EOF.
         upstream.unset_poolable();
@@ -6122,8 +6268,13 @@ async fn handle_volatile_buffered_download(
     send_db_command(cmd).await;
 
     // Record origin in database (mirrors the hyper path in main.rs).
+    // Use the original (pre-redirect) client request path so the recorded
+    // origin layout is consistent with the hyper backend (main.rs), which
+    // extracts Origin from `parts_cloned.uri.path()` captured before any
+    // redirect. Using the redirected `upstream_path` here would poison the
+    // DB with a different origin row for the same logical download.
     if let Some(origin) = Origin::from_path(
-        upstream_path,
+        original_uri_path,
         conn_details.mirror.host().clone(),
         conn_details.mirror.port(),
     ) && !cache_layout::is_pseudo_arch(&origin.architecture)
@@ -6235,6 +6386,7 @@ pub(crate) async fn splice_simple_proxy(
     request_received_at: coarsetime::Instant,
 ) -> Result<(), SpliceProxyError> {
     let host_authority = mirror.format_authority();
+    let original_uri_path = upstream_path;
 
     let (up, resp, hdr_buf, hdr_end, _label, poolable) =
         standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None).await?;
@@ -6274,6 +6426,19 @@ pub(crate) async fn splice_simple_proxy(
 
     metrics::record_client_status(resp.status_code);
     metrics::REQUESTS_PASSTHROUGH.increment();
+
+    // Mirror the hyper simple-proxy passthrough: record an Origin row on
+    // 2xx/3xx responses so the cleanup machinery can find the owning mirror
+    // for uncached resources that happen to carry a pool-style path.
+    if (resp.status_code.is_success() || resp.status_code.is_redirection())
+        && let Some(origin) =
+            Origin::from_path(original_uri_path, mirror.host().clone(), mirror.port())
+        && !cache_layout::is_pseudo_arch(&origin.architecture)
+    {
+        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        send_db_command(cmd).await;
+    }
+
     let t_client_first = coarsetime::Instant::now();
     write_all_to_stream(
         client_stream,
@@ -6302,8 +6467,13 @@ pub(crate) async fn splice_simple_proxy(
     let forwarded: u64 = if resp.is_chunked {
         // Chunked encoding: forward raw framing, detect termination.
         // body_prefix is passed into the helper, so its return includes the prefix.
+        // On success the closing `\r\n` after the `0\r\n` terminator has been
+        // fully consumed, so the connection stays poolable. On any framing
+        // error we must mark it non-poolable -- stray bytes may remain in
+        // the kernel socket buffer and would poison the next checkout.
         forward_upstream_chunked_body(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
             .await
+            .inspect_err(|_err| upstream.unset_poolable())
             .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "simple-proxy chunked body"))?
     } else if let Some(cl) = resp.content_length {
         if !body_prefix.is_empty() {
@@ -6325,6 +6495,7 @@ pub(crate) async fn splice_simple_proxy(
         if remaining > 0 {
             let helper_bytes = forward_upstream_body(&mut upstream, client_stream, remaining)
                 .await
+                .inspect_err(|_err| upstream.unset_poolable())
                 .map_err(|err| {
                     SpliceProxyError::AfterHeaderClient(err, "simple-proxy remaining body")
                 })?;
@@ -6957,5 +7128,131 @@ mod tests {
         drop(tx);
 
         let _rx = drain_handle.await.expect("drain task completes");
+    }
+
+    // Drive `buffered_dechunk_step` to completion over a single input buffer,
+    // returning the decoded body and the count of bytes consumed.
+    fn dechunk_once(input: &[u8], max_bytes: usize) -> std::io::Result<(Vec<u8>, usize)> {
+        let mut state = BufferedDechunkState::ReadingSize;
+        let mut size_buf = Vec::with_capacity(32);
+        let mut body = Vec::new();
+        let consumed =
+            buffered_dechunk_step(&mut state, &mut size_buf, &mut body, input, max_bytes)?;
+        Ok((body, consumed))
+    }
+
+    #[test]
+    fn test_buffered_dechunk_consumes_closing_crlf() {
+        // Well-formed chunked body: one 5-byte chunk "hello", then terminator.
+        // The decoder must consume every byte (including the final \r\n) so
+        // the upstream socket buffer is left empty and the connection can be
+        // returned to the pool.
+        let input: &[u8] = b"5\r\nhello\r\n0\r\n\r\n";
+        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
+        assert_eq!(body, b"hello");
+        assert_eq!(
+            consumed,
+            input.len(),
+            "decoder must consume every byte of the chunked frame, including the closing CRLF",
+        );
+    }
+
+    #[test]
+    fn test_buffered_dechunk_empty_body() {
+        // `0\r\n\r\n` -- a body that is purely the terminal chunk. Must
+        // consume all 5 bytes and produce an empty body.
+        let input: &[u8] = b"0\r\n\r\n";
+        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
+        assert!(
+            body.is_empty(),
+            "empty chunked body should decode to no bytes"
+        );
+        assert_eq!(consumed, input.len());
+    }
+
+    #[test]
+    fn test_buffered_dechunk_multi_chunk() {
+        // Two data chunks then terminator.
+        let input: &[u8] = b"3\r\nfoo\r\n4\r\nbarz\r\n0\r\n\r\n";
+        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
+        assert_eq!(body, b"foobarz");
+        assert_eq!(consumed, input.len());
+    }
+
+    #[test]
+    fn test_buffered_dechunk_rejects_trailer_fields() {
+        // Trailer fields between `0\r\n` and the final `\r\n` are not
+        // supported (matches the streaming variant's policy). A header
+        // line starting with `X` after `0\r\n` must be rejected because
+        // the byte after `0\r\n` is expected to be `\r`.
+        let input: &[u8] = b"0\r\nX-Trailer: foo\r\n\r\n";
+        let err = dechunk_once(input, 1024).expect_err("trailer fields must be rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_buffered_dechunk_rejects_garbage_after_zero_chunk() {
+        // The bytes following `0\r\n` must be exactly `\r\n`. Garbage in
+        // place of the CR triggers a framing error rather than silently
+        // succeeding (the pre-fix decoder did the latter, leaving the
+        // garbage in the upstream socket buffer).
+        let input: &[u8] = b"0\r\nXY";
+        let err = dechunk_once(input, 1024).expect_err("garbage after 0-chunk must be rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_buffered_dechunk_split_closing_crlf() {
+        // The closing `\r\n` arrives in two separate buffers (the `\r` in
+        // one read, the `\n` in the next). Verifies `Done { remaining }`
+        // correctly counts down across buffer boundaries.
+        let mut state = BufferedDechunkState::ReadingSize;
+        let mut size_buf = Vec::with_capacity(32);
+        let mut body = Vec::new();
+
+        // First buffer: data chunk + terminal `0\r\n` + the `\r` of the
+        // closing CRLF (1 byte short of the full terminator).
+        let part1: &[u8] = b"5\r\nhello\r\n0\r\n\r";
+        let c1 = buffered_dechunk_step(&mut state, &mut size_buf, &mut body, part1, 1024)
+            .expect("part1 decode");
+        assert_eq!(c1, part1.len());
+        assert!(
+            matches!(state, BufferedDechunkState::Done { remaining: 1 }),
+            "after part1 the decoder must still be waiting for one more byte (the LF)",
+        );
+
+        // Second buffer: just the `\n` that finishes the closing CRLF.
+        let part2: &[u8] = b"\n";
+        let c2 = buffered_dechunk_step(&mut state, &mut size_buf, &mut body, part2, 1024)
+            .expect("part2 decode");
+        assert_eq!(c2, 1);
+        assert!(matches!(state, BufferedDechunkState::Done { remaining: 0 }));
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn test_buffered_dechunk_stops_at_done_leaves_trailing_bytes() {
+        // After fully consuming `0\r\n\r\n` the decoder must stop and
+        // leave any trailing bytes in the input unconsumed -- the I/O
+        // wrapper turns that into a framing-violation error so a
+        // misbehaving upstream cannot poison the connection pool.
+        let input: &[u8] = b"0\r\n\r\nGARBAGE";
+        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
+        assert!(body.is_empty());
+        assert_eq!(
+            consumed, 5,
+            "decoder must stop right after the closing CRLF, not swallow trailing bytes",
+        );
+    }
+
+    #[test]
+    fn test_buffered_dechunk_chunk_extensions_ignored() {
+        // RFC 9112 allows chunk extensions after `;` on the chunk-size
+        // line; they must be parsed and ignored, matching the streaming
+        // variant.
+        let input: &[u8] = b"5;ext=foo\r\nhello\r\n0;final\r\n\r\n";
+        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
+        assert_eq!(body, b"hello");
+        assert_eq!(consumed, input.len());
     }
 }
