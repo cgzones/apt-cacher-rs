@@ -539,8 +539,7 @@ impl Database {
                 origins.architecture,
                 origins.last_seen
               FROM origins
-              JOIN mirrors_v2
-              WHERE mirrors_v2.id = origins.mirror_id;
+              JOIN mirrors_v2 ON mirrors_v2.id = origins.mirror_id;
         "#,
         )
         .fetch_all(&self.conn)
@@ -555,7 +554,8 @@ impl Database {
     ) -> Result<Vec<OriginEntry>, Error> {
         let port = port.map_or(0, std::num::NonZero::get);
 
-        query_as!(OriginEntry,
+        query_as!(
+            OriginEntry,
             r#"
               SELECT
                 mirrors_v2.host AS "host: ClientHost",
@@ -566,11 +566,15 @@ impl Database {
                 origins.architecture,
                 origins.last_seen
               FROM origins
-              JOIN mirrors_v2
-              WHERE mirrors_v2.host = ? AND mirrors_v2.port = ? AND mirrors_v2.path = ? AND mirrors_v2.id = origins.mirror_id;
-        "#, host, port, path
+              JOIN mirrors_v2 ON mirrors_v2.id = origins.mirror_id
+              WHERE mirrors_v2.host = ? AND mirrors_v2.port = ? AND mirrors_v2.path = ?;
+        "#,
+            host,
+            port,
+            path
         )
-        .fetch_all(&self.conn).await
+        .fetch_all(&self.conn)
+        .await
     }
 
     /// `true` iff a `mirrors_v2` row exists for the given identity tuple.

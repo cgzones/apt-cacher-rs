@@ -400,7 +400,8 @@ pub(crate) async fn db_loop(
                 let curr_capacity = db_thread_rx.capacity();
                 if curr_capacity == 0 {
                     if !at_cap {
-                        info!("Database command channel full ({max_capacity}/{max_capacity})");
+                        let depth = max_capacity - curr_capacity;
+                        info!("Database command channel full ({depth}/{max_capacity})");
                         metrics::DB_QUEUE_FULL_TRANSITIONS.increment();
                         at_cap = true;
                     }
