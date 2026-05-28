@@ -2178,7 +2178,7 @@ async fn serve_unfinished_sendfile(
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
-                    "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
+                    "Aborted serving downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
@@ -2187,7 +2187,7 @@ async fn serve_unfinished_sendfile(
                 );
             } else {
                 warn!(
-                    "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
+                    "Aborted serving downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
