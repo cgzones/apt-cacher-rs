@@ -144,7 +144,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         // ASCII), so fall through to the unrecognized-entry warn.
         let Some(name_str) = dir_name.to_str() else {
             warn!(
-                "Unrecognized directory entry in cache directory: `{}`",
+                "Cache directory entry with non-UTF-8 name: `{}`",
                 entry.path().display()
             );
             continue;
@@ -152,7 +152,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
 
         let Some(mirrors_here) = mirrors_by_dir.get(name_str) else {
             warn!(
-                "Unrecognized directory entry in cache directory: `{}`",
+                "Cache directory entry not matching any mirror: `{}`",
                 entry.path().display()
             );
             continue;
@@ -231,9 +231,15 @@ async fn scan_mirror_dir(
             // rows the absence is potentially a real inconsistency, so
             // keep the info-level call there.
             if mirror.kind() == MirrorKind::Flat {
-                debug!("Mirror directory `{}` not found", mirror_path.display());
+                debug!(
+                    "Mirror directory `{}` not found (flat-kind mirror, expected)",
+                    mirror_path.display()
+                );
             } else {
-                info!("Mirror directory `{}` not found", mirror_path.display());
+                info!(
+                    "Structured mirror directory `{}` not found",
+                    mirror_path.display()
+                );
             }
             return 0;
         }

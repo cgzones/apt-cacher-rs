@@ -152,7 +152,7 @@ async fn resolve_mirror_id(
     );
     metrics::DB_MIRROR_CACHE_ENTRIES.set(cache.len() as u64);
     if was_inserted {
-        info!("Encountered new mirror for the first time:  {mirror}");
+        info!("Encountered new mirror: {mirror}");
     }
     Ok(id)
 }
@@ -177,7 +177,10 @@ async fn stage(
                 Ok(id) => id,
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
-                    error!("Failed to resolve mirror for delivery:  {err}");
+                    error!(
+                        "Failed to resolve mirror for delivery {mirror}:  {err}",
+                        mirror = &c.mirror
+                    );
                     return;
                 }
             };
@@ -200,7 +203,10 @@ async fn stage(
                 Ok(id) => id,
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
-                    error!("Failed to resolve mirror for download:  {err}");
+                    error!(
+                        "Failed to resolve mirror for download {mirror}:  {err}",
+                        mirror = &c.mirror
+                    );
                     return;
                 }
             };
@@ -217,7 +223,10 @@ async fn stage(
                 Ok(id) => id,
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
-                    error!("Failed to resolve mirror for origin:  {err}");
+                    error!(
+                        "Failed to resolve mirror for origin {mirror}:  {err}",
+                        mirror = &c.origin.mirror
+                    );
                     return;
                 }
             };

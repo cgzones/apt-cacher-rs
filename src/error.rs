@@ -33,7 +33,7 @@ impl std::fmt::Display for ProxyCacheError {
         match self {
             Self::Io(e) => write!(f, "{}", ErrorReport(e)),
             Self::Hyper(e) => write!(f, "{}", ErrorReport(e)),
-            Self::Sqlx(e) => e.fmt(f),
+            Self::Sqlx(e) => write!(f, "{}", ErrorReport(e)),
             Self::ClientDownloadRate { error, client } => {
                 error.fmt_with_context(f, format_args!(" for client {client}"))
             }
@@ -131,7 +131,14 @@ pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> 
     }
     impl Display for ErrnoIoError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}: {}", self.msg, self.source)
+            // Print only the context message; the errno text lives on the
+            // inner io::Error exposed via `source()` and is appended by
+            // `ErrorReport`. Embedding it here would duplicate the errno
+            // string because `io::Error::new(_, custom)` makes the outer
+            // io::Error's `source()` delegate to this struct's source, so
+            // `ErrorReport` would walk through this struct to the inner
+            // io::Error and print the errno a second time.
+            f.write_str(self.msg)
         }
     }
     impl std::error::Error for ErrnoIoError {
@@ -143,4 +150,38 @@ pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> 
     let err = std::io::Error::from(errno);
     let kind = err.kind();
     std::io::Error::new(kind, ErrnoIoError { msg, source: err })
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "sendfile")]
+    use super::*;
+
+    #[cfg(feature = "sendfile")]
+    #[test]
+    fn errno_to_io_error_report_does_not_duplicate_errno_text() {
+        // ENOENT is portable enough to assert a stable substring on.
+        let err = errno_to_io_error(nix::errno::Errno::ENOENT, "sendfile failed");
+        let report = format!("{}", ErrorReport(&err));
+
+        // Expected shape: "<msg>:  <errno_text>" - the message once, the
+        // errno text once, separated by the two-space ErrorReport joiner.
+        assert!(
+            report.starts_with("sendfile failed:  "),
+            "unexpected prefix: {report}"
+        );
+        // The errno string must appear exactly once.
+        let needle = "(os error";
+        assert_eq!(
+            report.matches(needle).count(),
+            1,
+            "errno text duplicated in report: {report}"
+        );
+        // And the message must not be repeated either.
+        assert_eq!(
+            report.matches("sendfile failed").count(),
+            1,
+            "context message duplicated in report: {report}"
+        );
+    }
 }

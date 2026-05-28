@@ -412,15 +412,15 @@ impl UpstreamConn {
     /// on an idle pooled TLS connection almost certainly indicate a `close_notify`
     /// alert and are treated the same. The native-tls backend does not expose
     /// the underlying TCP fd cleanly, so we remain optimistic there.
-    fn check_alive(&self) -> bool {
-        fn tcp_peek_alive(fd: std::os::fd::RawFd) -> bool {
+    fn check_alive(&self, host: &str, port: u16) -> bool {
+        fn tcp_peek_alive(fd: std::os::fd::RawFd, host: &str, port: u16) -> bool {
             use nix::sys::socket::{MsgFlags, recv};
 
             let mut buf = [0u8; 1];
 
             match recv(fd, &mut buf, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
                 Ok(0) | Err(nix::errno::Errno::ECONNRESET) => {
-                    debug!("splice proxy: pooled connection closed by peer");
+                    debug!("splice proxy: pooled connection to {host}:{port} closed by peer");
                     false
                 }
                 Ok(pending) => {
@@ -433,18 +433,18 @@ impl UpstreamConn {
                 // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                 Err(nix::errno::Errno::EAGAIN) => true,
                 Err(errno) => {
-                    warn!("splice proxy: pooled connection check failed:  {errno}");
+                    warn_once_or_info!("splice proxy: pooled connection check failed:  {errno}");
                     false
                 }
             }
         }
 
         match self {
-            Self::Tcp(tcp) => tcp_peek_alive(tcp.as_raw_fd()),
+            Self::Tcp(tcp) => tcp_peek_alive(tcp.as_raw_fd(), host, port),
             #[cfg(feature = "tls_rustls")]
             Self::Tls(tls) => {
                 let (tcp, _) = tls.get_ref();
-                tcp_peek_alive(tcp.as_raw_fd())
+                tcp_peek_alive(tcp.as_raw_fd(), host, port)
             }
             #[cfg(not(feature = "tls_rustls"))]
             Self::Tls(_) => true,
@@ -884,7 +884,9 @@ async fn drain_buffered_records(
                 break;
             }
             other => {
-                warn_once!("splice proxy: unexpected ConnectionState variant: {other:?}");
+                warn_once!(
+                    "splice proxy: unexpected ConnectionState variant while draining buffered records: {other:?}"
+                );
                 discard_incoming(incoming, incoming_used, discard);
                 break;
             }
@@ -987,7 +989,7 @@ async fn try_unbuffered_ktls_connect(
     {
         Ok(Ok(state)) => KtlsResult::Ready(tcp, state),
         Ok(Err(KtlsError::TlsFailed(err))) => {
-            debug!("kTLS: TLS failed:  {err}");
+            debug!("kTLS: TLS handshake with {host_authority} failed:  {err}");
             KtlsResult::Failed {
                 tls_succeeded: false,
             }
@@ -1001,7 +1003,7 @@ async fn try_unbuffered_ktls_connect(
         }
         Ok(Err(KtlsError::UpstreamProtocolError(err))) => {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            warn!(
+            warn_once_or_info!(
                 "kTLS: upstream {} sent malformed HTTP (no host-block):  {err}",
                 mirror.format_authority()
             );
@@ -1015,9 +1017,10 @@ async fn try_unbuffered_ktls_connect(
         Ok(Err(KtlsError::KtlsSetupFailed(err))) => {
             metrics::KTLS_FALLBACK_PERMANENT.increment();
             warn!(
-                "kTLS: setup failed for {}, blocking kTLS for {}s:  {err}",
+                "kTLS: setup failed for {}, blocking kTLS for {}s:  {}",
                 mirror.format_authority(),
-                KTLS_BLOCK_DURATION.as_secs()
+                KTLS_BLOCK_DURATION.as_secs(),
+                ErrorReport(&err)
             );
             let key = SchemeKey {
                 host: key.host.to_owned(),
@@ -1039,8 +1042,9 @@ async fn try_unbuffered_ktls_connect(
         Ok(Err(KtlsError::KtlsSetupFailedTransient(err))) => {
             metrics::KTLS_FALLBACK_TRANSIENT.increment();
             info!(
-                "kTLS: transient setup failure for {} (no block):  {err}",
-                mirror.format_authority()
+                "kTLS: transient setup failure for {} (no block):  {}",
+                mirror.format_authority(),
+                ErrorReport(&err)
             );
             // Intentionally do not insert into KTLS_BLOCKED. Transient failures
             // (drain races etc.) can plausibly succeed on the next attempt.
@@ -1049,7 +1053,7 @@ async fn try_unbuffered_ktls_connect(
             }
         }
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            debug!("kTLS: timed out");
+            debug!("kTLS: handshake with {host_authority} timed out");
             KtlsResult::Failed {
                 tls_succeeded: false,
             }
@@ -1267,7 +1271,9 @@ async fn unbuffered_ktls_request(
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
             }
             other => {
-                warn_once!("splice proxy: unexpected ConnectionState variant: {other:?}");
+                warn_once!(
+                    "splice proxy: unexpected ConnectionState variant during post-handshake request: {other:?}"
+                );
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
             }
         }
@@ -1414,12 +1420,13 @@ async fn unbuffered_ktls_request(
     // --- Parse response to check status before setting up kTLS ---
     // Malformed HTTP from the upstream is not a kTLS issue — surface it as
     // UpstreamProtocolError so the host stays eligible for kTLS retries.
-    let mut response = parse_upstream_response(&header_buf, header_end).map_err(|err| {
-        KtlsError::UpstreamProtocolError(std::io::Error::new(
-            err.kind(),
-            format!("kTLS upstream protocol error:  {err}"),
-        ))
-    })?;
+    let mut response =
+        parse_upstream_response(&header_buf, header_end, host_authority).map_err(|err| {
+            KtlsError::UpstreamProtocolError(std::io::Error::new(
+                err.kind(),
+                format!("kTLS upstream protocol error:  {err}"),
+            ))
+        })?;
     response.request_sent_at = req_sent;
 
     if response.status_code != 200 || response.content_length.is_none_or(|ct| ct == 0) {
@@ -1809,7 +1816,11 @@ struct UpstreamResponse {
 /// to be honored. The kTLS path may parse a response that is then thrown
 /// away in favor of a standard-path reconnect (`ResponseNotSpliceable`); a
 /// metric bump here would double-count for that flow.
-fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<UpstreamResponse> {
+fn parse_upstream_response(
+    buf: &[u8],
+    header_end: usize,
+    host_authority: &str,
+) -> std::io::Result<UpstreamResponse> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
 
@@ -1845,7 +1856,7 @@ fn parse_upstream_response(buf: &[u8], header_end: usize) -> std::io::Result<Ups
             if is_valid_etag(etag) {
                 true
             } else {
-                warn_once_or_info!("Upstream mirror sent invalid ETag: {etag}");
+                warn_once_or_info!("Upstream mirror {host_authority} sent invalid ETag: {etag}");
                 false
             }
         })
@@ -2130,9 +2141,30 @@ async fn splice_proxy_body(
                             .checked_sub(sent)
                             .expect("client_remaining tracks bytes still owed to the client");
                     }
+                    // Rate-stall / HTTP per-op timeout on the client write:
+                    // the proxy gave up on this client but the upstream
+                    // download must continue so the cache is populated for
+                    // the late-joiner.  `HTTP_TIMEOUT_CLIENT_BODY` is already
+                    // bumped at the `write_all_to_stream_rated` throw site;
+                    // don't also bump `CLIENT_DISCONNECTED_MID_BODY`.
+                    Err(err) if err.kind() == ErrorKind::TimedOut => {
+                        info!(
+                            "splice proxy: client {} timed out during boundary chunk, abandoning client:  {}",
+                            client
+                                .peer_addr()
+                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                            ErrorReport(&err)
+                        );
+                        client_status = ClientStatus::Disconnected;
+                    }
                     Err(err) if is_peer_disconnect(&err) => {
                         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                        info!("splice proxy: client disconnected during boundary chunk");
+                        info!(
+                            "splice proxy: client {} disconnected during boundary chunk",
+                            client
+                                .peer_addr()
+                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string())
+                        );
                         client_status = ClientStatus::Disconnected;
                     }
                     Err(err) => return Err(err),
@@ -2504,9 +2536,28 @@ async fn splice_proxy_body_tls(
                             .checked_sub(sent)
                             .expect("client_remaining tracks bytes still owed to the client");
                     }
+                    // Rate-stall / HTTP per-op timeout on the TLS client
+                    // write: see the matching plaintext arm above for the
+                    // rationale (continue download for late-joiner, no
+                    // double-attribution to CLIENT_DISCONNECTED_MID_BODY).
+                    Err(err) if err.kind() == ErrorKind::TimedOut => {
+                        info!(
+                            "splice proxy: client {} timed out during TLS boundary chunk, abandoning client:  {}",
+                            client
+                                .peer_addr()
+                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                            ErrorReport(&err)
+                        );
+                        client_status = ClientStatus::Disconnected;
+                    }
                     Err(err) if is_peer_disconnect(&err) => {
                         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                        info!("splice proxy: client disconnected during TLS boundary chunk");
+                        info!(
+                            "splice proxy: client {} disconnected during TLS boundary chunk",
+                            client
+                                .peer_addr()
+                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string())
+                        );
                         client_status = ClientStatus::Disconnected;
                     }
                     Err(err) => return Err(err),
@@ -2630,7 +2681,8 @@ async fn serve_remaining_from_file(
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 debug!(
-                    "splice proxy: demoted client disconnected during file-serve from cache offset {content_start}:  {err}"
+                    "splice proxy: demoted client disconnected during file-serve from cache offset {content_start}:  {}",
+                    ErrorReport(&err)
                 );
             } else {
                 info!(
@@ -3076,7 +3128,7 @@ async fn send_and_read_headers(
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
-    let mut resp = parse_upstream_response(&hdr_buf, hdr_end).map_err(|err| {
+    let mut resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority).map_err(|err| {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         warn_once_or_info!("splice proxy: upstream {host_authority} sent malformed HTTP:  {err}");
         err
@@ -3127,7 +3179,7 @@ async fn standard_upstream_connect(
         let is_tls = matches!(scheme, Scheme::Https);
         let port = mirror_port(mirror, is_tls);
         if let Some(mut pooled) = pool_checkout(mirror.host(), port, is_tls) {
-            if pooled.check_alive() {
+            if pooled.check_alive(mirror.host(), port) {
                 match send_and_read_headers(
                     &mut pooled,
                     host_authority,
@@ -3173,7 +3225,7 @@ async fn standard_upstream_connect(
     metrics::POOL_NEW.increment();
 
     let (mut up, scheme) = connect_upstream(mirror).await.map_err(|err| {
-        warn!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
+        warn_once_or_info!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
         SpliceProxyError::Upstream
     })?;
     cache_scheme(mirror, scheme);
@@ -3190,7 +3242,7 @@ async fn standard_upstream_connect(
     )
     .await
     .map_err(|err| {
-        warn!(
+        warn_once_or_info!(
             "splice proxy: failed upstream request to {host_authority} for {upstream_path}:  {err}"
         );
         SpliceProxyError::Upstream
@@ -3308,7 +3360,18 @@ async fn follow_redirect(
         resume_if_range,
         volatile_cond,
     )
-    .await?;
+    .await
+    .inspect_err(|_| {
+        // The throw site inside `standard_upstream_connect` already WARNs
+        // with the underlying error detail (per `SpliceProxyError::Upstream`
+        // log convention); this line adds the redirect breadcrumb so an
+        // operator can correlate the connect failure with the redirect that
+        // pointed at the now-failing target.
+        warn_once_or_info!(
+            "splice proxy: upstream connect failed after {status} redirect from {} to `{moved_uri}`",
+            conn_details.mirror
+        );
+    })?;
     let port = mirror_port(&redirect_mirror, up.is_tls());
     *upstream = PoolGuard::new(up, moved_host.to_owned(), port, poolable);
     *upstream_resp = resp;
@@ -4013,7 +4076,9 @@ async fn splice_proxy_drive(
                 );
             } else {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                debug!("splice proxy: no usable Content-Length (from kTLS attempt), returning 502");
+                warn_once_or_info!(
+                    "splice proxy: no usable Content-Length (from kTLS attempt), returning 502"
+                );
                 // Honoring the kTLS-parsed response: record its status before
                 // emitting our own 502 to the client. (The standard path is not
                 // reconnected for, so no other site will record this 200.)
@@ -4150,9 +4215,10 @@ async fn splice_proxy_drive(
             // inside `try_unbuffered_ktls_connect` carries the kTLS-layer
             // error for trace-level visibility.
             if resolve_mirror_scheme(mirror) == Some(Scheme::Https) {
-                warn!(
-                    "splice proxy: upstream TCP error for {} from mirror {}:  {err}",
-                    conn_details.debname, conn_details.mirror
+                warn_once_or_info!(
+                    "splice proxy: failed to fetch {} from mirror {} (upstream TCP error):  {err}",
+                    conn_details.debname,
+                    conn_details.mirror
                 );
                 return Err(SpliceProxyError::Upstream);
             }
@@ -4236,9 +4302,11 @@ async fn splice_proxy_drive(
 
     // Handle resume: if we got 416 (stale partial), discard and retry without Range
     if resume_offset > 0 && upstream_resp.status_code == 416 {
-        warn!(
+        warn_once_or_info!(
             "splice proxy: 416 for resume of {} from mirror {} (partial {} bytes), discarding stale partial and retrying",
-            conn_details.debname, conn_details.mirror, resume_offset
+            conn_details.debname,
+            conn_details.mirror,
+            resume_offset
         );
         discard_partial_and_retry(
             &mut partial,
@@ -4429,9 +4497,10 @@ async fn splice_proxy_drive(
             });
 
         if !content_range_valid {
-            warn!(
+            warn_once_or_info!(
                 "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}, discarding partial and retrying fresh",
-                conn_details.debname, conn_details.mirror
+                conn_details.debname,
+                conn_details.mirror
             );
             discard_partial_and_retry(
                 &mut partial,
@@ -4493,9 +4562,10 @@ async fn splice_proxy_drive(
                     && cl != remaining
                 {
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    warn!(
+                    warn_once_or_info!(
                         "splice proxy: Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}",
-                        conn_details.debname, conn_details.mirror
+                        conn_details.debname,
+                        conn_details.mirror
                     );
                     upstream.unset_poolable();
                     write_invalid_response(
@@ -4529,9 +4599,11 @@ async fn splice_proxy_drive(
                 // pre-check above (which discards partial and retries fresh).
                 // Defensive fallback in case of unexpected state.
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn!(
+                warn_once_or_info!(
                     "splice proxy: unexpected Content-Range state for 206 response of {} from mirror {}: {:?}",
-                    conn_details.debname, conn_details.mirror, upstream_resp.content_range
+                    conn_details.debname,
+                    conn_details.mirror,
+                    upstream_resp.content_range
                 );
                 upstream.unset_poolable();
                 write_invalid_response(
@@ -4568,9 +4640,10 @@ async fn splice_proxy_drive(
                 .await;
             }
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            debug!(
+            warn_once_or_info!(
                 "splice proxy: no Content-Length for file {} from mirror {}",
-                conn_details.debname, conn_details.mirror
+                conn_details.debname,
+                conn_details.mirror
             );
             // Body framing unknown — any bytes in header_buf tail or on the
             // socket cannot be safely skipped, so don't return the connection
@@ -4593,9 +4666,10 @@ async fn splice_proxy_drive(
 
     let Some(total_content_length) = NonZero::new(total_file_size) else {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        debug!(
+        warn_once_or_info!(
             "splice proxy: zero total file size for file {} from mirror {}",
-            conn_details.debname, conn_details.mirror
+            conn_details.debname,
+            conn_details.mirror
         );
         // Protocol-violating response — don't trust the connection's framing.
         upstream.unset_poolable();
@@ -4615,7 +4689,7 @@ async fn splice_proxy_drive(
         global_config().max_object_size,
     ) {
         metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
-        warn!(
+        warn_once_or_info!(
             "splice proxy: upstream object size {} for file {} from mirror {} exceeds max_object_size",
             total_content_length.get(),
             conn_details.debname,
@@ -4635,9 +4709,10 @@ async fn splice_proxy_drive(
     }
     let Some(body_content_length) = NonZero::new(body_content_length) else {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        debug!(
+        warn_once_or_info!(
             "splice proxy: zero body content length for file {} from mirror {}",
-            conn_details.debname, conn_details.mirror
+            conn_details.debname,
+            conn_details.mirror
         );
         upstream.unset_poolable();
         write_invalid_response(
@@ -4924,7 +4999,7 @@ async fn splice_proxy_drive(
         let resume_percent = resume_offset as f32 / total_content_length.get() as f32 * 100.0;
 
         debug!(
-            "Splice proxy{tls_label}: resuming and serving {} from mirror {} for client {} at byte {} ({}%)...",
+            "splice proxy{tls_label}: resuming and serving {} from mirror {} for client {} at byte {} ({}%)...",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client,
@@ -4933,7 +5008,7 @@ async fn splice_proxy_drive(
         );
     } else {
         debug!(
-            "Splice proxy{tls_label}: downloading and serving {} from mirror {} for client {}...",
+            "splice proxy{tls_label}: downloading and serving {} from mirror {} for client {}...",
             conn_details.debname, conn_details.mirror, conn_details.client
         );
     }
@@ -5386,7 +5461,7 @@ async fn splice_proxy_drive(
         )
     };
     info!(
-        "Splice proxy{tls_label}: {} {volatile}{} from mirror {} for client {} in {} ({upstream}, {client}){}",
+        "splice proxy{tls_label}: {} {volatile}{} from mirror {} for client {} in {} ({upstream}, {client}){}",
         if client_succeeded {
             "served and cached"
         } else {
@@ -5717,7 +5792,7 @@ async fn handle_volatile_buffered_download(
     };
 
     debug!(
-        "Splice proxy{tls_label}: buffered volatile download of {} from mirror {} for client {} ({} bytes)...",
+        "splice proxy{tls_label}: buffered volatile download of {} from mirror {} for client {} ({} bytes)...",
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
 
@@ -6010,7 +6085,7 @@ async fn handle_volatile_buffered_download(
         ""
     };
     info!(
-        "Splice proxy{tls_label}: served and cached {volatile}{} from mirror {} for client {} in {} ({}, {})",
+        "splice proxy{tls_label}: served and cached {volatile}{} from mirror {} for client {} in {} ({}, {})",
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
@@ -6187,7 +6262,7 @@ pub(crate) async fn splice_simple_proxy(
     ) {
         Ok(s) => s,
         Err(err) => {
-            warn!(
+            warn_once_or_info!(
                 "splice proxy: failed to rewrite headers for {upstream_path} from {host_authority}:  {err}"
             );
             upstream.unset_poolable();
@@ -6287,7 +6362,7 @@ pub(crate) async fn splice_simple_proxy(
     let t_done = coarsetime::Instant::now();
     let in_time = request_received_at.elapsed();
     info!(
-        "Simple proxy: passed through {upstream_path} from host {host_authority} for client {client} in {} ({}, {})",
+        "simple proxy: passed through {upstream_path} from host {host_authority} for client {client} in {} ({}, {})",
         HumanFmt::Time(in_time.into()),
         rate_log::upstream_segment(forwarded, t_done.duration_since(t_req_sent)),
         rate_log::client_segment(forwarded, t_done.duration_since(t_client_first)),
@@ -6423,7 +6498,8 @@ mod tests {
                         Content-Type: application/vnd.debian.binary-package\r\n\
                         Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length, Some(12345));
         assert_eq!(
@@ -6439,7 +6515,8 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_no_content_length() {
         let headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length, None);
         assert!(resp.is_chunked);
@@ -6448,7 +6525,8 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_not_chunked() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert!(!resp.is_chunked);
         assert_eq!(resp.content_length, Some(42));
     }
@@ -6456,7 +6534,8 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_404() {
         let headers = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 404);
     }
 
@@ -6577,7 +6656,8 @@ mod tests {
                         Content-Length: 100\r\n\
                         ETag: \"abc123\"\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.etag.as_deref(), Some("\"abc123\""));
     }
 
@@ -6587,7 +6667,8 @@ mod tests {
                         Content-Length: 100\r\n\
                         ETag: not-a-valid-etag\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.etag, None);
     }
 
@@ -6597,7 +6678,8 @@ mod tests {
                         Content-Length: 500\r\n\
                         Content-Range: bytes 100-599/1000\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 206);
         assert_eq!(resp.content_range.as_deref(), Some("bytes 100-599/1000"));
     }
@@ -6608,7 +6690,8 @@ mod tests {
                         Content-Length: 100\r\n\
                         Connection: close\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert!(resp.connection_close);
     }
 
@@ -6618,14 +6701,16 @@ mod tests {
                         Content-Length: 100\r\n\
                         Connection: keep-alive\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert!(!resp.connection_close);
     }
 
     #[test]
     fn test_parse_upstream_response_no_connection_header() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert!(!resp.connection_close);
     }
 
@@ -6637,7 +6722,8 @@ mod tests {
                         last-modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
                         etag: \"xyz\"\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.content_length, Some(42));
         assert_eq!(resp.content_type.as_deref(), Some("text/plain"));
         assert_eq!(
@@ -6650,7 +6736,7 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_malformed() {
         let garbage = b"not an http response at all";
-        assert!(parse_upstream_response(garbage, garbage.len()).is_err());
+        assert!(parse_upstream_response(garbage, garbage.len(), "test.mirror").is_err());
     }
 
     #[test]
@@ -6663,7 +6749,8 @@ mod tests {
                         Content-Range: bytes 0-998/999\r\n\
                         Connection: close\r\n\
                         \r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length, Some(999));
         assert_eq!(
@@ -6682,7 +6769,8 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_no_optional_fields() {
         let headers = b"HTTP/1.1 200 OK\r\n\r\n";
-        let resp = parse_upstream_response(headers, headers.len()).expect("should parse");
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length, None);
         assert_eq!(resp.content_type, None);
@@ -6714,7 +6802,7 @@ mod tests {
         let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len();
         let buf = make_padded_response(pad_len);
         assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE);
-        let result = parse_upstream_response(&buf, buf.len());
+        let result = parse_upstream_response(&buf, buf.len(), "test.mirror");
         assert!(
             result.is_ok(),
             "expected Ok for response at exact cap, got Err"
@@ -6731,7 +6819,7 @@ mod tests {
         let buf = make_padded_response(pad_len);
         assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE + 1);
         // Must not panic; Ok or Err both acceptable.
-        match parse_upstream_response(&buf, buf.len()) {
+        match parse_upstream_response(&buf, buf.len(), "test.mirror") {
             Ok(_) | Err(_) => {}
         }
     }

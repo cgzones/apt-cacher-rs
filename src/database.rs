@@ -1009,13 +1009,16 @@ impl Database {
                 if bad_host {
                     warn!(
                         "Removing mirror id={} with invalid host `{}`",
-                        mirror.id, mirror.host
+                        mirror.id,
+                        mirror.host.escape_debug()
                     );
                 }
                 if bad_kind {
                     warn!(
                         "Removing mirror id={} (host `{}`) with out-of-range kind={}",
-                        mirror.id, mirror.host, mirror.kind
+                        mirror.id,
+                        mirror.host.escape_debug(),
+                        mirror.kind
                     );
                 }
 

@@ -671,7 +671,7 @@ where
                 continue;
             }
             _ => {
-                warn!("Cleanup request {uri} failed with status code {status}:  {response:?}");
+                warn!("Cleanup request {uri} failed with status code {status}");
                 return Err(status);
             }
         };
@@ -1066,7 +1066,8 @@ async fn cleanup_mirror_deb_files(
             // upstream). Bail conservatively and retry next cycle.
             Err(status) => {
                 warn!(
-                    "Could not fetch package file for {origin:?} ({status}); skipping cleanup for mirror {mirror}"
+                    "Could not fetch package file for host {} path {} ({status}); skipping cleanup for mirror {mirror}",
+                    origin.host, origin.mirror_path
                 );
 
                 return Ok(CleanupDone::tally(
@@ -1413,7 +1414,7 @@ async fn sweep_aged_cached_debs(
                     Err(modified_err) => {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Failed to get create and modify timestamp of file `{}`:  {created_err}  //  {modified_err}",
+                            "Failed to get create timestamp ({created_err}) and modify timestamp ({modified_err}) of file `{}`",
                             path.display()
                         );
                         continue;
@@ -1783,9 +1784,8 @@ async fn cleanup_byhash_dir(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read directory `{}`:  {}",
-                byhash_path.display(),
-                err
+                "Failed to read directory `{}`:  {err}",
+                byhash_path.display()
             );
             return Err(ProxyCacheError::Io(err));
         }
