@@ -644,7 +644,7 @@ pub(crate) fn record_client_status(status: StatusCode) {
 }
 
 /// Record an upstream response status code. Tracks status-class buckets and
-/// the 304 fast-path independently from the client-side `record_client_status`.
+/// the individually-tracked codes (200/301/302/304/307/308) independently from the client-side `record_client_status`.
 pub(crate) fn record_upstream_status(status: StatusCode) {
     match status.as_u16() {
         200..=299 => UPSTREAM_STATUS_2XX.increment(),
