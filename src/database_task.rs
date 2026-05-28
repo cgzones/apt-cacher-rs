@@ -179,7 +179,7 @@ async fn stage(
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
                         "Failed to resolve mirror for delivery {mirror}:  {err}",
-                        mirror = &c.mirror
+                        mirror = c.mirror
                     );
                     return;
                 }
@@ -205,7 +205,7 @@ async fn stage(
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
                         "Failed to resolve mirror for download {mirror}:  {err}",
-                        mirror = &c.mirror
+                        mirror = c.mirror
                     );
                     return;
                 }
@@ -225,7 +225,7 @@ async fn stage(
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
                         "Failed to resolve mirror for origin {mirror}:  {err}",
-                        mirror = &c.origin.mirror
+                        mirror = c.origin.mirror
                     );
                     return;
                 }

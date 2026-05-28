@@ -315,7 +315,7 @@ impl sqlx::Type<sqlx::Sqlite> for DomainName {
 impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for DomainName {
     fn encode_by_ref(
         &self,
-        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
     ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         <String as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(self.into(), buf)
     }
@@ -519,7 +519,7 @@ impl sqlx::Type<sqlx::Sqlite> for ClientHost {
 impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for ClientHost {
     fn encode_by_ref(
         &self,
-        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer<'q>,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
     ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
         <DomainName as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(&self.0, buf)
     }

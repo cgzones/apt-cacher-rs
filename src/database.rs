@@ -840,7 +840,7 @@ impl Database {
         let mut tx = self.conn.begin().await?;
         let mut affected = 0u64;
         for chunk in pairs.chunks(CHUNK_SIZE) {
-            let mut qb: sqlx::QueryBuilder<'_, Sqlite> =
+            let mut qb: sqlx::QueryBuilder<Sqlite> =
                 sqlx::QueryBuilder::new("WITH new_seen(id, ts) AS (");
             qb.push_values(chunk, |mut b, &(id, ts)| {
                 b.push_bind(id).push_bind(ts);
@@ -873,7 +873,7 @@ impl Database {
 
         let mut tx = self.conn.begin().await?;
         for chunk in rows.chunks(CHUNK_SIZE) {
-            let mut qb: sqlx::QueryBuilder<'_, Sqlite> = sqlx::QueryBuilder::new(
+            let mut qb: sqlx::QueryBuilder<Sqlite> = sqlx::QueryBuilder::new(
                 "INSERT INTO deliveries (mirror_id, debname, size, duration, partial, client_ip) ",
             );
             qb.push_values(chunk, |mut b, row| {
@@ -905,7 +905,7 @@ impl Database {
 
         let mut tx = self.conn.begin().await?;
         for chunk in rows.chunks(CHUNK_SIZE) {
-            let mut qb: sqlx::QueryBuilder<'_, Sqlite> = sqlx::QueryBuilder::new(
+            let mut qb: sqlx::QueryBuilder<Sqlite> = sqlx::QueryBuilder::new(
                 "INSERT INTO downloads (mirror_id, debname, size, duration, client_ip) ",
             );
             qb.push_values(chunk, |mut b, row| {
