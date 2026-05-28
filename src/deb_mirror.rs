@@ -1,5 +1,7 @@
 use std::{borrow::Cow, num::NonZero, path::PathBuf, sync::OnceLock};
 
+use log::debug;
+
 use crate::{
     config::{CacheHost, ClientHost},
     database,
@@ -211,13 +213,35 @@ pub(crate) struct Origin {
 }
 
 impl Origin {
+    /// Parse a `dists/.../Packages*` path into an [`Origin`].
+    ///
+    /// Two URL shapes are recognised, both anchoring on `/dists/`:
+    ///
+    /// * `dists/<dist>/<comp>/<arch>/Packages{,.gz,.xz,.diff}` — the
+    ///   canonical per-architecture index path.
+    /// * `dists/<dist>/<comp>/<arch>/by-hash/<ALGO>/<hex>` — the
+    ///   content-addressed sibling.  The algorithm name and digest length
+    ///   are cross-checked via [`is_byhash_digest_shape`] +
+    ///   [`is_valid_byhash_pair`] so a junk pairing like `by-hash/MD5/...`
+    ///   or `by-hash/SHA256/notahex` does NOT mint an Origin row.
+    ///
+    /// **Trailing slash:** tolerated for the `Packages*` shape only — a
+    /// single trailing `/` (collapsed by [`normalize_uri_path`] from any
+    /// `/+` run) is permitted because callers derive URIs from
+    /// cleanup/database state where trailing slashes can arise from
+    /// upstream `Location` headers or normalisation variants.  Any other
+    /// trailing segment after the recognised filename causes rejection —
+    /// `.../Packages/extra/garbage` returns `None`.  Contrast with
+    /// [`parse_request_path`], which uses a right-to-left `rsplit('/')` and
+    /// rejects even the trailing-slash form by design.
     #[must_use]
     pub(crate) fn from_path(
         path: &str,
         host: ClientHost,
         port: Option<NonZero<u16>>,
     ) -> Option<Self> {
-        /* /debian/dists/sid/main/binary-amd64/Packages{,.diff,.gz,.xz} */
+        /* /debian/dists/sid/main/binary-amd64/Packages{,.gz,.xz}
+         * /debian/dists/sid/main/binary-amd64/by-hash/SHA256/<hex>     */
 
         let path = normalize_uri_path(path);
         let path = path.trim_start_matches('/');
@@ -233,11 +257,36 @@ impl Origin {
         let architecture = parts.next()?;
 
         let filename = parts.next()?;
-        if !matches!(
-            filename,
-            "Packages" | "Packages.gz" | "Packages.xz" | "Packages.diff" | "by-hash"
-        ) {
-            return None;
+        match filename {
+            "Packages" | "Packages.gz" | "Packages.xz" => {
+                // Trailing-slash tolerance: at most a single empty segment
+                // (e.g. `.../Packages/`).  Anything else — including a
+                // non-empty trailing segment like `Packages/Index` or
+                // `Packages/extra/garbage` — is rejected as unrecognised.
+                if let Some(extra) = parts.next()
+                    && (!extra.is_empty() || parts.next().is_some())
+                {
+                    return None;
+                }
+            }
+            "by-hash" => {
+                // `by-hash/<ALGO>/<hex>` shape: both segments are required
+                // and must validate as a supported (algo, digest) pair.
+                let algorithm = parts.next()?;
+                let digest = parts.next()?;
+                if !is_byhash_digest_shape(digest) || !is_valid_byhash_pair(algorithm, digest) {
+                    return None;
+                }
+                // No trailing segments past the digest are valid.  Tolerate
+                // a single empty trailing segment for parity with the
+                // `Packages*` arm, but nothing more.
+                if let Some(extra) = parts.next()
+                    && (!extra.is_empty() || parts.next().is_some())
+                {
+                    return None;
+                }
+            }
+            _ => return None,
         }
 
         Some(Self {
@@ -384,9 +433,9 @@ pub(crate) enum ResourceFile<'a> {
 
 /// Defensive cap on the normalised output size. A URI longer than this is
 /// already rejected upstream by the request-line size limit
-/// (`sendfile_conn::MAX_HEADER_SIZE` = 8 KiB on the sendfile path, hyper's
-/// default header limits on the rustls path); this is belt-and-suspenders
-/// against any code path that could reach here without that bound.
+/// (8 KiB on the sendfile path, hyper's default header limits on the rustls
+/// path); this is belt-and-suspenders against any code path that could reach
+/// here without that bound.
 pub(crate) const MAX_NORMALIZED_PATH_LEN: usize = 16 * 1024;
 
 /// Collapse runs of consecutive ASCII forward-slashes in a URL path to a
@@ -463,6 +512,17 @@ fn needs_normalization(path: &str) -> bool {
 ///
 /// The directory name "pool" is not supported as part of the mirror path.
 /// The directory name "dists" should be avoided as part of the mirror path.
+///
+/// **Trailing slash:** rejected.  A request like
+/// `dists/sid/main/binary-amd64/Packages/` returns `None` because the
+/// right-to-left `rsplit('/')` used inside the per-filename arms yields
+/// the trailing empty segment first, failing the literal filename match
+/// (`"Packages" | "Packages.gz" | ...`).  Strictness keeps the cache
+/// keyspace clean — APT never sends a trailing-slash URL, so accepting
+/// one would let an oddly-shaped client request alias to a cached file.
+/// Contrast with [`Origin::from_path`], which tolerates a single trailing
+/// slash on the `Packages*` shape for cleanup/Location-header recovery
+/// callers; both forms reject any non-empty trailing junk.
 #[must_use]
 pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
     let path = path.trim_start_matches('/');
@@ -510,10 +570,10 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         let mut parts = dists_path.rsplit('/');
 
         let filename = parts.next()?;
-        if filename == "Release" || filename == "InRelease" {
+        if filename == "Release" || filename == "InRelease" || filename == "Release.gpg" {
             // `rsplit` walks segments right-to-left.  The first segment may
-            // be either the distribution (top-level Release/InRelease) or
-            // the `binary-<arch>` / `source` scope of a per-component
+            // be either the distribution (top-level Release/InRelease/Release.gpg)
+            // or the `binary-<arch>` / `source` scope of a per-component
             // Release.
             let next = parts.next()?;
 
@@ -527,7 +587,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 }
                 Some(component) => {
                     // Per-component Release: dists/<dist>/<component>/(binary-<arch>|source)/Release.
-                    // `InRelease` has no per-component form.
+                    // `InRelease` and `Release.gpg` have no per-component form.
                     if filename != "Release" {
                         return None;
                     }
@@ -621,11 +681,10 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 component,
                 filename,
             });
-        } else if filename.len() >= 64 && filename.bytes().all(|b| b.is_ascii_hexdigit()) {
+        } else if is_byhash_digest_shape(filename) {
             let hash_algorithm = parts.next()?;
 
-            // The filename length >= 64 characters ensures that only SHA >= SHA256 is supported
-            if !hash_algorithm.starts_with("SHA") {
+            if !is_valid_byhash_pair(hash_algorithm, filename) {
                 return None;
             }
 
@@ -652,17 +711,31 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
      * apt/twilio-cli_5.0.0_amd64.deb
      * apt/by-hash/SHA256/<hex>
      */
-    let (mirror_path, tail) = path.rsplit_once('/')?;
+    // Flat repository: requires a mirror namespace prefix.  apt-cacher-rs
+    // stores cache files at `{cache}/{host}/<mirror_path>/...`; the host
+    // root has no namespace to disambiguate a root-served flat repo from
+    // the structured layout's `dists/` and `flat/` siblings, so the spec's
+    // "directory may also be the empty string" form is intentionally
+    // declined.  The debug log surfaces the rejection for operators
+    // wondering why a root-level flat URL falls through to simple proxy.
+    let Some((mirror_path, tail)) = path.rsplit_once('/') else {
+        debug!(
+            "Rejecting request `{path}` with no mirror namespace prefix; \
+             apt-cacher-rs requires one even for flat repositories"
+        );
+        return None;
+    };
     if mirror_path.is_empty() {
         return None;
     }
 
-    // By-hash: `<base>/by-hash/SHA*/<hex>` — hex tail of length >= 64 ensures
-    // SHA256 or stronger.  On structural mismatch fall through to None rather
-    // than reclassifying as a pool file.
-    if tail.len() >= 64 && tail.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // By-hash: `<base>/by-hash/<ALGO>/<hex>` — the digest shape (64 or 128
+    // hex chars) and the algorithm directory name are cross-checked by
+    // `is_valid_byhash_pair`.  On structural mismatch fall through to None
+    // rather than reclassifying as a pool file.
+    if is_byhash_digest_shape(tail) {
         if let Some((base, hash_algo)) = mirror_path.rsplit_once('/')
-            && hash_algo.starts_with("SHA")
+            && is_valid_byhash_pair(hash_algo, tail)
             && let Some((flat_base, by_hash_dir)) = base.rsplit_once('/')
             && by_hash_dir == "by-hash"
             && !flat_base.is_empty()
@@ -784,6 +857,30 @@ pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
     decoded
         .split('/')
         .any(|seg| seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control()))
+}
+
+/// Whether `s` has the shape of a by-hash digest tail: a hex string of
+/// exactly 64 chars (SHA256) or 128 chars (SHA512). Used as the fast
+/// disambiguator in the parser; the algorithm cross-check lives in
+/// [`is_valid_byhash_pair`].
+#[must_use]
+pub(crate) fn is_byhash_digest_shape(s: &str) -> bool {
+    (s.len() == 64 || s.len() == 128) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether `(algo, digest)` is a supported by-hash pair: `algo` is exactly
+/// `SHA256` or `SHA512`, and `digest` is a hex string of the matching length
+/// (64 hex chars for SHA256, 128 for SHA512). Spelt-out algorithm names per
+/// the Debian repository spec — non-spec or weaker algorithms (`MD5Sum`,
+/// `SHA1`, `SHA224`, `SHA384`, lowercase variants) all reject here.
+#[must_use]
+pub(crate) fn is_valid_byhash_pair(algo: &str, digest: &str) -> bool {
+    let expected_len = match algo {
+        "SHA256" => 64,
+        "SHA512" => 128,
+        _ => return false,
+    };
+    digest.len() == expected_len && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Recognise any of: `Translation-LANG`, `Translation-LANG.bz2`,
@@ -1149,6 +1246,17 @@ mod tests {
             })
         );
 
+        // `Release.gpg` is the detached signature for `Release`; APT fetches
+        // it when `InRelease` is absent or unusable.
+        assert_eq!(
+            parse_request_path("debian/dists/sid/Release.gpg"),
+            Some(ResourceFile::Release {
+                mirror_path: "debian",
+                distribution: "sid",
+                filename: "Release.gpg"
+            })
+        );
+
         // Per-component per-architecture Release files (sibling to Packages*).
         assert_eq!(
             parse_request_path("debian/dists/trixie/main/binary-amd64/Release"),
@@ -1414,6 +1522,12 @@ mod tests {
             None
         );
 
+        // Per-component Release: `Release.gpg` has no per-component form.
+        assert_eq!(
+            parse_request_path("debian/dists/trixie/main/binary-amd64/Release.gpg"),
+            None
+        );
+
         // Per-component Release: scope must be `binary-*` or `source`.
         assert_eq!(
             parse_request_path("debian/dists/trixie/main/dep11/Release"),
@@ -1475,6 +1589,62 @@ mod tests {
         assert_eq!(
             parse_request_path("apt/by-hash/SHA1/cf31e359ca586340c1b2d3ddaa1d473519ad26bd"),
             None
+        );
+
+        // by-hash with algorithm/length mismatch — SHA256 paired with a 128-hex
+        // digest, or SHA512 with a 64-hex digest — rejected.  Prevents an
+        // upstream from pairing an algo directory with a digest of the wrong
+        // size.
+        assert_eq!(
+            parse_request_path(
+                "debian/dists/trixie/main/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_request_path(
+                "apt/by-hash/SHA512/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            None
+        );
+
+        // by-hash with an unsupported algorithm name (SHA384, lowercase variants,
+        // future algorithms).  Only the spec-named `SHA256` / `SHA512` are
+        // accepted.
+        assert_eq!(
+            parse_request_path(
+                "apt/by-hash/SHA384/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_request_path(
+                "apt/by-hash/sha256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            None
+        );
+
+        // SHA512 (128-char hex) paired with the `SHA512` algorithm directory:
+        // accepted.  Confirms the new length cross-check accepts the canonical
+        // SHA512 form.
+        assert_eq!(
+            parse_request_path(
+                "apt/by-hash/SHA512/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::ByHash,
+                mirror_path: "apt",
+                filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            })
+        );
+        assert_eq!(
+            parse_request_path(
+                "debian/dists/trixie/main/by-hash/SHA512/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            ),
+            Some(ResourceFile::ByHash {
+                mirror_path: "debian",
+                filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+            })
         );
 
         // Hex tail at an unrecognized location must not be reclassified as Pool.
@@ -1823,6 +1993,148 @@ mod tests {
         )
         .expect("`///` in mirror path should still parse after normalisation");
         assert_eq!(raw.architecture, tripled.architecture);
+    }
+
+    #[test]
+    fn test_origin_from_path_byhash_does_not_mis_parse_filename() {
+        // Regression: a by-hash URL must NOT yield a filename of `"by-hash"`
+        // with unconsumed/unvalidated `SHA*/<hex>` segments.  The architecture
+        // segment is the canonical apt arch (`binary-amd64`), not the literal
+        // string `"by-hash"`.
+        let host = ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let parsed = Origin::from_path(
+            "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
+             84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
+            host,
+            None,
+        )
+        .expect("valid by-hash URL must parse");
+        assert_eq!(parsed.distribution, "sid");
+        assert_eq!(parsed.component, "main");
+        // The architecture must be `binary-amd64`, never `"by-hash"`.
+        assert_eq!(parsed.architecture, "binary-amd64");
+        assert_ne!(parsed.architecture, "by-hash");
+    }
+
+    #[test]
+    fn test_origin_from_path_byhash_validates_algo_and_digest() {
+        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+
+        // SHA512 with a 128-char hex digest: accepted.
+        let sha512_digest = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba\
+                             4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        let path = format!("/debian/dists/sid/main/binary-amd64/by-hash/SHA512/{sha512_digest}");
+        assert!(Origin::from_path(&path, host(), None).is_some());
+
+        // Unsupported algorithm: rejected.
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/by-hash/MD5/\
+                 84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
+                host(),
+                None,
+            ),
+            None
+        );
+
+        // SHA256 paired with a 128-char digest: length mismatch → rejected.
+        let path = format!("/debian/dists/sid/main/binary-amd64/by-hash/SHA256/{sha512_digest}");
+        assert_eq!(Origin::from_path(&path, host(), None), None);
+
+        // Non-hex digest: rejected.
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
+                 zzz902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
+                host(),
+                None,
+            ),
+            None
+        );
+
+        // Missing digest segment: rejected.
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/by-hash/SHA256",
+                host(),
+                None,
+            ),
+            None
+        );
+
+        // Missing both algo and digest segments: rejected.
+        assert_eq!(
+            Origin::from_path("/debian/dists/sid/main/binary-amd64/by-hash", host(), None,),
+            None
+        );
+
+        // Lowercase algorithm name (not spec-named): rejected.
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/by-hash/sha256/\
+                 84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
+                host(),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_origin_from_path_rejects_trailing_junk() {
+        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+
+        // Trailing non-empty segment after `Packages`: rejected.  Previously
+        // silently accepted, masking unrecognised URL shapes as valid origins.
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/Packages/extra",
+                host(),
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/Packages/extra/garbage",
+                host(),
+                None,
+            ),
+            None
+        );
+        // Same for pdiff index suffixes — apt fetches a real Packages* on
+        // first contact, so dropping the Origin record on these tail forms is
+        // safe.
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/Packages.diff/Index",
+                host(),
+                None,
+            ),
+            None
+        );
+
+        // Trailing junk after a by-hash digest: rejected.
+        assert_eq!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
+                 84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83/extra",
+                host(),
+                None,
+            ),
+            None
+        );
+
+        // The single-trailing-slash tolerance still holds for `Packages*`
+        // (regression-protects `test_parse_1`).
+        assert!(
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/Packages/",
+                host(),
+                None,
+            )
+            .is_some()
+        );
     }
 
     #[test]
