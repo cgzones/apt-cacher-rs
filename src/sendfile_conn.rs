@@ -818,7 +818,7 @@ async fn try_sendfile_request(
                         }
 
                         debug!(
-                            "Volatile file `{}` is just {} old (limit: {}s), serving cached version...",
+                            "Volatile file `{}` age {} is within the {}s freshness window, serving cached version...",
                             cache_path.display(),
                             HumanFmt::Time(elapsed),
                             VOLATILE_CACHE_MAX_AGE.as_secs()
