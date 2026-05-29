@@ -27,7 +27,7 @@ use crate::{
     database::{Database, MirrorStatEntry},
     database_task::DB_TASK_QUEUE_SENDER,
     deb_mirror::VALID_DEB_EXTENSIONS,
-    full_body, get_features, global_cache_quota, global_config,
+    full_body, get_features, global_cache_quota, global_checksum_registry, global_config,
     http_range::format_http_date,
     humanfmt::HumanFmt,
     hyper_conn::tunnel_limiter::active_tunnels,
@@ -1595,6 +1595,26 @@ fn build_metrics_html() -> String {
             ),
         );
     }
+    t.row_tip(
+        "Integrity Verified",
+        "Downloaded resources (pool .debs, by-hash files, Packages indices) whose content hash matched a known digest.",
+        metrics::CHECKSUM_VERIFIED.get(),
+    );
+    t.row_tip(
+        "Integrity Mismatch (rejected)",
+        "Resources rejected because their content hash did not match the expected digest. Non-zero indicates a corrupt or tampered upstream response.",
+        AlertNonzero(metrics::CHECKSUM_MISMATCH.get()),
+    );
+    t.row_tip(
+        "Integrity Unverified (no known digest)",
+        "Resources for which no expected digest was available in the registry; cached unverified (best-effort).",
+        metrics::CHECKSUM_UNVERIFIED.get(),
+    );
+    t.row_tip(
+        "Integrity Registry entries",
+        "In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart).",
+        global_checksum_registry().len(),
+    );
     {
         let status_2xx = metrics::CLIENT_STATUS_2XX.get();
         let status_200 = metrics::CLIENT_STATUS_200.get();

@@ -146,6 +146,15 @@ pub(crate) static VOLATILE_REFETCHED_UPTODATE: Counter = Counter::new();
 /// Subset of `VOLATILE_REFETCHED`: stale-but-present, upstream returned a fresh body.
 pub(crate) static VOLATILE_REFETCHED_OUTOFDATE: Counter = Counter::new();
 
+/// Downloads whose content matched its expected digest before being committed
+/// to the cache.
+pub(crate) static CHECKSUM_VERIFIED: Counter = Counter::new();
+/// Downloads rejected because their content did not match the expected digest.
+pub(crate) static CHECKSUM_MISMATCH: Counter = Counter::new();
+/// Verifiable-kind downloads committed to the cache without a known expected
+/// digest (best-effort coverage gap).
+pub(crate) static CHECKSUM_UNVERIFIED: Counter = Counter::new();
+
 /// Body-write failures attributed to the client (`BrokenPipe` /
 /// `ConnectionReset` / `ConnectionAborted`).
 ///

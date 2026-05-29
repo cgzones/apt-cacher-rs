@@ -48,6 +48,8 @@ const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
 const DEFAULT_MAX_OBJECT_SIZE: Option<NonZero<u64>> = Some(nonzero!(2 * 1024 * 1024 * 1024));
 const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
 const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
+const DEFAULT_VERIFY_CHECKSUMS: bool = true;
+const DEFAULT_VERIFY_CHECKSUMS_MAX_ENTRIES: NonZero<usize> = nonzero!(500_000);
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: StatusCode = StatusCode::TOO_MANY_REQUESTS;
@@ -805,6 +807,23 @@ pub(crate) struct Config {
     #[serde(default = "default_reject_pdiff_requests")]
     pub(crate) reject_pdiff_requests: bool,
 
+    /// Whether to verify the integrity of cached content against the
+    /// repository's own metadata (by-hash digests, `Packages` checksums,
+    /// `Release` checksums) before committing a download to the cache.
+    /// Defence in depth: APT's client-side GPG check remains the root of
+    /// trust. Verification reads each verifiable file back once before
+    /// `rename`; the cost is one extra (page-cache-hot) full read.
+    #[serde(default = "default_verify_checksums")]
+    pub(crate) verify_checksums: bool,
+
+    /// Upper bound on the in-memory checksum registry (entries). The registry
+    /// maps `(host, mirror_path, resource key)` to an expected digest, populated
+    /// by parsing index files as they flow through. At the cap, the oldest
+    /// entries are evicted in bulk. One full Debian `main`/amd64 `Packages` is
+    /// ~64k entries.
+    #[serde(default = "default_verify_checksums_max_entries")]
+    pub(crate) verify_checksums_max_entries: NonZero<usize>,
+
     #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
@@ -1063,6 +1082,14 @@ const fn default_usage_retention_days() -> Option<NonZero<u64>> {
 
 const fn default_reject_pdiff_requests() -> bool {
     DEFAULT_REJECT_PDIFF_REQUESTS
+}
+
+const fn default_verify_checksums() -> bool {
+    DEFAULT_VERIFY_CHECKSUMS
+}
+
+const fn default_verify_checksums_max_entries() -> NonZero<usize> {
+    DEFAULT_VERIFY_CHECKSUMS_MAX_ENTRIES
 }
 
 const fn default_logstore_capacity() -> NonZero<usize> {
@@ -1667,6 +1694,13 @@ impl Config {
             ));
         }
 
+        if self.verify_checksums && self.verify_checksums_max_entries.get() < 10_000 {
+            warnings.push(format!(
+                "verify_checksums_max_entries ({}) is very low; checksum verification coverage of .deb files will be poor",
+                self.verify_checksums_max_entries
+            ));
+        }
+
         if self.cache_directory.as_os_str().is_empty() {
             bail!("Invalid cache_directory value: must not be empty");
         }
@@ -2033,5 +2067,18 @@ mod test {
         assert_eq!(client.format_cache_dir(port).as_ref(), "example.test:8080");
         assert_eq!(cache.format_cache_dir(port).as_ref(), "example.test:8080");
         assert_eq!(client.format_authority(port).as_ref(), "example.test:8080");
+    }
+
+    #[test]
+    fn verify_checksums_defaults_on() {
+        let cfg: Config = toml::from_str("").expect("empty config parses");
+        assert!(cfg.verify_checksums);
+        assert_eq!(cfg.verify_checksums_max_entries.get(), 500_000);
+    }
+
+    #[test]
+    fn verify_checksums_can_be_disabled() {
+        let cfg: Config = toml::from_str("verify_checksums = false").expect("config parses");
+        assert!(!cfg.verify_checksums);
     }
 }

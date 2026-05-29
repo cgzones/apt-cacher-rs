@@ -35,6 +35,7 @@ mod http_range;
 mod humanfmt;
 mod hyper_conn;
 mod index_parser;
+mod integrity;
 #[cfg(feature = "ktls")]
 mod ktls;
 #[cfg(feature = "ktls")]
@@ -590,6 +591,7 @@ struct RuntimeDetails {
     start_time: time::OffsetDateTime,
     config: config::Config,
     cache_quota: cache_quota::CacheQuota,
+    checksum_registry: integrity::ChecksumRegistry,
 }
 
 #[derive(Clone, Debug)]
@@ -654,6 +656,15 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
         .get()
         .expect("Global was initialized in main()")
         .cache_quota
+}
+
+#[must_use]
+#[inline]
+pub(crate) fn global_checksum_registry() -> &'static integrity::ChecksumRegistry {
+    &RUNTIMEDETAILS
+        .get()
+        .expect("Global was initialized in main()")
+        .checksum_registry
 }
 
 #[cfg(feature = "tls_rustls")]
@@ -817,11 +828,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config_http_timeout = config.http_timeout;
 
+    let checksum_registry = integrity::ChecksumRegistry::new(config.verify_checksums_max_entries);
+
     RUNTIMEDETAILS
         .set(RuntimeDetails {
             start_time: time::OffsetDateTime::now_utc(),
             cache_quota: cache_quota::CacheQuota::new(0, config.disk_quota),
             config,
+            checksum_registry,
         })
         .expect("Initial set in main() should succeed");
 

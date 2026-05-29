@@ -10,6 +10,7 @@ use crate::{
     cache_quota::QuotaReservation,
     config::CacheHost,
     deb_mirror::Mirror,
+    integrity::{self, CommitError, RenamePlan},
     metrics,
 };
 #[cfg(feature = "splice")]
@@ -218,18 +219,53 @@ impl DownloadBarrier {
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
         let mut data = self.data.take().expect("every sink consumes the instance");
 
-        // Ordering matters: flush the final ping, drop `tx`, then take the status
-        // write lock. The watch channel retains the last sent value after sender drop,
-        // so a racing receiver either wakes from `.changed()` Ok (saw the ping) or
-        // RecvError then observes Finished after `RenameBarrier::release`.
+        // Ordering matters: flush the final ping, flip `Download -> Verifying`
+        // under the status write lock, release the lock, then drop `tx`.
+        //
+        // The flip is what closes the late-joiner race: any reader that wakes
+        // from `receiver.changed().await` with `RecvError` (sender dropped)
+        // re-reads `status` and is guaranteed to see `Verifying`, `Finished`,
+        // or `Aborted` — never a stale `Download`. The reader paths in
+        // `hyper_conn.rs` and `sendfile_conn.rs` treat `Verifying` as "all
+        // bytes are on disk; drain the open file handle" rather than as an
+        // error.
+        //
+        // The write lock is only held for the brief variant swap, NOT for the
+        // subsequent SHA-256 hashing in `RenameBarrier::commit` (which can
+        // take hundreds of ms for a large `.deb`). Late-joiner readers are
+        // therefore not stalled during verification.
         data.flush_batched_ping();
+        {
+            let mut lock = data.status.write().await;
+            let prev = std::mem::replace(
+                &mut *lock,
+                ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail),
+            );
+            *lock = match prev {
+                ActiveDownloadStatus::Download {
+                    path,
+                    content_length,
+                    rx: _,
+                    meta,
+                } => ActiveDownloadStatus::Verifying {
+                    path,
+                    content_length,
+                    meta,
+                },
+                other @ (ActiveDownloadStatus::Init(_)
+                | ActiveDownloadStatus::Verifying { .. }
+                | ActiveDownloadStatus::Finished { .. }
+                | ActiveDownloadStatus::Aborted(_)) => {
+                    error!("begin_rename reached with non-Download status: {other:?}");
+                    other
+                }
+            };
+        }
         drop(data.tx);
-
-        let lock = data.status.write_owned().await;
 
         RenameBarrier {
             data: Some(RenameBarrierData {
-                lock,
+                status: data.status,
                 active_downloads: data.active_downloads,
                 mirror: data.mirror,
                 debname: data.debname,
@@ -323,7 +359,7 @@ impl Drop for DownloadBarrier {
 }
 
 struct RenameBarrierData {
-    lock: tokio::sync::OwnedRwLockWriteGuard<ActiveDownloadStatus>,
+    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: ActiveDownloads,
     mirror: Mirror,
     debname: String,
@@ -337,54 +373,69 @@ pub(crate) struct RenameBarrier {
 }
 
 impl RenameBarrier {
-    /// Transition the barrier to `Finished`, publish the upstream metadata
-    /// to the post-flight [`cache_metadata`] cache, and clear the
+    /// Verify the finished temp file, rename it into the cache, transition the
+    /// barrier to `Finished`, publish upstream metadata, and clear the
     /// active-downloads entry.
     ///
-    /// Ordering matters: the cache is populated **before** the entry
-    /// is removed, so workers that miss the entry always find it
-    /// primed.  Workers that still see the entry observe `Finished
-    /// { meta: Some(_) }` and read from status.  The non-`Download`
-    /// fallback below is a logic-bug path: logs, sets `meta: None`,
-    /// skips the cache publish; observers fall through to
-    /// `cache_metadata::resolve` like `InitBarrier::finished`.
-    pub(crate) fn release(mut self, path: PathBuf, bytes_received: u64) {
-        let mut data = self.data.take().expect("every sink consumes the instance");
+    /// Verification is delegated to `integrity::verify_and_rename`; this is the
+    /// **only** way to finish a `RenameBarrier`, so no download backend can
+    /// commit a download without it. On any `CommitError` the barrier is
+    /// dropped (its `Drop` runs the abort / signal-waiters path, exactly as a
+    /// failed rename does today) and the error is returned to the caller.
+    ///
+    /// Lock ordering: `verify_and_rename` runs *before* the status write lock
+    /// is acquired, so late-joiner readers (`status.read().await`) can proceed
+    /// concurrently while the temp file is being SHA-256-hashed on a blocking
+    /// thread. The lock is only held for the brief `Verifying -> Finished`
+    /// status flip after verification succeeds. The preceding `Download ->
+    /// Verifying` flip happens in `DownloadBarrier::begin_rename`.
+    ///
+    /// Cancellation window: if the `commit` future is dropped between the
+    /// `tokio::fs::rename` completing and the status-write lock being
+    /// acquired, the renamed file is already in the cache but the
+    /// `Verifying -> Finished` flip never runs; `Drop for RenameBarrier`
+    /// then flips status to `Aborted` and removes the active-downloads
+    /// entry. The xattr-backed metadata persists on disk regardless, so
+    /// post-flight readers lazy-load `ETag` / `Last-Modified` via
+    /// `cache_metadata::store().resolve(...)` instead of from the in-process
+    /// Arc -- benign for correctness, just slightly slower for the first
+    /// read after cancellation.
+    pub(crate) async fn commit(mut self, plan: RenamePlan) -> Result<(), CommitError> {
+        integrity::verify_and_rename(&plan).await?;
+
+        // Verified and renamed. Finalise quota outside the lock, then take the
+        // write lock briefly for the `Verifying -> Finished` status flip.
+        let data = self.data.take().expect("every sink consumes the instance");
 
         if let Some(reservation) = data.quota_reservation {
-            reservation.finalize(bytes_received);
+            reservation.finalize(plan.bytes_received);
         }
 
-        // Carry the in-flight metadata over to the post-flight cache and
-        // the `Finished` status before we tear the active-downloads entry
-        // down.  The barrier reached this point via `DownloadBarrier`
-        // (which set the status to `Download { meta }`); any other shape
-        // is a logic bug — log it, fall back to no metadata, and proceed
-        // with the status / cache transitions so the active-downloads
-        // entry doesn't leak.
-        let meta_for_status: Option<Arc<UpstreamMetadata>> = match &*data.lock {
-            ActiveDownloadStatus::Download {
-                path: _,
-                content_length: _,
-                rx: _,
-                meta,
-            } => Some(Arc::clone(meta)),
-            ActiveDownloadStatus::Init(_)
-            | ActiveDownloadStatus::Finished { .. }
-            | ActiveDownloadStatus::Aborted(_) => {
-                error!(
-                    "RenameBarrier::release reached with non-Download status: {:?}",
-                    *data.lock
-                );
-                None
-            }
+        let meta_for_status: Option<Arc<UpstreamMetadata>> = {
+            let mut lock = data.status.write().await;
+            let meta = match &*lock {
+                ActiveDownloadStatus::Verifying {
+                    path: _,
+                    content_length: _,
+                    meta,
+                } => Some(Arc::clone(meta)),
+                ActiveDownloadStatus::Init(_)
+                | ActiveDownloadStatus::Download { .. }
+                | ActiveDownloadStatus::Finished { .. }
+                | ActiveDownloadStatus::Aborted(_) => {
+                    error!(
+                        "RenameBarrier::commit reached with non-Verifying status: {:?}",
+                        *lock
+                    );
+                    None
+                }
+            };
+            *lock = ActiveDownloadStatus::Finished {
+                path: plan.dest_path,
+                meta: meta.clone(),
+            };
+            meta
         };
-
-        *data.lock = ActiveDownloadStatus::Finished {
-            path,
-            meta: meta_for_status.clone(),
-        };
-        drop(data.lock);
 
         if let Some(meta) = meta_for_status {
             cache_metadata::store().set(
@@ -394,18 +445,24 @@ impl RenameBarrier {
         }
         data.active_downloads
             .remove(&data.mirror, &data.debname, data.layout);
+
+        Ok(())
     }
 }
 
 impl Drop for RenameBarrier {
     fn drop(&mut self) {
-        if let Some(mut data) = self.data.take() {
-            *data.lock = ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
-            metrics::DOWNLOADS_ABORTED.increment();
-            drop(data.lock);
-
-            data.active_downloads
-                .remove(&data.mirror, &data.debname, data.layout);
+        if let Some(data) = self.data.take() {
+            // Mirrors `Drop for DownloadBarrier`: the status handle is now an
+            // `Arc<RwLock<...>>` (not an `OwnedRwLockWriteGuard`), so the
+            // write lock has to be acquired synchronously here.
+            tokio::task::block_in_place(|| {
+                *data.status.blocking_write() =
+                    ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
+                metrics::DOWNLOADS_ABORTED.increment();
+                data.active_downloads
+                    .remove(&data.mirror, &data.debname, data.layout);
+            });
         }
     }
 }

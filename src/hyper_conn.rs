@@ -50,7 +50,7 @@ use crate::{
     http_last_modified::write_last_modified,
     http_range::{self, HttpDate, ParsedRange, format_http_date, http_parse_range},
     humanfmt::HumanFmt,
-    limits, metrics,
+    integrity, limits, metrics,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
     quick_response,
@@ -908,7 +908,11 @@ async fn serve_unfinished_file(
                 /* sender closed, either download finished or aborted */
                 let st = status.read().await;
                 let _: Never = match *st {
-                    ActiveDownloadStatus::Finished { .. } => {
+                    // Verifying: writer has written all bytes and is hashing on
+                    // a blocking thread. The open file handle stays valid
+                    // across the upcoming rename, so drain like Finished.
+                    ActiveDownloadStatus::Finished { .. }
+                    | ActiveDownloadStatus::Verifying { .. } => {
                         drop(st);
                         finished = true;
                         continue;
@@ -1543,6 +1547,61 @@ async fn serve_downloading_file(
                 )
                 .await;
             }
+            ActiveDownloadStatus::Verifying {
+                path,
+                content_length: _,
+                meta,
+            } => {
+                // Writer has finished writing all bytes; the file is being
+                // hashed and will be renamed to its dest path. Open the
+                // partial path now — the inode stays valid across the
+                // upcoming rename. On the rare ENOENT race (open after the
+                // rename completes but before the status flip lands), re-loop
+                // and pick up the Finished state with the new path.
+                let path_clone = path.clone();
+                let prefetched_upstream_metadata = if let Some(meta) = prefetched_upstream_metadata
+                {
+                    Some(UpstreamMetadataView::Borrowed(meta))
+                } else {
+                    Some(UpstreamMetadataView::Arc(Arc::clone(meta)))
+                };
+                drop(st);
+                let file = match tokio::fs::File::options()
+                    .read(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(&path_clone)
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Lost the rename race; re-read status.
+                        continue;
+                    }
+                    Err(err) => {
+                        metrics::CACHE_IO_FAILURE.increment();
+                        error!(
+                            "Failed to open verifying file `{}`:  {}",
+                            path_clone.display(),
+                            ErrorReport(&err)
+                        );
+                        return quick_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Cache Access Failure",
+                        );
+                    }
+                };
+                drop(status);
+
+                return serve_cached_file(
+                    conn_details,
+                    &req,
+                    file,
+                    path_clone,
+                    prefetched_upstream_metadata.as_deref(),
+                    None,
+                )
+                .await;
+            }
             ActiveDownloadStatus::Download {
                 path,
                 content_length,
@@ -1711,6 +1770,10 @@ async fn serve_volatile_file(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "has only one caller and is task entrypoint"
+)]
 async fn download_file(
     conn_details: &ConnectionDetails,
     warn_on_override: bool,
@@ -1719,6 +1782,7 @@ async fn download_file(
     mut dbarrier: DownloadBarrier,
     resume_offset: u64,
     request_sent: PreciseInstant,
+    raw_uri_path: String,
 ) {
     let config = global_config();
 
@@ -1915,25 +1979,36 @@ async fn download_file(
             }
         }
 
-        match tokio::fs::rename(&outpath, &dest_file_path).await {
+        let total_bytes = resume_offset + bytes;
+        let plan = integrity::RenamePlan {
+            temp_path: outpath.to_path_buf(),
+            dest_path: dest_file_path.clone(),
+            bytes_received: total_bytes,
+            resource_kind: conn_details.resource_kind,
+            debname: conn_details.debname.clone(),
+            host: conn_details.mirror.host().to_string(),
+            mirror_path: conn_details.mirror.path().to_owned(),
+            raw_uri_path: raw_uri_path.clone(),
+        };
+        match rbarrier.commit(plan).await {
             Ok(()) => {
-                // Defuse the TempPath - the file has been successfully renamed
+                // The file was verified and renamed; defuse the temp guard.
                 TempPath::defuse(outpath);
-
-                let total_bytes = resume_offset + bytes;
-                rbarrier.release(dest_file_path, total_bytes);
             }
             Err(err) => {
-                drop(rbarrier);
-
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to rename file `{}` to `{}`:  {err}",
-                    outpath.display(),
-                    dest_file_path.display()
-                );
-                // The scopeguard will remove the temp file on drop
-
+                // commit() already dropped the barrier (abort path) and logged
+                // mismatch / verify-IO; rename failures are logged here. The
+                // TempPath guard removes the temp file on drop. The client was
+                // already served from the live stream.
+                if let integrity::CommitError::Rename(io_err) = &err {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to rename file `{}` to `{}`:  {}",
+                        outpath.display(),
+                        dest_file_path.display(),
+                        ErrorReport(io_err)
+                    );
+                }
                 return;
             }
         }
@@ -2834,6 +2909,7 @@ async fn serve_new_file(
 
     {
         let cd = conn_details.clone();
+        let raw_uri_path = req.uri().path().to_owned();
         tokio::task::spawn(async move {
             download_file(
                 &cd,
@@ -2843,6 +2919,7 @@ async fn serve_new_file(
                 dbarrier,
                 resume_offset,
                 upstream_request_sent,
+                raw_uri_path,
             )
             .await;
         });
@@ -3345,6 +3422,7 @@ async fn pre_process_client_request(
                     debname: plan.debname,
                     cached_flavor: plan.cached_flavor,
                     layout: plan.layout,
+                    resource_kind: plan.resource_kind,
                 };
                 return process_cache_request(conn_details, req, appstate).await;
             }
