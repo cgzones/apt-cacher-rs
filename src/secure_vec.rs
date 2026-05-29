@@ -152,7 +152,7 @@ unsafe fn zeroize(ptr: *mut u8, len: usize) {
 }
 
 /// Best-effort `mlock(2)`. Failure (typically `RLIMIT_MEMLOCK` exhaustion
-/// for unprivileged processes) is logged at debug level and ignored —
+/// for unprivileged processes) is logged once at warn level (debug thereafter) and ignored —
 /// zeroization on drop remains the primary defense.
 ///
 /// # Safety
@@ -171,7 +171,7 @@ unsafe fn try_mlock(ptr: *const u8, len: usize) {
     }
 }
 
-/// Best-effort `munlock(2)`. Failure is logged at debug level and ignored.
+/// Best-effort `munlock(2)`. Failure is logged once at warn level (debug thereafter) and ignored.
 ///
 /// # Safety
 ///
@@ -193,7 +193,7 @@ unsafe fn try_munlock(ptr: *const u8, len: usize) {
 }
 
 /// Best-effort `madvise(MADV_DONTDUMP)`. Excludes the range from core dumps.
-/// Failure is logged at debug level and ignored.
+/// Failure is logged once at warn level (debug thereafter) and ignored.
 ///
 /// # Safety
 ///
@@ -237,7 +237,7 @@ unsafe fn try_madvise_dontdump(ptr: *const u8, len: usize) {
 /// Best-effort `madvise(MADV_DODUMP)`. Restores the default core-dump policy
 /// for the range. Called before freeing so the allocator can reuse the pages
 /// for non-sensitive allocations without silently hiding them from dumps.
-/// Failure is logged at debug level and ignored.
+/// Failure is logged once at warn level (debug thereafter) and ignored.
 ///
 /// # Safety
 ///

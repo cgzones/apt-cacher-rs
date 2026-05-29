@@ -148,7 +148,7 @@ impl<'a> Iterator for IfNoneMatchSplit<'a> {
 /// Check if a stored `ETag` matches an `If-None-Match` header value.
 ///
 /// Parses comma-separated values and the `*` wildcard. Uses weak comparison
-/// per RFC 9110 §13.1.2: the `W/` prefix is stripped before comparing opaque-tags.
+/// per RFC 9110 §8.8.3.2: the `W/` prefix is stripped before comparing opaque-tags.
 #[must_use]
 pub(crate) fn if_none_match(header: &str, etag: &str) -> bool {
     /// RFC 9110 allows long If-None-Match lists, but a sane client sends a
@@ -230,7 +230,7 @@ mod tests {
         assert!(if_none_match("\"x\", \"abc\", \"y\"", "\"abc\""));
         assert!(!if_none_match("\"x\", \"y\"", "\"abc\""));
         assert!(if_none_match("\"x\" , \"abc\"", "\"abc\""));
-        // Weak comparison: W/"abc" matches "abc" (RFC 9110 §13.1.2)
+        // Weak comparison: W/"abc" matches "abc" (RFC 9110 §8.8.3.2)
         assert!(if_none_match("W/\"abc\"", "\"abc\""));
         assert!(if_none_match("\"abc\"", "W/\"abc\""));
         assert!(if_none_match("W/\"abc\"", "W/\"abc\""));
