@@ -2294,8 +2294,10 @@ async fn serve_unfinished_file(
                     ActiveDownloadStatus::Aborted(ref err) => {
                         match err {
                             AbortReason::MirrorDownloadRate(mdr) => {
+                                let mdr = (*mdr).clone();
+                                drop(st);
                                 if tx
-                                    .send(Err(ChannelBodyError::MirrorDownloadRate((*mdr).clone())))
+                                    .send(Err(ChannelBodyError::MirrorDownloadRate(mdr)))
                                     .await
                                     .is_err()
                                 {
