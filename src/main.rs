@@ -1861,7 +1861,7 @@ async fn serve_volatile_file(
     if let Ok(elapsed) = modified_system_time.elapsed() {
         if elapsed < VOLATILE_CACHE_MAX_AGE {
             debug!(
-                "Volatile file `{}` is just {} old (limit: {}s), serving cached version...",
+                "Volatile file `{}` age {} is within the {}s freshness window, serving cached version...",
                 file_path.display(),
                 HumanFmt::Time(elapsed),
                 VOLATILE_CACHE_MAX_AGE.as_secs()

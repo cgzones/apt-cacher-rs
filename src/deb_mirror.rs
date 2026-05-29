@@ -217,7 +217,7 @@ impl Origin {
     ///
     /// Two URL shapes are recognised, both anchoring on `/dists/`:
     ///
-    /// * `dists/<dist>/<comp>/<arch>/Packages{,.gz,.xz,.diff}` — the
+    /// * `dists/<dist>/<comp>/<arch>/Packages{,.gz,.xz}` — the
     ///   canonical per-architecture index path.
     /// * `dists/<dist>/<comp>/<arch>/by-hash/<ALGO>/<hex>` — the
     ///   content-addressed sibling.  The algorithm name and digest length
