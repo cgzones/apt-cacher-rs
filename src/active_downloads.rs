@@ -95,9 +95,22 @@ pub(crate) enum ActiveDownloadStatus {
         rx: tokio::sync::watch::Receiver<()>,
         meta: Arc<UpstreamMetadata>,
     },
+    /// All upstream bytes have been written to `path` (the partial / temp
+    /// file) but the file is still being hashed and renamed by
+    /// `RenameBarrier::commit` on a blocking thread. Readers that observe
+    /// this state can treat the file as a complete, drainable copy of the
+    /// resource: existing late-joiner file handles remain valid across the
+    /// upcoming rename (Linux keeps the inode open). The watch sender has
+    /// already been dropped by `begin_rename`, so this is the variant
+    /// late-joiners see after `RecvError` instead of a stale `Download`.
+    Verifying {
+        path: PathBuf,
+        content_length: ContentLength,
+        meta: Arc<UpstreamMetadata>,
+    },
     /// Rename-completed (or revalidation-confirmed) cached file.
     /// `meta` is `Some` when the values came from a fresh upstream
-    /// response (`RenameBarrier::release`); `None` when the entry was
+    /// response (`RenameBarrier::commit`); `None` when the entry was
     /// produced by `InitBarrier::finished` (e.g. volatile-revalidation
     /// 304) — in that case readers fall through to the post-flight
     /// [`crate::cache_metadata`] cache, which lazy-loads from xattrs.
@@ -400,14 +413,26 @@ impl ActiveDownloads {
             let mut sum = 0;
 
             for entry in self.inner.read().values() {
-                let d = entry.status.blocking_read();
-                if let ActiveDownloadStatus::Download {
-                    path: _,
-                    content_length,
-                    rx: _,
-                    meta: _,
-                } = &*d
-                {
+                let content_length = {
+                    let d = entry.status.blocking_read();
+                    match &*d {
+                        ActiveDownloadStatus::Download {
+                            path: _,
+                            content_length,
+                            rx: _,
+                            meta: _,
+                        }
+                        | ActiveDownloadStatus::Verifying {
+                            path: _,
+                            content_length,
+                            meta: _,
+                        } => Some(*content_length),
+                        ActiveDownloadStatus::Init(_)
+                        | ActiveDownloadStatus::Finished { .. }
+                        | ActiveDownloadStatus::Aborted(_) => None,
+                    }
+                };
+                if let Some(content_length) = content_length {
                     sum += content_length.upper().get();
                 }
             }
@@ -426,6 +451,7 @@ impl ActiveDownloads {
                 match &*d {
                     ActiveDownloadStatus::Init(_)
                     | ActiveDownloadStatus::Download { .. }
+                    | ActiveDownloadStatus::Verifying { .. }
                     | ActiveDownloadStatus::Aborted(_) => {
                         count += 1;
                     }

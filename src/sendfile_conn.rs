@@ -735,6 +735,7 @@ async fn try_sendfile_request(
         debname: plan.debname,
         cached_flavor: plan.cached_flavor,
         layout: plan.layout,
+        resource_kind: plan.resource_kind,
     };
 
     // Check if the file is currently being downloaded — if so, serve it via
@@ -1828,10 +1829,15 @@ pub(crate) async fn async_sendfile_unfinished(
             let _: Never = match receiver.changed().await {
                 Ok(()) => continue,
                 Err(_err @ tokio::sync::watch::error::RecvError { .. }) => {
-                    // Sender dropped — download finished or aborted.
+                    // Sender dropped — download finished, verifying, or
+                    // aborted. Verifying means all bytes are on disk and the
+                    // writer is hashing on a blocking thread; the open file
+                    // handle stays valid across the upcoming rename, so drain
+                    // like Finished.
                     let st = status.read().await;
                     match *st {
-                        ActiveDownloadStatus::Finished { .. } => {
+                        ActiveDownloadStatus::Finished { .. }
+                        | ActiveDownloadStatus::Verifying { .. } => {
                             drop(st);
                             finished = true;
                             continue;
@@ -1881,7 +1887,8 @@ pub(crate) async fn async_sendfile_unfinished(
                 let (is_finished, is_aborted) = {
                     let st = status.read().await;
                     match *st {
-                        ActiveDownloadStatus::Finished { .. } => (true, false),
+                        ActiveDownloadStatus::Finished { .. }
+                        | ActiveDownloadStatus::Verifying { .. } => (true, false),
                         ActiveDownloadStatus::Aborted(_) => (false, true),
                         ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
                             (false, false)
@@ -2025,6 +2032,55 @@ async fn serve_unfinished_sendfile(
                         (conn_version, conn_action),
                         headers,
                         prefetched.as_deref(),
+                    )
+                    .await
+                    .into();
+                }
+                ActiveDownloadStatus::Verifying {
+                    path,
+                    content_length: _,
+                    meta,
+                } => {
+                    // All bytes are on disk; the writer is hashing and about
+                    // to rename. Open the partial path now — the inode stays
+                    // valid across the upcoming rename. On the rare ENOENT
+                    // race (open after the rename completes but before the
+                    // status flip lands), re-loop and pick up Finished.
+                    let verifying_path = path.clone();
+                    let prefetched = Arc::clone(meta);
+                    drop(st);
+
+                    let file = match tokio::fs::File::options()
+                        .read(true)
+                        .custom_flags(nix::libc::O_NOFOLLOW)
+                        .open(&verifying_path)
+                        .await
+                    {
+                        Ok(f) => f,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => {
+                            metrics::CACHE_IO_FAILURE.increment();
+                            error!(
+                                "Failed to open verifying file `{}` for joining client {}:  {}",
+                                verifying_path.display(),
+                                conn_details.client,
+                                ErrorReport(&err)
+                            );
+                            return ZeroCopyResult::Invalid {
+                                status: StatusCode::INTERNAL_SERVER_ERROR,
+                                msg: "Cache Access Failure",
+                            };
+                        }
+                    };
+
+                    return serve_file_via_sendfile(
+                        stream,
+                        conn_details,
+                        aliased,
+                        (file, &verifying_path),
+                        (conn_version, conn_action),
+                        headers,
+                        Some(&prefetched),
                     )
                     .await
                     .into();

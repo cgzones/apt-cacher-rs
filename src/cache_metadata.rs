@@ -14,11 +14,11 @@
 //!   [`crate::ActiveDownloadStatus::Download`] and on `Finished { meta:
 //!   Some(_) }`; late-joiners read those directly. `Finished { meta:
 //!   None }` (volatile-304 in `InitBarrier::finished`, error fallback
-//!   in `RenameBarrier::release`) falls through to
+//!   in `RenameBarrier::commit`) falls through to
 //!   [`CacheMetadataStore::resolve`].
 //! - **Post-flight (rename complete, active-downloads entry removed)** is
 //!   what this cache covers. The transition from in-flight to post-flight
-//!   happens inside `RenameBarrier::release`, which calls
+//!   happens inside `RenameBarrier::commit`, which calls
 //!   [`CacheMetadataStore::set`] (via `cache_metadata::store().set(...)`)
 //!   *before* removing the active-downloads entry — so a worker that
 //!   misses the entry always finds the cache populated.

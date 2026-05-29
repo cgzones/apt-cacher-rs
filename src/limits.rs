@@ -36,6 +36,14 @@ pub(crate) const MAX_UPSTREAM_HEADERS: usize = 32;
 /// Absolute ceiling (bytes) on the decompressed output of a `Packages` file.
 pub(crate) const MAX_DECOMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(1024 * 1024 * 1024);
 
+/// Maximum size (bytes) of a `Release` / `InRelease` file ingested into the
+/// checksum registry. Real Release files for Debian-scale archives are tens
+/// of KB; an 8 MiB cap leaves several orders of magnitude of headroom while
+/// bounding the memory ballooning surface from a hostile or buggy mirror
+/// (which could otherwise serve a multi-GB `Release` under `max_object_size`
+/// and force `read_to_string` to grow without bound).
+pub(crate) const MAX_RELEASE_SIZE: NonZero<u64> = nonzero!(8 * 1024 * 1024);
+
 /// Maximum decompressed-to-compressed ratio tolerated for a `Packages` file.
 pub(crate) const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 

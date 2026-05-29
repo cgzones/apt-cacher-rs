@@ -2,9 +2,9 @@
 //! field, hex-encoded `SHA256:` / `SHA512:` digests, and the small helpers
 //! that derive cache lookup keys from a stanza's relative path.
 //!
-//! Used by `task_cleanup`'s 24h sweep (and its tests). The cold path is
-//! currently the only consumer; the helpers stay free of hot-path-specific
-//! coupling so they can be reused if a future call site needs them.
+//! Used by `integrity.rs` (post-commit registry ingest/verify) and
+//! `task_cleanup`'s 24h sweep (and its tests). Cold-path only; the helpers
+//! stay free of hot-path-specific coupling.
 
 use std::path::Path;
 
@@ -167,6 +167,110 @@ impl Stanza {
     }
 }
 
+/// Decode a `by-hash` URL's digest filename against the algorithm taken from
+/// the URL's `<algo>` path segment (see `integrity::byhash_algo_from_uri_path`).
+///
+/// A `/by-hash/SHA256/<hex>` (or `/SHA512/<hex>`) URL embeds the digest in the
+/// path component, so the filename *is* the expected digest -- but the
+/// authoritative algorithm is the `<algo>` segment, not the digest length. The
+/// hex length must match `algo` (64 for SHA256, 128 for SHA512); a length/algo
+/// mismatch or non-hex input returns `None`, so verification treats the
+/// resource as unverifiable rather than hashing with the wrong algorithm.
+pub(crate) fn byhash_digest_for_algo(algo: HashAlgo, filename: &str) -> Option<Vec<u8>> {
+    match algo {
+        HashAlgo::Sha256 => hex_decode_exact::<32>(filename).map(|d| d.to_vec()),
+        HashAlgo::Sha512 => hex_decode_exact::<64>(filename).map(|d| d.to_vec()),
+    }
+}
+
+/// Discriminator for `Packages`/`Filename` parsing rules: structured
+/// (pool-based) repositories versus flat-repo layouts. Replaces the
+/// previous `is_flat: bool` parameter so the call sites self-document and
+/// no impossible "neither" state can be constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexFormat {
+    Structured,
+    Flat,
+}
+
+/// Map a `Packages` stanza `Filename:` value to the registry key used to look
+/// it up at `.deb` download time.
+///
+/// - structured repos: the cache flattens `pool/.../<deb>` to the basename, so
+///   the key is the basename (`structured_lookup_key`).
+/// - flat repos: the URL path is the on-disk path verbatim, so the key is the
+///   validated relpath itself.
+///
+/// Returns `None` when the relpath fails `is_safe_filename_relpath`.
+pub(crate) fn registry_key_from_filename_field(
+    filename_field: &str,
+    format: IndexFormat,
+) -> Option<String> {
+    if !is_safe_filename_relpath(filename_field) {
+        return None;
+    }
+    match format {
+        IndexFormat::Flat => Some(filename_field.to_owned()),
+        IndexFormat::Structured => structured_lookup_key(filename_field).map(str::to_owned),
+    }
+}
+
+/// Iterate the `(repo-relative path, SHA256 digest)` entries from a Debian
+/// `Release` / `InRelease` file's `SHA256:` section.
+///
+/// Handles the `InRelease` clearsigned wrapper by stopping at the PGP
+/// signature boundary. Entry lines are indented with one or more spaces or
+/// tabs followed by `<hex> <size> <path>`; the section ends at the first
+/// non-indented line. Paths failing `is_safe_filename_relpath` are skipped.
+pub(crate) fn parse_release_checksums(
+    content: &str,
+) -> impl Iterator<Item = (String, [u8; 32])> + '_ {
+    let mut in_sha256_section = false;
+    content.lines().filter_map(move |line| {
+        if line.starts_with("-----BEGIN PGP SIGNATURE-----") {
+            in_sha256_section = false;
+            return None;
+        }
+        // A non-indented, non-empty line ends the current section. Section
+        // headers ("SHA256:", "MD5Sum:", ...) are themselves non-indented.
+        // Debian uses spaces but accept tabs too so non-canonical mirrors
+        // that emit `\t`-indented entries still ingest.
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        if !indented && !line.is_empty() {
+            in_sha256_section = line.trim_end() == "SHA256:";
+            return None;
+        }
+        if !in_sha256_section {
+            return None;
+        }
+        // Indented entry: " <hex> <size> <path>"
+        let mut parts = line.split_whitespace();
+        let hex = parts.next()?;
+        let _size = parts.next()?;
+        let path = parts.next()?;
+        // Debian repo paths do not contain spaces; if a 4th token exists the
+        // path had a space - reject.
+        if parts.next().is_some() {
+            return None;
+        }
+        let digest = hex_decode_exact::<32>(hex)?;
+        if !is_safe_filename_relpath(path) {
+            return None;
+        }
+        Some((path.to_owned(), digest))
+    })
+}
+
+/// Map a `.deb` download's request to the same registry key.
+///
+/// `debname` is `ConnectionDetails::debname` (already the basename for a
+/// structured pool file). For structured pool the key is `debname` directly.
+/// Flat-pool layer-B verification is deferred (see the plan's deferred list),
+/// so this is currently only used for the structured-pool path.
+pub(crate) fn registry_key_for_download(debname: &str) -> String {
+    debname.to_owned()
+}
+
 /// Hash the contents of an open file. Synchronous; blocks the current thread.
 pub(crate) fn hash_open_file<D: sha2::Digest>(
     file: &mut std::fs::File,
@@ -218,5 +322,136 @@ mod tests {
             s.chosen(),
             Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
         );
+    }
+
+    #[test]
+    fn byhash_digest_sha256() {
+        let hex = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        let digest = byhash_digest_for_algo(HashAlgo::Sha256, hex).expect("valid sha256 hex");
+        assert_eq!(digest.len(), 32);
+        assert_eq!(hex_encode(&digest), hex);
+    }
+
+    #[test]
+    fn byhash_digest_sha512() {
+        let hex = &"a".repeat(128);
+        let digest = byhash_digest_for_algo(HashAlgo::Sha512, hex).expect("valid sha512 hex");
+        assert_eq!(digest.len(), 64);
+        assert_eq!(hex_encode(&digest), *hex);
+    }
+
+    #[test]
+    fn byhash_digest_rejects_bad_input() {
+        assert!(byhash_digest_for_algo(HashAlgo::Sha256, "").is_none());
+        assert!(byhash_digest_for_algo(HashAlgo::Sha256, "deadbeef").is_none()); // too short
+        assert!(byhash_digest_for_algo(HashAlgo::Sha256, &"z".repeat(64)).is_none()); // non-hex
+        // Length/algo mismatch: a 128-hex digest under a SHA256 URL segment (or
+        // a 64-hex one under SHA512) must be rejected, never hashed as the other
+        // algorithm.
+        assert!(byhash_digest_for_algo(HashAlgo::Sha256, &"a".repeat(128)).is_none());
+        assert!(byhash_digest_for_algo(HashAlgo::Sha512, &"a".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn registry_key_for_structured_pool_uses_basename() {
+        assert_eq!(
+            registry_key_from_filename_field(
+                "pool/main/f/foo/foo_1.0_amd64.deb",
+                IndexFormat::Structured,
+            ),
+            Some("foo_1.0_amd64.deb".to_string())
+        );
+    }
+
+    #[test]
+    fn registry_key_for_flat_uses_relpath_verbatim() {
+        assert_eq!(
+            registry_key_from_filename_field("amd64/foo_1.0_amd64.deb", IndexFormat::Flat),
+            Some("amd64/foo_1.0_amd64.deb".to_string())
+        );
+    }
+
+    #[test]
+    fn registry_key_rejects_unsafe_relpath() {
+        assert_eq!(
+            registry_key_from_filename_field("../etc/passwd", IndexFormat::Structured),
+            None
+        );
+        assert_eq!(
+            registry_key_from_filename_field("", IndexFormat::Flat),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_release_detached() {
+        let release = "\
+Origin: Debian
+Suite: sid
+MD5Sum:
+ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1234 main/binary-amd64/Packages
+SHA256:
+ 1111111111111111111111111111111111111111111111111111111111111111 1234 main/binary-amd64/Packages
+ 2222222222222222222222222222222222222222222222222222222222222222 567 main/binary-amd64/Packages.xz
+SHA512:
+ 3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333 1234 main/binary-amd64/Packages
+";
+        let entries: Vec<_> = parse_release_checksums(release).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "main/binary-amd64/Packages");
+        assert_eq!(entries[0].1, [0x11u8; 32]);
+        assert_eq!(entries[1].0, "main/binary-amd64/Packages.xz");
+        assert_eq!(entries[1].1, [0x22u8; 32]);
+    }
+
+    #[test]
+    fn parse_release_inrelease_clearsigned() {
+        let inrelease = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: Debian
+SHA256:
+ 1111111111111111111111111111111111111111111111111111111111111111 1234 main/binary-amd64/Packages
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAd...
+-----END PGP SIGNATURE-----
+";
+        let entries: Vec<_> = parse_release_checksums(inrelease).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "main/binary-amd64/Packages");
+    }
+
+    #[test]
+    fn parse_release_rejects_unsafe_path() {
+        let release = "\
+SHA256:
+ 1111111111111111111111111111111111111111111111111111111111111111 1 ../../etc/passwd
+";
+        assert!(parse_release_checksums(release).next().is_none());
+    }
+
+    #[test]
+    fn hex_decode_exact_rejects_truncated() {
+        assert!(hex_decode_exact::<32>("deadbeef").is_none());
+    }
+
+    #[test]
+    fn hex_decode_exact_rejects_oversize() {
+        let oversize = "a".repeat(128);
+        assert!(hex_decode_exact::<32>(&oversize).is_none());
+    }
+
+    #[test]
+    fn hex_decode_exact_rejects_odd_length() {
+        let odd = "a".repeat(63);
+        assert!(hex_decode_exact::<32>(&odd).is_none());
+    }
+
+    #[test]
+    fn byhash_digest_rejects_non_hex_with_correct_length() {
+        let bad = "g".repeat(64);
+        assert!(byhash_digest_for_algo(HashAlgo::Sha256, &bad).is_none());
     }
 }

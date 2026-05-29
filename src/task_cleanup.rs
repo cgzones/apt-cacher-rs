@@ -22,8 +22,8 @@ use tokio::io::{AsyncBufRead, AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
 use crate::{
     AppState, ClientInfo, Never, ProxyCacheBody, RETENTION_TIME,
     cache_layout::{
-        CacheLayout, CachedFlavor, ConnectionDetails, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH,
-        SUBDIR_TMP,
+        CacheLayout, CachedFlavor, ConnectionDetails, ResourceKind, SUBDIR_DISTS_BYHASH,
+        SUBDIR_FLAT_BYHASH, SUBDIR_TMP,
     },
     cache_metadata,
     config::{CacheHost, Config},
@@ -626,6 +626,24 @@ async fn try_fetch_packages_file<F>(
 where
     F: Fn(PackageFormat) -> String,
 {
+    // The resource kind drives integrity-registry lookup/ingestion: structured
+    // `dists/.../Packages*` is `Packages`; flat-repo `<root>/Packages*` is
+    // `FlatMetadata`. Match the dispatcher's `classify_request` so a cleanup
+    // re-fetch is classified identically to a client request.
+    let resource_kind = match layout {
+        CacheLayout::Dists => ResourceKind::Packages,
+        CacheLayout::Flat => ResourceKind::FlatMetadata,
+        CacheLayout::StructuredPool | CacheLayout::DistsByHash | CacheLayout::FlatByHash => {
+            // try_fetch_packages_file is only called with Dists or Flat above;
+            // a future caller passing a by-hash/pool layout is a logic bug.
+            error!(
+                "try_fetch_packages_file called with unexpected layout {layout:?}; \
+                 defaulting resource_kind to Packages"
+            );
+            ResourceKind::Packages
+        }
+    };
+
     let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
     // Remember a representative missing-ish status to surface after every
     // format fails. AWS S3 returns 403 (not 404) for a missing object when
@@ -657,6 +675,7 @@ where
             debname: debname_for(pkgfmt),
             cached_flavor: CachedFlavor::Volatile,
             layout,
+            resource_kind,
         };
 
         let response = process_cache_request(conn_details, req, appstate.clone()).await;

@@ -34,7 +34,7 @@ use log::{info, trace};
 
 use crate::{
     ClientInfo,
-    cache_layout::{self, CacheLayout, CachedFlavor, ClassifyError},
+    cache_layout::{self, CacheLayout, CachedFlavor, ClassifyError, ResourceKind},
     config::{Alias, CacheHost, ClientHost, resolve_alias},
     database_task::{DatabaseCommand, DbCmdOrigin, send_db_command},
     deb_mirror::{
@@ -58,6 +58,7 @@ pub(crate) struct CachePlan {
     pub(crate) cached_flavor: CachedFlavor,
     pub(crate) layout: CacheLayout,
     pub(crate) request_received_at: PreciseInstant,
+    pub(crate) resource_kind: ResourceKind,
     _private: (),
 }
 
@@ -311,6 +312,7 @@ fn decide_request(
                             cached_flavor: class.cached_flavor,
                             layout: class.layout,
                             request_received_at,
+                            resource_kind: class.resource_kind,
                             _private: (),
                         },
                         pending_origin,
