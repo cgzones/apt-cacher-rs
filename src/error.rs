@@ -1,27 +1,39 @@
 use std::fmt::Display;
 
+#[cfg(feature = "hyper")]
+use crate::channel_body::ChannelBodyError;
+#[cfg(feature = "hyper")]
 use crate::deb_mirror::Mirror;
-use crate::rate_checked_body::InsufficientRate;
-use crate::{ChannelBodyError, ClientInfo, ContentLength};
+#[cfg(feature = "hyper")]
+use crate::rate_checker::InsufficientRate;
+#[cfg(feature = "hyper")]
+use crate::{ClientInfo, ContentLength};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorDownloadRate {
+    #[cfg(feature = "hyper")]
     pub(crate) download_rate_err: InsufficientRate,
+    #[cfg(feature = "hyper")]
     pub(crate) mirror: Mirror,
+    #[cfg(feature = "hyper")]
     pub(crate) debname: String,
 }
 
 #[derive(Debug)]
 pub(crate) enum ProxyCacheError {
     Io(std::io::Error),
+    #[cfg(feature = "hyper")]
     Hyper(hyper::Error),
     Sqlx(sqlx::Error),
+    #[cfg(feature = "hyper")]
     ClientDownloadRate {
         error: InsufficientRate,
         client: ClientInfo,
     },
+    #[cfg(feature = "hyper")]
     MirrorDownloadRate(MirrorDownloadRate),
     Memfd(memfd::Error),
+    #[cfg(feature = "hyper")]
     ContentTooLarge {
         announced: ContentLength,
         received: u64,
@@ -32,11 +44,14 @@ impl std::fmt::Display for ProxyCacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{}", ErrorReport(e)),
+            #[cfg(feature = "hyper")]
             Self::Hyper(e) => write!(f, "{}", ErrorReport(e)),
             Self::Sqlx(e) => write!(f, "{}", ErrorReport(e)),
+            #[cfg(feature = "hyper")]
             Self::ClientDownloadRate { error, client } => {
                 error.fmt_with_context(f, format_args!(" for client {client}"))
             }
+            #[cfg(feature = "hyper")]
             Self::MirrorDownloadRate(MirrorDownloadRate {
                 download_rate_err,
                 mirror,
@@ -46,6 +61,7 @@ impl std::fmt::Display for ProxyCacheError {
                 format_args!(" for mirror {mirror} downloading file {debname}"),
             ),
             Self::Memfd(e) => write!(f, "{}", ErrorReport(e)),
+            #[cfg(feature = "hyper")]
             Self::ContentTooLarge {
                 announced,
                 received,
@@ -67,6 +83,7 @@ impl From<std::io::Error> for ProxyCacheError {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl From<hyper::Error> for ProxyCacheError {
     fn from(value: hyper::Error) -> Self {
         Self::Hyper(value)
@@ -79,6 +96,7 @@ impl From<sqlx::Error> for ProxyCacheError {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl From<ChannelBodyError> for ProxyCacheError {
     fn from(value: ChannelBodyError) -> Self {
         match value {
@@ -93,6 +111,7 @@ impl From<std::io::Error> for Box<ProxyCacheError> {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl From<hyper::Error> for Box<ProxyCacheError> {
     fn from(value: hyper::Error) -> Self {
         Self::new(ProxyCacheError::Hyper(value))

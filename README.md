@@ -78,14 +78,16 @@ The cleanup can also be manually triggered by sending the signal `USR2` to the `
 
 ## Crate features
 
-`apt-cacher-rs` exposes several optional cargo features (the default set is `mmap`, `tls_rustls`, `sendfile`):
+`apt-cacher-rs` exposes several optional cargo features (the default set is `hyper`, `mmap`, `tls_rustls`, `sendfile`):
 
+- `hyper` *(default)*: enables the hyper fallback backend for requests that cannot be served by zero-copy paths.
 - `mmap` *(default)*: serve cached files via memory-mapped I/O (`memmap2`).
 - `sendfile` *(default)*: serve cached files to clients with zero-copy `sendfile(2)`.
 - `tls_rustls` *(default)*: use [`rustls`](https://github.com/rustls/rustls) as the TLS backend for upstream connections.
 - `tls_hyper`: use the system-provided TLS implementation (`hyper-tls`/native TLS) instead of `rustls`; disable default features when enabling this.
 - `webpki-roots`: bundle Mozilla's CA root set with `rustls` instead of relying on the system trust store.
 - `splice`: proxy upstream responses to clients using `splice(2)` (implies `sendfile`).
+- At least one HTTP backend must be enabled: `hyper` or `splice`. A `splice`-only build stays operational and routes requests through the splice/sendfile path.
 - `ktls`: offload TLS encryption to the kernel via kTLS (implies `splice` and `tls_rustls`).
 
 ## Security
