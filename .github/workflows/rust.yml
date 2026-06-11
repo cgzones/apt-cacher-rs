@@ -25,13 +25,13 @@ jobs:
           components: clippy
 
       - name: Build
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose build --verbose
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --at-least-one-of hyper,splice --verbose build --verbose
 
       - name: Lint via Clippy
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose clippy --all-targets -- -D warnings -D clippy::pedantic
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --at-least-one-of hyper,splice --verbose clippy --all-targets -- -D warnings -D clippy::pedantic
 
       - name: Test
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose test --verbose
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --at-least-one-of hyper,splice --verbose test --verbose
 
   formatting:
     permissions:
