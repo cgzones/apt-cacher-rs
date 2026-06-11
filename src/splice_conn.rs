@@ -5640,6 +5640,152 @@ async fn read_body_to_vec_until_eof(
     Ok(body)
 }
 
+/// Read an upstream body with known `Content-Length` into a `Vec<u8>`.
+async fn read_body_to_vec_with_content_length(
+    upstream: &mut UpstreamConn,
+    prefix: &[u8],
+    content_length: u64,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let content_length = usize::try_from(content_length).map_err(|_err| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "content-length value too large to fit in memory address space",
+        )
+    })?;
+    if content_length > max_bytes {
+        return Err(std::io::Error::other(
+            "content-length exceeds cleanup buffering cap",
+        ));
+    }
+    if prefix.len() > content_length {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "upstream body prefix exceeds content-length",
+        ));
+    }
+
+    let config = global_config();
+    let mut body = Vec::with_capacity(content_length);
+    body.extend_from_slice(prefix);
+    let mut rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+
+    while body.len() < content_length {
+        let remaining = content_length - body.len();
+        body.reserve(TLS_READ_BUF_SIZE.min(remaining));
+        let n = match tokio::time::timeout(
+            config.http_timeout,
+            (&mut *upstream).take(remaining as u64).read_buf(&mut body),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "upstream closed before content-length body completed",
+                ));
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(err),
+            Err(tokio::time::error::Elapsed { .. }) => {
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "upstream read timed out during cleanup body buffering",
+                ));
+            }
+        };
+
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+
+        if let Some(ref mut rc) = rate_checker {
+            rc.add(n);
+            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
+                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
+            }
+        }
+    }
+
+    Ok(body)
+}
+
+#[cfg(not(feature = "hyper"))]
+#[must_use]
+pub(crate) async fn splice_cleanup_request(
+    mirror: &Mirror,
+    upstream_uri: &str,
+) -> http::Response<crate::ProxyCacheBody> {
+    let upstream_path_buf = upstream_uri
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_owned()));
+    let upstream_path = upstream_path_buf.as_deref().unwrap_or(upstream_uri);
+    let host_authority = mirror.format_authority();
+    let (up, resp, hdr_buf, hdr_end, _label, poolable) = match standard_upstream_connect(
+        mirror,
+        &host_authority,
+        upstream_path,
+        0,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(_err) => {
+            debug!("splice cleanup request to {upstream_path} failed to connect/read headers");
+            return http::Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(crate::full_body(bytes::Bytes::new()))
+                .expect("static response is valid");
+        }
+    };
+
+    let status = resp.status_code;
+    if status != StatusCode::OK {
+        return http::Response::builder()
+            .status(status)
+            .body(crate::full_body(bytes::Bytes::new()))
+            .expect("static response is valid");
+    }
+
+    let port = mirror_port(mirror, up.is_tls());
+    let mut upstream = PoolGuard::new(up, mirror.host().to_string(), port, poolable);
+    let body_prefix = &hdr_buf[hdr_end..];
+    let max_bytes: usize = crate::limits::MAX_DECOMPRESSED_PACKAGES_SIZE
+        .get()
+        .try_into()
+        .expect("constant fits into usize");
+    let body = if resp.is_chunked {
+        read_dechunk_body_to_vec(&mut upstream, body_prefix, max_bytes)
+            .await
+            .inspect_err(|_| upstream.unset_poolable())
+    } else if let Some(cl) = resp.content_length {
+        read_body_to_vec_with_content_length(&mut upstream, body_prefix, cl, max_bytes)
+            .await
+            .inspect_err(|_| upstream.unset_poolable())
+    } else {
+        upstream.unset_poolable();
+        read_body_to_vec_until_eof(&mut upstream, body_prefix, max_bytes).await
+    };
+
+    match body {
+        Ok(body) => http::Response::builder()
+            .status(StatusCode::OK)
+            .body(crate::full_body(body))
+            .expect("upstream response is valid"),
+        Err(err) => {
+            debug!("splice cleanup request to {upstream_path} failed to read body: {err}");
+            http::Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(crate::full_body(bytes::Bytes::new()))
+                .expect("static response is valid")
+        }
+    }
+}
+
 /// State machine for the buffered chunked-body decoder.
 ///
 /// Mirrors [`ChunkedState`] used by the streaming variant

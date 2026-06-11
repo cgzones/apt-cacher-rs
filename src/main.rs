@@ -96,16 +96,24 @@ use hashbrown::{Equivalent, HashMap};
 #[cfg(feature = "hyper")]
 use http::Method;
 #[cfg(feature = "hyper")]
+use http::StatusCode;
+#[cfg(feature = "hyper")]
 use http::Uri;
+#[cfg(feature = "hyper")]
 use http::header::ALLOW;
+#[cfg(feature = "hyper")]
 use http::header::CONNECTION;
+#[cfg(feature = "hyper")]
 use http::header::CONTENT_TYPE;
+#[cfg(feature = "hyper")]
 use http::header::DATE;
+#[cfg(feature = "hyper")]
 use http::header::SERVER;
 #[cfg(feature = "hyper")]
 use http::header::USER_AGENT;
+#[cfg(feature = "hyper")]
 use http::header::VIA;
-use http::{Request, Response, StatusCode};
+use http::{Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
 #[cfg(feature = "tls_rustls")]
@@ -149,6 +157,7 @@ use crate::deb_mirror::Mirror;
 use crate::deb_mirror::Origin;
 use crate::error::ErrorReport;
 use crate::error::ProxyCacheError;
+#[cfg(feature = "hyper")]
 use crate::http_range::format_http_date;
 use crate::humanfmt::HumanFmt;
 use crate::logstore::LogStore;
@@ -378,6 +387,7 @@ pub(crate) static KTLS_BLOCKED: OnceLock<
 > = OnceLock::new();
 
 #[must_use]
+#[cfg(feature = "hyper")]
 fn quick_response<T: Into<bytes::Bytes>>(
     status: StatusCode,
     message: T,
@@ -683,14 +693,11 @@ impl std::fmt::Display for ContentLength {
 #[must_use]
 #[cfg(not(feature = "hyper"))]
 pub(crate) async fn process_cache_request(
-    _conn_details: ConnectionDetails,
-    _req: Request<Empty<()>>,
+    conn_details: ConnectionDetails,
+    req: Request<Empty<()>>,
     _appstate: AppState,
 ) -> Response<ProxyCacheBody> {
-    quick_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Request path requires hyper backend",
-    )
+    crate::splice_conn::splice_cleanup_request(&conn_details.mirror, &req.uri().to_string()).await
 }
 
 pub(crate) mod client_counter {

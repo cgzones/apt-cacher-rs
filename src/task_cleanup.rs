@@ -13,7 +13,8 @@ use std::{
 use coarsetime::Instant;
 use futures_util::StreamExt as _;
 use hashbrown::HashMap;
-use http::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
+use http::{Method, Request, header::CACHE_CONTROL};
+use http::{Response, StatusCode};
 use http_body_util::{BodyExt as _, Empty};
 use log::{debug, error, info, trace, warn};
 use memfd::MemfdOptions;
