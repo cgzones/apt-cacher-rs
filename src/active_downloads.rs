@@ -105,6 +105,10 @@ pub(crate) enum ActiveDownloadStatus {
         path: PathBuf,
         meta: Option<Arc<UpstreamMetadata>>,
     },
+    #[cfg_attr(
+        not(feature = "hyper"),
+        expect(unused, reason = "not read in splice backend")
+    )]
     Aborted(AbortReason),
 }
 
@@ -134,6 +138,7 @@ impl std::fmt::Debug for ActiveDownloads {
 /// download, or it attaches as a late joiner to one already in flight. The
 /// late-joiner accounting (per-entry count + global metrics) is performed
 /// inside `insert()` itself — callers do not need any follow-up helper.
+#[cfg(feature = "hyper")]
 pub(crate) enum InsertOutcome {
     Originator {
         init_tx: tokio::sync::watch::Sender<()>,
@@ -293,6 +298,7 @@ impl ActiveDownloads {
     /// in flight. Late-joiner accounting (`LATE_JOINERS_TOTAL`,
     /// `LATE_JOINER_PEAK_PER_DOWNLOAD`) is performed atomically when joining,
     /// so callers do not need to follow up with any metric helper.
+    #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn insert(
         &self,
@@ -416,6 +422,7 @@ impl ActiveDownloads {
         })
     }
 
+    #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn download_count(&self) -> usize {
         tokio::task::block_in_place(move || {

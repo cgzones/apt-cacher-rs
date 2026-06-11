@@ -14,7 +14,7 @@ use crate::{
 #[cfg(feature = "splice")]
 use crate::{
     error::MirrorDownloadRate,
-    rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker},
+    rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
 };
 
 struct InitBarrierData<'a> {
@@ -297,11 +297,14 @@ impl DownloadBarrier {
             " for mirror {} downloading file {}",
             data.mirror, data.debname,
         ));
+        #[cfg(feature = "hyper")]
         let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {
             download_rate_err,
             mirror: data.mirror.clone(),
             debname: data.debname.clone(),
         });
+        #[cfg(not(feature = "hyper"))]
+        let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {});
         self.abort_with_reason(reason).await;
         io_err
     }

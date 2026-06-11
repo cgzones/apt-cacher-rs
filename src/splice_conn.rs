@@ -50,7 +50,7 @@ use crate::ktls;
 #[cfg(feature = "ktls")]
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
-use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::rate_checker::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::rate_log;
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;

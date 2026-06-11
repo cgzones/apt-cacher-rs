@@ -2,8 +2,10 @@ use std::io::ErrorKind;
 use std::num::NonZero;
 use std::os::fd::AsFd as _;
 use std::path::Path;
+#[cfg(feature = "hyper")]
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "hyper")]
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
@@ -13,6 +15,7 @@ use http::StatusCode;
 use http::header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE};
 use log::{debug, error, info, trace, warn};
 use nix::sys::sendfile::sendfile;
+#[cfg(feature = "hyper")]
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -21,6 +24,8 @@ use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_metadata::{self, CacheMetadataKeyRef};
 use crate::database_task::{DatabaseCommand, DbCmdDelivery, send_db_command};
 use crate::error::{ErrorReport, errno_to_io_error};
+#[cfg(feature = "hyper")]
+use crate::handle_hyper_connection;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header, find_header_end,
     write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
@@ -28,7 +33,7 @@ use crate::http_helpers::{
 };
 use crate::http_range::{ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
-use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::rate_checker::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::rate_log;
 use crate::request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request};
 use crate::tcp_cork_guard::CorkGuard;
@@ -36,8 +41,7 @@ use crate::utils::{hint_sequential_read, is_peer_disconnect};
 use crate::{
     APP_NAME, ActiveDownloadStatus, AppState, ClientInfo, ContentLength, Never,
     VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter, content_type_for_cached_file,
-    global_config, handle_hyper_connection, metrics, static_assert, warn_once_or_debug,
-    warn_once_or_info,
+    global_config, metrics, static_assert, warn_once_or_debug, warn_once_or_info,
     web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
 };
 
@@ -185,15 +189,33 @@ pub(crate) async fn handle_sendfile_connection(
                 return;
             }
             ZeroCopyResult::NotApplicable(reason) => {
-                // Fall back to hyper for this and all subsequent requests
-                debug!(
-                    "Falling back to hyper for client {client} after {req_num} requests due to: {reason} ({} bytes buffered)",
-                    buf.len()
-                );
+                #[cfg(feature = "hyper")]
+                {
+                    // Fall back to hyper for this and all subsequent requests
+                    debug!(
+                        "Falling back to hyper for client {client} after {req_num} requests due to: {reason} ({} bytes buffered)",
+                        buf.len()
+                    );
 
-                let stream = MaybePrependedStream::new(buf, stream);
+                    let stream = MaybePrependedStream::new(buf, stream);
 
-                return handle_hyper_connection(stream, client, appstate).await;
+                    return handle_hyper_connection(stream, client, appstate).await;
+                }
+                #[cfg(not(feature = "hyper"))]
+                {
+                    warn_once_or_info!(
+                        "Rejecting request from client {client} in splice-only backend due to unsupported sendfile fallback path: {reason}"
+                    );
+                    let _ignore = write_invalid_response(
+                        &stream,
+                        conn_version,
+                        ConnectionAction::Close,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Request not supported by splice backend",
+                    )
+                    .await;
+                    return;
+                }
             }
             ZeroCopyResult::Invalid { status, msg } => {
                 if let Err(err) = write_invalid_response(
@@ -604,23 +626,12 @@ async fn try_sendfile_request(
                 | RejectReason::UnsafePath => ZeroCopyResult::Invalid { status, msg },
             };
         }
-        // Pool filename failed the deb-extension or strict-flat-shape check;
-        // hand back to hyper so the simple proxy can handle it without caching.
-        DispatchOutcome::Passthrough {
-            reason: PassthroughReason::NonDebPool,
-            requested_host: _,
-            request_received_at: _,
-        } => return ZeroCopyResult::NotApplicable("unsupported pool filename"),
-        // Structured mirror has claimed this host's `flat/` anchor; hand back
-        // to hyper which will pass the request through uncached.
-        DispatchOutcome::Passthrough {
-            reason: PassthroughReason::FlatBlocked,
-            requested_host: _,
-            request_received_at: _,
-        } => return ZeroCopyResult::NotApplicable("flat host blocked by structured collision"),
         #[cfg(feature = "splice")]
         DispatchOutcome::Passthrough {
-            reason: PassthroughReason::Unrecognized,
+            reason:
+                PassthroughReason::Unrecognized
+                | PassthroughReason::NonDebPool
+                | PassthroughReason::FlatBlocked,
             requested_host,
             request_received_at,
         } => {
@@ -631,9 +642,7 @@ async fn try_sendfile_request(
             };
 
             // Splice serves this request directly; hyper won't re-enter the
-            // dispatcher, so record here.  The `NotApplicable` arms above
-            // intentionally skip this - hyper records when it re-runs the
-            // dispatcher.
+            // dispatcher, so record here.
             record_uncacheable(&requested_host, uri_path);
 
             // Simple-proxy path: this Mirror is used only for upstream
@@ -700,6 +709,18 @@ async fn try_sendfile_request(
                 },
             };
         }
+        #[cfg(not(feature = "splice"))]
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::NonDebPool,
+            requested_host: _,
+            request_received_at: _,
+        } => return ZeroCopyResult::NotApplicable("unsupported pool filename"),
+        #[cfg(not(feature = "splice"))]
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::FlatBlocked,
+            requested_host: _,
+            request_received_at: _,
+        } => return ZeroCopyResult::NotApplicable("flat host blocked by structured collision"),
         #[cfg(not(feature = "splice"))]
         DispatchOutcome::Passthrough {
             reason: PassthroughReason::Unrecognized,
@@ -2025,6 +2046,10 @@ async fn serve_unfinished_sendfile(
     };
 
     // We need an exact content length to write a Content-Length header.
+    #[cfg_attr(
+        not(feature = "hyper"),
+        expect(irrefutable_let_patterns, reason = "only one variant")
+    )]
     let ContentLength::Exact(exact_size) = total_size else {
         warn_once_or_debug!(
             "Unknown content length for in-progress download of {} from mirror {}{aliased}",
@@ -2203,11 +2228,13 @@ async fn serve_unfinished_sendfile(
 /// A stream that may have prepended data from a previous read.
 /// When all prepended data is consumed, the buffer is dropped and
 /// subsequent reads go straight to the inner TCP stream.
+#[cfg(feature = "hyper")]
 struct MaybePrependedStream {
     prepend: Option<BytesMut>,
     stream: TcpStream,
 }
 
+#[cfg(feature = "hyper")]
 impl MaybePrependedStream {
     fn new(prepend: BytesMut, stream: TcpStream) -> Self {
         let prepend = if prepend.is_empty() {
@@ -2220,6 +2247,7 @@ impl MaybePrependedStream {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl AsyncRead for MaybePrependedStream {
     #[inline]
     fn poll_read(
@@ -2241,6 +2269,7 @@ impl AsyncRead for MaybePrependedStream {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl AsyncWrite for MaybePrependedStream {
     #[inline]
     fn poll_write(
