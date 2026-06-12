@@ -9,13 +9,12 @@ use std::{
 
 use coarsetime::Instant;
 use hashbrown::HashMap;
-use http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
-    X_FRAME_OPTIONS,
-};
-use hyper::{
+use http::{
     Response, StatusCode,
-    header::{CONNECTION, CONTENT_TYPE, DATE, SERVER},
+    header::{
+        CACHE_CONTROL, CONNECTION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, DATE, REFERRER_POLICY,
+        SERVER, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    },
 };
 use log::{debug, error, trace, warn};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};

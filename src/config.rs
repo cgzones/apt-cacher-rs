@@ -1,21 +1,18 @@
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
-use std::num::NonZero;
-use std::path::Path;
-use std::path::PathBuf;
-use std::str::FromStr as _;
-use std::time::Duration;
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::NonZero,
+    path::{Path, PathBuf},
+    str::FromStr as _,
+    time::Duration,
+};
 
-use anyhow::Context as _;
-use anyhow::anyhow;
-use anyhow::bail;
+use anyhow::{Context as _, anyhow, bail};
+use http::StatusCode;
 use ipnet::IpNet;
 use log::LevelFilter;
-use serde::Deserialize;
-use serde::Deserializer;
+use serde::{Deserialize, Deserializer};
 
 use crate::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::nonzero;
@@ -53,8 +50,7 @@ const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
 const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
-const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: hyper::StatusCode =
-    hyper::StatusCode::TOO_MANY_REQUESTS;
+const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: StatusCode = StatusCode::TOO_MANY_REQUESTS;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_RETRYAFTER: u16 = 5;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_FACTOR: f64 = 0.2;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MINSIZE: Option<NonZero<u64>> =
@@ -822,7 +818,7 @@ pub(crate) struct Config {
         default = "default_experimental_parallel_hack_statuscode",
         deserialize_with = "statuscode_from_u32"
     )]
-    pub(crate) experimental_parallel_hack_statuscode: hyper::StatusCode,
+    pub(crate) experimental_parallel_hack_statuscode: StatusCode,
 
     #[serde(default = "default_experimental_parallel_hack_retryafter")]
     pub(crate) experimental_parallel_hack_retryafter: u16,
@@ -941,14 +937,14 @@ where
         .map_err(D::Error::custom)
 }
 
-fn statuscode_from_u32<'de, D>(deserializer: D) -> Result<hyper::StatusCode, D::Error>
+fn statuscode_from_u32<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
 where
     D: Deserializer<'de>,
 {
     use serde::de::Error as _;
     let v = Deserialize::deserialize(deserializer)?;
 
-    hyper::StatusCode::from_u16(v).map_err(D::Error::custom)
+    StatusCode::from_u16(v).map_err(D::Error::custom)
 }
 
 fn from_nonzero_usize<'de, D>(deserializer: D) -> Result<Option<NonZero<usize>>, D::Error>
@@ -1117,7 +1113,7 @@ const fn default_experimental_parallel_hack_maxparallel() -> Option<NonZero<usiz
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL
 }
 
-const fn default_experimental_parallel_hack_statuscode() -> hyper::StatusCode {
+const fn default_experimental_parallel_hack_statuscode() -> StatusCode {
     DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE
 }
 

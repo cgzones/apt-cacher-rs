@@ -1,4 +1,4 @@
-use hyper::body::{Body, Frame, SizeHint};
+use http_body::{Body, Frame, SizeHint};
 
 use crate::{ContentLength, ProxyCacheError, error, metrics};
 
@@ -92,7 +92,7 @@ impl Body for ChannelBody {
     type Data = bytes::Bytes;
     type Error = Box<ProxyCacheError>;
 
-    fn size_hint(&self) -> hyper::body::SizeHint {
+    fn size_hint(&self) -> SizeHint {
         self.remaining.to_size_hint()
     }
 
@@ -171,9 +171,10 @@ mod tests {
     use std::pin::Pin;
     use std::task::Poll;
 
+    use http_body::Body as _;
+
     use super::{ChannelBody, ContentLength};
     use crate::ProxyCacheError;
-    use hyper::body::Body as _;
 
     fn nz(v: u64) -> NonZero<u64> {
         NonZero::new(v).expect("non-zero")
