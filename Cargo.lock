@@ -117,6 +117,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "urlencoding",
+ "webpki-roots",
  "xattr",
 ]
 
@@ -1035,7 +1036,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]

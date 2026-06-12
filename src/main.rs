@@ -655,6 +655,61 @@ pub(crate) fn global_cache_quota() -> &'static cache_quota::CacheQuota {
         .cache_quota
 }
 
+#[cfg(feature = "tls_rustls")]
+#[cfg_attr(
+    feature = "webpki-roots",
+    expect(clippy::unnecessary_wraps, reason = "webpki setup is infallible")
+)]
+fn build_rustls_client_config()
+-> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    /* Set a process wide default crypto provider. */
+    //let _ = rustls::crypto::ring::default_provider().install_default();
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("first and sole call should succeed");
+
+    #[cfg(feature = "webpki-roots")]
+    let tls_config = {
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
+
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+
+    #[cfg(not(feature = "webpki-roots"))]
+    let tls_config = {
+        use hyper_rustls::ConfigBuilderExt as _;
+
+        rustls::ClientConfig::builder()
+            .with_native_roots()
+            .inspect_err(|err| error!("Failed to load native roots:  {}", error::ErrorReport(err)))?
+            .with_no_client_auth()
+    };
+
+    Ok(tls_config)
+}
+
+#[cfg(all(feature = "tls_rustls", feature = "splice"))]
+fn init_splice_tls_client_config(
+    #[cfg_attr(
+        not(feature = "ktls"),
+        expect(unused_mut, reason = "kTLS needs to extract secret")
+    )]
+    mut tls_config: rustls::ClientConfig,
+) {
+    #[cfg(feature = "ktls")]
+    {
+        tls_config.enable_secret_extraction = true;
+    }
+
+    splice_conn::TLS_CLIENT_CONFIG
+        .set(Arc::new(tls_config))
+        .expect("function should only be called once");
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = Cli::parse();
 
@@ -825,43 +880,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         #[cfg(feature = "tls_rustls")]
         let https_connector = {
-            use hyper_rustls::ConfigBuilderExt as _;
-
-            /* Set a process wide default crypto provider. */
-            //let _ = rustls::crypto::ring::default_provider().install_default();
-            rustls::crypto::aws_lc_rs::default_provider()
-                .install_default()
-                .expect("first and sole call should succeed");
-
-            #[cfg(feature = "webpki-roots")]
-            let tls_config = rustls::ClientConfig::builder()
-                .with_webpki_roots()
-                .with_no_client_auth();
-            #[cfg(not(feature = "webpki-roots"))]
-            let tls_config = rustls::ClientConfig::builder()
-                .with_native_roots()
-                .inspect_err(|err| {
-                    error!("Failed to load native roots:  {}", error::ErrorReport(err));
-                })?
-                .with_no_client_auth();
+            let tls_config = build_rustls_client_config()?;
 
             #[cfg(feature = "splice")]
-            {
-                #[cfg_attr(
-                    not(feature = "ktls"),
-                    expect(unused_mut, reason = "kTLS needs to extract secret")
-                )]
-                let mut tls_config_splice = tls_config.clone();
-
-                #[cfg(feature = "ktls")]
-                {
-                    tls_config_splice.enable_secret_extraction = true;
-                }
-
-                splice_conn::TLS_CLIENT_CONFIG
-                    .set(Arc::new(tls_config_splice))
-                    .expect("function should only be called once");
-            }
+            init_splice_tls_client_config(tls_config.clone());
 
             hyper_rustls::HttpsConnectorBuilder::new()
                 .with_tls_config(tls_config)
