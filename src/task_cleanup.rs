@@ -13,12 +13,11 @@ use std::{
 use coarsetime::Instant;
 use futures_util::StreamExt as _;
 use hashbrown::HashMap;
+use http::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
 use http_body_util::{BodyExt as _, Empty};
-use hyper::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
 use log::{debug, error, info, trace, warn};
 use memfd::MemfdOptions;
-use tokio::io::{AsyncBufRead, BufWriter};
-use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncBufRead, AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
 
 use crate::{
     AppState, ClientInfo, Never, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,

@@ -2,7 +2,7 @@ use std::{fmt::Debug, num::NonZero};
 
 use bytes::Buf as _;
 use coarsetime::{Duration, Instant};
-use hyper::body::{Body, Frame, SizeHint};
+use http_body::{Body, Frame, SizeHint};
 use log::debug;
 use pin_project::pin_project;
 

@@ -63,91 +63,64 @@ mod web_interface;
 mod xattr_helpers;
 mod xz_stream;
 
-use std::convert::Infallible;
-use std::error::Error as _;
-use std::fmt::Debug;
-use std::fmt::Display;
-use std::hash::Hash;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
-use std::num::NonZero;
-use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::task::Poll::Pending;
-use std::task::Poll::Ready;
-use std::time::Duration;
+use std::{
+    convert::Infallible,
+    error::Error as _,
+    fmt::Debug,
+    fmt::Display,
+    hash::Hash,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
+    num::NonZero,
+    os::unix::fs::MetadataExt as _,
+    os::unix::fs::OpenOptionsExt as _,
+    path::Path,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    sync::OnceLock,
+    task::Poll::Pending,
+    task::Poll::Ready,
+    time::Duration,
+};
 
 use bytes::Buf as _;
-use channel_body::ChannelBody;
-use channel_body::ChannelBodyError;
+use channel_body::{ChannelBody, ChannelBodyError};
 use clap::Parser;
 use coarsetime::Instant;
-use futures_util::StreamExt as _;
-use futures_util::TryStreamExt as _;
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
-use http::header::ALLOW;
-use http::uri::Authority;
+use http::{
+    Method, Request, Response, StatusCode, Uri, Version,
+    header::{
+        ACCEPT, ACCEPT_RANGES, AGE, ALLOW, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH,
+        CONTENT_RANGE, CONTENT_TYPE, DATE, ETAG, HOST, HeaderName, HeaderValue, IF_MODIFIED_SINCE,
+        IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER, SERVER, USER_AGENT,
+        VIA,
+    },
+    uri::Authority,
+};
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Empty, Full, combinators::BoxBody};
 use http_range::{ParsedRange, http_parse_range};
-use hyper::Uri;
-use hyper::body::Frame;
-use hyper::body::Incoming;
-use hyper::body::SizeHint;
-use hyper::header::ACCEPT;
-use hyper::header::ACCEPT_RANGES;
-use hyper::header::AGE;
-use hyper::header::CACHE_CONTROL;
-use hyper::header::CONNECTION;
-use hyper::header::CONTENT_LENGTH;
-use hyper::header::CONTENT_RANGE;
-use hyper::header::CONTENT_TYPE;
-use hyper::header::DATE;
-use hyper::header::ETAG;
-use hyper::header::HOST;
-use hyper::header::HeaderName;
-use hyper::header::HeaderValue;
-use hyper::header::IF_MODIFIED_SINCE;
-use hyper::header::IF_NONE_MATCH;
-use hyper::header::IF_RANGE;
-use hyper::header::LAST_MODIFIED;
-use hyper::header::LOCATION;
-use hyper::header::RANGE;
-use hyper::header::RETRY_AFTER;
-use hyper::header::SERVER;
-use hyper::header::USER_AGENT;
-use hyper::header::VIA;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, body::Body};
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 #[cfg(feature = "tls_rustls")]
 use hyper_rustls::{ConfigBuilderExt as _, HttpsConnector};
 #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
 use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioIo;
+use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioIo};
 use log::{LevelFilter, debug, error, info, trace, warn};
 #[cfg(feature = "mmap")]
 use memmap2::{Advice, Mmap, MmapOptions};
-use pin_project::pin_project;
-use pin_project::pinned_drop;
-use rand::distr::Bernoulli;
-use rand::prelude::Distribution as _;
-use rate_checked_body::MaybeRated;
-use rate_checked_body::RateCheckedBodyErr;
-use simplelog::CombinedLogger;
-use simplelog::ConfigBuilder;
-use simplelog::WriteLogger;
-use simplelog::{ColorChoice, TermLogger, TerminalMode};
-use tokio::io::AsyncReadExt as _;
-use tokio::io::AsyncSeekExt as _;
-use tokio::io::AsyncWriteExt as _;
-use tokio::net::TcpListener;
-use tokio::runtime::Builder;
-use tokio::signal::unix::SignalKind;
+use pin_project::{pin_project, pinned_drop};
+use rand::{distr::Bernoulli, prelude::Distribution as _};
+use rate_checked_body::{MaybeRated, RateCheckedBodyErr};
+use simplelog::{
+    ColorChoice, CombinedLogger, ConfigBuilder, TermLogger, TerminalMode, WriteLogger,
+};
+use tokio::{
+    io::AsyncReadExt as _, io::AsyncSeekExt as _, io::AsyncWriteExt as _, net::TcpListener,
+    runtime::Builder, signal::unix::SignalKind,
+};
 
 #[cfg(feature = "splice")]
 use crate::active_downloads::OriginateOutcome;
@@ -703,7 +676,7 @@ pub(crate) async fn request_with_retry(
 
 #[must_use]
 fn quick_response<T: Into<bytes::Bytes>>(
-    status: hyper::StatusCode,
+    status: StatusCode,
     message: T,
 ) -> Response<ProxyCacheBody> {
     let mut builder = Response::builder()
@@ -714,7 +687,7 @@ fn quick_response<T: Into<bytes::Bytes>>(
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, "text/plain; charset=utf-8");
 
-    if status == hyper::StatusCode::METHOD_NOT_ALLOWED {
+    if status == StatusCode::METHOD_NOT_ALLOWED {
         builder = builder.header(ALLOW, "GET");
     }
 
@@ -3021,7 +2994,7 @@ async fn serve_new_file(
         .headers()
         .get(LOCATION)
         .and_then(|lc| lc.to_str().ok())
-        .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
+        .and_then(|lc_str| lc_str.parse::<Uri>().ok())
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
@@ -3833,19 +3806,13 @@ pub(crate) async fn process_cache_request(
                 cache_path.display(),
                 ErrorReport(&err)
             );
-            quick_response(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "Cache Access Failure",
-            )
+            quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure")
         }
     }
 }
 
 #[must_use]
-fn connect_response(
-    client: ClientInfo,
-    req: Request<hyper::body::Incoming>,
-) -> Response<ProxyCacheBody> {
+fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<ProxyCacheBody> {
     let config = global_config();
 
     {
@@ -3858,7 +3825,7 @@ fn connect_response(
         {
             warn_once_or_info!("Unauthorized proxy client {client}");
             metrics::AUTHZ_REJECTED_CLIENT.increment();
-            return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
+            return quick_response(StatusCode::FORBIDDEN, "Unauthorized client");
         }
     }
 
@@ -4008,7 +3975,7 @@ fn connect_response(
 #[inline]
 async fn pre_process_client_request_wrapper(
     client: ClientInfo,
-    req: Request<hyper::body::Incoming>,
+    req: Request<Incoming>,
     appstate: AppState,
 ) -> Result<Response<ProxyCacheBody>, Infallible> {
     let response = pre_process_client_request(client, req, appstate).await;
@@ -4019,7 +3986,7 @@ async fn pre_process_client_request_wrapper(
 #[must_use]
 async fn pre_process_client_request(
     client: ClientInfo,
-    req: Request<hyper::body::Incoming>,
+    req: Request<Incoming>,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     trace!("Incoming request: {req:?}");
@@ -4033,10 +4000,7 @@ async fn pre_process_client_request(
         &Method::GET => {}
         m => {
             warn_once_or_info!("Unsupported request method {m} from client {client}");
-            return quick_response(
-                hyper::StatusCode::METHOD_NOT_ALLOWED,
-                "Method not supported",
-            );
+            return quick_response(StatusCode::METHOD_NOT_ALLOWED, "Method not supported");
         }
     }
 
@@ -4046,49 +4010,46 @@ async fn pre_process_client_request(
         && *scheme != http::uri::Scheme::HTTP
     {
         warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}");
-        return quick_response(hyper::StatusCode::BAD_REQUEST, "Unsupported URI scheme");
+        return quick_response(StatusCode::BAD_REQUEST, "Unsupported URI scheme");
     }
 
-    let requested_host =
-        if let Some(h) = req.uri().authority().map(hyper::http::uri::Authority::host) {
-            h.to_owned()
-        } else {
-            // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
-            // HTTP/1.1 request that lacks a Host header field.
-            // HTTP/1.0 did not require Host, so only enforce for 1.1+.
-            if req.version() == hyper::Version::HTTP_11
-                && !req.headers().contains_key(hyper::header::HOST)
-            {
-                return quick_response(hyper::StatusCode::BAD_REQUEST, "Missing Host header");
-            }
+    let requested_host = if let Some(h) = req.uri().authority().map(Authority::host) {
+        h.to_owned()
+    } else {
+        // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
+        // HTTP/1.1 request that lacks a Host header field.
+        // HTTP/1.0 did not require Host, so only enforce for 1.1+.
+        if req.version() == Version::HTTP_11 && !req.headers().contains_key(HOST) {
+            return quick_response(StatusCode::BAD_REQUEST, "Missing Host header");
+        }
 
+        {
+            let allowed_webif_clients = config
+                .allowed_webif_clients
+                .as_ref()
+                .unwrap_or(&config.allowed_proxy_clients);
+            let client_ip = client.ip();
+            if !allowed_webif_clients.is_empty()
+                && !allowed_webif_clients
+                    .iter()
+                    .any(|ac| ac.contains(&client_ip))
             {
-                let allowed_webif_clients = config
-                    .allowed_webif_clients
-                    .as_ref()
-                    .unwrap_or(&config.allowed_proxy_clients);
-                let client_ip = client.ip();
-                if !allowed_webif_clients.is_empty()
-                    && !allowed_webif_clients
-                        .iter()
-                        .any(|ac| ac.contains(&client_ip))
-                {
-                    warn_once_or_info!("Unauthorized web-interface access by client {client}");
-                    metrics::AUTHZ_REJECTED_WEBUI.increment();
-                    return quick_response(hyper::StatusCode::FORBIDDEN, "Unauthorized client");
-                }
+                warn_once_or_info!("Unauthorized web-interface access by client {client}");
+                metrics::AUTHZ_REJECTED_WEBUI.increment();
+                return quick_response(StatusCode::FORBIDDEN, "Unauthorized client");
             }
+        }
 
-            return serve_web_interface(req.uri(), &appstate)
-                .await
-                .into_hyper_response();
-        };
+        return serve_web_interface(req.uri(), &appstate)
+            .await
+            .into_hyper_response();
+    };
 
     let requested_port = match req.uri().port_u16() {
         Some(port) => {
             let Some(port) = NonZero::new(port) else {
                 warn_once_or_info!("Unsupported request port 0 from client {client}");
-                return quick_response(hyper::StatusCode::BAD_REQUEST, "Invalid port");
+                return quick_response(StatusCode::BAD_REQUEST, "Invalid port");
             };
             Some(port)
         }
@@ -4202,7 +4163,7 @@ async fn pre_process_client_request(
         .headers()
         .get(LOCATION)
         .and_then(|lc| lc.to_str().ok())
-        .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
+        .and_then(|lc_str| lc_str.parse::<Uri>().ok())
     {
         debug!(
             "Requested URI: {}, Moved URI: {moved_uri}",
