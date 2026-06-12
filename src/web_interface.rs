@@ -27,9 +27,10 @@ use crate::{
     database::{Database, MirrorStatEntry},
     database_task::DB_TASK_QUEUE_SENDER,
     deb_mirror::VALID_DEB_EXTENSIONS,
-    format_http_date, full_body, get_features, global_cache_quota, global_config, metrics,
+    format_http_date, full_body, get_features, global_cache_quota, global_config,
+    hyper_conn::tunnel_limiter::active_tunnels,
+    metrics,
     task_cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
-    tunnel_limiter::active_tunnels,
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
     warn_once_or_debug,
 };

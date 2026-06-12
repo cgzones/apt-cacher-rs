@@ -103,24 +103,6 @@ impl UpstreamMetadata {
     }
 }
 
-/// A wrapper around [`UpstreamMetadata`] that supports borrowed, owned, and
-/// shared references.
-pub(crate) enum UpstreamMetadataView<'a> {
-    Borrowed(&'a UpstreamMetadata),
-    Arc(Arc<UpstreamMetadata>),
-}
-
-impl std::ops::Deref for UpstreamMetadataView<'_> {
-    type Target = UpstreamMetadata;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Borrowed(meta) => meta,
-            Self::Arc(meta) => meta,
-        }
-    }
-}
-
 /// Cache key.  Mirrors the keying used by `active_downloads.rs` so the
 /// in-flight and post-flight stores look up the same logical resource;
 /// see that module's `ActiveDownloadKey` doc for the rationale behind
