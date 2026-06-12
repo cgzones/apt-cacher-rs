@@ -1,9 +1,13 @@
 use http_body::{Body, Frame, SizeHint};
 
-use crate::{ContentLength, ProxyCacheError, error, metrics};
+use crate::{
+    ContentLength,
+    error::{MirrorDownloadRate, ProxyCacheError},
+    metrics,
+};
 
 pub(crate) enum ChannelBodyError {
-    MirrorDownloadRate(error::MirrorDownloadRate),
+    MirrorDownloadRate(MirrorDownloadRate),
 }
 
 #[derive(Clone, Copy)]
@@ -174,7 +178,7 @@ mod tests {
     use http_body::Body as _;
 
     use super::{ChannelBody, ContentLength};
-    use crate::ProxyCacheError;
+    use crate::error::ProxyCacheError;
 
     fn nz(v: u64) -> NonZero<u64> {
         NonZero::new(v).expect("non-zero")

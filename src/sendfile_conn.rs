@@ -22,15 +22,15 @@ use tokio::{
 };
 
 use crate::{
-    APP_NAME, ActiveDownloadStatus, AppState, ClientInfo, ContentLength, Never,
-    VOLATILE_CACHE_MAX_AGE, authorize_cache_access,
+    APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
+    active_downloads::ActiveDownloadStatus,
     cache_conditional::CacheInfo,
     cache_layout::{CachedFlavor, ConnectionDetails},
     cache_metadata::{self, CacheMetadataKeyRef},
     client_counter, content_type_for_cached_file,
     database_task::{DatabaseCommand, DbCmdDelivery, send_db_command},
     error::{ErrorReport, errno_to_io_error},
-    global_config, handle_hyper_connection,
+    global_config,
     http_helpers::{
         ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header,
         find_header_end, write_304_response, write_416_response, write_all_to_stream,
@@ -38,7 +38,9 @@ use crate::{
     },
     http_range::{ParsedRange, format_http_date, http_parse_range},
     humanfmt::HumanFmt,
+    hyper_conn::handle_hyper_connection,
     metrics,
+    permitted_host_cache::authorize_cache_access,
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
     rate_log,
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},

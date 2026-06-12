@@ -3,7 +3,8 @@ use std::{path::PathBuf, sync::Arc};
 use log::error;
 
 use crate::{
-    AbortReason, ActiveDownloadStatus, ActiveDownloads, ContentLength,
+    ContentLength,
+    active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads},
     cache_layout::CacheLayout,
     cache_metadata::{self, CacheMetadataKey, UpstreamMetadata},
     cache_quota::QuotaReservation,
