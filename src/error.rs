@@ -1,8 +1,9 @@
 use std::fmt::Display;
 
-use crate::deb_mirror::Mirror;
-use crate::rate_checked_body::InsufficientRate;
-use crate::{ChannelBodyError, ClientInfo, ContentLength};
+use crate::{
+    ClientInfo, ContentLength, channel_body::ChannelBodyError, deb_mirror::Mirror,
+    rate_checker::InsufficientRate,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorDownloadRate {

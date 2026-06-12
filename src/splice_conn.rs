@@ -1,11 +1,13 @@
-use std::fmt::Write as _;
-use std::io::ErrorKind;
-use std::num::{NonZero, Saturating};
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::{
+    fmt::Write as _,
+    io::ErrorKind,
+    num::{NonZero, Saturating},
+    os::fd::{AsFd as _, AsRawFd as _, BorrowedFd},
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    task::{Context, Poll},
+};
 
 use bytes::BytesMut;
 #[cfg(feature = "ktls")]
@@ -50,7 +52,7 @@ use crate::ktls;
 #[cfg(feature = "ktls")]
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
-use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::rate_checker::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::rate_log;
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;
