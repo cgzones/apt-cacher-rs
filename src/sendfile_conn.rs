@@ -1,43 +1,51 @@
-use std::io::ErrorKind;
-use std::num::NonZero;
-use std::os::fd::AsFd as _;
-use std::path::Path;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    io::ErrorKind,
+    num::NonZero,
+    os::fd::AsFd as _,
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use bytes::BytesMut;
-use bytes::buf::Buf as _;
+use bytes::{BytesMut, buf::Buf as _};
 use coarsetime::Instant;
-use http::StatusCode;
-use http::header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE};
+use http::{
+    StatusCode,
+    header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE},
+};
 use log::{debug, error, info, trace, warn};
 use nix::sys::sendfile::sendfile;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-
-use crate::cache_conditional::CacheInfo;
-use crate::cache_layout::{CachedFlavor, ConnectionDetails};
-use crate::cache_metadata::{self, CacheMetadataKeyRef};
-use crate::database_task::{DatabaseCommand, DbCmdDelivery, send_db_command};
-use crate::error::{ErrorReport, errno_to_io_error};
-use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header, find_header_end,
-    write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
-    write_response_headers,
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
 };
-use crate::http_range::{ParsedRange, format_http_date, http_parse_range};
-use crate::humanfmt::HumanFmt;
-use crate::rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker};
-use crate::rate_log;
-use crate::request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request};
-use crate::tcp_cork_guard::CorkGuard;
-use crate::utils::{hint_sequential_read, is_peer_disconnect};
+
 use crate::{
     APP_NAME, ActiveDownloadStatus, AppState, ClientInfo, ContentLength, Never,
-    VOLATILE_CACHE_MAX_AGE, authorize_cache_access, client_counter, content_type_for_cached_file,
-    global_config, handle_hyper_connection, metrics, static_assert, warn_once_or_debug,
-    warn_once_or_info,
+    VOLATILE_CACHE_MAX_AGE, authorize_cache_access,
+    cache_conditional::CacheInfo,
+    cache_layout::{CachedFlavor, ConnectionDetails},
+    cache_metadata::{self, CacheMetadataKeyRef},
+    client_counter, content_type_for_cached_file,
+    database_task::{DatabaseCommand, DbCmdDelivery, send_db_command},
+    error::{ErrorReport, errno_to_io_error},
+    global_config, handle_hyper_connection,
+    http_helpers::{
+        ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header,
+        find_header_end, write_304_response, write_416_response, write_all_to_stream,
+        write_invalid_response, write_response_headers,
+    },
+    http_range::{ParsedRange, format_http_date, http_parse_range},
+    humanfmt::HumanFmt,
+    metrics,
+    rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
+    rate_log,
+    request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
+    static_assert,
+    tcp_cork_guard::CorkGuard,
+    utils::{hint_sequential_read, is_peer_disconnect},
+    warn_once_or_debug, warn_once_or_info,
     web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
 };
 

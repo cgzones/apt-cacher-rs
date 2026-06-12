@@ -14,7 +14,7 @@ use crate::{
 #[cfg(feature = "splice")]
 use crate::{
     error::MirrorDownloadRate,
-    rate_checked_body::{InsufficientRate, RateCheckDirection, RateChecker},
+    rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
 };
 
 struct InitBarrierData<'a> {
