@@ -20,7 +20,7 @@ use memfd::MemfdOptions;
 use tokio::io::{AsyncBufRead, AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
 
 use crate::{
-    AppState, ClientInfo, Never, ProxyCacheBody, ProxyCacheError, RETENTION_TIME,
+    AppState, ClientInfo, Never, ProxyCacheBody, RETENTION_TIME,
     cache_layout::{
         CacheLayout, CachedFlavor, ConnectionDetails, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH,
         SUBDIR_TMP,
@@ -32,15 +32,18 @@ use crate::{
         Mirror, MirrorKind, UriFormat as _, is_deb_package, is_strict_path_descendant,
         mirror_cache_path_impl, path_starts_with_segment,
     },
+    error::ProxyCacheError,
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
+    hyper_conn::process_cache_request,
     index_parser::{HashAlgo, Stanza, hash_open_file, hex_encode, structured_lookup_key},
     info_once,
     limits::{
         CappedLine, LimitedReader, MAX_DECOMPRESSED_PACKAGES_SIZE, MAX_DECOMPRESSION_RATIO,
         MAX_METADATA_LINE_LEN, read_line_capped,
     },
-    metrics, process_cache_request, task_cache_scan,
+    metrics,
+    task_cache_scan::task_cache_scan,
     utils::probe_dir,
     xz_stream::xz_decoder,
 };

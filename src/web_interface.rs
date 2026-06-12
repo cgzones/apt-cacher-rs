@@ -20,14 +20,16 @@ use log::{debug, error, trace, warn};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
 use crate::{
-    APP_NAME, APP_VERSION, AppState, HumanFmt, LOGSTORE, ProxyCacheBody, RUNTIMEDETAILS,
-    RuntimeDetails, cache_metadata,
+    APP_NAME, APP_VERSION, AppState, LOGSTORE, ProxyCacheBody, RUNTIMEDETAILS, RuntimeDetails,
+    cache_metadata,
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
     database_task::DB_TASK_QUEUE_SENDER,
     deb_mirror::VALID_DEB_EXTENSIONS,
-    format_http_date, full_body, get_features, global_cache_quota, global_config,
+    full_body, get_features, global_cache_quota, global_config,
+    http_range::format_http_date,
+    humanfmt::HumanFmt,
     hyper_conn::tunnel_limiter::active_tunnels,
     metrics,
     task_cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},

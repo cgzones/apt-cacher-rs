@@ -67,11 +67,13 @@ use crate::utils::{
 };
 use crate::xattr_helpers;
 use crate::{
-    APP_USER_AGENT, APP_VIA, ActiveDownloadStatus, AppState, ClientInfo, ContentLength, Never,
-    OriginateOutcome, SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef,
-    VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, cache_metadata, client_counter,
-    content_type_for_cached_file, global_cache_quota, global_config, is_host_allowed_cached,
-    metrics, static_assert, warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
+    APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, SCHEME_CACHE, Scheme,
+    SchemeKey, SchemeKeyRef, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
+    active_downloads::{ActiveDownloadStatus, OriginateOutcome},
+    cache_metadata, client_counter, content_type_for_cached_file, global_cache_quota,
+    global_config, metrics,
+    permitted_host_cache::is_host_allowed_cached,
+    static_assert, warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
 };
 #[cfg(feature = "ktls")]
 use crate::{KTLS_BLOCKED, warn_once};
