@@ -776,7 +776,7 @@ enum KtlsError {
     /// TLS+HTTP succeeded, but response is not suitable for kTLS splice
     /// (non-200 status or missing/zero Content-Length). The caller reconnects
     /// via the standard path.
-    ResponseNotSpliceable { response: UpstreamResponse },
+    ResponseNotSpliceable { response: Box<UpstreamResponse> },
     /// TLS handshake succeeded but the upstream emitted malformed HTTP — the
     /// failure has nothing to do with kTLS. The caller falls back to the
     /// standard path without blocking kTLS for this host.
@@ -1019,7 +1019,9 @@ async fn try_unbuffered_ktls_connect(
                 "kTLS: response not spliceable (status={})",
                 response.status_code
             );
-            KtlsResult::ResponseNotSpliceable { response }
+            KtlsResult::ResponseNotSpliceable {
+                response: *response,
+            }
         }
         Ok(Err(KtlsError::UpstreamProtocolError(err))) => {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
@@ -1460,7 +1462,9 @@ async fn unbuffered_ktls_request(
         // Non-spliceable response: the caller will reconnect via the standard
         // path for a complete fetch, so no need to drain the remaining TLS
         // records from this one-shot kTLS connection.
-        return Err(KtlsError::ResponseNotSpliceable { response });
+        return Err(KtlsError::ResponseNotSpliceable {
+            response: Box::new(response),
+        });
     }
 
     // --- Phase 4 of 5: Drain Remaining Buffer ---
