@@ -2926,7 +2926,10 @@ async fn tunnel(
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "tunnel connect timed out",
+                format!(
+                    "tunnel connect timed out after {}",
+                    HumanFmt::Time(config.http_timeout)
+                ),
             ));
         }
     };

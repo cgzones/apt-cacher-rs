@@ -266,7 +266,8 @@ async fn read_request_headers(
         return Ok(Some(next_index));
     }
 
-    let deadline = tokio::time::sleep(global_config().client_idle_timeout);
+    let client_idle_timeout = global_config().client_idle_timeout;
+    let deadline = tokio::time::sleep(client_idle_timeout);
     tokio::pin!(deadline);
 
     loop {
@@ -303,7 +304,10 @@ async fn read_request_headers(
                 metrics::HTTP_TIMEOUT_CLIENT_HEADER.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "reading TCP stream request headers timed out",
+                    format!(
+                        "reading TCP stream request headers timed out after {}",
+                        HumanFmt::Time(client_idle_timeout)
+                    ),
                 ));
             }
         }
@@ -1419,7 +1423,10 @@ async fn wait_socket_rated(
                 }
                 () = &mut outer => {
                     bump_timeout();
-                    return Err(std::io::Error::new(ErrorKind::TimedOut, timeout_msg));
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!("{timeout_msg} after {}", HumanFmt::Time(http_timeout)),
+                    ));
                 }
             }
         }
@@ -1434,7 +1441,10 @@ async fn wait_socket_rated(
             } => result,
             () = &mut outer => {
                 bump_timeout();
-                Err(std::io::Error::new(ErrorKind::TimedOut, timeout_msg))
+                Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!("{timeout_msg} after {}", HumanFmt::Time(http_timeout)),
+                ))
             }
         }
     }

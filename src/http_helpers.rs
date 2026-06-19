@@ -4,7 +4,10 @@ use http::{HeaderName, StatusCode};
 use log::trace;
 use tokio::net::TcpStream;
 
-use crate::{APP_NAME, APP_VIA, Never, global_config, http_range::format_http_date, metrics};
+use crate::{
+    APP_NAME, APP_VIA, Never, global_config, http_range::format_http_date, humanfmt::HumanFmt,
+    metrics,
+};
 
 /// Represents the action to take after sending a response.
 #[derive(Copy, Clone)]
@@ -236,7 +239,8 @@ pub(crate) async fn write_all_to_stream(
     mut data: &[u8],
     phase: WritePhase,
 ) -> std::io::Result<()> {
-    let deadline = tokio::time::sleep(global_config().http_timeout);
+    let http_timeout = global_config().http_timeout;
+    let deadline = tokio::time::sleep(http_timeout);
     tokio::pin!(deadline);
 
     while !data.is_empty() {
@@ -271,7 +275,10 @@ pub(crate) async fn write_all_to_stream(
                 }
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "TCP stream write operation timed out",
+                    format!(
+                        "TCP stream write operation timed out after {}",
+                        HumanFmt::Time(http_timeout)
+                    ),
                 ));
             }
         }

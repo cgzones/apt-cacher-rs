@@ -641,39 +641,43 @@ async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Sch
 ///
 /// Times out after the configured HTTP timeout.
 async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    tokio::time::timeout(
-        global_config().http_timeout,
-        TcpStream::connect((host, port)),
-    )
-    .await
-    .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
-        // A connect timeout is a TCP setup failure too: classify it under
-        // both the timeout-specific counter and the broad connect-failed
-        // counter so dashboards summing UPSTREAM_CONNECT_FAILED see all
-        // TCP setup losses, not just non-timeout errors.
-        metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-        metrics::UPSTREAM_CONNECT_FAILED.increment();
-        std::io::Error::new(ErrorKind::TimedOut, "upstream TCP connect timed out")
-    })?
-    .map_err(|err| {
-        metrics::UPSTREAM_CONNECT_FAILED.increment();
-        std::io::Error::new(
-            err.kind(),
-            format!("TCP connect to upstream failed:  {err}"),
-        )
-    })
-    .inspect(|tcp| {
-        // Disable Nagle on upstream connections.  Mirror requests are mostly
-        // small headers followed by a long body, so up to a 40 ms ACK delay
-        // between segments is dead time we can avoid.
-        if global_config().upstream_tcp_nodelay
-            && let Err(err) = tcp.set_nodelay(true)
-        {
-            warn_once_or_debug!(
-                "Failed to set TCP_NODELAY on upstream connection to {host}:{port}:  {err}"
-            );
-        }
-    })
+    let http_timeout = global_config().http_timeout;
+    tokio::time::timeout(http_timeout, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
+            // A connect timeout is a TCP setup failure too: classify it under
+            // both the timeout-specific counter and the broad connect-failed
+            // counter so dashboards summing UPSTREAM_CONNECT_FAILED see all
+            // TCP setup losses, not just non-timeout errors.
+            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+            metrics::UPSTREAM_CONNECT_FAILED.increment();
+            std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "upstream TCP connect timed out after {}",
+                    HumanFmt::Time(http_timeout)
+                ),
+            )
+        })?
+        .map_err(|err| {
+            metrics::UPSTREAM_CONNECT_FAILED.increment();
+            std::io::Error::new(
+                err.kind(),
+                format!("TCP connect to upstream failed:  {err}"),
+            )
+        })
+        .inspect(|tcp| {
+            // Disable Nagle on upstream connections.  Mirror requests are mostly
+            // small headers followed by a long body, so up to a 40 ms ACK delay
+            // between segments is dead time we can avoid.
+            if global_config().upstream_tcp_nodelay
+                && let Err(err) = tcp.set_nodelay(true)
+            {
+                warn_once_or_debug!(
+                    "Failed to set TCP_NODELAY on upstream connection to {host}:{port}:  {err}"
+                );
+            }
+        })
 }
 
 /// Perform TLS handshake over an established TCP connection.
@@ -696,21 +700,25 @@ async fn tls_connect(
     })?;
 
     debug!("splice proxy: starting TLS handshake with {host}");
-    let tls_stream = tokio::time::timeout(
-        global_config().http_timeout,
-        connector.connect(server_name, tcp),
-    )
-    .await
-    .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
-        metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-        std::io::Error::new(ErrorKind::TimedOut, "TLS handshake timed out")
-    })?
-    .map_err(|err| {
-        std::io::Error::new(
-            err.kind(),
-            format!("failed to complete TLS handshake:  {err}"),
-        )
-    })?;
+    let http_timeout = global_config().http_timeout;
+    let tls_stream = tokio::time::timeout(http_timeout, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
+            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+            std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "TLS handshake timed out after {}",
+                    HumanFmt::Time(http_timeout)
+                ),
+            )
+        })?
+        .map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to complete TLS handshake:  {err}"),
+            )
+        })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
 }
@@ -728,14 +736,20 @@ async fn tls_connect(
     let connector = tokio_native_tls::TlsConnector::from(native_connector);
 
     debug!("splice proxy: starting TLS handshake with {host}");
-    let tls_stream =
-        tokio::time::timeout(global_config().http_timeout, connector.connect(host, tcp))
-            .await
-            .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
-                metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-                std::io::Error::new(ErrorKind::TimedOut, "TLS handshake timed out")
-            })?
-            .map_err(std::io::Error::other)?;
+    let http_timeout = global_config().http_timeout;
+    let tls_stream = tokio::time::timeout(http_timeout, connector.connect(host, tcp))
+        .await
+        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
+            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+            std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "TLS handshake timed out after {}",
+                    HumanFmt::Time(http_timeout)
+                ),
+            )
+        })?
+        .map_err(std::io::Error::other)?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
 }
@@ -1728,16 +1742,15 @@ async fn send_upstream_request(
         volatile_cond,
     );
 
-    match tokio::time::timeout(
-        global_config().http_timeout,
-        write_and_flush(upstream, request.as_bytes()),
-    )
-    .await
-    {
+    let http_timeout = global_config().http_timeout;
+    match tokio::time::timeout(http_timeout, write_and_flush(upstream, request.as_bytes())).await {
         Ok(result) => result,
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => Err(std::io::Error::new(
             ErrorKind::TimedOut,
-            "write operation timed out",
+            format!(
+                "write operation timed out after {}",
+                HumanFmt::Time(http_timeout)
+            ),
         )),
     }
 }
@@ -1750,7 +1763,8 @@ async fn read_upstream_response_headers(
     upstream: &mut UpstreamConn,
     buf: &mut BytesMut,
 ) -> std::io::Result<usize> {
-    let deadline = tokio::time::sleep(global_config().http_timeout);
+    let http_timeout = global_config().http_timeout;
+    let deadline = tokio::time::sleep(http_timeout);
     tokio::pin!(deadline);
 
     // Incremental scan offset: bytes before this index were already checked for
@@ -1769,7 +1783,10 @@ async fn read_upstream_response_headers(
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "timed out reading upstream response headers",
+                    format!(
+                        "timed out reading upstream response headers after {}",
+                        HumanFmt::Time(http_timeout)
+                    ),
                 ));
             }
         };
@@ -2418,7 +2435,10 @@ async fn splice_proxy_body_tls(
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "upstream TLS read timed out",
+                    format!(
+                        "upstream TLS read timed out after {}",
+                        HumanFmt::Time(config.http_timeout)
+                    ),
                 ));
             }
         };
@@ -3448,7 +3468,10 @@ async fn forward_upstream_body(
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "upstream read timed out during body forward",
+                    format!(
+                        "upstream read timed out during body forward after {}",
+                        HumanFmt::Time(config.http_timeout)
+                    ),
                 ));
             }
         };
@@ -3506,7 +3529,10 @@ async fn forward_upstream_body_until_eof(
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "upstream read timed out during body forward",
+                    format!(
+                        "upstream read timed out during body forward after {}",
+                        HumanFmt::Time(config.http_timeout)
+                    ),
                 ));
             }
         };
@@ -3790,7 +3816,10 @@ async fn forward_upstream_chunked_body(
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "upstream read timed out during chunked body forward",
+                    format!(
+                        "upstream read timed out during chunked body forward after {}",
+                        HumanFmt::Time(config.http_timeout)
+                    ),
                 ));
             }
         };
@@ -5627,7 +5656,10 @@ async fn read_body_to_vec_until_eof(
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    "upstream read timed out during volatile body buffering",
+                    format!(
+                        "upstream read timed out during volatile body buffering after {}",
+                        HumanFmt::Time(config.http_timeout)
+                    ),
                 ));
             }
         };
@@ -5840,7 +5872,10 @@ async fn read_dechunk_body_to_vec(
                         metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                         return Err(std::io::Error::new(
                             ErrorKind::TimedOut,
-                            "upstream read timed out during chunked body buffering",
+                            format!(
+                                "upstream read timed out during chunked body buffering after {}",
+                                HumanFmt::Time(config.http_timeout)
+                            ),
                         ));
                     }
                 };
