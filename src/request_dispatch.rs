@@ -29,7 +29,6 @@
 
 use std::{cell::LazyCell, num::NonZero};
 
-use coarsetime::Instant;
 use http::StatusCode;
 use log::{info, trace};
 
@@ -42,7 +41,9 @@ use crate::{
         Mirror, Origin, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path,
         parse_request_path,
     },
-    flat_blocklist, global_config, metrics, warn_once_or_debug, warn_once_or_info,
+    flat_blocklist, global_config, metrics,
+    precise_instant::PreciseInstant,
+    warn_once_or_debug, warn_once_or_info,
 };
 
 /// Post-classification payload routed through the cache pipeline.
@@ -56,7 +57,7 @@ pub(crate) struct CachePlan {
     pub(crate) debname: String,
     pub(crate) cached_flavor: CachedFlavor,
     pub(crate) layout: CacheLayout,
-    pub(crate) request_received_at: Instant,
+    pub(crate) request_received_at: PreciseInstant,
     _private: (),
 }
 
@@ -147,7 +148,7 @@ pub(crate) enum DispatchOutcome {
         requested_host: ClientHost,
         // Consumed by both backends: `splice_simple_proxy` (`splice_conn.rs`,
         // via the sendfile dispatch) and `PassthroughBody` (`main.rs`).
-        request_received_at: Instant,
+        request_received_at: PreciseInstant,
     },
 }
 
@@ -178,7 +179,7 @@ pub(crate) async fn dispatch_request(
     requested_port: Option<NonZero<u16>>,
     client: &ClientInfo,
 ) -> DispatchOutcome {
-    let request_received_at = Instant::now();
+    let request_received_at = PreciseInstant::now();
     let cfg = global_config();
     let decision = decide_request(
         uri_path,
@@ -215,7 +216,7 @@ fn decide_request(
     aliases: &'static [Alias],
     reject_pdiff_requests: bool,
     is_flat_blocked: impl FnOnce(&CacheHost, Option<NonZero<u16>>) -> bool,
-    request_received_at: Instant,
+    request_received_at: PreciseInstant,
 ) -> Decision {
     trace!("Dispatching request from client {client}: host=`{requested_host}` path=`{uri_path}`");
 
@@ -383,7 +384,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         let DispatchOutcome::Cache(plan) = decision.outcome else {
             unreachable!("expected Cache outcome")
@@ -403,7 +404,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         let DispatchOutcome::Cache(plan) = decision.outcome else {
             unreachable!("expected Cache outcome")
@@ -427,7 +428,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         assert!(
             matches!(
@@ -453,7 +454,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         assert!(
             matches!(
@@ -479,7 +480,7 @@ mod tests {
             &[],
             true,
             |_, _| true,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         assert!(
             matches!(
@@ -505,7 +506,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         assert!(
             matches!(decision.outcome, DispatchOutcome::Cache(_)),
@@ -524,7 +525,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         assert!(
             matches!(
@@ -546,7 +547,7 @@ mod tests {
             &[],
             false,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         // Path is not a recognised structured shape (parser rejects), and the
         // pdiff gate is disabled, so this falls through to a plain Unrecognized
@@ -574,7 +575,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         assert!(
             matches!(
@@ -600,7 +601,7 @@ mod tests {
             &[],
             true,
             never_flat_blocked,
-            Instant::now(),
+            PreciseInstant::now(),
         );
         assert!(
             matches!(

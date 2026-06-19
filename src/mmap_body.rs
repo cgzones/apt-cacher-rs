@@ -1,6 +1,5 @@
 use std::{convert::Infallible, pin::Pin, sync::Arc, task::Poll::Ready};
 
-use coarsetime::Instant;
 use http_body::{Body, Frame, SizeHint};
 use log::info;
 use memmap2::Mmap;
@@ -10,7 +9,9 @@ use crate::{
     client_counter,
     database_task::{DatabaseCommand, DbCmdDelivery, send_db_command},
     humanfmt::HumanFmt,
-    metrics, rate_log,
+    metrics,
+    precise_instant::PreciseInstant,
+    rate_log,
 };
 
 const MMAP_FRAME_SIZE: usize = 2 * 1024 * 1024; // 2MiB
@@ -20,7 +21,7 @@ pub(crate) struct MmapBody {
     position: usize,
     length: usize,
     partial: bool,
-    start: Instant,
+    start: PreciseInstant,
     conn_details: Option<ConnectionDetails>,
     _counter: client_counter::ClientDownload,
 }
@@ -39,7 +40,7 @@ impl MmapBody {
             position: 0,
             length,
             partial,
-            start: Instant::now(),
+            start: PreciseInstant::now(),
             conn_details: Some(conn_details),
             _counter: client_counter::ClientDownload::new(),
         }
@@ -74,7 +75,7 @@ impl Drop for MmapBody {
                     cd.mirror,
                     aliased,
                     cd.client,
-                    HumanFmt::Time(in_time.into()),
+                    HumanFmt::Time(in_time),
                     rate_log::client_segment(size, elapsed),
                 );
 
@@ -95,7 +96,7 @@ impl Drop for MmapBody {
                     cd.mirror,
                     aliased,
                     cd.client,
-                    HumanFmt::Time(in_time.into()),
+                    HumanFmt::Time(in_time),
                 );
             }
         });

@@ -4,7 +4,6 @@ use std::{
 };
 
 use bytes::Buf as _;
-use coarsetime::Instant;
 use futures_util::TryStreamExt as _;
 use hashbrown::hash_map::EntryRef;
 use http::{
@@ -53,6 +52,7 @@ use crate::{
     humanfmt::HumanFmt,
     limits, metrics,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
+    precise_instant::PreciseInstant,
     quick_response,
     rate_checked_body::{MaybeRated, RateCheckedBodyErr},
     rate_checker::RateCheckDirection,
@@ -398,7 +398,7 @@ pub(crate) async fn request_with_retry(
 struct DeliveryStreamBody<S, E> {
     #[pin]
     stream: S,
-    start: coarsetime::Instant,
+    start: PreciseInstant,
     size: u64,
     partial: bool,
     transferred_bytes: u64,
@@ -421,7 +421,7 @@ impl<S, E> DeliveryStreamBody<S, E> {
         metrics::REQUESTS_COPY.increment();
         Self {
             stream,
-            start: coarsetime::Instant::now(),
+            start: PreciseInstant::now(),
             size,
             partial,
             transferred_bytes: 0,
@@ -505,7 +505,7 @@ impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
                     cd.mirror,
                     aliased,
                     cd.client,
-                    HumanFmt::Time(in_time.into()),
+                    HumanFmt::Time(in_time),
                     rate_log::client_segment(size, duration),
                 );
                 let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -529,7 +529,7 @@ impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
                         cd.mirror,
                         aliased,
                         cd.client,
-                        HumanFmt::Time(in_time.into()),
+                        HumanFmt::Time(in_time),
                     );
                 } else {
                     warn!(
@@ -538,7 +538,7 @@ impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
                         cd.mirror,
                         aliased,
                         cd.client,
-                        HumanFmt::Time(in_time.into()),
+                        HumanFmt::Time(in_time),
                     );
                 }
             }
@@ -560,9 +560,9 @@ struct PassthroughBody<B: Body> {
     inner: B,
     end_of_stream: bool,
     transferred: u64,
-    start: coarsetime::Instant,
-    request_received_at: coarsetime::Instant,
-    request_sent: coarsetime::Instant,
+    start: PreciseInstant,
+    request_received_at: PreciseInstant,
+    request_sent: PreciseInstant,
     host: String,
     path: String,
     client: ClientInfo,
@@ -571,8 +571,8 @@ struct PassthroughBody<B: Body> {
 impl<B: Body> PassthroughBody<B> {
     fn new(
         inner: B,
-        request_received_at: coarsetime::Instant,
-        request_sent: coarsetime::Instant,
+        request_received_at: PreciseInstant,
+        request_sent: PreciseInstant,
         host: String,
         path: String,
         client: ClientInfo,
@@ -581,7 +581,7 @@ impl<B: Body> PassthroughBody<B> {
             inner,
             end_of_stream: false,
             transferred: 0,
-            start: coarsetime::Instant::now(),
+            start: PreciseInstant::now(),
             request_received_at,
             request_sent,
             host,
@@ -649,14 +649,14 @@ impl<B: Body> PinnedDrop for PassthroughBody<B> {
             metrics::SERVED_TOTAL.increment();
             info!(
                 "simple proxy: passed through {path} from host {host} for client {client} in {} ({}, {})",
-                HumanFmt::Time(in_time.into()),
+                HumanFmt::Time(in_time),
                 rate_log::upstream_segment(transferred, upstream_window),
                 rate_log::client_segment(transferred, client_window),
             );
         } else {
             info!(
                 "simple proxy: aborted passthrough of {path} from host {host} for client {client} in {} ({})",
-                HumanFmt::Time(in_time.into()),
+                HumanFmt::Time(in_time),
                 rate_log::client_disconnect_segment(transferred, client_window),
             );
         }
@@ -850,7 +850,7 @@ async fn serve_unfinished_file(
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::task::spawn(async move {
-        let start = Instant::now();
+        let start = PreciseInstant::now();
         debug!(
             "Starting stream task for downloading file `{}` from mirror {} with length {content_length:?} for client {}...",
             file_path.display(),
@@ -976,7 +976,7 @@ async fn serve_unfinished_file(
                 conn_details.debname,
                 conn_details.mirror,
                 conn_details.client,
-                HumanFmt::Time(in_time.into()),
+                HumanFmt::Time(in_time),
                 rate_log::client_disconnect_segment(bytes, elapsed),
             );
         } else {
@@ -985,7 +985,7 @@ async fn serve_unfinished_file(
                 conn_details.debname,
                 conn_details.mirror,
                 conn_details.client,
-                HumanFmt::Time(in_time.into()),
+                HumanFmt::Time(in_time),
                 rate_log::client_segment(bytes, elapsed),
             );
             let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -1718,11 +1718,11 @@ async fn download_file(
     output: (tokio::fs::File, TempPath),
     mut dbarrier: DownloadBarrier,
     resume_offset: u64,
-    request_sent: Instant,
+    request_sent: PreciseInstant,
 ) {
     let config = global_config();
 
-    let start = Instant::now();
+    let start = PreciseInstant::now();
 
     debug!(
         "Starting download of file {} from mirror {} for client {}...",
@@ -1770,7 +1770,7 @@ async fn download_file(
                             "Error extracting frame from body for file {} from mirror {} (time={}, size={}, upstream_rate={}):  {}",
                             conn_details.debname,
                             conn_details.mirror,
-                            HumanFmt::Time(start.elapsed().into()),
+                            HumanFmt::Time(start.elapsed()),
                             HumanFmt::Size(bytes),
                             HumanFmt::Rate(bytes, start.elapsed()),
                             ErrorReport(&ierr),
@@ -1849,7 +1849,7 @@ async fn download_file(
         }
     }
 
-    let t_upstream_done = Instant::now();
+    let t_upstream_done = PreciseInstant::now();
 
     if let Err(err) = writer.flush().await {
         metrics::CACHE_IO_FAILURE.increment();
@@ -1952,7 +1952,7 @@ async fn download_file(
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
-        HumanFmt::Time(in_time.into()),
+        HumanFmt::Time(in_time),
         rate_log::upstream_segment(bytes, t_upstream_done.duration_since(request_sent)),
         if resume_offset > 0 {
             format!(", resumed from {}", HumanFmt::Size(resume_offset))
@@ -2228,7 +2228,7 @@ async fn serve_new_file(
     );
     trace!("Forwarded request: {fwd_request:?}");
 
-    let mut upstream_request_sent = Instant::now();
+    let mut upstream_request_sent = PreciseInstant::now();
     let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
         Err(err) => {
@@ -2279,7 +2279,7 @@ async fn serve_new_file(
 
             trace!("Forwarded redirected request: {redirected_request:?}");
 
-            upstream_request_sent = Instant::now();
+            upstream_request_sent = PreciseInstant::now();
             let redirected_response = match request_with_retry(
                 &appstate.https_client,
                 redirected_request,
@@ -2423,7 +2423,7 @@ async fn serve_new_file(
         let retry_request =
             build_fwd_request(&req_uri, host, &CacheFileStat::New, volatile_etag, 0, None);
 
-        upstream_request_sent = Instant::now();
+        upstream_request_sent = PreciseInstant::now();
         fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
             Ok(r) => r,
             Err(err) => {
@@ -2911,7 +2911,7 @@ async fn tunnel(
     host: &str,
     port: NonZero<u16>,
 ) -> std::io::Result<()> {
-    let start = Instant::now();
+    let start = PreciseInstant::now();
     let config = global_config();
 
     /* Connect to remote server */
@@ -2957,7 +2957,7 @@ async fn tunnel(
         "Tunneled client {client} wrote {} and received {} from {host}:{port} in {}",
         HumanFmt::Size(from_client),
         HumanFmt::Size(from_server),
-        HumanFmt::Time(start.elapsed().into())
+        HumanFmt::Time(start.elapsed())
     );
 
     Ok(())
@@ -3382,7 +3382,7 @@ async fn pre_process_client_request(
 
     trace!("Forwarded request: {fwd_request:?}");
 
-    let fwd_request_sent = Instant::now();
+    let fwd_request_sent = PreciseInstant::now();
     let fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
         Err(err) => {
@@ -3444,7 +3444,7 @@ async fn pre_process_client_request(
 
             trace!("Redirected request: {redirected_request:?}");
 
-            let redirected_request_sent = Instant::now();
+            let redirected_request_sent = PreciseInstant::now();
             let redirected_response = match request_with_retry(
                 &appstate.https_client,
                 redirected_request,

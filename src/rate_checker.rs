@@ -37,9 +37,12 @@ impl InsufficientRate {
             "Timeout occurred{context} after a download rate of {} [< {}] for the last {} seconds",
             HumanFmt::Rate(
                 self.transferred as u64,
-                Duration::from_secs(self.timeframe.get() as u64)
+                std::time::Duration::from_secs(self.timeframe.get() as u64)
             ),
-            HumanFmt::Rate(self.min_rate.get() as u64, Duration::from_secs(1)),
+            HumanFmt::Rate(
+                self.min_rate.get() as u64,
+                std::time::Duration::from_secs(1)
+            ),
             self.timeframe,
         )
     }
@@ -95,7 +98,7 @@ impl RateChecker {
                     "RateChecker: {:.2}s elapsed since last poll receiving {} ({})",
                     elapsed.as_f64(),
                     HumanFmt::Size(bytes as u64),
-                    HumanFmt::Rate(bytes as u64, elapsed)
+                    HumanFmt::Rate(bytes as u64, elapsed.into())
                 );
                 for _ in 1..elapsed_secs {
                     self.buf.push(0);

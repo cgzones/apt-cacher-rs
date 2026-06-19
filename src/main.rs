@@ -47,6 +47,7 @@ mod metrics;
 #[cfg(feature = "mmap")]
 mod mmap_body;
 mod permitted_host_cache;
+mod precise_instant;
 mod rate_checked_body;
 mod rate_checker;
 mod rate_log;

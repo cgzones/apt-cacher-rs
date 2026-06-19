@@ -1,7 +1,7 @@
 #[must_use]
 pub(crate) enum HumanFmt {
     Size(u64),
-    Rate(u64, coarsetime::Duration),
+    Rate(u64, std::time::Duration),
     Time(std::time::Duration),
 }
 
@@ -41,7 +41,7 @@ impl std::fmt::Display for HumanFmt {
                 write!(f, "{size:.0$}TB", precision(size))
             }
             Self::Rate(bytes, time) => {
-                let time = time.as_f64();
+                let time = time.as_secs_f64();
                 if time == 0.0 {
                     return write!(f, "???B/s");
                 }
@@ -155,50 +155,39 @@ mod tests {
 
     #[test]
     fn rate_test() {
+        // Zero window is unmeasurable -> sentinel (essentially unreachable with
+        // the std::time::Instant ns clock, but guards against a 0/0 divide).
         assert_eq!(
-            format!(
-                "{}",
-                HumanFmt::Rate(0, coarsetime::Duration::from_millis(0))
-            ),
+            format!("{}", HumanFmt::Rate(0, Duration::from_millis(0))),
             "???B/s"
         );
         assert_eq!(
-            format!(
-                "{}",
-                HumanFmt::Rate(1000, coarsetime::Duration::from_millis(0))
-            ),
+            format!("{}", HumanFmt::Rate(1000, Duration::from_millis(0))),
             "???B/s"
         );
         assert_eq!(
-            format!(
-                "{}",
-                HumanFmt::Rate(0, coarsetime::Duration::from_millis(1000))
-            ),
+            format!("{}", HumanFmt::Rate(0, Duration::from_secs(1))),
             "0.00B/s"
         );
         assert_eq!(
-            format!(
-                "{}",
-                HumanFmt::Rate(1, coarsetime::Duration::from_millis(12_345_678_987_654_321))
-            ),
+            format!("{}", HumanFmt::Rate(1, Duration::from_secs(1_000_000))),
             "0.00B/s"
         );
         assert_eq!(
-            format!(
-                "{}",
-                HumanFmt::Rate(1000, coarsetime::Duration::from_millis(1000))
-            ),
+            format!("{}", HumanFmt::Rate(1000, Duration::from_secs(1))),
             "1.00kB/s"
         );
+        // Sub-millisecond host-local window stays finite.
+        assert_eq!(
+            format!("{}", HumanFmt::Rate(61_700, Duration::from_micros(50))),
+            "1.23GB/s"
+        );
         assert_eq!(
             format!(
                 "{}",
-                HumanFmt::Rate(
-                    u64::MAX,
-                    coarsetime::Duration::from_millis(12_345_678_987_654_321)
-                )
+                HumanFmt::Rate(u64::MAX, Duration::from_secs(1_000_000))
             ),
-            "4.29GB/s"
+            "18.4TB/s"
         );
     }
 

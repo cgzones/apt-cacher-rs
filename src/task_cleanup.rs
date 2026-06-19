@@ -43,6 +43,7 @@ use crate::{
         MAX_METADATA_LINE_LEN, read_line_capped,
     },
     metrics,
+    precise_instant::PreciseInstant,
     task_cache_scan::task_cache_scan,
     utils::probe_dir,
     xz_stream::xz_decoder,
@@ -650,7 +651,7 @@ where
 
         let conn_details = ConnectionDetails {
             client: ClientInfo::new_cleanup(),
-            request_received_at: Instant::now(),
+            request_received_at: PreciseInstant::now(),
             mirror: mirror.clone(),
             aliased_host: None,
             debname: debname_for(pkgfmt),

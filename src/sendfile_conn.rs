@@ -9,7 +9,6 @@ use std::{
 };
 
 use bytes::{BytesMut, buf::Buf as _};
-use coarsetime::Instant;
 use http::{
     StatusCode,
     header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE},
@@ -41,6 +40,7 @@ use crate::{
     hyper_conn::handle_hyper_connection,
     metrics,
     permitted_host_cache::authorize_cache_access,
+    precise_instant::PreciseInstant,
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
     rate_log,
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
@@ -1244,7 +1244,7 @@ pub(crate) async fn serve_file_via_sendfile(
         return SendfileResult::ClientError;
     }
 
-    let start = Instant::now();
+    let start = PreciseInstant::now();
 
     // Use sendfile(2) to transfer the file body
     metrics::REQUESTS_SENDFILE.increment();
@@ -1266,7 +1266,7 @@ pub(crate) async fn serve_file_via_sendfile(
                 conn_details.debname,
                 conn_details.mirror,
                 conn_details.client,
-                HumanFmt::Time(in_time.into()),
+                HumanFmt::Time(in_time),
                 rate_log::client_segment(transferred, elapsed),
             );
             let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -1290,7 +1290,7 @@ pub(crate) async fn serve_file_via_sendfile(
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
-                    HumanFmt::Time(in_time.into()),
+                    HumanFmt::Time(in_time),
                     ErrorReport(&err),
                 );
             } else {
@@ -1299,7 +1299,7 @@ pub(crate) async fn serve_file_via_sendfile(
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
-                    HumanFmt::Time(in_time.into()),
+                    HumanFmt::Time(in_time),
                     ErrorReport(&err),
                 );
             }
@@ -2137,7 +2137,7 @@ async fn serve_unfinished_sendfile(
         return ZeroCopyResult::ClientError;
     }
 
-    let start = Instant::now();
+    let start = PreciseInstant::now();
 
     metrics::REQUESTS_SENDFILE.increment();
 
@@ -2168,7 +2168,7 @@ async fn serve_unfinished_sendfile(
                 conn_details.debname,
                 conn_details.mirror,
                 conn_details.client,
-                HumanFmt::Time(in_time.into()),
+                HumanFmt::Time(in_time),
                 rate_log::client_segment(transferred, elapsed),
             );
             let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
@@ -2192,7 +2192,7 @@ async fn serve_unfinished_sendfile(
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
-                    HumanFmt::Time(in_time.into()),
+                    HumanFmt::Time(in_time),
                     ErrorReport(&err),
                 );
             } else {
@@ -2201,7 +2201,7 @@ async fn serve_unfinished_sendfile(
                     conn_details.debname,
                     conn_details.mirror,
                     conn_details.client,
-                    HumanFmt::Time(in_time.into()),
+                    HumanFmt::Time(in_time),
                     ErrorReport(&err),
                 );
             }

@@ -52,6 +52,7 @@ use crate::ktls;
 #[cfg(feature = "ktls")]
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
+use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{InsufficientRate, RateCheckDirection, RateChecker};
 use crate::rate_log;
 #[cfg(feature = "ktls")]
@@ -1185,7 +1186,7 @@ async fn unbuffered_ktls_request(
     // upstream-rate window. Set in the `WriteTraffic` arm below; every other
     // arm of the request-send loop continues or returns, so the compiler can
     // prove definite initialisation by the time the post-loop read occurs.
-    let req_sent: Option<coarsetime::Instant>;
+    let req_sent: Option<PreciseInstant>;
 
     loop {
         /// Cap on state-machine rounds between handshake-complete and
@@ -1255,7 +1256,7 @@ async fn unbuffered_ktls_request(
                 write_all_to_stream(tcp, &outgoing[..enc_len], WritePhase::Header)
                     .await
                     .map_err(KtlsError::KtlsSetupFailed)?;
-                req_sent = Some(coarsetime::Instant::now());
+                req_sent = Some(PreciseInstant::now());
                 break;
             }
             ConnectionState::BlockedHandshake => {
@@ -1818,7 +1819,7 @@ struct UpstreamResponse {
     is_chunked: bool,
     /// Instant the upstream request was sent - start of the upstream-rate
     /// window. `None` only on responses built by the bare parser in tests.
-    request_sent_at: Option<coarsetime::Instant>,
+    request_sent_at: Option<PreciseInstant>,
 }
 
 /// Parse upstream HTTP response headers.
@@ -3142,7 +3143,7 @@ async fn send_and_read_headers(
         volatile_cond,
     )
     .await?;
-    let request_sent_at = coarsetime::Instant::now();
+    let request_sent_at = PreciseInstant::now();
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
@@ -5038,7 +5039,7 @@ async fn splice_proxy_drive(
         };
     }
 
-    let start = coarsetime::Instant::now();
+    let start = PreciseInstant::now();
 
     // Per-request rate-logging timestamps.
     //   - `t_req_sent`: start of the upstream-rate window (instant the upstream
@@ -5056,7 +5057,7 @@ async fn splice_proxy_drive(
     //   - `client_bytes_sent`: best-effort count of body bytes written toward
     //     the client, for the disconnect segment.
     let t_req_sent = upstream_resp.request_sent_at.unwrap_or(start);
-    let mut t_upstream_done = coarsetime::Instant::now();
+    let mut t_upstream_done = PreciseInstant::now();
     let mut client_bytes_sent: u64 = 0;
 
     if resume_offset > 0 {
@@ -5138,7 +5139,7 @@ async fn splice_proxy_drive(
     // direct write, or the kTLS-extra-body direct write.
     metrics::REQUESTS_SPLICE.increment();
     // Start of the client-rate window: the first byte heading to the client.
-    let t_client_first = coarsetime::Instant::now();
+    let t_client_first = PreciseInstant::now();
     write_all_to_stream(
         client_stream,
         response_headers.as_bytes(),
@@ -5325,7 +5326,7 @@ async fn splice_proxy_drive(
     // Client-rate-window end after the prefix / kTLS-extra-body writes; covers
     // the case where the splice loop never runs (whole body in the prefix).
     // Reassigned after the splice body block and the demoted file-serve task.
-    let mut t_client_done = coarsetime::Instant::now();
+    let mut t_client_done = PreciseInstant::now();
 
     // Transfer the remaining body
     let (demoted_handle, body_client_disconnected) = if splice_count > 0 {
@@ -5393,7 +5394,7 @@ async fn splice_proxy_drive(
         // The splice body block ran: the upstream-rate and client-rate windows
         // both end here. The demoted-client case reassigns `t_client_done`
         // again after the file-serve task completes.
-        t_upstream_done = coarsetime::Instant::now();
+        t_upstream_done = PreciseInstant::now();
         t_client_done = t_upstream_done;
         client_bytes_sent += body_client_bytes;
         (demoted_handle, body_client_disconnected)
@@ -5506,7 +5507,7 @@ async fn splice_proxy_drive(
         };
         // The demoted file-serve task is the last thing to write to the
         // client, so the client-rate window ends here.
-        t_client_done = coarsetime::Instant::now();
+        t_client_done = PreciseInstant::now();
         succeeded
     } else {
         true
@@ -5546,7 +5547,7 @@ async fn splice_proxy_drive(
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
-        HumanFmt::Time(in_time.into()),
+        HumanFmt::Time(in_time),
         if resume_offset > 0 {
             format!(", resumed from {}", HumanFmt::Size(resume_offset))
         } else {
@@ -5914,7 +5915,7 @@ async fn handle_volatile_buffered_download(
     // inverted. The fallback is a pre-read now() so t_req_sent <= t_upstream_done.
     let t_req_sent = upstream_resp
         .request_sent_at
-        .unwrap_or_else(coarsetime::Instant::now);
+        .unwrap_or_else(PreciseInstant::now);
 
     // Account this buffered serve under `ACTIVE_CLIENT_DOWNLOADS` for the
     // duration of the function (RAII drop on every return path).  Mirrors
@@ -5945,7 +5946,7 @@ async fn handle_volatile_buffered_download(
         SpliceProxyError::Upstream
     })?;
 
-    let t_upstream_done = coarsetime::Instant::now();
+    let t_upstream_done = PreciseInstant::now();
 
     // Drop upstream early to free the socket.
     // (PoolGuard::drop returns the connection to pool if still poolable.)
@@ -6111,7 +6112,7 @@ async fn handle_volatile_buffered_download(
         )
         .await;
 
-    let start = coarsetime::Instant::now();
+    let start = PreciseInstant::now();
 
     // Send response headers to client.
     let last_modified_str = upstream_resp.last_modified.as_deref().unwrap_or("");
@@ -6169,7 +6170,7 @@ async fn handle_volatile_buffered_download(
         StatusCode::OK
     });
     metrics::REQUESTS_SPLICE.increment();
-    let t_client_first = coarsetime::Instant::now();
+    let t_client_first = PreciseInstant::now();
     write_all_to_stream(
         client_stream,
         response_headers.as_bytes(),
@@ -6196,7 +6197,7 @@ async fn handle_volatile_buffered_download(
         .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "volatile body to client"))?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
-    let t_client_done = coarsetime::Instant::now();
+    let t_client_done = PreciseInstant::now();
     metrics::SERVED_SPLICE.increment();
     metrics::SERVED_TOTAL.increment();
 
@@ -6265,7 +6266,7 @@ async fn handle_volatile_buffered_download(
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
-        HumanFmt::Time(in_time.into()),
+        HumanFmt::Time(in_time),
         rate_log::upstream_segment(
             total_content_length.get(),
             t_upstream_done.duration_since(t_req_sent),
@@ -6418,7 +6419,7 @@ pub(crate) async fn splice_simple_proxy(
     mirror: &Mirror,
     upstream_path: &str,
     client: ClientInfo,
-    request_received_at: coarsetime::Instant,
+    request_received_at: PreciseInstant,
 ) -> Result<(), SpliceProxyError> {
     let host_authority = mirror.format_authority();
     let original_uri_path = upstream_path;
@@ -6433,9 +6434,7 @@ pub(crate) async fn splice_simple_proxy(
     let (up, resp, hdr_buf, hdr_end, _label, poolable) =
         standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None).await?;
 
-    let t_req_sent = resp
-        .request_sent_at
-        .unwrap_or_else(coarsetime::Instant::now);
+    let t_req_sent = resp.request_sent_at.unwrap_or_else(PreciseInstant::now);
 
     let port = mirror_port(mirror, up.is_tls());
 
@@ -6481,7 +6480,7 @@ pub(crate) async fn splice_simple_proxy(
         send_db_command(cmd).await;
     }
 
-    let t_client_first = coarsetime::Instant::now();
+    let t_client_first = PreciseInstant::now();
     write_all_to_stream(
         client_stream,
         rewritten_headers.as_bytes(),
@@ -6572,11 +6571,11 @@ pub(crate) async fn splice_simple_proxy(
         body_prefix.len() as u64 + helper_bytes
     };
 
-    let t_done = coarsetime::Instant::now();
+    let t_done = PreciseInstant::now();
     let in_time = request_received_at.elapsed();
     info!(
         "simple proxy: passed through {upstream_path} from host {host_authority} for client {client} in {} ({}, {})",
-        HumanFmt::Time(in_time.into()),
+        HumanFmt::Time(in_time),
         rate_log::upstream_segment(forwarded, t_done.duration_since(t_req_sent)),
         rate_log::client_segment(forwarded, t_done.duration_since(t_client_first)),
     );

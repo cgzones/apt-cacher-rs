@@ -5,7 +5,7 @@
 //! so the format stays identical across the hyper, sendfile and splice
 //! backends.
 
-use coarsetime::Duration;
+use std::time::Duration;
 
 use crate::humanfmt::HumanFmt;
 
@@ -38,43 +38,49 @@ pub(crate) fn client_segment(bytes: u64, window: Duration) -> String {
 pub(crate) fn client_disconnect_segment(bytes: u64, elapsed: Duration) -> String {
     format!(
         "client disconnected after {} ({})",
-        HumanFmt::Time(elapsed.into()),
+        HumanFmt::Time(elapsed),
         HumanFmt::Size(bytes)
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use coarsetime::Duration;
+    use std::time::Duration;
 
     use super::{client_disconnect_segment, client_segment, upstream_segment};
 
     #[test]
     fn upstream_segment_format() {
-        // `coarsetime::Duration::from_millis` encodes sub-second time at ~0.977ms
-        // resolution, so from_millis(50) stores ~48.8ms -- the literals below
-        // reflect coarsetime's quantized output, not a mathematically exact 50ms.
         assert_eq!(
             upstream_segment(4_050_000, Duration::from_millis(50)),
-            "upstream 4.05MB at 82.9MB/s"
+            "upstream 4.05MB at 81.0MB/s"
         );
     }
 
     #[test]
     fn client_segment_format() {
         assert_eq!(
-            client_segment(1_000_000, Duration::from_millis(1000)),
+            client_segment(1_000_000, Duration::from_secs(1)),
             "client 1.00MB at 1.00MB/s"
         );
     }
 
     #[test]
+    fn client_segment_sub_millisecond_window() {
+        // Host-local serves complete in microseconds; the std::time::Instant
+        // backing the window has nanosecond resolution, so the rate stays
+        // finite instead of collapsing to `???B/s`.
+        assert_eq!(
+            client_segment(61_700, Duration::from_micros(50)),
+            "client 61.7kB at 1.23GB/s"
+        );
+    }
+
+    #[test]
     fn client_disconnect_segment_format() {
-        // `coarsetime::Duration::from_millis` encodes sub-second time at ~0.977ms
-        // resolution; 18ms renders as the nearest representable window.
         assert_eq!(
             client_disconnect_segment(1_200_000, Duration::from_millis(18)),
-            "client disconnected after 17.6ms (1.20MB)"
+            "client disconnected after 18.0ms (1.20MB)"
         );
     }
 
@@ -88,11 +94,9 @@ mod tests {
 
     #[test]
     fn client_disconnect_segment_zero_bytes() {
-        // `coarsetime::Duration::from_millis` encodes sub-second time at ~0.977ms
-        // resolution; 5ms renders as the nearest representable window.
         assert_eq!(
             client_disconnect_segment(0, Duration::from_millis(5)),
-            "client disconnected after 4.88ms (0B)"
+            "client disconnected after 5.00ms (0B)"
         );
     }
 }

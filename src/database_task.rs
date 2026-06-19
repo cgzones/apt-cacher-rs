@@ -1,7 +1,7 @@
 use core::net::IpAddr;
 use std::{sync::OnceLock, time::Duration as StdDuration};
 
-use coarsetime::{Clock, Duration};
+use coarsetime::Clock;
 use hashbrown::HashMap;
 use log::{debug, error, info, warn};
 use tokio::time::MissedTickBehavior;
@@ -16,7 +16,7 @@ pub(crate) struct DbCmdDelivery {
     pub(crate) mirror: Mirror,
     pub(crate) debname: String,
     pub(crate) size: u64,
-    pub(crate) elapsed: Duration,
+    pub(crate) elapsed: StdDuration,
     pub(crate) partial: bool,
     pub(crate) client_ip: IpAddr,
 }
@@ -25,7 +25,7 @@ pub(crate) struct DbCmdDownload {
     pub(crate) mirror: Mirror,
     pub(crate) debname: String,
     pub(crate) size: u64,
-    pub(crate) elapsed: Duration,
+    pub(crate) elapsed: StdDuration,
     pub(crate) client_ip: IpAddr,
 }
 
@@ -114,9 +114,9 @@ fn ip_to_octets(ip: IpAddr) -> [u8; 16] {
     }
 }
 
-fn convert_size_duration(size: u64, elapsed: Duration) -> Option<(i64, i64)> {
+fn convert_size_duration(size: u64, elapsed: StdDuration) -> Option<(i64, i64)> {
     let size = i64::try_from(size).ok()?;
-    let duration = i64::try_from(StdDuration::from(elapsed).as_millis()).ok()?;
+    let duration = i64::try_from(elapsed.as_millis()).ok()?;
     Some((size, duration))
 }
 
