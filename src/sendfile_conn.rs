@@ -998,12 +998,15 @@ async fn try_sendfile_request(
 }
 
 /// Range and status parameters for a successful conditional evaluation.
+///
+/// "Partial" (a 206 delivery) is not stored separately: it is exactly
+/// `content_range.is_some()` (equivalently `http_status == 206`), so deriving
+/// it keeps the flag from drifting out of sync with the Content-Range.
 struct ServeParams {
     http_status: StatusCode,
     content_start: u64,
     content_length: u64,
     content_range: Option<String>,
-    partial: bool,
 }
 
 /// Outcome of [`evaluate_conditional_and_range`].
@@ -1090,7 +1093,6 @@ async fn evaluate_conditional_and_range(
                     content_start: start,
                     content_length: cl,
                     content_range: Some(content_range),
-                    partial: true,
                 }));
             }
             ParsedRange::NotSatisfiable => {
@@ -1115,7 +1117,6 @@ async fn evaluate_conditional_and_range(
         content_start: 0,
         content_length: file_size,
         content_range: None,
-        partial: false,
     }))
 }
 
@@ -1189,7 +1190,6 @@ pub(crate) async fn serve_file_via_sendfile(
         content_start,
         content_length,
         content_range,
-        partial,
     } = match evaluate_conditional_and_range(
         stream,
         &conn_details.client,
@@ -1278,7 +1278,7 @@ pub(crate) async fn serve_file_via_sendfile(
                 debname: conn_details.debname.clone(),
                 size: content_length,
                 elapsed,
-                partial,
+                partial: content_range.is_some(),
                 client_ip: conn_details.client.ip(),
             });
             send_db_command(cmd).await;
@@ -2090,7 +2090,6 @@ async fn serve_unfinished_sendfile(
         content_start,
         content_length,
         content_range,
-        partial,
     } = match evaluate_conditional_and_range(
         stream,
         &conn_details.client,
@@ -2186,7 +2185,7 @@ async fn serve_unfinished_sendfile(
                 debname: conn_details.debname.clone(),
                 size: content_length,
                 elapsed,
-                partial,
+                partial: content_range.is_some(),
                 client_ip: conn_details.client.ip(),
             });
             send_db_command(cmd).await;
