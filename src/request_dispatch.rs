@@ -132,16 +132,15 @@ pub(crate) enum DispatchOutcome {
     /// can build an upstream `Mirror` or emit per-request log lines without
     /// re-deriving it.
     Passthrough {
-        // The hyper backend (`main.rs`) only needs `requested_host` to
-        // continue its uncached forwarding flow; the sendfile backend
-        // (`sendfile_conn.rs`) inspects `reason` to choose between
-        // `splice_simple_proxy` and a `NotApplicable` handoff back to
+        // The hyper backend only needs `requested_host` to continue its
+        // uncached forwarding flow (it ignores `reason` via `reason: _`); the
+        // sendfile backend (`sendfile_conn.rs`) inspects `reason` to choose
+        // between `splice_simple_proxy` and a `NotApplicable` handoff back to
         // hyper.  Under feature configurations that exclude sendfile
-        // (e.g. `--no-default-features --features tls_hyper`), the field
-        // is genuinely unread in non-test builds - silence the dead-code
-        // lint there only (tests pattern-match on it directly).
+        // (e.g. `--no-default-features --features tls_hyper`), the field is
+        // genuinely unread - silence the dead-code lint there.
         #[cfg_attr(
-            all(not(feature = "sendfile"), not(test)),
+            not(feature = "sendfile"),
             expect(dead_code, reason = "consumed only by sendfile_conn dispatch")
         )]
         reason: PassthroughReason,
@@ -154,16 +153,33 @@ pub(crate) enum DispatchOutcome {
 
 /// Output of [`decide_request`].
 ///
-/// Carries the synchronous [`DispatchOutcome`] plus any deferred side-effect
-/// the async wrapper must drive.  The split lets unit tests exercise the
-/// routing logic without standing up the DB task channel.
+/// Mirrors [`DispatchOutcome`] but attaches the deferred `pending_origin` to
+/// the `Cache` arm only - the one outcome it can legally accompany - so a
+/// non-`Cache` decision cannot carry a stray origin.  The async wrapper drives
+/// that side-effect, then maps to the backend-facing `DispatchOutcome`.  The
+/// split lets unit tests exercise the routing logic without standing up the DB
+/// task channel.
 #[derive(Debug)]
-struct Decision {
-    outcome: DispatchOutcome,
-    /// `Some` only on a `Cache` outcome whose `class.origin_fields` indicated
-    /// a real (non-pseudo) architecture; the wrapper forwards the value to
-    /// `send_db_command` before returning the outcome.
-    pending_origin: Option<Origin>,
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transient value: built in decide_request and destructured immediately in \
+              dispatch_request, never stored or collected, so the variant-size gap is \
+              irrelevant; boxing the plan would add a per-request heap alloc on the cache path"
+)]
+enum Decision {
+    /// `pending_origin` is `Some` when `class.origin_fields` indicated a real
+    /// (non-pseudo) architecture; the wrapper forwards it to `send_db_command`
+    /// before returning the `Cache` outcome.
+    Cache {
+        plan: CachePlan,
+        pending_origin: Option<Origin>,
+    },
+    Reject(RejectReason),
+    Passthrough {
+        reason: PassthroughReason,
+        requested_host: ClientHost,
+        request_received_at: PreciseInstant,
+    },
 }
 
 /// Classify an incoming request URL and decide how to route it.
@@ -191,10 +207,27 @@ pub(crate) async fn dispatch_request(
         flat_blocklist::is_blocked,
         request_received_at,
     );
-    if let Some(origin) = decision.pending_origin {
-        send_db_command(DatabaseCommand::Origin(DbCmdOrigin { origin })).await;
+    match decision {
+        Decision::Cache {
+            plan,
+            pending_origin,
+        } => {
+            if let Some(origin) = pending_origin {
+                send_db_command(DatabaseCommand::Origin(DbCmdOrigin { origin })).await;
+            }
+            DispatchOutcome::Cache(plan)
+        }
+        Decision::Reject(reason) => DispatchOutcome::Reject(reason),
+        Decision::Passthrough {
+            reason,
+            requested_host,
+            request_received_at,
+        } => DispatchOutcome::Passthrough {
+            reason,
+            requested_host,
+            request_received_at,
+        },
     }
-    decision.outcome
 }
 
 /// Pure routing decision: no global reads, no async side-effects.
@@ -231,10 +264,7 @@ fn decide_request(
     if reject_pdiff_requests && *is_diff {
         info!("Rejecting diff request {uri_path} for client {client}");
         metrics::PDIFF_REJECTED.increment();
-        return Decision {
-            outcome: DispatchOutcome::Reject(RejectReason::DiffRequest),
-            pending_origin: None,
-        };
+        return Decision::Reject(RejectReason::DiffRequest);
     }
 
     let normalized = normalize_uri_path(uri_path);
@@ -273,8 +303,8 @@ fn decide_request(
                         architecture: fields.architecture,
                     });
 
-                    return Decision {
-                        outcome: DispatchOutcome::Cache(CachePlan {
+                    return Decision::Cache {
+                        plan: CachePlan {
                             mirror,
                             aliased_host,
                             debname: class.debname,
@@ -282,7 +312,7 @@ fn decide_request(
                             layout: class.layout,
                             request_received_at,
                             _private: (),
-                        }),
+                        },
                         pending_origin,
                     };
                 }
@@ -292,20 +322,14 @@ fn decide_request(
                     "Failed to decode {kind} `{}` from client {client}:  {source}",
                     raw.escape_debug()
                 );
-                return Decision {
-                    outcome: DispatchOutcome::Reject(RejectReason::BadEncoding),
-                    pending_origin: None,
-                };
+                return Decision::Reject(RejectReason::BadEncoding);
             }
             Err(ClassifyError::InvalidValue { kind, decoded }) => {
                 warn_once_or_info!(
                     "Unsupported {kind} `{}` from client {client}",
                     decoded.escape_debug()
                 );
-                return Decision {
-                    outcome: DispatchOutcome::Reject(RejectReason::InvalidValue),
-                    pending_origin: None,
-                };
+                return Decision::Reject(RejectReason::InvalidValue);
             }
             Err(ClassifyError::NonDebPool { filename }) => {
                 warn_once_or_info!(
@@ -332,10 +356,7 @@ fn decide_request(
             "Rejecting unsafe passthrough path {uri_path} ({passthrough_label}) for client {client}"
         );
         metrics::UNSAFE_PATH_REJECTED.increment();
-        return Decision {
-            outcome: DispatchOutcome::Reject(RejectReason::UnsafePath),
-            pending_origin: None,
-        };
+        return Decision::Reject(RejectReason::UnsafePath);
     }
 
     // `record_uncacheable` is intentionally NOT called here.  The sendfile
@@ -345,13 +366,10 @@ fn decide_request(
     // backend's terminal forwarding step (hyper's simple-proxy block; the
     // sendfile splice path) instead of inside the dispatcher gives an
     // exactly-once guarantee.
-    Decision {
-        outcome: DispatchOutcome::Passthrough {
-            reason: passthrough_reason,
-            requested_host,
-            request_received_at,
-        },
-        pending_origin: None,
+    Decision::Passthrough {
+        reason: passthrough_reason,
+        requested_host,
+        request_received_at,
     }
 }
 
@@ -386,12 +404,16 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        let DispatchOutcome::Cache(plan) = decision.outcome else {
+        let Decision::Cache {
+            plan,
+            pending_origin,
+        } = decision
+        else {
             unreachable!("expected Cache outcome")
         };
         assert_eq!(plan.layout, CacheLayout::StructuredPool);
         assert_eq!(plan.debname, "firefox_1.0_amd64.deb");
-        assert!(decision.pending_origin.is_none());
+        assert!(pending_origin.is_none());
     }
 
     #[test]
@@ -406,13 +428,15 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        let DispatchOutcome::Cache(plan) = decision.outcome else {
+        let Decision::Cache {
+            plan,
+            pending_origin,
+        } = decision
+        else {
             unreachable!("expected Cache outcome")
         };
         assert_eq!(plan.layout, CacheLayout::Dists);
-        let origin = decision
-            .pending_origin
-            .expect("binary-amd64 must record an origin");
+        let origin = pending_origin.expect("binary-amd64 must record an origin");
         assert_eq!(origin.distribution, "sid");
         assert_eq!(origin.component, "main");
         assert_eq!(origin.architecture, "binary-amd64");
@@ -432,16 +456,14 @@ mod tests {
         );
         assert!(
             matches!(
-                decision.outcome,
-                DispatchOutcome::Passthrough {
+                decision,
+                Decision::Passthrough {
                     reason: PassthroughReason::Unrecognized,
                     ..
                 }
             ),
-            "expected Unrecognized passthrough, got {:?}",
-            decision.outcome
+            "expected Unrecognized passthrough, got {decision:?}"
         );
-        assert!(decision.pending_origin.is_none());
     }
 
     #[test]
@@ -458,16 +480,14 @@ mod tests {
         );
         assert!(
             matches!(
-                decision.outcome,
-                DispatchOutcome::Passthrough {
+                decision,
+                Decision::Passthrough {
                     reason: PassthroughReason::NonDebPool,
                     ..
                 }
             ),
-            "expected NonDebPool passthrough, got {:?}",
-            decision.outcome
+            "expected NonDebPool passthrough, got {decision:?}"
         );
-        assert!(decision.pending_origin.is_none());
     }
 
     #[test]
@@ -484,16 +504,14 @@ mod tests {
         );
         assert!(
             matches!(
-                decision.outcome,
-                DispatchOutcome::Passthrough {
+                decision,
+                Decision::Passthrough {
                     reason: PassthroughReason::FlatBlocked,
                     ..
                 }
             ),
-            "expected FlatBlocked passthrough, got {:?}",
-            decision.outcome
+            "expected FlatBlocked passthrough, got {decision:?}"
         );
-        assert!(decision.pending_origin.is_none());
     }
 
     #[test]
@@ -509,9 +527,8 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(decision.outcome, DispatchOutcome::Cache(_)),
-            "expected Cache, got {:?}",
-            decision.outcome
+            matches!(decision, Decision::Cache { .. }),
+            "expected Cache, got {decision:?}"
         );
     }
 
@@ -528,12 +545,8 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(
-                decision.outcome,
-                DispatchOutcome::Reject(RejectReason::DiffRequest)
-            ),
-            "expected DiffRequest reject, got {:?}",
-            decision.outcome
+            matches!(decision, Decision::Reject(RejectReason::DiffRequest)),
+            "expected DiffRequest reject, got {decision:?}"
         );
     }
 
@@ -554,14 +567,13 @@ mod tests {
         // passthrough.
         assert!(
             matches!(
-                decision.outcome,
-                DispatchOutcome::Passthrough {
+                decision,
+                Decision::Passthrough {
                     reason: PassthroughReason::Unrecognized,
                     ..
                 }
             ),
-            "expected Unrecognized passthrough, got {:?}",
-            decision.outcome
+            "expected Unrecognized passthrough, got {decision:?}"
         );
     }
 
@@ -578,12 +590,8 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(
-                decision.outcome,
-                DispatchOutcome::Reject(RejectReason::UnsafePath)
-            ),
-            "expected UnsafePath reject, got {:?}",
-            decision.outcome
+            matches!(decision, Decision::Reject(RejectReason::UnsafePath)),
+            "expected UnsafePath reject, got {decision:?}"
         );
     }
 
@@ -604,12 +612,8 @@ mod tests {
             PreciseInstant::now(),
         );
         assert!(
-            matches!(
-                decision.outcome,
-                DispatchOutcome::Reject(RejectReason::DiffRequest)
-            ),
-            "expected DiffRequest reject, got {:?}",
-            decision.outcome
+            matches!(decision, Decision::Reject(RejectReason::DiffRequest)),
+            "expected DiffRequest reject, got {decision:?}"
         );
     }
 }
