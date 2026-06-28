@@ -1927,6 +1927,12 @@ enum DeliveryResult {
     Failure(u64),
 }
 
+/// The caller must `.await` the join handle after the download barrier has
+/// been consumed (so the spawned task can observe a terminal
+/// `ActiveDownloadStatus` -- `Verifying` while integrity hashing is in
+/// flight, then `Finished` once `RenameBarrier::commit` flips the variant).
+type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
+
 /// Splice data from upstream TCP socket to client socket, with zero-copy tee to a cache file.
 ///
 /// Data flow (all in kernel space, zero userspace copies):
@@ -1937,12 +1943,10 @@ enum DeliveryResult {
 ///                                  `--> splice -> client
 /// ```
 ///
-/// The caller must `.await` the join handle after the download barrier has
-/// been consumed (so the spawned task can observe a terminal
-/// `ActiveDownloadStatus` -- `Verifying` while integrity hashing is in
-/// flight, then `Finished` once `RenameBarrier::commit` flips the variant).
-type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
-
+/// On error the upstream is left mid-message (fewer than `content_length`
+/// bytes consumed), so its socket still holds undelivered bytes -- the caller
+/// must mark the upstream non-poolable to keep the poisoned connection out of
+/// the pool.
 #[expect(clippy::too_many_arguments, reason = "called from a single site")]
 async fn splice_proxy_body(
     upstream: &TcpStream,
@@ -2334,6 +2338,11 @@ enum TlsReadOutcome {
 ///   `tls_stream` →[async read]→ buffer →[write]→ `pipe_A` →[tee]→ `pipe_B` →[splice]→ `cache_file`
 ///                                                         ↓
 ///                                                   [splice]→ `client_socket`
+///
+/// On error the upstream is left mid-message (fewer than `content_length`
+/// bytes consumed), so its socket still holds undelivered bytes -- the caller
+/// must mark the upstream non-poolable to keep the poisoned connection out of
+/// the pool.
 #[expect(clippy::too_many_arguments, reason = "called from a single site")]
 async fn splice_proxy_body_tls(
     upstream: &mut UpstreamConn,
@@ -5422,6 +5431,13 @@ async fn splice_proxy_drive(
                 )
                 .await
             }
+            // Any body-transfer error leaves the upstream mid-message (fewer
+            // than content_length bytes consumed), so the socket still holds
+            // undelivered bytes. Mark it non-poolable so PoolGuard::drop
+            // discards it rather than re-pooling a poisoned connection -- the
+            // next checkout would otherwise log "pooled connection has
+            // unexpected data, discarding".
+            .inspect_err(|_err| upstream.unset_poolable())
             .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "splice body transfer"))?;
         dbarrier = returned_dbarrier;
         // The splice body block ran: the upstream-rate and client-rate windows
