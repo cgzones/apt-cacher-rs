@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt::Write as _,
     io::ErrorKind,
     num::{NonZero, Saturating},
@@ -1456,7 +1457,7 @@ async fn unbuffered_ktls_request(
         })?;
     response.request_sent_at = req_sent;
 
-    if response.status_code != 200 || response.content_length.is_none_or(|ct| ct == 0) {
+    if response.status_code != 200 || response.content_length().is_none_or(|ct| ct == 0) {
         // Non-spliceable response: the caller will reconnect via the standard
         // path for a complete fetch, so no need to drain the remaining TLS
         // records from this one-shot kTLS connection.
@@ -1825,20 +1826,47 @@ async fn read_upstream_response_headers(
     }
 }
 
+/// How an upstream HTTP response body is framed on the wire.
+///
+/// Resolved once by [`parse_upstream_response`] with chunked-takes-precedence
+/// semantics (RFC 9112 §6.1): when `Transfer-Encoding: chunked` is present its
+/// framing wins and any accompanying `Content-Length` is ignored. Modelling the
+/// two as one sum type means "both at once" is no longer representable, so every
+/// consumer reads a single, already-disambiguated framing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyFraming {
+    /// `Content-Length: N` and not chunked. Splice-eligible when `N > 0`.
+    ContentLength(u64),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// Neither header present: the body runs until the connection closes.
+    CloseDelimited,
+}
+
 /// Parsed upstream response header info.
 struct UpstreamResponse {
     status_code: http::StatusCode,
-    content_length: Option<u64>,
+    framing: BodyFraming,
     content_type: Option<String>,
     last_modified: Option<String>,
     etag: Option<String>,
     content_range: Option<String>,
     location: Option<String>,
     connection_close: bool,
-    is_chunked: bool,
     /// Instant the upstream request was sent - start of the upstream-rate
     /// window. `None` only on responses built by the bare parser in tests.
     request_sent_at: Option<PreciseInstant>,
+}
+
+impl UpstreamResponse {
+    /// The body's fixed length, only when the response is length-delimited
+    /// (`Content-Length`). `None` for chunked or close-delimited framing.
+    fn content_length(&self) -> Option<u64> {
+        match self.framing {
+            BodyFraming::ContentLength(n) => Some(n),
+            BodyFraming::Chunked | BodyFraming::CloseDelimited => None,
+        }
+    }
 }
 
 /// Parse upstream HTTP response headers.
@@ -1906,16 +1934,27 @@ fn parse_upstream_response(
             .any(|v| v.trim().eq_ignore_ascii_case("chunked"))
     });
 
+    // RFC 9112 §6.1: chunked framing takes precedence; a `Content-Length` sent
+    // alongside `Transfer-Encoding: chunked` must be ignored (defense against
+    // response smuggling). Resolve the precedence once, here, so no consumer
+    // can observe both at the same time.
+    let framing = if is_chunked {
+        BodyFraming::Chunked
+    } else if let Some(len) = content_length {
+        BodyFraming::ContentLength(len)
+    } else {
+        BodyFraming::CloseDelimited
+    };
+
     Ok(UpstreamResponse {
         status_code,
-        content_length,
+        framing,
         content_type,
         last_modified,
         etag,
         content_range,
         location,
         connection_close,
-        is_chunked,
         request_sent_at: None,
     })
 }
@@ -4489,10 +4528,22 @@ async fn splice_proxy_drive(
         metrics::REQUESTS_PASSTHROUGH.increment();
         metrics::record_client_status(upstream_resp.status_code);
 
-        // Forward raw response headers to client
-        write_all_to_stream(client_stream, &header_buf[..header_end], WritePhase::Header)
-            .await
-            .map_err(|err| SpliceProxyError::Client(err, "passthrough headers"))?;
+        // Forward the response headers to the client. This relay deliberately
+        // passes the upstream status line and headers through verbatim, with
+        // one exception: a `Content-Length` alongside chunked framing is
+        // stripped (RFC 9112 §6.1), matching `rewrite_simple_proxy_headers` and
+        // keeping the headers consistent with the chunked body forwarded below.
+        let passthrough_headers = strip_content_length_when_chunked(
+            &header_buf[..header_end],
+            matches!(upstream_resp.framing, BodyFraming::Chunked),
+        );
+        write_all_to_stream(
+            client_stream,
+            passthrough_headers.as_ref(),
+            WritePhase::Header,
+        )
+        .await
+        .map_err(|err| SpliceProxyError::Client(err, "passthrough headers"))?;
 
         // Forward any body data that arrived with the headers
         let body_prefix = &header_buf[header_end..];
@@ -4502,71 +4553,81 @@ async fn splice_proxy_drive(
             .min_download_rate
             .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
-        // Forward the remaining body data
-        if let Some(cl) = upstream_resp.content_length {
-            if !body_prefix.is_empty() {
-                write_all_to_stream_rated(
+        // Forward the remaining body data, framed per the upstream's
+        // (precedence-resolved) framing.
+        match upstream_resp.framing {
+            BodyFraming::ContentLength(cl) => {
+                if !body_prefix.is_empty() {
+                    write_all_to_stream_rated(
+                        client_stream,
+                        body_prefix,
+                        &mut prefix_client_rate_checker,
+                        RateCheckDirection::Client,
+                        config.http_timeout,
+                    )
+                    .await
+                    .map_err(|err| {
+                        SpliceProxyError::AfterHeaderClient(err, "passthrough body prefix (CL)")
+                    })?;
+                    metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
+                }
+                let already_sent = body_prefix.len() as u64;
+                let remaining = cl.saturating_sub(already_sent);
+                if remaining > 0 {
+                    let _forwarded = forward_upstream_body(&mut upstream, client_stream, remaining)
+                        .await
+                        .inspect_err(|_err| upstream.unset_poolable())
+                        .map_err(|err| {
+                            SpliceProxyError::AfterHeaderClient(err, "passthrough remaining body")
+                        })?;
+                }
+            }
+            BodyFraming::Chunked => {
+                // Chunked encoding: forward raw framing, detect termination.
+                // On success the closing `\r\n` after the `0\r\n` terminator has
+                // been fully consumed, so the connection stays poolable. On any
+                // framing error we must mark it non-poolable -- stray bytes may
+                // remain in the kernel socket buffer and would poison the next
+                // checkout.
+                let _forwarded = forward_upstream_chunked_body(
+                    &mut upstream,
                     client_stream,
                     body_prefix,
-                    &mut prefix_client_rate_checker,
-                    RateCheckDirection::Client,
-                    config.http_timeout,
+                    VOLATILE_BODY_MAX,
+                )
+                .await
+                .inspect_err(|_err| upstream.unset_poolable())
+                .map_err(|err| {
+                    SpliceProxyError::AfterHeaderClient(err, "passthrough chunked body")
+                })?;
+            }
+            BodyFraming::CloseDelimited => {
+                // No Content-Length and not chunked: read until EOF
+                if !body_prefix.is_empty() {
+                    write_all_to_stream_rated(
+                        client_stream,
+                        body_prefix,
+                        &mut prefix_client_rate_checker,
+                        RateCheckDirection::Client,
+                        config.http_timeout,
+                    )
+                    .await
+                    .map_err(|err| {
+                        SpliceProxyError::AfterHeaderClient(err, "passthrough body prefix (EOF)")
+                    })?;
+                    metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
+                }
+                upstream.unset_poolable();
+                let _forwarded = forward_upstream_body_until_eof(
+                    &mut upstream,
+                    client_stream,
+                    VOLATILE_BODY_MAX,
                 )
                 .await
                 .map_err(|err| {
-                    SpliceProxyError::AfterHeaderClient(err, "passthrough body prefix (CL)")
+                    SpliceProxyError::AfterHeaderClient(err, "passthrough body until EOF")
                 })?;
-                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
             }
-            let already_sent = body_prefix.len() as u64;
-            let remaining = cl.saturating_sub(already_sent);
-            if remaining > 0 {
-                let _forwarded = forward_upstream_body(&mut upstream, client_stream, remaining)
-                    .await
-                    .inspect_err(|_err| upstream.unset_poolable())
-                    .map_err(|err| {
-                        SpliceProxyError::AfterHeaderClient(err, "passthrough remaining body")
-                    })?;
-            }
-        } else if upstream_resp.is_chunked {
-            // Chunked encoding: forward raw framing, detect termination.
-            // On success the closing `\r\n` after the `0\r\n` terminator has
-            // been fully consumed, so the connection stays poolable. On any
-            // framing error we must mark it non-poolable -- stray bytes may
-            // remain in the kernel socket buffer and would poison the next
-            // checkout.
-            let _forwarded = forward_upstream_chunked_body(
-                &mut upstream,
-                client_stream,
-                body_prefix,
-                VOLATILE_BODY_MAX,
-            )
-            .await
-            .inspect_err(|_err| upstream.unset_poolable())
-            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "passthrough chunked body"))?;
-        } else {
-            // No Content-Length and not chunked: read until EOF
-            if !body_prefix.is_empty() {
-                write_all_to_stream_rated(
-                    client_stream,
-                    body_prefix,
-                    &mut prefix_client_rate_checker,
-                    RateCheckDirection::Client,
-                    config.http_timeout,
-                )
-                .await
-                .map_err(|err| {
-                    SpliceProxyError::AfterHeaderClient(err, "passthrough body prefix (EOF)")
-                })?;
-                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
-            }
-            upstream.unset_poolable();
-            let _forwarded =
-                forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
-                    .await
-                    .map_err(|err| {
-                        SpliceProxyError::AfterHeaderClient(err, "passthrough body until EOF")
-                    })?;
         }
 
         // InitBarrier fires on return, which is correct: nothing was cached
@@ -4664,7 +4725,7 @@ async fn splice_proxy_drive(
             {
                 let remaining = end - start + 1;
                 // Cross-check declared Content-Length (if present) matches the range span.
-                if let Some(cl) = upstream_resp.content_length
+                if let Some(cl) = upstream_resp.content_length()
                     && cl != remaining
                 {
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
@@ -4727,7 +4788,9 @@ async fn splice_proxy_drive(
     } else {
         // Fresh download
         resume_offset = 0;
-        let Some(cl) = upstream_resp.content_length else {
+        // Length-delimited bodies are spliced; chunked / close-delimited fall
+        // back to the buffered path (volatile) or are refused (non-volatile).
+        let Some(cl) = upstream_resp.content_length() else {
             if conn_details.cached_flavor == CachedFlavor::Volatile {
                 return handle_volatile_buffered_download(
                     &mut upstream,
@@ -5976,20 +6039,26 @@ async fn handle_volatile_buffered_download(
     // bypasses those and would otherwise undercount.
     let _client_count = client_counter::ClientDownload::new();
 
-    // Buffer the entire body into memory.
-    let body = if upstream_resp.is_chunked {
-        // Chunked: on success the closing `\r\n` after the `0\r\n` terminator
-        // has been fully consumed, so the connection stays poolable. On any
-        // framing error we must mark it non-poolable -- stray bytes may
-        // remain in the kernel socket buffer and would poison the next
-        // checkout.
-        read_dechunk_body_to_vec(upstream, body_prefix, max_bytes)
-            .await
-            .inspect_err(|_err| upstream.unset_poolable())
-    } else {
-        // Close-delimited: read until EOF.
-        upstream.unset_poolable();
-        read_body_to_vec_until_eof(upstream, body_prefix, max_bytes).await
+    // Buffer the entire body into memory. This path is only reached without a
+    // usable Content-Length (the length-delimited case is spliced), so framing
+    // is chunked or close-delimited.
+    let body = match upstream_resp.framing {
+        BodyFraming::Chunked => {
+            // Chunked: on success the closing `\r\n` after the `0\r\n`
+            // terminator has been fully consumed, so the connection stays
+            // poolable. On any framing error we must mark it non-poolable --
+            // stray bytes may remain in the kernel socket buffer and would
+            // poison the next checkout.
+            read_dechunk_body_to_vec(upstream, body_prefix, max_bytes)
+                .await
+                .inspect_err(|_err| upstream.unset_poolable())
+        }
+        // Close-delimited: read until EOF. (A `ContentLength` body never
+        // reaches the buffered path; treat it as close-delimited defensively.)
+        BodyFraming::ContentLength(_) | BodyFraming::CloseDelimited => {
+            upstream.unset_poolable();
+            read_body_to_vec_until_eof(upstream, body_prefix, max_bytes).await
+        }
     }
     .map_err(|err| {
         warn_once_or_info!(
@@ -6462,6 +6531,42 @@ fn rewrite_simple_proxy_headers(
     Ok(buf)
 }
 
+/// Strip every `Content-Length` header line from a raw response header block
+/// when `chunked` is set, leaving the rest of the block byte-for-byte.
+///
+/// The lightweight non-2xx passthrough relay in `splice_proxy_drive` forwards
+/// the upstream status line and headers verbatim rather than going through
+/// `rewrite_simple_proxy_headers`; this applies that function's one
+/// security-relevant rewrite (RFC 9112 §6.1: a `Content-Length` accompanying
+/// `Transfer-Encoding: chunked` must be dropped, lest an intermediary frame the
+/// body the wrong way) without otherwise reshaping the headers. Returns the
+/// input unchanged when not chunked.
+fn strip_content_length_when_chunked(raw_headers: &[u8], chunked: bool) -> Cow<'_, [u8]> {
+    if !chunked {
+        return Cow::Borrowed(raw_headers);
+    }
+    let mut out = Vec::with_capacity(raw_headers.len());
+    let mut rest = raw_headers;
+    loop {
+        let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
+            // No further CRLF: append any trailing bytes verbatim and stop.
+            out.extend_from_slice(rest);
+            break;
+        };
+        let line = &rest[..eol];
+        let is_content_length = line
+            .iter()
+            .position(|&b| b == b':')
+            .is_some_and(|colon| line[..colon].eq_ignore_ascii_case(b"content-length"));
+        if !is_content_length {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+        rest = &rest[eol + 2..];
+    }
+    Cow::Owned(out)
+}
+
 /// Connects to upstream, sends a GET request, and forwards the complete response
 /// (headers + body) to the client.  No caching, no active-download tracking,
 /// no resume handling — just a transparent relay.
@@ -6550,78 +6655,83 @@ pub(crate) async fn splice_simple_proxy(
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
-    // Forward the remaining body.
-    //
-    // Framing priority: chunked takes precedence over Content-Length when
-    // both are present.  RFC 9112 §6.1 requires that Content-Length be
-    // ignored when Transfer-Encoding: chunked is also set (defense against
-    // request/response smuggling), and the header rewrite above already
-    // strips Content-Length in that case — so we must frame the body the
-    // same way the client will be reading it.
-    let forwarded: u64 = if resp.is_chunked {
-        // Chunked encoding: forward raw framing, detect termination.
-        // body_prefix is passed into the helper, so its return includes the prefix.
-        // On success the closing `\r\n` after the `0\r\n` terminator has been
-        // fully consumed, so the connection stays poolable. On any framing
-        // error we must mark it non-poolable -- stray bytes may remain in
-        // the kernel socket buffer and would poison the next checkout.
-        forward_upstream_chunked_body(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
+    // Forward the remaining body, framed per the upstream's framing. Chunked
+    // precedence over Content-Length is already resolved in the parser (RFC
+    // 9112 §6.1), and `rewrite_simple_proxy_headers` above stripped the ignored
+    // Content-Length, so the headers and the body framing agree.
+    let forwarded: u64 = match resp.framing {
+        BodyFraming::Chunked => {
+            // Chunked encoding: forward raw framing, detect termination.
+            // body_prefix is passed into the helper, so its return includes the prefix.
+            // On success the closing `\r\n` after the `0\r\n` terminator has been
+            // fully consumed, so the connection stays poolable. On any framing
+            // error we must mark it non-poolable -- stray bytes may remain in
+            // the kernel socket buffer and would poison the next checkout.
+            forward_upstream_chunked_body(
+                &mut upstream,
+                client_stream,
+                body_prefix,
+                VOLATILE_BODY_MAX,
+            )
             .await
             .inspect_err(|_err| upstream.unset_poolable())
             .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "simple-proxy chunked body"))?
-    } else if let Some(cl) = resp.content_length {
-        if !body_prefix.is_empty() {
-            write_all_to_stream_rated(
-                client_stream,
-                body_prefix,
-                &mut prefix_client_rate_checker,
-                RateCheckDirection::Client,
-                config.http_timeout,
-            )
-            .await
-            .map_err(|err| {
-                SpliceProxyError::AfterHeaderClient(err, "simple-proxy body prefix (CL)")
-            })?;
-            metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
         }
-        let already_sent = body_prefix.len() as u64;
-        let remaining = cl.saturating_sub(already_sent);
-        if remaining > 0 {
-            let helper_bytes = forward_upstream_body(&mut upstream, client_stream, remaining)
+        BodyFraming::ContentLength(cl) => {
+            if !body_prefix.is_empty() {
+                write_all_to_stream_rated(
+                    client_stream,
+                    body_prefix,
+                    &mut prefix_client_rate_checker,
+                    RateCheckDirection::Client,
+                    config.http_timeout,
+                )
                 .await
-                .inspect_err(|_err| upstream.unset_poolable())
                 .map_err(|err| {
-                    SpliceProxyError::AfterHeaderClient(err, "simple-proxy remaining body")
+                    SpliceProxyError::AfterHeaderClient(err, "simple-proxy body prefix (CL)")
                 })?;
+                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
+            }
+            let already_sent = body_prefix.len() as u64;
+            let remaining = cl.saturating_sub(already_sent);
+            if remaining > 0 {
+                let helper_bytes = forward_upstream_body(&mut upstream, client_stream, remaining)
+                    .await
+                    .inspect_err(|_err| upstream.unset_poolable())
+                    .map_err(|err| {
+                        SpliceProxyError::AfterHeaderClient(err, "simple-proxy remaining body")
+                    })?;
+                body_prefix.len() as u64 + helper_bytes
+            } else {
+                body_prefix.len() as u64
+            }
+        }
+        BodyFraming::CloseDelimited => {
+            // No Content-Length and not chunked: read until EOF.
+            // body_prefix is written separately before the helper call.
+            if !body_prefix.is_empty() {
+                write_all_to_stream_rated(
+                    client_stream,
+                    body_prefix,
+                    &mut prefix_client_rate_checker,
+                    RateCheckDirection::Client,
+                    config.http_timeout,
+                )
+                .await
+                .map_err(|err| {
+                    SpliceProxyError::AfterHeaderClient(err, "simple-proxy body prefix (EOF)")
+                })?;
+                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
+            }
+            upstream.unset_poolable();
+            let helper_bytes =
+                forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
+                    .await
+                    .map_err(|err| {
+                        SpliceProxyError::AfterHeaderClient(err, "simple-proxy body until EOF")
+                    })?;
             body_prefix.len() as u64 + helper_bytes
-        } else {
-            body_prefix.len() as u64
         }
-    } else {
-        // No Content-Length and not chunked: read until EOF.
-        // body_prefix is written separately before the helper call.
-        if !body_prefix.is_empty() {
-            write_all_to_stream_rated(
-                client_stream,
-                body_prefix,
-                &mut prefix_client_rate_checker,
-                RateCheckDirection::Client,
-                config.http_timeout,
-            )
-            .await
-            .map_err(|err| {
-                SpliceProxyError::AfterHeaderClient(err, "simple-proxy body prefix (EOF)")
-            })?;
-            metrics::BYTES_SERVED_PASSTHROUGH.increment_by(body_prefix.len() as u64);
-        }
-        upstream.unset_poolable();
-        let helper_bytes =
-            forward_upstream_body_until_eof(&mut upstream, client_stream, VOLATILE_BODY_MAX)
-                .await
-                .map_err(|err| {
-                    SpliceProxyError::AfterHeaderClient(err, "simple-proxy body until EOF")
-                })?;
-        body_prefix.len() as u64 + helper_bytes
     };
 
     let t_done = PreciseInstant::now();
@@ -6766,7 +6876,7 @@ mod tests {
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.content_length, Some(12345));
+        assert_eq!(resp.content_length(), Some(12345));
         assert_eq!(
             resp.content_type.as_deref(),
             Some("application/vnd.debian.binary-package")
@@ -6783,8 +6893,8 @@ mod tests {
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.content_length, None);
-        assert!(resp.is_chunked);
+        assert_eq!(resp.content_length(), None);
+        assert_eq!(resp.framing, BodyFraming::Chunked);
     }
 
     #[test]
@@ -6792,8 +6902,62 @@ mod tests {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
-        assert!(!resp.is_chunked);
-        assert_eq!(resp.content_length, Some(42));
+        assert_eq!(resp.framing, BodyFraming::ContentLength(42));
+        assert_eq!(resp.content_length(), Some(42));
+    }
+
+    #[test]
+    fn parse_upstream_response_chunked_takes_precedence_over_content_length() {
+        // RFC 9112 §6.1: a Content-Length sent alongside chunked must be
+        // ignored. The parser resolves the precedence so no consumer can
+        // observe both at once.
+        let headers = b"HTTP/1.1 200 OK\r\n\
+                        Content-Length: 42\r\n\
+                        Transfer-Encoding: chunked\r\n\
+                        \r\n";
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+        assert_eq!(resp.framing, BodyFraming::Chunked);
+        assert_eq!(resp.content_length(), None);
+    }
+
+    #[test]
+    fn parse_upstream_response_close_delimited_without_framing_headers() {
+        let headers = b"HTTP/1.1 200 OK\r\n\r\n";
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+        assert_eq!(resp.framing, BodyFraming::CloseDelimited);
+        assert_eq!(resp.content_length(), None);
+    }
+
+    #[test]
+    fn strip_content_length_when_chunked_drops_only_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Content-Length: 42\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    X-Keep: 1\r\n\
+                    \r\n";
+        let out = strip_content_length_when_chunked(raw, true);
+        assert_eq!(
+            out.as_ref(),
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Keep: 1\r\n\r\n"[..]
+        );
+        // Header-name match is case-insensitive.
+        let raw_lc = b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nX-Keep: 1\r\n\r\n";
+        let out_lc = strip_content_length_when_chunked(raw_lc, true);
+        assert_eq!(
+            out_lc.as_ref(),
+            &b"HTTP/1.1 200 OK\r\nX-Keep: 1\r\n\r\n"[..]
+        );
+    }
+
+    #[test]
+    fn strip_content_length_when_chunked_is_verbatim_when_not_chunked() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
+        let out = strip_content_length_when_chunked(raw, false);
+        // Not chunked: returned without copying or modification.
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), &raw[..]);
     }
 
     #[test]
@@ -6989,7 +7153,7 @@ mod tests {
                         \r\n";
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
-        assert_eq!(resp.content_length, Some(42));
+        assert_eq!(resp.content_length(), Some(42));
         assert_eq!(resp.content_type.as_deref(), Some("text/plain"));
         assert_eq!(
             resp.last_modified.as_deref(),
@@ -7017,7 +7181,7 @@ mod tests {
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.content_length, Some(999));
+        assert_eq!(resp.content_length(), Some(999));
         assert_eq!(
             resp.content_type.as_deref(),
             Some("application/octet-stream")
@@ -7037,7 +7201,7 @@ mod tests {
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
         assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.content_length, None);
+        assert_eq!(resp.content_length(), None);
         assert_eq!(resp.content_type, None);
         assert_eq!(resp.last_modified, None);
         assert_eq!(resp.etag, None);
