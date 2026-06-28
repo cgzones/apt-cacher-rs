@@ -355,19 +355,16 @@ struct PoolGuard {
     conn: Option<UpstreamConn>,
     host: String,
     port: u16,
-    is_tls: bool,
     poolable: bool,
 }
 
 impl PoolGuard {
     /// Creates a new `PoolGuard` wrapping the given `UpstreamConn`.
     fn new(conn: UpstreamConn, host: String, port: u16, poolable: bool) -> Self {
-        let is_tls = conn.is_tls();
         Self {
             conn: Some(conn),
             host,
             port,
-            is_tls,
             poolable,
         }
     }
@@ -380,7 +377,6 @@ impl PoolGuard {
     /// Replace the inner connection (e.g., after a retry with a fresh connection).
     /// The old connection is dropped without being returned to the pool.
     fn replace(&mut self, conn: UpstreamConn, poolable: bool) {
-        self.is_tls = conn.is_tls();
         self.conn = Some(conn);
         self.poolable = poolable;
     }
@@ -404,7 +400,9 @@ impl Drop for PoolGuard {
         if self.poolable
             && let Some(conn) = self.conn.take()
         {
-            pool_return(&self.host, self.port, self.is_tls, conn);
+            // Derive from the connection itself rather than caching it in a
+            // field that could drift from `conn`'s actual scheme.
+            pool_return(&self.host, self.port, conn.is_tls(), conn);
         }
     }
 }
