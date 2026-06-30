@@ -795,6 +795,25 @@ mod tests {
     }
 
     #[test]
+    fn classify_gitea_flat_pool() {
+        // issue #162: a non-canonical Gitea pool path arrives as Flat { Pool } and
+        // classifies as a permanent flat-pool resource under the host flat layout.
+        let res = ResourceFile::Flat {
+            kind: FlatKind::Pool,
+            mirror_path: "api/packages/85/debian/pool/php-zts/main",
+            filename: "php-zts-cli_8.5.7-1_amd64.deb",
+        };
+        let class = classify_request(&res, &fake_client()).unwrap();
+        assert_eq!(
+            class.mirror_path,
+            "api/packages/85/debian/pool/php-zts/main"
+        );
+        assert_eq!(class.debname, "php-zts-cli_8.5.7-1_amd64.deb");
+        assert_eq!(class.cached_flavor, CachedFlavor::Permanent);
+        assert_eq!(class.layout, CacheLayout::Flat);
+    }
+
+    #[test]
     fn classify_flat_byhash() {
         let res = ResourceFile::Flat {
             kind: FlatKind::ByHash,

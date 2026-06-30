@@ -29,8 +29,8 @@ use crate::{
     config::{CacheHost, Config},
     database::{MirrorEntry, resolved_cache_host},
     deb_mirror::{
-        Mirror, MirrorKind, UriFormat as _, is_deb_package, is_strict_path_descendant,
-        mirror_cache_path_impl, path_starts_with_segment,
+        Mirror, MirrorKind, UriFormat as _, flat_pool_archive_root, is_deb_package,
+        is_strict_path_descendant, mirror_cache_path_impl, path_starts_with_segment,
     },
     error::ProxyCacheError,
     global_cache_quota, global_config,
@@ -1481,6 +1481,177 @@ async fn sweep_aged_cached_debs(
     }
 }
 
+/// Strict cleanup for a hybrid flat-pool mirror whose referencing `Packages`
+/// index lives in the structured `dists/` tree of its archive root (issue #162,
+/// e.g. Gitea/Forgejo `.../pool/<dist>/<comp>`).
+///
+/// Returns `Some(CleanupDone)` when it owned the reconciliation: the archive
+/// root has a `mirrors_v2` row, has at least one active origin, and every active
+/// origin's `dists/.../Packages*` was fetched and reduced; leftover unreferenced
+/// debs are swept with the short `UNREFERENCED_KEEP_SPAN` grace. Returns `None`
+/// when strict reconciliation does not apply or cannot complete (no `/pool/`
+/// segment, no archive-root row, no active origins, or any Packages fetch/parse
+/// failed), so the caller falls back to the co-located / root-segment /
+/// time-based chain. Conservative on any fetch failure, matching
+/// `cleanup_mirror_deb_files`, so it never over-evicts.
+async fn try_strict_flat_pool_cleanup(
+    mirror: &Mirror,
+    cached_files: &mut HashMap<String, PathBuf>,
+    num_total_files: u64,
+    appstate: &AppState,
+    config: &Config,
+) -> Option<CleanupDone> {
+    let (archive_root, flat_lookup_prefix) = flat_pool_archive_root(mirror.path())?;
+
+    // Gate on an existing archive-root row so a fetch never mints a
+    // cleanup-synthesised mirror (parity with the root-segment fallback).
+    match appstate
+        .database
+        .mirror_exists(mirror.host(), mirror.port(), archive_root)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!("Error checking archive-root `{archive_root}` mirror row:  {err}");
+            return None;
+        }
+    }
+
+    let origins = match appstate
+        .database
+        .get_origins_by_mirror(mirror.host(), mirror.port(), archive_root)
+        .await
+    {
+        Ok(o) => o,
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!("Error looking up archive-root origins for `{archive_root}`:  {err}");
+            return None;
+        }
+    };
+
+    let now: Duration = coarsetime::Clock::now_since_epoch().into();
+    let active_origins: Vec<_> = origins
+        .into_iter()
+        .filter(|origin| {
+            Duration::from_secs(
+                u64::try_from(origin.last_seen)
+                    .expect("Database should never store negative timestamp"),
+            ) + RETENTION_TIME
+                > now
+        })
+        .collect();
+
+    if active_origins.is_empty() {
+        return None;
+    }
+
+    let archive_mirror = Mirror::new(
+        mirror.host().clone(),
+        mirror.port(),
+        archive_root.to_owned(),
+        MirrorKind::Structured,
+    );
+
+    let mut mismatch_files: u64 = 0;
+    let mut mismatch_bytes: u64 = 0;
+
+    for origin in &active_origins {
+        let base_uri = origin.uri();
+        let (mut response, pkgfmt) = match try_fetch_packages_file(
+            &archive_mirror,
+            &base_uri,
+            CacheLayout::Dists,
+            |pkgfmt| {
+                format!(
+                    "{}_{}_{}_Packages{}",
+                    origin.distribution,
+                    origin.component,
+                    origin.architecture,
+                    pkgfmt.extension()
+                )
+            },
+            appstate,
+        )
+        .await
+        {
+            Ok(r) => r,
+            // Conservative: a missing dists Packages for any active origin
+            // leaves the reference set incomplete; defer to the caller's
+            // time-based fallback rather than risk evicting debs this origin
+            // would have referenced.
+            Err(status) => {
+                debug!(
+                    "strict flat-pool cleanup: could not fetch archive-root Packages for `{archive_root}` ({status}); deferring mirror {mirror} to time-based fallback"
+                );
+                return None;
+            }
+        };
+
+        let memfdname = format!(
+            "{}_{}_{}_packages{}",
+            origin.distribution,
+            origin.component,
+            origin.architecture,
+            pkgfmt.extension(),
+        );
+
+        let file = match packages_body_to_memfd(&memfdname, response.body_mut(), config).await {
+            Ok(f) => f,
+            Err(err) => {
+                error!("Failed to buffer archive-root Packages `{memfdname}`:  {err}");
+                return None;
+            }
+        };
+
+        {
+            let mut ctx = ReduceContext {
+                mirror,
+                layout: CacheLayout::Flat,
+                mismatch_files: &mut mismatch_files,
+                mismatch_bytes: &mut mismatch_bytes,
+                flat_lookup_prefix: flat_lookup_prefix.as_str(),
+            };
+            if let Err(err) = pkgfmt
+                .reduce_file_list(file, &memfdname, cached_files, &mut ctx, config)
+                .await
+            {
+                error!("Failed to reduce archive-root Packages `{memfdname}`:  {err}");
+                return None;
+            }
+        }
+
+        if cached_files.is_empty() {
+            break;
+        }
+    }
+
+    // Every active origin's Packages was fetched and reduced. Leftovers are
+    // genuinely unreferenced; evict those past the short grace window.
+    let swept = sweep_aged_cached_debs(
+        cached_files,
+        UNREFERENCED_KEEP_SPAN,
+        mirror,
+        CacheLayout::Flat,
+    )
+    .await;
+
+    info!(
+        "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
+        swept.files_removed,
+        HumanFmt::Size(swept.bytes_removed),
+    );
+
+    Some(CleanupDone::tally(
+        mirror.clone(),
+        num_total_files,
+        mismatch_files + swept.files_removed,
+        mismatch_bytes + swept.bytes_removed,
+    ))
+}
+
 async fn cleanup_mirror_flat_files(
     mirror: MirrorEntry,
     nested_mirror_paths: Vec<String>,
@@ -1529,6 +1700,23 @@ async fn cleanup_mirror_flat_files(
 
     if cached_files.is_empty() {
         return Ok(CleanupDone::retained_only(mirror, num_total_files));
+    }
+
+    // Phase 2 (issue #162): a hybrid flat-pool mirror (`.../pool/<dist>/<comp>`)
+    // is referenced by the structured `dists/` Packages index of its archive
+    // root, which the co-located/root-segment fetches below cannot find.
+    // Reconcile against that index when available; otherwise fall through to
+    // the time-based fallback (never a regression).
+    if let Some(done) = try_strict_flat_pool_cleanup(
+        &mirror,
+        &mut cached_files,
+        num_total_files,
+        &appstate,
+        config,
+    )
+    .await
+    {
+        return Ok(done);
     }
 
     let base_uri = format!(

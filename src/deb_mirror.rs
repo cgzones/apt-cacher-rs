@@ -532,30 +532,13 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
      * debian-security/pool/updates/main/c/chromium/chromium-common_141.0.7390.65-1%7edeb12u1_amd64.deb
      */
     if let Some((mirror_path, pool_path)) = path.split_once("/pool/") {
-        let mut parts = pool_path.rsplit('/');
-
-        let filename = parts.next()?;
-
-        let package = parts.next()?;
-
-        let prefix = parts.next()?;
-        if !package.starts_with(prefix) {
-            return None;
-        }
-
-        let _component = parts.next()?;
-
-        if parts
-            .next()
-            .is_some_and(|s| s != "updates" || parts.next().is_some())
-        {
-            return None;
-        }
-
-        return Some(ResourceFile::Pool {
-            mirror_path,
-            filename,
-        });
+        // Canonical Debian-archive pool layout. On a non-canonical pool path
+        // (e.g. Gitea/Forgejo `pool/<dist>/<comp>/<file>`, which the Debian
+        // repository format permits via an arbitrary `Filename:` value) fall
+        // through to the flat handler, which keys by the URL directory verbatim
+        // and gates on the strict `<name>_<ver>_<arch>.<ext>` shape. A `/pool/`
+        // path is never reinterpreted as a `/dists/` path.
+        return parse_structured_pool(mirror_path, pool_path).or_else(|| parse_flat_resource(path));
     }
 
     /*
@@ -701,23 +684,58 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         return None;
     }
 
+    parse_flat_resource(path)
+}
+
+/// Parse the canonical Debian-archive pool layout
+/// `pool/<component>/<letter>/<source>/<file>` (optionally with a leading
+/// `updates/` segment for security archives). `mirror_path` is the segment
+/// before `/pool/`, `pool_path` the segment after it. Returns `None` for any
+/// path not matching that exact convention; the caller then falls back to the
+/// flat handler.
+fn parse_structured_pool<'a>(mirror_path: &'a str, pool_path: &'a str) -> Option<ResourceFile<'a>> {
+    let mut parts = pool_path.rsplit('/');
+
+    let filename = parts.next()?;
+
+    let package = parts.next()?;
+
+    let prefix = parts.next()?;
+    if !package.starts_with(prefix) {
+        return None;
+    }
+
+    let _component = parts.next()?;
+
+    if parts
+        .next()
+        .is_some_and(|s| s != "updates" || parts.next().is_some())
+    {
+        return None;
+    }
+
+    Some(ResourceFile::Pool {
+        mirror_path,
+        filename,
+    })
+}
+
+/// Parse a flat (trivial) repository resource from an already
+/// leading-slash-trimmed `path`. Reached when neither `/pool/` (canonically)
+/// nor `/dists/` matched, and as the fall-through target for non-canonical
+/// `/pool/` paths. A mirror namespace prefix is required even for flat repos:
+/// the host root has no namespace to disambiguate a root-served flat repo from
+/// the structured `dists/` / `flat/` siblings, so the spec's empty-directory
+/// form is declined.
+/// See <https://wiki.debian.org/DebianRepository/Format#Flat_Repository_Format>.
+fn parse_flat_resource(path: &str) -> Option<ResourceFile<'_>> {
     /*
-     * Flat (trivial) repository format — only reached when neither `/pool/`
-     * nor `/dists/` matched, so structured-layout rejections are preserved.
-     *
      * apt/InRelease
      * apt/Release.gpg
      * apt/Packages.gz
      * apt/twilio-cli_5.0.0_amd64.deb
      * apt/by-hash/SHA256/<hex>
      */
-    // Flat repository: requires a mirror namespace prefix.  apt-cacher-rs
-    // stores cache files at `{cache}/{host}/<mirror_path>/...`; the host
-    // root has no namespace to disambiguate a root-served flat repo from
-    // the structured layout's `dists/` and `flat/` siblings, so the spec's
-    // "directory may also be the empty string" form is intentionally
-    // declined.  The debug log surfaces the rejection for operators
-    // wondering why a root-level flat URL falls through to simple proxy.
     let Some((mirror_path, tail)) = path.rsplit_once('/') else {
         debug!(
             "Rejecting request `{path}` with no mirror namespace prefix; \
@@ -729,10 +747,9 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         return None;
     }
 
-    // By-hash: `<base>/by-hash/<ALGO>/<hex>` — the digest shape (64 or 128
-    // hex chars) and the algorithm directory name are cross-checked by
-    // `is_valid_byhash_pair`.  On structural mismatch fall through to None
-    // rather than reclassifying as a pool file.
+    // By-hash: `<base>/by-hash/<ALGO>/<hex>`; the digest shape and algorithm
+    // directory name are cross-checked. On structural mismatch fall through to
+    // None rather than reclassifying as a pool file.
     if is_byhash_digest_shape(tail) {
         if let Some((base, hash_algo)) = mirror_path.rsplit_once('/')
             && is_valid_byhash_pair(hash_algo, tail)
@@ -749,9 +766,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         return None;
     }
 
-    // Metadata: closed allowlist of canonical filenames documented by the
-    // flat-repo spec.  Mirrors the structured matcher's accepted set (also
-    // including `Release.gpg`).
+    // Metadata: closed allowlist of canonical flat-repo filenames.
     if matches!(
         tail,
         "InRelease"
@@ -773,7 +788,6 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
     }
 
     // Pool data: enforce the strict `<name>_<version>_<arch>.<ext>` shape.
-    // Anything else falls through to the splice proxy.
     if is_flat_deb_filename(tail) {
         return Some(ResourceFile::Flat {
             kind: FlatKind::Pool,
@@ -1004,6 +1018,31 @@ pub(crate) fn is_strict_path_descendant(path: &str, ancestor: &str) -> bool {
 #[must_use]
 pub(crate) fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
     path == prefix || is_strict_path_descendant(path, prefix)
+}
+
+/// For a flat-pool mirror path containing a `/pool/` segment, split it into the
+/// structured archive root (everything before the first `/pool/`) and the
+/// `flat_lookup_prefix` (the in-archive sub-path with a trailing `/`) to strip
+/// from `dists/.../Packages` `Filename:` values during strict cleanup.
+///
+/// `api/packages/85/debian/pool/php-zts/main`
+///   -> ("api/packages/85/debian", "pool/php-zts/main/")
+///
+/// Returns `None` when there is no `/pool/` segment or no archive root before
+/// it, in which case strict reconciliation does not apply (issue #162 Phase 2).
+#[must_use]
+pub(crate) fn flat_pool_archive_root(mirror_path: &str) -> Option<(&str, String)> {
+    let (archive_root, pool_tail) = mirror_path.split_once("/pool/")?;
+    if archive_root.is_empty() {
+        return None;
+    }
+    let pool_tail = pool_tail.trim_end_matches('/');
+    let prefix = if pool_tail.is_empty() {
+        "pool/".to_owned()
+    } else {
+        format!("pool/{pool_tail}/")
+    };
+    Some((archive_root, prefix))
 }
 
 #[must_use]
@@ -1511,9 +1550,16 @@ mod tests {
          * failures
          */
 
+        // Wrong-letter pool is no longer rejected: it caches as flat (issue
+        // #162 uniform fall-through). APT never emits wrong-letter URLs, so
+        // this only widens what gets cached.
         assert_eq!(
             parse_request_path("debian/pool/main/g/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
-            None
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Pool,
+                mirror_path: "debian/pool/main/g/firefox-esr",
+                filename: "firefox-esr_115.9.1esr-1_amd64.deb",
+            })
         );
 
         assert_eq!(parse_request_path("debian/dists/sid/Foo"), None);
@@ -1661,6 +1707,53 @@ mod tests {
 
         // Arbitrary non-apt filename in an otherwise flat-shaped path.
         assert_eq!(parse_request_path("apt/random.txt"), None);
+    }
+
+    #[test]
+    fn test_parse_request_path_pool_flat_fallback() {
+        // issue #162: Gitea/Forgejo serve pool debs at the spec-conformant but
+        // non-canonical `pool/<dist>/<comp>/<file>`. They must fall through to the
+        // flat handler, keyed by the URL directory verbatim.
+        assert_eq!(
+            parse_request_path(
+                "api/packages/85/debian/pool/php-zts/main/php-zts-cli_8.5.7-1_amd64.deb"
+            ),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Pool,
+                mirror_path: "api/packages/85/debian/pool/php-zts/main",
+                filename: "php-zts-cli_8.5.7-1_amd64.deb",
+            })
+        );
+
+        // Canonical correct-letter pool stays structured (regression guard: real
+        // Debian mirrors are unaffected).
+        assert_eq!(
+            parse_request_path("debian/pool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
+            Some(ResourceFile::Pool {
+                mirror_path: "debian",
+                filename: "firefox-esr_115.9.1esr-1_amd64.deb",
+            })
+        );
+
+        // Non-canonical pool with a non-deb tail is still rejected at the filename
+        // gate (strictness preserved).
+        assert_eq!(
+            parse_request_path("api/packages/85/debian/pool/php-zts/main/README"),
+            None
+        );
+
+        // A non-canonical /pool/ path whose tail is a metadata filename caches as
+        // flat metadata: the uniform fall-through routes the whole URL to the flat
+        // handler, which also accepts the metadata allowlist. Intentional and
+        // harmless (volatile, keyed by the URL path verbatim).
+        assert_eq!(
+            parse_request_path("api/packages/85/debian/pool/php-zts/main/Packages.gz"),
+            Some(ResourceFile::Flat {
+                kind: FlatKind::Metadata,
+                mirror_path: "api/packages/85/debian/pool/php-zts/main",
+                filename: "Packages.gz",
+            })
+        );
     }
 
     #[test]
@@ -2449,5 +2542,29 @@ mod tests {
         if at_cap.contains("//") {
             assert!(!normalized.contains("//"));
         }
+    }
+
+    #[test]
+    fn flat_pool_archive_root_splits_gitea_path() {
+        assert_eq!(
+            flat_pool_archive_root("api/packages/85/debian/pool/php-zts/main"),
+            Some(("api/packages/85/debian", "pool/php-zts/main/".to_owned()))
+        );
+    }
+
+    #[test]
+    fn flat_pool_archive_root_none_without_pool_segment() {
+        assert_eq!(flat_pool_archive_root("apt/amd64"), None);
+        // `/pool/` requires a leading archive-root segment; a path that merely
+        // starts with `pool/` has no `/pool/` substring.
+        assert_eq!(flat_pool_archive_root("pool/php-zts/main"), None);
+    }
+
+    #[test]
+    fn flat_pool_archive_root_trailing_slash() {
+        assert_eq!(
+            flat_pool_archive_root("repo/pool/"),
+            Some(("repo", "pool/".to_owned()))
+        );
     }
 }
