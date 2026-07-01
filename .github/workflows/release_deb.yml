@@ -27,7 +27,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-deb
-        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419
         with:
           tool: cargo-deb
 
