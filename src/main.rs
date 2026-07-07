@@ -19,6 +19,7 @@ mod cache_layout;
 mod cache_metadata;
 mod cache_quota;
 mod channel_body;
+mod cleanup;
 mod client_counter;
 mod config;
 mod database;
@@ -62,7 +63,6 @@ mod small_vec_deque;
 #[cfg(feature = "splice")]
 mod splice_conn;
 mod task_cache_scan;
-mod task_cleanup;
 mod task_setup;
 #[cfg(feature = "sendfile")]
 mod tcp_cork_guard;

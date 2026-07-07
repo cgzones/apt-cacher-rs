@@ -97,20 +97,40 @@ impl MirrorEntry {
 
     #[must_use]
     pub(crate) fn cache_path(&self) -> PathBuf {
-        let cache = self.cache_host();
+        self.cache_path_with_aliases(&global_config().aliases)
+    }
+
+    /// Pure sibling of [`Self::cache_path`] taking the alias table explicitly
+    /// instead of reaching for `global_config()`. `global_config()` panics
+    /// outside a running daemon, so a pure caller that already carries its
+    /// own `&Config` (e.g. `cleanup::model::classify_mirror`) uses this to
+    /// stay unit-testable without a `main()`-initialized global.
+    #[must_use]
+    pub(crate) fn cache_path_with_aliases(&self, aliases: &[Alias]) -> PathBuf {
+        let cache = resolved_cache_host(aliases, &self.host);
         mirror_cache_path_impl(cache, self.port(), &self.path)
     }
 
     /// On-disk flat root for this mirror: `<cache_dir>/<host>/flat/<mirror_path>`.
     /// Callers append further segments (`by-hash`, `tmp`, …) as needed.
+    ///
+    /// Pure: takes the alias table explicitly instead of reaching for
+    /// `global_config()`, which panics outside a running daemon; a pure caller
+    /// that already carries its own `&Config` (e.g.
+    /// `cleanup::model::classify_mirror`) uses this to stay unit-testable
+    /// without a `main()`-initialized global. See [`Self::cache_path_with_aliases`].
     #[must_use]
-    pub(crate) fn flat_root_path(&self, cache_dir: &Path) -> PathBuf {
+    pub(crate) fn flat_root_path_with_aliases(
+        &self,
+        cache_dir: &Path,
+        aliases: &[Alias],
+    ) -> PathBuf {
         let mirror_path = Path::new(&self.path);
         assert!(
             mirror_path.is_relative(),
             "mirror path must be relative when building the flat root"
         );
-        let cache = self.cache_host();
+        let cache = resolved_cache_host(aliases, &self.host);
         let host_dir = cache.format_cache_dir(self.port());
         [
             cache_dir,
@@ -120,6 +140,26 @@ impl MirrorEntry {
         ]
         .iter()
         .collect()
+    }
+}
+
+#[cfg(test)]
+impl MirrorEntry {
+    /// Test-only constructor: production code only builds a `MirrorEntry`
+    /// from a SQL row, but `cleanup::model::classify_mirror`'s pure unit
+    /// tests need to build one directly.
+    pub(crate) fn new_for_test(
+        host: ClientHost,
+        port: Option<NonZero<u16>>,
+        path: String,
+        kind: MirrorKind,
+    ) -> Self {
+        Self {
+            host,
+            port: port.map_or(0, NonZero::get),
+            path,
+            kind: kind.as_db_int(),
+        }
     }
 }
 

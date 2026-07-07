@@ -43,7 +43,7 @@ use crate::{
     content_type_for_cached_file,
     database_task::{DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command},
     deb_mirror::Origin,
-    error::{ErrorReport, MirrorDownloadRate, ProxyCacheError},
+    error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
     global_cache_quota, global_config,
     guards::{DownloadBarrier, InitBarrier},
     http_etag::{is_valid_etag, write_etag},
@@ -332,6 +332,16 @@ pub(crate) async fn request_with_retry(
                             }
                         }
 
+                        // Single WARN authority for upstream-fetch failures: the
+                        // non-connect arm above already warns; mirror it here so a
+                        // connect-exhaustion terminal is logged once too (callers no
+                        // longer re-warn).
+                        warn_once_or_info!(
+                            "Request of internal client to {} failed:  {}",
+                            parts.uri,
+                            ErrorReport(&err)
+                        );
+
                         return Err((err, parts.uri));
                     }
 
@@ -367,7 +377,10 @@ pub(crate) async fn request_with_retry(
             let result =
                 inner_loop(&client, parts, orig_scheme, None, https_upgrade_mode, true).await;
             if let Err(ref err) = result {
-                warn!(
+                // inner_loop already logged the transport error at WARN; keep this
+                // background-task framing at DEBUG so request_with_retry stays the
+                // single WARN authority (no cold-start double-warn).
+                debug!(
                     "Failed to initialize scheme cache for host {} in background task:  {}",
                     err.1
                         .authority()
@@ -391,6 +404,20 @@ pub(crate) async fn request_with_retry(
         .await
         .map_err(|err| err.0)
     }
+}
+
+/// Synthetic `502 Bad Gateway` for an upstream-fetch failure, carrying the real
+/// transport reason as an `http::Extensions` value so an internal caller (cleanup)
+/// can recover it instead of seeing only the laundered status. Real clients ignore
+/// the extension (it is never serialised to the wire). The throw site does NOT log;
+/// `request_with_retry` is the single WARN authority for upstream-fetch failures.
+#[must_use]
+fn upstream_error_response(err: &hyper_util::client::legacy::Error) -> Response<ProxyCacheBody> {
+    let mut response = quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
+    response.extensions_mut().insert(UpstreamFetchError {
+        reason: ErrorReport(err).to_string(),
+    });
+    response
 }
 
 /* Adopted from http_body_util::StreamBody */
@@ -2306,14 +2333,7 @@ async fn serve_new_file(
     let mut upstream_request_sent = PreciseInstant::now();
     let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
-        Err(err) => {
-            warn_once_or_info!(
-                "Proxy request failed to mirror {}:  {}",
-                conn_details.mirror,
-                ErrorReport(&err)
-            );
-            return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
-        }
+        Err(err) => return upstream_error_response(&err),
     };
 
     trace!("Forwarded response: {fwd_response:?}");
@@ -2355,21 +2375,11 @@ async fn serve_new_file(
             trace!("Forwarded redirected request: {redirected_request:?}");
 
             upstream_request_sent = PreciseInstant::now();
-            let redirected_response = match request_with_retry(
-                &appstate.https_client,
-                redirected_request,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    warn_once_or_info!(
-                        "Failed to proxy request to host {redirected_host:?} after redirect from {host:?}:  {}",
-                        ErrorReport(&err)
-                    );
-                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
-                }
-            };
+            let redirected_response =
+                match request_with_retry(&appstate.https_client, redirected_request).await {
+                    Ok(r) => r,
+                    Err(err) => return upstream_error_response(&err),
+                };
 
             trace!("Forwarded redirected response: {redirected_response:?}");
 
@@ -2501,14 +2511,7 @@ async fn serve_new_file(
         upstream_request_sent = PreciseInstant::now();
         fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
             Ok(r) => r,
-            Err(err) => {
-                warn_once_or_info!(
-                    "Retry proxy request failed to mirror {}:  {}",
-                    conn_details.mirror,
-                    ErrorReport(&err)
-                );
-                return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
-            }
+            Err(err) => return upstream_error_response(&err),
         };
     }
 
@@ -2651,6 +2654,13 @@ async fn serve_new_file(
                     conn_details.mirror,
                     fwd_response.status()
                 );
+            }
+
+            // Cleanup probes read only the status; relaying the upstream error
+            // body just makes the consumer drop it undrained (a spurious
+            // "aborted passthrough" log), and these are not client passthroughs.
+            if conn_details.client.is_cleanup_synthetic() {
+                return quick_response(fwd_response.status(), "");
             }
 
             let (parts, body) = fwd_response.into_parts();
@@ -3466,13 +3476,7 @@ async fn pre_process_client_request(
     let fwd_request_sent = PreciseInstant::now();
     let fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok(r) => r,
-        Err(err) => {
-            warn_once_or_info!(
-                "Proxy request to host {requested_host} failed for client {client}:  {}",
-                ErrorReport(&err)
-            );
-            return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
-        }
+        Err(err) => return upstream_error_response(&err),
     };
 
     trace!("Forwarded response: {fwd_response:?}");
@@ -3526,21 +3530,11 @@ async fn pre_process_client_request(
             trace!("Redirected request: {redirected_request:?}");
 
             let redirected_request_sent = PreciseInstant::now();
-            let redirected_response = match request_with_retry(
-                &appstate.https_client,
-                redirected_request,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    warn_once_or_info!(
-                        "Proxy request to host {requested_host} for client {client} failed after redirect:  {}",
-                        ErrorReport(&err)
-                    );
-                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
-                }
-            };
+            let redirected_response =
+                match request_with_retry(&appstate.https_client, redirected_request).await {
+                    Ok(r) => r,
+                    Err(err) => return upstream_error_response(&err),
+                };
 
             trace!("Redirected response: {redirected_response:?}");
 

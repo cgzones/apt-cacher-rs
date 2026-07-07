@@ -215,42 +215,71 @@ pub(crate) fn registry_key_from_filename_field(
     }
 }
 
-/// Iterate the `(repo-relative path, SHA256 digest)` entries from a Debian
-/// `Release` / `InRelease` file's `SHA256:` section.
+/// A `SHA256:` / `SHA512:` section of a Debian `Release`/`InRelease` file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleaseHashSection {
+    Sha256,
+    Sha512,
+}
+
+/// Iterate the `(section, hex, path)` triples of every indented
+/// `<hex> <size> <path>` entry inside a `SHA256:`/`SHA512:` section of a Debian
+/// `Release`/`InRelease` file. Shared skeleton behind [`parse_release_checksums`]
+/// and [`parse_release_byhash_digests`] so the section state machine lives in one
+/// place.
 ///
-/// Handles the `InRelease` clearsigned wrapper by stopping at the PGP
-/// signature boundary. Entry lines are indented with one or more spaces or
-/// tabs followed by `<hex> <size> <path>`; the section ends at the first
-/// non-indented line. Paths failing `is_safe_filename_relpath` are skipped.
-pub(crate) fn parse_release_checksums(
+/// Latches off at the `-----BEGIN PGP SIGNATURE-----` boundary: nothing past it
+/// is signed, so a later section header in the (unsigned) signature block must
+/// not re-open a section. Entry lines are indented with spaces or tabs (tabs
+/// accepted for non-canonical mirrors); a non-indented, non-empty line switches
+/// section (`MD5Sum:`, `SHA1:`, ... switch out). A 4th whitespace-separated
+/// token means the path contained a space, so the entry is rejected. The
+/// `<size>` field and the algorithm/length of `hex` are validated by the callers.
+fn release_hash_entries(
     content: &str,
-) -> impl Iterator<Item = (String, [u8; 32])> + '_ {
-    let mut in_sha256_section = false;
+) -> impl Iterator<Item = (ReleaseHashSection, &str, &str)> + '_ {
+    let mut section: Option<ReleaseHashSection> = None;
+    let mut terminated = false;
     content.lines().filter_map(move |line| {
-        if line.starts_with("-----BEGIN PGP SIGNATURE-----") {
-            in_sha256_section = false;
+        if terminated {
             return None;
         }
-        // A non-indented, non-empty line ends the current section. Section
-        // headers ("SHA256:", "MD5Sum:", ...) are themselves non-indented.
-        // Debian uses spaces but accept tabs too so non-canonical mirrors
-        // that emit `\t`-indented entries still ingest.
+        if line.starts_with("-----BEGIN PGP SIGNATURE-----") {
+            terminated = true;
+            return None;
+        }
         let indented = line.starts_with(' ') || line.starts_with('\t');
         if !indented && !line.is_empty() {
-            in_sha256_section = line.trim_end() == "SHA256:";
+            section = match line.trim_end() {
+                "SHA256:" => Some(ReleaseHashSection::Sha256),
+                "SHA512:" => Some(ReleaseHashSection::Sha512),
+                _ => None,
+            };
             return None;
         }
-        if !in_sha256_section {
-            return None;
-        }
-        // Indented entry: " <hex> <size> <path>"
+        let section = section?;
+        // Indented entry: " <hex> <size> <path>".
         let mut parts = line.split_whitespace();
         let hex = parts.next()?;
         let _size = parts.next()?;
         let path = parts.next()?;
-        // Debian repo paths do not contain spaces; if a 4th token exists the
-        // path had a space - reject.
         if parts.next().is_some() {
+            return None;
+        }
+        Some((section, hex, path))
+    })
+}
+
+/// Iterate the `(repo-relative path, SHA256 digest)` entries from a Debian
+/// `Release` / `InRelease` file's `SHA256:` section.
+///
+/// Handles the `InRelease` clearsigned wrapper by stopping at the PGP
+/// signature boundary. Paths failing `is_safe_filename_relpath` are skipped.
+pub(crate) fn parse_release_checksums(
+    content: &str,
+) -> impl Iterator<Item = (String, [u8; 32])> + '_ {
+    release_hash_entries(content).filter_map(|(section, hex, path)| {
+        if section != ReleaseHashSection::Sha256 {
             return None;
         }
         let digest = hex_decode_exact::<32>(hex)?;
@@ -258,6 +287,31 @@ pub(crate) fn parse_release_checksums(
             return None;
         }
         Some((path.to_owned(), digest))
+    })
+}
+
+/// A content-addressed digest referenced by a `Release`/`InRelease`, tagged by
+/// the algorithm of the section it appeared in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ByHashRef {
+    Sha256([u8; 32]),
+    Sha512([u8; 64]),
+}
+
+/// Iterate the by-hash digests referenced by a Debian `Release`/`InRelease`,
+/// from BOTH the `SHA256:` and `SHA512:` sections, tagged by algorithm.
+///
+/// Unlike [`parse_release_checksums`] (SHA256-only, consumed by the integrity
+/// registry), this is deliberately path-agnostic: it does NOT filter to
+/// `Packages` leaves and does NOT apply `is_safe_filename_relpath`. Every listed
+/// resource (`Packages`, `Contents-*`, `Translation-*`, `Sources`, `.diff/Index`,
+/// ...) has a corresponding by-hash file, and only the digest -- not the path --
+/// is content-addressed, so the path is unused here. Stops at the PGP signature
+/// boundary like its sibling.
+pub(crate) fn parse_release_byhash_digests(content: &str) -> impl Iterator<Item = ByHashRef> + '_ {
+    release_hash_entries(content).filter_map(|(section, hex, _path)| match section {
+        ReleaseHashSection::Sha256 => hex_decode_exact::<32>(hex).map(ByHashRef::Sha256),
+        ReleaseHashSection::Sha512 => hex_decode_exact::<64>(hex).map(ByHashRef::Sha512),
     })
 }
 
@@ -353,6 +407,72 @@ mod tests {
     }
 
     #[test]
+    fn release_byhash_digests_sha256_only_ignores_md5() {
+        // Debian's `InRelease` carries `MD5Sum:` + `SHA256:` (no SHA512).
+        let a = hex_encode(&[0xaa; 32]);
+        let b = hex_encode(&[0xbb; 32]);
+        let content = format!(
+            "Origin: Debian\n\
+             MD5Sum:\n \
+             {md5} 111 main/binary-amd64/Packages\n\
+             SHA256:\n \
+             {a} 222 main/binary-amd64/Packages\n \
+             {b} 333 main/Contents-amd64\n",
+            md5 = hex_encode(&[0xcc; 16]),
+        );
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        assert_eq!(
+            got,
+            vec![ByHashRef::Sha256([0xaa; 32]), ByHashRef::Sha256([0xbb; 32])]
+        );
+    }
+
+    #[test]
+    fn release_byhash_digests_both_algos() {
+        let s256 = hex_encode(&[0x11; 32]);
+        let s512 = hex_encode(&[0x22; 64]);
+        let content = format!(
+            "SHA256:\n {s256} 10 main/binary-amd64/Packages\n\
+             SHA512:\n {s512} 10 main/binary-amd64/Packages\n",
+        );
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        assert_eq!(
+            got,
+            vec![ByHashRef::Sha256([0x11; 32]), ByHashRef::Sha512([0x22; 64])]
+        );
+    }
+
+    #[test]
+    fn release_byhash_digests_stops_at_pgp_signature() {
+        let inside = hex_encode(&[0x33; 32]);
+        let after = hex_encode(&[0x44; 32]);
+        let content = format!(
+            "SHA256:\n {inside} 10 main/binary-amd64/Packages\n\
+             -----BEGIN PGP SIGNATURE-----\n\
+             SHA256:\n {after} 10 evil/Packages\n\
+             -----END PGP SIGNATURE-----\n",
+        );
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        assert_eq!(got, vec![ByHashRef::Sha256([0x33; 32])]);
+    }
+
+    #[test]
+    fn release_byhash_digests_accepts_tab_indent() {
+        let d = hex_encode(&[0x55; 32]);
+        let content = format!("SHA256:\n\t{d} 10 main/binary-amd64/Packages\n");
+        let got: Vec<ByHashRef> = parse_release_byhash_digests(&content).collect();
+        assert_eq!(got, vec![ByHashRef::Sha256([0x55; 32])]);
+    }
+
+    #[test]
+    fn release_byhash_digests_rejects_space_in_path() {
+        let d = hex_encode(&[0x66; 32]);
+        // A 4th whitespace-separated token means the path had a space.
+        let content = format!("SHA256:\n {d} 10 main/with space/Packages\n");
+        assert!(parse_release_byhash_digests(&content).next().is_none());
+    }
+
+    #[test]
     fn registry_key_for_structured_pool_uses_basename() {
         assert_eq!(
             registry_key_from_filename_field(
@@ -430,6 +550,28 @@ SHA256:
  1111111111111111111111111111111111111111111111111111111111111111 1 ../../etc/passwd
 ";
         assert!(parse_release_checksums(release).next().is_none());
+    }
+
+    #[test]
+    fn parse_release_checksums_stops_at_pgp_signature() {
+        // Shares the `release_hash_entries` latch with the by-hash parser: a
+        // `SHA256:` block after the (unsigned) signature boundary must not
+        // re-open a section and inject entries into the integrity registry.
+        let inrelease = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+SHA256:
+ 1111111111111111111111111111111111111111111111111111111111111111 10 main/binary-amd64/Packages
+-----BEGIN PGP SIGNATURE-----
+SHA256:
+ 2222222222222222222222222222222222222222222222222222222222222222 10 evil/Packages
+-----END PGP SIGNATURE-----
+";
+        let entries: Vec<_> = parse_release_checksums(inrelease).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "main/binary-amd64/Packages");
+        assert_eq!(entries[0].1, [0x11u8; 32]);
     }
 
     #[test]

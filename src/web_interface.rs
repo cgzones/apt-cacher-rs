@@ -22,6 +22,7 @@ use time::{OffsetDateTime, format_description::FormatItem, macros::format_descri
 use crate::{
     APP_NAME, APP_VERSION, AppState, LOGSTORE, ProxyCacheBody, RUNTIMEDETAILS, RuntimeDetails,
     cache_metadata,
+    cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
@@ -32,7 +33,6 @@ use crate::{
     humanfmt::HumanFmt,
     hyper_conn::tunnel_limiter::active_tunnels,
     metrics,
-    task_cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
     warn_once_or_debug,
 };
@@ -2026,6 +2026,11 @@ fn build_metrics_html() -> String {
             metrics::CLEANUP_EVICTIONS.get(),
             HumanFmt::Size(metrics::CLEANUP_BYTES_RECLAIMED.get())
         ),
+    );
+    t.row_tip(
+        "Cleanup By-Hash Unreferenced (total)",
+        "By-hash index files reclaimed because their digest was absent from the mirror's current Release set (a subset of total evictions). The rest age out via byhash_retention_days when no current Release can be read.",
+        metrics::CLEANUP_BYHASH_UNREFERENCED.get(),
     );
     t.row_tip(
         "Cleanup Checksum Mismatches",
