@@ -123,6 +123,22 @@ where
     }
 }
 
+/// Reason an upstream fetch failed, captured at the point the proxy synthesises a
+/// `502 Bad Gateway`. Attached to that response as an `http::Extensions` value so an
+/// internal caller (cleanup) can recover the real transport error instead of seeing
+/// only the laundered status code. The wire response never carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpstreamFetchError {
+    /// Full `source()`-chain rendering of the transport error (e.g. `... timed out`).
+    pub(crate) reason: String,
+}
+
+impl Display for UpstreamFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 #[cfg(feature = "sendfile")]
 pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> std::io::Error {
     #[derive(Debug)]
@@ -183,6 +199,17 @@ mod tests {
             report.matches("sendfile failed").count(),
             1,
             "context message duplicated in report: {report}"
+        );
+    }
+
+    #[test]
+    fn upstream_fetch_error_display_is_the_reason() {
+        let err = super::UpstreamFetchError {
+            reason: "client error (SendRequest):  connection error:  timed out".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "client error (SendRequest):  connection error:  timed out"
         );
     }
 }

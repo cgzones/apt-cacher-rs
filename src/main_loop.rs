@@ -18,7 +18,11 @@ use crate::{
     APP_USER_AGENT, AppState, ClientInfo, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
     SCHEME_CACHE,
     active_downloads::ActiveDownloads,
-    cache_layout, cache_metadata, client_counter,
+    cache_layout, cache_metadata,
+    cleanup::{
+        CLEANUP_INTERVAL_SECS, FIRST_CLEANUP_DELAY_SECS, set_next_cleanup_epoch, task_cleanup,
+    },
+    client_counter,
     database::Database,
     database_task::{self, db_loop},
     deb_mirror,
@@ -28,9 +32,6 @@ use crate::{
     hyper_conn::{HttpClient, request_with_retry},
     metrics,
     task_cache_scan::task_cache_scan,
-    task_cleanup::{
-        CLEANUP_INTERVAL_SECS, FIRST_CLEANUP_DELAY_SECS, set_next_cleanup_epoch, task_cleanup,
-    },
 };
 
 pub(crate) async fn main_loop(

@@ -616,6 +616,11 @@ pub(crate) static DB_MIRROR_CACHE_ENTRIES: StateU64 = StateU64::new();
 pub(crate) static CLEANUP_EVICTIONS: Accumulator = Accumulator::new();
 /// Total bytes reclaimed across all cleanup runs.
 pub(crate) static CLEANUP_BYTES_RECLAIMED: Accumulator = Accumulator::new();
+/// By-hash files evicted because their digest was absent from the mirror's
+/// current `Release`/`InRelease` set (reference-based reclaim). A subset of
+/// `CLEANUP_EVICTIONS`; the remainder of by-hash evictions are aged out by the
+/// `byhash_retention_days` backstop when no current Release could be read.
+pub(crate) static CLEANUP_BYHASH_UNREFERENCED: Accumulator = Accumulator::new();
 /// Cache files removed by cleanup because their content hash did not match the
 /// value advertised in the upstream Packages stanza. A non-zero counter
 /// indicates either disk corruption, an upstream mirror returning a different

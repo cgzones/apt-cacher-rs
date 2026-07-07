@@ -693,7 +693,14 @@ pub(crate) struct Config {
     )]
     pub(crate) max_object_size: Option<NonZero<u64>>,
 
-    /// Retention time (in days) for files acquired "by-hash".
+    /// Backstop retention time (in days) for files acquired "by-hash".
+    ///
+    /// By-hash cleanup is primarily *reference-based*: a by-hash file is
+    /// reclaimed once its digest is absent from the mirror's current
+    /// `Release`/`InRelease` set (after a short grace). This age cap only
+    /// applies as a fallback - when no current Release can be read for a
+    /// by-hash directory, or for an on-disk digest type the Release does not
+    /// list - so it rarely governs disk usage on a healthy mirror.
     #[serde(default = "default_byhash_retention_days")]
     pub(crate) byhash_retention_days: NonZero<u64>,
 

@@ -896,6 +896,27 @@ pub(crate) async fn ingest_packages_file(
     }
 }
 
+/// Read a cached `Release` / `InRelease` file to a string with the cache's
+/// standard hardening: `O_NOFOLLOW` (reject a symlinked final component) and a
+/// `LimitedReader` capped at `MAX_RELEASE_SIZE`, so a hostile or buggy mirror
+/// serving a multi-GB `Release` (which passes the `max_object_size` admission
+/// check) cannot balloon memory unbounded. An over-cap file fails with
+/// `io::ErrorKind::InvalidData` rather than truncating silently.
+///
+/// Shared by registry ingest ([`ingest_release_file`]) and the by-hash cleanup
+/// reference-set builder.
+pub(crate) async fn read_release_to_string(path: &std::path::Path) -> std::io::Result<String> {
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .await?;
+    let mut limited = LimitedReader::new(file, limits::MAX_RELEASE_SIZE);
+    let mut buf = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut limited, &mut buf).await?;
+    Ok(buf)
+}
+
 /// Parse a `Release` / `InRelease` file and insert its `Packages*` entries
 /// into the registry. `release_dir` is the host-relative directory the
 /// `Release` file lives in (`Release`'s entry paths are relative to it).
@@ -910,20 +931,7 @@ pub(crate) async fn ingest_release_file(
     path: &std::path::Path,
     release_dir: &str,
 ) -> std::io::Result<()> {
-    let content = {
-        let file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(path)
-            .await?;
-        // Cap the in-memory read so a hostile or buggy mirror serving a
-        // multi-GB `Release` (which passes the `max_object_size` admission
-        // check) cannot balloon ingest memory unbounded.
-        let mut limited = LimitedReader::new(file, limits::MAX_RELEASE_SIZE);
-        let mut buf = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut limited, &mut buf).await?;
-        buf
-    };
+    let content = read_release_to_string(path).await?;
 
     for (rel, digest) in index_parser::parse_release_checksums(&content) {
         // Only Packages files are verified at layer C.
