@@ -50,6 +50,8 @@ const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
 const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
 const DEFAULT_VERIFY_CHECKSUMS: bool = true;
 const DEFAULT_VERIFY_CHECKSUMS_MAX_ENTRIES: NonZero<usize> = nonzero!(500_000);
+const DEFAULT_VERIFY_CHECKSUMS_THROTTLE_BASE: Duration = Duration::from_secs(30);
+const DEFAULT_VERIFY_CHECKSUMS_THROTTLE_CAP: Duration = Duration::from_hours(1);
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
 const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: StatusCode = StatusCode::TOO_MANY_REQUESTS;
@@ -831,6 +833,26 @@ pub(crate) struct Config {
     #[serde(default = "default_verify_checksums_max_entries")]
     pub(crate) verify_checksums_max_entries: NonZero<usize>,
 
+    /// Backoff window (in seconds) applied to a resource after its download
+    /// failed checksum verification: subsequent requests for it are rejected
+    /// with 503 without contacting upstream. The window doubles per
+    /// consecutive failure up to `verify_checksums_throttle_cap`; a
+    /// successfully verified download clears it. 0 disables the throttle.
+    /// Only effective when `verify_checksums` is enabled.
+    #[serde(
+        default = "default_verify_checksums_throttle_base",
+        deserialize_with = "from_secs_f64"
+    )]
+    pub(crate) verify_checksums_throttle_base: Duration,
+
+    /// Upper bound (in seconds) on the exponential verification-failure
+    /// backoff window.
+    #[serde(
+        default = "default_verify_checksums_throttle_cap",
+        deserialize_with = "from_secs_f64"
+    )]
+    pub(crate) verify_checksums_throttle_cap: Duration,
+
     #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
@@ -1097,6 +1119,14 @@ const fn default_verify_checksums() -> bool {
 
 const fn default_verify_checksums_max_entries() -> NonZero<usize> {
     DEFAULT_VERIFY_CHECKSUMS_MAX_ENTRIES
+}
+
+const fn default_verify_checksums_throttle_base() -> Duration {
+    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_BASE
+}
+
+const fn default_verify_checksums_throttle_cap() -> Duration {
+    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_CAP
 }
 
 const fn default_logstore_capacity() -> NonZero<usize> {
@@ -1708,6 +1738,37 @@ impl Config {
             ));
         }
 
+        if self.verify_checksums_throttle_cap < self.verify_checksums_throttle_base {
+            warnings.push(format!(
+                "verify_checksums_throttle_cap ({}s) is below verify_checksums_throttle_base ({}s); the cap will be raised to the base",
+                self.verify_checksums_throttle_cap.as_secs_f64(),
+                self.verify_checksums_throttle_base.as_secs_f64()
+            ));
+        }
+
+        if !self.verify_checksums {
+            // An explicit 0 means deliberately disabled -- no warning.
+            for (name, value, default) in [
+                (
+                    "verify_checksums_throttle_base",
+                    self.verify_checksums_throttle_base,
+                    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_BASE,
+                ),
+                (
+                    "verify_checksums_throttle_cap",
+                    self.verify_checksums_throttle_cap,
+                    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_CAP,
+                ),
+            ] {
+                if value != default && !value.is_zero() {
+                    warnings.push(format!(
+                        "{name} ({}s) has no effect while verify_checksums is disabled",
+                        value.as_secs_f64()
+                    ));
+                }
+            }
+        }
+
         if self.cache_directory.as_os_str().is_empty() {
             bail!("Invalid cache_directory value: must not be empty");
         }
@@ -2087,5 +2148,75 @@ mod test {
     fn verify_checksums_can_be_disabled() {
         let cfg: Config = toml::from_str("verify_checksums = false").expect("config parses");
         assert!(!cfg.verify_checksums);
+    }
+
+    #[test]
+    fn verify_throttle_defaults() {
+        let cfg: Config = toml::from_str("").expect("empty config parses");
+        assert_eq!(cfg.verify_checksums_throttle_base, Duration::from_secs(30));
+        assert_eq!(cfg.verify_checksums_throttle_cap, Duration::from_hours(1));
+    }
+
+    #[test]
+    fn verify_throttle_overrides_parse() {
+        let cfg: Config = toml::from_str(
+            "verify_checksums_throttle_base = 0.5\nverify_checksums_throttle_cap = 60",
+        )
+        .expect("config parses");
+        assert_eq!(
+            cfg.verify_checksums_throttle_base,
+            Duration::from_millis(500)
+        );
+        assert_eq!(cfg.verify_checksums_throttle_cap, Duration::from_mins(1));
+    }
+
+    #[test]
+    fn verify_throttle_cap_below_base_warns() {
+        let mut cfg: Config = toml::from_str(
+            "verify_checksums_throttle_base = 60\nverify_checksums_throttle_cap = 30",
+        )
+        .expect("config parses");
+        let warnings = cfg.validate().expect("config validates");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("the cap will be raised to the base")),
+            "expected cap-below-base warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn verify_throttle_set_while_verify_off_warns() {
+        let mut cfg: Config = toml::from_str(
+            "verify_checksums = false\nverify_checksums_throttle_base = 60\nverify_checksums_throttle_cap = 120",
+        )
+        .expect("config parses");
+        let warnings = cfg.validate().expect("config validates");
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("has no effect while verify_checksums is disabled"))
+                .count(),
+            2,
+            "expected warnings for both throttle options, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn verify_throttle_defaults_or_zero_while_verify_off_do_not_warn() {
+        for toml_input in [
+            "verify_checksums = false",
+            "verify_checksums = false\nverify_checksums_throttle_base = 0\nverify_checksums_throttle_cap = 0",
+            "verify_checksums = false\nverify_checksums_throttle_base = 30\nverify_checksums_throttle_cap = 3600",
+        ] {
+            let mut cfg: Config = toml::from_str(toml_input).expect("config parses");
+            let warnings = cfg.validate().expect("config validates");
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| w.contains("has no effect while verify_checksums is disabled")),
+                "unexpected warning for `{toml_input}`: {warnings:?}"
+            );
+        }
     }
 }

@@ -72,7 +72,7 @@ use crate::{
     SchemeKey, SchemeKeyRef, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
     active_downloads::{ActiveDownloadStatus, OriginateOutcome},
     cache_metadata, client_counter, content_type_for_cached_file, global_cache_quota,
-    global_config, metrics,
+    global_config, global_verify_throttle, metrics,
     permitted_host_cache::is_host_allowed_cached,
     static_assert, warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
 };
@@ -4030,7 +4030,7 @@ async fn serve_volatile_304_via_sendfile(
         | SendfileResult::ClientError
         | SendfileResult::AfterHeaderError => Ok(()),
         SendfileResult::Invalid { status, msg } => {
-            write_invalid_response(client_stream, conn_version, conn_action, status, msg)
+            write_invalid_response(client_stream, conn_version, conn_action, status, msg, None)
                 .await
                 .map_err(|err| SpliceProxyError::Client(err, invalid_tag))?;
             Ok(())
@@ -4066,6 +4066,38 @@ async fn splice_proxy_drive(
         &conn_details.debname,
         conn_details.layout,
     );
+
+    // Cleanup probes bypass the throttle: they run once per 24h cycle and a
+    // 503 would hard-fail the index-fetch cascade; their commit outcome
+    // still records/clears throttle state. (Only the hyper gate is reachable
+    // by cleanup today; kept here for parallel-path symmetry.)
+    if !conn_details.client.is_cleanup_synthetic()
+        && let Some(throttled) = global_verify_throttle().check(
+            &conn_details.mirror,
+            &conn_details.debname,
+            conn_details.layout,
+        )
+    {
+        warn_once_or_info!(
+            "splice proxy: rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+            conn_details.debname,
+            conn_details.client,
+            throttled.failures,
+            HumanFmt::Time(throttled.remaining)
+        );
+        metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
+        write_invalid_response(
+            client_stream,
+            conn_version,
+            conn_action,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Recently failed checksum verification",
+            Some(throttled.remaining),
+        )
+        .await
+        .map_err(|err| SpliceProxyError::Client(err, "verify-throttle 503"))?;
+        return Ok(());
+    }
 
     let mirror = &conn_details.mirror;
     let host_authority = mirror.format_authority();
@@ -4225,6 +4257,7 @@ async fn splice_proxy_drive(
                     conn_action,
                     StatusCode::BAD_GATEWAY,
                     "no Content-Length",
+                    None,
                 )
                 .await
                 .map_err(|err| SpliceProxyError::Client(err, "kTLS no-CL 502"))?;
@@ -4702,6 +4735,7 @@ async fn splice_proxy_drive(
             conn_action,
             StatusCode::BAD_GATEWAY,
             "Unsolicited 206",
+            None,
         )
         .await
         .map_err(|err| SpliceProxyError::Client(err, "unsolicited 206 502"))?;
@@ -4741,6 +4775,7 @@ async fn splice_proxy_drive(
                         conn_action,
                         StatusCode::BAD_GATEWAY,
                         "Inconsistent Content-Range",
+                        None,
                     )
                     .await
                     .map_err(|err| {
@@ -4779,6 +4814,7 @@ async fn splice_proxy_drive(
                     conn_action,
                     StatusCode::BAD_GATEWAY,
                     "unexpected Content-Range",
+                    None,
                 )
                 .await
                 .map_err(|err| SpliceProxyError::Client(err, "unexpected Content-Range 502"))?;
@@ -4824,6 +4860,7 @@ async fn splice_proxy_drive(
                 conn_action,
                 StatusCode::BAD_GATEWAY,
                 "no Content-Length",
+                None,
             )
             .await
             .map_err(|err| SpliceProxyError::Client(err, "no-CL 502"))?;
@@ -4848,6 +4885,7 @@ async fn splice_proxy_drive(
             conn_action,
             StatusCode::BAD_GATEWAY,
             "zero total file size",
+            None,
         )
         .await
         .map_err(|err| SpliceProxyError::Client(err, "zero total-size 502"))?;
@@ -4871,6 +4909,7 @@ async fn splice_proxy_drive(
             conn_action,
             StatusCode::BAD_GATEWAY,
             "upstream resource too large",
+            None,
         )
         .await
         .map_err(|err| SpliceProxyError::Client(err, "oversize 502"))?;
@@ -4890,6 +4929,7 @@ async fn splice_proxy_drive(
             conn_action,
             StatusCode::BAD_GATEWAY,
             "zero body Content-Length",
+            None,
         )
         .await
         .map_err(|err| SpliceProxyError::Client(err, "zero body-CL 502"))?;
@@ -4995,6 +5035,7 @@ async fn splice_proxy_drive(
                 conn_action,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Disk quota reached",
+                None,
             )
             .await
             .map_err(|err| SpliceProxyError::Client(err, "quota 503"))?;
@@ -5023,6 +5064,7 @@ async fn splice_proxy_drive(
                     conn_action,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Cache Access Failure",
+                    None,
                 )
                 .await
                 .map_err(|err| SpliceProxyError::Client(err, "partial-size mismatch 500"))?;
@@ -5109,6 +5151,7 @@ async fn splice_proxy_drive(
             conn_action,
             StatusCode::BAD_GATEWAY,
             "body Content-Length mismatch",
+            None,
         )
         .await
         .map_err(|err| SpliceProxyError::Client(err, "body-CL mismatch 502"))?;
@@ -5135,6 +5178,7 @@ async fn splice_proxy_drive(
                 conn_action,
                 StatusCode::BAD_GATEWAY,
                 "body Content-Length mismatch",
+                None,
             )
             .await
             .map_err(|err| SpliceProxyError::Client(err, "kTLS extra-body mismatch 502"))?;
@@ -6111,6 +6155,7 @@ async fn handle_volatile_buffered_download(
             conn_action,
             StatusCode::BAD_GATEWAY,
             "zero-length body",
+            None,
         )
         .await
         .map_err(|err| SpliceProxyError::Client(err, "volatile zero-body 502"))?;
@@ -6163,6 +6208,7 @@ async fn handle_volatile_buffered_download(
                 conn_action,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Disk quota reached",
+                None,
             )
             .await
             .map_err(|err| SpliceProxyError::Client(err, "volatile quota 503"))?;

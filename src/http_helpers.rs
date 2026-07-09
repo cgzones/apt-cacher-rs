@@ -142,6 +142,7 @@ pub(crate) async fn write_invalid_response(
     conn_action: ConnectionAction,
     status: StatusCode,
     msg: &'static str,
+    retry_after: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     let date = format_http_date();
     let content_length = msg.len();
@@ -150,6 +151,14 @@ pub(crate) async fn write_invalid_response(
         "Allow: GET\r\n"
     } else {
         ""
+    };
+
+    let retry_after = match retry_after {
+        Some(remaining) => {
+            let secs = u32::try_from(remaining.as_secs().saturating_add(1)).unwrap_or(u32::MAX);
+            format!("Retry-After: {secs}\r\n")
+        }
+        None => String::new(),
     };
 
     let response = format!(
@@ -162,6 +171,7 @@ pub(crate) async fn write_invalid_response(
          Content-Length: {content_length}\r\n\
          Accept-Ranges: bytes\r\n\
          {extra_headers}\
+         {retry_after}\
          \r\n\
          {msg}"
     );

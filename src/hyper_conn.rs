@@ -44,7 +44,7 @@ use crate::{
     database_task::{DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command},
     deb_mirror::Origin,
     error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
-    global_cache_quota, global_config,
+    full_body, global_cache_quota, global_config, global_verify_throttle,
     guards::{DownloadBarrier, InitBarrier},
     http_etag::{is_valid_etag, write_etag},
     http_last_modified::write_last_modified,
@@ -2261,6 +2261,38 @@ async fn serve_new_file(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many concurrent upstream downloads",
         );
+    }
+
+    // Cleanup probes bypass the throttle: they run once per 24h cycle and a
+    // 503 would hard-fail the index-fetch cascade; their commit outcome
+    // still records/clears throttle state.
+    if !conn_details.client.is_cleanup_synthetic()
+        && let Some(throttled) = global_verify_throttle().check(
+            &conn_details.mirror,
+            &conn_details.debname,
+            conn_details.layout,
+        )
+    {
+        warn_once_or_info!(
+            "Rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+            conn_details.debname,
+            conn_details.client,
+            throttled.failures,
+            HumanFmt::Time(throttled.remaining)
+        );
+        metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
+        let secs =
+            u32::try_from(throttled.remaining.as_secs().saturating_add(1)).unwrap_or(u32::MAX);
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(SERVER, APP_NAME)
+            .header(VIA, APP_VIA)
+            .header(DATE, format_http_date())
+            .header(CONNECTION, "keep-alive")
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(RETRY_AFTER, HeaderValue::from(secs))
+            .body(full_body("Recently failed checksum verification"))
+            .expect("Response is valid");
     }
 
     let prefetched_upstream_metadata = match &cfstate {
