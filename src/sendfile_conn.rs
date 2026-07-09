@@ -169,6 +169,7 @@ pub(crate) async fn handle_sendfile_connection(
                     ConnectionAction::Close,
                     StatusCode::BAD_REQUEST,
                     "Error reading request headers",
+                    None,
                 )
                 .await;
                 return;
@@ -212,6 +213,7 @@ pub(crate) async fn handle_sendfile_connection(
                     ConnectionAction::Close,
                     status,
                     msg,
+                    None,
                 )
                 .await
                 {
@@ -229,7 +231,8 @@ pub(crate) async fn handle_sendfile_connection(
                 msg,
             } => {
                 if let Err(err) =
-                    write_invalid_response(&stream, conn_version, conn_action, status, msg).await
+                    write_invalid_response(&stream, conn_version, conn_action, status, msg, None)
+                        .await
                 {
                     info!(
                         "Failed to write rejection response to client {client}:  {}",

@@ -68,6 +68,7 @@ mod task_setup;
 mod tcp_cork_guard;
 mod uncacheables;
 mod utils;
+mod verify_throttle;
 mod web_interface;
 mod xattr_helpers;
 mod xz_stream;
@@ -592,6 +593,7 @@ struct RuntimeDetails {
     config: config::Config,
     cache_quota: cache_quota::CacheQuota,
     checksum_registry: integrity::ChecksumRegistry,
+    verify_throttle: verify_throttle::VerifyThrottle,
 }
 
 #[derive(Clone, Debug)]
@@ -665,6 +667,15 @@ pub(crate) fn global_checksum_registry() -> &'static integrity::ChecksumRegistry
         .get()
         .expect("Global was initialized in main()")
         .checksum_registry
+}
+
+#[must_use]
+#[inline]
+pub(crate) fn global_verify_throttle() -> &'static verify_throttle::VerifyThrottle {
+    &RUNTIMEDETAILS
+        .get()
+        .expect("Global was initialized in main()")
+        .verify_throttle
 }
 
 #[cfg(feature = "tls_rustls")]
@@ -830,12 +841,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let checksum_registry = integrity::ChecksumRegistry::new(config.verify_checksums_max_entries);
 
+    // Zeroed base when verification is off: the throttle can never arm, so
+    // no call site needs to consult `verify_checksums`.
+    let verify_throttle = verify_throttle::VerifyThrottle::new(
+        if config.verify_checksums {
+            config.verify_checksums_throttle_base
+        } else {
+            Duration::ZERO
+        },
+        config.verify_checksums_throttle_cap,
+    );
+
     RUNTIMEDETAILS
         .set(RuntimeDetails {
             start_time: time::OffsetDateTime::now_utc(),
             cache_quota: cache_quota::CacheQuota::new(0, config.disk_quota),
             config,
             checksum_registry,
+            verify_throttle,
         })
         .expect("Initial set in main() should succeed");
 

@@ -316,6 +316,9 @@ pub(crate) static DOWNLOAD_REJECTED_QUOTA: Counter = Counter::new();
 /// Downloads rejected because the upstream-declared object size exceeded the
 /// configured `max_object_size`.
 pub(crate) static DOWNLOAD_REJECTED_OVERSIZE: Counter = Counter::new();
+/// Requests rejected with 503 because the resource recently failed checksum
+/// verification and is inside its backoff window (upstream not contacted).
+pub(crate) static DOWNLOAD_REJECTED_VERIFY_THROTTLE: Counter = Counter::new();
 
 /// Permanent-file cache lookup found a usable file.
 pub(crate) static CACHE_HITS: Counter = Counter::new();

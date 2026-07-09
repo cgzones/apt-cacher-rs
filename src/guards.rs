@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use log::error;
+use log::{error, info};
 
 use crate::{
     ContentLength,
@@ -10,6 +10,8 @@ use crate::{
     cache_quota::QuotaReservation,
     config::CacheHost,
     deb_mirror::Mirror,
+    global_verify_throttle,
+    humanfmt::HumanFmt,
     integrity::{self, CommitError, RenamePlan},
     metrics,
 };
@@ -401,7 +403,30 @@ impl RenameBarrier {
     /// Arc -- benign for correctness, just slightly slower for the first
     /// read after cancellation.
     pub(crate) async fn commit(mut self, plan: RenamePlan) -> Result<(), CommitError> {
-        integrity::verify_and_rename(&plan).await?;
+        if let Err(err) = integrity::verify_and_rename(&plan).await {
+            // Arm the re-download throttle only on a genuine content
+            // mismatch; VerifyIo/Rename are transient local problems.
+            if matches!(err, CommitError::ChecksumMismatch) {
+                let data = self
+                    .data
+                    .as_ref()
+                    .expect("every sink consumes the instance");
+                if let Some((window, failures)) = global_verify_throttle().record_failure(
+                    &data.mirror,
+                    &data.debname,
+                    data.layout,
+                ) {
+                    info!(
+                        "Throttling downloads of {} from mirror {} for {} after checksum verification failure (consecutive failures: {failures})",
+                        data.debname,
+                        data.mirror,
+                        HumanFmt::Time(window),
+                    );
+                }
+            }
+            // `self.data` is still held: Drop runs the abort path.
+            return Err(err);
+        }
 
         // Verified and renamed. Finalise quota outside the lock, then take the
         // write lock briefly for the `Verifying -> Finished` status flip.
@@ -443,6 +468,7 @@ impl RenameBarrier {
                 meta,
             );
         }
+        global_verify_throttle().record_success(&data.mirror, &data.debname, data.layout);
         data.active_downloads
             .remove(&data.mirror, &data.debname, data.layout);
 

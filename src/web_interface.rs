@@ -29,6 +29,7 @@ use crate::{
     database_task::DB_TASK_QUEUE_SENDER,
     deb_mirror::VALID_DEB_EXTENSIONS,
     full_body, get_features, global_cache_quota, global_checksum_registry, global_config,
+    global_verify_throttle,
     http_range::format_http_date,
     humanfmt::HumanFmt,
     hyper_conn::tunnel_limiter::active_tunnels,
@@ -1615,6 +1616,11 @@ fn build_metrics_html() -> String {
         "In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart).",
         global_checksum_registry().len(),
     );
+    t.row_tip(
+        "Integrity Throttled resources",
+        "Resources currently rejected with 503 because a recent download failed checksum verification (exponential backoff; cleared by a successfully verified download).",
+        WarnNonzero(global_verify_throttle().active_len() as u64),
+    );
     {
         let status_2xx = metrics::CLIENT_STATUS_2XX.get();
         let status_200 = metrics::CLIENT_STATUS_200.get();
@@ -1678,14 +1684,15 @@ fn build_metrics_html() -> String {
         );
     }
     t.row_tip(
-        "Rejected Requests (pdiff / unsafe path / quota hit / oversize)",
-        "Client requests rejected before serving: pdiff requests, requests with unsafe paths, downloads denied because the configured disk quota is exhausted, and downloads rejected because the upstream object size exceeded max_object_size.",
+        "Rejected Requests (pdiff / unsafe path / quota hit / oversize / verify-throttled)",
+        "Client requests rejected before serving: pdiff requests, requests with unsafe paths, downloads denied because the configured disk quota is exhausted, downloads rejected because the upstream object size exceeded max_object_size, and downloads rejected because the resource recently failed checksum verification.",
         format_args!(
-            "{} / {} / {} / {}",
+            "{} / {} / {} / {} / {}",
             metrics::PDIFF_REJECTED.get(),
             WarnNonzero(metrics::UNSAFE_PATH_REJECTED.get()),
             WarnNonzero(metrics::DOWNLOAD_REJECTED_QUOTA.get()),
-            WarnNonzero(metrics::DOWNLOAD_REJECTED_OVERSIZE.get())
+            WarnNonzero(metrics::DOWNLOAD_REJECTED_OVERSIZE.get()),
+            WarnNonzero(metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.get())
         ),
     );
     t.row_tip(
