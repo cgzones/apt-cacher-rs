@@ -207,7 +207,7 @@ pub(crate) struct ClientInfo {
 /// (Packages fetches for the GC reference set).  Distinct from `127.0.0.1`
 /// so logging and metrics can distinguish real loopback clients from the
 /// cleanup-driven probes.
-const CLEANUP_CLIENT_ADDR: SocketAddr =
+pub(crate) const CLEANUP_CLIENT_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0));
 
 impl ClientInfo {

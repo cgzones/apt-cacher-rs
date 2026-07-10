@@ -14,6 +14,7 @@ use sqlx::{
 };
 
 use crate::{
+    CLEANUP_CLIENT_ADDR,
     cache_layout::SUBDIR_FLAT,
     config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
     deb_mirror::{self, Mirror, MirrorKind, mirror_cache_path_impl},
@@ -710,6 +711,14 @@ impl Database {
                     }
                 };
                 let ip: Ipv6Addr = octets.into();
+                // The cleanup-synthetic sentinel has download rows but never
+                // delivery rows, so its entry would render as "0 requests
+                // with bytes downloaded". Cleanup is excluded from
+                // client-facing metrics; keep the per-client table
+                // consistent with that.
+                if ip.to_canonical() == CLEANUP_CLIENT_ADDR.ip() {
+                    return None;
+                }
                 Some(ClientStatEntry {
                     client_ip: ip.to_canonical(),
                     last_seen: r.last_seen,
