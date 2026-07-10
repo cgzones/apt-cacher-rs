@@ -1,6 +1,6 @@
 apt-cacher-rs (0.8.0-1) unstable; urgency=medium
 
-  * New upstream release candidate.
+  * New upstream release.
   * See the upstream release notes for the full list of changes.
 
  -- Christian Göttsche <cgzones@googlemail.com>  Fri, 29 May 2026 13:49:00 +0200
