@@ -1945,7 +1945,7 @@ async fn download_file(
     if let Err(err) = writer.flush().await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "Failed to write to file `{}`:  {}",
+            "Failed to flush file `{}`:  {}",
             outpath.display(),
             ErrorReport(&err)
         );
@@ -2416,6 +2416,10 @@ async fn serve_new_file(
             trace!("Forwarded redirected response: {redirected_response:?}");
 
             fwd_response = redirected_response;
+        } else if moved_uri.scheme().is_none_or(|scheme| {
+            *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
+        }) {
+            debug!("Scheme of moved URI `{moved_uri:?}` not supported");
         } else {
             debug!(
                 "Host `{}` of moved URI not permitted",
@@ -2466,7 +2470,7 @@ async fn serve_new_file(
             metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
         }
         debug!(
-            "File `{}` is outdated (status={}), downloading new version",
+            "File `{}` did not revalidate (status={})",
             file_path.display(),
             fwd_response.status()
         );
@@ -2612,7 +2616,7 @@ async fn serve_new_file(
                 ) {
                     metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
                     warn_once_or_info!(
-                        "Upstream 206 declares total size {} for file {} from mirror {} exceeds max_object_size",
+                        "Upstream 206 declares total size {} for file {} from mirror {}, exceeding max_object_size",
                         total_nz.get(),
                         conn_details.debname,
                         conn_details.mirror
@@ -2680,7 +2684,7 @@ async fn serve_new_file(
                     fwd_response.status()
                 );
             } else {
-                warn!(
+                warn_once_or_info!(
                     "Request for file {} from mirror {} with URI `{req_uri}` failed with code `{}`",
                     conn_details.debname,
                     conn_details.mirror,
@@ -2743,7 +2747,7 @@ async fn serve_new_file(
                 if !limits::content_length_within_cap(size.get(), global_config().max_object_size) {
                     metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
                     warn_once_or_info!(
-                        "Upstream declared Content-Length {} for file {} from mirror {} exceeds max_object_size",
+                        "Upstream declared Content-Length {} for file {} from mirror {}, exceeding max_object_size",
                         size.get(),
                         conn_details.debname,
                         conn_details.mirror
@@ -3443,8 +3447,9 @@ async fn pre_process_client_request(
     };
 
     if req.body().size_hint().exact() != Some(0) {
+        // Also fires for unknown-length bodies, whose lower bound can be 0.
         warn_once_or_info!(
-            "Request from client {client} has non-empty body ({} bytes), not forwarding body: {} {}",
+            "Request from client {client} has a body (at least {} bytes), not forwarding it: {} {}",
             req.body().size_hint().lower(),
             req.method(),
             req.uri()
