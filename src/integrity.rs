@@ -74,8 +74,8 @@ impl std::error::Error for CommitError {
     }
 }
 
-/// Input for [`verify_temp_file`]. Holds everything the decision needs as plain
-/// borrows so the decision logic is global-free (no `global_config()`, no
+/// Input for [`verify_temp_file`]. Holds everything the decision needs as
+/// plain values/borrows so the decision logic is global-free (no `global_config()`, no
 /// process-wide registry) and therefore unit-testable. Note: `verify_temp_file`
 /// performs file I/O (it reads and hashes `temp_path`) - it is not a pure
 /// function, but it is free of process-global state.

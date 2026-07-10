@@ -2,7 +2,8 @@ use std::num::NonZero;
 
 use smallvec::SmallVec;
 
-/// Fixed-capacity FIFO with O(1) push/pop on both ends, backed by a
+/// Fixed-capacity FIFO ring (O(1) `push_back` with oldest-slot overwrite
+/// when full), backed by a
 /// [`SmallVec`] pre-sized (and pre-filled with `T::default()`) to
 /// exactly `capacity`.  Entries are addressed through a `head` index
 /// plus `len`, so `push_back` when the buffer is full overwrites the

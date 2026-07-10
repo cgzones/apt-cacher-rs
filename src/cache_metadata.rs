@@ -1,7 +1,7 @@
 //! Process-local cache for cached-file metadata (`ETag`, Last-Modified).
 //!
-//! See `dev/baselines/2026-05-08-e64d9328.summary.txt` for the profiling
-//! finding that motivated this: every cache-hit conditional-request path
+//! Motivated by a profiling finding (May 2026, local samply baseline):
+//! every cache-hit conditional-request path
 //! issues two `fgetxattr(2)` syscalls (one for the `ETag` xattr, one for
 //! Last-Modified), and the rustix bounds-check inside the xattr crate
 //! showed up at ~0.5 % of worker samples plus drove `block_in_place` and

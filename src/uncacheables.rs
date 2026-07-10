@@ -9,7 +9,8 @@ static UNCACHEABLES: LazyLock<parking_lot::RwLock<RingBuffer<(ClientHost, String
 
 /// Record a request as uncacheable for web-interface display.
 ///
-/// Moves existing entries to the end so the most recent entries stay newest.
+/// A re-recorded entry moves to the end, refreshing its most-recently-seen
+/// position.
 pub(crate) fn record_uncacheable(host: &ClientHost, path: &str) {
     let uncacheables = &mut *UNCACHEABLES.write();
 

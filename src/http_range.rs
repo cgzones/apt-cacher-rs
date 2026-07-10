@@ -144,11 +144,10 @@ pub(crate) fn format_http_date() -> String {
     formatted
 }
 
-/// Maximum value for the HTTP `Age` header, per RFC 9111 §5.1.
-///
-/// "If a cache receives a value larger than the largest positive integer it can represent,
-/// or if any of its age calculations overflows, it MUST transmit an Age field value of
-/// 2147483648 (2^31)."
+/// Maximum value for the HTTP `Age` header, per RFC 9111 §5.1: a cache
+/// receiving a value greater than the greatest integer it can represent, or
+/// overflowing an age calculation, must transmit an `Age` of 2147483648
+/// (2^31).
 pub(crate) const AGE_OVERFLOW_VALUE: u64 = 1u64 << 31;
 
 /// Return the timestamp considered representative of when a cached file was last replaced.
@@ -241,8 +240,10 @@ pub(crate) fn http_parse_range(
     };
 
     if file_size == 0 {
-        // A zero-length entity admits no satisfiable byte range. Per RFC 9110 §14.1.1,
-        // a server that supports Range MAY ignore the header for zero-length content.
+        // A zero-length entity admits no satisfiable byte range (RFC 9110
+        // §14.1.2: a valid range requires start < current length, impossible
+        // at length zero). Checked before the syntactic-invalidity arms
+        // below, so even a malformed range on an empty file yields 416.
         return ParsedRange::NotSatisfiable;
     }
 

@@ -88,7 +88,7 @@ where
 
 /// A `Body` that is optionally wrapped in a [`RateCheckedBody`].
 ///
-/// Let call sites express "rate-check this body if `min_download_rate` is
+/// Lets call sites express "rate-check this body if `min_download_rate` is
 /// configured, otherwise pass it through" without manually picking between
 /// two body shapes — the unified `Error` (`Box<RateCheckedBodyErr<B::Error>>`)
 /// matches the rated case so downstream error mapping is identical.
@@ -222,8 +222,9 @@ mod tests {
     fn rate_checker_fills_zeros_for_gaps() {
         let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
 
-        // Sleep 4 seconds to ensure at least 3 elapsed seconds are seen by
-        // coarsetime (which has ~1ms resolution but rounding can lose a tick).
+        // Sleep slightly over 3 seconds to ensure at least 3 elapsed seconds
+        // are seen by coarsetime (which has ~1ms resolution but rounding can
+        // lose a tick).
         std::thread::sleep(std::time::Duration::from_millis(3100));
         rc.add(1);
 

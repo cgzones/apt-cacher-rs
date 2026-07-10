@@ -154,7 +154,8 @@ impl Display for FmtTimestamp {
     }
 }
 
-/// Renders an "X ago" age for a `SystemTime`, or "N/A" when missing.
+/// Renders the age of a `SystemTime` as a bare duration (e.g. "5d 3h"),
+/// or "N/A" when missing.
 struct FmtMTimeAge(Option<SystemTime>);
 impl Display for FmtMTimeAge {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -938,16 +939,17 @@ struct DashboardData {
     db_elapsed: std::time::Duration,
     /// Wall-clock time the mirror-section branch spent on FS work after
     /// the initial `get_mirrors_with_stats` query: the per-mirror directory
-    /// walks plus the (small) `DIR_STATS_CACHE` prune. Subtracted from the
-    /// total parallel time to produce `db_elapsed`.
+    /// walks, the (small) `DIR_STATS_CACHE` prune and the `statvfs` probe.
+    /// Subtracted from the total parallel time to produce `db_elapsed`.
     fs_elapsed: std::time::Duration,
 }
 
 /// Fetch the mirror list and walk each mirror's cache directory to populate
 /// the Mirrors table. Returns the loaded mirrors (used downstream for the
 /// Maintenance and Cache Statistics sections), the rendered table HTML,
-/// the row count, the aggregated `DirStats`, and the wall-clock time spent
-/// in the FS walks (separated from `db_elapsed` for the dashboard footer).
+/// the row count, the aggregated `DirStats`, the free disk space reported
+/// by `statvfs`, and the wall-clock time spent in the FS walks (separated
+/// from `db_elapsed` for the dashboard footer).
 ///
 /// This is a free async fn rather than an inline `tokio::join!` branch so
 /// rustc can prove `Send` for the future without tripping over higher-rank
