@@ -59,9 +59,9 @@ pub(super) struct TreeSpec {
 }
 
 /// One source *description* applied to the unit's candidate map. Per-origin
-/// fan-out happens at resolution time in the engine; sources within a group
-/// are conjunctive (all must be resolved to consider the group's candidates
-/// reduced).
+/// fan-out happens at resolution time in the engine and is conjunctive there:
+/// an `OriginPackages` group counts as complete only when every one of its
+/// origins' `Packages` fetches resolved.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SourceGroup {
     pub source: IndexSource,
@@ -115,7 +115,7 @@ pub(super) enum FlatFetch {
     RootSegment { seg: String, prefix: String },
 }
 
-/// Whether a [`IndexSource::LocalReleaseDigests`] group requires every
+/// Whether an [`IndexSource::LocalReleaseDigests`] group requires every
 /// expected active-origin distribution to be present before it counts as
 /// complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +135,10 @@ pub(super) enum RetentionPolicy {
     /// (no sweep this cycle); otherwise sweep past `grace`
     /// (`UNREFERENCED_KEEP_SPAN`).
     ReferencedOrBail { grace: Duration },
-    /// Flat: at least one group parsed OK sweeps past `grace`; all groups
-    /// failed falls back to age-based `fallback` (`RETENTION_TIME`).
+    /// Flat: sweep past `grace` when the reference set is usable per the
+    /// `decide_sweep` truth table (note the quirk: a co-located parse error
+    /// forces the fallback even when the root group completed); otherwise
+    /// fall back to age-based `fallback` (`RETENTION_TIME`).
     ReferencedOrAge { grace: Duration, fallback: Duration },
     /// By-hash: a complete reference set keeps referenced digests and sweeps
     /// unreferenced-but-covered past `grace`; anything uncovered (or the
@@ -190,9 +192,9 @@ pub(super) enum SweepAction {
     /// Sweep leftover candidates past the policy's short grace span.
     Grace,
     /// Sweep leftover candidates past the policy's age-based fallback span,
-    /// carrying the primary fetch failure and (if attempted and it failed
-    /// with a different status) the root-segment failure for the warn
-    /// suffix.
+    /// carrying the primary fetch failure and, when the root fallback was
+    /// attempted and fetch-failed, the root-segment failure (the warn site
+    /// only renders it when its status differs from the primary).
     AgeFallback {
         primary: FetchFailure,
         root_failed: Option<(String, FetchFailure)>,
@@ -203,8 +205,7 @@ pub(super) enum SweepAction {
 
 /// Final sweep decision for a unit from its policy and the ordered results of
 /// the groups that ran. The whole flat-cascade fallback table lives here —
-/// replacing the RootFirst/FlatTimeFallback state threading of the previous
-/// implementation.
+/// replacing the ad-hoc state threading of the previous implementation.
 pub(super) fn decide_sweep(policy: &RetentionPolicy, groups: &[GroupResult]) -> SweepAction {
     match policy {
         RetentionPolicy::ReferencedOrBail { grace: _ } => {
@@ -242,9 +243,8 @@ pub(super) fn decide_sweep(policy: &RetentionPolicy, groups: &[GroupResult]) -> 
             match &colocated.outcome {
                 GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => SweepAction::Grace,
                 // A parse error falls back to age retention even when the
-                // root index reduced fine — preserved from the previous
-                // implementation (reconcile.rs colocated-Err arm ignored
-                // root_first). See truth-table test.
+                // root index reduced fine — quirk preserved from the previous
+                // implementation. See truth-table test.
                 GroupOutcome::ParseError => SweepAction::AgeFallback {
                     primary: FetchFailure {
                         status: StatusCode::BAD_GATEWAY,
@@ -724,10 +724,9 @@ mod tests {
         );
     }
 
-    /// Quirk row (invariant 3): a co-located parse error falls back to age
-    /// retention even when the root index reduced fine, reproducing
-    /// `reconcile.rs:837-848` — the colocated-Err arm there ignores
-    /// `root_first` entirely.
+    /// Quirk row: a co-located parse error falls back to age retention even
+    /// when the root index reduced fine — behavior preserved from the
+    /// previous implementation's colocated-Err arm.
     #[test]
     fn age_colocated_parse_error_ignores_completed_root() {
         assert_eq!(
@@ -1054,7 +1053,7 @@ mod tests {
         );
     }
 
-    // flat_root_split (moved from reconcile.rs)
+    // flat_root_split
 
     #[test]
     fn flat_root_split_computes_segment_and_prefix() {
