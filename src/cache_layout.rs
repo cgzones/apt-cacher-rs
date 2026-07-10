@@ -345,7 +345,7 @@ pub(crate) struct OriginFields {
 /// This helper is the single source of truth for the list; adding a future
 /// pseudo-arch (e.g. `signed-by`) is a one-line change here. Call sites:
 /// the `origin_fields` arm in [`classify_request`] and the deferred-`Origin`
-/// DB-emission filters in `main.rs` and `splice_conn.rs`.
+/// DB-emission filters in `hyper_conn.rs` and `splice_conn.rs`.
 #[must_use]
 pub(crate) fn is_pseudo_arch(arch: &str) -> bool {
     matches!(arch, "dep11" | "i18n" | "source")
@@ -399,9 +399,10 @@ pub(crate) enum ClassifyError<'a> {
 // ---------------------------------------------------------------------------
 
 /// Decode + validate every URL-borne field in `resource`, then derive the
-/// on-disk classification (`debname`, `cached_flavor`, `subdir`).  This is
-/// the single source of truth shared by the hyper dispatcher in `main.rs`
-/// and the sendfile dispatcher in `sendfile_conn.rs`.
+/// on-disk classification (`debname`, `cached_flavor`, `layout`).  This is
+/// the single source of truth behind `request_dispatch::dispatch_request`,
+/// shared by the hyper (`hyper_conn.rs`) and sendfile (`sendfile_conn.rs`)
+/// dispatchers.
 ///
 /// On success, the caller wraps `RequestClass` into a `ConnectionDetails`
 /// and routes the request through `process_cache_request` (or the sendfile
@@ -416,7 +417,8 @@ pub(crate) fn classify_request<'a>(
     client: &ClientInfo,
 ) -> Result<RequestClass, ClassifyError<'a>> {
     // Each arm decodes/validates only the fields that variant carries, then
-    // assembles the (debname, cached_flavor, subdir, origin_fields) tuple.
+    // assembles the (mirror_path, debname, cached_flavor, layout,
+    // resource_kind, origin_fields) `RequestClass`.
     match resource {
         ResourceFile::Pool {
             mirror_path,

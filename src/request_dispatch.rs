@@ -1,5 +1,5 @@
 //! Unified URI dispatch entry point shared by the hyper backend in
-//! `main.rs` and the sendfile backend in `sendfile_conn.rs`.
+//! `hyper_conn.rs` and the sendfile backend in `sendfile_conn.rs`.
 //!
 //! Owns the request-classification pipeline that previously appeared inline
 //! in both dispatchers:
@@ -147,7 +147,7 @@ pub(crate) enum DispatchOutcome {
         reason: PassthroughReason,
         requested_host: ClientHost,
         // Consumed by both backends: `splice_simple_proxy` (`splice_conn.rs`,
-        // via the sendfile dispatch) and `PassthroughBody` (`main.rs`).
+        // via the sendfile dispatch) and `PassthroughBody` (`hyper_conn.rs`).
         request_received_at: PreciseInstant,
     },
 }
