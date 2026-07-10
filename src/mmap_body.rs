@@ -53,7 +53,7 @@ impl Drop for MmapBody {
         let partial = self.partial;
         let elapsed = self.start.elapsed();
         let transferred_bytes = self.position as u64;
-        metrics::BYTES_SERVED_MMAP.increment_by(self.position as u64);
+        metrics::BYTES_SERVED_MMAP.increment_by(transferred_bytes);
         let cd = self.conn_details.take().expect("set in new()");
         tokio::task::spawn(async move {
             let aliased = match cd.aliased_host {

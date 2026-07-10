@@ -671,19 +671,19 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                     );
                     break;
                 }
-                Err(nix::errno::Errno::EWOULDBLOCK) => {
-                    // EWOULDBLOCK after a successful peek means the record
+                Err(nix::errno::Errno::EAGAIN) => {
+                    // EAGAIN after a successful peek means the record
                     // was consumed between the peek and the consume --
                     // leaving an unconsumed non-data record queued would
                     // desync kTLS. Fail closed so the caller falls back to
                     // userspace TLS instead of corrupting the stream.
                     warn!(
-                        "kTLS: drain consume got EWOULDBLOCK after successful peek \
+                        "kTLS: drain consume got EAGAIN after successful peek \
                          ({peeked_bytes} bytes, type={rt_to_consume:?}); aborting kTLS setup"
                     );
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "kTLS: drain consume EWOULDBLOCK after peek",
+                        "kTLS: drain consume EAGAIN after peek",
                     ));
                 }
                 Err(nix::errno::Errno::EINTR) => continue,

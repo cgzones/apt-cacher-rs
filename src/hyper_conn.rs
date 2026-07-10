@@ -1990,6 +1990,8 @@ async fn download_file(
 
     debug!("Saving downloaded file to `{}`", dest_file_path.display());
 
+    let total_bytes = resume_offset + bytes;
+
     {
         // Lock to block all downloading tasks, since the file from the
         // path of the downloading state is going to be moved.
@@ -2016,7 +2018,6 @@ async fn download_file(
             }
         }
 
-        let total_bytes = resume_offset + bytes;
         let plan = integrity::RenamePlan {
             temp_path: outpath.to_path_buf(),
             dest_path: dest_file_path.clone(),
@@ -2051,7 +2052,6 @@ async fn download_file(
         }
     }
 
-    let total_bytes = resume_offset + bytes;
     let elapsed = start.elapsed();
     let in_time = conn_details.request_received_at.elapsed();
     let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
