@@ -239,14 +239,11 @@ pub(crate) fn http_parse_range(
         Some(e)
     };
 
-    if file_size == 0 {
-        // A zero-length entity admits no satisfiable byte range (RFC 9110
-        // §14.1.2: a valid range requires start < current length, impossible
-        // at length zero). Checked before the syntactic-invalidity arms
-        // below, so even a malformed range on an empty file yields 416.
-        return ParsedRange::NotSatisfiable;
-    }
-
+    // A zero-length entity admits no satisfiable byte range (RFC 9110
+    // §14.1.2: a valid range requires start < current length, impossible at
+    // length zero); the arms below all yield `NotSatisfiable` for it.
+    // Syntactic invalidity is checked first so a malformed range is ignored
+    // (served as 200) regardless of file size, per RFC 9110 §14.2.
     let (start, end) = match (start, end) {
         // "bytes=-" is malformed: neither a first-byte-pos nor a suffix-length
         (None, None) => return ParsedRange::Invalid,
@@ -267,7 +264,9 @@ pub(crate) fn http_parse_range(
             (s, file_size - 1)
         }
         (None, Some(e)) => {
-            if e == 0 {
+            // A zero suffix-length is unsatisfiable, and so is any suffix
+            // of a zero-length file.
+            if e == 0 || file_size == 0 {
                 return ParsedRange::NotSatisfiable;
             }
             (file_size.saturating_sub(e), file_size - 1)
@@ -283,7 +282,13 @@ pub(crate) fn http_parse_range(
             false
         } else {
             match HttpDate::parse(if_range) {
-                Some(if_time) => if_time >= cache_time,
+                // RFC 9110 §13.1.5: an HTTP-date If-Range condition is true
+                // only on an *exact* match with the representation's
+                // Last-Modified. A client holding a validator we cannot
+                // reproduce (e.g. the file-birth-time fallback) fails the
+                // condition and gets a safe full 200 instead of risking a
+                // 206 stitched onto bytes from a different revision.
+                Some(if_time) => if_time == cache_time,
                 // Unparsable If-Range date: treat as failed precondition
                 None => false,
             }
@@ -414,16 +419,29 @@ mod tests {
          * valid
          */
 
+        /* If-Range date matching the cache time exactly (RFC 9110 §13.1.5) */
         assert_eq!(
             satisfiable(http_parse_range(
                 "bytes=0-1023",
-                Some("Tue, 21 Mar 2361 19:15:09 GMT"),
+                Some("Thu, 01 Jan 1970 00:00:00 GMT"),
                 8192,
                 HttpDate::UNIX_EPOCH,
                 None,
             )),
             Some(("bytes 0-1023/8192".to_string(), 0, 1024))
         );
+
+        /* If-Range time newer than cache time: exact match required, IfRangeFailed */
+        assert!(matches!(
+            http_parse_range(
+                "bytes=0-1023",
+                Some("Tue, 21 Mar 2361 19:15:09 GMT"),
+                8192,
+                HttpDate::UNIX_EPOCH,
+                None,
+            ),
+            ParsedRange::IfRangeFailed
+        ));
 
         assert_eq!(
             satisfiable(http_parse_range(
@@ -563,6 +581,26 @@ mod tests {
                 None,
             ),
             ParsedRange::NotSatisfiable
+        ));
+
+        /* empty file, open-ended and suffix forms */
+        assert!(matches!(
+            http_parse_range("bytes=0-", None, 0, HttpDate::UNIX_EPOCH, None),
+            ParsedRange::NotSatisfiable
+        ));
+        assert!(matches!(
+            http_parse_range("bytes=-500", None, 0, HttpDate::UNIX_EPOCH, None),
+            ParsedRange::NotSatisfiable
+        ));
+
+        /* empty file with a *malformed* range: ignored (200), not 416, per RFC 9110 §14.2 */
+        assert!(matches!(
+            http_parse_range("bytes=5-2", None, 0, HttpDate::UNIX_EPOCH, None),
+            ParsedRange::Invalid
+        ));
+        assert!(matches!(
+            http_parse_range("bytes=-", None, 0, HttpDate::UNIX_EPOCH, None),
+            ParsedRange::Invalid
         ));
 
         /* start out-of-range */
