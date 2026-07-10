@@ -1612,7 +1612,7 @@ fn build_metrics_html() -> String {
         metrics::CHECKSUM_UNVERIFIED.get(),
     );
     t.row_tip(
-        "Integrity Registry entries",
+        "Integrity Registry Entries",
         "In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart).",
         global_checksum_registry().len(),
     );
@@ -1769,7 +1769,7 @@ fn build_metrics_html() -> String {
         let served = metrics::SERVED_SPLICE.get();
         t.row_tip(
             "Delivery (splice) requests \u{2192} served / bytes",
-            "Responses streamed from upstream to client via Linux splice(2) zero-copy without ever touching userspace: requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
+            "Responses streamed from upstream to client via Linux splice(2) zero-copy (small userspace-written tails such as header prefixes and kTLS handshake spill included): requests that entered this path \u{2192} requests whose body was fully delivered, and total bytes delivered.",
             format_args!(
                 "{requests} \u{2192} {}{} / {}",
                 alert_if(served, served > requests),
@@ -1883,7 +1883,7 @@ fn build_metrics_html() -> String {
     }
     t.row_tip(
         "HTTP Timeouts (upstream connect / upstream read / client header read / client header write / client body)",
-        "Configured-timeout firings on upstream connect, upstream body read, client request-header read, client response-header write, and client response-body write paths.",
+        "Configured-timeout firings on upstream connect, upstream read (header or body bytes), client request-header read, client response-header write, and client response-body write paths.",
         format_args!(
             "{} / {} / {} / {} / {}",
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.get(),
@@ -1933,7 +1933,7 @@ fn build_metrics_html() -> String {
         let failed = metrics::HTTPS_UPGRADE_FAILED.get();
         t.row_tip(
             "HTTPS Upgrade (attempted / succeeded / reverted / failed, scheme-cache removed)",
-            "HTTPS upgrade attempts on plain-HTTP requests (reverted: Auto-mode soft give-up; failed: Always-mode terminal failure), plus removals from the per-host scheme cache.",
+            "HTTPS upgrade attempts on plain-HTTP requests (reverted: Auto-mode soft give-up; failed: terminal failure - Always-mode exhaustion or a non-connect transport error in any mode), plus removals from the per-host scheme cache.",
             format_args!(
                 "{} / {succeeded} / {reverted} / {failed}, {}",
                 warn_if(attempted, attempted != succeeded + reverted + failed),
@@ -1968,7 +1968,7 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Cache Size Corruption",
-        "Cache files whose recorded size disagreed with the actual size on disk.",
+        "Overflow or underflow detected in the in-memory total-cache-size accounting (value clamped; repaired by the next reconcile).",
         AlertNonzero(metrics::CACHE_SIZE_CORRUPTION.get()),
     );
     t.row_tip(
@@ -1992,7 +1992,7 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Cache I/O Failures",
-        "Local cache stat/open errors that produced a 5xx response to the client.",
+        "Cached-file syscall failures (write/flush/read/rename/create/stat/open/mmap/seek) on serving, download, scan and cleanup paths, regardless of whether a client response was affected.",
         AlertNonzero(metrics::CACHE_IO_FAILURE.get()),
     );
     t.row_tip(
@@ -2016,7 +2016,7 @@ fn build_metrics_html() -> String {
         WarnNonzero(metrics::LOGSTORE_EVICTIONS.get()),
     );
     t.row_tip(
-        "kTLS RX Enabled / permanent Fallbacks / transient Fallbacks",
+        "kTLS RX Enabled / Permanent Fallbacks / Transient Fallbacks",
         "Connections where kernel-TLS receive offload was enabled and successfully started splicing application data, vs. fallback events: permanent (host blocked from kTLS retries until cooldown expires) or transient (post-`setup_rx` drain race; host not blocked).",
         format_args!(
             "{} / {} / {}",

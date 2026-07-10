@@ -955,7 +955,7 @@ async fn try_unbuffered_ktls_connect(
         match blocked_at {
             Some(at) if now.duration_since(at) < KTLS_BLOCK_DURATION => {
                 debug!(
-                    "kTLS: skipping {} (setup blocked since {}s ago)",
+                    "kTLS: skipping {} (setup blocked {}s ago)",
                     mirror.host(),
                     now.duration_since(at).as_secs()
                 );
@@ -2762,7 +2762,7 @@ async fn serve_remaining_from_file(
     {
         Ok(bytes) => {
             debug!(
-                "splice proxy: demoted client file-serve complete, sent {content_length} bytes from cache offset {content_start}"
+                "splice proxy: demoted client file-serve complete, sent {bytes} bytes from cache offset {content_start}"
             );
             DeliveryResult::Success(bytes)
         }
@@ -3592,7 +3592,7 @@ async fn forward_upstream_body_until_eof(
         total += n as u64;
         if total > max_bytes as u64 {
             warn_once_or_info!(
-                "splice proxy: upstream error response body exceeded {} byte cap, truncating",
+                "splice proxy: upstream error response body exceeded {} byte cap",
                 max_bytes
             );
             return Err(std::io::Error::other(

@@ -242,7 +242,7 @@ impl Drop for QuotaReservation {
             Ordering::Less => {
                 let revert = self.prev_file_size - self.reserved.get();
                 trace!(
-                    "Reverting quota reservation: reserved={} prev_file_size={} revert=-{revert}",
+                    "Reverting quota reservation: reserved={} prev_file_size={} revert=+{revert}",
                     self.reserved, self.prev_file_size
                 );
                 self.quota.add(revert);
@@ -251,7 +251,7 @@ impl Drop for QuotaReservation {
             Ordering::Greater => {
                 let revert = self.reserved.get() - self.prev_file_size;
                 trace!(
-                    "Reverting quota reservation: reserved={} prev_file_size={} revert={revert}",
+                    "Reverting quota reservation: reserved={} prev_file_size={} revert=-{revert}",
                     self.reserved, self.prev_file_size
                 );
                 self.quota.subtract(revert);

@@ -198,7 +198,7 @@ pub(crate) async fn handle_sendfile_connection(
             ZeroCopyResult::NotApplicable(reason) => {
                 // Fall back to hyper for this and all subsequent requests
                 debug!(
-                    "Falling back to hyper for client {client} after {req_num} requests due to: {reason} ({} bytes buffered)",
+                    "Falling back to hyper for client {client} on request #{req_num} due to: {reason} ({} bytes buffered)",
                     buf.len()
                 );
 

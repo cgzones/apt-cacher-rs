@@ -1431,7 +1431,7 @@ impl Config {
 
         if self.buffer_size < 1024 || self.buffer_size > 1024 * 1024 * 1024 {
             bail!(
-                "Invalid buffer_size value of {}: must be between 1k and 1G",
+                "Invalid buffer_size value of {}: must be between 1KiB and 1GiB",
                 self.buffer_size
             );
         }
@@ -1657,7 +1657,7 @@ impl Config {
             && self.rate_check_timeframe != default_rate_check_timeframe()
         {
             bail!(
-                "rate_check_timeframe is set to {}s but min_download_rate is not configured",
+                "rate_check_timeframe is set to {}s but min_download_rate is disabled",
                 self.rate_check_timeframe
             );
         }

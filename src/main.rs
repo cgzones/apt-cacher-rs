@@ -931,14 +931,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
         let mut timeout_connector = hyper_timeout::TimeoutConnector::new(https_connector);
-        let http_timeout = match config_http_timeout {
-            x if x.is_zero() => None,
-            x => Some(x),
-        };
-        debug!("Using http timeout of {http_timeout:?}");
-        timeout_connector.set_connect_timeout(http_timeout);
-        timeout_connector.set_read_timeout(http_timeout);
-        timeout_connector.set_write_timeout(http_timeout);
+        // Config validation guarantees 1s <= http_timeout <= 360s, so there
+        // is no zero-means-disabled case here.
+        debug!("Using http timeout of {config_http_timeout:?}");
+        timeout_connector.set_connect_timeout(Some(config_http_timeout));
+        timeout_connector.set_read_timeout(Some(config_http_timeout));
+        timeout_connector.set_write_timeout(Some(config_http_timeout));
 
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .http1_max_headers(limits::MAX_UPSTREAM_HEADERS)
