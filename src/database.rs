@@ -24,9 +24,9 @@ use crate::{
 /// alias-resolved [`CacheHost`] (the `main` host under which files are actually
 /// stored on disk).  Falls back to `host.as_cache_host()` when no alias matches.
 ///
-/// Centralises the five identical
+/// Centralises the identical
 /// `match resolve_alias(...) { Some(c) => c, None => host.as_cache_host() }`
-/// blocks that appear across `database.rs` and `task_cleanup.rs`.
+/// blocks that appear across `database.rs` and the `cleanup/` submodule.
 #[must_use]
 pub(crate) fn resolved_cache_host<'a>(aliases: &'a [Alias], host: &'a ClientHost) -> &'a CacheHost {
     match resolve_alias(aliases, host) {
@@ -328,7 +328,11 @@ pub(crate) struct OriginRow {
 
 /// Upsert a mirror row and return `(id, was_inserted)` in a single round
 /// trip via `RETURNING`. `was_inserted` is `first_seen = last_seen`: equal
-/// only on a fresh INSERT, since ON CONFLICT rewrites just `last_seen`.
+/// on a fresh INSERT, since ON CONFLICT rewrites `last_seen` (and
+/// conditionally `kind`) but never `first_seen`. An ON-CONFLICT update
+/// landing in the same unixepoch second as the original INSERT also
+/// compares equal - a harmless false positive (a repeated "Encountered
+/// new mirror" debug line at worst).
 ///
 /// The `kind` column on ON-CONFLICT latches to `Structured` (0) whenever
 /// any structured request arrives for an existing row, so the blocklist
@@ -770,6 +774,9 @@ impl Database {
         &self,
         limit: u32,
     ) -> Result<Vec<TopPackageEntry>, Error> {
+        // Same volatile-resource exclusion as `get_top_packages`: repeatedly
+        // re-delivered metadata (e.g. `Packages.xz`) would otherwise
+        // accumulate SUM(size) and dominate the by-size table too.
         query_as!(
             TopPackageEntry,
             r#"
@@ -779,6 +786,9 @@ impl Database {
                 SUM(size) AS "total_delivered!: i64",
                 MAX(size) AS "package_size!: i64"
             FROM deliveries
+            WHERE debname LIKE '%.deb'
+               OR debname LIKE '%.udeb'
+               OR debname LIKE '%.ddeb'
             GROUP BY debname
             ORDER BY SUM(size) DESC
             LIMIT ?;
@@ -851,7 +861,8 @@ impl Database {
     /// Pool-based variant of the private `upsert_mirror_get_id`. Issued on a
     /// mirror-id cache miss in the batched `db_loop`. Returns the row `id`
     /// and `was_inserted = true` when the mirror was inserted for the first
-    /// time (no prior row in `mirrors_v2`).
+    /// time (no prior row in `mirrors_v2`; same-second caveat on
+    /// `upsert_mirror_get_id` applies).
     pub(crate) async fn upsert_mirror_id(&self, mirror: &Mirror) -> Result<(i64, bool), Error> {
         let mut tx = self.conn.begin().await?;
         let result = upsert_mirror_get_id(&mut tx, mirror).await?;
@@ -1020,7 +1031,7 @@ impl Database {
         // `DomainName::new` or whose `kind` is outside the [`MirrorKind`]
         // invariant.  Cascade to origins/downloads/deliveries.
         //
-        // The host check uses `DomainName::new` (not `is_valid_domain`) so
+        // The host check uses `DomainName::new` (not `is_valid_config_domain`) so
         // the row set this function purges is exactly the set of rows
         // downstream code — notably `flat_blocklist::init` — relies on
         // being absent.  Any future tightening of `DomainName::new` then
