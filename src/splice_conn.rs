@@ -4104,8 +4104,8 @@ async fn splice_proxy_drive(
     // Capture the original (pre-redirect) client request path. A 301 redirect
     // below shadows `upstream_path` to the redirected URL; the Origin row and
     // `handle_volatile_buffered_download` must carry the original path so
-    // registry keys match across all backends (the hyper backend in main.rs
-    // always uses the client-request URI).
+    // registry keys match across all backends (the hyper backend in
+    // hyper_conn.rs always uses the client-request URI).
     let original_uri_path = upstream_path;
 
     // Check for a partial download file to resume (permanent files only).
@@ -4719,7 +4719,7 @@ async fn splice_proxy_drive(
     }
 
     // Reject unsolicited 206: upstream returned partial content for a request
-    // without Range. See parallel reject in main.rs (hyper path).
+    // without Range. See parallel reject in hyper_conn.rs (hyper path).
     if resume_offset == 0 && upstream_resp.status_code == 206 {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         metrics::UPSTREAM_UNSOLICITED_206.increment();
@@ -5601,7 +5601,7 @@ async fn splice_proxy_drive(
         host: conn_details.mirror.host().to_string(),
         mirror_path: conn_details.mirror.path().to_owned(),
         // Use the original (pre-redirect) client request path so registry
-        // keys are consistent with the hyper backend (main.rs), which always
+        // keys are consistent with the hyper backend (hyper_conn.rs), which always
         // uses `req.uri().path()` captured before any redirect.
         raw_uri_path: original_uri_path.to_owned(),
     };
@@ -5631,7 +5631,7 @@ async fn splice_proxy_drive(
 
     let elapsed = start.elapsed();
 
-    // Record download in database (mirrors download_file() in main.rs).
+    // Record download in database (mirrors download_file() in hyper_conn.rs).
     let cmd = DatabaseCommand::Download(DbCmdDownload {
         mirror: conn_details.mirror.clone(),
         debname: conn_details.debname.clone(),
@@ -5642,9 +5642,9 @@ async fn splice_proxy_drive(
     send_db_command(cmd).await;
 
     // Record origin in database for this cached download.  This is an
-    // intentional asymmetry with the hyper backend: in `main.rs`,
-    // `Origin::from_path` is only called from the hyper `simple_proxy`
-    // passthrough in `main.rs`; the hyper cache-download paths in
+    // intentional asymmetry with the hyper backend: `Origin::from_path` is
+    // only called from the hyper simple-proxy passthrough in
+    // `hyper_conn.rs`; the hyper cache-download paths in
     // `download_file`/`serve_new_file` never record an Origin row.  The
     // splice path records Origins for cached downloads too, so it is doing
     // strictly more origin-recording work than hyper.  Treat the splice
@@ -6452,7 +6452,7 @@ async fn handle_volatile_buffered_download(
         host: conn_details.mirror.host().to_string(),
         mirror_path: conn_details.mirror.path().to_owned(),
         // Use the original (pre-redirect) client request path so registry
-        // keys are consistent with the hyper backend (main.rs), which always
+        // keys are consistent with the hyper backend (hyper_conn.rs), which always
         // uses `req.uri().path()` captured before any redirect.
         raw_uri_path: original_uri_path.to_owned(),
     };
@@ -6504,7 +6504,7 @@ async fn handle_volatile_buffered_download(
         ),
     );
 
-    // Record download in database (mirrors download_file() in main.rs).
+    // Record download in database (mirrors download_file() in hyper_conn.rs).
     let cmd = DatabaseCommand::Download(DbCmdDownload {
         mirror: conn_details.mirror.clone(),
         debname: conn_details.debname.clone(),
@@ -6527,7 +6527,7 @@ async fn handle_volatile_buffered_download(
 
     // Record origin in database for this cached (volatile-buffered)
     // download.  As in `splice_proxy_drive`, this is an intentional
-    // asymmetry with the hyper backend: in `main.rs`, `Origin::from_path`
+    // asymmetry with the hyper backend: in `hyper_conn.rs`, `Origin::from_path`
     // is only called from the simple-proxy passthrough; hyper's cache
     // paths (`download_file`/`serve_new_file`) never record an Origin row.
     // The splice path records Origins for cached downloads too, so it is

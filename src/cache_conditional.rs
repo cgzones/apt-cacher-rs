@@ -3,7 +3,7 @@
 //! Centralizes the cached representation's metadata view (`ETag` /
 //! `Last-Modified` / cache `Age`) and the RFC 9110 §13.1 precedence rules for
 //! evaluating `If-None-Match` / `If-Modified-Since` against a cached file.
-//! Both the hyper path in `main.rs` and the sendfile path in
+//! Both the hyper path in `hyper_conn.rs` and the sendfile path in
 //! `sendfile_conn.rs` previously rebuilt this view inline; sharing it keeps
 //! their behavior in lockstep.
 
