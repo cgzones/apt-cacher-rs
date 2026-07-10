@@ -1170,10 +1170,20 @@ async fn serve_cached_file(
         }
         None => None,
     };
-    let if_modified_since_str = req
-        .headers()
-        .get(IF_MODIFIED_SINCE)
-        .and_then(|v| v.to_str().ok());
+    let if_modified_since_str = match req.headers().get(IF_MODIFIED_SINCE) {
+        Some(v) => {
+            if let Ok(s) = v.to_str() {
+                Some(s)
+            } else {
+                warn_once!(
+                    "Client {} sent an invalid If-Modified-Since header: {v:?}",
+                    conn_details.client
+                );
+                None
+            }
+        }
+        None => None,
+    };
 
     let cache_info = CacheInfo::with_meta(&mdata, &resolved_meta);
     let serve_304 = cache_info.decide_serve_304(if_none_match_str, if_modified_since_str);
