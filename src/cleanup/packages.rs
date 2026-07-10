@@ -1163,7 +1163,7 @@ mod tests {
             }),
         };
         // Two upstream failures with different reasons are NOT equal (drives the
-        // flat-root suffix-suppression in reconcile.rs).
+        // flat-root suffix-suppression in engine.rs).
         assert_ne!(a, b);
         assert_eq!(a, a);
     }

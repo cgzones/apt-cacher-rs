@@ -319,7 +319,7 @@ pub(crate) fn parse_release_byhash_digests(content: &str) -> impl Iterator<Item 
 ///
 /// `debname` is `ConnectionDetails::debname` (already the basename for a
 /// structured pool file). For structured pool the key is `debname` directly.
-/// Flat-pool layer-B verification is deferred (see the plan's deferred list),
+/// Flat-pool download verification is not implemented,
 /// so this is currently only used for the structured-pool path.
 pub(crate) fn registry_key_for_download(debname: &str) -> String {
     debname.to_owned()

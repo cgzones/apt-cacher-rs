@@ -166,8 +166,8 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
 
-    // Create a stream of futures for structured deb files, flat deb files,
-    // and by-hash files cleanup.
+    // Create a stream of futures, one per mirror, each running that
+    // mirror's full ordered cleanup-unit list.
     //
     // For each mirror, collect the paths of any other mirrors registered
     // under the same alias-resolved (cache_host, port) whose path lives
@@ -237,7 +237,7 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
             // classifier's emission order guarantees the two Partials units run
             // first (a stale temp file from an interrupted download shouldn't
             // linger) and each mirror's metadata sweep precedes its by-hash
-            // units (invariant 12). `nested` feeds the FlatTree unit's walk
+            // units. `nested` feeds the FlatTree unit's walk
             // boundaries.
             let units = classify_mirror(&mirror, nested, config);
             tokio::task::spawn(run_mirror_units(mirror, units, appstate.clone(), config))

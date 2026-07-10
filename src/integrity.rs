@@ -788,7 +788,7 @@ async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesComp
 /// Guards against decompression bombs: total decompressed output is capped at
 /// the smaller of [`crate::limits::MAX_DECOMPRESSED_PACKAGES_SIZE`] and the
 /// compressed file size multiplied by
-/// [`crate::limits::MAX_DECOMPRESSION_RATIO`] (mirroring `task_cleanup.rs`).
+/// [`crate::limits::MAX_DECOMPRESSION_RATIO`] (mirroring `cleanup/packages.rs`).
 /// Per-line length is capped at [`crate::limits::MAX_METADATA_LINE_LEN`].
 /// Hitting either cap stops ingestion gracefully (the registry is just
 /// less-populated).

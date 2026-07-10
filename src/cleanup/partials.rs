@@ -20,7 +20,7 @@ use super::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry};
 /// (structured `<cache>/<cache_path>/tmp` and flat `<cache>/flat/<flat_root>/tmp`
 /// — see `model::classify_mirror`'s two `Partials` units). The returned count
 /// is logged only, never folded into `UnitStats::removed`/`bytes_removed`:
-/// partial-download scratch files are not cached content (invariant 10).
+/// partial-download scratch files are not cached content.
 pub(super) async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
     const PARTIAL_MAX_AGE: Duration = Duration::from_hours(3 * 24);
     const FOREIGN_MAX_AGE: Duration = Duration::from_hours(7 * 24);

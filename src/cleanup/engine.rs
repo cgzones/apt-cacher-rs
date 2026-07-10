@@ -386,7 +386,7 @@ struct ReconcileCtx<'a> {
 enum GroupResolution {
     /// The group ran and produced this result (pushed onto the tail's results).
     Ran(GroupResult),
-    /// Reducing emptied the candidate map (invariant 6): short-circuit the whole
+    /// Reducing emptied the candidate map: short-circuit the whole
     /// unit — there is nothing left to sweep.
     Exhausted,
     /// The group's precondition did not hold (no candidates, no index to fetch),
@@ -430,9 +430,9 @@ pub(super) async fn run_unit(
 /// the structured tree, one for the flat tree — see `model::classify_mirror`).
 ///
 /// Delegates to [`partials::cleanup_tmp_dir`] for the actual sweep and logs
-/// the same summary line `cleanup_stale_partials` used to emit (pre-Task-7,
+/// the same summary line `cleanup_stale_partials` used to emit (formerly
 /// aggregated across every mirror in one pre-pass; now per-unit). The count is
-/// deliberately NOT returned in `UnitStats` — invariant 10: partial-download
+/// deliberately NOT returned in `UnitStats` — partial-download
 /// scratch files are not cached content, so they must not inflate
 /// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED` or the quota reconcile, exactly
 /// matching the old pre-pass, which only ever logged its total.
@@ -454,11 +454,10 @@ async fn run_partials_unit(unit: &CleanupUnit, mirror: &Mirror, now: SystemTime)
 /// (`CacheLayout::Dists`, `skip_debs = false`) sweeps the pure `dists/` metadata
 /// tree; flat (`CacheLayout::Flat`, `skip_debs = true`) sweeps the flat root,
 /// leaving co-mingled `.deb` files to the flat-deb cleanup. The summary line is
-/// emitted only when something was removed (parity with the old byhash-task
-/// loop); the metadata units contribute nothing to `files_retained` (their
+/// emitted only when something was removed; the metadata units contribute nothing to `files_retained` (their
 /// `scanned` equals `removed`, so the derived retained count is zero).
 ///
-/// The always-fired debug marker anchors invariant 12: the metadata sweep runs
+/// The always-fired debug marker documents the unit ordering: the metadata sweep runs
 /// (and logs) before this mirror's by-hash units in the same cycle, so a stale
 /// `Release` freed now unpins its digests this cycle.
 async fn run_metadata_unit(
@@ -761,7 +760,7 @@ async fn sweep_byhash_dir(
 /// let [`decide_sweep`] pick the [`SweepAction`] from the unit's policy, and act
 /// on it. The per-source resolvers (fetch / reduce / diagnostics) and the
 /// per-facet completion summaries are the only facet-specific parts — the
-/// *decision* is shared, so cutting a new facet over (Tasks 5-6) is a new
+/// *decision* is shared, so adding a facet is a new
 /// resolver arm, not a second decision path.
 async fn run_reconcile_unit(
     unit: &CleanupUnit,
@@ -803,7 +802,7 @@ async fn run_reconcile_unit(
 
     // Resolve every source group in order and collect the full ordered result
     // set. The tail's ONLY short-circuit is `Exhausted` (the candidate map
-    // emptied — nothing left to sweep, invariant 6); every other outcome is
+    // emptied — nothing left to sweep); every other outcome is
     // handed to `decide_sweep`, which needs *all* groups present (the flat
     // cascade's decision depends on the always-last co-located group appearing
     // even when an earlier root/hybrid group failed). Per-source bail (e.g.
@@ -837,7 +836,8 @@ async fn run_reconcile_unit(
     // Strict-hybrid early finish: the owning archive-root group reconciled the
     // flat-pool mirror against the structured `dists/` index of its archive
     // root. Grace-sweep the leftover unreferenced debs and emit the strict
-    // summary, folding through the shared tally (invariant 4). The generic
+    // summary, folding through the shared tally so deletions performed before
+    // a mid-cascade failure stay accounted. The generic
     // `decide_sweep` for `[owning(Complete)]` also returns `Grace`, but the
     // early break preserves the old behavior of never probing the root/colocated
     // sources once strict succeeds, plus the strict-specific summary line.
@@ -882,10 +882,10 @@ async fn run_reconcile_unit(
             log_reconcile_removed(unit.facet, mirror, &swept);
             tally.fold(swept);
         }
-        // Conservative bail (invariant 1): no sweep this cycle. The resolver
+        // Conservative bail: no sweep this cycle. The resolver
         // already emitted the per-origin warn with the failing host/path/status.
         SweepAction::Bail => {}
-        // Flat time-based fallback (invariant 2): every index source failed, so
+        // Flat time-based fallback: every index source failed, so
         // the reference set is incomplete and leftovers age out on the long
         // `RETENTION_TIME` span instead of the short grace. Only the flat facet
         // (`ReferencedOrAge`) ever reaches here.
@@ -906,7 +906,7 @@ async fn run_reconcile_unit(
                 }
             }
             // Suffix only when the root fallback was attempted and failed with a
-            // status *differing* from the co-located probe (invariant 2).
+            // status *differing* from the co-located probe.
             let suffix = match &root_failed {
                 Some((seg, root_status)) if *root_status != primary => {
                     format!(", flat-root `{seg}` {root_status}")
@@ -938,10 +938,10 @@ async fn run_reconcile_unit(
     Ok(tally.unit_stats())
 }
 
-/// Dispatch one [`SourceGroup`] to its resolver. The structured-pool, hybrid
-/// archive-root, and flat (root-segment / co-located) sources are live; the
-/// by-hash `LocalReleaseDigests` source is cut over in Task 6 and never sent to
-/// the engine this task.
+/// Dispatch one [`SourceGroup`] to its resolver: the structured-pool, hybrid
+/// archive-root, and flat (root-segment / co-located) sources. The by-hash
+/// `LocalReleaseDigests` source is resolved by [`run_byhash_unit`] and never
+/// reaches this reconcile path.
 async fn resolve_group(
     ctx: &ReconcileCtx<'_>,
     group: &SourceGroup,
@@ -1025,13 +1025,13 @@ fn keymapper_for(spec: &KeymapSpec) -> KeyMapper<'_> {
 /// this reconciles the sub-path mirror's cached debs against the archive-root
 /// row's active origins, stripping the in-mirror `prefix` from `Filename:`
 /// values. Gated on an existing archive-root row so a fetch never mints a
-/// cleanup-synthesised mirror (invariant 11). This is the unit's `owning` group:
+/// cleanup-synthesised mirror row. This is the unit's `owning` group:
 /// on full success (`GroupOutcome::Complete`) the tail short-circuits the
 /// remaining root/colocated groups and grace-sweeps. Conservative on any fetch/
 /// parse failure — the group resolves to `NotApplicable`/`FetchFailed`/
-/// `ParseError` and the cascade continues (invariant 4). Metadata invalidation
+/// `ParseError` and the cascade continues. Metadata invalidation
 /// keys by `owner_mirror = mirror` (the original sub-path mirror, NOT the
-/// truncated archive-root fetch mirror — invariant 8); any checksum-mismatch
+/// truncated archive-root fetch mirror); any checksum-mismatch
 /// deletions performed before a mid-loop bail stay in the shared `tally`.
 async fn resolve_origin_packages_archive_root(
     ctx: &ReconcileCtx<'_>,
@@ -1134,7 +1134,7 @@ async fn resolve_origin_packages_archive_root(
             Ok(ReduceOutcome::Exhausted) => return Ok(GroupResolution::Exhausted),
             Ok(ReduceOutcome::FetchFailed(status)) => {
                 debug!(
-                    "strict flat-pool cleanup: could not fetch archive-root Packages for `{root}` ({status}); deferring mirror {mirror} to time-based fallback"
+                    "strict flat-pool cleanup: could not fetch archive-root Packages for `{root}` ({status}); continuing with fallback index sources for mirror {mirror}"
                 );
                 return Ok(ran_owning(GroupOutcome::FetchFailed(status)));
             }
@@ -1153,11 +1153,11 @@ async fn resolve_origin_packages_archive_root(
 /// registered flat-repo root (`apt/`). Reconciles against that root index,
 /// stripping the in-mirror `prefix` from `Filename:` values (via
 /// [`flat_root_fetch_plan`], which also keys `owner_mirror` on the original
-/// sub-path mirror — invariant 8). Gated on an existing root row (`NoRow`/
+/// sub-path mirror). Gated on an existing root row (`NoRow`/
 /// `DbError` → `NotApplicable`, both carrying `root_seg = Some(seg)` so
 /// [`decide_sweep`] can build the fallback warn suffix). Never `owning`: a
 /// complete root reference set still lets the always-last co-located group run
-/// unless the reduce `Exhausted`s the map (invariant 6 short-circuit — this is
+/// unless the reduce `Exhausted`s the map (the short-circuit above — this is
 /// how the co-located probe is skipped when the root already references every
 /// subdir deb).
 async fn resolve_flat_root_segment(
@@ -1338,7 +1338,7 @@ async fn resolve_origin_packages_self(
         config,
     } = ctx;
 
-    // Grace window is documentation only in the diagnostics below; the sweep
+    // The grace window is used only for the diagnostics below; the sweep
     // span is re-derived from the policy in the tail.
     let grace = span_table_grace(&unit.policy).deb;
 
@@ -1545,16 +1545,17 @@ fn reconcile_layout(facet: RepoFacet) -> CacheLayout {
         RepoFacet::StructuredPool => CacheLayout::StructuredPool,
         RepoFacet::StructuredByHash => CacheLayout::DistsByHash,
         RepoFacet::FlatByHash => CacheLayout::FlatByHash,
-        // Metadata and partials never reach the reconcile sweep; a defined
-        // layout keeps this total.
+        // By-hash, metadata and partials units never route through the
+        // reconcile sweep (`run_reconcile_unit` handles only StructuredPool
+        // and FlatTree); defined layouts keep this match total.
         RepoFacet::StructuredMetadata => CacheLayout::Dists,
         RepoFacet::FlatTree | RepoFacet::FlatMetadata | RepoFacet::Partials => CacheLayout::Flat,
     }
 }
 
-/// Per-facet reconcile-sweep completion summary for the `Grace` action.
-/// Structured pool and flat are live; the by-hash summary is wired when that
-/// facet routes through the engine (Task 6). The flat `AgeFallback` path emits
+/// Per-facet reconcile-sweep completion summary for the `Grace` action —
+/// only the structured-pool and flat facets reach it (the by-hash units emit
+/// their own summary in `run_byhash_unit`). The flat `AgeFallback` path emits
 /// its own "aged flat deb files" line rather than routing through here.
 fn log_reconcile_removed(facet: RepoFacet, mirror: &Mirror, swept: &SweepResult) {
     match facet {
