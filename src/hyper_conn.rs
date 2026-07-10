@@ -1080,7 +1080,7 @@ async fn serve_unfinished_file(
     response
 }
 
-/// A wrapper around [`UpstreamMetadata`] that supports borrowed, owned, and
+/// A wrapper around [`UpstreamMetadata`] that supports borrowed and
 /// shared references.
 enum UpstreamMetadataView<'a> {
     Borrowed(&'a UpstreamMetadata),
@@ -1147,7 +1147,7 @@ async fn serve_cached_file(
         conn_details.layout,
     );
 
-    // Caller pre-resolves on the volatile / late-joiner / originator paths;
+    // Caller pre-resolves on the stale-volatile revalidation path;
     // otherwise fall back to the post-flight cache (lazy-loads xattr on miss).
     let resolved_meta = match prefetched_upstream_metadata {
         Some(meta) => UpstreamMetadataView::Borrowed(meta),
@@ -2321,8 +2321,8 @@ async fn serve_new_file(
     // from the same file descriptor, avoiding TOCTOU races between metadata() and open().
     // The guard uses keep_on_drop: true so the partial file survives transient
     // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
-    // Explicit guard.remove() is used only when a stale partial must be discarded
-    // (200 fallback from unsupported Range, 416, invalid Content-Range).
+    // `partial.discard_resume()` is used only when a stale partial must be
+    // discarded (200 fallback from unsupported Range, 416, invalid Content-Range).
     let (mut resume_offset, mut resume_expected_total, resume_if_range, mut partial) =
         if conn_details.cached_flavor == CachedFlavor::Permanent
             && matches!(cfstate, CacheFileStat::New)

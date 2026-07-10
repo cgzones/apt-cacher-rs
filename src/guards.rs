@@ -233,7 +233,7 @@ impl DownloadBarrier {
         // error.
         //
         // The write lock is only held for the brief variant swap, NOT for the
-        // subsequent SHA-256 hashing in `RenameBarrier::commit` (which can
+        // subsequent SHA-256/-512 hashing in `RenameBarrier::commit` (which can
         // take hundreds of ms for a large `.deb`). Late-joiner readers are
         // therefore not stalled during verification.
         data.flush_batched_ping();
@@ -387,7 +387,7 @@ impl RenameBarrier {
     ///
     /// Lock ordering: `verify_and_rename` runs *before* the status write lock
     /// is acquired, so late-joiner readers (`status.read().await`) can proceed
-    /// concurrently while the temp file is being SHA-256-hashed on a blocking
+    /// concurrently while the temp file is being hashed on a blocking
     /// thread. The lock is only held for the brief `Verifying -> Finished`
     /// status flip after verification succeeds. The preceding `Download ->
     /// Verifying` flip happens in `DownloadBarrier::begin_rename`.

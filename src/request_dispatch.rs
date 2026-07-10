@@ -62,7 +62,7 @@ pub(crate) struct CachePlan {
     _private: (),
 }
 
-/// Reason the dispatcher refused a request with a fixed 4xx/5xx response.
+/// Reason the dispatcher refused a request with a fixed 4xx response.
 ///
 /// Backends call [`Self::response_parts`] to materialise the `(status, body)`
 /// pair; logging and metric bumping have already been done by the dispatcher.
@@ -124,7 +124,7 @@ pub(crate) enum DispatchOutcome {
     /// Route through the cache pipeline using `plan` as the
     /// `ConnectionDetails` seed.
     Cache(CachePlan),
-    /// Refuse with a fixed 4xx/5xx response.  Logging and metric bumping
+    /// Refuse with a fixed 4xx response.  Logging and metric bumping
     /// already done.
     Reject(RejectReason),
     /// Forward to upstream uncached.  Logging and metric bumping already
@@ -231,7 +231,8 @@ pub(crate) async fn dispatch_request(
     }
 }
 
-/// Pure routing decision: no global reads, no async side-effects.
+/// Routing decision without `RUNTIMEDETAILS`/DB dependencies or async
+/// side-effects (it does bump reject metrics and the `warn_once` state).
 ///
 /// The two real-world side-effects that surround it -
 /// `flat_blocklist::is_blocked` and the deferred `Origin` DB write - are

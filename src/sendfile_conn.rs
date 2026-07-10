@@ -102,7 +102,9 @@ impl From<SendfileResult> for ZeroCopyResult {
 /// Handle a client connection using sendfile(2) for cached file delivery.
 ///
 /// For each request on the connection:
-/// - If it's a GET for a permanently cached file, serve it using sendfile(2)
+/// - If it's a GET for a cached file (permanent, or volatile within its
+///   freshness window), serve it using sendfile(2)
+/// - Web-interface and splice-proxy-eligible requests are handled in place
 /// - Otherwise, fall back to the standard hyper-based handler
 pub(crate) async fn handle_sendfile_connection(
     stream: TcpStream,
@@ -461,7 +463,8 @@ fn compute_conn_action(
 }
 
 /// Try to serve a request using sendfile(2).
-/// Return whether the request was handled.
+/// Returns a [`ZeroCopyResult`] telling the caller how the request was (or
+/// was not) handled.
 async fn try_sendfile_request(
     buf: &[u8],
     stream: &TcpStream,
@@ -931,8 +934,9 @@ async fn try_sendfile_request(
                 // existing download's status was handed back by
                 // `originate()` and is held alive by the Arc, so we can
                 // serve from the partial via sendfile directly — no
-                // re-attach, no race-of-races fall-back. `CACHE_MISSES` was
-                // bumped above when the cache lookup found no usable file;
+                // re-attach, no race-of-races fall-back. `CACHE_MISSES`
+                // (permanent) or `VOLATILE_REFETCHED` (volatile) was bumped
+                // above when the cache lookup found no usable file;
                 // `LATE_JOINERS_TOTAL` was bumped inside `originate()`.
                 serve_unfinished_sendfile(
                     stream,
@@ -1529,13 +1533,10 @@ pub(crate) async fn write_all_to_stream_rated(
     Ok(())
 }
 
-/// Transfer up to `amount` bytes from `file` at `*file_offset` to `socket`
-/// using sendfile(2), handling rate checking and writability polling.
-///
-/// Returns [`ChunkLoopOutcome::Complete`] when all `amount` bytes were
-/// transferred.  Returns [`ChunkLoopOutcome::Eof`] if sendfile(2) reported
-/// EOF (returned 0) before completion — the caller decides whether that is
-/// an error.
+/// Outcome of [`sendfile_chunk_loop`]: [`ChunkLoopOutcome::Complete`] when
+/// all `amount` bytes were transferred, [`ChunkLoopOutcome::Eof`] if
+/// sendfile(2) reported EOF (returned 0) before completion — the caller
+/// decides whether that is an error.
 enum ChunkLoopOutcome {
     Complete,
     Eof { transferred: u64 },
@@ -1562,6 +1563,8 @@ struct SendfileBatch {
     stop: SendfileBatchStop,
 }
 
+/// Transfer up to `amount` bytes from `file` at `*file_offset` to `socket`
+/// using sendfile(2), handling rate checking and writability polling.
 async fn sendfile_chunk_loop(
     socket: &TcpStream,
     file: &tokio::fs::File,

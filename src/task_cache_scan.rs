@@ -39,7 +39,7 @@ impl SubDirMode {
 }
 
 /// Returns the size in bytes of the entire cache.
-/// Files that cannot be accessed are not included, but logged about.
+/// Files that cannot be accessed are not included; a message is logged for each.
 pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCacheError> {
     let config = global_config();
 

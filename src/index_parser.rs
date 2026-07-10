@@ -11,7 +11,8 @@ use std::path::Path;
 /// Extract the `Filename:` field's relative-path value from a Debian
 /// `Packages` stanza line. Returns the path verbatim.
 ///
-/// **Security**: rejects empty values, absolute paths, NUL bytes, backslash,
+/// **Security**: rejects empty values, absolute paths, ASCII control bytes
+/// (including NUL and DEL), backslash,
 /// and any segment equal to `..` or `.`. An attacker-controlled upstream
 /// `Packages` stanza could otherwise inject a traversal sequence; rejecting
 /// here keeps downstream `HashMap` keys and filesystem joins honest.

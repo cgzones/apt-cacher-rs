@@ -66,11 +66,9 @@ pub(crate) async fn main_loop(
     //
     // Both failure modes here are startup-fatal: a DB read error would
     // leave the blocklist empty and silently re-allow flat caching at
-    // collision sites, and a double-init is a programmer error in main-
-    // loop ordering.  `.expect` panics with `{msg}: {err:?}`, so the
-    // panic line surfaces the specific `InitFailure` variant alongside
-    // the message (the DB error itself has already been logged inside
-    // `init`).
+    // collision sites (propagated via `?` after logging), and a double-
+    // init is a programmer error in main-loop ordering (the `.expect`
+    // inside `flat_blocklist::init` panics).
     flat_blocklist::init(&database).await.inspect_err(|err| {
         error!("Failed to load flat-collision mirrors at startup:  {err}");
     })?;

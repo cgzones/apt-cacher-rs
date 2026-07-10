@@ -117,7 +117,7 @@ const POOL_IDLE_TIMEOUT: coarsetime::Duration = coarsetime::Duration::from_secs(
 /// Maximum number of idle connections kept per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 4;
 
-/// Buffer size for TLS upstream reads (matches pipe buffer size).
+/// Buffer size for TLS upstream reads.
 const TLS_READ_BUF_SIZE: usize = 64 * 1024;
 
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
@@ -773,8 +773,8 @@ enum KtlsError {
     /// Failure before or during TLS handshake — connection cannot be reused
     TlsFailed(std::io::Error),
     /// TLS+HTTP succeeded, but response is not suitable for kTLS splice
-    /// (non-200 status or missing/zero Content-Length). The caller reconnects
-    /// via the standard path.
+    /// (non-200 status or missing/zero Content-Length). The caller serves
+    /// cached data (volatile 304) or reconnects via the standard path.
     ResponseNotSpliceable { response: Box<UpstreamResponse> },
     /// TLS handshake succeeded but the upstream emitted malformed HTTP — the
     /// failure has nothing to do with kTLS. The caller falls back to the
@@ -1634,11 +1634,13 @@ async fn unbuffered_ktls_request(
 
     metrics::KTLS_RX_ENABLED.increment();
 
-    // Credit body bytes that arrived through the kTLS handshake — both the
-    // body_prefix bundled with the response headers and the extra_body
-    // drained from already-buffered TLS records after the headers. Both
-    // are upstream payload that downstream consumers will write to the
-    // cache/client without a separate read syscall, so credit them here.
+    // Credit body bytes that arrived through the kTLS handshake: the
+    // extra_body drained from already-buffered TLS records after the
+    // headers. (Phase 3 folds any bytes past the header terminator into
+    // `extra_body` and truncates `header_buf` to `header_end`, so the
+    // first term is 0 today; kept for robustness against reordering.)
+    // These are upstream payload that downstream consumers will write to
+    // the cache/client without a separate read syscall, so credit them here.
     let downloaded_body = (header_buf.len() - header_end) + extra_body.len();
     if downloaded_body > 0 {
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(downloaded_body as u64);
@@ -2289,7 +2291,7 @@ async fn pwrite_buf_to_file(
         let (pwrite_result, temp_return) = tokio::task::spawn_blocking(move || {
             let avail = &temp[written..size];
 
-            // SAFETY: cache_fd is valid because the caller holds a reference to the
+            // SAFETY: file_fd is valid because the caller holds a reference to the
             // tokio::fs::File, and the spawn_blocking result is awaited without cancellation
             let fd = unsafe { BorrowedFd::borrow_raw(file_fd) };
             let r = nix::sys::uio::pwrite(fd, avail, offset);
@@ -2324,7 +2326,7 @@ async fn pwrite_buf_to_file(
             }
             // EAGAIN/EWOULDBLOCK: see module-level static_assert.
             Err(nix::errno::Errno::EAGAIN) => {
-                // file is not ready, wait for it to be writable
+                // yield to avoid busy loop
                 tokio::task::yield_now().await;
             }
             Err(nix::errno::Errno::EINTR) => {}
@@ -3352,7 +3354,7 @@ async fn standard_upstream_connect(
 /// Times out after the configured HTTP timeout.
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors splice_proxy's mutable state"
+    reason = "mirrors splice_proxy_drive's mutable state"
 )]
 async fn follow_redirect(
     upstream_resp: &mut UpstreamResponse,
@@ -3472,7 +3474,8 @@ async fn follow_redirect(
 }
 
 /// Forward remaining body bytes from upstream to client (no caching).
-/// Used for non-200 responses where we just want to relay the body.
+/// Used for relaying bodies verbatim: non-200 responses on the cache path
+/// and any status via `splice_simple_proxy`.
 /// On error the connection state is indeterminate -- callers must mark the upstream non-poolable.
 async fn forward_upstream_body(
     upstream: &mut UpstreamConn,
@@ -3553,7 +3556,8 @@ async fn forward_upstream_body(
 }
 
 /// Forward body bytes from upstream to client until EOF, with a size cap.
-/// Used for non-200 responses that lack a Content-Length header.
+/// Used for relayed responses that lack a Content-Length header (non-200 on
+/// the cache path, any status via `splice_simple_proxy`).
 async fn forward_upstream_body_until_eof(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
@@ -3894,7 +3898,7 @@ async fn forward_upstream_chunked_body(
 /// Shared by the 416 and invalid-Content-Range recovery paths.
 #[expect(
     clippy::too_many_arguments,
-    reason = "called from exactly 2 sites in splice_proxy"
+    reason = "called from exactly 2 sites in splice_proxy_drive"
 )]
 async fn discard_partial_and_retry(
     partial: &mut utils::PartialDownload,
@@ -4270,7 +4274,7 @@ async fn splice_proxy_drive(
                 "splice proxy: kTLS got {} during resume, falling back to standard path",
                 response.status_code
             );
-            // Fall through to standard_upstream_connect via Failed branch below
+            // Fall through to standard_upstream_connect via the ResponseNotSpliceable arm below
         } else if response.status_code == 304
             && let Some(cache_path) = volatile_cache_path
         {
@@ -6140,9 +6144,6 @@ async fn handle_volatile_buffered_download(
     })?;
 
     let t_upstream_done = PreciseInstant::now();
-
-    // Drop upstream early to free the socket.
-    // (PoolGuard::drop returns the connection to pool if still poolable.)
 
     let Some(total_content_length) = NonZero::new(body.len() as u64) else {
         debug!(

@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn resize_grow_from_empty() {
-        // old_len == 0 exercises copy_nonoverlapping with len 0.
+        // old_len == 0 exercises the grow-path copy with an empty source.
         let mut sv = SecureVec::new(0);
         sv.resize(8, 0x42);
         assert_eq!(sv.len(), 8);

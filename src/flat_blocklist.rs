@@ -18,7 +18,7 @@
 //!
 //! # Lifecycle
 //!
-//! - **Init**: `main()` calls [`init`] once at startup with the seed set
+//! - **Init**: `main_loop` calls [`init`] once at startup with the seed set
 //!   hydrated from a `SELECT … WHERE path = 'flat' OR path LIKE 'flat/%'`
 //!   query.  Logs one `warn!` per colliding mirror so operators see the
 //!   collision in the daemon's startup log.
@@ -130,8 +130,8 @@ pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
 /// Append a (host, port) entry if `mirror_path` matches the collision
 /// pattern.  Called from the DB upsert path whenever the post-upsert
 /// row's `kind` column is `Structured` — that gate fires both on
-/// fresh inserts and on an UPDATE that latches an existing row from
-/// `Flat` back to `Structured`, so the blocklist sees the collision
+/// fresh inserts and on an UPDATE that latches a previously-`Flat`
+/// row to `Structured`, so the blocklist sees the collision
 /// even when it surfaced after a flat row already existed.  The
 /// `HashSet::insert` is idempotent, so repeat calls cost only a write
 /// lock + lookup.

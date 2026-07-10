@@ -15,7 +15,7 @@ pub(crate) struct RateChecker {
 /// The result of a failed rate check.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct InsufficientRate {
-    /// The number of bytes already transferred.
+    /// The number of bytes transferred within the measured timeframe window.
     pub(crate) transferred: usize,
     /// The number of seconds over which the download was measured.
     pub(crate) timeframe: NonZero<usize>,

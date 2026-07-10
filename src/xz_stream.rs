@@ -15,7 +15,8 @@ use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
 
 /// Internal pipe capacity. 64 KiB amortises copy syscalls between the blocking
-/// decoder thread and the async consumer without holding meaningful state.
+/// decoder thread and the async consumer without buffering meaningful amounts
+/// of memory.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
 /// Async wrapper over a blocking `lzma_rust2::XzReader` decode.

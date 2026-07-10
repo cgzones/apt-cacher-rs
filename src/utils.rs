@@ -53,7 +53,7 @@ macro_rules! static_assert {
 /// `HTTP_TIMEOUT_*` counters at construction. Folding them into
 /// "peer disconnect" was double-attributing them to
 /// `CLIENT_DISCONNECTED_MID_BODY`. The rare OS-level `ETIMEDOUT`
-/// (TCP keepalive / `TCP_USER_TIMEOUT`) is the only remaining caller and
+/// (TCP keepalive / `TCP_USER_TIMEOUT`) is the only remaining source and
 /// is acceptable to log as a warn-level timeout rather than an
 /// info-level "peer disconnect" — the wording stays accurate either way.
 ///
@@ -566,7 +566,7 @@ pub(crate) async fn touch_volatile_mtime(
             return file;
         }
     };
-    // Cache entries are replaced on update, not overridden, so the creation time (btime)
+    // Cache entries are replaced on update, not overwritten, so the creation time (btime)
     // represents the actual content age.  Mtime is repurposed as a "last revalidated"
     // timestamp.  If the filesystem does not support btime, updating mtime would destroy
     // the only content-age signal, so skip the update in that case.

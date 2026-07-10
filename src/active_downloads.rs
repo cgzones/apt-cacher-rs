@@ -7,7 +7,8 @@
 //!
 //! - Late-joiner counts ([`metrics::LATE_JOINERS_TOTAL`] /
 //!   [`metrics::LATE_JOINER_PEAK_PER_DOWNLOAD`]) — bumped atomically when
-//!   [`ActiveDownloads::insert`] joins or [`ActiveDownloads::attach`] hits.
+//!   [`ActiveDownloads::insert`] joins, [`ActiveDownloads::attach`] hits, or
+//!   [`ActiveDownloads::originate`] returns `Concurrent`.
 //! - Saturation transitions for `max_upstream_downloads`
 //!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
 //!   module-private [`AT_CAP`] latch so each saturation episode counts once.
@@ -325,9 +326,9 @@ impl ActiveDownloads {
     /// Originate-only variant of [`Self::insert`]: returns `Concurrent`
     /// when a download for the same key is already in flight, while still
     /// bumping the existing entry's late-joiner accounting to mirror
-    /// [`Self::attach`]. The splice path turns `Concurrent` into a fall-back
-    /// signal; the caller may retry via [`Self::attach`] to serve from the
-    /// partial file via the sendfile backend before falling back to hyper.
+    /// [`Self::attach`]. `Concurrent` carries the existing entry's status,
+    /// which the sendfile caller serves the partial file from directly — no
+    /// separate `attach()`, no re-check race.
     #[cfg(feature = "splice")]
     #[must_use]
     pub(crate) fn originate(

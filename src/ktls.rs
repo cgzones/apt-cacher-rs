@@ -409,7 +409,9 @@ pub(crate) fn setup_rx<F: AsFd>(
 /// 2. [`setup_rx`] — configure crypto keys
 /// 3. [`drain_control_messages`] — consume non-data TLS records
 ///
-/// Calling `setup_rx` before `load_ulp` will fail with `ENOENT`.
+/// Calling `setup_rx` before `load_ulp` will fail with `ENOPROTOOPT`
+/// (`ENOENT` is what `load_ulp` itself returns when the kernel lacks the
+/// tls module).
 /// Calling `drain_control_messages` before `setup_rx` has undefined results.
 pub(crate) fn load_ulp<F: AsFd>(fd: &F) -> io::Result<()> {
     nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpUlp::default(), b"tls").map_err(

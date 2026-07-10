@@ -225,7 +225,8 @@ impl Origin {
     ///   [`is_valid_byhash_pair`] so a junk pairing like `by-hash/MD5/...`
     ///   or `by-hash/SHA256/notahex` does NOT mint an Origin row.
     ///
-    /// **Trailing slash:** tolerated for the `Packages*` shape only — a
+    /// **Trailing slash:** tolerated for the `Packages*` and `by-hash`
+    /// shapes — a
     /// single trailing `/` (collapsed by [`normalize_uri_path`] from any
     /// `/+` run) is permitted because callers derive URIs from
     /// cleanup/database state where trailing slashes can arise from
@@ -857,7 +858,8 @@ fn contains_translation_diff(uri_path: &str) -> bool {
     false
 }
 
-/// Check whether a percent-decoded URI path is safe to forward upstream.
+/// Check whether a raw URI path is safe to forward upstream
+/// (percent-decoding is applied internally before inspection).
 ///
 /// Rejects traversal segments (`..`, `.`) and control characters (including null bytes).
 ///
