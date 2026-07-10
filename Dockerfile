@@ -6,8 +6,7 @@ RUN apk add \
     musl-dev \
     build-base \
     cmake \
-    pkgconf \
-    xz-static
+    pkgconf
 
 RUN adduser \
     --disabled-password \

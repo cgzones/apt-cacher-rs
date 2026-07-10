@@ -3,7 +3,7 @@ name = "apt-cacher-rs"
 version = "0.8.0"
 authors = ["Christian Göttsche <cgzones@googlemail.com>"]
 license = "MIT"
-description = "Caching proxy for Debian style package repositories"
+description = "Caching proxy for Debian-style package repositories"
 readme = "README.md"
 repository = "https://github.com/cgzones/apt-cacher-rs"
 keywords = ["Debian", "proxy", "cache", "deb", "apt"]
@@ -208,7 +208,7 @@ panic = 'abort'
 [profile.dev]
 debug = "line-tables-only"
 
-# Speed up compile time query checking
+# Speed up compile-time query checking
 [profile.dev.package.sqlx-macros]
 opt-level = 3
 

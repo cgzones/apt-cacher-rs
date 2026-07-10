@@ -3,7 +3,7 @@
 [![Version info](https://img.shields.io/crates/v/apt-cacher-rs.svg)](https://crates.io/crates/apt-cacher-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE?raw=true)
 
-`apt-cacher-rs` is a simple caching proxy daemon for Debian style repositories.
+`apt-cacher-rs` is a simple caching proxy daemon for Debian-style repositories.
 It is inspired by and an alternative to [`apt-cacher`](https://salsa.debian.org/LeePen/apt-cacher) and [`apt-cacher-ng`](https://www.unix-ag.uni-kl.de/~bloch/acng/).
 
 ## Build the Debian package
@@ -11,7 +11,7 @@ It is inspired by and an alternative to [`apt-cacher`](https://salsa.debian.org/
 Before you can create a Debian package, the following commands must be run once to install the necessary dependencies:
 
 ```bash
-apt-get -y install dpkg-dev liblzma-dev
+apt-get -y install dpkg-dev
 cargo install cargo-deb
 ```
 
@@ -32,7 +32,7 @@ podman build -t apt-cacher-rs:dev -f Dockerfile .
 ```
 
 The image expects a `volume` mounted at */data* to store the database and cached files.
-You must also provide a configuration file via a mount on */app/apt-cacher-rs.conf*, since the default configuration does not permit any clients.
+You must also provide a configuration file via a mount on */app/apt-cacher-rs.conf*: the entrypoint passes this path explicitly, so the file must exist, and the built-in defaults do not permit any mirrors anyway.
 For example you can start a container via:
 
 ```bash
@@ -60,7 +60,7 @@ Install the Debian package via dpkg on a local network server and add the follow
 Acquire::http::Proxy "http://<proxy_ip>:3142/";
 ```
 
-If your sources contain HTTPS repositories you like to cache as well, change their URL schema to *http://* to cache their packages.
+If your sources contain HTTPS repositories you would like to cache as well, change their URL scheme to *http://* to cache their packages.
 Note that connections from the client to the proxy are unencrypted (but all packages are by default verified by `apt(8)` after download to have a valid GPG signature).
 
 ## Web interface
@@ -90,7 +90,7 @@ The cleanup can also be manually triggered by sending the signal `USR2` to the `
 
 ## Security
 
-The proxy interface should not be made public available to the internet or completely untrusted clients.
+The proxy interface should not be made publicly available to the internet or completely untrusted clients.
 That could lead to Denial of Service issues, like congesting the network traffic or exhausting the filesystem's capacity.
 
 ## License
