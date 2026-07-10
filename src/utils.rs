@@ -309,7 +309,7 @@ pub(crate) async fn tokio_tempfile(
 
     let mut tries = 0;
     loop {
-        const MAX_TRIES: u32 = 10;
+        const MAX_RETRIES: u32 = 10;
 
         let s: String = (&mut rng)
             .sample_iter(Alphanumeric)
@@ -340,7 +340,7 @@ pub(crate) async fn tokio_tempfile(
             }
             Err(err) if err.kind() == tokio::io::ErrorKind::AlreadyExists => {
                 tries += 1;
-                if tries > MAX_TRIES {
+                if tries > MAX_RETRIES {
                     return Err(err);
                 }
                 assert!(
