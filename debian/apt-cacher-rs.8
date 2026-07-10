@@ -17,7 +17,7 @@ apt-cacher-ng for hosts that need to share package downloads across
 multiple machines.
 .SH OPTIONS
 .TP
-.BI \-c\  PATH ", " \-\-config\-file= PATH
+.BI \-c " PATH" ", \-\-config\-file=" PATH
 Configuration file path
 .RI ( default :
 .IR /etc/apt\-cacher\-rs/apt\-cacher\-rs.conf ).
@@ -36,7 +36,7 @@ from the configuration file.
 Log file path. Logs are written to the given file instead of the
 console (the default).
 .TP
-.BI \-l\  SEVERITY ", " \-\-log\-level= SEVERITY
+.BI \-l " SEVERITY" ", \-\-log\-level=" SEVERITY
 Logging level (e.g. \fItrace\fR, \fIdebug\fR, \fIinfo\fR, \fIwarn\fR,
 \fIerror\fR).
 .TP
@@ -48,10 +48,10 @@ manager (such as systemd) already adds one.
 Permit the daemon to run as the root user. This is potentially
 dangerous and is not recommended.
 .TP
-.B \-h ", " \-\-help
+.BR \-h ", " \-\-help
 Print a help summary and exit.
 .TP
-.B \-V ", " \-\-version
+.BR \-V ", " \-\-version
 Print version information and exit.
 .SH FILES
 .TP
@@ -65,8 +65,11 @@ Default cache directory.
 Default database file.
 .SH SIGNALS
 .TP
-.B SIGHUP
-Reopen the log file (when logging to a file).
+.B SIGUSR1
+Reopen the log file (when logging to a file), e.g. after log rotation.
+.TP
+.B SIGUSR2
+Trigger a cache cleanup run.
 .SH SEE ALSO
 .BR apt (8),
 .BR systemd.service (5).
