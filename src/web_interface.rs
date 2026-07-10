@@ -3,7 +3,9 @@ use std::{
     cmp::Reverse,
     fmt::{self, Display, Formatter, Write as _},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::LazyLock,
+    task::{Context, Poll},
     time::SystemTime,
 };
 
@@ -16,6 +18,8 @@ use http::{
         SERVER, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
     },
 };
+use http_body::{Body, Frame, SizeHint};
+use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use log::{debug, error, trace, warn};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
@@ -28,7 +32,7 @@ use crate::{
     database::{Database, MirrorStatEntry},
     database_task::DB_TASK_QUEUE_SENDER,
     deb_mirror::VALID_DEB_EXTENSIONS,
-    full_body, get_features, global_cache_quota, global_checksum_registry, global_config,
+    get_features, global_cache_quota, global_checksum_registry, global_config,
     global_verify_throttle,
     http_range::format_http_date,
     humanfmt::HumanFmt,
@@ -2287,9 +2291,67 @@ impl WebResponse {
             }
             WebResponseKind::Error => {}
         }
+        let body = WebUiCountedBody {
+            inner: Full::new(self.body),
+            delivered: false,
+        };
         builder
-            .body(full_body(self.body))
+            .body(ProxyCacheBody::Boxed(BoxBody::new(
+                body.map_err(|never| match never {}),
+            )))
             .expect("HTTP response is valid")
+    }
+}
+
+/// `Full<Bytes>` wrapper for hyper-served web-interface responses: credits
+/// `SERVED_WEBUI`/`SERVED_TOTAL` in `Drop` only once the body was polled to
+/// completion, so a client aborting before the page was written out does not
+/// count as served (`SERVED_*` means "fully delivered", see `metrics.rs`).
+/// The sendfile path instead bumps after its synchronous write succeeds
+/// (`sendfile_conn::serve_webui_request`).
+struct WebUiCountedBody {
+    inner: Full<bytes::Bytes>,
+    delivered: bool,
+}
+
+impl Drop for WebUiCountedBody {
+    fn drop(&mut self) {
+        if self.delivered {
+            metrics::SERVED_WEBUI.increment();
+            metrics::SERVED_TOTAL.increment();
+        }
+    }
+}
+
+impl Body for WebUiCountedBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(cx);
+        match &result {
+            // hyper stops polling once `is_end_stream()` turns true after the
+            // final frame, so a `Ready(None)` poll cannot be relied upon.
+            Poll::Ready(Some(Ok(_))) => {
+                if self.inner.is_end_stream() {
+                    self.delivered = true;
+                }
+            }
+            Poll::Ready(None) => self.delivered = true,
+            Poll::Ready(Some(Err(_))) | Poll::Pending => {}
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -2325,9 +2387,6 @@ pub(crate) async fn serve_web_interface(uri: &http::Uri, appstate: &AppState) ->
         response.content_type(),
         response.body.len()
     );
-
-    metrics::SERVED_WEBUI.increment();
-    metrics::SERVED_TOTAL.increment();
 
     response
 }

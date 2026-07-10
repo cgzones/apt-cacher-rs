@@ -80,12 +80,18 @@ impl Drop for ChannelBody {
     fn drop(&mut self) {
         // "Fully delivered" (per `metrics.rs` SERVED_TOTAL doc) requires
         // reaching a terminal state AND never having surfaced an error. For
-        // `Exact` the announced total was delivered; for `Upper` the channel
-        // closed cleanly. A `ContentTooLarge` after the announced total (or
-        // any upstream error) vetoes the credit even when the terminal flag
-        // is set. Preserves the parent/subset invariant from `metrics.rs`:
+        // `Exact` only delivery of the announced total counts - a sender that
+        // drops the channel early (e.g. a cache-read failure abort) closed
+        // the channel but truncated the body. For `Upper` (unknown length) a
+        // clean channel close is the only terminal signal there is. An
+        // upstream error vetoes the credit even when the terminal flag is
+        // set. Preserves the parent/subset invariant from `metrics.rs`:
         // `SERVED_TOTAL` = sum of per-path `SERVED_*`.
-        if (self.delivered_announced || self.channel_closed) && !self.errored {
+        let terminal = match self.content_length {
+            ContentLength::Exact(_) => self.delivered_announced,
+            ContentLength::Unknown(_) => self.channel_closed,
+        };
+        if terminal && !self.errored {
             metrics::SERVED_CHANNEL.increment();
             metrics::SERVED_TOTAL.increment();
         }
@@ -101,12 +107,12 @@ impl Body for ChannelBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        // Hint per the `Body` trait. We return `true` once the announced
-        // total has been delivered so well-behaved consumers can stop early;
-        // `poll_frame` itself only short-circuits on `channel_closed`, so a
-        // consumer that keeps polling still gets `ContentTooLarge` if the
-        // upstream pushes more frames after the announced total.
-        self.delivered_announced || self.channel_closed
+        // Hint per the `Body` trait: `true` implies `poll_frame` will only
+        // yield `Ready(None)`. Mirror every terminal short-circuit in
+        // `poll_frame` - the announced total delivered, the channel closed,
+        // or an error surfaced - so a consumer relying on the hint stops
+        // instead of issuing a redundant poll after the body has terminated.
+        self.delivered_announced || self.channel_closed || self.errored
     }
 
     fn poll_frame(
@@ -270,6 +276,35 @@ mod tests {
             matches!(*err, ProxyCacheError::ContentTooLarge { received: 4, .. }),
             "expected ContentTooLarge {{ received: 4, .. }}, got {err:?}"
         );
+    }
+
+    /// After a surfaced error `poll_frame` only ever yields `Ready(None)`, so
+    /// `is_end_stream()` must report `true` even when neither the announced
+    /// total was delivered nor the channel closed - otherwise a consumer using
+    /// the hint issues a redundant poll on the terminated body.
+    #[tokio::test]
+    async fn errored_marks_end_of_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = ChannelBody::new(rx, ContentLength::Exact(nz(3)));
+
+        // Over-announce within a single frame: sets `errored` while
+        // `delivered_announced` and `channel_closed` both stay `false`.
+        tx.send(Ok(bytes::Bytes::from_static(b"abcd")))
+            .await
+            .expect("send");
+
+        let result = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("frame present");
+        let err = result.expect_err("expected ContentTooLarge, got Ok frame");
+        assert!(matches!(*err, ProxyCacheError::ContentTooLarge { .. }));
+
+        assert!(
+            body.is_end_stream(),
+            "is_end_stream() must be true once `errored` is set"
+        );
+
+        drop(tx);
     }
 
     /// When the announced total is reached but the channel has not yet

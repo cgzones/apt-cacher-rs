@@ -578,14 +578,18 @@ impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
 /// exposes no post-write hook). Splice/sendfile count post-write directly.
 ///
 /// On Drop, bumps `SERVED_PASSTHROUGH` + `SERVED_TOTAL` iff the inner body
-/// reached clean end-of-stream (`poll_frame` returned `Ready(None)`) — so
-/// aborted clients do not increment the served counter.  Also logs a
-/// per-request rate summary (total in-time, upstream rate, client rate).
+/// reached clean end-of-stream (`poll_frame` returned `Ready(None)`) without
+/// ever surfacing an error — so aborted clients and errored deliveries do
+/// not increment the served counter.  Also logs a per-request rate summary
+/// (total in-time, upstream rate, client rate).
 #[pin_project(PinnedDrop)]
 struct PassthroughBody<B: Body> {
     #[pin]
     inner: B,
     end_of_stream: bool,
+    // Sticky: set once `poll_frame` has yielded any `Err`, vetoing the
+    // Drop-time `SERVED_*` credit even if a later poll reaches `Ready(None)`.
+    errored: bool,
     transferred: u64,
     start: PreciseInstant,
     request_received_at: PreciseInstant,
@@ -607,6 +611,7 @@ impl<B: Body> PassthroughBody<B> {
         Self {
             inner,
             end_of_stream: false,
+            errored: false,
             transferred: 0,
             start: PreciseInstant::now(),
             request_received_at,
@@ -643,7 +648,10 @@ where
             Ready(None) => {
                 *this.end_of_stream = true;
             }
-            Ready(Some(Err(_))) | Pending => {}
+            Ready(Some(Err(_))) => {
+                *this.errored = true;
+            }
+            Pending => {}
         }
         result
     }
@@ -667,11 +675,12 @@ impl<B: Body> PinnedDrop for PassthroughBody<B> {
         let in_time = self.request_received_at.elapsed();
         let upstream_window = self.request_sent.elapsed();
         let end_of_stream = self.end_of_stream;
+        let errored = self.errored;
         let this = self.project();
         let host = std::mem::take(this.host);
         let path = std::mem::take(this.path);
         let client = *this.client;
-        if end_of_stream {
+        if end_of_stream && !errored {
             metrics::SERVED_PASSTHROUGH.increment();
             metrics::SERVED_TOTAL.increment();
             info!(
@@ -2871,7 +2880,21 @@ async fn serve_new_file(
             // The file handle has been held open since the check, so no TOCTOU race.
             // Verify the file size matches expectations (should always hold since
             // we've held the fd open, but check as defense-in-depth).
-            let current_size = file.seek(std::io::SeekFrom::End(0)).await.unwrap_or(0);
+            let current_size = match file.seek(std::io::SeekFrom::End(0)).await {
+                Ok(size) => size,
+                Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to seek in partial file for `{}`:  {}",
+                        conn_details.debname,
+                        ErrorReport(&err)
+                    );
+                    return quick_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Cache Access Failure",
+                    );
+                }
+            };
             if current_size != resume_offset {
                 error!(
                     "Partial file size {current_size} != expected {resume_offset} despite held fd, aborting resume"

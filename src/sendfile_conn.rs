@@ -362,6 +362,10 @@ async fn serve_webui(
         );
         return ZeroCopyResult::AfterHeaderError;
     }
+    // `SERVED_*` means "fully delivered": bump only after the synchronous
+    // write completed (the hyper path gates via `WebUiCountedBody`).
+    metrics::SERVED_WEBUI.increment();
+    metrics::SERVED_TOTAL.increment();
     ZeroCopyResult::Served(conn_action)
 }
 
@@ -844,13 +848,15 @@ async fn try_sendfile_request(
                             HumanFmt::Time(elapsed),
                             VOLATILE_CACHE_MAX_AGE.as_secs()
                         );
-                        metrics::VOLATILE_HIT.increment();
                     } else {
+                        // Served from cache all the same - keep the
+                        // hit/miss metrics complete via the shared bump below.
                         warn!(
                             "Volatile file `{}` was modified in the future, ignoring modification time",
                             cache_path.display()
                         );
                     }
+                    metrics::VOLATILE_HIT.increment();
                 }
                 Ok(_) => {
                     metrics::CACHE_NON_REGULAR.increment();
