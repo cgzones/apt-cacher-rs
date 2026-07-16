@@ -7,7 +7,7 @@
 use std::io;
 use std::io::IoSliceMut;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use nix::libc;
 use nix::sys::socket::sockopt::TlsCryptoInfo;
@@ -95,10 +95,25 @@ static_assert!(NONCE_LEN == 12, "kTLS requires NONCE_LEN == 12");
 // Availability probe (cached)
 // ---------------------------------------------------------------------------
 
-static KTLS_AVAILABLE: OnceLock<bool> = OnceLock::new();
+/// Cached probe result: definitive outcomes (available / unavailable) are
+/// latched for the process lifetime; probe *errors* are not, so a transient
+/// startup failure (e.g. ephemeral-port exhaustion) does not permanently
+/// disable kTLS.
+const KTLS_PROBE_UNKNOWN: u8 = 0;
+const KTLS_PROBE_AVAILABLE: u8 = 1;
+const KTLS_PROBE_UNAVAILABLE: u8 = 2;
+
+static KTLS_AVAILABLE: AtomicU8 = AtomicU8::new(KTLS_PROBE_UNKNOWN);
+
+/// Erroring probe attempts so far. Once `MAX_PROBE_ERRORS` is reached the
+/// probe latches unavailable, bounding per-request probe work and log noise
+/// on persistently broken environments.
+static KTLS_PROBE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Probe kTLS availability by attempting to set the TLS ULP on a connected socket.
-/// The result is cached for the lifetime of the process.
+/// A definitive result (available / unavailable) is cached for the lifetime of
+/// the process; an errored probe is retried on the next call, up to
+/// `MAX_PROBE_ERRORS` attempts.
 ///
 /// `TCP_ULP` requires a connected socket, so we create a loopback TCP pair
 /// to test whether the kernel supports the `tls` ULP.
@@ -114,7 +129,7 @@ pub(crate) fn is_available() -> bool {
 
     fn inner() -> TestResult {
         use nix::sys::socket::{
-            AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, accept, bind, connect,
+            AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, accept4, bind, connect,
             getsockname, listen, setsockopt, socket, sockopt::TcpUlp,
         };
         use std::os::fd::{FromRawFd as _, OwnedFd};
@@ -122,7 +137,7 @@ pub(crate) fn is_available() -> bool {
         let listener: OwnedFd = match socket(
             AddressFamily::Inet,
             SockType::Stream,
-            SockFlag::empty(),
+            SockFlag::SOCK_CLOEXEC,
             None,
         ) {
             Ok(fd) => fd,
@@ -156,7 +171,7 @@ pub(crate) fn is_available() -> bool {
         let client: OwnedFd = match socket(
             AddressFamily::Inet,
             SockType::Stream,
-            SockFlag::empty(),
+            SockFlag::SOCK_CLOEXEC,
             None,
         ) {
             Ok(fd) => fd,
@@ -172,10 +187,10 @@ pub(crate) fn is_available() -> bool {
         }
 
         // Accept the server side (not needed for the probe, but completes the handshake)
-        let _server = match accept(listener.as_raw_fd()) {
+        let _server = match accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
             Ok(fd) => {
-                // SAFETY: accept succeeded so the fd is valid, and no other code owns it.
-                // nix::sys::socket::accept returns a raw fd (not OwnedFd), so we wrap it
+                // SAFETY: accept4 succeeded so the fd is valid, and no other code owns it.
+                // nix::sys::socket::accept4 returns a raw fd (not OwnedFd), so we wrap it
                 // immediately to ensure it is closed on drop.
                 unsafe { OwnedFd::from_raw_fd(fd) }
             }
@@ -198,20 +213,41 @@ pub(crate) fn is_available() -> bool {
         }
     }
 
-    *KTLS_AVAILABLE.get_or_init(|| match inner() {
+    /// Give up and latch unavailable after this many erroring probe attempts.
+    const MAX_PROBE_ERRORS: u32 = 3;
+
+    match KTLS_AVAILABLE.load(Ordering::Relaxed) {
+        KTLS_PROBE_AVAILABLE => return true,
+        KTLS_PROBE_UNAVAILABLE => return false,
+        _ => {}
+    }
+
+    // Concurrent probes are benign: the loopback test is idempotent and both
+    // callers store the same definitive outcome.
+    match inner() {
         TestResult::Available => {
             info!("kTLS: kernel TLS support detected");
+            KTLS_AVAILABLE.store(KTLS_PROBE_AVAILABLE, Ordering::Relaxed);
             true
         }
         TestResult::Unavailable => {
             info!("kTLS: kernel TLS not available (modprobe tls?)");
+            KTLS_AVAILABLE.store(KTLS_PROBE_UNAVAILABLE, Ordering::Relaxed);
             false
         }
         TestResult::Error => {
-            // Log message should have been emitted.
+            // A log message was emitted by inner(). Do not latch: the error
+            // may be transient and the next call retries the probe.
+            let errors = KTLS_PROBE_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+            if errors >= MAX_PROBE_ERRORS {
+                warn!(
+                    "kTLS: availability probe failed {errors} times; disabling kTLS for this run"
+                );
+                KTLS_AVAILABLE.store(KTLS_PROBE_UNAVAILABLE, Ordering::Relaxed);
+            }
             false
         }
-    })
+    }
 }
 
 /// Resolve TLS protocol version to the kernel constant, or return an error.
@@ -414,12 +450,10 @@ pub(crate) fn setup_rx<F: AsFd>(
 /// tls module).
 /// Calling `drain_control_messages` before `setup_rx` has undefined results.
 pub(crate) fn load_ulp<F: AsFd>(fd: &F) -> io::Result<()> {
-    nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpUlp::default(), b"tls").map_err(
-        |errno| {
-            warn_once!("kTLS: failed to load TLS ULP:  {errno}");
-            errno_to_io_error(errno, "kTLS: setsockopt TLS ULP failed")
-        },
-    )
+    // No logging here: the caller logs the returned error (with host context)
+    // and records the kTLS block for the mirror.
+    nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpUlp::default(), b"tls")
+        .map_err(|errno| errno_to_io_error(errno, "kTLS: setsockopt TLS ULP failed"))
 }
 
 /// Return a display name for a `ConnectionTrafficSecrets` variant.
@@ -531,16 +565,27 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
     // Buffer for the record payload. 0x4001 (16385) is one byte more than the
     // TLS max record size (16384) to avoid EMSGSIZE on exactly-max-size records
     // during MSG_PEEK.
+    /// Cap on consumed control records per drain. Real servers send a small
+    /// burst of post-handshake messages (rustls-facing servers emit at most
+    /// ~4 `NewSessionTicket`s); a peer streaming control records without end
+    /// would otherwise pin a worker in this loop at network rate.
+    const MAX_DRAIN_RECORDS: u32 = 16;
+
     #[expect(clippy::large_stack_arrays, reason = "must fit full TLS record")]
     let mut buf = [0u8; 0x4001];
 
     let mut first_iteration = true;
+    let mut consumed_records = 0u32;
+
+    // cmsg buffers are allocated once and zero-filled before every recvmsg so
+    // stale bytes from a previous call cannot influence extract_record_type()
+    // if the kernel writes fewer bytes.
+    let mut cmsg_buf = nix::cmsg_space!(TlsGetRecordType);
+    let mut consume_cmsg = nix::cmsg_space!(TlsGetRecordType);
 
     loop {
         let mut iov = [IoSliceMut::new(&mut buf)];
-        // Fresh cmsg buffer per iteration so stale bytes from a previous recvmsg
-        // cannot influence extract_record_type() if the kernel writes fewer bytes.
-        let mut cmsg_buf = nix::cmsg_space!(TlsGetRecordType);
+        cmsg_buf.fill(0);
 
         // Use recvmsg with cmsg to receive control messages that read() can't deliver.
         // kTLS only returns non-data records (NewSessionTicket, etc.) when cmsg is available.
@@ -585,11 +630,16 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
 
         first_iteration = false;
 
-        let record_type = extract_record_type(&recv);
+        let record_type = match extract_record_type(&recv) {
+            Ok(rt) => rt,
+            Err(err) => {
+                warn!("kTLS: drain peek cmsg decode failed; aborting kTLS setup:  {err}");
+                return Err(err);
+            }
+        };
         let peeked_bytes = recv.bytes;
         let flags = recv.flags;
         debug!("kTLS: peeked {peeked_bytes} bytes, record_type={record_type:?}, flags={flags:?}");
-        drop(cmsg_buf); // Avoid accidental reuse.
 
         // MSG_CTRUNC is orthogonal to record-type classification: it
         // indicates the cmsg buffer was truncated, so we cannot trust
@@ -636,12 +686,24 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
             }
         };
 
+        consumed_records += 1;
+        if consumed_records > MAX_DRAIN_RECORDS {
+            warn!(
+                "kTLS: more than {MAX_DRAIN_RECORDS} control records queued without \
+                 reaching application data; aborting kTLS setup"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kTLS: too many control records in drain",
+            ));
+        }
+
         // Consume the peeked record (no MSG_PEEK). Retry tightly on EINTR
         // to avoid restarting the outer peek cycle for a record we already
         // identified.
         loop {
             let mut consume_iov = [IoSliceMut::new(&mut buf)];
-            let mut consume_cmsg = nix::cmsg_space!(TlsGetRecordType);
+            consume_cmsg.fill(0);
             let _: Never = match socket::recvmsg::<SockaddrStorage>(
                 fd.as_raw_fd(),
                 &mut consume_iov,
@@ -658,7 +720,15 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                          concurrent reader on kTLS socket?",
                         msg.bytes
                     );
-                    let consumed_rt = extract_record_type(&msg);
+                    let consumed_rt = match extract_record_type(&msg) {
+                        Ok(rt) => rt,
+                        Err(err) => {
+                            warn!(
+                                "kTLS: drain consume cmsg decode failed; aborting kTLS setup:  {err}"
+                            );
+                            return Err(err);
+                        }
+                    };
                     debug_assert_eq!(
                         consumed_rt,
                         Some(rt_to_consume),
@@ -699,16 +769,23 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
 }
 
 /// Extract the `TlsGetRecordType` from a `recvmsg()` result's control messages.
+///
+/// Returns `Ok(None)` when the cmsg buffer decodes cleanly but carries no
+/// record-type entry (the kernel's signal for plain application data). A cmsg
+/// *decode* error is surfaced as `Err` so callers fail closed instead of
+/// misclassifying an undecodable record as application data.
 fn extract_record_type(
     recv: &socket::RecvMsg<'_, '_, SockaddrStorage>,
-) -> Option<TlsGetRecordType> {
-    let cmsgs = recv.cmsgs().ok()?;
+) -> io::Result<Option<TlsGetRecordType>> {
+    let cmsgs = recv
+        .cmsgs()
+        .map_err(|errno| errno_to_io_error(errno, "kTLS: cmsg decode failed"))?;
     for cmsg in cmsgs {
         if let ControlMessageOwned::TlsGetRecordType(rt) = cmsg {
-            return Some(rt);
+            return Ok(Some(rt));
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
