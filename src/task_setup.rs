@@ -1,10 +1,8 @@
-use std::os::unix::fs::OpenOptionsExt as _;
-
 use anyhow::Context as _;
 use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
-use crate::{cache_layout::SUBDIR_TMP, global_config};
+use crate::{cache_layout::SUBDIR_TMP, global_config, utils::nofollow_options};
 
 fn remove_dir_contents<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(path)? {
@@ -67,11 +65,10 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
 
         let xattr_probe_path = cache_path.join(".xattr_probe");
 
-        let xattr_probe_file = std::fs::File::options()
+        let xattr_probe_file = nofollow_options()
             .write(true)
             .create(true)
             .truncate(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(&xattr_probe_path)
             .with_context(|| {
                 format!(

@@ -1,5 +1,7 @@
 /cache/
 /apt-cacher-rs.db
+/apt-cacher-rs.db-shm
+/apt-cacher-rs.db-wal
 
 /target/
 /.vscode/

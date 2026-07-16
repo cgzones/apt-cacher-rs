@@ -2051,6 +2051,11 @@ fn build_metrics_html() -> String {
         AlertNonzero(metrics::CLEANUP_CHECKSUM_MISMATCHES.get()),
     );
     t.row_tip(
+        "Cleanup Checksum Skips",
+        "Digest verifications skipped because the file was already verified in an earlier cleanup cycle and is unchanged (same inode, size and expected digest).",
+        metrics::CLEANUP_CHECKSUM_SKIPS.get(),
+    );
+    t.row_tip(
         "Last Cleanup",
         "Duration, files removed and bytes reclaimed by the most recent cache-cleanup run.",
         format_args!(

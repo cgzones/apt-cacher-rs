@@ -33,6 +33,7 @@ use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
 use crate::limits::LimitedReader;
+use crate::utils::{nofollow_options, tokio_nofollow_options};
 use crate::xz_stream::xz_decoder;
 use crate::{
     cache_layout::ResourceKind,
@@ -194,12 +195,7 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 
 /// Open `path` with `O_NOFOLLOW`, hint sequential read, and hash it.
 fn hash_file(path: &Path, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let mut file = std::fs::File::options()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut file = nofollow_options().read(true).open(path)?;
     hint_sequential_read_std(&file, path);
     match algo {
         HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut file),
@@ -265,76 +261,94 @@ pub(crate) struct RenamePlan {
 /// `mirror_path` is a redundant prefix of `relpath`; for layer-B basenames it
 /// is the sole discriminator.)
 #[derive(Debug, Eq, Hash, PartialEq)]
-struct RegistryKey {
+struct RegistryScope {
     host: String,
     mirror_path: String,
-    relpath: String,
 }
 
-/// Borrowed lookup key paired with `RegistryKey` via `hashbrown::Equivalent`,
-/// so `lookup` does not allocate three `String`s per call. Mirrors the
-/// pattern in `active_downloads.rs` (`ActiveDownloadKeyRef`).
+/// Borrowed lookup key paired with `RegistryScope` via
+/// `hashbrown::Equivalent`, so `lookup` does not allocate per call. Mirrors
+/// the pattern in `active_downloads.rs` (`ActiveDownloadKeyRef`).
 #[derive(Hash)]
-struct RegistryKeyRef<'a> {
+struct RegistryScopeRef<'a> {
     host: &'a str,
     mirror_path: &'a str,
-    relpath: &'a str,
 }
 
-impl Equivalent<RegistryKey> for RegistryKeyRef<'_> {
-    fn equivalent(&self, key: &RegistryKey) -> bool {
-        let &Self {
-            host,
-            mirror_path,
-            relpath,
-        } = self;
-        let RegistryKey {
+impl Equivalent<RegistryScope> for RegistryScopeRef<'_> {
+    fn equivalent(&self, key: &RegistryScope) -> bool {
+        let &Self { host, mirror_path } = self;
+        let RegistryScope {
             host: khost,
             mirror_path: kmpath,
-            relpath: krelpath,
         } = key;
-        host == khost && mirror_path == kmpath && relpath == krelpath
+        host == khost && mirror_path == kmpath
     }
 }
 
-// `RegistryInner.map` keys on `Arc<RegistryKey>` so the eviction-order deque
+// The outer map keys on `Arc<RegistryScope>` so the eviction-order deque
 // can share the same allocation. Forwarding `Equivalent` here lets `lookup`
-// keep using the borrowed `RegistryKeyRef` (no allocation on the hot path).
-// `Arc<T>: Hash` delegates to `T: Hash` in std, so the hash byte sequence
-// matches `RegistryKey`'s derived hash and `RegistryKeyRef`'s manual impl.
-impl Equivalent<Arc<RegistryKey>> for RegistryKeyRef<'_> {
-    fn equivalent(&self, key: &Arc<RegistryKey>) -> bool {
-        <Self as Equivalent<RegistryKey>>::equivalent(self, key.as_ref())
+// keep using the borrowed `RegistryScopeRef` (no allocation on the hot
+// path). `Arc<T>: Hash` delegates to `T: Hash` in std, so the hash byte
+// sequence matches `RegistryScope`'s derived hash and `RegistryScopeRef`'s
+// manual impl.
+impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
+    fn equivalent(&self, key: &Arc<RegistryScope>) -> bool {
+        <Self as Equivalent<RegistryScope>>::equivalent(self, key.as_ref())
     }
 }
 
-/// Bounded in-memory map from a [`RegistryKey`] (`host`, `mirror_path`, resource
-/// lookup key) to an expected SHA256 digest, populated by parsing `Packages` /
-/// `Release` index files as they flow through. In-memory only (lost on restart,
-/// re-populated by the next `apt update`). FIFO bulk eviction at the configured
-/// cap.
+/// Bounded in-memory map from `(host, mirror_path)` scope and per-scope
+/// resource lookup key to an expected SHA256 digest, populated by parsing
+/// `Packages` / `Release` index files as they flow through. In-memory only
+/// (lost on restart, re-populated by the next `apt update`). FIFO bulk
+/// eviction at the configured cap.
+///
+/// Two-level layout: essentially all entries of one mirror share the same
+/// `(host, mirror_path)` pair, so a flat per-entry key would store those
+/// strings ~100k times per Debian-main `Packages` ingest (tens of MB at the
+/// default 500k cap). The scope is allocated once per mirror; entries only
+/// own their relpath.
 #[derive(Debug)]
 pub(crate) struct ChecksumRegistry {
     inner: Mutex<RegistryInner>,
     cap: usize,
 }
 
+/// Per-scope relpath map: digest plus insert generation (see
+/// `RegistryInner::next_gen`).
+type ScopeEntries = HashMap<Arc<str>, ([u8; 32], u64)>;
+
 #[derive(Debug)]
 struct RegistryInner {
-    /// Maps `Arc<RegistryKey>` to `(digest, generation)`. The generation is
-    /// the value of `next_gen` at the moment of the most recent insert for
-    /// this key. The same `Arc` is also pushed onto `order`, so `insert`
-    /// allocates the three field `String`s once instead of twice.
-    map: HashMap<Arc<RegistryKey>, ([u8; 32], u64)>,
+    /// `(host, mirror_path)` scope to per-relpath `(digest, generation)`.
+    /// The generation is the value of `next_gen` at the moment of the most
+    /// recent insert for that relpath. The scope `Arc` and relpath
+    /// `Arc<str>` are shared with `order`, so `insert` allocates each
+    /// string once.
+    map: HashMap<Arc<RegistryScope>, ScopeEntries>,
+    /// Total relpath entry count across all scopes (the outer map's `len`
+    /// counts scopes, not entries).
+    len: usize,
     /// Insertion-order log for FIFO eviction. Each entry pairs the key with
     /// the generation it was inserted at. Entries whose generation no longer
-    /// matches `map[key].1` are stale (the key was re-inserted later); the
+    /// matches the live entry are stale (the key was re-inserted later); the
     /// eviction loop skips them and `compact_order` periodically removes
     /// them.
-    order: VecDeque<(Arc<RegistryKey>, u64)>,
+    order: VecDeque<(Arc<RegistryScope>, Arc<str>, u64)>,
     /// Monotonic counter, incremented on every `insert`. Overflow at 2^64
     /// is unreachable in practice (millennia at any realistic insert rate).
     next_gen: u64,
+}
+
+impl RegistryInner {
+    /// Live generation of `(scope, relpath)`, if present.
+    fn live_generation(&self, scope: &Arc<RegistryScope>, relpath: &Arc<str>) -> Option<u64> {
+        self.map
+            .get(scope)
+            .and_then(|submap| submap.get(relpath))
+            .map(|&(_, generation)| generation)
+    }
 }
 
 impl ChecksumRegistry {
@@ -342,6 +356,7 @@ impl ChecksumRegistry {
         Self {
             inner: Mutex::new(RegistryInner {
                 map: HashMap::new(),
+                len: 0,
                 order: VecDeque::new(),
                 next_gen: 0,
             }),
@@ -353,17 +368,42 @@ impl ChecksumRegistry {
     /// ~25% of entries in one pass. Re-inserting an existing key refreshes
     /// its eviction-order position to most-recent.
     pub(crate) fn insert(&self, host: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
-        let key = Arc::new(RegistryKey {
-            host: host.to_owned(),
-            mirror_path: mirror_path.to_owned(),
-            relpath: relpath.to_owned(),
-        });
         let mut inner = self.inner.lock();
         let generation = inner.next_gen;
         inner.next_gen += 1;
-        inner.order.push_back((Arc::clone(&key), generation));
-        inner.map.insert(key, (digest, generation));
-        if inner.map.len() > self.cap {
+
+        let scope_ref = RegistryScopeRef { host, mirror_path };
+        let scope = match inner.map.get_key_value(&scope_ref) {
+            Some((scope, _)) => Arc::clone(scope),
+            None => {
+                let scope = Arc::new(RegistryScope {
+                    host: host.to_owned(),
+                    mirror_path: mirror_path.to_owned(),
+                });
+                inner.map.insert(Arc::clone(&scope), ScopeEntries::new());
+                scope
+            }
+        };
+
+        let submap = inner
+            .map
+            .get_mut(&scope)
+            .expect("scope was just looked up or inserted");
+        // Reuse the existing relpath allocation on refresh; `Arc<str>:
+        // Borrow<str>` makes the borrowed lookup allocation-free.
+        let rel = match submap.get_key_value(relpath) {
+            Some((rel, _)) => Arc::clone(rel),
+            None => Arc::from(relpath),
+        };
+        if submap
+            .insert(Arc::clone(&rel), (digest, generation))
+            .is_none()
+        {
+            inner.len += 1;
+        }
+        inner.order.push_back((scope, rel, generation));
+
+        if inner.len > self.cap {
             evict(&mut inner, self.cap);
         }
         if inner.order.len() > 2 * self.cap {
@@ -372,22 +412,20 @@ impl ChecksumRegistry {
     }
 
     /// Look up an expected digest by `(host, mirror_path, relpath)`.
-    /// Allocation-free via `hashbrown::Equivalent`.
+    /// Allocation-free via `hashbrown::Equivalent` and `Arc<str>:
+    /// Borrow<str>`.
     pub(crate) fn lookup(&self, host: &str, mirror_path: &str, relpath: &str) -> Option<[u8; 32]> {
         let inner = self.inner.lock();
         inner
             .map
-            .get(&RegistryKeyRef {
-                host,
-                mirror_path,
-                relpath,
-            })
+            .get(&RegistryScopeRef { host, mirror_path })
+            .and_then(|submap| submap.get(relpath))
             .map(|&(digest, _)| digest)
     }
 
     /// Current entry count (for the web dashboard).
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().map.len()
+        self.inner.lock().len
     }
 
     #[cfg(test)]
@@ -397,21 +435,28 @@ impl ChecksumRegistry {
 }
 
 /// FIFO eviction: pop from the front of `order`, drop live entries whose
-/// generation still matches `map`, skip stale ones (re-inserted keys whose
+/// generation still matches the map, skip stale ones (re-inserted keys whose
 /// current generation is newer than the popped one). Stale skips do not
 /// count against `quota`, so each pass frees `min(quota, live remaining)`
-/// map slots.
+/// entries. Scopes whose submap drains empty are removed with it.
 fn evict(inner: &mut RegistryInner, cap: usize) {
     let quota = (cap / 4).max(1);
     let mut live = 0usize;
     while live < quota {
-        let Some((key, generation)) = inner.order.pop_front() else {
+        let Some((scope, rel, generation)) = inner.order.pop_front() else {
             break;
         };
-        match inner.map.get(&key) {
+        let Some(submap) = inner.map.get_mut(&scope) else {
+            continue;
+        };
+        match submap.get(&rel) {
             Some(&(_, current_gen)) if current_gen == generation => {
-                inner.map.remove(&key);
+                submap.remove(&rel);
+                inner.len -= 1;
                 live += 1;
+                if submap.is_empty() {
+                    inner.map.remove(&scope);
+                }
             }
             _ => {
                 // Stale entry: the key was re-inserted later (newer gen) or
@@ -422,14 +467,14 @@ fn evict(inner: &mut RegistryInner, cap: usize) {
 }
 
 /// Rebuild `order` keeping only entries whose generation matches the
-/// current live entry in `map`. Preserves FIFO order of live entries.
+/// current live entry in the map. Preserves FIFO order of live entries.
 /// Triggered from `insert` when `order.len() > 2 * cap`, so amortized
 /// O(1) per insert. Worst-case pass is O(order.len()).
 fn compact_order(inner: &mut RegistryInner) {
-    let mut compacted = VecDeque::with_capacity(inner.map.len());
+    let mut compacted = VecDeque::with_capacity(inner.len);
     while let Some(entry) = inner.order.pop_front() {
-        let (ref key, generation) = entry;
-        if inner.map.get(key).map(|&(_, g)| g) == Some(generation) {
+        let (ref scope, ref rel, generation) = entry;
+        if inner.live_generation(scope, rel) == Some(generation) {
             compacted.push_back(entry);
         }
     }
@@ -755,11 +800,7 @@ impl PackagesCompression {
 /// pre-sniff behaviour for any non-`.xz`/non-`.gz` content).
 async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesCompression> {
     use tokio::io::AsyncReadExt as _;
-    let mut file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)
-        .await?;
+    let mut file = tokio_nofollow_options().read(true).open(path).await?;
     // Fill up to 6 magic bytes, tolerating short reads (a single `read` may
     // return fewer bytes than requested) and early EOF (a genuinely tiny raw
     // `Packages` file is valid and classifies as `Raw`, not an error).
@@ -801,11 +842,7 @@ pub(crate) async fn ingest_packages_file(
     format: IndexFormat,
     buffer_size: usize,
 ) -> std::io::Result<()> {
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)
-        .await?;
+    let file = tokio_nofollow_options().read(true).open(path).await?;
 
     // Compute the decompressed-output ceiling from the compressed file size.
     // Fall back to the absolute cap if stat fails (non-fatal).
@@ -906,11 +943,7 @@ pub(crate) async fn ingest_packages_file(
 /// Shared by registry ingest ([`ingest_release_file`]) and the by-hash cleanup
 /// reference-set builder.
 pub(crate) async fn read_release_to_string(path: &std::path::Path) -> std::io::Result<String> {
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)
-        .await?;
+    let file = tokio_nofollow_options().read(true).open(path).await?;
     let mut limited = LimitedReader::new(file, limits::MAX_RELEASE_SIZE);
     let mut buf = String::new();
     tokio::io::AsyncReadExt::read_to_string(&mut limited, &mut buf).await?;

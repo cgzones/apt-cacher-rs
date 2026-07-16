@@ -642,6 +642,11 @@ pub(crate) static CLEANUP_BYHASH_UNREFERENCED: Accumulator = Accumulator::new();
 /// build than its index claims, or a stale cache file whose origin re-issued
 /// the same `Filename:` under a different content.
 pub(crate) static CLEANUP_CHECKSUM_MISMATCHES: Counter = Counter::new();
+/// Cleanup digest verifications skipped because the file carries a valid
+/// verified-marker xattr from an earlier cycle (same inode, size, algorithm
+/// and expected digest) — the daily re-hash then scales with churn instead
+/// of total cache size.
+pub(crate) static CLEANUP_CHECKSUM_SKIPS: Counter = Counter::new();
 
 /// Last cleanup run: duration in seconds (atomically updated; readers may
 /// observe a transient mix across the trio between updates).

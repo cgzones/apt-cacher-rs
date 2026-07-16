@@ -65,7 +65,8 @@ use crate::sendfile_conn::{
 };
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{
-    self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_tempfile, touch_volatile_mtime,
+    self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
+    tokio_tempfile, touch_volatile_mtime,
 };
 use crate::xattr_helpers;
 use crate::{
@@ -488,6 +489,10 @@ fn dev_null() -> std::io::Result<&'static std::fs::File> {
     if let Some(f) = DEV_NULL.get() {
         return Ok(f);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "/dev/null sink, not a cache path; needs its own custom_flags which would overwrite the helper's O_NOFOLLOW"
+    )]
     let f = std::fs::OpenOptions::new()
         .write(true)
         .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
@@ -2829,12 +2834,7 @@ async fn serve_remaining_from_file(
         "splice proxy: starting to serve remaining bytes from cache file for demoted client at offset {content_start} ({content_length} bytes remaining)",
     );
 
-    let file = match tokio::fs::File::options()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&cache_path)
-        .await
-    {
+    let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
         Ok(f) => f,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -4103,12 +4103,7 @@ async fn serve_volatile_304_via_sendfile(
         metrics::VOLATILE_REFETCHED_UPTODATE.increment();
     }
 
-    let file = match tokio::fs::File::options()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(cache_path)
-        .await
-    {
+    let file = match tokio_nofollow_options().read(true).open(cache_path).await {
         Ok(f) => f,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -4253,12 +4248,7 @@ async fn splice_proxy_drive(
     if conn_details.cached_flavor == CachedFlavor::Volatile {
         let cache_path = conn_details.cache_file_path();
 
-        let file = match tokio::fs::File::options()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(&cache_path)
-            .await
-        {
+        let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
             Ok(f) => Some(f),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
@@ -5408,9 +5398,8 @@ async fn splice_proxy_drive(
         let send_start = client_range_start.min(resume_offset);
         let send_end = client_range_end.min(resume_offset);
         if send_end > send_start {
-            let partial_reader = tokio::fs::File::options()
+            let partial_reader = tokio_nofollow_options()
                 .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW)
                 .open(temppath.as_ref())
                 .await
                 .map_err(|err| {
