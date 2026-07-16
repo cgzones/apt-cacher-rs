@@ -80,7 +80,6 @@ use std::{
     io::IsTerminal as _,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZero,
-    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -608,10 +607,9 @@ struct ReopenableLogFile {
 
 impl ReopenableLogFile {
     fn new(path: &Path) -> std::io::Result<Self> {
-        let file = std::fs::File::options()
+        let file = utils::nofollow_options()
             .append(true)
             .create(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -621,10 +619,9 @@ impl ReopenableLogFile {
     }
 
     fn reopen(&self) -> std::io::Result<()> {
-        let file = std::fs::File::options()
+        let file = utils::nofollow_options()
             .append(true)
             .create(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(&self.path)?;
         *self.file.lock() = file;
         Ok(())

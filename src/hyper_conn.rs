@@ -64,8 +64,8 @@ use crate::{
     static_assert,
     uncacheables::record_uncacheable,
     utils::{
-        self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_tempfile,
-        touch_volatile_mtime,
+        self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
+        tokio_tempfile, touch_volatile_mtime,
     },
     warn_on_content_type_mismatch, warn_once, warn_once_or_debug, warn_once_or_info,
     web_interface::serve_web_interface,
@@ -1583,12 +1583,7 @@ async fn serve_downloading_file(
                 };
                 drop(st);
                 drop(status);
-                let file = match tokio::fs::File::options()
-                    .read(true)
-                    .custom_flags(nix::libc::O_NOFOLLOW)
-                    .open(&path_clone)
-                    .await
-                {
+                let file = match tokio_nofollow_options().read(true).open(&path_clone).await {
                     Ok(f) => f,
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
@@ -1633,12 +1628,7 @@ async fn serve_downloading_file(
                     Some(UpstreamMetadataView::Arc(Arc::clone(meta)))
                 };
                 drop(st);
-                let file = match tokio::fs::File::options()
-                    .read(true)
-                    .custom_flags(nix::libc::O_NOFOLLOW)
-                    .open(&path_clone)
-                    .await
-                {
+                let file = match tokio_nofollow_options().read(true).open(&path_clone).await {
                     Ok(f) => f,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                         // Lost the rename race; re-read status.
@@ -1676,12 +1666,7 @@ async fn serve_downloading_file(
                 meta,
             } => {
                 // Cannot use mmap(2) since the file is not yet completely written
-                let file = match tokio::fs::File::options()
-                    .read(true)
-                    .custom_flags(nix::libc::O_NOFOLLOW)
-                    .open(&path)
-                    .await
-                {
+                let file = match tokio_nofollow_options().read(true).open(&path).await {
                     Ok(f) => f,
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
@@ -3151,12 +3136,7 @@ pub(crate) async fn process_cache_request(
 ) -> Response<ProxyCacheBody> {
     let cache_path = conn_details.cache_file_path();
 
-    match tokio::fs::File::options()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&cache_path)
-        .await
-    {
+    match tokio_nofollow_options().read(true).open(&cache_path).await {
         Ok(file) => {
             // CACHE_HITS only counts permanent-file hits; volatile hits live
             // in VOLATILE_HIT / VOLATILE_REFETCHED.

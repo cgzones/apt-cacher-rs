@@ -298,6 +298,40 @@ impl AsRef<Path> for TempPath {
     }
 }
 
+/// [`std::fs::OpenOptions`] with `O_NOFOLLOW` pre-set: every open of a path
+/// under the cache directory must refuse a symlink at the final component.
+/// Callers chain the remaining flags on the returned options.
+///
+/// `custom_flags` overwrites rather than ORs, so callers must NOT call
+/// `.custom_flags()` again on the returned options.
+pub(crate) fn nofollow_options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "single blessed construction site"
+    )]
+    let mut options = std::fs::OpenOptions::new();
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    options
+}
+
+/// [`tokio::fs::OpenOptions`] with `O_NOFOLLOW` pre-set: every open of a path
+/// under the cache directory must refuse a symlink at the final component.
+/// Callers chain the remaining flags on the returned options.
+///
+/// `custom_flags` overwrites rather than ORs, so callers must NOT call
+/// `.custom_flags()` again on the returned options.
+pub(crate) fn tokio_nofollow_options() -> tokio::fs::OpenOptions {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "single blessed construction site"
+    )]
+    let mut options = tokio::fs::OpenOptions::new();
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    options
+}
+
 /// Create a temporary file with a unique extension for the given path.
 pub(crate) async fn tokio_tempfile(
     path: &Path,
@@ -322,7 +356,7 @@ pub(crate) async fn tokio_tempfile(
             "buf is non-empty so adding a new extension must succeed"
         );
 
-        let _: Never = match tokio::fs::File::options()
+        let _: Never = match tokio_nofollow_options()
             .create_new(true)
             .write(true)
             .mode(mode)
@@ -444,10 +478,9 @@ async fn open_partial_file(
         path: &Path,
         log_prefix: &'static str,
     ) -> Result<(tokio::fs::File, u64), tokio::io::Error> {
-        let mut file = tokio::fs::File::options()
+        let mut file = tokio_nofollow_options()
             .write(true)
             .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)
             .await
             .inspect_err(|err| {
@@ -520,13 +553,12 @@ pub(crate) async fn create_partial_file(
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::File::options()
+        tokio_nofollow_options()
             .create(true)
             .truncate(true)
             .write(true)
             .read(true)
             .mode(mode)
-            .custom_flags(nix::libc::O_NOFOLLOW)
             .open(path)
             .await
     }
