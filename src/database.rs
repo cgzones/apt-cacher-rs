@@ -9,7 +9,8 @@ use std::{
 
 use sqlx::{
     ConnectOptions as _, Error, Executor as _, Pool, Sqlite, SqliteConnection, SqlitePool, query,
-    query_as, sqlite::SqliteConnectOptions,
+    query_as,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 use tracing::{debug, info, trace, warn};
 
@@ -319,7 +320,11 @@ pub(crate) struct DownloadRow {
 }
 
 /// Pre-converted SQL-ready row for an `origins` upsert.
-#[derive(Debug)]
+///
+/// `PartialEq` supports batch-level dedup in the DB task: on default-build
+/// cache misses the sendfile->hyper handoff dispatches the same request
+/// twice, enqueueing two identical origin upserts.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OriginRow {
     pub(crate) mirror_id: i64,
     pub(crate) distribution: String,
@@ -400,8 +405,17 @@ impl Database {
 
         debug!("Opening database `{url}` with slow timeout of {slow_timeout:?}...");
 
+        // WAL lets readers (web interface, cleanup) run concurrently with
+        // the batch-flush writer instead of excluding it across pool
+        // connections, and keeps synchronous=NORMAL corruption-safe: an
+        // OS/power crash can only lose the last uncheckpointed transactions,
+        // never corrupt the file. That loss is fine for reconstructible cache
+        // metadata, and it avoids the DELETE-journal churn plus per-flush
+        // fsyncs of sqlx's FULL default.
         let opts = SqliteConnectOptions::from_str(&url)?
             .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             // These two take `log::LevelFilter`, the crate's only remaining
             // `log` use — don't drop the `log` dep to "modernize" onto tracing.
             .log_statements(log::LevelFilter::Trace)

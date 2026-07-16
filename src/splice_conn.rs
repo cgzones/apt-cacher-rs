@@ -23,7 +23,7 @@ use http::{
 };
 use nix::fcntl::{SpliceFFlags, splice, tee};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Interest, ReadBuf},
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf},
     net::{TcpStream, unix::pipe},
 };
 use tracing::{debug, error, info, trace, warn};
@@ -53,14 +53,15 @@ use crate::ktls;
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
 use crate::limits::{self, MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
 use crate::precise_instant::PreciseInstant;
-use crate::rate_checker::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::rate_log;
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;
 use crate::sendfile_conn::RangeRequestHeaders;
 use crate::sendfile_conn::{
-    SendfileResult, async_sendfile, async_sendfile_unfinished, serve_file_via_sendfile,
-    wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
+    SendfileResult, async_sendfile, async_sendfile_unfinished, clear_tcp_readable_cache,
+    clear_tcp_writable_cache, serve_file_via_sendfile, wait_readable_rated, wait_writable_rated,
+    write_all_to_stream_rated,
 };
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{
@@ -92,7 +93,7 @@ static_assert!(nix::errno::Errno::EAGAIN as i32 == nix::errno::Errno::EWOULDBLOC
 /// Sent to upstream when a cached volatile file is stale (>30s).
 struct VolatileCondHeaders {
     if_modified_since: String,
-    if_none_match: Option<String>,
+    if_none_match: Option<std::sync::Arc<str>>,
 }
 
 /// Pre-computed byte offsets for range-filtering the splice loop output.
@@ -117,8 +118,15 @@ const POOL_IDLE_TIMEOUT: coarsetime::Duration = coarsetime::Duration::from_secs(
 /// Maximum number of idle connections kept per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 4;
 
-/// Buffer size for TLS upstream reads.
-const TLS_READ_BUF_SIZE: usize = 64 * 1024;
+/// Buffer size for TLS upstream reads.  TLS records are at most 16 KiB, so
+/// a larger buffer amortizes the per-chunk pwrite+write pair — 256 KiB
+/// costs one allocation per concurrent userspace-TLS download (not per
+/// connection) and quarters the loop iterations per MiB.
+const TLS_READ_BUF_SIZE: usize = 256 * 1024;
+
+/// Cadence of the upstream rate-check tick in `splice_proxy_body_tls`'s
+/// read loop.
+const RATE_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
 const VOLATILE_BODY_MAX: usize = 1024 * 1024;
@@ -502,25 +510,9 @@ fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
     Ok((sender, receiver))
 }
 
-// Force-clear Tokio's cached readiness on a TCP socket or pipe end.
-//
-// `splice`/`tee` operate on raw fds and can return `EAGAIN` on either
-// participant; Tokio doesn't see those errors so its cache stays "ready".
-// We invoke `try_io` with a no-op closure that returns `WouldBlock` to
-// trigger `clear_readiness` and force the next `readable()`/`writable()`
-// to actually park until a fresh epoll event arrives.
-
-fn clear_tcp_readable_cache(socket: &TcpStream) {
-    let _ignore = socket.try_io(Interest::READABLE, || -> std::io::Result<()> {
-        Err(std::io::ErrorKind::WouldBlock.into())
-    });
-}
-
-fn clear_tcp_writable_cache(socket: &TcpStream) {
-    let _ignore = socket.try_io(Interest::WRITABLE, || -> std::io::Result<()> {
-        Err(std::io::ErrorKind::WouldBlock.into())
-    });
-}
+// Force-clear Tokio's cached readiness on a pipe end. See
+// `sendfile_conn::clear_tcp_writable_cache` for the rationale (the TCP
+// variants live there so the sendfile path can share them).
 
 fn clear_pipe_readable_cache(receiver: &pipe::Receiver) {
     let _ignore =
@@ -2447,21 +2439,19 @@ async fn pwrite_buf_to_file(
     Ok(())
 }
 
-/// Carries the inner read-loop result out of the async closure in
-/// `splice_proxy_body_tls` so the outer scope (which holds `dbarrier`) can
-/// abort with a structured `MirrorDownloadRate` when an upstream rate
-/// timeout fires mid-read.
-enum TlsReadOutcome {
-    Io(std::io::Error),
-    RateTimeout(InsufficientRate),
-}
-
-/// Transfer body from TLS upstream to client+cache via userspace read then tee+splice fan-out.
+/// Transfer body from TLS upstream to client+cache in userspace.
 ///
 /// Data flow:
-///   `tls_stream` →[async read]→ buffer →[write]→ `pipe_A` →[tee]→ `pipe_B` →[splice]→ `cache_file`
-///                                                         ↓
-///                                                   [splice]→ `client_socket`
+///   `tls_stream` →[async read]→ buffer →[pwrite]→ `cache_file`
+///                                       →[write]→ `client_socket`
+///
+/// Once the bytes have been decrypted into userspace a pipe+tee fan-out
+/// adds no zero-copy benefit -- `write` into a pipe copies user→kernel
+/// exactly like a direct socket `write`, and `splice` pipe→file copies
+/// into the page cache exactly like `pwrite` -- so the direct form saves
+/// three syscalls per chunk. The cache is always written first so
+/// concurrent clients see progress without being gated on this client's
+/// send speed.
 ///
 /// On error the upstream is left mid-message (fewer than `content_length`
 /// bytes consumed), so its socket still holds undelivered bytes -- the caller
@@ -2490,9 +2480,6 @@ async fn splice_proxy_body_tls(
     // this body fn is skipped when the entire response fits in the
     // body_prefix / kTLS extra-body and we still need to count it.
 
-    let (mut upstream_pipe_sender, upstream_pipe_receiver) = create_pipe()?;
-    let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
-
     let config = global_config();
 
     let mut rate_checker = config
@@ -2518,8 +2505,15 @@ async fn splice_proxy_body_tls(
         + range_filter.skip;
     let mut client_remaining: u64 = range_filter.send;
     let mut demoted_handle: Option<DemotedClientHandle> = None;
-    let client_skip = range_filter.skip;
-    let client_range_end = range_filter.skip + range_filter.send;
+
+    // One pinned re-armable sleep per body for the http_timeout deadline
+    // and one for the 1 s rate-check tick — the previous version built two
+    // fresh `Timeout` futures per chunk (see `wait_socket_rated` for the
+    // same pattern and rationale).
+    let outer = tokio::time::sleep(config.http_timeout);
+    tokio::pin!(outer);
+    let tick = tokio::time::sleep(RATE_TICK_PERIOD);
+    tokio::pin!(tick);
 
     while remaining > 0 {
         dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
@@ -2534,49 +2528,44 @@ async fn splice_proxy_body_tls(
         );
         read_buf.clear();
         let to_read = std::cmp::min(remaining, TLS_READ_BUF_SIZE as u64);
-        let read_outcome = tokio::time::timeout(config.http_timeout, async {
-            if let Some(ref mut rc) = rate_checker {
-                loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
-                        (&mut *upstream).take(to_read).read_buf(&mut read_buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => return Ok(n),
-                        Ok(Err(err)) => return Err(TlsReadOutcome::Io(err)),
-                        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                            rc.add(0);
-                            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                                return Err(TlsReadOutcome::RateTimeout(rate));
-                            }
+        outer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + config.http_timeout);
+        let got = {
+            let mut taken = (&mut *upstream).take(to_read);
+            let read_fut = taken.read_buf(&mut read_buf);
+            tokio::pin!(read_fut);
+            loop {
+                tokio::select! {
+                    biased;
+                    // The pinned future is re-polled (not re-created) after a
+                    // tick fires, so no read progress is ever cancelled.
+                    result = &mut read_fut => match result {
+                        Ok(n) => break n,
+                        Err(err) => return Err(err),
+                    },
+                    () = &mut tick, if rate_checker.is_some() => {
+                        let rc = rate_checker
+                            .as_mut()
+                            .expect("guarded by rate_checker.is_some()");
+                        rc.add(0);
+                        if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
+                            return Err(dbarrier.abort_with_rate_timeout(rate).await);
                         }
+                        tick.as_mut()
+                            .reset(tokio::time::Instant::now() + RATE_TICK_PERIOD);
+                    }
+                    () = &mut outer => {
+                        metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+                        return Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            format!(
+                                "upstream TLS read timed out after {}",
+                                HumanFmt::Time(config.http_timeout)
+                            ),
+                        ));
                     }
                 }
-            } else {
-                (&mut *upstream)
-                    .take(to_read)
-                    .read_buf(&mut read_buf)
-                    .await
-                    .map_err(TlsReadOutcome::Io)
-            }
-        })
-        .await;
-        let got = match read_outcome {
-            Ok(Ok(n)) => n,
-            Ok(Err(TlsReadOutcome::Io(err))) => return Err(err),
-            Ok(Err(TlsReadOutcome::RateTimeout(rate))) => {
-                return Err(dbarrier.abort_with_rate_timeout(rate).await);
-            }
-            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!(
-                        "upstream TLS read timed out after {}",
-                        HumanFmt::Time(config.http_timeout)
-                    ),
-                ));
             }
         };
         if got == 0 {
@@ -2599,30 +2588,37 @@ async fn splice_proxy_body_tls(
         let chunk_start = bytes_done;
         let chunk_end = bytes_done + got as u64;
 
-        if !matches!(client_status, ClientStatus::Active)
-            || chunk_end <= client_skip
-            || chunk_start >= client_range_end
+        // Write the full chunk to cache via pwrite first, so concurrent
+        // clients see progress without being gated on this client's send
+        // speed.
+        pwrite_buf_to_file(cache_file, &mut read_buf, got, file_offset).await?;
+
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "got is bounded by TLS_READ_BUF_SIZE which fits in i64"
+        )]
         {
-            // Chunk is entirely outside client range, or client is gone/demoted — cache only
-            upstream_pipe_sender.write_all(&read_buf[..got]).await?;
-            splice_pipe_to_file(&upstream_pipe_receiver, cache_file, got, &mut file_offset).await?;
-            dbarrier.ping_batched(got as u64);
-        } else if chunk_start >= client_skip && chunk_end <= client_range_end {
-            // Chunk is entirely inside client range — normal tee+splice path
-            upstream_pipe_sender.write_all(&read_buf[..got]).await?;
-            client_status = tee_and_splice(
-                &upstream_pipe_receiver,
-                &cache_pipe_receiver,
-                &cache_pipe_sender,
+            file_offset += got as i64;
+        }
+
+        // Notify concurrent clients of progress
+        dbarrier.ping_batched(got as u64);
+
+        // Then send the overlap with the client range (may be slow)
+        let client_slice = range_slice(
+            &read_buf[..got],
+            chunk_start,
+            range_filter.skip,
+            range_filter.send,
+        );
+        if matches!(client_status, ClientStatus::Active) && !client_slice.is_empty() {
+            client_status = write_client_or_demote(
                 client,
-                (cache_file, &mut file_offset),
-                range_filter.send,
-                got,
-                client_status,
-                &mut dbarrier,
+                client_slice,
                 &mut client_rate_checker,
                 &mut client_file_pos,
                 &mut client_remaining,
+                range_filter.send,
             )
             .await?;
 
@@ -2660,85 +2656,6 @@ async fn splice_proxy_body_tls(
                 )?);
                 client_status = ClientStatus::Demoted;
             }
-        } else {
-            // Boundary chunk — data is already in read_buf, handle in userspace.
-            // Write cache first, then send to client.
-            debug_assert!(
-                matches!(client_status, ClientStatus::Active),
-                "outer condition excludes non-active"
-            );
-            debug_assert!(
-                client_range_end > chunk_start,
-                "boundary chunk must overlap client range"
-            );
-
-            // Write full chunk to cache via pwrite first, so concurrent clients
-            // see progress without being gated on the first client's send speed.
-            pwrite_buf_to_file(cache_file, &mut read_buf, got, file_offset).await?;
-
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "got is bounded by TLS_READ_BUF_SIZE which fits in i64"
-            )]
-            {
-                file_offset += got as i64;
-            }
-
-            // Notify concurrent clients of progress
-            dbarrier.ping_batched(got as u64);
-
-            // Then send to client (may be slow)
-            let client_slice = range_slice(
-                &read_buf[..got],
-                chunk_start,
-                range_filter.skip,
-                range_filter.send,
-            );
-            if matches!(client_status, ClientStatus::Active) && !client_slice.is_empty() {
-                match write_all_to_stream_rated(
-                    client,
-                    client_slice,
-                    &mut client_rate_checker,
-                    RateCheckDirection::Client,
-                    config.http_timeout,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let sent = client_slice.len() as u64;
-                        metrics::BYTES_SERVED_SPLICE.increment_by(sent);
-                        client_file_pos += sent;
-                        client_remaining = client_remaining
-                            .checked_sub(sent)
-                            .expect("client_remaining tracks bytes still owed to the client");
-                    }
-                    // Rate-stall / HTTP per-op timeout on the TLS client
-                    // write: see the matching plaintext arm above for the
-                    // rationale (continue download for late-joiner, no
-                    // double-attribution to CLIENT_DISCONNECTED_MID_BODY).
-                    Err(err) if err.kind() == ErrorKind::TimedOut => {
-                        info!(
-                            "splice proxy: client {} timed out during TLS boundary chunk, abandoning client:  {}",
-                            client
-                                .peer_addr()
-                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
-                            ErrorReport(&err)
-                        );
-                        client_status = ClientStatus::Disconnected;
-                    }
-                    Err(err) if is_peer_disconnect(&err) => {
-                        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                        info!(
-                            "splice proxy: client {} disconnected during TLS boundary chunk",
-                            client
-                                .peer_addr()
-                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string())
-                        );
-                        client_status = ClientStatus::Disconnected;
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
         }
 
         bytes_done = chunk_end;
@@ -2756,6 +2673,106 @@ async fn splice_proxy_body_tls(
         client_disconnected,
         client_bytes_written,
     ))
+}
+
+/// Write `slice` to the client with rate checking, translating client
+/// failures into [`ClientStatus`] transitions instead of hard errors:
+/// the cache already holds these bytes, so a slow or gone client must
+/// not abort the download (late joiners depend on it).
+///
+/// Mirrors the `tee_and_splice` client-splice semantics: a client
+/// rate-check trip after progress returns `DemoteRequested` (the caller
+/// adjudicates the actual demote), a peer disconnect returns
+/// `Disconnected` (bumping `CLIENT_DISCONNECTED_MID_BODY`), and a rated
+/// wait timeout abandons the client (`Disconnected`, no metric — the
+/// timeout counters were already bumped at rejection) so the download
+/// continues cache-only. Only unexpected I/O errors are returned as
+/// `Err`.
+async fn write_client_or_demote(
+    client: &TcpStream,
+    slice: &[u8],
+    client_rate_checker: &mut Option<RateChecker>,
+    client_file_pos: &mut u64,
+    client_remaining: &mut u64,
+    client_total: u64,
+) -> std::io::Result<ClientStatus> {
+    let disconnected = |client_remaining: u64| {
+        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+        let client_sent = client_total - client_remaining;
+        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+        let client_sent_percent = 100.0 * client_sent as f32 / client_total as f32;
+        info!(
+            "splice proxy: client disconnected after {} out of {} ({:.1}%), continuing cache-only",
+            HumanFmt::Size(client_sent),
+            HumanFmt::Size(client_total),
+            client_sent_percent,
+        );
+        ClientStatus::Disconnected
+    };
+
+    let mut written = 0;
+    while written < slice.len() {
+        // `try_write` clears tokio's cached writability itself on
+        // `WouldBlock`, so the rated wait below parks properly.
+        match client.try_write(&slice[written..]) {
+            Ok(n) => {
+                written += n;
+                *client_file_pos += n as u64;
+                *client_remaining = client_remaining
+                    .checked_sub(n as u64)
+                    .expect("client_remaining tracks bytes still owed to the client");
+                metrics::BYTES_SERVED_SPLICE.increment_by(n as u64);
+                if let Some(rc) = client_rate_checker {
+                    rc.add(n);
+                    if rc.check_fail(RateCheckDirection::Client).is_some() {
+                        // Client RC tripped — the cache already has the
+                        // bytes, hand off to the caller for demote
+                        // adjudication.
+                        return Ok(ClientStatus::DemoteRequested {
+                            client_file_pos: *client_file_pos,
+                            client_remaining: *client_remaining,
+                        });
+                    }
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                match wait_writable_rated(
+                    client,
+                    client_rate_checker,
+                    RateCheckDirection::Client,
+                    global_config().http_timeout,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    // Rate-stall / HTTP per-op timeout on the client write:
+                    // abandon the client but keep downloading for late
+                    // joiners; no CLIENT_DISCONNECTED_MID_BODY bump (the
+                    // timeout metrics were bumped at error construction).
+                    Err(err) if err.kind() == ErrorKind::TimedOut => {
+                        info!(
+                            "splice proxy: client {} timed out during TLS body, abandoning client:  {}",
+                            client
+                                .peer_addr()
+                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                            ErrorReport(&err)
+                        );
+                        return Ok(ClientStatus::Disconnected);
+                    }
+                    Err(err) if is_peer_disconnect(&err) => {
+                        return Ok(disconnected(*client_remaining));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) if is_peer_disconnect(&err) => {
+                return Ok(disconnected(*client_remaining));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(ClientStatus::Active)
 }
 
 /// Duplicate the client socket fd and spawn a task that serves remaining bytes
@@ -2831,8 +2848,9 @@ async fn serve_remaining_from_file(
 
     // Demoted clients keep reading the partial cache file linearly via
     // sendfile chunks, so warm the kernel readahead window before the loop
-    // starts.
-    hint_sequential_read(&file, &cache_path);
+    // starts.  The final size is unknown (file still growing), so always
+    // hint.
+    hint_sequential_read(&file, u64::MAX, &cache_path);
 
     metrics::CLIENTS_DEMOTED.increment();
 
@@ -4108,7 +4126,7 @@ async fn serve_volatile_304_via_sendfile(
         client_stream,
         conn_details,
         "",
-        (file, cache_path),
+        (file, None, cache_path),
         (conn_version, conn_action),
         client_range,
         None,
@@ -4233,9 +4251,7 @@ async fn splice_proxy_drive(
     let mut volatile_cond: Option<VolatileCondHeaders> = None;
     let mut volatile_cache_path: Option<PathBuf> = None;
     if conn_details.cached_flavor == CachedFlavor::Volatile {
-        let cache_path = conn_details
-            .cache_dir_path()
-            .join(Path::new(&conn_details.debname));
+        let cache_path = conn_details.cache_file_path();
 
         let file = match tokio::fs::File::options()
             .read(true)
@@ -6263,9 +6279,7 @@ async fn handle_volatile_buffered_download(
     );
 
     let prev_file_size = {
-        let prev_path = conn_details
-            .cache_dir_path()
-            .join(Path::new(&conn_details.debname));
+        let prev_path = conn_details.cache_file_path();
 
         match tokio::fs::symlink_metadata(&prev_path).await {
             Ok(m) if m.file_type().is_file() => m.len(),

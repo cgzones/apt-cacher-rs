@@ -255,21 +255,37 @@ impl ConnectionDetails {
     /// `mirror.path()` rather than a separately threaded field.
     #[must_use]
     pub(crate) fn cache_dir_path(&self) -> PathBuf {
+        self.cache_path_impl(None)
+    }
+
+    /// [`Self::cache_dir_path`] plus the `debname` leaf, in one pre-sized
+    /// allocation — use this instead of pushing/joining the filename onto
+    /// the directory path.
+    #[must_use]
+    pub(crate) fn cache_file_path(&self) -> PathBuf {
+        self.cache_path_impl(Some(&self.debname))
+    }
+
+    #[expect(
+        clippy::pathbuf_init_then_push,
+        reason = "the auto-suggestion `.join()` allocates a fresh PathBuf and \
+                  throws away the with_capacity sizing we want here"
+    )]
+    fn cache_path_impl(&self, leaf: Option<&str>) -> PathBuf {
         let root = &global_config().cache_directory;
 
         let host = match self.aliased_host {
             Some(cache) => cache.format_cache_dir(self.mirror.port()),
             None => self.mirror.host().format_cache_dir(self.mirror.port()),
         };
-        let host = Path::new(host.as_ref());
         assert!(
-            host.is_relative(),
+            Path::new(host.as_ref()).is_relative(),
             "path construction must not contain absolute components"
         );
 
-        let uri_path = Path::new(self.mirror.path());
+        let uri_path = self.mirror.path();
         assert!(
-            uri_path.is_relative(),
+            Path::new(uri_path).is_relative(),
             "path construction must not contain absolute components"
         );
 
@@ -279,19 +295,41 @@ impl ConnectionDetails {
             "path construction must not contain absolute components"
         );
 
-        if self.layout.is_flat() {
-            [
-                root.as_path(),
-                host,
-                Path::new(SUBDIR_FLAT),
-                uri_path,
-                subdir,
-            ]
-            .iter()
-            .collect()
-        } else {
-            [root.as_path(), host, uri_path, subdir].iter().collect()
+        if let Some(leaf) = leaf {
+            assert!(
+                Path::new(leaf).is_relative(),
+                "path construction must not contain absolute components"
+            );
         }
+
+        // Pre-size for the final length (+1 per separator) so `push` doesn't
+        // grow the underlying OsString — this runs once per request on both
+        // dispatch hot paths (same rationale as `mirror_cache_path_impl`).
+        let is_flat = self.layout.is_flat();
+        let capacity = root.as_os_str().len()
+            + 1
+            + host.len()
+            + 1
+            + if is_flat { SUBDIR_FLAT.len() + 1 } else { 0 }
+            + uri_path.len()
+            + 1
+            + subdir.as_os_str().len()
+            + 1
+            + leaf.map_or(0, |l| l.len() + 1);
+
+        let mut path = PathBuf::with_capacity(capacity);
+        path.push(root.as_path());
+        path.push(host.as_ref());
+        if is_flat {
+            path.push(SUBDIR_FLAT);
+        }
+        path.push(uri_path);
+        path.push(subdir);
+        if let Some(leaf) = leaf {
+            path.push(leaf);
+        }
+
+        path
     }
 }
 

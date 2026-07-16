@@ -36,7 +36,12 @@ impl Peak {
     }
 
     pub(crate) fn update(&self, value: u64) {
-        self.0.fetch_max(value, Ordering::Relaxed);
+        // Steady state (no new peak) stays read-only: fetch_max compiles to
+        // a CAS loop on x86, an RMW on the shared line even when the stored
+        // max already dominates.
+        if self.0.load(Ordering::Relaxed) < value {
+            self.0.fetch_max(value, Ordering::Relaxed);
+        }
     }
 
     #[must_use]
@@ -45,6 +50,13 @@ impl Peak {
     }
 }
 
+/// Cache-line aligned: accumulators are the per-chunk-bumped byte counters
+/// (`BYTES_SERVED_*`, `BYTES_DOWNLOADED_UPSTREAM`), hit from different
+/// worker threads at chunk granularity. Without the alignment, up to eight
+/// of them share one 64-byte line and every bump bounces it between cores.
+/// There are only ~14 accumulators, so the padding is negligible;
+/// the ~100 request-granularity `Counter`s stay packed on purpose.
+#[repr(align(64))]
 pub(crate) struct Accumulator(AtomicU64);
 
 impl Accumulator {

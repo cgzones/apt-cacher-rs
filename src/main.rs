@@ -64,7 +64,7 @@ mod small_vec_deque;
 mod splice_conn;
 mod task_cache_scan;
 mod task_setup;
-#[cfg(feature = "sendfile")]
+#[cfg(feature = "splice")]
 mod tcp_cork_guard;
 mod uncacheables;
 mod utils;
@@ -319,7 +319,7 @@ fn quick_response<T: Into<bytes::Bytes>>(
         .status(status)
         .header(SERVER, APP_NAME)
         .header(VIA, APP_VIA)
-        .header(DATE, http_range::format_http_date())
+        .header(DATE, &*http_range::format_http_date())
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, "text/plain; charset=utf-8");
 
@@ -799,6 +799,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     KTLS_BLOCKED
         .set(parking_lot::RwLock::new(HashMap::new()))
         .expect("Initial set in main() should succeed");
+
+    #[cfg(feature = "ktls")]
+    secure_vec::set_lock_enabled(config.ktls_memory_lock);
 
     let logstore_handle = LOGSTORE.get().expect("initialized in main()").clone();
     let internal_layer = tracing_subscriber::fmt::layer()

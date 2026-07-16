@@ -41,7 +41,10 @@ use crate::{
     client_counter,
     config::HttpsUpgradeMode,
     content_type_for_cached_file,
-    database_task::{DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command},
+    database_task::{
+        DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
+        send_db_command_nonblocking,
+    },
     deb_mirror::Origin,
     error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
     full_body, global_cache_quota, global_config, global_verify_throttle,
@@ -98,10 +101,14 @@ fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// On success the request `Parts` are handed back alongside the response —
+/// they were consumed by the request anyway, and returning them lets the
+/// rare redirect-follow path rebuild a request without the caller cloning
+/// the whole HeaderMap up front.
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
-) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
+) -> Result<(Response<Incoming>, http::request::Parts), hyper_util::client::legacy::Error> {
     const MAX_ATTEMPTS: u32 = 10;
     // Auto-mode's HTTPS-upgrade revert branch only fires once `attempt`
     // has crossed this threshold; below it, transient connect errors
@@ -190,7 +197,8 @@ pub(crate) async fn request_with_retry(
         cached_scheme: Option<Scheme>,
         https_upgrade_mode: HttpsUpgradeMode,
         mut https_upgrade_test: bool,
-    ) -> Result<Response<Incoming>, (hyper_util::client::legacy::Error, Uri)> {
+    ) -> Result<(Response<Incoming>, http::request::Parts), (hyper_util::client::legacy::Error, Uri)>
+    {
         let mut attempt = 1;
         let mut sleep_prev = 0;
         let mut sleep_curr = 500;
@@ -238,7 +246,7 @@ pub(crate) async fn request_with_retry(
                         }
                     }
                     metrics::record_upstream_status(response.status());
-                    return Ok(response);
+                    return Ok((response, parts));
                 }
                 Err(err) if !err.is_connect() => {
                     if is_io_timed_out_in_chain(&err) {
@@ -512,64 +520,64 @@ impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
         let project = self.project();
         let cd = project.conn_details.take().expect("Option is set in new()");
         let error = project.error.take();
-        tokio::task::spawn(async move {
-            let aliased = match cd.aliased_host {
-                Some(alias) => format!(" aliased to host {alias}"),
-                None => String::new(),
-            };
-            let in_time = cd.request_received_at.elapsed();
-            let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
-                "volatile "
-            } else {
-                ""
-            };
-            if transferred_bytes == size {
-                metrics::SERVED_COPY.increment();
-                metrics::SERVED_TOTAL.increment();
+        // Logging is synchronous and the DB enqueue has a sync fast path —
+        // no per-request task spawn needed here.
+        let aliased = match cd.aliased_host {
+            Some(alias) => format!(" aliased to host {alias}"),
+            None => String::new(),
+        };
+        let in_time = cd.request_received_at.elapsed();
+        let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
+            "volatile "
+        } else {
+            ""
+        };
+        if transferred_bytes == size {
+            metrics::SERVED_COPY.increment();
+            metrics::SERVED_TOTAL.increment();
+            info!(
+                "Served cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({})",
+                cd.debname,
+                cd.mirror,
+                aliased,
+                cd.client,
+                HumanFmt::Time(in_time),
+                rate_log::client_segment(size, duration),
+            );
+            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+                mirror: cd.mirror,
+                debname: cd.debname,
+                size,
+                elapsed: duration,
+                partial,
+                client_ip: cd.client.ip(),
+            });
+            send_db_command_nonblocking(cmd);
+        } else {
+            let segment = rate_log::client_disconnect_segment(transferred_bytes, duration);
+            let (reason, peer_disconnect) =
+                error.unwrap_or_else(|| (String::from("unknown reason"), false));
+            if peer_disconnect {
+                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 info!(
-                    "Served cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({})",
+                    "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({segment}):  {reason}",
                     cd.debname,
                     cd.mirror,
                     aliased,
                     cd.client,
                     HumanFmt::Time(in_time),
-                    rate_log::client_segment(size, duration),
                 );
-                let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
-                    mirror: cd.mirror,
-                    debname: cd.debname,
-                    size,
-                    elapsed: duration,
-                    partial,
-                    client_ip: cd.client.ip(),
-                });
-                send_db_command(cmd).await;
             } else {
-                let segment = rate_log::client_disconnect_segment(transferred_bytes, duration);
-                let (reason, peer_disconnect) =
-                    error.unwrap_or_else(|| (String::from("unknown reason"), false));
-                if peer_disconnect {
-                    metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                    info!(
-                        "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({segment}):  {reason}",
-                        cd.debname,
-                        cd.mirror,
-                        aliased,
-                        cd.client,
-                        HumanFmt::Time(in_time),
-                    );
-                } else {
-                    warn!(
-                        "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({segment}):  {reason}",
-                        cd.debname,
-                        cd.mirror,
-                        aliased,
-                        cd.client,
-                        HumanFmt::Time(in_time),
-                    );
-                }
+                warn!(
+                    "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({segment}):  {reason}",
+                    cd.debname,
+                    cd.mirror,
+                    aliased,
+                    cd.client,
+                    HumanFmt::Time(in_time),
+                );
             }
-        });
+        }
     }
 }
 
@@ -756,21 +764,25 @@ async fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
     file: tokio::fs::File,
     file_path: PathBuf,
-    last_modified_str: String,
+    last_modified_str: std::sync::Arc<str>,
     age: u32,
     http_status: StatusCode,
     content_length: usize,
     content_start: u64,
     content_range: Option<String>,
     partial: bool,
-    etag: Option<String>,
+    etag: Option<std::sync::Arc<str>>,
 ) -> Response<ProxyCacheBody> {
     trace!(
         "Using mmap(2) with start={content_start} and length={content_length} from content_range={content_range:?} for file `{}`",
         file_path.display()
     );
 
-    let Some(memory_map) = tokio::task::spawn_blocking(move || {
+    // block_in_place, not spawn_blocking: mmap(2)/madvise(2) only build a
+    // VMA (no I/O), so the blocking-pool dispatch/rendezvous would cost
+    // more than the syscalls themselves — per-hit latency on every
+    // mmap-served file.
+    let Some(memory_map) = tokio::task::block_in_place(|| {
         // SAFETY:
         // The file is only read from and only forwarded as bytes to a network socket.
         // Also clients perform a signature check on received packages.
@@ -807,9 +819,7 @@ async fn serve_cached_file_mmap(
         }
 
         Some(memory_map)
-    })
-    .await
-    .expect("task should not panic") else {
+    }) else {
         metrics::CACHE_IO_FAILURE.increment();
         return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
     };
@@ -902,15 +912,17 @@ async fn serve_unfinished_file(
         let buf_size = config.buffer_size;
 
         // Late-joiner reads of an in-progress download are still sequential —
-        // hint readahead before the streaming loop starts.
-        hint_sequential_read(&file, &file_path);
+        // hint readahead before the streaming loop starts.  The final size
+        // is unknown (file still growing), so always hint.
+        hint_sequential_read(&file, u64::MAX, &file_path);
 
-        let mut reader = tokio::io::BufReader::with_capacity(buf_size, &mut file);
-
+        // No BufReader: every read below goes into a fresh BytesMut of the
+        // same capacity, so tokio's BufReader would bypass its internal
+        // buffer on every read anyway — it only cost a dead allocation.
         'stream: loop {
             loop {
                 let mut buf = bytes::BytesMut::with_capacity(buf_size);
-                let ret = match reader.read_buf(&mut buf).await {
+                let ret = match file.read_buf(&mut buf).await {
                     Ok(0) => break, // EOF
                     Ok(r) => r,
                     Err(err) => {
@@ -993,7 +1005,7 @@ async fn serve_unfinished_file(
         }
 
         /* Perform cleanup before database operation */
-        drop(reader);
+        drop(file);
         drop(receiver);
         drop(status);
         drop(tx);
@@ -1042,21 +1054,21 @@ async fn serve_unfinished_file(
 
     let mut response_builder = Response::builder()
         .status(StatusCode::OK)
-        .header(DATE, format_http_date())
+        .header(DATE, &*format_http_date())
         .header(VIA, APP_VIA)
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_TYPE, content_type)
         .header(ACCEPT_RANGES, "bytes")
         .header(
             LAST_MODIFIED,
-            HeaderValue::try_from(last_modified_str).expect("Http datetime is valid"),
+            HeaderValue::try_from(&*last_modified_str).expect("Http datetime is valid"),
         )
         .header(AGE, HeaderValue::from(age));
 
     if let Some(etag) = file_etag {
         response_builder = response_builder.header(
             ETAG,
-            HeaderValue::try_from(etag).expect("ETag is validated before passing"),
+            HeaderValue::try_from(&*etag).expect("ETag is validated before passing"),
         );
     }
 
@@ -1212,19 +1224,19 @@ async fn serve_cached_file(
 
         let mut builder = Response::builder()
             .status(StatusCode::NOT_MODIFIED)
-            .header(DATE, format_http_date())
+            .header(DATE, &*format_http_date())
             .header(VIA, APP_VIA)
             .header(CONNECTION, "keep-alive")
             .header(
                 LAST_MODIFIED,
-                HeaderValue::try_from(last_modified_str).expect("HTTP date is valid"),
+                HeaderValue::try_from(&*last_modified_str).expect("HTTP date is valid"),
             )
             .header(AGE, HeaderValue::from(age));
 
         if let Some(etag) = file_etag {
             builder = builder.header(
                 ETAG,
-                HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
+                HeaderValue::try_from(&*etag).expect("ETag is validated by read_etag"),
             );
         }
 
@@ -1260,7 +1272,7 @@ async fn serve_cached_file(
                         .status(StatusCode::RANGE_NOT_SATISFIABLE)
                         .header(SERVER, APP_NAME)
                         .header(VIA, APP_VIA)
-                        .header(DATE, format_http_date())
+                        .header(DATE, &*format_http_date())
                         .header(CONNECTION, "keep-alive")
                         .header(
                             CONTENT_RANGE,
@@ -1322,7 +1334,7 @@ async fn serve_cached_file(
 
     // Buf path streams the file straight through; let the kernel grow its
     // readahead window accordingly.
-    hint_sequential_read(&file, &file_path);
+    hint_sequential_read(&file, content_length, &file_path);
 
     debug!(
         "Serving cached file {} from mirror {}{} for client {} via stream...",
@@ -1358,14 +1370,14 @@ async fn serve_cached_file_buf(
     mut file: tokio::fs::File,
     file_path: PathBuf,
     file_size: u64,
-    last_modified_str: String,
+    last_modified_str: std::sync::Arc<str>,
     age: u32,
     http_status: StatusCode,
     content_length: u64,
     start: u64,
     content_range: Option<String>,
     partial: bool,
-    etag: Option<String>,
+    etag: Option<std::sync::Arc<str>>,
 ) -> Response<ProxyCacheBody> {
     debug_assert!(
         start + content_length <= file_size,
@@ -1387,7 +1399,16 @@ async fn serve_cached_file_buf(
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
 
-    let reader_stream = tokio_util::io::ReaderStream::with_capacity(file, config.buffer_size);
+    // Bound the reader to the (possibly range-trimmed) content length,
+    // mirroring the mmap path: an unbounded stream over-reads past a closed
+    // range's end, and the surplus makes DeliveryStreamBody's Drop
+    // accounting see transferred != size — logging a spurious "Aborted
+    // serving" warn and skipping the SERVED_* metrics and delivery DB row
+    // for a request that was actually served fully.
+    let reader_stream = tokio_util::io::ReaderStream::with_capacity(
+        tokio::io::AsyncReadExt::take(file, content_length),
+        config.buffer_size,
+    );
 
     let delivery_body = DeliveryStreamBody::new(
         reader_stream.map_ok(Frame::data),
@@ -1431,13 +1452,13 @@ async fn serve_cached_file_buf(
 )]
 fn serve_cached_file_response(
     http_status: StatusCode,
-    last_modified_str: String,
+    last_modified_str: std::sync::Arc<str>,
     age: u32,
     content_length: u64,
     content_type: &'static str,
     body: ProxyCacheBody,
     content_range: Option<String>,
-    etag: Option<String>,
+    etag: Option<std::sync::Arc<str>>,
 ) -> Response<ProxyCacheBody> {
     /*
      * Original headers:
@@ -1466,14 +1487,14 @@ fn serve_cached_file_response(
 
     let mut response_builder = Response::builder()
         .status(http_status)
-        .header(DATE, format_http_date())
+        .header(DATE, &*format_http_date())
         .header(VIA, APP_VIA)
         .header(CONNECTION, "keep-alive")
         .header(CONTENT_LENGTH, HeaderValue::from(content_length))
         .header(CONTENT_TYPE, content_type)
         .header(
             LAST_MODIFIED,
-            HeaderValue::try_from(last_modified_str).expect("date string is valid"),
+            HeaderValue::try_from(&*last_modified_str).expect("date string is valid"),
         )
         .header(ACCEPT_RANGES, "bytes")
         .header(AGE, HeaderValue::from(age));
@@ -1488,7 +1509,7 @@ fn serve_cached_file_response(
     if let Some(etag) = etag {
         response_builder = response_builder.header(
             ETAG,
-            HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
+            HeaderValue::try_from(&*etag).expect("ETag is validated by read_etag"),
         );
     }
 
@@ -2035,7 +2056,7 @@ async fn download_file(
             debname: conn_details.debname.clone(),
             host: conn_details.mirror.host().to_string(),
             mirror_path: conn_details.mirror.path().to_owned(),
-            raw_uri_path: raw_uri_path.clone(),
+            raw_uri_path,
         };
         match rbarrier.commit(plan).await {
             Ok(()) => {
@@ -2383,7 +2404,7 @@ async fn serve_new_file(
 
     let mut upstream_request_sent = PreciseInstant::now();
     let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
-        Ok(r) => r,
+        Ok((r, _parts)) => r,
         Err(err) => return upstream_error_response(&err),
     };
 
@@ -2428,7 +2449,7 @@ async fn serve_new_file(
             upstream_request_sent = PreciseInstant::now();
             let redirected_response =
                 match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok(r) => r,
+                    Ok((r, _parts)) => r,
                     Err(err) => return upstream_error_response(&err),
                 };
 
@@ -2565,7 +2586,7 @@ async fn serve_new_file(
 
         upstream_request_sent = PreciseInstant::now();
         fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
-            Ok(r) => r,
+            Ok((r, _parts)) => r,
             Err(err) => return upstream_error_response(&err),
         };
     }
@@ -3034,7 +3055,7 @@ async fn serve_new_file(
 
                 let mut response_builder = Response::builder()
                     .status(config.experimental_parallel_hack_statuscode)
-                    .header(DATE, format_http_date())
+                    .header(DATE, &*format_http_date())
                     .header(VIA, APP_VIA)
                     .header(CONNECTION, "keep-alive");
 
@@ -3128,16 +3149,7 @@ pub(crate) async fn process_cache_request(
     req: Request<Empty<()>>,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
-    let cache_path = {
-        let mut p = conn_details.cache_dir_path();
-        let filename = Path::new(&conn_details.debname);
-        assert!(
-            filename.is_relative(),
-            "path construction must not contain absolute components"
-        );
-        p.push(filename);
-        p
-    };
+    let cache_path = conn_details.cache_file_path();
 
     match tokio::fs::File::options()
         .read(true)
@@ -3381,7 +3393,7 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
     let response = Response::builder()
         .header(SERVER, APP_NAME)
         .header(VIA, APP_VIA)
-        .header(DATE, format_http_date())
+        .header(DATE, &*format_http_date())
         .body(empty_body())
         .expect("HTTP response is valid");
 
@@ -3535,28 +3547,26 @@ async fn pre_process_client_request(
         .headers
         .insert(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT));
 
-    let mut parts_cloned = parts.clone();
-    let request_path = parts_cloned.uri.path().to_owned();
-
     // TODO: tweak http version?
     let fwd_request = Request::from_parts(parts, Empty::new());
 
     trace!("Forwarded request: {fwd_request:?}");
 
     let fwd_request_sent = PreciseInstant::now();
-    let fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
-        Ok(r) => r,
-        Err(err) => return upstream_error_response(&err),
-    };
+    // The returned parts serve the origin extraction and the rare
+    // redirect-follow below — no up-front HeaderMap clone per request.
+    let (fwd_response, mut parts) =
+        match request_with_retry(&appstate.https_client, fwd_request).await {
+            Ok(rp) => rp,
+            Err(err) => return upstream_error_response(&err),
+        };
+    let request_path = parts.uri.path().to_owned();
 
     trace!("Forwarded response: {fwd_response:?}");
 
     if (fwd_response.status().is_success() || fwd_response.status().is_redirection())
-        && let Some(origin) = Origin::from_path(
-            parts_cloned.uri.path(),
-            requested_host.clone(),
-            requested_port,
-        )
+        && let Some(origin) =
+            Origin::from_path(parts.uri.path(), requested_host.clone(), requested_port)
     {
         debug!("Extracted origin: {origin:?}");
 
@@ -3579,10 +3589,7 @@ async fn pre_process_client_request(
         .and_then(|lc| lc.to_str().ok())
         .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
     {
-        debug!(
-            "Requested URI: {}, Moved URI: {moved_uri}",
-            parts_cloned.uri
-        );
+        debug!("Requested URI: {}, Moved URI: {moved_uri}", parts.uri);
 
         if moved_uri.scheme().is_some_and(|scheme| {
             *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
@@ -3590,19 +3597,19 @@ async fn pre_process_client_request(
             && is_host_allowed_cached(moved_auth.host())
         {
             // Update the Host header so it matches the redirect target,
-            // otherwise the cloned header from the original request would be
+            // otherwise the header from the original request would be
             // sent to a different mirror.
             let redirected_host = host_header_from_uri(moved_auth);
-            parts_cloned.headers.insert(HOST, redirected_host);
-            parts_cloned.uri = moved_uri;
-            let redirected_request = Request::from_parts(parts_cloned, Empty::new());
+            parts.headers.insert(HOST, redirected_host);
+            parts.uri = moved_uri;
+            let redirected_request = Request::from_parts(parts, Empty::new());
 
             trace!("Redirected request: {redirected_request:?}");
 
             let redirected_request_sent = PreciseInstant::now();
             let redirected_response =
                 match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok(r) => r,
+                    Ok((r, _parts)) => r,
                     Err(err) => return upstream_error_response(&err),
                 };
 

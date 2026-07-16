@@ -114,6 +114,10 @@ pub(crate) struct Stanza {
     pub(crate) filename: Option<String>,
     pub(crate) sha256: Option<[u8; 32]>,
     pub(crate) sha512: Option<[u8; 64]>,
+    /// Whether `ingest` should decode `SHA512:` fields at all — the
+    /// registry ingest only ever reads `sha256`, so it skips the 128-char
+    /// hex decode per stanza on mirrors that publish SHA512.
+    want_sha512: bool,
 }
 
 impl Stanza {
@@ -122,6 +126,17 @@ impl Stanza {
             filename: None,
             sha256: None,
             sha512: None,
+            want_sha512: true,
+        }
+    }
+
+    /// A stanza whose consumer only reads SHA256 (see `want_sha512`).
+    pub(crate) const fn new_sha256_only() -> Self {
+        Self {
+            filename: None,
+            sha256: None,
+            sha512: None,
+            want_sha512: false,
         }
     }
 
@@ -148,7 +163,8 @@ impl Stanza {
             self.sha256 = Some(h);
             return;
         }
-        if self.sha512.is_none()
+        if self.want_sha512
+            && self.sha512.is_none()
             && let Some(h) = parse_hex_field::<64>(line, "SHA512: ")
         {
             self.sha512 = Some(h);

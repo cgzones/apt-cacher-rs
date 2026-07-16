@@ -235,7 +235,81 @@ pub(crate) async fn write_response_headers(
 
     trace!("Outgoing file response headers:\n{response}");
     metrics::record_client_status(headers.status);
-    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
+    if headers.content_length == 0 {
+        // No body bytes will follow to flush a MSG_MORE-held segment.
+        write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
+    } else {
+        write_all_to_stream_msg_more(stream, response.as_bytes()).await
+    }
+}
+
+/// Like [`write_all_to_stream`] with `WritePhase::Header`, but issues the
+/// bytes via `send(2)` with `MSG_MORE`: the kernel holds the trailing
+/// partial segment until the body written right after completes it — the
+/// same header+body coalescing `TCP_CORK` gave, without the per-response
+/// setsockopt on/off pair.
+///
+/// Only correct when body bytes follow immediately on the same socket and
+/// the body write does *not* carry the flag (sendfile(2) does not), so the
+/// body tail flushes without an uncork.
+async fn write_all_to_stream_msg_more(stream: &TcpStream, mut data: &[u8]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    use nix::sys::socket::{MsgFlags, send};
+
+    let http_timeout = global_config().http_timeout;
+    let deadline = tokio::time::sleep(http_timeout);
+    tokio::pin!(deadline);
+
+    while !data.is_empty() {
+        tokio::select! {
+            biased;
+            ready = stream.writable() => {
+                ready?;
+                // `try_io` keeps tokio's readiness cache honest: a raw
+                // send(2) EAGAIN is invisible to it otherwise.
+                let result = stream.try_io(tokio::io::Interest::WRITABLE, || {
+                    // nix's MsgFlags does not re-export MSG_MORE; build the
+                    // flag set from the libc constants it wraps.
+                    let flags = MsgFlags::from_bits_retain(
+                        nix::libc::MSG_MORE | nix::libc::MSG_DONTWAIT,
+                    );
+                    send(stream.as_raw_fd(), data, flags).map_err(std::io::Error::from)
+                });
+                let _: Never = match result {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::WriteZero,
+                            "failed to write to TCP stream",
+                        ));
+                    }
+                    Ok(n) => {
+                        data = &data[n..];
+                        continue;
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+            }
+            () = &mut deadline => {
+                metrics::HTTP_TIMEOUT_CLIENT_HEADER_WRITE.increment();
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "TCP stream write operation timed out after {}",
+                        HumanFmt::Time(http_timeout)
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Write all bytes to the TCP stream, handling partial writes.

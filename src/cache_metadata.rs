@@ -84,10 +84,13 @@ use crate::{
 /// `last_modified` stores both the raw header string (for `Last-Modified`
 /// response headers) and its parsed [`HttpDate`] (for If-Modified-Since
 /// comparison) so consumers don't re-parse on every hit.
+///
+/// The strings are `Arc<str>` so per-serve [`crate::cache_conditional::CacheInfo`]
+/// construction is a refcount bump instead of a String clone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UpstreamMetadata {
-    pub(crate) etag: Option<String>,
-    pub(crate) last_modified: Option<(String, HttpDate)>,
+    pub(crate) etag: Option<Arc<str>>,
+    pub(crate) last_modified: Option<(Arc<str>, HttpDate)>,
 }
 
 impl UpstreamMetadata {
@@ -95,9 +98,10 @@ impl UpstreamMetadata {
     /// produced only if the value parses as a valid HTTP-date.
     #[must_use]
     pub(crate) fn from_upstream(etag: Option<String>, last_modified: Option<String>) -> Self {
-        let last_modified = last_modified.and_then(|s| HttpDate::parse(&s).map(|t| (s, t)));
+        let last_modified =
+            last_modified.and_then(|s| HttpDate::parse(&s).map(|t| (Arc::from(s), t)));
         Self {
-            etag,
+            etag: etag.map(Arc::from),
             last_modified,
         }
     }
@@ -186,6 +190,13 @@ pub(crate) struct CacheMetadataStore {
     map: parking_lot::RwLock<HashMap<CacheMetadataKey, Arc<UpstreamMetadata>>>,
 }
 
+/// Soft cap on cached entries, bounding memory for caches holding very
+/// many distinct files (entries are a few hundred bytes each).  Values are
+/// lazily re-loadable from the on-disk xattrs, so overflow simply clears
+/// the map (no LRU) and subsequent serves re-populate it — same
+/// best-effort approach as `verify_throttle` and `permitted_host_cache`.
+const CACHE_METADATA_MAX_ENTRIES: usize = 64 * 1024;
+
 impl std::fmt::Debug for CacheMetadataStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Avoid dumping the entire map (could be large and mostly noise)
@@ -232,8 +243,9 @@ impl CacheMetadataStore {
         // a best-effort `Arc` containing whichever fields succeeded for
         // this request but do not insert — see the "Negative caching
         // and transient errors" section in the module docs.
-        let etag_res = try_read_etag(file, path);
-        let last_modified_res = try_read_last_modified(file, path);
+        let etag_res = try_read_etag(file, path).map(|o| o.map(Arc::from));
+        let last_modified_res =
+            try_read_last_modified(file, path).map(|o| o.map(|(s, t)| (Arc::from(s), t)));
         let (etag, last_modified) = match (etag_res, last_modified_res) {
             (Ok(etag), Ok(last_modified)) => (etag, last_modified),
             (etag_res, last_modified_res) => {
@@ -262,6 +274,9 @@ impl CacheMetadataStore {
         // spuriously on filesystems without xattr support.
         let owned = <Self as ResolveOwn<K>>::own(key);
         let mut map = self.map.write();
+        if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&owned) {
+            map.clear();
+        }
         match map.entry(owned) {
             Entry::Occupied(occ) => {
                 debug_assert!(
@@ -297,7 +312,11 @@ impl CacheMetadataStore {
     /// would otherwise clobber the published value with the stale xattr
     /// read).
     pub(crate) fn set(&self, key: CacheMetadataKey, meta: Arc<UpstreamMetadata>) {
-        self.map.write().insert(key, meta);
+        let mut map = self.map.write();
+        if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&key) {
+            map.clear();
+        }
+        map.insert(key, meta);
     }
 
     /// Drop any cached entry for `key`.  Called from cleanup file
@@ -489,7 +508,7 @@ mod tests {
         );
         assert_eq!(m.etag.as_deref(), Some("\"abc\""));
         let (s, _date) = m.last_modified.expect("parsed");
-        assert_eq!(s, "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(&*s, "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
     #[test]

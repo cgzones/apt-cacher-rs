@@ -41,10 +41,17 @@ where
 
     tokio::task::spawn_blocking(move || {
         let bridge_in = SyncIoBridge::new(reader);
-        let mut bridge_out = SyncIoBridge::new(write_half);
+        // Buffer up to the duplex capacity: io::copy alone crosses the
+        // bridge in 8 KiB chunks, each a block_on round-trip between the
+        // blocking thread and the runtime — the BufWriter cuts those
+        // handoffs 8x. The explicit flush surfaces write errors before the
+        // result send (BufWriter's Drop swallows them).
+        let mut bridge_out =
+            std::io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
         let mut decoder =
             lzma_rust2::XzReader::new(bridge_in, /* allow_multiple_streams = */ true);
-        let result = std::io::copy(&mut decoder, &mut bridge_out).map(|_| ());
+        let result = std::io::copy(&mut decoder, &mut bridge_out)
+            .and_then(|_| std::io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
         // EOF on `inner` before polling `tail`. Without this, the consumer can
         // observe Pending on the oneshot while the duplex still has an open

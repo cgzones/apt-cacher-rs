@@ -7,7 +7,7 @@ use tracing::info;
 use crate::{
     cache_layout::{CachedFlavor, ConnectionDetails},
     client_counter,
-    database_task::{DatabaseCommand, DbCmdDelivery, send_db_command},
+    database_task::{DatabaseCommand, DbCmdDelivery, send_db_command_nonblocking},
     humanfmt::HumanFmt,
     metrics,
     precise_instant::PreciseInstant,
@@ -55,51 +55,51 @@ impl Drop for MmapBody {
         let transferred_bytes = self.position as u64;
         metrics::BYTES_SERVED_MMAP.increment_by(transferred_bytes);
         let cd = self.conn_details.take().expect("set in new()");
-        tokio::task::spawn(async move {
-            let aliased = match cd.aliased_host {
-                Some(alias) => format!(" aliased to host {alias}"),
-                None => String::new(),
-            };
-            let in_time = cd.request_received_at.elapsed();
-            let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
-                "volatile "
-            } else {
-                ""
-            };
-            if transferred_bytes == size {
-                metrics::SERVED_MMAP.increment();
-                metrics::SERVED_TOTAL.increment();
-                info!(
-                    "Served cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({})",
-                    cd.debname,
-                    cd.mirror,
-                    aliased,
-                    cd.client,
-                    HumanFmt::Time(in_time),
-                    rate_log::client_segment(size, elapsed),
-                );
+        // Logging is synchronous and the DB enqueue has a sync fast path —
+        // no per-request task spawn needed here.
+        let aliased = match cd.aliased_host {
+            Some(alias) => format!(" aliased to host {alias}"),
+            None => String::new(),
+        };
+        let in_time = cd.request_received_at.elapsed();
+        let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
+            "volatile "
+        } else {
+            ""
+        };
+        if transferred_bytes == size {
+            metrics::SERVED_MMAP.increment();
+            metrics::SERVED_TOTAL.increment();
+            info!(
+                "Served cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({})",
+                cd.debname,
+                cd.mirror,
+                aliased,
+                cd.client,
+                HumanFmt::Time(in_time),
+                rate_log::client_segment(size, elapsed),
+            );
 
-                let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
-                    mirror: cd.mirror,
-                    debname: cd.debname,
-                    size,
-                    elapsed,
-                    partial,
-                    client_ip: cd.client.ip(),
-                });
-                send_db_command(cmd).await;
-            } else {
-                let segment = rate_log::client_disconnect_segment(transferred_bytes, elapsed);
-                info!(
-                    "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({segment})",
-                    cd.debname,
-                    cd.mirror,
-                    aliased,
-                    cd.client,
-                    HumanFmt::Time(in_time),
-                );
-            }
-        });
+            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+                mirror: cd.mirror,
+                debname: cd.debname,
+                size,
+                elapsed,
+                partial,
+                client_ip: cd.client.ip(),
+            });
+            send_db_command_nonblocking(cmd);
+        } else {
+            let segment = rate_log::client_disconnect_segment(transferred_bytes, elapsed);
+            info!(
+                "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({segment})",
+                cd.debname,
+                cd.mirror,
+                aliased,
+                cd.client,
+                HumanFmt::Time(in_time),
+            );
+        }
     }
 }
 

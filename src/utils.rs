@@ -587,14 +587,30 @@ pub(crate) async fn touch_volatile_mtime(
     tokio::fs::File::from_std(std_file)
 }
 
+/// Transfers below this size don't get a readahead hint: the kernel's
+/// default readahead window (128 KiB) already covers them, so the
+/// `posix_fadvise` syscall would be pure per-request overhead — hot small
+/// index files are the dominant request class.
+const SEQUENTIAL_HINT_MIN_SIZE: u64 = 256 * 1024;
+
 /// Hint to the kernel that `file` will be read sequentially from start to end,
 /// so the page-cache readahead window can grow more aggressively.  Used on
 /// every cache file we are about to stream to a client through the
-/// hyper/sendfile paths.  Failure is non-fatal — the first failure is logged
-/// at warn level (subsequent ones at debug) and we fall back to the kernel's
-/// default readahead policy.
-pub(crate) fn hint_sequential_read(file: &tokio::fs::File, display_path: &Path) {
+/// hyper/sendfile paths.  `transfer_size` is the number of bytes about to be
+/// streamed (`u64::MAX` when unknown, e.g. a still-growing download); small
+/// transfers skip the syscall.  Failure is non-fatal — the first failure is
+/// logged at warn level (subsequent ones at debug) and we fall back to the
+/// kernel's default readahead policy.
+pub(crate) fn hint_sequential_read(
+    file: &tokio::fs::File,
+    transfer_size: u64,
+    display_path: &Path,
+) {
     use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+
+    if transfer_size < SEQUENTIAL_HINT_MIN_SIZE {
+        return;
+    }
 
     // Avoid using `tokio::task::block_in_place`, since no real I/O is involved
     if let Err(errno) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
