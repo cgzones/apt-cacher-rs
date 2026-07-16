@@ -127,6 +127,12 @@ const VOLATILE_BODY_MAX: usize = 1024 * 1024;
 #[cfg(feature = "ktls")]
 const KTLS_BLOCK_DURATION: Duration = Duration::from_secs(600);
 
+/// `tls_label` value for a kTLS-offloaded upstream connection. Doubles as the
+/// kTLS marker at body-transfer time: every reconnect helper updates
+/// `tls_label`, so it always describes the *current* upstream connection.
+#[cfg(feature = "ktls")]
+const KTLS_TLS_LABEL: &str = " (kTLS)";
+
 /// Monotonic time (coarsetime ticks) of the last opportunistic GC of `KTLS_BLOCKED`
 /// from the read path. Used to rate-limit GC sweeps to at most once per
 /// `KTLS_BLOCK_DURATION` on cache misses.
@@ -1243,13 +1249,37 @@ async fn unbuffered_ktls_request(
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
             }
             ConnectionState::WriteTraffic(mut wt) => {
-                // Ready to send — encrypt and transmit the HTTP request
+                // Ready to send — encrypt and transmit the HTTP request.
+                // The kTLS socket is one-shot (never pooled), so advertise
+                // Connection: close and let the upstream release the
+                // connection promptly instead of holding it idle.
+                //
+                // The rustls state machine pairs every EncodeTlsData with a
+                // TransmitTlsData before yielding WriteTraffic, so no encoded
+                // bytes should be pending here. wt.encrypt() below writes at
+                // outgoing[0..] and only outgoing[..enc_len] is transmitted,
+                // so pending bytes would be silently clobbered. Fail closed
+                // rather than corrupt the stream if that pairing ever breaks.
+                debug_assert_eq!(
+                    outgoing_used, 0,
+                    "un-transmitted TLS bytes pending at WriteTraffic"
+                );
+                if outgoing_used != 0 {
+                    return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "kTLS: {outgoing_used} un-transmitted TLS bytes pending at \
+                             WriteTraffic; request encryption would clobber them"
+                        ),
+                    )));
+                }
                 let request = format_http_request(
                     upstream_path,
                     host_authority,
                     resume_offset,
                     resume_if_range,
                     volatile_cond,
+                    ConnectionAction::Close,
                 );
                 let plaintext = request.as_bytes();
 
@@ -1484,6 +1514,15 @@ async fn unbuffered_ktls_request(
     // from TCP until all records are drained or a per-read timeout fires.
     // The overall http_timeout (applied at the call site) caps total wait time.
     if incoming_used > 0 {
+        /// Cap on decrypted body bytes buffered while waiting for the incoming
+        /// stream to reach a TLS record boundary. Alignment depends on where
+        /// TCP reads happen to end; against a fast upstream streaming a large
+        /// body it may not occur for a long time, and every drained byte
+        /// accumulates in `extra_body` (RAM). Beyond this cap, give up on kTLS
+        /// for this connection (transient — no host block) and let the
+        /// standard streaming path handle the fetch.
+        const MAX_KTLS_EXTRA_BODY: usize = 4 * 1024 * 1024;
+
         let per_read_timeout = std::time::Duration::from_secs(5);
 
         // Log how many bytes the current partial TLS record needs.
@@ -1539,6 +1578,15 @@ async fn unbuffered_ktls_request(
                 &mut extra_body,
             )
             .await?;
+            if extra_body.len() > MAX_KTLS_EXTRA_BODY {
+                return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::other(
+                    format!(
+                        "kTLS: buffered {} bytes of decrypted body without reaching \
+                         TLS record alignment; falling back to the streaming path",
+                        extra_body.len()
+                    ),
+                )));
+            }
             if incoming_used == 0 {
                 break 'drain;
             }
@@ -1687,6 +1735,7 @@ fn format_http_request(
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
+    connection: ConnectionAction,
 ) -> String {
     let range_header = if resume_offset > 0 {
         let if_range = match resume_if_range {
@@ -1716,7 +1765,7 @@ fn format_http_request(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_authority}\r\n\
          User-Agent: {APP_USER_AGENT}\r\n\
-         Connection: keep-alive\r\n\
+         Connection: {connection}\r\n\
          {range_header}\
          {volatile_headers}\
          \r\n"
@@ -1745,6 +1794,7 @@ async fn send_upstream_request(
         resume_offset,
         resume_if_range,
         volatile_cond,
+        ConnectionAction::KeepAlive,
     );
 
     let http_timeout = global_config().http_timeout;
@@ -1996,6 +2046,7 @@ async fn splice_proxy_body(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
+    #[cfg(feature = "ktls")] upstream_is_ktls: bool,
 ) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64)> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
@@ -2021,6 +2072,13 @@ async fn splice_proxy_body(
     let mut client_rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+
+    // Budget for draining kTLS control records that arrive mid-stream (e.g. a
+    // late NewSessionTicket) — see the drain-retry arm in the splice loop.
+    // Multiple bursts over a long download are plausible; each drain consumes
+    // a whole burst.
+    #[cfg(feature = "ktls")]
+    let mut ktls_drain_retries: u32 = 8;
 
     let mut remaining = content_length;
     let mut file_offset: i64 = file_start_offset;
@@ -2094,6 +2152,33 @@ async fn splice_proxy_body(
                         ) => r?,
                         w = upstream_pipe_sender.writable() => w?,
                     }
+                    continue;
+                }
+                // A kTLS control record (e.g. a late NewSessionTicket) at the
+                // head of the receive queue fails splice(2) instead of
+                // delivering bytes; the errno varies by kernel version
+                // (EINVAL/EIO/EBADMSG). Drain the record(s) and retry. The
+                // budget keeps this bounded: a KeyUpdate is consumed as a
+                // handshake record, but subsequent records cannot be decrypted
+                // with the fixed RX key, so persistent failures exhaust the
+                // budget and abort.
+                #[cfg(feature = "ktls")]
+                Err(
+                    err @ (nix::errno::Errno::EINVAL
+                    | nix::errno::Errno::EIO
+                    | nix::errno::Errno::EBADMSG),
+                ) if upstream_is_ktls && ktls_drain_retries > 0 => {
+                    ktls_drain_retries -= 1;
+                    if let Err(drain_err) =
+                        ktls::drain_control_messages(upstream.as_fd(), ktls::DrainExpect::DataReady)
+                    {
+                        warn!(
+                            "splice proxy: mid-stream kTLS control-record drain failed:  {}",
+                            ErrorReport(&drain_err)
+                        );
+                        return Err(errno_to_io_error(err, "splice failed on kTLS record"));
+                    }
+                    debug!("splice proxy: drained mid-stream kTLS control record(s), retrying");
                     continue;
                 }
                 Err(err) => return Err(errno_to_io_error(err, "splice failed")),
@@ -4351,7 +4436,7 @@ async fn splice_proxy_drive(
                 state.header_buf,
                 state.header_end,
                 splice_extra,
-                " (kTLS)",
+                KTLS_TLS_LABEL,
             )
         }
         KtlsResult::ResponseNotSpliceable { .. } => {
@@ -5512,6 +5597,13 @@ async fn splice_proxy_drive(
         // rename step; on a structured rate-timeout it's already consumed into
         // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
         // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
+        // Whether the upstream socket has kTLS RX configured: tls_label is
+        // maintained by every reconnect helper, so it describes the current
+        // connection (and a kTLS attempt only yields Ready for 200 responses,
+        // so no reconnect path fires after it).
+        #[cfg(feature = "ktls")]
+        let upstream_is_ktls = tls_label == KTLS_TLS_LABEL;
+
         let (returned_dbarrier, demoted_handle, body_client_disconnected, body_client_bytes) =
             if let Some(tcp_upstream) = upstream.as_tcp() {
                 // Zero-copy path for TCP (plain or kTLS)
@@ -5524,6 +5616,8 @@ async fn splice_proxy_drive(
                     dbarrier,
                     &range_filter,
                     &temppath,
+                    #[cfg(feature = "ktls")]
+                    upstream_is_ktls,
                 )
                 .await
             } else {
