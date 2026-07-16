@@ -2271,7 +2271,7 @@ impl WebResponse {
         let mut builder = Response::builder()
             .status(self.status)
             .header(SERVER, APP_NAME)
-            .header(DATE, format_http_date())
+            .header(DATE, &*format_http_date())
             .header(CONNECTION, "keep-alive")
             .header(CONTENT_TYPE, self.content_type());
         match self.kind {

@@ -20,9 +20,9 @@ use crate::http_range::{HttpDate, cache_file_http_date, compute_age};
 /// request headers and to populate response headers (`Last-Modified`, `ETag`,
 /// `Age`).
 pub(crate) struct CacheInfo {
-    pub(crate) file_etag: Option<String>,
+    pub(crate) file_etag: Option<std::sync::Arc<str>>,
     pub(crate) last_modified_for_ims: HttpDate,
-    pub(crate) last_modified_str: String,
+    pub(crate) last_modified_str: std::sync::Arc<str>,
     pub(crate) age: u32,
 }
 
@@ -51,8 +51,8 @@ impl CacheInfo {
         let cache_ts = cache_file_http_date(metadata);
 
         let (last_modified_for_ims, last_modified_str) = match meta.last_modified.as_ref() {
-            Some((s, time)) => (*time, s.clone()),
-            None => (cache_ts, cache_ts.format()),
+            Some((s, time)) => (*time, std::sync::Arc::clone(s)),
+            None => (cache_ts, cache_ts.format().into()),
         };
 
         let age = compute_age(metadata);

@@ -116,29 +116,33 @@ impl From<SystemTime> for HttpDate {
 
 /// Format the current date and time as an HTTP date string.
 ///
-/// Cached at 1-second granularity.
+/// Cached at 1-second granularity.  Every response writer calls this once
+/// per response for the `Date` header, so the steady state is a shared
+/// read lock plus an `Arc` refcount bump — no allocation and no exclusive
+/// lock; only the once-per-second rollover takes the write lock and
+/// formats.
 #[must_use]
-pub(crate) fn format_http_date() -> String {
-    static CACHE: std::sync::LazyLock<parking_lot::Mutex<(HttpDate, String)>> =
-        std::sync::LazyLock::new(|| parking_lot::Mutex::new((HttpDate(u64::MAX), String::new())));
+pub(crate) fn format_http_date() -> std::sync::Arc<str> {
+    static CACHE: std::sync::LazyLock<parking_lot::RwLock<(HttpDate, std::sync::Arc<str>)>> =
+        std::sync::LazyLock::new(|| {
+            parking_lot::RwLock::new((HttpDate(u64::MAX), std::sync::Arc::from("")))
+        });
 
     let now = HttpDate::now();
 
     {
-        let cached = CACHE.lock();
+        let cached = CACHE.read();
         if cached.0 == now {
-            return cached.1.clone();
+            return std::sync::Arc::clone(&cached.1);
         }
     }
 
-    let formatted = now.format();
+    let formatted: std::sync::Arc<str> = now.format().into();
 
-    {
-        let mut cached = CACHE.lock();
-        if cached.0 != now {
-            cached.0 = now;
-            cached.1.clone_from(&formatted);
-        }
+    let mut cached = CACHE.write();
+    if cached.0 != now {
+        cached.0 = now;
+        cached.1 = std::sync::Arc::clone(&formatted);
     }
 
     formatted

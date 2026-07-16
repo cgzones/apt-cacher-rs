@@ -252,6 +252,30 @@ impl ActiveDownloads {
         layout: CacheLayout,
         max_upstream_downloads: Option<NonZero<usize>>,
     ) -> LookupResult {
+        // First pass with the borrowed key: joining an in-flight download
+        // allocates nothing (no owned key, no channel, no status Arc).
+        {
+            let keyref = ActiveDownloadKeyRef {
+                mirror,
+                debname,
+                layout,
+            };
+            let mut guard = self.inner.write();
+            if let Some(entry) = guard.get_mut(&keyref) {
+                entry.late_joiners += 1;
+                let peak = entry.late_joiners;
+                let status = Arc::clone(&entry.status);
+                let current_len = guard.len();
+                record_cap_saturation(current_len, max_upstream_downloads);
+                drop(guard);
+
+                metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(current_len as u64);
+                metrics::LATE_JOINERS_TOTAL.increment();
+                metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
+                return LookupResult::LateJoiner { status };
+            }
+        }
+
         let key = ActiveDownloadKey {
             mirror: mirror.to_owned(),
             debname: debname.to_owned(),
@@ -263,6 +287,9 @@ impl ActiveDownloads {
         let (tx, rx) = tokio::sync::watch::channel(());
         let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Init(rx)));
 
+        // Re-checked via entry(): another task may have originated the same
+        // download between the two lock acquisitions — then we join late
+        // after all and the pre-allocations are discarded (rare race).
         let mut guard = self.inner.write();
         let (outcome, late_joiner_peak) = match guard.entry(key) {
             Entry::Occupied(mut oentry) => {
@@ -396,6 +423,16 @@ impl ActiveDownloads {
             debname,
             layout,
         };
+
+        // Fast path under the shared lock: this runs on every cacheable
+        // sendfile request and almost always misses (nothing in flight for
+        // the key), so don't pay the exclusive lock for a pure lookup.
+        if !self.inner.read().contains_key(&key) {
+            return None;
+        }
+
+        // Re-check under the write lock — the entry may have been removed
+        // between the two acquisitions.
         let mut guard = self.inner.write();
         let entry = guard.get_mut(&key)?;
         entry.late_joiners += 1;
@@ -444,24 +481,14 @@ impl ActiveDownloads {
 
     #[must_use]
     pub(crate) fn download_count(&self) -> usize {
-        tokio::task::block_in_place(move || {
-            let mut count = 0;
-
-            for entry in self.inner.read().values() {
-                let d = entry.status.blocking_read();
-                match &*d {
-                    ActiveDownloadStatus::Init(_)
-                    | ActiveDownloadStatus::Download { .. }
-                    | ActiveDownloadStatus::Verifying { .. }
-                    | ActiveDownloadStatus::Aborted(_) => {
-                        count += 1;
-                    }
-                    ActiveDownloadStatus::Finished { .. } => (),
-                }
-            }
-
-            count
-        })
+        // Every terminal status transition (Finished/Aborted) in guards.rs
+        // is immediately followed by `remove()`, so mapped entries are in a
+        // pre-terminal state apart from a transition-to-removal window a
+        // few statements wide. The map length therefore matches the old
+        // per-entry status scan (which took every entry's status lock
+        // inside block_in_place) up to that transient — fine for the
+        // parallel-hack probability and web display consumers.
+        self.inner.read().len()
     }
 }
 

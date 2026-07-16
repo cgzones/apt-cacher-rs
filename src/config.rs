@@ -45,6 +45,7 @@ const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
 const DEFAULT_DB_BATCH_FLUSH_MAX_COUNT: NonZero<usize> = nonzero!(256);
 const DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS: NonZero<u64> = nonzero!(15);
 const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
+const DEFAULT_KTLS_MEMORY_LOCK: bool = true;
 const DEFAULT_MAX_OBJECT_SIZE: Option<NonZero<u64>> = Some(nonzero!(2 * 1024 * 1024 * 1024));
 const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
 const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
@@ -144,11 +145,17 @@ impl<'de> Deserialize<'de> for ConfigDomainName {
     }
 }
 
+/// Inner strings are `Arc<str>`: `DomainName` rides inside
+/// `ClientHost`/`CacheHost`/`Mirror`, which are cloned into
+/// active-download keys, metadata-cache keys, DB commands, and the
+/// permitted-host cache on hot paths — a refcount bump instead of a
+/// String allocation each time.  `Arc<str>` hashes/compares by content,
+/// so map-key semantics are unchanged.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum DomainNameInner {
-    Dns(String),
-    Ipv4(String, Ipv4Addr),
-    Ipv6(String, Ipv6Addr),
+    Dns(std::sync::Arc<str>),
+    Ipv4(std::sync::Arc<str>, Ipv4Addr),
+    Ipv6(std::sync::Arc<str>, Ipv6Addr),
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -159,19 +166,19 @@ impl DomainName {
         if domain.contains(':') {
             return domain
                 .parse::<Ipv6Addr>()
-                .map(|addr| Self(DomainNameInner::Ipv6(addr.to_string(), addr)))
+                .map(|addr| Self(DomainNameInner::Ipv6(addr.to_string().into(), addr)))
                 .map_err(|_parse_err| domain);
         }
 
         if let Ok(addr) = domain.parse::<Ipv4Addr>() {
-            return Ok(Self(DomainNameInner::Ipv4(addr.to_string(), addr)));
+            return Ok(Self(DomainNameInner::Ipv4(addr.to_string().into(), addr)));
         }
 
         // At this point we've already proven there's no `:` and the string
         // is not a valid IPv4 address, so skip those branches in the
         // validator.
         if is_valid_dns_label_string(&domain) {
-            Ok(Self(DomainNameInner::Dns(domain)))
+            Ok(Self(DomainNameInner::Dns(domain.into())))
         } else {
             Err(domain)
         }
@@ -189,11 +196,11 @@ impl DomainName {
 
     #[must_use]
     #[inline]
-    pub(crate) const fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Self(
                 DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
-            ) => s.as_str(),
+            ) => s,
         }
     }
 
@@ -287,17 +294,7 @@ impl From<DomainName> for String {
         match val {
             DomainName(
                 DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
-            ) => s,
-        }
-    }
-}
-
-impl<'a> From<&'a DomainName> for &'a String {
-    fn from(val: &'a DomainName) -> Self {
-        match val {
-            DomainName(
-                DomainNameInner::Dns(s) | DomainNameInner::Ipv4(s, _) | DomainNameInner::Ipv6(s, _),
-            ) => s,
+            ) => Self::from(&*s),
         }
     }
 }
@@ -317,7 +314,10 @@ impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for DomainName {
         &self,
         buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
     ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        <String as sqlx::Encode<'q, sqlx::Sqlite>>::encode_by_ref(self.into(), buf)
+        // The owned copy is unavoidable: SQLite's argument buffer requires
+        // 'q-lived text and `self` only lives for this call. Encodes happen
+        // on the batched DB task, not per request.
+        <String as sqlx::Encode<'q, sqlx::Sqlite>>::encode(self.as_str().to_owned(), buf)
     }
 }
 
@@ -803,6 +803,14 @@ pub(crate) struct Config {
     #[serde(default = "default_mmap_threshold")]
     pub(crate) mmap_threshold: NonZero<u64>,
 
+    /// Whether to pin the kTLS handshake buffers (which hold TLS secrets and
+    /// decrypted handshake data) in RAM via `mlock(2)`, keeping them out of
+    /// swap. Disable in mlock-restricted environments (containers, tight
+    /// `RLIMIT_MEMLOCK`). Zeroize-on-drop and core-dump exclusion stay
+    /// active regardless.
+    #[serde(default = "default_ktls_memory_lock")]
+    pub(crate) ktls_memory_lock: bool,
+
     /// Whether to set `TCP_NODELAY` on upstream sockets (hyper, splice, and
     /// CONNECT tunnels).  Mirror requests are typically a small header
     /// followed by a long body read; disabling Nagle's algorithm avoids the
@@ -1159,6 +1167,10 @@ const fn default_db_batch_flush_interval_secs() -> NonZero<u64> {
 
 const fn default_mmap_threshold() -> NonZero<u64> {
     DEFAULT_MMAP_THRESHOLD
+}
+
+const fn default_ktls_memory_lock() -> bool {
+    DEFAULT_KTLS_MEMORY_LOCK
 }
 
 const fn default_max_object_size() -> Option<NonZero<u64>> {
@@ -1682,6 +1694,12 @@ impl Config {
                 "mmap_threshold is set to {} but mmap feature is not enabled",
                 self.mmap_threshold
             ));
+        }
+
+        #[cfg(not(feature = "ktls"))]
+        if !self.ktls_memory_lock {
+            warnings
+                .push("ktls_memory_lock is disabled but ktls feature is not enabled".to_owned());
         }
 
         #[expect(clippy::float_cmp, reason = "compare against default value")]

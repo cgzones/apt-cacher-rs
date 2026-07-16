@@ -106,6 +106,7 @@ impl<'a> InitBarrier<'a> {
                 tx,
                 quota_reservation,
                 bytes_since_ping: 0,
+                pinged_once: false,
             }),
         }
     }
@@ -171,6 +172,8 @@ struct DownloadBarrierData {
     quota_reservation: Option<QuotaReservation>,
     /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
     bytes_since_ping: u64,
+    /// Whether any ping was sent yet — the first one is unbatched.
+    pinged_once: bool,
 }
 
 impl DownloadBarrierData {
@@ -184,6 +187,7 @@ impl DownloadBarrierData {
         // Send error means no receivers; not cached because send() is a cheap atomic load.
         if let Err(_err @ tokio::sync::watch::error::SendError(())) = self.tx.send(()) {}
         self.bytes_since_ping = 0;
+        self.pinged_once = true;
     }
 }
 
@@ -195,6 +199,12 @@ pub(crate) struct DownloadBarrier {
 impl DownloadBarrier {
     /// Accumulate `bytes` and ping receivers once `PING_BATCH_THRESHOLD` is crossed.
     /// `&mut self` enforces single-writer access at compile time.
+    ///
+    /// The very first ping is sent unbatched: the originating client reads
+    /// the partial file itself, so without it a download smaller than the
+    /// batch threshold would deliver its first byte only when the whole
+    /// download finished (pure store-and-forward latency, no wake-up-storm
+    /// justification).
     pub(crate) fn ping_batched(&mut self, bytes: u64) {
         /// Roughly 1 MiB; tunes between wake-up overhead and joiner latency.
         const PING_BATCH_THRESHOLD: u64 = 1024 * 1024;
@@ -204,7 +214,7 @@ impl DownloadBarrier {
             .as_mut()
             .expect("every sink consumes the instance");
         data.bytes_since_ping = data.bytes_since_ping.saturating_add(bytes);
-        if data.bytes_since_ping >= PING_BATCH_THRESHOLD {
+        if !data.pinged_once || data.bytes_since_ping >= PING_BATCH_THRESHOLD {
             data.internal_ping();
         }
     }

@@ -36,7 +36,7 @@ use crate::{
     ClientInfo,
     cache_layout::{self, CacheLayout, CachedFlavor, ClassifyError, ResourceKind},
     config::{Alias, CacheHost, ClientHost, resolve_alias},
-    database_task::{DatabaseCommand, DbCmdOrigin, send_db_command},
+    database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
         Mirror, Origin, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path,
         parse_request_path,
@@ -169,7 +169,7 @@ pub(crate) enum DispatchOutcome {
 )]
 enum Decision {
     /// `pending_origin` is `Some` when `class.origin_fields` indicated a real
-    /// (non-pseudo) architecture; the wrapper forwards it to `send_db_command`
+    /// (non-pseudo) architecture; the wrapper forwards it to `send_db_command_nonblocking`
     /// before returning the `Cache` outcome.
     Cache {
         plan: CachePlan,
@@ -214,7 +214,9 @@ pub(crate) async fn dispatch_request(
             pending_origin,
         } => {
             if let Some(origin) = pending_origin {
-                send_db_command(DatabaseCommand::Origin(DbCmdOrigin { origin })).await;
+                // Nonblocking: this runs pre-response on the dispatch path,
+                // so a saturated DB queue must not stall request handling.
+                send_db_command_nonblocking(DatabaseCommand::Origin(DbCmdOrigin { origin }));
             }
             DispatchOutcome::Cache(plan)
         }

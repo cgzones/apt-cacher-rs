@@ -856,7 +856,7 @@ pub(crate) async fn ingest_packages_file(
 
     let mut line = String::with_capacity(128);
     let mut line_buf: Vec<u8> = Vec::with_capacity(128);
-    let mut stanza = index_parser::Stanza::new();
+    let mut stanza = index_parser::Stanza::new_sha256_only();
     loop {
         line.clear();
         match limits::read_line_capped(

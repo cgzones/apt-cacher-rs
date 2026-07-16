@@ -15,7 +15,7 @@ use http::{
 };
 use nix::sys::sendfile::sendfile;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite, Interest, ReadBuf},
     net::TcpStream,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -45,7 +45,6 @@ use crate::{
     rate_log,
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
     static_assert,
-    tcp_cork_guard::CorkGuard,
     utils::{hint_sequential_read, is_peer_disconnect},
     warn_once_or_debug, warn_once_or_info,
     web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
@@ -53,6 +52,9 @@ use crate::{
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
 const MAX_HEADER_SIZE: usize = 8192;
+
+/// Upper bound for `async_sendfile`'s inline single-syscall fast path.
+const SMALL_SERVE_INLINE_MAX: u64 = 256 * 1024;
 /// Initial size for HTTP request headers buffer.
 const INITIAL_HEADER_SIZE: usize = 2048;
 /// Maximum number of HTTP headers to parse (matches hyper's default of 100).
@@ -786,16 +788,7 @@ async fn try_sendfile_request(
         return result;
     }
 
-    let cache_path = {
-        let mut p = conn_details.cache_dir_path();
-        let filename = Path::new(&conn_details.debname);
-        assert!(
-            filename.is_relative(),
-            "path construction must not contain absolute components"
-        );
-        p.push(filename);
-        p
-    };
+    let cache_path = conn_details.cache_file_path();
 
     // Try to open the cached file; for volatile resources, treat stale files as cache misses.
     let mut cache_miss_was_volatile_notfound = false;
@@ -829,7 +822,8 @@ async fn try_sendfile_request(
 
         // Volatile staleness: if file is older than VOLATILE_CACHE_MAX_AGE,
         // treat as cache miss so splice/hyper can fetch a fresh copy from
-        // upstream.
+        // upstream. Keep the metadata for the serve path so it doesn't
+        // fstat a second time.
         if conn_details.cached_flavor == CachedFlavor::Volatile {
             match file.metadata().await {
                 Ok(md) if md.file_type().is_file() => {
@@ -857,6 +851,7 @@ async fn try_sendfile_request(
                         );
                     }
                     metrics::VOLATILE_HIT.increment();
+                    break 'cache_lookup Some((file, Some(md)));
                 }
                 Ok(_) => {
                     metrics::CACHE_NON_REGULAR.increment();
@@ -884,10 +879,10 @@ async fn try_sendfile_request(
             }
         }
 
-        Some(file)
+        Some((file, None))
     };
 
-    if let Some(file) = cached_file {
+    if let Some((file, mdata)) = cached_file {
         // CACHE_HITS only counts permanent-file hits; fresh volatile hits
         // were already bumped as VOLATILE_HIT in the cache_lookup block.
         if conn_details.cached_flavor == CachedFlavor::Permanent {
@@ -898,7 +893,7 @@ async fn try_sendfile_request(
             stream,
             &conn_details,
             &aliased,
-            (file, &cache_path),
+            (file, mdata, &cache_path),
             (*conn_version, conn_action),
             RangeRequestHeaders::extract(req.headers),
             None,
@@ -1153,36 +1148,42 @@ pub(crate) async fn serve_file_via_sendfile(
     stream: &TcpStream,
     conn_details: &ConnectionDetails,
     aliased: &str,
-    source: (tokio::fs::File, &Path),
+    source: (tokio::fs::File, Option<std::fs::Metadata>, &Path),
     conn_settings: (ConnectionVersion, ConnectionAction),
     headers: RangeRequestHeaders<'_>,
     prefetched_upstream_metadata: Option<&cache_metadata::UpstreamMetadata>,
 ) -> SendfileResult {
-    let (file, file_path) = source;
+    let (file, prefetched_mdata, file_path) = source;
     let (conn_version, conn_action) = conn_settings;
 
-    let mdata = match file.metadata().await {
-        Ok(m) if m.file_type().is_file() => m,
-        Ok(_) => {
-            metrics::CACHE_NON_REGULAR.increment();
-            error!("Cache file `{}` is not a regular file", file_path.display());
-            return SendfileResult::Invalid {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                msg: "Cache Access Failure",
-            };
-        }
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to get metadata of cached file `{}` for client {}:  {}",
-                file_path.display(),
-                conn_details.client,
-                ErrorReport(&err)
-            );
-            return SendfileResult::Invalid {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                msg: "Cache Access Failure",
-            };
+    // The volatile-hit path already fetched (and is_file-validated) the
+    // metadata for its staleness check; don't pay a second fstat here.
+    let mdata = if let Some(m) = prefetched_mdata {
+        m
+    } else {
+        match file.metadata().await {
+            Ok(m) if m.file_type().is_file() => m,
+            Ok(_) => {
+                metrics::CACHE_NON_REGULAR.increment();
+                error!("Cache file `{}` is not a regular file", file_path.display());
+                return SendfileResult::Invalid {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    msg: "Cache Access Failure",
+                };
+            }
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to get metadata of cached file `{}` for client {}:  {}",
+                    file_path.display(),
+                    conn_details.client,
+                    ErrorReport(&err)
+                );
+                return SendfileResult::Invalid {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    msg: "Cache Access Failure",
+                };
+            }
         }
     };
 
@@ -1236,10 +1237,11 @@ pub(crate) async fn serve_file_via_sendfile(
 
     // sendfile streams the file linearly through the kernel, so help the
     // page-cache readahead window grow before the splice loop starts.
-    hint_sequential_read(&file, file_path);
+    hint_sequential_read(&file, content_length, file_path);
 
-    // Cork the socket to coalesce headers + body into fewer TCP segments
-    let _cork = CorkGuard::new_optional(stream);
+    // Headers are sent with MSG_MORE (see write_response_headers), so the
+    // kernel coalesces them with the first sendfile body bytes — no
+    // TCP_CORK setsockopt pair needed.
 
     // Write HTTP response headers
     let headers = ResponseHeaders {
@@ -1464,6 +1466,29 @@ async fn wait_socket_rated(
     }
 }
 
+// Force-clear Tokio's cached readiness on a TCP socket.
+//
+// `sendfile`/`splice`/`tee` operate on raw fds and can return `EAGAIN`;
+// Tokio doesn't see those errors so its cache stays "ready" and the next
+// `readable()`/`writable()` returns instantly instead of parking — a
+// busy-spin. We invoke `try_io` with a no-op closure that returns
+// `WouldBlock` to trigger `clear_readiness` and force the next wait to
+// actually park until a fresh epoll event arrives.
+
+#[cfg(feature = "splice")]
+pub(crate) fn clear_tcp_readable_cache(socket: &TcpStream) {
+    let _ignore = socket.try_io(Interest::READABLE, || -> std::io::Result<()> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    });
+}
+
+#[cfg(feature = "splice")]
+pub(crate) fn clear_tcp_writable_cache(socket: &TcpStream) {
+    let _ignore = socket.try_io(Interest::WRITABLE, || -> std::io::Result<()> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    });
+}
+
 pub(crate) async fn wait_writable_rated(
     socket: &TcpStream,
     rate_checker: &mut Option<RateChecker>,
@@ -1569,15 +1594,46 @@ struct SendfileBatch {
     stop: SendfileBatchStop,
 }
 
-/// Transfer up to `amount` bytes from `file` at `*file_offset` to `socket`
-/// using sendfile(2), handling rate checking and writability polling.
+/// Dup'd socket + file descriptor pair threaded through the blocking
+/// sendfile batches.
+///
+/// The descriptors are dup'd once per transfer and passed by ownership
+/// through each `spawn_blocking`, coming back via the closure return
+/// value.  If the outer future is cancelled mid-batch (client disconnect,
+/// runtime shutdown), tokio cannot abort `spawn_blocking` — it merely
+/// detaches the `JoinHandle`.  The detached closure still owns the
+/// `OwnedFd`s, so the kernel descriptors stay open until it returns and
+/// cannot be reassigned to an unrelated FD by a parent's
+/// `TcpStream`/`File` Drop.  One dup pair per transfer amortises across
+/// many EAGAIN cycles and, for unfinished-file serves, across many
+/// availability windows.
+pub(crate) struct SendfileFds {
+    socket: std::os::fd::OwnedFd,
+    file: std::os::fd::OwnedFd,
+}
+
+impl SendfileFds {
+    pub(crate) fn dup(socket: &TcpStream, file: &tokio::fs::File) -> std::io::Result<Self> {
+        Ok(Self {
+            socket: nix::unistd::dup(socket.as_fd())
+                .map_err(|errno| errno_to_io_error(errno, "dup of socket fd failed"))?,
+            file: nix::unistd::dup(file.as_fd())
+                .map_err(|errno| errno_to_io_error(errno, "dup of file fd failed"))?,
+        })
+    }
+}
+
+/// Transfer up to `amount` bytes from `fds.file` at `*file_offset` to
+/// `fds.socket` using sendfile(2), handling rate checking and writability
+/// polling.  Returns the fd pair for reuse by the next call; on error the
+/// transfer is over and the pair is dropped.
 async fn sendfile_chunk_loop(
     socket: &TcpStream,
-    file: &tokio::fs::File,
+    mut fds: SendfileFds,
     file_offset: &mut i64,
     amount: u64,
     rate_checker: &mut Option<RateChecker>,
-) -> std::io::Result<ChunkLoopOutcome> {
+) -> std::io::Result<(ChunkLoopOutcome, SendfileFds)> {
     // Per-syscall cap to avoid exceeding system limits.  Always within
     // usize range since it fits in 31 bits.
     const MAX_PER_SYSCALL: usize = 0x7fff_f000;
@@ -1585,20 +1641,6 @@ async fn sendfile_chunk_loop(
 
     let config = global_config();
     let mut remaining = amount;
-
-    // Dup the socket and file descriptors once per chunk_loop call and
-    // pass ownership through each spawn_blocking, getting them back via
-    // the closure return value.  If the outer future is cancelled
-    // mid-batch (client disconnect, runtime shutdown), tokio cannot
-    // abort spawn_blocking — it merely detaches the JoinHandle.  The
-    // detached closure still owns the OwnedFds, so the kernel
-    // descriptors stay open until it returns and cannot be reassigned
-    // to an unrelated FD by a parent's TcpStream/File Drop.  One dup
-    // pair per transfer amortises across many EAGAIN cycles.
-    let mut socket_dup = nix::unistd::dup(socket.as_fd())
-        .map_err(|errno| errno_to_io_error(errno, "dup of socket fd failed"))?;
-    let mut file_dup = nix::unistd::dup(file.as_fd())
-        .map_err(|errno| errno_to_io_error(errno, "dup of file fd failed"))?;
 
     while remaining > 0 {
         if let Some(rc) = rate_checker.as_ref()
@@ -1625,8 +1667,7 @@ async fn sendfile_chunk_loop(
         let count: usize = remaining.try_into().unwrap_or(usize::MAX);
         let off_in = *file_offset;
 
-        let s = socket_dup;
-        let f = file_dup;
+        let SendfileFds { socket: s, file: f } = fds;
 
         let (batch, s, f) = tokio::task::spawn_blocking(move || {
             let mut transferred: usize = 0;
@@ -1663,8 +1704,7 @@ async fn sendfile_chunk_loop(
         .await
         .expect("task should not panic");
 
-        socket_dup = s;
-        file_dup = f;
+        fds = SendfileFds { socket: s, file: f };
 
         // Apply state changes from whatever progress the batch made before
         // it stopped (success or EAGAIN both leave us with bytes to credit).
@@ -1680,23 +1720,83 @@ async fn sendfile_chunk_loop(
         }
 
         match batch.stop {
-            SendfileBatchStop::Done => return Ok(ChunkLoopOutcome::Complete),
+            SendfileBatchStop::Done => return Ok((ChunkLoopOutcome::Complete, fds)),
             SendfileBatchStop::Eof => {
                 warn_once_or_debug!(
                     "sendfile returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining"
                 );
-                return Ok(ChunkLoopOutcome::Eof {
-                    transferred: amount - remaining,
-                });
+                return Ok((
+                    ChunkLoopOutcome::Eof {
+                        transferred: amount - remaining,
+                    },
+                    fds,
+                ));
             }
-            SendfileBatchStop::NeedsWritable => (),
+            SendfileBatchStop::NeedsWritable => {
+                // The raw sendfile(2) EAGAIN inside the blocking batch is
+                // invisible to Tokio, so its cached WRITABLE readiness would
+                // make the next `wait_writable_rated` return instantly — a
+                // busy-spin for as long as the client's socket buffer stays
+                // full.  A bare no-op `try_io` clear would race a wakeup
+                // delivered between the batch's EAGAIN and the clear
+                // (wiping it stalls the transfer until http_timeout), so
+                // retry one sendfile *inside* `try_io`: tokio's readiness
+                // tick makes the EAGAIN observation and the cache clear
+                // atomic, and a wakeup arriving during the syscall survives.
+                let chunk_size =
+                    std::cmp::min(remaining.try_into().unwrap_or(usize::MAX), MAX_PER_SYSCALL);
+                let mut off = *file_offset;
+                match socket.try_io(Interest::WRITABLE, || {
+                    loop {
+                        match sendfile(
+                            fds.socket.as_fd(),
+                            fds.file.as_fd(),
+                            Some(&mut off),
+                            chunk_size,
+                        ) {
+                            Ok(n) => return Ok(n),
+                            Err(nix::errno::Errno::EAGAIN) => {
+                                return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                            }
+                            Err(nix::errno::Errno::EINTR) => {}
+                            Err(errno) => return Err(errno_to_io_error(errno, "sendfile failed")),
+                        }
+                    }
+                }) {
+                    Ok(0) => {
+                        warn_once_or_debug!(
+                            "sendfile returned 0 at offset {off} with {remaining}/{amount} bytes remaining"
+                        );
+                        return Ok((
+                            ChunkLoopOutcome::Eof {
+                                transferred: amount - remaining,
+                            },
+                            fds,
+                        ));
+                    }
+                    Ok(n) => {
+                        *file_offset = off;
+                        remaining = remaining
+                            .checked_sub(n as u64)
+                            .expect("sendfile(2) should not transfer more bytes than requested");
+                        metrics::BYTES_SERVED_SENDFILE.increment_by(n as u64);
+                        if let Some(rc) = rate_checker {
+                            rc.add(n);
+                        }
+                    }
+                    // Readiness cleared race-free; the next loop iteration
+                    // parks in `wait_writable_rated` until a fresh event.
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err),
+                }
+            }
             SendfileBatchStop::Error(errno) => {
                 return Err(errno_to_io_error(errno, "sendfile failed"));
             }
         }
     }
 
-    Ok(ChunkLoopOutcome::Complete)
+    Ok((ChunkLoopOutcome::Complete, fds))
 }
 
 /// Perform an async sendfile(2) operation, transferring `count` bytes from `file`
@@ -1725,7 +1825,71 @@ pub(crate) async fn async_sendfile(
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
-    match sendfile_chunk_loop(socket, file, &mut file_offset, count, &mut rate_checker)
+    let mut remaining = count;
+
+    // Fast path for the dominant request class (small hot cached files):
+    // one sendfile(2) into a usually-empty socket buffer completes the
+    // whole transfer on the request task — no fd dup pair, no
+    // blocking-pool round-trip.  `try_io` keeps tokio's readiness cache
+    // honest on EAGAIN; any partial/blocked outcome falls through to the
+    // batched loop below.  The dup-based cancellation-safety argument
+    // doesn't apply here: the syscall runs synchronously on this task
+    // while `socket`/`file` are borrowed.
+    if count > 0 && count <= SMALL_SERVE_INLINE_MAX {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "count is bounded by SMALL_SERVE_INLINE_MAX which fits in usize"
+        )]
+        let want = count as usize;
+        match socket.try_io(Interest::WRITABLE, || {
+            loop {
+                match sendfile(socket.as_fd(), file.as_fd(), Some(&mut file_offset), want) {
+                    Ok(n) => return Ok(n),
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                    }
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(errno) => return Err(errno_to_io_error(errno, "sendfile failed")),
+                }
+            }
+        }) {
+            Ok(0) => {
+                return Err((
+                    0,
+                    std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        format!(
+                            "sendfile: unexpected end of file (transferred 0/{count} at offset {file_offset})"
+                        ),
+                    ),
+                ));
+            }
+            Ok(n) => {
+                metrics::BYTES_SERVED_SENDFILE.increment_by(n as u64);
+                if let Some(rc) = &mut rate_checker {
+                    rc.add(n);
+                }
+                remaining -= n as u64;
+                if remaining == 0 {
+                    return Ok(count);
+                }
+            }
+            // Socket buffer full — the batched loop below parks properly.
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) => return Err((0, err)),
+        }
+    }
+
+    let fds = SendfileFds::dup(socket, file).map_err(|e| {
+        (
+            u64::try_from(file_offset)
+                .unwrap_or(0)
+                .saturating_sub(offset),
+            e,
+        )
+    })?;
+
+    match sendfile_chunk_loop(socket, fds, &mut file_offset, remaining, &mut rate_checker)
         .await
         .map_err(|e| {
             (
@@ -1735,16 +1899,19 @@ pub(crate) async fn async_sendfile(
                 e,
             )
         })? {
-        ChunkLoopOutcome::Complete => Ok(count),
-        ChunkLoopOutcome::Eof { transferred } => Err((
-            transferred,
-            std::io::Error::new(
-                ErrorKind::UnexpectedEof,
-                format!(
-                    "sendfile: unexpected end of file (transferred {transferred}/{count} at offset {file_offset})"
+        (ChunkLoopOutcome::Complete, _fds) => Ok(count),
+        (ChunkLoopOutcome::Eof { transferred }, _fds) => {
+            let transferred = (count - remaining) + transferred;
+            Err((
+                transferred,
+                std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!(
+                        "sendfile: unexpected end of file (transferred {transferred}/{count} at offset {file_offset})"
+                    ),
                 ),
-            ),
-        )),
+            ))
+        }
     }
 }
 
@@ -1789,13 +1956,22 @@ pub(crate) async fn async_sendfile_unfinished(
     let mut remaining = content_length;
     let mut finished = false;
 
+    // One dup pair for the whole transfer, reused across availability
+    // windows (each window is one `sendfile_chunk_loop` call).
+    let mut fds = SendfileFds::dup(socket, file).map_err(|e| (0, e))?;
+
     while remaining > 0 {
         // Determine how many bytes the file currently has available past our offset.
         let offset_u64: u64 = file_offset
             .try_into()
             .expect("file_offset is non-negative by construction");
 
-        let file_size = match tokio::task::block_in_place(|| nix::sys::stat::fstat(file.as_fd())) {
+        // Deliberately NOT `block_in_place`: this runs once (usually twice)
+        // per availability window, and `block_in_place` demotes the worker
+        // thread — orders of magnitude dearer than the fstat it would wrap.
+        // fstat on a regular file reads the in-memory inode; the writer task
+        // keeps the inode hot, so there is no disk wait to shield against.
+        let file_size = match nix::sys::stat::fstat(file.as_fd()) {
             Ok(stat) if stat.st_mode & nix::libc::S_IFMT == nix::libc::S_IFREG => stat
                 .st_size
                 .try_into()
@@ -1878,8 +2054,8 @@ pub(crate) async fn async_sendfile_unfinished(
         }
 
         // Transfer what is currently available via the shared sendfile loop.
-        let outcome =
-            sendfile_chunk_loop(socket, file, &mut file_offset, sendable, &mut rate_checker)
+        let (outcome, fds_back) =
+            sendfile_chunk_loop(socket, fds, &mut file_offset, sendable, &mut rate_checker)
                 .await
                 .map_err(|e| {
                     (
@@ -1889,6 +2065,7 @@ pub(crate) async fn async_sendfile_unfinished(
                         e,
                     )
                 })?;
+        fds = fds_back;
         let sent = match outcome {
             ChunkLoopOutcome::Complete => sendable,
             ChunkLoopOutcome::Eof { transferred } => {
@@ -2040,7 +2217,7 @@ async fn serve_unfinished_sendfile(
                         stream,
                         conn_details,
                         aliased,
-                        (file, &finished_path),
+                        (file, None, &finished_path),
                         (conn_version, conn_action),
                         headers,
                         prefetched.as_deref(),
@@ -2089,7 +2266,7 @@ async fn serve_unfinished_sendfile(
                         stream,
                         conn_details,
                         aliased,
-                        (file, &verifying_path),
+                        (file, None, &verifying_path),
                         (conn_version, conn_action),
                         headers,
                         Some(&prefetched),
@@ -2189,10 +2366,12 @@ async fn serve_unfinished_sendfile(
     );
 
     // Joining clients also stream the partial cache file linearly via sendfile,
-    // so warm the kernel readahead window before the loop starts.
-    hint_sequential_read(&file, &file_path);
+    // so warm the kernel readahead window before the loop starts.  The final
+    // size is unknown (file still growing), so always hint.
+    hint_sequential_read(&file, u64::MAX, &file_path);
 
-    let _cork = CorkGuard::new_optional(stream);
+    // Headers go out with MSG_MORE (see write_response_headers); the first
+    // sendfile body bytes complete the held segment — no TCP_CORK pair.
 
     let headers = ResponseHeaders {
         conn_version,

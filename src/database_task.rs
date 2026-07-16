@@ -73,6 +73,39 @@ pub(crate) async fn send_db_command(cmd: DatabaseCommand) {
     metrics::DB_QUEUE_DEPTH_PEAK.update(max_capacity.saturating_sub(tx.capacity()) as u64);
 }
 
+/// Synchronous variant of [`send_db_command`] for `Drop` impls and
+/// pre-response paths that must not stall on a saturated queue:
+/// `try_send` inline (the channel is rarely full) and fall back to a
+/// spawned task only on saturation — preserving the no-drop semantics
+/// without paying a task spawn per event or blocking the caller.
+pub(crate) fn send_db_command_nonblocking(cmd: DatabaseCommand) {
+    use tokio::sync::mpsc::error::TrySendError;
+
+    let tx = DB_TASK_QUEUE_SENDER
+        .get()
+        .expect("Sender initialized in main_loop()");
+    let max_capacity = tx.max_capacity();
+    metrics::DB_COMMANDS_SENT.increment();
+    match tx.try_send(cmd) {
+        Ok(()) => {
+            // See send_db_command for the peak-sampling rationale.
+            metrics::DB_QUEUE_DEPTH_PEAK.update(max_capacity.saturating_sub(tx.capacity()) as u64);
+        }
+        Err(TrySendError::Full(cmd)) => {
+            metrics::DB_QUEUE_FULL_WAITS.increment();
+            let tx = tx.clone();
+            tokio::task::spawn(async move {
+                if tx.send(cmd).await.is_err() {
+                    metrics::DB_COMMANDS_DROPPED_SHUTDOWN.increment();
+                }
+            });
+        }
+        Err(TrySendError::Closed(_cmd)) => {
+            metrics::DB_COMMANDS_DROPPED_SHUTDOWN.increment();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum FlushReason {
     BySize,
@@ -230,12 +263,19 @@ async fn stage(
                     return;
                 }
             };
-            buf.origins.push(OriginRow {
+            let row = OriginRow {
                 mirror_id,
                 distribution: c.origin.distribution,
                 component: c.origin.component,
                 architecture: c.origin.architecture,
-            });
+            };
+            // Dedup within the batch: the sendfile->hyper handoff dispatches
+            // a cache-missed Packages request twice, producing two identical
+            // upserts back-to-back. Batches are <= flush size (256), and
+            // origin rows are a small fraction, so a linear scan is fine.
+            if !buf.origins.contains(&row) {
+                buf.origins.push(row);
+            }
         }
     }
 }

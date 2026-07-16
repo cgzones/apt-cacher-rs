@@ -231,7 +231,7 @@ pub(crate) async fn main_loop(
                             .expect("Valid request");
 
                         match request_with_retry(&client, request).await {
-                            Ok(response) => {
+                            Ok((response, _parts)) => {
                                 if response.status().is_server_error() {
                                     warn!(
                                         "Initial scheme cache request to host {authority} returned server error {}",
