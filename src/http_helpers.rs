@@ -49,13 +49,34 @@ impl std::fmt::Display for ConnectionVersion {
     }
 }
 
-/// Check if the buffer contains the end of HTTP headers (\r\n\r\n) and return the index after the end.
+/// Find the end of the HTTP request header block, returning the index just
+/// past the terminating empty line.
+///
+/// Recognizes both the canonical `CRLF` line terminator and a lone `LF`
+/// (RFC 9112 §2.2 permits a recipient to treat a bare LF as a line
+/// terminator). This matches `httparse`'s lenient parsing, so the index
+/// returned here agrees with the byte count `httparse` consumes for the same
+/// request — keeping the sendfile read/advance boundary in lockstep with the
+/// parser (and with the hyper backend, which parses via the same `httparse`).
+/// A CRLF-only scan desyncs on a bare-LF-terminated pipelined request,
+/// advancing past the *following* request and dropping it.
 #[must_use]
 #[inline]
 pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.array_windows()
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
+    // The header block ends at the first empty line. Every header line ends in
+    // LF (optionally preceded by CR), so an empty line begins right after some
+    // LF: either LF LF (bare-LF empty line) or LF CR LF.
+    for (i, &b) in buf.iter().enumerate() {
+        if b != b'\n' {
+            continue;
+        }
+        match buf.get(i + 1) {
+            Some(b'\n') => return Some(i + 2),
+            Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some(i + 3),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Find a header value by name (case-insensitive).
@@ -389,6 +410,17 @@ mod tests {
         );
         assert_eq!(find_header_end(b"GET /"), None);
         assert_eq!(find_header_end(b"\r\n\r\n"), Some(4));
+        // Bare-LF line terminators (RFC 9112 §2.2), as httparse accepts.
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\nHost: x\n\n"), Some(24));
+        assert_eq!(find_header_end(b"\n\n"), Some(2));
+        // Mixed: LF-terminated header line then a CRLF empty line.
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\nHost: x\n\r\n"), Some(25));
+        // Pipelined bare-LF request A followed by request B: the returned
+        // index must be the END OF A, not A+B, or B gets dropped.
+        assert_eq!(
+            find_header_end(b"GET /a HTTP/1.1\nHost: x\n\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Some(25)
+        );
     }
 
     #[test]

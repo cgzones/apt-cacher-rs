@@ -3,6 +3,30 @@
 //! When kTLS RX is configured on a socket, the kernel decrypts incoming TLS
 //! records transparently, allowing `splice(2)` to move plaintext data without
 //! ever copying it to userspace.
+//!
+//! Setup pipeline (kernel-canonical order): [`attach_ulp`] right after
+//! `connect(2)` → userspace TLS handshake (`TLS_BASE` passthrough) →
+//! [`setup_rx`] with the extracted secrets → [`drain_control_messages`].
+//!
+//! # Security
+//!
+//! `setsockopt(SOL_TLS, TLS_RX/TLS_TX)` copies the session key into kernel
+//! memory for the socket's lifetime. The kernel intentionally allows reading
+//! the full crypto state — including the key — back out via
+//! `getsockopt(SOL_TLS, TLS_RX/TLS_TX)`, with no opt-out: a kTLS socket fd is
+//! therefore a key-extraction capability until it is closed, to any holder of
+//! that fd (or a ptrace-capable attacker).
+//!
+//! The userspace zeroization in this module ([`ZeroizingCryptoInfo`],
+//! `SecureVec`-backed buffers, dropping rustls' `AeadKey`) defends only
+//! against *memory disclosure* of key material transiently present in this
+//! process — it does nothing about the kernel-held copy, which remains
+//! readable via `getsockopt` regardless.
+//!
+//! What actually bounds the exposure is the one-shot design: kTLS sockets
+//! are sent with `Connection: close` and are never returned to a connection
+//! pool, so the kernel-held key — and the fd able to read it back — dies
+//! with the socket at the end of a single transfer.
 
 use std::io;
 use std::io::IoSliceMut;
@@ -105,6 +129,151 @@ const KTLS_PROBE_UNAVAILABLE: u8 = 2;
 
 static KTLS_AVAILABLE: AtomicU8 = AtomicU8::new(KTLS_PROBE_UNKNOWN);
 
+/// Bitmask of kernel-supported `(TLS version, cipher)` RX combos, indexed by
+/// [`combo_bit`]. Populated by [`is_available`]'s probe *before*
+/// [`KTLS_AVAILABLE`] latches AVAILABLE, and read by [`rx_supported`] to gate
+/// `setup_rx`. A value of 0 means "never populated" — [`rx_supported`] then
+/// defers to `setup_rx` so the gate can never make things worse.
+static KTLS_RX_SUPPORT: AtomicU32 = AtomicU32::new(0);
+
+/// The six `(TLS version, cipher)` combos the RX probe tests, with display
+/// names for the support-summary log line. Kept as the single source of the
+/// probe order and the combo naming.
+const PROBE_COMBOS: [(u16, u16, &str); 6] = [
+    (
+        libc::TLS_1_2_VERSION,
+        libc::TLS_CIPHER_AES_GCM_128,
+        "TLSv1.2+AES-128-GCM",
+    ),
+    (
+        libc::TLS_1_2_VERSION,
+        libc::TLS_CIPHER_AES_GCM_256,
+        "TLSv1.2+AES-256-GCM",
+    ),
+    (
+        libc::TLS_1_2_VERSION,
+        libc::TLS_CIPHER_CHACHA20_POLY1305,
+        "TLSv1.2+ChaCha20-Poly1305",
+    ),
+    (
+        libc::TLS_1_3_VERSION,
+        libc::TLS_CIPHER_AES_GCM_128,
+        "TLSv1.3+AES-128-GCM",
+    ),
+    (
+        libc::TLS_1_3_VERSION,
+        libc::TLS_CIPHER_AES_GCM_256,
+        "TLSv1.3+AES-256-GCM",
+    ),
+    (
+        libc::TLS_1_3_VERSION,
+        libc::TLS_CIPHER_CHACHA20_POLY1305,
+        "TLSv1.3+ChaCha20-Poly1305",
+    ),
+];
+
+/// Map a kernel `(TLS version, cipher_type)` pair to its distinct bit index in
+/// [`KTLS_RX_SUPPORT`], or `None` for an unrecognised version or cipher.
+fn combo_bit(tls_version: u16, cipher_type: u16) -> Option<u8> {
+    let version_index = if tls_version == libc::TLS_1_2_VERSION {
+        0u8
+    } else if tls_version == libc::TLS_1_3_VERSION {
+        1u8
+    } else {
+        return None;
+    };
+    let cipher_index = if cipher_type == libc::TLS_CIPHER_AES_GCM_128 {
+        0u8
+    } else if cipher_type == libc::TLS_CIPHER_AES_GCM_256 {
+        1u8
+    } else if cipher_type == libc::TLS_CIPHER_CHACHA20_POLY1305 {
+        2u8
+    } else {
+        return None;
+    };
+    Some(version_index * 3 + cipher_index)
+}
+
+/// Map a rustls `ConnectionTrafficSecrets` variant to its kernel `cipher_type`
+/// constant, or `None` for a cipher kTLS does not support. Single source of the
+/// secrets->cipher mapping shared by [`rx_supported`].
+fn kernel_cipher_type(secrets: &ConnectionTrafficSecrets) -> Option<u16> {
+    match secrets {
+        ConnectionTrafficSecrets::Aes128Gcm { .. } => Some(libc::TLS_CIPHER_AES_GCM_128),
+        ConnectionTrafficSecrets::Aes256Gcm { .. } => Some(libc::TLS_CIPHER_AES_GCM_256),
+        ConnectionTrafficSecrets::Chacha20Poly1305 { .. } => {
+            Some(libc::TLS_CIPHER_CHACHA20_POLY1305)
+        }
+        // ConnectionTrafficSecrets is #[non_exhaustive]; an unknown cipher is
+        // simply not kTLS-capable here.
+        _ => None,
+    }
+}
+
+/// Build a shape-correct kTLS crypto-info struct with zeroed key material for
+/// the availability probe. The kernel validates the version/cipher/struct
+/// shape, not key content, so a zeroed struct is enough to test whether the
+/// combo's `TLS_RX` setsockopt is accepted. `None` for an unknown cipher.
+fn dummy_crypto_info(tls_version: u16, cipher_type: u16) -> Option<TlsCryptoInfo> {
+    let info = libc::tls_crypto_info {
+        version: tls_version,
+        cipher_type,
+    };
+    if cipher_type == libc::TLS_CIPHER_AES_GCM_128 {
+        Some(TlsCryptoInfo::Aes128Gcm(
+            libc::tls12_crypto_info_aes_gcm_128 {
+                info,
+                iv: [0u8; 8],
+                key: [0u8; 16],
+                salt: [0u8; 4],
+                rec_seq: [0u8; 8],
+            },
+        ))
+    } else if cipher_type == libc::TLS_CIPHER_AES_GCM_256 {
+        Some(TlsCryptoInfo::Aes256Gcm(
+            libc::tls12_crypto_info_aes_gcm_256 {
+                info,
+                iv: [0u8; 8],
+                key: [0u8; 32],
+                salt: [0u8; 4],
+                rec_seq: [0u8; 8],
+            },
+        ))
+    } else if cipher_type == libc::TLS_CIPHER_CHACHA20_POLY1305 {
+        Some(TlsCryptoInfo::Chacha20Poly1305(
+            libc::tls12_crypto_info_chacha20_poly1305 {
+                info,
+                iv: [0u8; NONCE_LEN],
+                salt: [],
+                key: [0u8; 32],
+                rec_seq: [0u8; 8],
+            },
+        ))
+    } else {
+        None
+    }
+}
+
+/// Human-readable list of the supported combos in a [`KTLS_RX_SUPPORT`] mask,
+/// for the support-summary log line.
+fn describe_rx_support(mask: u32) -> String {
+    PROBE_COMBOS
+        .iter()
+        .filter(|&&(version, cipher, _)| {
+            combo_bit(version, cipher).is_some_and(|bit| mask & (1u32 << bit) != 0)
+        })
+        .map(|&(_, _, name)| name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Latch kTLS unavailable for the rest of the process; [`is_available`]
+/// short-circuits to `false` from then on. Single owner of the
+/// unavailable-latch store so every latch site is greppable.
+fn latch_unavailable() {
+    KTLS_AVAILABLE.store(KTLS_PROBE_UNAVAILABLE, Ordering::Relaxed);
+}
+
 /// Erroring probe attempts so far. Once `MAX_PROBE_ERRORS` is reached the
 /// probe latches unavailable, bounding per-request probe work and log noise
 /// on persistently broken environments.
@@ -120,7 +289,9 @@ static KTLS_PROBE_ERRORS: AtomicU32 = AtomicU32::new(0);
 #[must_use]
 pub(crate) fn is_available() -> bool {
     enum TestResult {
-        Available,
+        /// ULP attach succeeded; the payload is the [`KTLS_RX_SUPPORT`] bitmask
+        /// of combos whose `TLS_RX` setsockopt was accepted (0 = none).
+        Available(u32),
         Unavailable,
         /// An error occurred during the test.
         /// A log message should have been emitted.
@@ -130,7 +301,8 @@ pub(crate) fn is_available() -> bool {
     fn inner() -> TestResult {
         use nix::sys::socket::{
             AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, accept4, bind, connect,
-            getsockname, listen, setsockopt, socket, sockopt::TcpUlp,
+            getsockname, listen, setsockopt, socket,
+            sockopt::{TcpTlsRx, TcpUlp},
         };
         use std::os::fd::{FromRawFd as _, OwnedFd};
 
@@ -167,50 +339,76 @@ pub(crate) fn is_available() -> bool {
             }
         };
 
-        // Connect a client socket
-        let client: OwnedFd = match socket(
-            AddressFamily::Inet,
-            SockType::Stream,
-            SockFlag::SOCK_CLOEXEC,
-            None,
-        ) {
-            Ok(fd) => fd,
+        // Create a fresh connected loopback pair. TLS_RX can be set only once
+        // per socket (EBUSY on the second set), so every combo probe needs its
+        // own pair. The listener stays alive across all pairs.
+        let make_pair = || -> nix::Result<(OwnedFd, OwnedFd)> {
+            let client = socket(
+                AddressFamily::Inet,
+                SockType::Stream,
+                SockFlag::SOCK_CLOEXEC,
+                None,
+            )?;
+            connect(client.as_raw_fd(), &sockname)?;
+            let server_raw = accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC)?;
+            // SAFETY: accept4 returned a valid fd that no other code owns; wrap
+            // it immediately so it is closed on drop.
+            let server = unsafe { OwnedFd::from_raw_fd(server_raw) };
+            Ok((client, server))
+        };
+
+        // First pair: the ULP attach test (unchanged behavior).
+        let (probe_client, probe_server) = match make_pair() {
+            Ok(pair) => pair,
             Err(err) => {
-                warn!("kTLS: availability test: failed to create client socket:  {err}");
+                warn!("kTLS: availability test: failed to create loopback pair:  {err}");
                 return TestResult::Error;
             }
         };
-
-        if let Err(err) = connect(client.as_raw_fd(), &sockname) {
-            warn!("kTLS: availability test: failed to connect client socket:  {err}");
-            return TestResult::Error;
-        }
-
-        // Accept the server side (not needed for the probe, but completes the handshake)
-        let _server = match accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
-            Ok(fd) => {
-                // SAFETY: accept4 succeeded so the fd is valid, and no other code owns it.
-                // nix::sys::socket::accept4 returns a raw fd (not OwnedFd), so we wrap it
-                // immediately to ensure it is closed on drop.
-                unsafe { OwnedFd::from_raw_fd(fd) }
-            }
-            Err(err) => {
-                warn!("kTLS: availability test: failed to accept client connection:  {err}");
-                return TestResult::Error;
-            }
-        };
-
-        drop(listener);
-
-        // Now try TCP_ULP on the connected client socket
-        match setsockopt(&client, TcpUlp::default(), b"tls") {
-            Ok(()) => TestResult::Available,
-            Err(nix::errno::Errno::ENOENT) => TestResult::Unavailable,
+        match setsockopt(&probe_client, TcpUlp::default(), b"tls") {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ENOENT) => return TestResult::Unavailable,
             Err(err) => {
                 warn!("kTLS: availability test: failed to set TCP_ULP:  {err}");
-                TestResult::Error
+                return TestResult::Error;
             }
         }
+        drop((probe_client, probe_server));
+
+        // The ULP is present. Probe each supported (version, cipher) combo on a
+        // fresh pair to discover per-cipher/version kernel gaps up front,
+        // instead of a wasted upstream request + a per-host block later.
+        let mut mask: u32 = 0;
+        for &(version, cipher, name) in &PROBE_COMBOS {
+            let (client, _server) = match make_pair() {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(
+                        "kTLS: availability test: failed to create probe pair for {name}:  {err}"
+                    );
+                    return TestResult::Error;
+                }
+            };
+            if let Err(err) = setsockopt(&client, TcpUlp::default(), b"tls") {
+                warn!("kTLS: availability test: failed to attach ULP for {name}:  {err}");
+                return TestResult::Error;
+            }
+            let (Some(bit), Some(crypto)) = (
+                combo_bit(version, cipher),
+                dummy_crypto_info(version, cipher),
+            ) else {
+                // PROBE_COMBOS entries always map; defensive skip only.
+                continue;
+            };
+            match setsockopt(&client, TcpTlsRx, &crypto) {
+                Ok(()) => mask |= 1u32 << bit,
+                Err(errno) => {
+                    debug!("kTLS: availability test: {name} TLS_RX unsupported:  {errno}");
+                }
+            }
+        }
+
+        TestResult::Available(mask)
     }
 
     /// Give up and latch unavailable after this many erroring probe attempts.
@@ -225,14 +423,29 @@ pub(crate) fn is_available() -> bool {
     // Concurrent probes are benign: the loopback test is idempotent and both
     // callers store the same definitive outcome.
     match inner() {
-        TestResult::Available => {
-            info!("kTLS: kernel TLS support detected");
+        TestResult::Available(mask) => {
+            if mask == 0 {
+                // ULP present but no cipher/version combo has a usable TLS_RX
+                // (e.g. 4.13-4.16 kernels with no RX support at all).
+                info!(
+                    "kTLS: kernel TLS ULP present but TLS_RX unusable for every supported cipher"
+                );
+                latch_unavailable();
+                return false;
+            }
+            // Publish the support matrix before latching AVAILABLE so any
+            // thread observing AVAILABLE also observes the matrix.
+            KTLS_RX_SUPPORT.store(mask, Ordering::Relaxed);
+            info!(
+                "kTLS: kernel TLS support detected (RX ciphers: {})",
+                describe_rx_support(mask)
+            );
             KTLS_AVAILABLE.store(KTLS_PROBE_AVAILABLE, Ordering::Relaxed);
             true
         }
         TestResult::Unavailable => {
             info!("kTLS: kernel TLS not available (modprobe tls?)");
-            KTLS_AVAILABLE.store(KTLS_PROBE_UNAVAILABLE, Ordering::Relaxed);
+            latch_unavailable();
             false
         }
         TestResult::Error => {
@@ -243,11 +456,39 @@ pub(crate) fn is_available() -> bool {
                 warn!(
                     "kTLS: availability probe failed {errors} times; disabling kTLS for this run"
                 );
-                KTLS_AVAILABLE.store(KTLS_PROBE_UNAVAILABLE, Ordering::Relaxed);
+                latch_unavailable();
             }
             false
         }
     }
+}
+
+/// Whether this kernel's `TLS_RX` accepts the given TLS version + cipher,
+/// according to the matrix built by [`is_available`]'s probe.
+///
+/// The gate in `splice_conn.rs` calls this before `setup_rx` so an unsupported
+/// combo fails fast (deterministic `KtlsSetupFailed`) instead of wasting a full
+/// upstream request. An unknown version/cipher returns `false`. If the matrix
+/// was never populated (mask 0 but AVAILABLE — should not happen) this returns
+/// `true` and lets `setup_rx` decide, so the gate can never make things worse.
+pub(crate) fn rx_supported(
+    version: rustls::ProtocolVersion,
+    secrets: &ConnectionTrafficSecrets,
+) -> bool {
+    let Ok(tls_version) = resolve_tls_version(version) else {
+        return false;
+    };
+    let Some(cipher_type) = kernel_cipher_type(secrets) else {
+        return false;
+    };
+    let Some(bit) = combo_bit(tls_version, cipher_type) else {
+        return false;
+    };
+    let mask = KTLS_RX_SUPPORT.load(Ordering::Relaxed);
+    if mask == 0 {
+        return true;
+    }
+    mask & (1u32 << bit) != 0
 }
 
 /// Resolve TLS protocol version to the kernel constant, or return an error.
@@ -300,9 +541,19 @@ fn copy_fixed<const N: usize>(src: &[u8], label: &'static str) -> io::Result<[u8
 ///
 /// # Safety considerations
 ///
-/// The caller must ensure `fd` is a valid, connected TCP socket with TLS ULP
-/// already loaded (via [`load_ulp`]) and that the TLS secrets correspond to
-/// the current connection state.
+/// The caller must ensure `fd` is a valid TCP socket with the TLS ULP
+/// already attached (via [`attach_ulp`]) and that the TLS secrets correspond
+/// to the current connection state.
+///
+/// Unlike the ULP attach, the kernel's `TLS_RX` setsockopt has **no**
+/// `TCP_ESTABLISHED` check: it succeeds on a `CLOSE_WAIT` socket, and
+/// ciphertext queued before or after the peer's FIN stays decryptable. This
+/// is what makes the attach-at-connect order robust against upstreams that
+/// honor `Connection: close` aggressively.
+///
+/// For TLS 1.3, once `TCP_TLS_RX` is set this also best-effort enables
+/// `TLS_RX_EXPECT_NO_PAD` (see [`enable_rx_expect_no_pad`]) — a kernel >= 5.19
+/// speculative-decrypt fast path. Failure there is non-fatal.
 pub(crate) fn setup_rx<F: AsFd>(
     fd: &F,
     seq: u64,
@@ -426,34 +677,121 @@ pub(crate) fn setup_rx<F: AsFd>(
     // `crypto` drops here, zeroing the enum payload (both success and panic paths).
     drop(crypto);
 
+    if version == rustls::ProtocolVersion::TLSv1_3 {
+        enable_rx_expect_no_pad(fd);
+    }
+
     Ok(())
+}
+
+/// Best-effort: authorize the kernel's TLS 1.3 speculative "no padding"
+/// decrypt fast path (`setsockopt(SOL_TLS, TLS_RX_EXPECT_NO_PAD, 1)`,
+/// kernel >= 5.19), letting it decrypt directly into the final destination
+/// without a padding scan.
+///
+/// Per <https://docs.kernel.org/networking/tls.html>: "If the record
+/// decrypted turns out to had been padded or is not a data record it will be
+/// decrypted again into a kernel buffer without zero copy." — a padded
+/// record after this is set is transparently re-decrypted with no
+/// user-visible error (counted in the `TlsDecryptRetry` /
+/// `TlsRxNoPadViolation` stats), so enabling this is correctness-safe.
+///
+/// Older kernels reject the option (`ENOPROTOOPT`/`EINVAL`); that failure is
+/// non-fatal, this is a pure optimization.
+fn enable_rx_expect_no_pad<F: AsFd>(fd: &F) {
+    let value: libc::c_int = 1;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "size_of::<c_int>() is always 4, well within socklen_t (u32)"
+    )]
+    let value_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+    // SAFETY: `fd` is a valid open socket for the lifetime of this call
+    // (borrowed via `AsFd`); `value` is a live `c_int` and `value_len` is its
+    // exact byte size, passed together and correctly to `setsockopt(2)`.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_fd().as_raw_fd(),
+            libc::SOL_TLS,
+            libc::TLS_RX_EXPECT_NO_PAD,
+            std::ptr::from_ref(&value).cast::<libc::c_void>(),
+            value_len,
+        )
+    };
+
+    if ret != 0 {
+        let errno = nix::errno::Errno::last();
+        debug!("kTLS: TLS_RX_EXPECT_NO_PAD not supported (kernel < 5.19):  {errno}");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Load the TLS Upper Layer Protocol on the socket.
+/// Classified failure of [`attach_ulp`].
 ///
-/// This must be called on a connected TCP socket (state `TCP_ESTABLISHED`)
-/// before [`setup_rx`]. The kernel rejects this with `ENOTCONN`
-/// if the socket is in `CLOSE_WAIT` or any other non-established state.
+/// Classification happens here because [`errno_to_io_error`] wraps the errno
+/// in a custom payload; callers cannot recover it via `raw_os_error()`.
+#[derive(Debug)]
+pub(crate) enum UlpAttachError {
+    /// `ENOENT` (kernel tls module gone — the availability probe should have
+    /// caught this) or `EPERM` (an LSM policy denying the ULP attach, which is
+    /// process-wide, not per-host). The global availability latch has already
+    /// been flipped to unavailable by [`attach_ulp`], so this fires at most
+    /// once per process.
+    Unavailable(io::Error),
+    /// `ENOTCONN` — the socket left `TCP_ESTABLISHED` between `connect(2)`
+    /// and the attach (peer FIN/RST raced the connect). Transient.
+    Transient(io::Error),
+    /// Any other errno. Persistent (per-host block only).
+    Persistent(io::Error),
+}
+
+/// Attach the TLS Upper Layer Protocol to the socket.
+///
+/// Call this immediately after `connect(2)` succeeds, **before any bytes are
+/// exchanged** — the kernel-canonical order (Documentation/networking/tls.rst;
+/// OpenSSL attaches at BIO creation). `TCP_ULP` requires `TCP_ESTABLISHED`;
+/// attaching after the handshake races the upstream's FIN (a `Connection:
+/// close` response moves the socket to `CLOSE_WAIT`, rejected with
+/// `ENOTCONN`). With the ULP attached but no crypto configured the kernel
+/// context is in `TLS_BASE` mode: `sendmsg`/`recvmsg` pass through to TCP
+/// unchanged, so the userspace TLS handshake runs unmodified.
+///
+/// The attach is irrevocable: the socket must never be pooled or reused for
+/// plaintext protocols afterwards.
 ///
 /// # Required call order
 ///
-/// 1. [`load_ulp`] — load TLS ULP (this function)
-/// 2. [`setup_rx`] — configure crypto keys
-/// 3. [`drain_control_messages`] — consume non-data TLS records
+/// 1. [`attach_ulp`] — attach TLS ULP right after connect (this function)
+/// 2. userspace TLS handshake (`TLS_BASE` passthrough)
+/// 3. [`setup_rx`] — configure crypto keys
+/// 4. [`drain_control_messages`] — consume non-data TLS records
 ///
-/// Calling `setup_rx` before `load_ulp` will fail with `ENOPROTOOPT`
-/// (`ENOENT` is what `load_ulp` itself returns when the kernel lacks the
-/// tls module).
+/// Calling `setup_rx` without the ULP attached fails with `ENOPROTOOPT`.
 /// Calling `drain_control_messages` before `setup_rx` has undefined results.
-pub(crate) fn load_ulp<F: AsFd>(fd: &F) -> io::Result<()> {
+pub(crate) fn attach_ulp<F: AsFd>(fd: &F) -> Result<(), UlpAttachError> {
     // No logging here: the caller logs the returned error (with host context)
-    // and records the kTLS block for the mirror.
-    nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpUlp::default(), b"tls")
-        .map_err(|errno| errno_to_io_error(errno, "kTLS: setsockopt TLS ULP failed"))
+    // and decides between transient fallback and a kTLS block for the mirror.
+    match nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpUlp::default(), b"tls") {
+        Ok(()) => Ok(()),
+        Err(errno) => {
+            let err = errno_to_io_error(errno, "kTLS: setsockopt TLS ULP failed");
+            Err(
+                if errno == nix::errno::Errno::ENOENT || errno == nix::errno::Errno::EPERM {
+                    // EPERM is almost certainly an LSM denying the ULP attach
+                    // process-wide; latch unavailable rather than block per host.
+                    latch_unavailable();
+                    UlpAttachError::Unavailable(err)
+                } else if errno == nix::errno::Errno::ENOTCONN {
+                    UlpAttachError::Transient(err)
+                } else {
+                    UlpAttachError::Persistent(err)
+                },
+            )
+        }
+    }
 }
 
 /// Return a display name for a `ConnectionTrafficSecrets` variant.
@@ -497,10 +835,12 @@ enum DrainAction {
     /// Expected post-handshake control message (`NewSessionTicket`,
     /// `KeyUpdate`); consume silently and continue the drain loop.
     ConsumeHandshake,
-    /// Spurious post-handshake `ChangeCipherSpec` -- legal-but-unexpected
-    /// in TLS 1.3 (CCS is a legacy compat field). Consume + DEBUG-log +
-    /// continue.
-    ConsumeChangeCipherSpec,
+    /// Post-handshake `ChangeCipherSpec`. RFC 8446 section 5 only tolerates
+    /// CCS during the handshake; `drain_control_messages` runs only after
+    /// the handshake completes, so this can only mean an attacker-crafted
+    /// record or a TLS 1.2 renegotiation attempt (rustls does not support
+    /// renegotiation). Fail-closed, record left on the socket.
+    AbortChangeCipherSpec,
     /// TLS `Alert` record. Could be a fatal alert (`bad_record_mac`,
     /// `handshake_failure`); we cannot inspect severity from the cmsg
     /// alone. Fail-closed so the caller falls back to userspace TLS,
@@ -517,13 +857,39 @@ fn classify_drain_action(record_type: Option<TlsGetRecordType>) -> DrainAction {
     match record_type {
         Some(TlsGetRecordType::ApplicationData) | None => DrainAction::Done,
         Some(TlsGetRecordType::Handshake) => DrainAction::ConsumeHandshake,
-        Some(TlsGetRecordType::ChangeCipherSpec) => DrainAction::ConsumeChangeCipherSpec,
+        Some(TlsGetRecordType::ChangeCipherSpec) => DrainAction::AbortChangeCipherSpec,
         Some(TlsGetRecordType::Alert) => DrainAction::AbortAlert,
         // Catches both TlsGetRecordType::Unknown(_) (unrecognised numeric
         // record types) and any future nix variants added after this code
         // was written (TlsGetRecordType is #[non_exhaustive]).
         Some(_) => DrainAction::AbortUnknown,
     }
+}
+
+/// Whether a TLS Handshake record payload contains a KeyUpdate message.
+///
+/// Walks the handshake-message framing (1-byte type + 3-byte big-endian
+/// length) covering the case where the kernel coalesced several
+/// consecutive handshake records (e.g. `NewSessionTicket`s) into one
+/// delivery. Stops without error on a truncated tail (a fragmented
+/// message continues in the next record); detection is best-effort by
+/// design -- an undetected KeyUpdate still fails later as EBADMSG.
+fn handshake_contains_key_update(payload: &[u8]) -> bool {
+    /// RFC 8446 `HandshakeType.key_update`.
+    const HANDSHAKE_TYPE_KEY_UPDATE: u8 = 24;
+
+    let mut rest = payload;
+    while let [msg_type, len_hi, len_mid, len_lo, tail @ ..] = rest {
+        if *msg_type == HANDSHAKE_TYPE_KEY_UPDATE {
+            return true;
+        }
+        let len = u32::from_be_bytes([0, *len_hi, *len_mid, *len_lo]) as usize;
+        let Some(remainder) = tail.get(len..) else {
+            return false;
+        };
+        rest = remainder;
+    }
+    false
 }
 
 /// Consume any pending TLS 1.3 control messages (e.g. `NewSessionTicket`) from a
@@ -545,26 +911,29 @@ fn classify_drain_action(record_type: Option<TlsGetRecordType>) -> DrainAction {
 ///
 /// This function must only be called by one thread/task at a time for a given fd.
 /// The peek-then-consume pattern assumes no concurrent consumer on the same socket.
-/// `debug_assert_eq!`s on the peeked vs. consumed `recvmsg` result detect violations
-/// in debug builds.
+/// Release-mode fail-closed checks on the peeked vs. consumed `recvmsg` result detect
+/// violations of that invariant.
 ///
 /// # Kernel record atomicity
 ///
-/// `TLS-ULP` in the Linux kernel delivers one TLS record per `recvmsg()`
-/// (`net/tls/tls_sw.c: tls_sw_recvmsg`): the payload length returned via
-/// `msg_iov` is bounded by the current record boundary, and the record-type
-/// cmsg always describes exactly that record. A partial record cannot be
-/// surfaced to userspace — the kernel blocks (or returns `EAGAIN` in
-/// non-blocking mode) until a full record has been decrypted. This is what
-/// makes the peek-then-consume pattern sound: the consume `recvmsg` sees the
-/// same record-type cmsg as the peek, not a stale type from a record that was
-/// only partially in the kernel buffer during the peek. The `MSG_CTRUNC`
+/// `TLS-ULP` in the Linux kernel never mixes record *types* within a single
+/// `recvmsg()` delivery (`net/tls/tls_sw.c: tls_sw_recvmsg`): the record-type
+/// cmsg always describes the type of every byte returned via `msg_iov` for
+/// that call. It may, however, coalesce multiple *consecutive same-type*
+/// records (e.g. a burst of `NewSessionTicket`s) into one delivery. A partial
+/// record cannot be surfaced to userspace — the kernel blocks (or returns
+/// `EAGAIN` in non-blocking mode) until a full record has been decrypted.
+/// This is what makes the peek-then-consume pattern sound: the consume
+/// `recvmsg` sees the same record-type cmsg as the peek, not a stale type
+/// from a record that was only partially in the kernel buffer during the
+/// peek, and both calls see the same coalescing horizon. The `MSG_CTRUNC`
 /// check below additionally defends against kernel-side cmsg-buffer
 /// insufficiency rather than wire-level partial records.
 pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) -> io::Result<()> {
-    // Buffer for the record payload. 0x4001 (16385) is one byte more than the
-    // TLS max record size (16384) to avoid EMSGSIZE on exactly-max-size records
-    // during MSG_PEEK.
+    // Buffer for the record payload. 0x4001 (16385) holds the largest legal
+    // record payload (16384 bytes) plus slack, so a whole record is
+    // peeked/consumed in one recvmsg() call and the peek/consume pair stays
+    // symmetric.
     /// Cap on consumed control records per drain. Real servers send a small
     /// burst of post-handshake messages (rustls-facing servers emit at most
     /// ~4 `NewSessionTicket`s); a peer streaming control records without end
@@ -616,10 +985,10 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::EMSGSIZE) => {
-                warn!("kTLS: peek buffer too small (EMSGSIZE); aborting kTLS setup");
+                warn!("kTLS: oversized TLS record from peer (EMSGSIZE); aborting kTLS setup");
                 return Err(errno_to_io_error(
                     nix::errno::Errno::EMSGSIZE,
-                    "kTLS: recvmsg peek EMSGSIZE",
+                    "kTLS: recvmsg peek EMSGSIZE (oversized record)",
                 ));
             }
             Err(errno) => {
@@ -676,15 +1045,35 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                     "kTLS: unknown record type in drain",
                 ));
             }
-            DrainAction::ConsumeHandshake => TlsGetRecordType::Handshake,
-            DrainAction::ConsumeChangeCipherSpec => {
-                debug!(
-                    "kTLS: draining spurious post-handshake ChangeCipherSpec \
-                     ({peeked_bytes} bytes)"
+            DrainAction::AbortChangeCipherSpec => {
+                warn!(
+                    "kTLS: peeked post-handshake ChangeCipherSpec record ({peeked_bytes} bytes, \
+                     left on socket); aborting kTLS setup"
                 );
-                TlsGetRecordType::ChangeCipherSpec
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "kTLS: post-handshake ChangeCipherSpec",
+                ));
             }
+            DrainAction::ConsumeHandshake => TlsGetRecordType::Handshake,
         };
+
+        // A TLS 1.3 KeyUpdate arrives as a generic Handshake control
+        // record. Rekey is impossible in this design (rustls has been
+        // consumed; the traffic secret needed to derive the next key was
+        // handed to the kernel), so detect it here and abort immediately
+        // with a clear error rather than let every later record fail with
+        // sticky EBADMSG.
+        if handshake_contains_key_update(&buf[..peeked_bytes]) {
+            warn!(
+                "kTLS: peer sent KeyUpdate ({peeked_bytes} bytes, left on socket); \
+                 kernel TLS cannot rekey; aborting kTLS setup"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kTLS: peer sent KeyUpdate",
+            ));
+        }
 
         consumed_records += 1;
         if consumed_records > MAX_DRAIN_RECORDS {
@@ -711,15 +1100,36 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                 MsgFlags::MSG_DONTWAIT,
             ) {
                 Ok(msg) => {
-                    // Verify the consumed message matches what we peeked.
-                    // This should always hold since we are the sole consumer
-                    // on this fd, but verify as defence-in-depth.
-                    debug_assert_eq!(
-                        msg.bytes, peeked_bytes,
-                        "consumed {}, but peeked {peeked_bytes} -- \
-                         concurrent reader on kTLS socket?",
-                        msg.bytes
-                    );
+                    // A truncated cmsg buffer means the control data (and thus
+                    // the record type read from it below) cannot be trusted;
+                    // check this before anything else that relies on it.
+                    if msg.flags.contains(MsgFlags::MSG_CTRUNC) {
+                        warn!(
+                            "kTLS: cmsg buffer truncated on consume ({} bytes); aborting \
+                             kTLS setup",
+                            msg.bytes
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "kTLS: cmsg buffer truncated on consume",
+                        ));
+                    }
+                    // Fewer bytes than peeked means a concurrent consumer took
+                    // part of the record between peek and consume -- the
+                    // sole-consumer invariant broke. (Strictly `<`, not `!=`:
+                    // MORE bytes than peeked is legal when an additional
+                    // same-type record was coalesced in between the two calls.)
+                    if msg.bytes < peeked_bytes {
+                        warn!(
+                            "kTLS: consumed {} bytes, but peeked {peeked_bytes} -- \
+                             concurrent reader on kTLS socket?; aborting kTLS setup",
+                            msg.bytes
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "kTLS: consumed fewer bytes than peeked",
+                        ));
+                    }
                     let consumed_rt = match extract_record_type(&msg) {
                         Ok(rt) => rt,
                         Err(err) => {
@@ -729,15 +1139,42 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                             return Err(err);
                         }
                     };
-                    debug_assert_eq!(
-                        consumed_rt,
-                        Some(rt_to_consume),
-                        "consumed record type {consumed_rt:?} differs from \
-                         peeked {rt_to_consume:?} -- concurrent reader on kTLS socket?"
-                    );
+                    // Record-type mismatch between peek and consume means a
+                    // concurrent reader interleaved with us -- the
+                    // sole-consumer invariant broke.
+                    if consumed_rt != Some(rt_to_consume) {
+                        warn!(
+                            "kTLS: consumed record type {consumed_rt:?} differs from peeked \
+                             {rt_to_consume:?} -- concurrent reader on kTLS socket?; aborting \
+                             kTLS setup"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "kTLS: consumed record type {consumed_rt:?} differs from \
+                                 peeked {rt_to_consume:?}"
+                            ),
+                        ));
+                    }
+                    let consumed_bytes = msg.bytes;
+                    // The consume recvmsg can coalesce in a KeyUpdate record
+                    // that arrived after the peek; check the payload we just
+                    // consumed too. The record is already off the socket, but
+                    // the connection is doomed anyway (kernel TLS cannot
+                    // rekey), so abort here as well.
+                    if handshake_contains_key_update(&buf[..consumed_bytes]) {
+                        warn!(
+                            "kTLS: consumed control record contained KeyUpdate \
+                             ({consumed_bytes} bytes); kernel TLS cannot rekey; \
+                             aborting kTLS setup"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "kTLS: peer sent KeyUpdate",
+                        ));
+                    }
                     debug!(
-                        "kTLS: consumed control message ({} bytes, type={rt_to_consume:?})",
-                        msg.bytes
+                        "kTLS: consumed control message ({consumed_bytes} bytes, type={rt_to_consume:?})",
                     );
                     break;
                 }
@@ -822,10 +1259,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_drain_action_change_cipher_spec_consumes() {
+    fn classify_drain_action_change_cipher_spec_aborts() {
         assert_eq!(
             classify_drain_action(Some(TlsGetRecordType::ChangeCipherSpec)),
-            DrainAction::ConsumeChangeCipherSpec,
+            DrainAction::AbortChangeCipherSpec,
         );
     }
 
@@ -846,6 +1283,76 @@ mod tests {
             classify_drain_action(Some(TlsGetRecordType::Unknown(99))),
             DrainAction::AbortUnknown,
         );
+    }
+
+    #[test]
+    fn handshake_contains_key_update_lone_message() {
+        // type=24 (key_update), len=1, body=[0] (key_update_requested).
+        assert!(handshake_contains_key_update(&[24, 0, 0, 1, 0]));
+    }
+
+    #[test]
+    fn handshake_contains_key_update_new_session_ticket_only() {
+        // type=4 (new_session_ticket), len=2, body=[0xAA, 0xBB].
+        assert!(!handshake_contains_key_update(&[4, 0, 0, 2, 0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn handshake_contains_key_update_coalesced_after_new_session_ticket() {
+        // A NewSessionTicket followed by a KeyUpdate coalesced into one
+        // recvmsg delivery -- the KeyUpdate must still be found.
+        let mut payload = vec![4, 0, 0, 2, 0xAA, 0xBB];
+        payload.extend_from_slice(&[24, 0, 0, 1, 0]);
+        assert!(handshake_contains_key_update(&payload));
+    }
+
+    #[test]
+    fn handshake_contains_key_update_truncated_tail_is_false() {
+        // Header claims a 10-byte body but only 1 byte follows -- a
+        // fragmented message continuing in the next record, not an error.
+        assert!(!handshake_contains_key_update(&[4, 0, 0, 10, 0xAA]));
+    }
+
+    #[test]
+    fn handshake_contains_key_update_empty_payload_is_false() {
+        assert!(!handshake_contains_key_update(&[]));
+    }
+
+    #[test]
+    fn handshake_contains_key_update_short_of_header_is_false() {
+        // Fewer than 4 bytes: not enough for even the message header.
+        assert!(!handshake_contains_key_update(&[24, 0, 0]));
+    }
+
+    #[test]
+    fn combo_bit_maps_all_six_combos_to_distinct_bits() {
+        let bits: Vec<u8> = PROBE_COMBOS
+            .iter()
+            .map(|&(version, cipher, _)| {
+                combo_bit(version, cipher).expect("PROBE_COMBOS entry must map to a bit")
+            })
+            .collect();
+        assert_eq!(bits.len(), 6, "there must be six probe combos");
+        for &bit in &bits {
+            assert!(bit < 6, "bit {bit} out of the 0..6 range");
+        }
+        for i in 0..bits.len() {
+            for j in (i + 1)..bits.len() {
+                assert_ne!(
+                    bits[i], bits[j],
+                    "combos {i} and {j} collide on bit {}",
+                    bits[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn combo_bit_unknown_cipher_or_version_is_none() {
+        // 0 is not a valid kernel cipher_type constant.
+        assert_eq!(combo_bit(libc::TLS_1_3_VERSION, 0), None);
+        // 0 is not a valid kernel TLS version constant.
+        assert_eq!(combo_bit(0, libc::TLS_CIPHER_AES_GCM_128), None);
     }
 
     /// Result of setting up a kTLS test: a client socket with kTLS RX configured,
@@ -902,16 +1409,12 @@ mod tests {
         setup_ktls_test_with_provider(tls_versions, None, write_fn)
     }
 
-    /// Like `setup_ktls_test`, but accepts an optional cipher-suite filter so
-    /// tests can exercise a specific cipher (e.g. ChaCha20-Poly1305).
-    fn setup_ktls_test_with_provider<F>(
+    /// Build a matching server/client TLS config pair for loopback tests,
+    /// with secret extraction enabled on the client.
+    fn build_tls_configs(
         tls_versions: &[&'static rustls::SupportedProtocolVersion],
         cipher_suite_filter: Option<&[rustls::SupportedCipherSuite]>,
-        write_fn: F,
-    ) -> KtlsTestHarness
-    where
-        F: FnOnce(&mut rustls::Stream<'_, rustls::ServerConnection, &TcpStream>) + Send + 'static,
-    {
+    ) -> (std::sync::Arc<rustls::ServerConfig>, rustls::ClientConfig) {
         let (certs, key) = generate_test_cert();
 
         let build_provider = || {
@@ -939,6 +1442,21 @@ mod tests {
             .with_root_certificates(root_store)
             .with_no_client_auth();
         client_config.enable_secret_extraction = true;
+
+        (server_config, client_config)
+    }
+
+    /// Like `setup_ktls_test`, but accepts an optional cipher-suite filter so
+    /// tests can exercise a specific cipher (e.g. ChaCha20-Poly1305).
+    fn setup_ktls_test_with_provider<F>(
+        tls_versions: &[&'static rustls::SupportedProtocolVersion],
+        cipher_suite_filter: Option<&[rustls::SupportedCipherSuite]>,
+        write_fn: F,
+    ) -> KtlsTestHarness
+    where
+        F: FnOnce(&mut rustls::Stream<'_, rustls::ServerConnection, &TcpStream>) + Send + 'static,
+    {
+        let (server_config, client_config) = build_tls_configs(tls_versions, cipher_suite_filter);
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -978,6 +1496,10 @@ mod tests {
         });
 
         let tcp_client = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+        // Attach the ULP before the handshake, mirroring production: the
+        // kernel context is TLS_BASE passthrough until setup_rx, so the
+        // buffered complete_io handshake below is unaffected.
+        attach_ulp(&tcp_client).expect("attach_ulp");
         let server_name =
             rustls::pki_types::ServerName::try_from("localhost").expect("server name");
         let mut client_conn =
@@ -995,7 +1517,15 @@ mod tests {
             .expect("extract secrets");
         let (rx_seq, ref rx_secrets) = secrets.rx;
 
-        load_ulp(&tcp_client).expect("load_ulp");
+        // rx_supported must predict the setup_rx outcome: the probe reported
+        // this combo usable, and setup_rx below proves it. Asserting both here
+        // pins the gate and the probe to the same truth.
+        assert!(
+            rx_supported(version, rx_secrets),
+            "rx_supported must agree with setup_rx for {} {version:?}",
+            secret_name(rx_secrets)
+        );
+
         setup_rx(&tcp_client, rx_seq, rx_secrets, version).expect("setup_rx");
 
         KtlsTestHarness {
@@ -1093,6 +1623,135 @@ mod tests {
     #[test]
     fn test_ktls_rx_tls13() {
         run_ktls_read_test(&[&rustls::version::TLS13]);
+    }
+
+    /// Regression test for the FIN-before-setup shape: the server writes its
+    /// data, sends `close_notify`, and closes the connection before the
+    /// client configures kTLS RX — modelling an upstream that honors
+    /// `Connection: close` aggressively. With the ULP attached at connect
+    /// time, `setup_rx` succeeds on the `CLOSE_WAIT` socket and the queued
+    /// records stay decryptable. Under the old post-handshake attach order
+    /// the `TCP_ULP` setsockopt at this point failed with `ENOTCONN`.
+    #[expect(
+        clippy::print_stderr,
+        reason = "skip message when the kernel lacks the tls module"
+    )]
+    fn run_ktls_setup_rx_after_server_fin(
+        tls_versions: &[&'static rustls::SupportedProtocolVersion],
+    ) {
+        if !is_available() {
+            eprintln!("kTLS not available, skipping");
+            return;
+        }
+
+        let plaintext_msg = b"kTLS after FIN: data queued before setup_rx";
+
+        let (server_config, client_config) = build_tls_configs(tls_versions, None);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let start_barrier = Arc::new(Barrier::new(2));
+        let server_start_barrier = Arc::clone(&start_barrier);
+
+        let server_handle = std::thread::spawn(move || {
+            let (tcp_server, _) = listener.accept().expect("accept");
+            let mut server_conn =
+                rustls::ServerConnection::new(server_config).expect("server conn");
+            while server_conn.is_handshaking() {
+                server_conn
+                    .complete_io(&mut &tcp_server)
+                    .expect("server handshake");
+            }
+            while server_conn.wants_write() {
+                server_conn
+                    .write_tls(&mut &tcp_server)
+                    .expect("flush post-handshake");
+            }
+
+            server_start_barrier.wait();
+
+            let mut tcp_ref = &tcp_server;
+            let mut stream = rustls::Stream::new(&mut server_conn, &mut tcp_ref);
+            stream.write_all(plaintext_msg).expect("write plaintext");
+            stream.flush().expect("flush");
+            server_conn.send_close_notify();
+            server_conn
+                .write_tls(&mut &tcp_server)
+                .expect("write close_notify");
+            // tcp_server drops on return -> FIN.
+        });
+
+        let mut tcp_client = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+        attach_ulp(&tcp_client).expect("attach_ulp");
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let mut client_conn =
+            rustls::ClientConnection::new(std::sync::Arc::new(client_config), server_name)
+                .expect("client conn");
+        let mut tcp_ref: &TcpStream = &tcp_client;
+        while client_conn.is_handshaking() {
+            client_conn.complete_io(&mut tcp_ref).expect("handshake io");
+        }
+
+        // Let the server write everything and exit; joining guarantees its
+        // FIN is on the wire before kTLS RX is configured.
+        start_barrier.wait();
+        server_handle.join().expect("server thread");
+
+        // Wait until the kernel has processed the FIN: POLLRDHUP is only
+        // reported once the peer's shutdown reached this socket, making
+        // "socket is in CLOSE_WAIT" deterministic rather than sleep-based.
+        // nix 0.31 does not expose POLLRDHUP, so use the raw libc poll.
+        let mut pfd = nix::libc::pollfd {
+            fd: tcp_client.as_raw_fd(),
+            events: nix::libc::POLLIN | nix::libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid pollfd for an open socket, nfds is 1.
+        let nready = unsafe { nix::libc::poll(&raw mut pfd, 1, 5000) };
+        assert_eq!(nready, 1, "expected socket readable after server exit");
+        assert!(
+            pfd.revents & nix::libc::POLLRDHUP != 0,
+            "expected POLLRDHUP after server FIN, got {:#x}",
+            pfd.revents
+        );
+
+        // The regression assertion: configuring RX on the CLOSE_WAIT socket
+        // must succeed (the ULP is already attached).
+        let version = client_conn.protocol_version().expect("protocol version");
+        let secrets = client_conn
+            .dangerous_extract_secrets()
+            .expect("extract secrets");
+        let (rx_seq, ref rx_secrets) = secrets.rx;
+        setup_rx(&tcp_client, rx_seq, rx_secrets, version).expect("setup_rx on CLOSE_WAIT socket");
+
+        // Data is provably queued (POLLIN above), so DataReady is correct.
+        drain_control_messages(tcp_client.as_fd(), DrainExpect::DataReady)
+            .expect("drain control messages");
+
+        let mut buf = [0u8; 1024];
+        let n = tcp_client.read(&mut buf).expect("read from kTLS socket");
+        assert_eq!(
+            &buf[..n],
+            plaintext_msg,
+            "kTLS should decrypt data queued before the FIN"
+        );
+        // Do not read past the payload: the queued close_notify alert
+        // surfaces as EIO on a plain kTLS read; alert semantics are out of
+        // scope here.
+    }
+
+    /// `setup_rx` succeeds after the server's FIN with TLS 1.2.
+    #[test]
+    fn test_ktls_setup_rx_after_server_fin_tls12() {
+        run_ktls_setup_rx_after_server_fin(&[&rustls::version::TLS12]);
+    }
+
+    /// `setup_rx` succeeds after the server's FIN with TLS 1.3 (the queued
+    /// `NewSessionTicket`s are drained as control records first).
+    #[test]
+    fn test_ktls_setup_rx_after_server_fin_tls13() {
+        run_ktls_setup_rx_after_server_fin(&[&rustls::version::TLS13]);
     }
 
     /// kTLS RX decryption works with the ChaCha20-Poly1305 cipher, which takes
