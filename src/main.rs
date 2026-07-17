@@ -745,16 +745,21 @@ fn build_rustls_client_config()
 }
 
 #[cfg(all(feature = "tls_rustls", feature = "splice"))]
-fn init_splice_tls_client_config(
-    #[cfg_attr(
-        not(feature = "ktls"),
-        expect(unused_mut, reason = "kTLS needs to extract secret")
-    )]
-    mut tls_config: rustls::ClientConfig,
-) {
+fn init_splice_tls_client_config(tls_config: rustls::ClientConfig) {
     #[cfg(feature = "ktls")]
     {
-        tls_config.enable_secret_extraction = true;
+        // Clone before moving the base config into the Arc below:
+        // `ClientConfig::clone` shares the `resumption` session store (an
+        // `Arc<ClientSessionMemoryCache>` internally), so session tickets
+        // learned via the kTLS config still benefit the plain splice
+        // fallback and vice versa. Secret extraction is confined to this
+        // kTLS-only clone — only the kTLS setup path hands raw traffic
+        // secrets to the kernel.
+        let mut ktls_config = tls_config.clone();
+        ktls_config.enable_secret_extraction = true;
+        splice_conn::KTLS_CLIENT_CONFIG
+            .set(Arc::new(ktls_config))
+            .expect("function should only be called once");
     }
 
     splice_conn::TLS_CLIENT_CONFIG

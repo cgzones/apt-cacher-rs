@@ -373,16 +373,15 @@ impl ChecksumRegistry {
         inner.next_gen += 1;
 
         let scope_ref = RegistryScopeRef { host, mirror_path };
-        let scope = match inner.map.get_key_value(&scope_ref) {
-            Some((scope, _)) => Arc::clone(scope),
-            None => {
-                let scope = Arc::new(RegistryScope {
-                    host: host.to_owned(),
-                    mirror_path: mirror_path.to_owned(),
-                });
-                inner.map.insert(Arc::clone(&scope), ScopeEntries::new());
-                scope
-            }
+        let scope = if let Some((scope, _)) = inner.map.get_key_value(&scope_ref) {
+            Arc::clone(scope)
+        } else {
+            let scope = Arc::new(RegistryScope {
+                host: host.to_owned(),
+                mirror_path: mirror_path.to_owned(),
+            });
+            inner.map.insert(Arc::clone(&scope), ScopeEntries::new());
+            scope
         };
 
         let submap = inner

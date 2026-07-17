@@ -104,7 +104,7 @@ fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
 /// On success the request `Parts` are handed back alongside the response —
 /// they were consumed by the request anyway, and returning them lets the
 /// rare redirect-follow path rebuild a request without the caller cloning
-/// the whole HeaderMap up front.
+/// the whole `HeaderMap` up front.
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
@@ -756,15 +756,14 @@ where
 #[cfg(feature = "mmap")]
 #[expect(
     clippy::too_many_arguments,
-    clippy::inline_always,
     reason = "function has only 1 caller and is a tail call"
 )]
 #[inline(always)]
-async fn serve_cached_file_mmap(
+fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
     file: tokio::fs::File,
-    file_path: PathBuf,
-    last_modified_str: std::sync::Arc<str>,
+    file_path: &Path,
+    last_modified_str: &str,
     age: u32,
     http_status: StatusCode,
     content_length: usize,
@@ -1319,8 +1318,8 @@ async fn serve_cached_file(
         return serve_cached_file_mmap(
             conn_details,
             file,
-            file_path,
-            last_modified_str,
+            &file_path,
+            &last_modified_str,
             age,
             http_status,
             mmap_content_length,
@@ -1328,8 +1327,7 @@ async fn serve_cached_file(
             content_range,
             partial,
             file_etag,
-        )
-        .await;
+        );
     }
 
     // Buf path streams the file straight through; let the kernel grow its
@@ -1436,7 +1434,7 @@ async fn serve_cached_file_buf(
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(
         http_status,
-        last_modified_str,
+        &last_modified_str,
         age,
         content_length,
         content_type,
@@ -1452,7 +1450,7 @@ async fn serve_cached_file_buf(
 )]
 fn serve_cached_file_response(
     http_status: StatusCode,
-    last_modified_str: std::sync::Arc<str>,
+    last_modified_str: &str,
     age: u32,
     content_length: u64,
     content_type: &'static str,
@@ -1494,7 +1492,7 @@ fn serve_cached_file_response(
         .header(CONTENT_TYPE, content_type)
         .header(
             LAST_MODIFIED,
-            HeaderValue::try_from(&*last_modified_str).expect("date string is valid"),
+            HeaderValue::try_from(last_modified_str).expect("date string is valid"),
         )
         .header(ACCEPT_RANGES, "bytes")
         .header(AGE, HeaderValue::from(age));
@@ -1762,12 +1760,14 @@ async fn serve_volatile_file(
                 VOLATILE_CACHE_MAX_AGE.as_secs()
             );
 
-            // Gated on `not(sendfile)`: when the sendfile backend is enabled,
-            // it has already bumped VOLATILE_HIT before any fallback into hyper.
-            // Cleanup-synthetic probes (task_cleanup's `.xz → .gz → raw` walk)
-            // bypass sendfile and would otherwise inflate the user-facing
-            // counter — exclude them.
-            #[cfg(not(feature = "sendfile"))]
+            // Hyper owns hit/refetch accounting for every request it
+            // processes: in sendfile builds requests only get here when
+            // sendfile did NOT account them — either re-dispatched after a
+            // `NotApplicable` handoff (sendfile's bumps are splice-only) or
+            // arriving on an already-handed-off keep-alive connection that
+            // bypasses sendfile entirely. Cleanup-synthetic probes
+            // (task_cleanup's `.xz → .gz → raw` walk) would inflate the
+            // user-facing counter — exclude them.
             if !conn_details.client.is_cleanup_synthetic() {
                 metrics::VOLATILE_HIT.increment();
             }
@@ -1781,12 +1781,13 @@ async fn serve_volatile_file(
         );
     }
 
-    // Gated on `not(sendfile)`: when the sendfile backend is enabled, it has
-    // already bumped VOLATILE_REFETCHED for this stale-volatile path before
-    // any fallback into hyper. Cleanup-synthetic probes bypass sendfile and
-    // are operator bookkeeping, not user traffic — exclude them so the
-    // dashboard ratio reflects real client behavior only.
-    #[cfg(not(feature = "sendfile"))]
+    // Hyper owns the parent refetch bump for every stale-volatile request it
+    // processes (see the VOLATILE_HIT comment above: sendfile's bumps are
+    // splice-only, and handed-off keep-alive connections bypass sendfile).
+    // This dominates the VOLATILE_REFETCHED_* subset bumps in
+    // `serve_new_file`. Cleanup-synthetic probes are operator bookkeeping,
+    // not user traffic — exclude them so the dashboard ratio reflects real
+    // client behavior only.
     if !conn_details.client.is_cleanup_synthetic() {
         metrics::VOLATILE_REFETCHED.increment();
     }
@@ -3139,8 +3140,10 @@ pub(crate) async fn process_cache_request(
     match tokio_nofollow_options().read(true).open(&cache_path).await {
         Ok(file) => {
             // CACHE_HITS only counts permanent-file hits; volatile hits live
-            // in VOLATILE_HIT / VOLATILE_REFETCHED.
-            #[cfg(not(feature = "sendfile"))]
+            // in VOLATILE_HIT / VOLATILE_REFETCHED. Unconditional: in
+            // sendfile builds only unaccounted requests reach hyper
+            // (handed-off keep-alive connections bypass sendfile; sendfile
+            // serves its own hits without hyper).
             if conn_details.cached_flavor == CachedFlavor::Permanent {
                 metrics::CACHE_HITS.increment();
             }
@@ -3163,13 +3166,16 @@ pub(crate) async fn process_cache_request(
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(not(feature = "sendfile"))]
+            // Unconditional miss accounting: in sendfile builds only
+            // unaccounted requests reach hyper (sendfile's bumps are
+            // splice-only, and handed-off keep-alive connections bypass
+            // sendfile entirely).
             match conn_details.cached_flavor {
                 CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
                 CachedFlavor::Volatile => {
-                    // Cleanup-synthetic probes bypass sendfile's pre-bump on
-                    // the volatile-not-found path; exclude them so the
-                    // dashboard ratio reflects real client behavior only.
+                    // Cleanup-synthetic probes are operator bookkeeping, not
+                    // user traffic — exclude them so the dashboard ratio
+                    // reflects real client behavior only.
                     if !conn_details.client.is_cleanup_synthetic() {
                         metrics::VOLATILE_REFETCHED.increment();
                     }

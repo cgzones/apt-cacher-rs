@@ -9,9 +9,12 @@
 //! allocations would lose their protection as soon as a neighbour releases
 //! it. A dedicated mapping makes the protection page-exact, and `munmap(2)`
 //! on drop tears it down with the pages — no munlock/`MADV_DODUMP` restore
-//! step exists to get wrong. A small process-wide pool recycles the hot
-//! buffer sizes (the kTLS handshake's 32 KiB incoming / 8 KiB outgoing
-//! buffers) to avoid per-connection mmap/mlock churn.
+//! step exists to get wrong. Fresh mappings also get `madvise(MADV_DONTDUMP)`
+//! (excluded from core dumps) and `madvise(MADV_WIPEONFORK)` (zero-filled in
+//! a forked child, so key material can never leak across `fork(2)`). A small
+//! process-wide pool recycles the hot buffer sizes (the kTLS handshake's
+//! 32 KiB incoming / 8 KiB outgoing buffers) to avoid per-connection
+//! mmap/mlock churn.
 
 use std::alloc::{Layout, handle_alloc_error};
 use std::num::NonZero;
@@ -89,6 +92,9 @@ impl SecureVec {
             // SAFETY: `ptr` is the page-aligned start of a live mapping of
             // `map_len` bytes.
             unsafe { try_madvise_dontdump(ptr.as_ptr(), map_len) };
+            // SAFETY: `ptr` is the page-aligned start of a live mapping of
+            // `map_len` bytes.
+            unsafe { try_madvise_wipeonfork(ptr.as_ptr(), map_len) };
             ptr
         };
 
@@ -443,6 +449,37 @@ unsafe fn try_madvise_dontdump(ptr: *const u8, len: usize) {
     if rc != 0 {
         warn_once_or_debug!(
             "madvise(MADV_DONTDUMP, {len}) failed:  {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Best-effort `madvise(MADV_WIPEONFORK)`. On `fork(2)`, the child's copy of
+/// the range is zero-filled while the parent is unaffected — key-material
+/// buffers can never leak into a forked process. The flag sticks to the
+/// mapping, so pool-parked regions keep it, like `MADV_DONTDUMP`. Failure is
+/// logged once at warn level (debug thereafter) and ignored.
+///
+/// # Safety
+///
+/// `ptr` must be the page-aligned start of a live mapping of at least `len`
+/// bytes (the kernel extends `len` to page granularity).
+unsafe fn try_madvise_wipeonfork(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+
+    // SAFETY: guaranteed by the caller.
+    let rc = unsafe {
+        libc::madvise(
+            ptr.cast_mut().cast::<libc::c_void>(),
+            len,
+            libc::MADV_WIPEONFORK,
+        )
+    };
+    if rc != 0 {
+        warn_once_or_debug!(
+            "madvise(MADV_WIPEONFORK, {len}) failed:  {}",
             std::io::Error::last_os_error()
         );
     }

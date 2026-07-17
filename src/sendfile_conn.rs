@@ -790,12 +790,20 @@ async fn try_sendfile_request(
 
     let cache_path = conn_details.cache_file_path();
 
-    // Try to open the cached file; for volatile resources, treat stale files as cache misses.
+    // Refetch/miss accounting split: with splice, the request is served here
+    // without ever reaching hyper, so this function bumps the counters.
+    // Without splice, every miss/stale outcome below ends in `NotApplicable`
+    // and hyper re-dispatches the request through its own accounting —
+    // bumping here too would double-count.
+    #[cfg(feature = "splice")]
     let mut cache_miss_was_volatile_notfound = false;
+
+    // Try to open the cached file; for volatile resources, treat stale files as cache misses.
     let cached_file = 'cache_lookup: {
         let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
             Ok(f) => f,
             Err(err) if err.kind() == ErrorKind::NotFound => {
+                #[cfg(feature = "splice")]
                 if conn_details.cached_flavor == CachedFlavor::Volatile {
                     cache_miss_was_volatile_notfound = true;
                 }
@@ -827,6 +835,7 @@ async fn try_sendfile_request(
                         .expect("Platform should support modification timestamps via setup check");
                     if let Ok(elapsed) = last_modified.elapsed() {
                         if elapsed >= VOLATILE_CACHE_MAX_AGE {
+                            #[cfg(feature = "splice")]
                             metrics::VOLATILE_REFETCHED.increment();
                             break 'cache_lookup None;
                         }
@@ -900,7 +909,9 @@ async fn try_sendfile_request(
     // Cache miss or stale volatile file — try splice proxy, then hyper fallback.
     // The stale-volatile case has already bumped VOLATILE_REFETCHED above; bump
     // it for the volatile-not-found case too. Permanent-not-found is a real
-    // cache miss.
+    // cache miss. Splice-only: without splice the `NotApplicable` fallthrough
+    // below hands the request to hyper, which owns the accounting.
+    #[cfg(feature = "splice")]
     if cache_miss_was_volatile_notfound {
         metrics::VOLATILE_REFETCHED.increment();
     } else if conn_details.cached_flavor == CachedFlavor::Permanent {
