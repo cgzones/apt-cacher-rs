@@ -278,6 +278,20 @@ impl From<Scheme> for http::uri::Scheme {
     }
 }
 
+#[cfg(any(test, feature = "splice"))]
+impl Scheme {
+    /// Map an HTTP(S) URI scheme back to a `Scheme`; `None` for any other scheme.
+    pub(crate) fn from_uri_scheme(s: &http::uri::Scheme) -> Option<Self> {
+        if *s == http::uri::Scheme::HTTPS {
+            Some(Self::Https)
+        } else if *s == http::uri::Scheme::HTTP {
+            Some(Self::Http)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SchemeKey {
     host: String,
@@ -1021,6 +1035,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[cfg(test)]
 mod tests {
     use crate::content_type_for_cached_file;
+
+    #[test]
+    fn scheme_from_uri_scheme_roundtrip() {
+        use crate::Scheme;
+
+        assert_eq!(
+            Scheme::from_uri_scheme(&http::uri::Scheme::HTTPS),
+            Some(Scheme::Https)
+        );
+        assert_eq!(
+            Scheme::from_uri_scheme(&http::uri::Scheme::HTTP),
+            Some(Scheme::Http)
+        );
+        let ftp = http::uri::Scheme::try_from("ftp").expect("ftp is a valid scheme");
+        assert_eq!(Scheme::from_uri_scheme(&ftp), None);
+    }
 
     #[test]
     fn content_type_for_text_manifests() {

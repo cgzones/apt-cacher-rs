@@ -54,6 +54,14 @@ use crate::{
 const MAX_HEADER_SIZE: usize = 8192;
 
 /// Upper bound for `async_sendfile`'s inline single-syscall fast path.
+///
+/// The fast path runs `sendfile(2)` on the tokio worker (not the blocking
+/// pool), so a cold-page-cache serve blocks the worker on disk I/O, and the
+/// transfer only *completes* inline when the file fits the socket's autotuned
+/// `SO_SNDBUF` (cold start ~16 KiB, grows to `wmem_max`). This bound caps that
+/// worker-blocking exposure; raising it widens it. Pinning `SO_SNDBUF` to force
+/// larger inline completions is a net loss: it disables autotuning, wasting
+/// memory on the dominant localhost/LAN clients while capping WAN throughput.
 const SMALL_SERVE_INLINE_MAX: u64 = 256 * 1024;
 /// Initial size for HTTP request headers buffer.
 const INITIAL_HEADER_SIZE: usize = 2048;

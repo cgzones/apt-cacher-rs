@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     fmt::Write as _,
     io::ErrorKind,
     num::{NonZero, Saturating},
@@ -355,16 +354,21 @@ fn pool_checkout(host: &str, port: u16, is_tls: bool) -> Option<UpstreamConn> {
 
     let now = coarsetime::Instant::now();
     let conn = loop {
-        let entry = conns.pop()?;
-        if now.duration_since(entry.idle_since) < POOL_IDLE_TIMEOUT {
-            break entry.conn;
+        match conns.pop() {
+            Some(entry) if now.duration_since(entry.idle_since) < POOL_IDLE_TIMEOUT => {
+                break Some(entry.conn);
+            }
+            Some(_) => {
+                debug!("splice proxy: discarding stale pooled connection to {host}:{port}");
+            }
+            None => break None,
         }
-        debug!("splice proxy: discarding stale pooled connection to {host}:{port}");
     };
     if conns.is_empty() {
         map.remove(&key_ref);
     }
     drop(map);
+    let conn = conn?;
     debug!("splice proxy: reusing pooled connection to {host}:{port} (tls={is_tls})");
     Some(conn)
 }
@@ -451,6 +455,53 @@ impl Drop for PoolGuard {
             // field that could drift from `conn`'s actual scheme.
             pool_return(&self.host, self.port, conn.is_tls(), conn);
         }
+    }
+}
+
+/// RAII poison for a pooled upstream connection whose response body has not
+/// yet been fully drained from the socket. While this guard is alive, any
+/// drop (i.e. any early return in the download body) marks the wrapped
+/// `PoolGuard` non-poolable, so a half-read connection can never re-enter the
+/// pool. Call [`UnconsumedBodyGuard::consumed`] once the body has been fully
+/// read to defuse it.
+struct UnconsumedBodyGuard<'g> {
+    upstream: &'g mut PoolGuard,
+    consumed: bool,
+}
+
+impl<'g> UnconsumedBodyGuard<'g> {
+    fn new(upstream: &'g mut PoolGuard) -> Self {
+        Self {
+            upstream,
+            consumed: false,
+        }
+    }
+
+    /// Defuse: the response body has been fully drained, so the connection's
+    /// existing `poolable` decision (from `Connection:` keep-alive) stands.
+    fn consumed(&mut self) {
+        self.consumed = true;
+    }
+}
+
+impl Drop for UnconsumedBodyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.upstream.unset_poolable();
+        }
+    }
+}
+
+impl std::ops::Deref for UnconsumedBodyGuard<'_> {
+    type Target = PoolGuard;
+    fn deref(&self) -> &PoolGuard {
+        self.upstream
+    }
+}
+
+impl std::ops::DerefMut for UnconsumedBodyGuard<'_> {
+    fn deref_mut(&mut self) -> &mut PoolGuard {
+        self.upstream
     }
 }
 
@@ -615,10 +666,18 @@ fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
 /// In Auto mode with no cached scheme, tries HTTPS first and falls back to HTTP.
 ///
 /// Times out after the configured HTTP timeout.
-async fn connect_upstream(mirror: &Mirror) -> std::io::Result<(UpstreamConn, Scheme)> {
+async fn connect_upstream(
+    mirror: &Mirror,
+    scheme_override: Option<Scheme>,
+) -> std::io::Result<(UpstreamConn, Scheme)> {
     let host = mirror.host().as_str();
 
-    match resolve_mirror_scheme(mirror) {
+    let scheme = match scheme_override {
+        Some(s) => Some(s),
+        None => resolve_mirror_scheme(mirror),
+    };
+
+    match scheme {
         Some(Scheme::Http) => {
             let port = mirror.port().map_or(80, std::num::NonZero::get);
             let tcp = tcp_connect(host, port).await?;
@@ -957,6 +1016,35 @@ async fn drain_buffered_records(
     Ok(())
 }
 
+/// Additional bytes the next drain read should request so it stops exactly at
+/// the end of the TLS record currently at the front of `incoming` — never
+/// pulling bytes of the *following* record into the buffer.
+///
+/// Reading past a record boundary is what lets a fast upstream keep the buffer
+/// perpetually mid-record: every greedy read appends a fresh partial record, so
+/// `process_tls_records` never drains to `incoming_used == 0` and the kTLS
+/// hand-off (which needs record alignment) fails after buffering megabytes.
+/// Bounding each read to the current record means that once it completes, the
+/// buffer holds only whole records and drains empty — alignment after one
+/// record instead of never.
+///
+/// The record length is header bytes 3..5 (big-endian), matched from the
+/// buffered prefix `incoming[..incoming_used]`. Until the whole 5-byte header is
+/// buffered the pattern fails to match, and we ask only for the missing header
+/// bytes — never indexing past what is actually buffered.
+#[cfg(feature = "ktls")]
+fn record_framed_read_len(incoming: &[u8], incoming_used: usize) -> usize {
+    /// TLS record header: content type (1) + legacy version (2) + length (2).
+    const TLS_RECORD_HEADER_LEN: usize = 5;
+
+    if let Some(&[_, _, _, hi, lo, ..]) = incoming.get(..incoming_used) {
+        let record_len = u16::from_be_bytes([hi, lo]) as usize;
+        (TLS_RECORD_HEADER_LEN + record_len).saturating_sub(incoming_used)
+    } else {
+        TLS_RECORD_HEADER_LEN - incoming_used.min(TLS_RECORD_HEADER_LEN)
+    }
+}
+
 /// Try to establish a kTLS-ready connection using the unbuffered rustls API.
 ///
 /// Returns a rich result indicating success, a non-spliceable response (which
@@ -1207,6 +1295,10 @@ async fn unbuffered_ktls_request(
                 .state
                 .map_err(|err| std::io::Error::other(format!("TLS handshake error:  {err}")))?;
 
+            #[expect(
+                clippy::wildcard_enum_match_arm,
+                reason = "all known variants are matched; the @-binding on the terminal arm hides them from the lint"
+            )]
             match state {
                 ConnectionState::EncodeTlsData(mut etd) => {
                     encode_tls_data(&mut etd, &mut outgoing, &mut outgoing_used);
@@ -1234,10 +1326,13 @@ async fn unbuffered_ktls_request(
                     discard_incoming(&mut incoming, &mut incoming_used, discard);
                     break;
                 }
-                ConnectionState::ReadTraffic(_)
+                unexpected_state @ (ConnectionState::ReadTraffic(_)
                 | ConnectionState::PeerClosed
                 | ConnectionState::Closed
-                | ConnectionState::ReadEarlyData(_) => {
+                | ConnectionState::ReadEarlyData(_)) => {
+                    warn_once!(
+                        "splice proxy: unexpected terminal ConnectionState during TLS handshake: {unexpected_state:?}"
+                    );
                     return Err(std::io::Error::other(
                         "unexpected state during TLS handshake",
                     ));
@@ -1320,6 +1415,10 @@ async fn unbuffered_ktls_request(
             )))
         })?;
 
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "all known variants are matched; the @-binding on the terminal arm hides them from the lint"
+        )]
         match state {
             ConnectionState::EncodeTlsData(mut etd) => {
                 encode_tls_data(&mut etd, &mut outgoing, &mut outgoing_used);
@@ -1405,10 +1504,13 @@ async fn unbuffered_ktls_request(
                 }
                 incoming_used += n;
             }
-            ConnectionState::ReadTraffic(_)
+            unexpected_state @ (ConnectionState::ReadTraffic(_)
             | ConnectionState::PeerClosed
             | ConnectionState::Closed
-            | ConnectionState::ReadEarlyData(_) => {
+            | ConnectionState::ReadEarlyData(_)) => {
+                warn_once!(
+                    "splice proxy: unexpected ConnectionState during post-handshake request send (peer closed or sent data before request?): {unexpected_state:?}"
+                );
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
             }
             other => {
@@ -1531,7 +1633,9 @@ async fn unbuffered_ktls_request(
                 state @ (ConnectionState::PeerClosed
                 | ConnectionState::Closed
                 | ConnectionState::ReadEarlyData(_)) => {
-                    debug!("kTLS: connection in terminal state during header read: {state:?}");
+                    warn_once_or_debug!(
+                        "kTLS: connection in terminal state during header read (upstream closed before headers complete?): {state:?}"
+                    );
                     discard_incoming(&mut incoming, &mut incoming_used, discard);
                     break true;
                 }
@@ -1602,14 +1706,17 @@ async fn unbuffered_ktls_request(
     // from TCP until all records are drained or a per-read timeout fires.
     // The overall http_timeout (applied at the call site) caps total wait time.
     if incoming_used > 0 {
-        /// Cap on decrypted body bytes buffered while waiting for the incoming
-        /// stream to reach a TLS record boundary. Alignment depends on where
-        /// TCP reads happen to end; against a fast upstream streaming a large
-        /// body it may not occur for a long time, and every drained byte
-        /// accumulates in `extra_body` (RAM). Beyond this cap, give up on kTLS
-        /// for this connection (transient — no host block) and let the
-        /// standard streaming path handle the fetch.
-        const MAX_KTLS_EXTRA_BODY: usize = 4 * 1024 * 1024;
+        /// Defensive backstop on decrypted body bytes buffered while waiting to
+        /// reach a TLS record boundary. The loop reads record-framed (see
+        /// `record_framed_read_len`), so it now adds at most one record to
+        /// `extra_body` before reaching alignment — this cap can no longer be
+        /// the routine outcome it once was. It still bounds the bytes drained
+        /// *before* the loop (Phase 3/4), which are read greedily and are
+        /// limited only by the 2 MiB incoming-buffer cap (`grow_incoming`); keep
+        /// it comfortably above that so a large legitimate first burst never
+        /// trips it. On a trip: give up on kTLS for this connection (transient —
+        /// no host block) and let the standard streaming path handle the fetch.
+        const MAX_KTLS_EXTRA_BODY: usize = 2 * 1024 * 1024 + 256 * 1024;
 
         let per_read_timeout = std::time::Duration::from_secs(5);
 
@@ -1630,8 +1737,19 @@ async fn unbuffered_ktls_request(
             grow_incoming(&mut incoming, incoming_used, "drain")
                 .map_err(KtlsError::KtlsSetupFailed)?;
 
-            match tokio::time::timeout(per_read_timeout, tcp.read(&mut incoming[incoming_used..]))
-                .await
+            // Bound this read to the end of the current record so it never pulls
+            // the following partial record in — that is what would keep us
+            // perpetually mid-record against a fast upstream. `.max(1)` guards
+            // the abnormal case where a whole record is already buffered but
+            // undrained: a zero-length read slice would misread as EOF.
+            let want = record_framed_read_len(&incoming, incoming_used).max(1);
+            let read_end = (incoming_used + want).min(incoming.len());
+
+            match tokio::time::timeout(
+                per_read_timeout,
+                tcp.read(&mut incoming[incoming_used..read_end]),
+            )
+            .await
             {
                 Ok(Ok(n @ 1..)) => {
                     incoming_used += n;
@@ -2105,6 +2223,19 @@ fn parse_upstream_response(
         BodyFraming::ContentLength(len)
     } else {
         BodyFraming::CloseDelimited
+    };
+
+    // RFC 9112 §6.3: 1xx, 204, and 304 responses never carry a message body,
+    // regardless of Content-Length / Transfer-Encoding headers. Force
+    // zero-length framing so relay/consumer paths do not read-until-EOF
+    // (stalling a keep-alive upstream) or mis-frame a bodyless response.
+    let framing = if status_code.is_informational()
+        || status_code == StatusCode::NO_CONTENT
+        || status_code == StatusCode::NOT_MODIFIED
+    {
+        BodyFraming::ContentLength(0)
+    } else {
+        framing
     };
 
     Ok(UpstreamResponse {
@@ -2930,8 +3061,29 @@ fn spawn_file_serve_task(
     let status = Arc::clone(dbarrier.status());
     let cache_path = cache_path.to_path_buf();
 
+    // Open the cache file synchronously here, before the caller's splice loop
+    // continues, so the fd is captured pre-rename: the download is still
+    // mid-body (the file provably exists), and this fixes a race where the
+    // download could finish and `RenamePlan::commit` rename the temp file away
+    // before a spawned task's open ran (NotFound, truncating this client). This
+    // is a short local-file open syscall on the async worker, consistent with
+    // the synchronous `dup(2)` above.
+    let std_file = match utils::nofollow_options().read(true).open(&cache_path) {
+        Ok(f) => f,
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "splice proxy: failed to open cache file `{}` for demoted client:  {err}",
+                cache_path.display()
+            );
+            return Ok(tokio::task::spawn(async { DeliveryResult::Failure(0) }));
+        }
+    };
+    let file = tokio::fs::File::from_std(std_file);
+
     Ok(tokio::task::spawn(serve_remaining_from_file(
         client_stream,
+        file,
         cache_path,
         content_start,
         content_length,
@@ -2951,6 +3103,7 @@ fn spawn_file_serve_task(
 /// `sendfile_chunk_loop`).
 async fn serve_remaining_from_file(
     client: TcpStream,
+    file: tokio::fs::File,
     cache_path: PathBuf,
     content_start: u64,
     content_length: u64,
@@ -2960,18 +3113,6 @@ async fn serve_remaining_from_file(
     debug!(
         "splice proxy: starting to serve remaining bytes from cache file for demoted client at offset {content_start} ({content_length} bytes remaining)",
     );
-
-    let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
-        Ok(f) => f,
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to open cache file `{}` for demoted client:  {err}",
-                cache_path.display()
-            );
-            return DeliveryResult::Failure(0);
-        }
-    };
 
     // Demoted clients keep reading the partial cache file linearly via
     // sendfile chunks, so warm the kernel readahead window before the loop
@@ -3144,7 +3285,13 @@ async fn tee_and_splice(
                 );
 
                 let _: Never = match result {
-                    Ok(0) | Err(nix::errno::Errno::EPIPE | nix::errno::Errno::ECONNRESET) => {
+                    Ok(0)
+                    | Err(
+                        nix::errno::Errno::EPIPE
+                        | nix::errno::Errno::ECONNRESET
+                        | nix::errno::Errno::ECONNABORTED
+                        | nix::errno::Errno::ENOTCONN,
+                    ) => {
                         // Client disconnected — drain the remaining teed bytes from pipe_A
                         // by splicing them to /dev/null (discard)
                         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
@@ -3479,6 +3626,7 @@ async fn standard_upstream_connect(
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
+    scheme_override: Option<Scheme>,
 ) -> Result<
     (
         UpstreamConn,
@@ -3496,7 +3644,7 @@ async fn standard_upstream_connect(
     // for it as `POOL_MISS_NO_SCHEME` and fall through to the fresh-connect
     // path — the invariant `POOL_NEW ≈ sum(POOL_MISS_*)` then holds for
     // first connections too.
-    if let Some(scheme) = resolve_mirror_scheme(mirror) {
+    if let Some(scheme) = scheme_override.or_else(|| resolve_mirror_scheme(mirror)) {
         let is_tls = matches!(scheme, Scheme::Https);
         let port = mirror_port(mirror, is_tls);
         if let Some(mut pooled) = pool_checkout(mirror.host(), port, is_tls) {
@@ -3545,11 +3693,17 @@ async fn standard_upstream_connect(
 
     metrics::POOL_NEW.increment();
 
-    let (mut up, scheme) = connect_upstream(mirror).await.map_err(|err| {
-        warn_once_or_info!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
-        SpliceProxyError::Upstream
-    })?;
-    cache_scheme(mirror, scheme);
+    let (mut up, scheme) = connect_upstream(mirror, scheme_override)
+        .await
+        .map_err(|err| {
+            warn_once_or_info!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
+            SpliceProxyError::Upstream
+        })?;
+    // A redirect's forced scheme is per-request; don't let it reprogram the
+    // global SCHEME_CACHE for this host.
+    if scheme_override.is_none() {
+        cache_scheme(mirror, scheme);
+    }
 
     let is_tls = up.is_tls();
 
@@ -3606,13 +3760,10 @@ async fn follow_redirect(
         debug!("splice proxy: {status} with unparsable Location `{location}`, not following");
         return Ok(None);
     };
-    if !moved_uri
-        .scheme()
-        .is_some_and(|s| *s == http::uri::Scheme::HTTP || *s == http::uri::Scheme::HTTPS)
-    {
+    let Some(redirect_scheme) = moved_uri.scheme().and_then(Scheme::from_uri_scheme) else {
         debug!("splice proxy: {status} redirect to non-HTTP scheme `{moved_uri}`, not following");
         return Ok(None);
-    }
+    };
     let Some(moved_host) = moved_uri.host() else {
         return Ok(None);
     };
@@ -3680,6 +3831,7 @@ async fn follow_redirect(
         resume_offset,
         resume_if_range,
         volatile_cond,
+        Some(redirect_scheme),
     )
     .await
     .inspect_err(|_| {
@@ -4142,18 +4294,45 @@ async fn discard_partial_and_retry(
     upstream_resp: &mut UpstreamResponse,
     header_buf: &mut BytesMut,
     header_end: &mut usize,
+    conn_details: &ConnectionDetails,
 ) -> Result<(), SpliceProxyError> {
     partial.discard_resume().await;
     *resume_offset = 0;
     *resume_expected_total = None;
     upstream.unset_poolable();
     let (up, resp, hdr_buf, hdr_end, label, pool) =
-        standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None).await?;
+        standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
+            .await?;
     *tls_label = label;
     upstream.replace(up, pool);
     *upstream_resp = resp;
     *header_buf = hdr_buf;
     *header_end = hdr_end;
+    // The fresh connect above does not follow redirects; the caller's top-level
+    // redirect handling already ran on the original (now-discarded) response, so
+    // follow one redirect here if the retry also lands on a 3xx (the retry is
+    // always a fresh full request: resume_offset=0, no If-Range/volatile cond).
+    if matches!(
+        upstream_resp.status_code,
+        http::StatusCode::MOVED_PERMANENTLY
+            | http::StatusCode::FOUND
+            | http::StatusCode::TEMPORARY_REDIRECT
+            | http::StatusCode::PERMANENT_REDIRECT
+    ) {
+        follow_redirect(
+            upstream_resp,
+            upstream,
+            header_buf,
+            header_end,
+            tls_label,
+            conn_details,
+            upstream_path,
+            0,
+            None,
+            None,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -4587,6 +4766,7 @@ async fn splice_proxy_drive(
                 resume_offset,
                 resume_if_range.as_deref(),
                 volatile_cond.as_ref(),
+                None,
             )
             .await?;
             let port = mirror_port(mirror, up.is_tls());
@@ -4625,6 +4805,7 @@ async fn splice_proxy_drive(
                 resume_offset,
                 resume_if_range.as_deref(),
                 volatile_cond.as_ref(),
+                None,
             )
             .await?;
             let port = mirror_port(mirror, up.is_tls());
@@ -4650,6 +4831,7 @@ async fn splice_proxy_drive(
                 resume_offset,
                 resume_if_range.as_deref(),
                 volatile_cond.as_ref(),
+                None,
             )
             .await?;
             let port = mirror_port(mirror, up.is_tls());
@@ -4673,6 +4855,7 @@ async fn splice_proxy_drive(
             resume_offset,
             resume_if_range.as_deref(),
             volatile_cond.as_ref(),
+            None,
         )
         .await?;
         let port = mirror_port(mirror, up.is_tls());
@@ -4684,6 +4867,36 @@ async fn splice_proxy_drive(
             label,
         )
     };
+
+    // Handle 3xx redirects (301/302/307/308): follow if the target host is allowed.
+    // Only follows one redirect (no loops), matching hyper behavior. Runs first —
+    // before the resume/304/passthrough handlers — so those all operate on the
+    // (possibly redirected) response, mirroring hyper_conn.rs which follows the
+    // redirect before its NOT_MODIFIED check.
+    let redirected_path_owned = if matches!(
+        upstream_resp.status_code,
+        http::StatusCode::MOVED_PERMANENTLY
+            | http::StatusCode::FOUND
+            | http::StatusCode::TEMPORARY_REDIRECT
+            | http::StatusCode::PERMANENT_REDIRECT
+    ) {
+        follow_redirect(
+            &mut upstream_resp,
+            &mut upstream,
+            &mut header_buf,
+            &mut header_end,
+            &mut tls_label,
+            conn_details,
+            upstream_path,
+            resume_offset,
+            resume_if_range.as_deref(),
+            volatile_cond.as_ref(),
+        )
+        .await?
+    } else {
+        None
+    };
+    let upstream_path = redirected_path_owned.as_deref().unwrap_or(upstream_path);
 
     // Handle resume: if we sent Range and got 200 (server ignores Range), discard partial
     if resume_offset > 0 && upstream_resp.status_code == 200 {
@@ -4716,6 +4929,7 @@ async fn splice_proxy_drive(
             &mut upstream_resp,
             &mut header_buf,
             &mut header_end,
+            conn_details,
         )
         .await?;
     }
@@ -4750,33 +4964,6 @@ async fn splice_proxy_drive(
         .await;
     }
 
-    // Handle 3xx redirects (301/302/307/308): follow if the target host is allowed.
-    // Only follows one redirect (no loops), matching hyper behavior.
-    let redirected_path_owned = if matches!(
-        upstream_resp.status_code,
-        http::StatusCode::MOVED_PERMANENTLY
-            | http::StatusCode::FOUND
-            | http::StatusCode::TEMPORARY_REDIRECT
-            | http::StatusCode::PERMANENT_REDIRECT
-    ) {
-        follow_redirect(
-            &mut upstream_resp,
-            &mut upstream,
-            &mut header_buf,
-            &mut header_end,
-            &mut tls_label,
-            conn_details,
-            upstream_path,
-            resume_offset,
-            resume_if_range.as_deref(),
-            volatile_cond.as_ref(),
-        )
-        .await?
-    } else {
-        None
-    };
-    let upstream_path = redirected_path_owned.as_deref().unwrap_or(upstream_path);
-
     // Forward non-200/non-206 responses directly to the client instead of falling back
     // to hyper (which would open a redundant second connection).
     if upstream_resp.status_code != 200 && upstream_resp.status_code != 206 {
@@ -4788,18 +4975,31 @@ async fn splice_proxy_drive(
         metrics::REQUESTS_PASSTHROUGH.increment();
         metrics::record_client_status(upstream_resp.status_code);
 
-        // Forward the response headers to the client. This relay deliberately
-        // passes the upstream status line and headers through verbatim, with
-        // one exception: a `Content-Length` alongside chunked framing is
-        // stripped (RFC 9112 §6.1), matching `rewrite_simple_proxy_headers` and
-        // keeping the headers consistent with the chunked body forwarded below.
-        let passthrough_headers = strip_content_length_when_chunked(
+        // Rewrite the response headers before forwarding: strip hop-by-hop
+        // headers, emit a single `Connection:` matching our keep-alive
+        // decision, drop `Content-Length` when chunked, and append `Via:`.
+        // Nothing has been written to the client yet, so a malformed-header
+        // error can safely bail to a 502 via the outer arm.
+        let passthrough_headers = match rewrite_simple_proxy_headers(
             &header_buf[..header_end],
-            matches!(upstream_resp.framing, BodyFraming::Chunked),
-        );
+            conn_version,
+            conn_action,
+            upstream_resp.status_code,
+        ) {
+            Ok(s) => s,
+            Err(err) => {
+                warn_once_or_info!(
+                    "splice proxy: failed to rewrite passthrough headers for {} from mirror {}:  {err}",
+                    conn_details.debname,
+                    conn_details.mirror
+                );
+                upstream.unset_poolable();
+                return Err(SpliceProxyError::Upstream);
+            }
+        };
         write_all_to_stream(
             client_stream,
-            passthrough_headers.as_ref(),
+            passthrough_headers.as_bytes(),
             WritePhase::Header,
         )
         .await
@@ -4940,6 +5140,7 @@ async fn splice_proxy_drive(
                 &mut upstream_resp,
                 &mut header_buf,
                 &mut header_end,
+                conn_details,
             )
             .await?;
         }
@@ -5163,6 +5364,12 @@ async fn splice_proxy_drive(
         return Ok(());
     };
 
+    // Committed to splicing a length-delimited body: keep the upstream out of
+    // the pool for the whole "body not yet drained" window, so no early return
+    // below can leave a half-read connection re-poolable. Defused via
+    // `consumed()` once the body is fully read.
+    let mut upstream_guard = UnconsumedBodyGuard::new(&mut upstream);
+
     // Parse client Range request now that we know the total file size.
     let client_range_result = client_range.range.map(|range| {
         let cache_time = upstream_resp
@@ -5371,7 +5578,7 @@ async fn splice_proxy_drive(
             conn_details.debname,
             conn_details.mirror
         );
-        upstream.unset_poolable();
+        // `upstream_guard` poisons the connection on drop.
         write_invalid_response(
             client_stream,
             conn_version,
@@ -5398,7 +5605,7 @@ async fn splice_proxy_drive(
                  body content length ({splice_count} bytes) for {} from mirror {}",
                 conn_details.debname, conn_details.mirror
             );
-            upstream.unset_poolable();
+            // `upstream_guard` poisons the connection on drop.
             write_invalid_response(
                 client_stream,
                 conn_version,
@@ -5742,7 +5949,7 @@ async fn splice_proxy_drive(
         let upstream_is_ktls = tls_label == KTLS_TLS_LABEL;
 
         let (returned_dbarrier, demoted_handle, body_client_disconnected, body_client_bytes) =
-            if let Some(tcp_upstream) = upstream.as_tcp() {
+            if let Some(tcp_upstream) = upstream_guard.as_tcp() {
                 // Zero-copy path for TCP (plain or kTLS)
                 splice_proxy_body(
                     tcp_upstream,
@@ -5760,7 +5967,7 @@ async fn splice_proxy_drive(
             } else {
                 // TLS: userspace read, then tee+splice fan-out
                 splice_proxy_body_tls(
-                    &mut upstream,
+                    &mut upstream_guard,
                     client_stream,
                     &tempfile,
                     splice_count,
@@ -5773,11 +5980,10 @@ async fn splice_proxy_drive(
             }
             // Any body-transfer error leaves the upstream mid-message (fewer
             // than content_length bytes consumed), so the socket still holds
-            // undelivered bytes. Mark it non-poolable so PoolGuard::drop
-            // discards it rather than re-pooling a poisoned connection -- the
-            // next checkout would otherwise log "pooled connection has
-            // unexpected data, discarding".
-            .inspect_err(|_err| upstream.unset_poolable())
+            // undelivered bytes. `upstream_guard` (still armed here) poisons
+            // the connection on the early return so PoolGuard::drop discards it
+            // rather than re-pooling it -- the next checkout would otherwise log
+            // "pooled connection has unexpected data, discarding".
             .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "splice body transfer"))?;
         dbarrier = returned_dbarrier;
         // The splice body block ran: the upstream-rate and client-rate windows
@@ -5790,6 +5996,14 @@ async fn splice_proxy_drive(
     } else {
         (None, false)
     };
+
+    // The full upstream body is now drained: either the splice loop consumed
+    // exactly `splice_count` bytes, or `splice_count` was 0 because the whole
+    // body arrived in the prefix / kTLS-extra-body. The client-write outcome is
+    // irrelevant to poolability — the download always drains upstream fully.
+    // Defuse the poison guard and release its borrow before dropping upstream.
+    upstream_guard.consumed();
+    drop(upstream_guard);
 
     // PoolGuard::drop returns the connection to pool if still poolable.
     // Drop it now before the sync+rename to free the upstream socket promptly.
@@ -5840,17 +6054,19 @@ async fn splice_proxy_drive(
         // uses `req.uri().path()` captured before any redirect.
         raw_uri_path: original_uri_path.to_owned(),
     };
-    match rbarrier.commit(plan).await {
+    let cache_committed = match rbarrier.commit(plan).await {
         Ok(()) => {
             TempPath::defuse(temppath);
+            true
         }
         Err(err) => {
             // commit() dropped the barrier and logged mismatch / verify-IO;
             // log rename failures here. The body was already fully delivered
             // to the client; this only leaves the cache without the file
             // (the TempPath guard removes the temp file, future requests
-            // re-download). Report success so the connection stays alive and
-            // skip the DB Download/Delivery/Origin records.
+            // re-download). The DB records below are skipped because nothing
+            // was cached, but we still finish the client-facing bookkeeping
+            // (await the demoted task, count the delivery) before returning.
             if let integrity::CommitError::Rename(io_err) = &err {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -5860,42 +6076,44 @@ async fn splice_proxy_drive(
                     ErrorReport(io_err)
                 );
             }
-            return Ok(());
+            false
         }
-    }
+    };
 
     let elapsed = start.elapsed();
 
-    // Record download in database (mirrors download_file() in hyper_conn.rs).
-    let cmd = DatabaseCommand::Download(DbCmdDownload {
-        mirror: conn_details.mirror.clone(),
-        debname: conn_details.debname.clone(),
-        size: total_content_length.get(),
-        elapsed,
-        client_ip: conn_details.client.ip(),
-    });
-    send_db_command(cmd).await;
-
-    // Record origin in database for this cached download.  This is an
-    // intentional asymmetry with the hyper backend: `Origin::from_path` is
-    // only called from the hyper simple-proxy passthrough in
-    // `hyper_conn.rs`; the hyper cache-download paths in
-    // `download_file`/`serve_new_file` never record an Origin row.  The
-    // splice path records Origins for cached downloads too, so it is doing
-    // strictly more origin-recording work than hyper.  Treat the splice
-    // origin write as the source of truth for cached-download origins for
-    // now.  Use the original (pre-redirect) client request path so the
-    // recorded origin layout is stable across upstream redirects (the
-    // redirected `upstream_path` would otherwise poison the DB with a
-    // different origin row for the same logical download).
-    if let Some(origin) = Origin::from_path(
-        original_uri_path,
-        conn_details.mirror.host().clone(),
-        conn_details.mirror.port(),
-    ) && !cache_layout::is_pseudo_arch(&origin.architecture)
-    {
-        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+    if cache_committed {
+        // Record download in database (mirrors download_file() in hyper_conn.rs).
+        let cmd = DatabaseCommand::Download(DbCmdDownload {
+            mirror: conn_details.mirror.clone(),
+            debname: conn_details.debname.clone(),
+            size: total_content_length.get(),
+            elapsed,
+            client_ip: conn_details.client.ip(),
+        });
         send_db_command(cmd).await;
+
+        // Record origin in database for this cached download.  This is an
+        // intentional asymmetry with the hyper backend: `Origin::from_path` is
+        // only called from the hyper simple-proxy passthrough in
+        // `hyper_conn.rs`; the hyper cache-download paths in
+        // `download_file`/`serve_new_file` never record an Origin row.  The
+        // splice path records Origins for cached downloads too, so it is doing
+        // strictly more origin-recording work than hyper.  Treat the splice
+        // origin write as the source of truth for cached-download origins for
+        // now.  Use the original (pre-redirect) client request path so the
+        // recorded origin layout is stable across upstream redirects (the
+        // redirected `upstream_path` would otherwise poison the DB with a
+        // different origin row for the same logical download).
+        if let Some(origin) = Origin::from_path(
+            original_uri_path,
+            conn_details.mirror.host().clone(),
+            conn_details.mirror.port(),
+        ) && !cache_layout::is_pseudo_arch(&origin.architecture)
+        {
+            let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+            send_db_command(cmd).await;
+        }
     }
 
     // If the first client was demoted to file-serve, wait for the
@@ -5932,44 +6150,49 @@ async fn splice_proxy_drive(
     let client_succeeded =
         !prefix_client_failed && !body_client_disconnected && demoted_client_succeeded;
 
-    let in_time = conn_details.request_received_at.elapsed();
-    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
-        "volatile "
-    } else {
-        ""
-    };
-    let upstream = rate_log::upstream_segment(
-        body_content_length.get(),
-        t_upstream_done.duration_since(t_req_sent),
-    );
-    let client = if client_succeeded {
-        rate_log::client_segment(
-            response_content_length,
-            t_client_done.duration_since(t_client_first),
-        )
-    } else {
-        rate_log::client_disconnect_segment(
-            client_bytes_sent,
-            t_client_done.duration_since(t_client_first),
-        )
-    };
-    info!(
-        "splice proxy{tls_label}: {} {volatile}{} from mirror {} for client {} in {} ({upstream}, {client}){}",
-        if client_succeeded {
-            "served and cached"
+    // Only log a completion "…cached…" line when the file actually landed in
+    // the cache; the commit-failure path already logged an ERROR (rename) or
+    // commit() logged the mismatch/verify failure internally.
+    if cache_committed {
+        let in_time = conn_details.request_received_at.elapsed();
+        let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+            "volatile "
         } else {
-            "cached"
-        },
-        conn_details.debname,
-        conn_details.mirror,
-        conn_details.client,
-        HumanFmt::Time(in_time),
-        if resume_offset > 0 {
-            format!(", resumed from {}", HumanFmt::Size(resume_offset))
+            ""
+        };
+        let upstream = rate_log::upstream_segment(
+            body_content_length.get(),
+            t_upstream_done.duration_since(t_req_sent),
+        );
+        let client = if client_succeeded {
+            rate_log::client_segment(
+                response_content_length,
+                t_client_done.duration_since(t_client_first),
+            )
         } else {
-            String::new()
-        },
-    );
+            rate_log::client_disconnect_segment(
+                client_bytes_sent,
+                t_client_done.duration_since(t_client_first),
+            )
+        };
+        info!(
+            "splice proxy{tls_label}: {} {volatile}{} from mirror {} for client {} in {} ({upstream}, {client}){}",
+            if client_succeeded {
+                "served and cached"
+            } else {
+                "cached"
+            },
+            conn_details.debname,
+            conn_details.mirror,
+            conn_details.client,
+            HumanFmt::Time(in_time),
+            if resume_offset > 0 {
+                format!(", resumed from {}", HumanFmt::Size(resume_offset))
+            } else {
+                String::new()
+            },
+        );
+    }
 
     if !client_succeeded {
         // The actual failure (prefix-write, body splice, or demoted task)
@@ -5982,15 +6205,17 @@ async fn splice_proxy_drive(
     metrics::SERVED_SPLICE.increment();
     metrics::SERVED_TOTAL.increment();
 
-    let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
-        mirror: conn_details.mirror.clone(),
-        debname: conn_details.debname.clone(),
-        size: total_content_length.get(),
-        elapsed,
-        partial: is_partial,
-        client_ip: conn_details.client.ip(),
-    });
-    send_db_command(cmd).await;
+    if cache_committed {
+        let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            mirror: conn_details.mirror.clone(),
+            debname: conn_details.debname.clone(),
+            size: total_content_length.get(),
+            elapsed,
+            partial: is_partial,
+            client_ip: conn_details.client.ip(),
+        });
+        send_db_command(cmd).await;
+    }
 
     Ok(())
 }
@@ -6539,7 +6764,138 @@ async fn handle_volatile_buffered_download(
 
     let start = PreciseInstant::now();
 
-    // Send response headers to client.
+    // The whole body is already buffered in memory, so — unlike the streaming
+    // path (`splice_proxy_drive`) — the cache can be fully persisted BEFORE
+    // serving the client. Caching costs nothing here and must not depend on the
+    // client write, so a late client-write failure no longer discards an
+    // already-downloaded body (late joiners and future requests keep it).
+
+    // Write the full body to the cache temp file (best-effort).
+    let cache_write_ok = match tempfile.write_all(&body).await {
+        Ok(()) => true,
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "splice proxy: failed to write volatile body to cache file `{}`:  {err}",
+                temppath.display()
+            );
+            false
+        }
+    };
+    if cache_write_ok {
+        dbarrier.ping();
+
+        // Sync cache file.
+        if let Err(err) = tempfile.sync_all().await {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "splice proxy: failed to sync cache file `{}`:  {err}",
+                temppath.display()
+            );
+        }
+    }
+    drop(tempfile);
+
+    // Persist via rename+commit, only if the body reached the temp file. When
+    // the write failed, `dbarrier` is dropped here without a rename — its Drop
+    // records the terminal aborted state, correct since nothing is on disk for
+    // late joiners to serve.
+    let dest_file_path = dest_dir.join(filename);
+    let cache_committed = if cache_write_ok {
+        // Move temp file to final cache path.
+        let rbarrier = dbarrier.begin_rename().await;
+
+        // Use the actual on-disk size rather than the declared Content-Length.
+        // The buffered path writes the entire `body` Vec so these match today,
+        // but the defensive stat keeps the quota-finalisation input honest.
+        let actual_bytes = match tokio::fs::metadata(temppath.as_ref()).await {
+            Ok(m) => m.len(),
+            Err(err) => {
+                warn!(
+                    "splice proxy: failed to stat temp file `{}` post-sync; using buffered body length:  {}",
+                    temppath.display(),
+                    ErrorReport(&err)
+                );
+                total_content_length.get()
+            }
+        };
+        let plan = integrity::RenamePlan {
+            temp_path: temppath.to_path_buf(),
+            dest_path: dest_file_path.clone(),
+            bytes_received: actual_bytes,
+            resource_kind: conn_details.resource_kind,
+            debname: conn_details.debname.clone(),
+            host: conn_details.mirror.host().to_string(),
+            mirror_path: conn_details.mirror.path().to_owned(),
+            // Use the original (pre-redirect) client request path so registry
+            // keys are consistent with the hyper backend (hyper_conn.rs), which always
+            // uses `req.uri().path()` captured before any redirect.
+            raw_uri_path: original_uri_path.to_owned(),
+        };
+        match rbarrier.commit(plan).await {
+            Ok(()) => {
+                TempPath::defuse(temppath);
+                true
+            }
+            Err(err) => {
+                // commit() dropped the barrier and logged mismatch / verify-IO;
+                // log rename failures here. The TempPath guard removes the temp
+                // file, future requests re-download. The DB records below are
+                // skipped because nothing was cached.
+                if let integrity::CommitError::Rename(io_err) = &err {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "splice proxy: failed to rename temp file `{}` to `{}`:  {}",
+                        temppath.display(),
+                        dest_file_path.display(),
+                        ErrorReport(io_err)
+                    );
+                }
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let elapsed = start.elapsed();
+
+    if cache_committed {
+        // Record download in database (mirrors download_file() in hyper_conn.rs).
+        let cmd = DatabaseCommand::Download(DbCmdDownload {
+            mirror: conn_details.mirror.clone(),
+            debname: conn_details.debname.clone(),
+            size: total_content_length.get(),
+            elapsed,
+            client_ip: conn_details.client.ip(),
+        });
+        send_db_command(cmd).await;
+
+        // Record origin in database for this cached (volatile-buffered)
+        // download.  As in `splice_proxy_drive`, this is an intentional
+        // asymmetry with the hyper backend: in `hyper_conn.rs`, `Origin::from_path`
+        // is only called from the simple-proxy passthrough; hyper's cache
+        // paths (`download_file`/`serve_new_file`) never record an Origin row.
+        // The splice path records Origins for cached downloads too, so it is
+        // doing strictly more origin-recording work than hyper.  Use the
+        // original (pre-redirect) client request path so the recorded origin
+        // layout is stable across upstream redirects (the redirected
+        // `upstream_path` would otherwise poison the DB with a different
+        // origin row for the same logical download).
+        if let Some(origin) = Origin::from_path(
+            original_uri_path,
+            conn_details.mirror.host().clone(),
+            conn_details.mirror.port(),
+        ) && !cache_layout::is_pseudo_arch(&origin.architecture)
+        {
+            let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+            send_db_command(cmd).await;
+        }
+    }
+
+    // Serve the client from the in-memory body. The cache is already persisted
+    // (best-effort above), so an early return on a client write failure no
+    // longer loses the downloaded body.
     let last_modified_str = upstream_resp.last_modified.as_deref().unwrap_or("");
     let content_type = content_type_for_cached_file(&conn_details.debname);
     warn_on_content_type_mismatch(
@@ -6623,156 +6979,45 @@ async fn handle_volatile_buffered_download(
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
     let t_client_done = PreciseInstant::now();
-    metrics::SERVED_SPLICE.increment();
-    metrics::SERVED_TOTAL.increment();
 
     drop(cork);
 
-    // Write full body to cache file.
-    if let Err(err) = tempfile.write_all(&body).await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to write volatile body to cache file `{}`:  {err}",
-            temppath.display()
+    // The client was fully served (an early return above skips these).
+    metrics::SERVED_SPLICE.increment();
+    metrics::SERVED_TOTAL.increment();
+
+    if cache_committed {
+        let in_time = conn_details.request_received_at.elapsed();
+        let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+            "volatile "
+        } else {
+            ""
+        };
+        info!(
+            "splice proxy{tls_label}: served and cached {volatile}{} from mirror {} for client {} in {} ({}, {})",
+            conn_details.debname,
+            conn_details.mirror,
+            conn_details.client,
+            HumanFmt::Time(in_time),
+            rate_log::upstream_segment(
+                total_content_length.get(),
+                t_upstream_done.duration_since(t_req_sent),
+            ),
+            rate_log::client_segment(
+                response_content_length as u64,
+                t_client_done.duration_since(t_client_first),
+            ),
         );
-        // Body was already fully delivered to the client; this failure
-        // only leaves cache state inconsistent.  Report success to the
-        // caller so the connection stays alive; skip the rename and
-        // the DB Download/Delivery/Origin records that would otherwise
-        // claim the file is cached.
-        return Ok(());
-    }
 
-    dbarrier.ping();
-
-    // Sync cache file.
-    if let Err(err) = tempfile.sync_all().await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to sync cache file `{}`:  {err}",
-            temppath.display()
-        );
-    }
-    drop(tempfile);
-
-    // Move temp file to final cache path.
-    let dest_file_path = dest_dir.join(filename);
-    let rbarrier = dbarrier.begin_rename().await;
-
-    // Use the actual on-disk size rather than the declared Content-Length.
-    // The buffered path writes the entire `body` Vec so these match today,
-    // but the defensive stat keeps the quota-finalisation input honest.
-    let actual_bytes = match tokio::fs::metadata(temppath.as_ref()).await {
-        Ok(m) => m.len(),
-        Err(err) => {
-            warn!(
-                "splice proxy: failed to stat temp file `{}` post-sync; using buffered body length:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            );
-            total_content_length.get()
-        }
-    };
-    let plan = integrity::RenamePlan {
-        temp_path: temppath.to_path_buf(),
-        dest_path: dest_file_path.clone(),
-        bytes_received: actual_bytes,
-        resource_kind: conn_details.resource_kind,
-        debname: conn_details.debname.clone(),
-        host: conn_details.mirror.host().to_string(),
-        mirror_path: conn_details.mirror.path().to_owned(),
-        // Use the original (pre-redirect) client request path so registry
-        // keys are consistent with the hyper backend (hyper_conn.rs), which always
-        // uses `req.uri().path()` captured before any redirect.
-        raw_uri_path: original_uri_path.to_owned(),
-    };
-    match rbarrier.commit(plan).await {
-        Ok(()) => {
-            TempPath::defuse(temppath);
-        }
-        Err(err) => {
-            // commit() dropped the barrier and logged mismatch / verify-IO;
-            // log rename failures here. The body was already fully delivered
-            // to the client; this only leaves the cache without the file
-            // (the TempPath guard removes the temp file, future requests
-            // re-download). Report success so the connection stays alive and
-            // skip the DB Download/Delivery/Origin records.
-            if let integrity::CommitError::Rename(io_err) = &err {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "splice proxy: failed to rename temp file `{}` to `{}`:  {}",
-                    temppath.display(),
-                    dest_file_path.display(),
-                    ErrorReport(io_err)
-                );
-            }
-            return Ok(());
-        }
-    }
-
-    let elapsed = start.elapsed();
-
-    let in_time = conn_details.request_received_at.elapsed();
-    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
-        "volatile "
-    } else {
-        ""
-    };
-    info!(
-        "splice proxy{tls_label}: served and cached {volatile}{} from mirror {} for client {} in {} ({}, {})",
-        conn_details.debname,
-        conn_details.mirror,
-        conn_details.client,
-        HumanFmt::Time(in_time),
-        rate_log::upstream_segment(
-            total_content_length.get(),
-            t_upstream_done.duration_since(t_req_sent),
-        ),
-        rate_log::client_segment(
-            response_content_length as u64,
-            t_client_done.duration_since(t_client_first),
-        ),
-    );
-
-    // Record download in database (mirrors download_file() in hyper_conn.rs).
-    let cmd = DatabaseCommand::Download(DbCmdDownload {
-        mirror: conn_details.mirror.clone(),
-        debname: conn_details.debname.clone(),
-        size: total_content_length.get(),
-        elapsed,
-        client_ip: conn_details.client.ip(),
-    });
-    send_db_command(cmd).await;
-
-    // Record delivery in database.
-    let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
-        mirror: conn_details.mirror.clone(),
-        debname: conn_details.debname.clone(),
-        size: total_content_length.get(),
-        elapsed,
-        partial: is_partial,
-        client_ip: conn_details.client.ip(),
-    });
-    send_db_command(cmd).await;
-
-    // Record origin in database for this cached (volatile-buffered)
-    // download.  As in `splice_proxy_drive`, this is an intentional
-    // asymmetry with the hyper backend: in `hyper_conn.rs`, `Origin::from_path`
-    // is only called from the simple-proxy passthrough; hyper's cache
-    // paths (`download_file`/`serve_new_file`) never record an Origin row.
-    // The splice path records Origins for cached downloads too, so it is
-    // doing strictly more origin-recording work than hyper.  Use the
-    // original (pre-redirect) client request path so the recorded origin
-    // layout is stable across upstream redirects (the redirected
-    // `upstream_path` would otherwise poison the DB with a different
-    // origin row for the same logical download).
-    if let Some(origin) = Origin::from_path(
-        original_uri_path,
-        conn_details.mirror.host().clone(),
-        conn_details.mirror.port(),
-    ) && !cache_layout::is_pseudo_arch(&origin.architecture)
-    {
-        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        // Record delivery in database.
+        let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            mirror: conn_details.mirror.clone(),
+            debname: conn_details.debname.clone(),
+            size: total_content_length.get(),
+            elapsed,
+            partial: is_partial,
+            client_ip: conn_details.client.ip(),
+        });
         send_db_command(cmd).await;
     }
 
@@ -6825,9 +7070,31 @@ fn rewrite_simple_proxy_headers(
             })
     });
 
+    // RFC 9110 §7.6.1: the Connection header nominates further connection-specific
+    // field names that an intermediary must remove before forwarding.
+    let mut connection_nominated: Vec<String> = Vec::new();
+    for h in parsed.headers.iter() {
+        if h.name.eq_ignore_ascii_case("connection")
+            && let Ok(v) = std::str::from_utf8(h.value)
+        {
+            for tok in v.split(',') {
+                let tok = tok.trim();
+                if !tok.is_empty() {
+                    connection_nominated.push(tok.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
     let mut buf = format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n");
     for h in parsed.headers.iter() {
         if HOP_BY_HOP.iter().any(|n| h.name.eq_ignore_ascii_case(n)) {
+            continue;
+        }
+        if connection_nominated
+            .iter()
+            .any(|n| h.name.eq_ignore_ascii_case(n))
+        {
             continue;
         }
         if has_chunked_te && h.name.eq_ignore_ascii_case("content-length") {
@@ -6866,42 +7133,6 @@ fn rewrite_simple_proxy_headers(
     Ok(buf)
 }
 
-/// Strip every `Content-Length` header line from a raw response header block
-/// when `chunked` is set, leaving the rest of the block byte-for-byte.
-///
-/// The lightweight non-2xx passthrough relay in `splice_proxy_drive` forwards
-/// the upstream status line and headers verbatim rather than going through
-/// `rewrite_simple_proxy_headers`; this applies that function's one
-/// security-relevant rewrite (RFC 9112 §6.1: a `Content-Length` accompanying
-/// `Transfer-Encoding: chunked` must be dropped, lest an intermediary frame the
-/// body the wrong way) without otherwise reshaping the headers. Returns the
-/// input unchanged when not chunked.
-fn strip_content_length_when_chunked(raw_headers: &[u8], chunked: bool) -> Cow<'_, [u8]> {
-    if !chunked {
-        return Cow::Borrowed(raw_headers);
-    }
-    let mut out = Vec::with_capacity(raw_headers.len());
-    let mut rest = raw_headers;
-    loop {
-        let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
-            // No further CRLF: append any trailing bytes verbatim and stop.
-            out.extend_from_slice(rest);
-            break;
-        };
-        let line = &rest[..eol];
-        let is_content_length = line
-            .iter()
-            .position(|&b| b == b':')
-            .is_some_and(|colon| line[..colon].eq_ignore_ascii_case(b"content-length"));
-        if !is_content_length {
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-        }
-        rest = &rest[eol + 2..];
-    }
-    Cow::Owned(out)
-}
-
 /// Connects to upstream, sends a GET request, and forwards the complete response
 /// (headers + body) to the client.  No caching, no active-download tracking,
 /// no resume handling — just a transparent relay.
@@ -6930,7 +7161,8 @@ pub(crate) async fn splice_simple_proxy(
     let _client_count = client_counter::ClientDownload::new();
 
     let (up, resp, hdr_buf, hdr_end, _label, poolable) =
-        standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None).await?;
+        standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
+            .await?;
 
     let t_req_sent = resp.request_sent_at.unwrap_or_else(PreciseInstant::now);
 
@@ -7190,6 +7422,41 @@ mod tests {
         assert!(out.contains("Transfer-Encoding: chunked\r\n"));
     }
 
+    #[test]
+    fn test_rewrite_simple_proxy_headers_drops_connection_nominated() {
+        // RFC 9110 §7.6.1: header fields nominated by the upstream Connection
+        // header must be stripped before forwarding to the client.
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Connection: close, X-Custom-Hop\r\n\
+                    X-Custom-Hop: secret\r\n\
+                    Content-Type: text/plain\r\n\
+                    \r\n";
+        let out = rewrite_simple_proxy_headers(
+            raw,
+            ConnectionVersion::Http11,
+            ConnectionAction::KeepAlive,
+            http::StatusCode::OK,
+        )
+        .expect("rewrite should succeed");
+
+        // The nominated field must not be forwarded.
+        assert!(
+            !out.to_ascii_lowercase().contains("x-custom-hop"),
+            "Connection-nominated header leaked into output:\n{out}"
+        );
+        // End-to-end headers still pass through.
+        assert!(out.contains("Content-Type: text/plain\r\n"));
+        // Exactly one Connection header (ours), regardless of the upstream's.
+        let connection_lines = out
+            .split("\r\n")
+            .filter(|line| line.to_ascii_lowercase().starts_with("connection:"))
+            .count();
+        assert_eq!(
+            connection_lines, 1,
+            "expected exactly one Connection header in rewritten output, got:\n{out}"
+        );
+    }
+
     #[tokio::test]
     async fn test_create_pipe() {
         let (tx, rx) = create_pipe().expect("pipe creation should succeed");
@@ -7271,33 +7538,22 @@ mod tests {
     }
 
     #[test]
-    fn strip_content_length_when_chunked_drops_only_content_length() {
-        let raw = b"HTTP/1.1 200 OK\r\n\
-                    Content-Length: 42\r\n\
-                    Transfer-Encoding: chunked\r\n\
-                    X-Keep: 1\r\n\
-                    \r\n";
-        let out = strip_content_length_when_chunked(raw, true);
-        assert_eq!(
-            out.as_ref(),
-            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Keep: 1\r\n\r\n"[..]
-        );
-        // Header-name match is case-insensitive.
-        let raw_lc = b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nX-Keep: 1\r\n\r\n";
-        let out_lc = strip_content_length_when_chunked(raw_lc, true);
-        assert_eq!(
-            out_lc.as_ref(),
-            &b"HTTP/1.1 200 OK\r\nX-Keep: 1\r\n\r\n"[..]
-        );
+    fn parse_upstream_response_304_is_bodyless() {
+        // RFC 9112 §6.3: a 304 never carries a body even with Content-Length.
+        let headers = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 500\r\n\r\n";
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+        assert_eq!(resp.framing, BodyFraming::ContentLength(0));
+        assert_eq!(resp.content_length(), Some(0));
     }
 
     #[test]
-    fn strip_content_length_when_chunked_is_verbatim_when_not_chunked() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
-        let out = strip_content_length_when_chunked(raw, false);
-        // Not chunked: returned without copying or modification.
-        assert!(matches!(out, Cow::Borrowed(_)));
-        assert_eq!(out.as_ref(), &raw[..]);
+    fn parse_upstream_response_204_is_bodyless() {
+        // RFC 9112 §6.3: a 204 never carries a body even with chunked framing.
+        let headers = b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+        assert_eq!(resp.framing, BodyFraming::ContentLength(0));
     }
 
     #[test]
@@ -7613,6 +7869,44 @@ mod tests {
         // Discard all remaining
         discard_incoming(&mut buf, &mut used, 3);
         assert_eq!(used, 0);
+    }
+
+    #[cfg(feature = "ktls")]
+    #[test]
+    fn record_framed_read_len_stops_at_record_boundary() {
+        // Front record header declares a 16384-byte payload (length bytes
+        // 3..5), so the whole record is 5 + 16384 bytes. The buffer is sized to
+        // hold the full record, mirroring the call site where
+        // `incoming_used <= incoming.len()`.
+        let record_total: usize = 5 + 16 * 1024;
+        let mut incoming = vec![0u8; record_total];
+        incoming[0] = 0x17; // application_data
+        incoming[1] = 0x03;
+        incoming[2] = 0x03;
+        incoming[3] = 0x40; // length hi
+        incoming[4] = 0x00; // length lo
+
+        // 100 bytes of the record buffered: ask for exactly the remainder,
+        // never reaching into the following record.
+        assert_eq!(record_framed_read_len(&incoming, 100), record_total - 100);
+
+        // Exactly one full record buffered: nothing more to read for it.
+        assert_eq!(record_framed_read_len(&incoming, record_total), 0);
+
+        // A tiny record (length 0): the 5-byte header is the whole record.
+        let hdr = [0x17u8, 0x03, 0x03, 0x00, 0x00];
+        assert_eq!(record_framed_read_len(&hdr, 5), 0);
+        assert_eq!(record_framed_read_len(&hdr, 2), 3);
+    }
+
+    #[cfg(feature = "ktls")]
+    #[test]
+    fn record_framed_read_len_asks_for_header_first() {
+        // Fewer than 5 bytes buffered: the length field is not yet readable,
+        // so ask only for enough to complete the 5-byte record header —
+        // without indexing past what is present.
+        assert_eq!(record_framed_read_len(&[], 0), 5);
+        assert_eq!(record_framed_read_len(&[0x17u8, 0x03, 0x03], 3), 2);
     }
 
     #[test]
