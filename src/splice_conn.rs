@@ -4335,7 +4335,12 @@ async fn splice_proxy_drive(
     // `handle_volatile_buffered_download` must carry the original path so
     // registry keys match across all backends (the hyper backend in
     // hyper_conn.rs always uses the client-request URI).
-    let original_uri_path = upstream_path;
+    // Strip the query so cache identity (registry keys, Origin rows) stays
+    // path-only; the query still rides on the upstream GET line via
+    // `upstream_path`. Matches the hyper backend.
+    let original_uri_path = upstream_path
+        .split_once('?')
+        .map_or(upstream_path, |(path, _)| path);
 
     // Check for a partial download file to resume (permanent files only).
     // Opens the file upfront (if it exists and is non-empty) to get size + mtime
@@ -6910,7 +6915,12 @@ pub(crate) async fn splice_simple_proxy(
     request_received_at: PreciseInstant,
 ) -> Result<(), SpliceProxyError> {
     let host_authority = mirror.format_authority();
-    let original_uri_path = upstream_path;
+    // Strip the query so cache identity (registry keys, Origin rows) stays
+    // path-only; the query still rides on the upstream GET line via
+    // `upstream_path`. Matches the hyper backend.
+    let original_uri_path = upstream_path
+        .split_once('?')
+        .map_or(upstream_path, |(path, _)| path);
 
     // Account this passthrough under `ACTIVE_CLIENT_DOWNLOADS` for the
     // duration of the function (RAII drop on every return path). The hyper

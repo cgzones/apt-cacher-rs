@@ -644,7 +644,9 @@ pub(crate) fn hint_sequential_read(
         return;
     }
 
-    // Avoid using `tokio::task::block_in_place`, since no real I/O is involved
+    // Avoid using `tokio::task::block_in_place`, since no real I/O is involved.
+    // SEQUENTIAL only (not NOREUSE): a cache proxy wants the pages retained for
+    // reuse across clients, which NOREUSE would drop after this read.
     if let Err(errno) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
         warn_once_or_debug!(
             "posix_fadvise(SEQUENTIAL) failed for `{}`:  {errno}",
