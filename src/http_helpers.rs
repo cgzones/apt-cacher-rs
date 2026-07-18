@@ -65,7 +65,10 @@ impl std::fmt::Display for ConnectionVersion {
 pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
     // The header block ends at the first empty line. Every header line ends in
     // LF (optionally preceded by CR), so an empty line begins right after some
-    // LF: either LF LF (bare-LF empty line) or LF CR LF.
+    // LF: either LF LF (bare-LF empty line) or LF CR LF. Do NOT simplify this
+    // to a `\r\n\r\n` search: httparse accepts bare LF, and a CRLF-only scan
+    // desyncs the sendfile keep-alive request boundary against the parser,
+    // dropping the next pipelined request.
     for (i, &b) in buf.iter().enumerate() {
         if b != b'\n' {
             continue;

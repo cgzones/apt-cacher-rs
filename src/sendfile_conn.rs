@@ -176,6 +176,7 @@ pub(crate) async fn handle_sendfile_connection(
                     None,
                 )
                 .await;
+                graceful_close(&stream).await;
                 return;
             }
         };
@@ -227,6 +228,7 @@ pub(crate) async fn handle_sendfile_connection(
                     );
                 }
 
+                graceful_close(&stream).await;
                 return;
             }
             ZeroCopyResult::Rejection {
@@ -250,7 +252,10 @@ pub(crate) async fn handle_sendfile_connection(
                         buf.advance(next_header_index);
                         continue;
                     }
-                    ConnectionAction::Close => return,
+                    ConnectionAction::Close => {
+                        graceful_close(&stream).await;
+                        return;
+                    }
                 }
             }
             ZeroCopyResult::AfterHeaderError | ZeroCopyResult::ClientError => {
@@ -283,7 +288,20 @@ async fn read_request_headers(
             ready = stream.readable() => {
                 ready?;
                 match stream.try_read_buf(buf) {
-                    Ok(0) => return Ok(None),
+                    Ok(0) => {
+                        if buf.is_empty() {
+                            // Clean close between requests.
+                            return Ok(None);
+                        }
+                        // Peer closed its write side mid-request, leaving a
+                        // partial header block buffered — a truncated request,
+                        // not a clean close. Surface it as a disconnect (the
+                        // caller's is_peer_disconnect branch handles UnexpectedEof).
+                        return Err(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "connection closed mid-request",
+                        ));
+                    }
                     Ok(n) => {
                         if let Some(next_index) = find_header_end(buf) {
                             trace!("Read {n} bytes from client, found header end at {next_index}");
@@ -317,6 +335,54 @@ async fn read_request_headers(
                     ),
                 ));
             }
+        }
+    }
+}
+
+/// Best-effort graceful close after writing an error/rejection response on a
+/// connection we are about to drop.  Half-closes the write side (FIN, which
+/// flushes the queued response) then briefly drains pending client input, so
+/// the final `close(2)` emits a FIN rather than an RST.  An RST can make the
+/// peer discard the response it has not read yet — e.g. a request that carried
+/// an unread body, which `compute_conn_action` deliberately does not drain.
+/// Bounded in both time and bytes so a slow or hostile client cannot pin the
+/// task here.
+async fn graceful_close(stream: &TcpStream) {
+    use std::os::fd::AsRawFd as _;
+
+    const DRAIN_BUDGET: usize = 64 * 1024;
+
+    // FIN out: response bytes flush; the read half stays open to drain.
+    if nix::sys::socket::shutdown(stream.as_raw_fd(), nix::sys::socket::Shutdown::Write).is_err() {
+        return;
+    }
+
+    let mut scratch = [0u8; 4096];
+    let mut drained = 0usize;
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(1));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            biased;
+            ready = stream.readable() => {
+                if ready.is_err() {
+                    return;
+                }
+                match stream.try_read(&mut scratch) {
+                    Ok(0) => return, // peer FIN: recv queue drained
+                    Ok(n) => {
+                        drained = drained.saturating_add(n);
+                        if drained >= DRAIN_BUDGET {
+                            return;
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+            () = &mut deadline => return,
         }
     }
 }
@@ -676,7 +742,7 @@ async fn try_sendfile_request(
                 *conn_version,
                 conn_action,
                 &mirror,
-                uri_path,
+                uri.path_and_query().map_or(uri_path, |pq| pq.as_str()),
                 client,
                 request_received_at,
             )
@@ -927,7 +993,7 @@ async fn try_sendfile_request(
             *conn_version,
             conn_action,
             &conn_details,
-            uri.path(),
+            uri.path_and_query().map_or(uri_path, |pq| pq.as_str()),
             appstate,
             RangeRequestHeaders::extract(req.headers),
         )
@@ -1818,6 +1884,11 @@ pub(crate) async fn async_sendfile(
 ) -> Result<u64, (u64, std::io::Error)> {
     let _counter = client_counter::ClientDownload::new();
 
+    // Nothing to transfer: skip the fd dup and the blocking-pool round-trip.
+    if count == 0 {
+        return Ok(0);
+    }
+
     let Ok(mut file_offset) = i64::try_from(offset) else {
         return Err((
             0,
@@ -1962,6 +2033,10 @@ pub(crate) async fn async_sendfile_unfinished(
     let mut remaining = content_length;
     let mut finished = false;
 
+    // A persistently failing fstat would otherwise log + bump the metric on
+    // every availability window; report it once per request.
+    let mut fstat_error_logged = false;
+
     // One dup pair for the whole transfer, reused across availability
     // windows (each window is one `sendfile_chunk_loop` call).
     let mut fds = SendfileFds::dup(socket, file).map_err(|e| (0, e))?;
@@ -1992,11 +2067,14 @@ pub(crate) async fn async_sendfile_unfinished(
                 ));
             }
             Err(errno) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to query metadata of downloading file `{}` during sendfile:  {errno}",
-                    file_path.display()
-                );
+                if !fstat_error_logged {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to query metadata of downloading file `{}` during sendfile:  {errno}",
+                        file_path.display()
+                    );
+                    fstat_error_logged = true;
+                }
                 offset_u64
             }
         };

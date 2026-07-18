@@ -10,12 +10,12 @@
 //!
 //! # Security
 //!
-//! `setsockopt(SOL_TLS, TLS_RX/TLS_TX)` copies the session key into kernel
-//! memory for the socket's lifetime. The kernel intentionally allows reading
-//! the full crypto state — including the key — back out via
-//! `getsockopt(SOL_TLS, TLS_RX/TLS_TX)`, with no opt-out: a kTLS socket fd is
-//! therefore a key-extraction capability until it is closed, to any holder of
-//! that fd (or a ptrace-capable attacker).
+//! `setsockopt(SOL_TLS, TLS_RX)` copies the RX session key into kernel
+//! memory for the socket's lifetime (this module configures RX only — see
+//! [`setup_rx`] — and never TX). On kernels >= 5.10 the kernel allows reading
+//! that key back via `getsockopt(SOL_TLS, TLS_RX)`, with no opt-out, so a
+//! kTLS socket fd is a key-extraction capability until it is closed, to any
+//! holder of that fd (or a ptrace-capable attacker).
 //!
 //! The userspace zeroization in this module ([`ZeroizingCryptoInfo`],
 //! `SecureVec`-backed buffers, dropping rustls' `AeadKey`) defends only
@@ -433,14 +433,15 @@ pub(crate) fn is_available() -> bool {
                 latch_unavailable();
                 return false;
             }
-            // Publish the support matrix before latching AVAILABLE so any
-            // thread observing AVAILABLE also observes the matrix.
+            // The Release store of KTLS_AVAILABLE below is paired with the
+            // Acquire load in rx_supported, so a thread observing AVAILABLE
+            // also observes the fully-published matrix.
             KTLS_RX_SUPPORT.store(mask, Ordering::Relaxed);
             info!(
                 "kTLS: kernel TLS support detected (RX ciphers: {})",
                 describe_rx_support(mask)
             );
-            KTLS_AVAILABLE.store(KTLS_PROBE_AVAILABLE, Ordering::Relaxed);
+            KTLS_AVAILABLE.store(KTLS_PROBE_AVAILABLE, Ordering::Release);
             true
         }
         TestResult::Unavailable => {
@@ -469,8 +470,9 @@ pub(crate) fn is_available() -> bool {
 /// The gate in `splice_conn.rs` calls this before `setup_rx` so an unsupported
 /// combo fails fast (deterministic `KtlsSetupFailed`) instead of wasting a full
 /// upstream request. An unknown version/cipher returns `false`. If the matrix
-/// was never populated (mask 0 but AVAILABLE — should not happen) this returns
-/// `true` and lets `setup_rx` decide, so the gate can never make things worse.
+/// isn't published yet (not AVAILABLE), or was never populated (mask 0 —
+/// should not happen once AVAILABLE), this returns `true` and lets `setup_rx`
+/// decide, so the gate can never make things worse.
 pub(crate) fn rx_supported(
     version: rustls::ProtocolVersion,
     secrets: &ConnectionTrafficSecrets,
@@ -484,6 +486,11 @@ pub(crate) fn rx_supported(
     let Some(bit) = combo_bit(tls_version, cipher_type) else {
         return false;
     };
+    // Acquire-paired with the Release store in is_available: observing
+    // AVAILABLE here guarantees the matrix below is fully published.
+    if KTLS_AVAILABLE.load(Ordering::Acquire) != KTLS_PROBE_AVAILABLE {
+        return true;
+    }
     let mask = KTLS_RX_SUPPORT.load(Ordering::Relaxed);
     if mask == 0 {
         return true;
@@ -551,8 +558,8 @@ fn copy_fixed<const N: usize>(src: &[u8], label: &'static str) -> io::Result<[u8
 /// is what makes the attach-at-connect order robust against upstreams that
 /// honor `Connection: close` aggressively.
 ///
-/// For TLS 1.3, once `TCP_TLS_RX` is set this also best-effort enables
-/// `TLS_RX_EXPECT_NO_PAD` (see [`enable_rx_expect_no_pad`]) — a kernel >= 5.19
+/// For TLS 1.3, once `TLS_RX` is set this also best-effort enables
+/// `TLS_RX_EXPECT_NO_PAD` (see [`enable_rx_expect_no_pad`]) — a kernel >= 6.0
 /// speculative-decrypt fast path. Failure there is non-fatal.
 pub(crate) fn setup_rx<F: AsFd>(
     fd: &F,
@@ -686,7 +693,7 @@ pub(crate) fn setup_rx<F: AsFd>(
 
 /// Best-effort: authorize the kernel's TLS 1.3 speculative "no padding"
 /// decrypt fast path (`setsockopt(SOL_TLS, TLS_RX_EXPECT_NO_PAD, 1)`,
-/// kernel >= 5.19), letting it decrypt directly into the final destination
+/// kernel >= 6.0), letting it decrypt directly into the final destination
 /// without a padding scan.
 ///
 /// Per <https://docs.kernel.org/networking/tls.html>: "If the record
@@ -700,11 +707,8 @@ pub(crate) fn setup_rx<F: AsFd>(
 /// non-fatal, this is a pure optimization.
 fn enable_rx_expect_no_pad<F: AsFd>(fd: &F) {
     let value: libc::c_int = 1;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "size_of::<c_int>() is always 4, well within socklen_t (u32)"
-    )]
-    let value_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let value_len =
+        libc::socklen_t::try_from(size_of::<libc::c_int>()).expect("c_int size fits socklen_t");
 
     // SAFETY: `fd` is a valid open socket for the lifetime of this call
     // (borrowed via `AsFd`); `value` is a live `c_int` and `value_len` is its
@@ -721,7 +725,7 @@ fn enable_rx_expect_no_pad<F: AsFd>(fd: &F) {
 
     if ret != 0 {
         let errno = nix::errno::Errno::last();
-        debug!("kTLS: TLS_RX_EXPECT_NO_PAD not supported (kernel < 5.19):  {errno}");
+        debug!("kTLS: TLS_RX_EXPECT_NO_PAD not supported (kernel < 6.0):  {errno}");
     }
 }
 

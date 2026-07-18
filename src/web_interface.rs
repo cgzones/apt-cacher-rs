@@ -2313,7 +2313,7 @@ impl WebResponse {
 /// completion, so a client aborting before the page was written out does not
 /// count as served (`SERVED_*` means "fully delivered", see `metrics.rs`).
 /// The sendfile path instead bumps after its synchronous write succeeds
-/// (`sendfile_conn::serve_webui_request`).
+/// (`sendfile_conn::serve_webui`).
 struct WebUiCountedBody {
     inner: Full<bytes::Bytes>,
     delivered: bool,
