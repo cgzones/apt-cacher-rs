@@ -870,14 +870,39 @@ fn classify_drain_action(record_type: Option<TlsGetRecordType>) -> DrainAction {
     }
 }
 
-/// Whether a TLS Handshake record payload contains a KeyUpdate message.
+/// TLS `Alert` record fields (RFC 8446 section 6): a 2-byte payload of
+/// `[AlertLevel, AlertDescription]`. `close_notify` is the peer's clean
+/// end-of-stream signal at warning level.
+const TLS_ALERT_LEVEL_WARNING: u8 = 1;
+const TLS_ALERT_DESC_CLOSE_NOTIFY: u8 = 0;
+
+/// Whether a peeked alert payload is a clean warning-level `close_notify` that
+/// the given drain context may treat as end-of-stream instead of failing
+/// closed.
+///
+/// Only the post-`setup_rx` [`DrainExpect::MaybeIdle`] drain accepts it: there,
+/// the alert being frontmost proves all application data was already consumed
+/// into `extra_body` (kTLS delivers records in order), so a clean close is the
+/// expected end, not a fault. The [`DrainExpect::DataReady`] splice-loop drain
+/// still fails closed -- a `close_notify` seen there means the peer closed
+/// *before* delivering data we polled for (truncation), which must surface as
+/// an error. Fatal alerts (level 2) and non-`close_notify` warnings never match.
+fn alert_is_clean_close(expect: DrainExpect, payload: &[u8]) -> bool {
+    expect == DrainExpect::MaybeIdle
+        && matches!(
+            payload,
+            [TLS_ALERT_LEVEL_WARNING, TLS_ALERT_DESC_CLOSE_NOTIFY]
+        )
+}
+
+/// Whether a TLS Handshake record payload contains a `KeyUpdate` message.
 ///
 /// Walks the handshake-message framing (1-byte type + 3-byte big-endian
 /// length) covering the case where the kernel coalesced several
 /// consecutive handshake records (e.g. `NewSessionTicket`s) into one
 /// delivery. Stops without error on a truncated tail (a fragmented
 /// message continues in the next record); detection is best-effort by
-/// design -- an undetected KeyUpdate still fails later as EBADMSG.
+/// design -- an undetected `KeyUpdate` still fails later as EBADMSG.
 fn handshake_contains_key_update(payload: &[u8]) -> bool {
     /// RFC 8446 `HandshakeType.key_update`.
     const HANDSHAKE_TYPE_KEY_UPDATE: u8 = 24;
@@ -1030,6 +1055,19 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
         let rt_to_consume = match classify_drain_action(record_type) {
             DrainAction::Done => return Ok(()),
             DrainAction::AbortAlert => {
+                if alert_is_clean_close(expect, buf.get(..peeked_bytes).unwrap_or_default()) {
+                    // Peer's clean end-of-stream. All application data already
+                    // sits in extra_body (this alert is frontmost, so no data
+                    // records precede it); serve that and let the connection
+                    // drop with the alert unread. A short body is still caught
+                    // downstream by the Content-Length check, same as any
+                    // truncated response.
+                    debug!(
+                        "kTLS: peer sent warning close_notify during post-setup drain \
+                         ({peeked_bytes} bytes); treating as clean end-of-stream"
+                    );
+                    return Ok(());
+                }
                 warn!(
                     "kTLS: peeked TLS Alert record ({peeked_bytes} bytes, left on socket); \
                      aborting kTLS setup so userspace TLS can read and decode it"
@@ -1287,6 +1325,24 @@ mod tests {
             classify_drain_action(Some(TlsGetRecordType::Unknown(99))),
             DrainAction::AbortUnknown,
         );
+    }
+
+    #[test]
+    fn alert_clean_close_only_close_notify_in_maybe_idle() {
+        // Warning close_notify in the post-setup drain: the one accepted case.
+        assert!(alert_is_clean_close(DrainExpect::MaybeIdle, &[1, 0]));
+        // Same alert in the data-ready splice-loop drain must still abort so a
+        // mid-stream truncation surfaces as an error.
+        assert!(!alert_is_clean_close(DrainExpect::DataReady, &[1, 0]));
+        // Fatal alerts (level 2) must reach userspace TLS, even a fatal record
+        // carrying the close_notify description byte.
+        assert!(!alert_is_clean_close(DrainExpect::MaybeIdle, &[2, 0]));
+        // Warning-level but not close_notify (e.g. user_canceled = 90).
+        assert!(!alert_is_clean_close(DrainExpect::MaybeIdle, &[1, 90]));
+        // Malformed payload lengths never match the exact 2-byte pattern.
+        assert!(!alert_is_clean_close(DrainExpect::MaybeIdle, &[]));
+        assert!(!alert_is_clean_close(DrainExpect::MaybeIdle, &[1]));
+        assert!(!alert_is_clean_close(DrainExpect::MaybeIdle, &[1, 0, 0]));
     }
 
     #[test]
@@ -1756,6 +1812,74 @@ mod tests {
     #[test]
     fn test_ktls_setup_rx_after_server_fin_tls13() {
         run_ktls_setup_rx_after_server_fin(&[&rustls::version::TLS13]);
+    }
+
+    /// A warning-level `close_notify` at the head of the kTLS receive queue is
+    /// the peer's clean end-of-stream, not a fault. The post-setup `MaybeIdle`
+    /// drain must accept it (so kTLS setup completes and the already-buffered
+    /// body is served instead of forcing a userspace-TLS refetch), while the
+    /// mid-stream `DataReady` drain must still fail closed so a truncated
+    /// response cannot pass as complete. Exercises the real kernel-decrypted
+    /// alert record, not just the pure `alert_is_clean_close` classifier.
+    #[expect(
+        clippy::print_stderr,
+        reason = "skip message when the kernel lacks the tls module"
+    )]
+    fn run_ktls_drain_close_notify(tls_versions: &[&'static rustls::SupportedProtocolVersion]) {
+        if !is_available() {
+            eprintln!("kTLS not available, skipping");
+            return;
+        }
+
+        let plaintext_msg = b"kTLS close_notify drain: body before the alert";
+
+        let mut harness = setup_ktls_test(tls_versions, |stream| {
+            stream.write_all(plaintext_msg).expect("write plaintext");
+            stream.flush().expect("flush");
+        });
+
+        // Drain post-handshake control records and read the body, leaving the
+        // server's close_notify as the frontmost queued record.
+        signal_and_drain(&harness);
+        let mut buf = [0u8; 1024];
+        let n = harness.tcp_client.read(&mut buf).expect("read body");
+        assert_eq!(&buf[..n], plaintext_msg, "kTLS should decrypt the body");
+
+        // Release the server to send close_notify, then FIN. Joining
+        // guarantees the alert record is on the wire before we drain.
+        harness.done_barrier.wait();
+        harness.server_handle.join().expect("server thread");
+
+        // Wait until the queued close_notify is readable.
+        let pollfd =
+            nix::poll::PollFd::new(harness.tcp_client.as_fd(), nix::poll::PollFlags::POLLIN);
+        let nready =
+            nix::poll::poll(&mut [pollfd], nix::poll::PollTimeout::from(5000u16)).expect("poll");
+        assert_eq!(nready, 1, "expected close_notify to be readable");
+
+        // MaybeIdle (post-setup) accepts the clean close as end-of-stream. The
+        // peek does not consume the record, so it stays queued for the next
+        // drain below.
+        drain_control_messages(harness.tcp_client.as_fd(), DrainExpect::MaybeIdle)
+            .expect("MaybeIdle drain must accept a clean close_notify");
+
+        // DataReady (mid-stream splice loop) must still fail closed on the same
+        // record so a truncated response cannot pass as complete.
+        let err = drain_control_messages(harness.tcp_client.as_fd(), DrainExpect::DataReady)
+            .expect_err("DataReady drain must reject a close_notify");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Clean `close_notify` handling in the post-setup drain, TLS 1.2.
+    #[test]
+    fn test_ktls_drain_close_notify_tls12() {
+        run_ktls_drain_close_notify(&[&rustls::version::TLS12]);
+    }
+
+    /// Clean `close_notify` handling in the post-setup drain, TLS 1.3.
+    #[test]
+    fn test_ktls_drain_close_notify_tls13() {
+        run_ktls_drain_close_notify(&[&rustls::version::TLS13]);
     }
 
     /// kTLS RX decryption works with the ChaCha20-Poly1305 cipher, which takes

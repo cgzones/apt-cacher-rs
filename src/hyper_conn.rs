@@ -2313,7 +2313,7 @@ async fn serve_new_file(
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header(SERVER, APP_NAME)
             .header(VIA, APP_VIA)
-            .header(DATE, format_http_date())
+            .header(DATE, &*format_http_date())
             .header(CONNECTION, "keep-alive")
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .header(RETRY_AFTER, HeaderValue::from(secs))
