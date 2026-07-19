@@ -205,6 +205,9 @@ strip = true
 codegen-units = 1
 panic = 'abort'
 
+[profile.dev]
+debug = "line-tables-only"
+
 # Speed up compile time query checking
 [profile.dev.package.sqlx-macros]
 opt-level = 3
