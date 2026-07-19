@@ -1619,7 +1619,7 @@ fn build_metrics_html() -> String {
         global_checksum_registry().len(),
     );
     t.row_tip(
-        "Integrity Throttled resources",
+        "Integrity Throttled Resources",
         "Resources currently rejected with 503 because a recent download failed checksum verification (exponential backoff; cleared by a successfully verified download).",
         WarnNonzero(global_verify_throttle().active_len() as u64),
     );
