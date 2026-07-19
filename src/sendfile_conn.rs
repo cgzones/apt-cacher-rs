@@ -1438,22 +1438,22 @@ async fn wait_socket_rated(
                 }
             }
         }
-    } else {
-        tokio::select! {
-            biased;
-            result = async {
-                match op {
-                    SocketReadiness::Readable => socket.readable().await,
-                    SocketReadiness::Writable => socket.writable().await,
-                }
-            } => result,
-            () = &mut outer => {
-                bump_timeout();
-                Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!("{timeout_msg} after {}", HumanFmt::Time(http_timeout)),
-                ))
+    }
+
+    tokio::select! {
+        biased;
+        result = async {
+            match op {
+                SocketReadiness::Readable => socket.readable().await,
+                SocketReadiness::Writable => socket.writable().await,
             }
+        } => result,
+        () = &mut outer => {
+            bump_timeout();
+            Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!("{timeout_msg} after {}", HumanFmt::Time(http_timeout)),
+            ))
         }
     }
 }
