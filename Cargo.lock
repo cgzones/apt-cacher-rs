@@ -103,6 +103,7 @@ dependencies = [
  "rand",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "scopeguard",
  "serde",
  "sha2 0.11.0",

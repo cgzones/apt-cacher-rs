@@ -748,11 +748,29 @@ fn build_rustls_client_config()
 
     #[cfg(not(feature = "webpki-roots"))]
     let tls_config = {
-        use hyper_rustls::ConfigBuilderExt as _;
+        let result = rustls_native_certs::load_native_certs();
+        for err in &result.errors {
+            warn!("native root CA loading error:  {}", error::ErrorReport(err));
+        }
+        if result.certs.is_empty() {
+            return Err(format!(
+                "no native root CA certificates found ({} errors)",
+                result.errors.len()
+            )
+            .into());
+        }
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let (valid, invalid) = root_store.add_parsable_certificates(result.certs);
+        debug!("Loaded {valid} native root CA certificates ({invalid} invalid)");
+        if root_store.is_empty() {
+            return Err(
+                format!("no valid native root CA certificates found ({invalid} invalid)").into(),
+            );
+        }
 
         rustls::ClientConfig::builder()
-            .with_native_roots()
-            .inspect_err(|err| error!("Failed to load native roots:  {}", error::ErrorReport(err)))?
+            .with_root_certificates(root_store)
             .with_no_client_auth()
     };
 
