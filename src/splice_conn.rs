@@ -79,6 +79,8 @@ use crate::{
 };
 #[cfg(feature = "ktls")]
 use crate::{KTLS_BLOCKED, warn_once};
+#[cfg(not(feature = "hyper"))]
+use crate::{ProxyCacheBody, VOLATILE_CACHE_MAX_AGE, error::UpstreamFetchError, full_body};
 use crate::{cache_layout, integrity};
 
 // On Linux, EAGAIN and EWOULDBLOCK share the same numeric value, so matching
@@ -6283,6 +6285,340 @@ async fn read_body_to_vec_until_eof(
     }
 
     Ok(body)
+}
+
+/// Read an upstream body with known `Content-Length` into a `Vec<u8>`.
+#[cfg(not(feature = "hyper"))]
+async fn read_body_to_vec_with_content_length(
+    upstream: &mut UpstreamConn,
+    prefix: &[u8],
+    content_length: u64,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let content_length = usize::try_from(content_length).map_err(|_err| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "content-length value too large to fit in memory address space",
+        )
+    })?;
+    if content_length > max_bytes {
+        return Err(std::io::Error::other(
+            "content-length exceeds cleanup buffering cap",
+        ));
+    }
+    if prefix.len() > content_length {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "upstream body prefix exceeds content-length",
+        ));
+    }
+
+    let config = global_config();
+    // Allocate incrementally (the per-iteration `reserve` below), like
+    // `read_body_to_vec_until_eof`: `content_length` is an untrusted upstream
+    // header and must not size an up-front allocation.
+    let mut body = Vec::with_capacity((prefix.len() + 32 * 1024).min(content_length));
+    body.extend_from_slice(prefix);
+    let mut rate_checker = config
+        .min_download_rate
+        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+
+    while body.len() < content_length {
+        let remaining = content_length - body.len();
+        body.reserve(TLS_READ_BUF_SIZE.min(remaining));
+        let n = match tokio::time::timeout(
+            config.http_timeout,
+            (&mut *upstream).take(remaining as u64).read_buf(&mut body),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "upstream closed before content-length body completed",
+                ));
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(err),
+            Err(tokio::time::error::Elapsed { .. }) => {
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "upstream read timed out during cleanup body buffering",
+                ));
+            }
+        };
+
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+
+        if let Some(ref mut rc) = rate_checker {
+            rc.add(n);
+            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
+                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
+            }
+        }
+    }
+
+    Ok(body)
+}
+
+/// Empty-bodied response for the cleanup bridge (`packages.rs` only reads the
+/// status on non-200s).
+#[cfg(not(feature = "hyper"))]
+fn cleanup_response(status: StatusCode) -> http::Response<ProxyCacheBody> {
+    http::Response::builder()
+        .status(status)
+        .body(full_body(bytes::Bytes::new()))
+        .expect("static response is valid")
+}
+
+/// Parse the `max-age` directive from a request's `Cache-Control` header.
+#[cfg(not(feature = "hyper"))]
+fn cache_control_max_age(
+    req: &http::Request<http_body_util::Empty<()>>,
+) -> Option<std::time::Duration> {
+    let value = req
+        .headers()
+        .get(http::header::CACHE_CONTROL)?
+        .to_str()
+        .ok()?;
+    value
+        .split(',')
+        .find_map(|directive| directive.trim().strip_prefix("max-age="))
+        .and_then(|secs| secs.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+}
+
+/// Serve a cleanup index request from the already-open cache file, if fresh.
+///
+/// Returns `None` when the cached copy is stale (or has a future mtime) and
+/// the caller should fetch upstream; `Some` carries either the cached bytes
+/// or a 500 on cache anomalies (mirroring the hyper backend's
+/// `serve_volatile_file` error handling).
+#[cfg(not(feature = "hyper"))]
+async fn serve_cached_cleanup_file(
+    mut file: tokio::fs::File,
+    cache_path: &Path,
+    req: &http::Request<http_body_util::Empty<()>>,
+) -> Option<http::Response<ProxyCacheBody>> {
+    let mdata = match file.metadata().await {
+        Ok(data) if data.file_type().is_file() => data,
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            error!(
+                "Cache file `{}` is not a regular file",
+                cache_path.display()
+            );
+            return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to get metadata of file `{}`:  {}",
+                cache_path.display(),
+                ErrorReport(&err)
+            );
+            return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+    };
+
+    let modified = mdata
+        .modified()
+        .expect("Platform should support modification timestamps via setup check");
+    let Ok(elapsed) = modified.elapsed() else {
+        warn!(
+            "Volatile file `{}` was modified in the future, ignoring modification time",
+            cache_path.display()
+        );
+        return None;
+    };
+    let max_age = cache_control_max_age(req).unwrap_or(VOLATILE_CACHE_MAX_AGE);
+    if elapsed >= max_age {
+        return None;
+    }
+
+    let max_bytes = limits::MAX_DECOMPRESSED_PACKAGES_SIZE.get();
+    if mdata.len() > max_bytes {
+        warn_once_or_info!(
+            "splice cleanup: cached file `{}` exceeds the {max_bytes} byte buffering cap, refetching",
+            cache_path.display()
+        );
+        return None;
+    }
+    let size = usize::try_from(mdata.len()).expect("size below buffering cap fits usize");
+
+    hint_sequential_read(&file, mdata.len(), cache_path);
+    let mut body = Vec::with_capacity(size);
+    match file.read_to_end(&mut body).await {
+        Ok(_bytes) => {
+            debug!(
+                "splice cleanup: serving `{}` from cache (age {} within {})",
+                cache_path.display(),
+                HumanFmt::Time(elapsed),
+                HumanFmt::Time(max_age)
+            );
+            Some(
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(full_body(body))
+                    .expect("cached response is valid"),
+            )
+        }
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to read file `{}`:  {}",
+                cache_path.display(),
+                ErrorReport(&err)
+            );
+            Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+    }
+}
+
+/// Cleanup index fetch for hyper-less builds: the `process_cache_request`
+/// bridge in `main.rs` lands here.
+///
+/// A cached copy younger than the request's `Cache-Control: max-age`
+/// (cleanup sends 1 week) is served without touching upstream. This
+/// deliberately diverges from the hyper backend, which revalidates
+/// conditionally past `VOLATILE_CACHE_MAX_AGE` (30s): without conditional
+/// refetch machinery here yet, honoring the caller-declared max-age avoids a
+/// full re-download of every index each cleanup cycle, and a stale index errs
+/// toward *keeping* cached debs — the conservative direction for cleanup.
+#[cfg(not(feature = "hyper"))]
+#[must_use]
+pub(crate) async fn splice_cleanup_request(
+    conn_details: &ConnectionDetails,
+    req: &http::Request<http_body_util::Empty<()>>,
+) -> http::Response<ProxyCacheBody> {
+    let cache_path = conn_details.cache_file_path();
+    match tokio_nofollow_options().read(true).open(&cache_path).await {
+        Ok(file) => {
+            if let Some(resp) = serve_cached_cleanup_file(file, &cache_path, req).await {
+                return resp;
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to open file `{}`:  {}",
+                cache_path.display(),
+                ErrorReport(&err)
+            );
+            return cleanup_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    cleanup_upstream_fetch(&conn_details.mirror, &req.uri().to_string()).await
+}
+
+#[cfg(not(feature = "hyper"))]
+#[must_use]
+async fn cleanup_upstream_fetch(
+    mirror: &Mirror,
+    upstream_uri: &str,
+) -> http::Response<ProxyCacheBody> {
+    let upstream_path_buf = upstream_uri
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_owned()));
+    let upstream_path = upstream_path_buf.as_deref().unwrap_or(upstream_uri);
+    let host_authority = mirror.format_authority();
+    let (up, resp, hdr_buf, hdr_end, _label, poolable) = match standard_upstream_connect(
+        mirror,
+        &host_authority,
+        upstream_path,
+        0,
+        None,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(_err) => {
+            debug!("splice cleanup request to {upstream_path} failed to connect/read headers");
+            let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
+            // `SpliceProxyError::Upstream` carries no payload (details were
+            // logged at the throw site); give cleanup's decision log a
+            // generic transport reason instead of a bare 502.
+            resp.extensions_mut().insert(UpstreamFetchError {
+                reason: "upstream connect or response-header read failed".to_owned(),
+            });
+            return resp;
+        }
+    };
+
+    let status = resp.status_code;
+    let port = mirror_port(mirror, up.is_tls());
+    let mut upstream = PoolGuard::new(up, mirror.host().to_string(), port, poolable);
+    let body_prefix = &hdr_buf[hdr_end..];
+
+    if status != StatusCode::OK {
+        // Drain the (small) error body so the connection returns to the pool;
+        // the `.xz` -> `.gz` -> raw probe cascade reuses it for the next format.
+        // Oversized or unreadable error bodies mark the connection non-poolable
+        // instead (via the cap error or `inspect_err`).
+        const MAX_ERROR_BODY_DRAIN: usize = 64 * 1024;
+        let drained = match resp.framing {
+            BodyFraming::Chunked => {
+                read_dechunk_body_to_vec(&mut upstream, body_prefix, MAX_ERROR_BODY_DRAIN)
+                    .await
+                    .inspect_err(|_| upstream.unset_poolable())
+            }
+            BodyFraming::ContentLength(cl) => read_body_to_vec_with_content_length(
+                &mut upstream,
+                body_prefix,
+                cl,
+                MAX_ERROR_BODY_DRAIN,
+            )
+            .await
+            .inspect_err(|_| upstream.unset_poolable()),
+            BodyFraming::CloseDelimited => {
+                upstream.unset_poolable();
+                Ok(Vec::new())
+            }
+        };
+        if let Err(err) = drained {
+            debug!("splice cleanup request to {upstream_path} failed to drain error body: {err}");
+        }
+        return cleanup_response(status);
+    }
+
+    let max_bytes: usize = limits::MAX_DECOMPRESSED_PACKAGES_SIZE
+        .get()
+        .try_into()
+        .expect("constant fits into usize");
+    let body = match resp.framing {
+        BodyFraming::Chunked => read_dechunk_body_to_vec(&mut upstream, body_prefix, max_bytes)
+            .await
+            .inspect_err(|_| upstream.unset_poolable()),
+        BodyFraming::ContentLength(cl) => {
+            read_body_to_vec_with_content_length(&mut upstream, body_prefix, cl, max_bytes)
+                .await
+                .inspect_err(|_| upstream.unset_poolable())
+        }
+        BodyFraming::CloseDelimited => {
+            upstream.unset_poolable();
+            read_body_to_vec_until_eof(&mut upstream, body_prefix, max_bytes).await
+        }
+    };
+
+    match body {
+        Ok(body) => http::Response::builder()
+            .status(StatusCode::OK)
+            .body(full_body(body))
+            .expect("upstream response is valid"),
+        Err(err) => {
+            debug!("splice cleanup request to {upstream_path} failed to read body: {err}");
+            let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
+            resp.extensions_mut().insert(UpstreamFetchError {
+                reason: ErrorReport(&err).to_string(),
+            });
+            resp
+        }
+    }
 }
 
 /// State machine for the buffered chunked-body decoder.

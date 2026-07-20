@@ -1,5 +1,6 @@
+#[cfg(feature = "hyper")]
+use std::borrow::Cow;
 use std::{
-    borrow::Cow,
     net::{IpAddr, Ipv6Addr},
     num::{NonZero, TryFromIntError},
     path::{Path, PathBuf},
@@ -80,6 +81,7 @@ impl MirrorEntry {
         MirrorKind::from_db_int(self.kind).unwrap_or(MirrorKind::Structured)
     }
 
+    #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn format_authority(&self) -> Cow<'_, str> {
         self.host.format_authority(self.port())
@@ -519,6 +521,7 @@ impl Database {
     }
 
     /// Returns mirrors whose `last_seen` is within the `active` range from the current time.
+    #[cfg(feature = "hyper")]
     pub(crate) async fn get_recent_mirrors(
         &self,
         active: Duration,

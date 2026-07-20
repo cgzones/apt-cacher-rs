@@ -3,6 +3,9 @@
     reason = "prefer documented and clear structure"
 )]
 
+#[cfg(not(any(feature = "hyper", feature = "splice")))]
+compile_error!("At least one HTTP backend must be enabled: feature \"hyper\" or \"splice\".");
+
 #[cfg(not(any(feature = "tls_hyper", feature = "tls_rustls")))]
 compile_error!("Either feature \"tls_hyper\" or \"tls_rustls\" must be enabled for this crate.");
 
@@ -18,10 +21,12 @@ mod cache_conditional;
 mod cache_layout;
 mod cache_metadata;
 mod cache_quota;
+#[cfg(feature = "hyper")]
 mod channel_body;
 mod cleanup;
 mod client_counter;
 mod config;
+mod connect_tunnel;
 mod database;
 mod database_task;
 mod deb_mirror;
@@ -34,6 +39,7 @@ mod http_helpers;
 mod http_last_modified;
 mod http_range;
 mod humanfmt;
+#[cfg(feature = "hyper")]
 mod hyper_conn;
 mod index_parser;
 mod integrity;
@@ -46,10 +52,11 @@ mod log_once;
 mod logstore;
 mod main_loop;
 mod metrics;
-#[cfg(feature = "mmap")]
+#[cfg(all(feature = "mmap", feature = "hyper"))]
 mod mmap_body;
 mod permitted_host_cache;
 mod precise_instant;
+#[cfg(feature = "hyper")]
 mod rate_checked_body;
 mod rate_checker;
 mod rate_log;
@@ -66,6 +73,7 @@ mod task_cache_scan;
 mod task_setup;
 #[cfg(feature = "splice")]
 mod tcp_cork_guard;
+mod tunnel_limiter;
 mod uncacheables;
 mod utils;
 mod verify_throttle;
@@ -91,15 +99,16 @@ use std::{
 
 use clap::Parser;
 use hashbrown::{Equivalent, HashMap};
+use http::Response;
+#[cfg(feature = "hyper")]
 use http::{
-    Response, StatusCode,
+    StatusCode,
     header::{ALLOW, CONNECTION, CONTENT_TYPE, DATE, SERVER, VIA},
 };
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
-use hyper_util::client::legacy::connect::HttpConnector;
 use pin_project::pin_project;
-#[cfg(feature = "mmap")]
+#[cfg(all(feature = "mmap", feature = "hyper"))]
 use rate_checked_body::{MaybeRated, RateCheckedBodyErr};
 use time::format_description::well_known::Rfc2822;
 use tokio::runtime::Builder;
@@ -324,6 +333,7 @@ pub(crate) static KTLS_BLOCKED: OnceLock<
 > = OnceLock::new();
 
 #[must_use]
+#[cfg(feature = "hyper")]
 fn quick_response<T: Into<bytes::Bytes>>(
     status: StatusCode,
     message: T,
@@ -352,7 +362,7 @@ pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
 
 #[pin_project(project = EnumProj)]
 #[cfg_attr(
-    feature = "mmap",
+    all(feature = "mmap", feature = "hyper"),
     expect(
         clippy::large_enum_variant,
         reason = "Mmap is the zero-allocation hot path; boxing it would add a heap \
@@ -360,7 +370,7 @@ pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
     )
 )]
 enum ProxyCacheBody {
-    #[cfg(feature = "mmap")]
+    #[cfg(all(feature = "mmap", feature = "hyper"))]
     Mmap(#[pin] MaybeRated<mmap_body::MmapBody>, ClientInfo),
     Boxed(#[pin] BoxBody<bytes::Bytes, Box<error::ProxyCacheError>>),
 }
@@ -368,7 +378,7 @@ enum ProxyCacheBody {
 impl Debug for ProxyCacheBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(feature = "mmap")]
+            #[cfg(all(feature = "mmap", feature = "hyper"))]
             Self::Mmap(_, _) => f.debug_tuple("Mmap").finish(),
             Self::Boxed(_) => f.debug_tuple("Boxed").finish(),
         }
@@ -386,7 +396,7 @@ impl Body for ProxyCacheBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.project() {
-            #[cfg(feature = "mmap")]
+            #[cfg(all(feature = "mmap", feature = "hyper"))]
             EnumProj::Mmap(memory_map, client) => memory_map
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
@@ -409,7 +419,7 @@ impl Body for ProxyCacheBody {
     #[inline]
     fn size_hint(&self) -> SizeHint {
         match self {
-            #[cfg(feature = "mmap")]
+            #[cfg(all(feature = "mmap", feature = "hyper"))]
             Self::Mmap(mmap_body, _) => mmap_body.size_hint(),
             Self::Boxed(box_body) => box_body.size_hint(),
         }
@@ -418,7 +428,7 @@ impl Body for ProxyCacheBody {
     #[inline]
     fn is_end_stream(&self) -> bool {
         match self {
-            #[cfg(feature = "mmap")]
+            #[cfg(all(feature = "mmap", feature = "hyper"))]
             Self::Mmap(mmap_body, _) => mmap_body.is_end_stream(),
             Self::Boxed(box_body) => box_body.is_end_stream(),
         }
@@ -426,7 +436,7 @@ impl Body for ProxyCacheBody {
 }
 
 enum ProxyCacheBodyData {
-    #[cfg(feature = "mmap")]
+    #[cfg(all(feature = "mmap", feature = "hyper"))]
     Mmap(mmap_body::MmapData),
     Bytes(bytes::Bytes),
 }
@@ -434,7 +444,7 @@ enum ProxyCacheBodyData {
 impl bytes::buf::Buf for ProxyCacheBodyData {
     fn remaining(&self) -> usize {
         match self {
-            #[cfg(feature = "mmap")]
+            #[cfg(all(feature = "mmap", feature = "hyper"))]
             Self::Mmap(memory_map) => memory_map.remaining(),
             Self::Bytes(bytes) => bytes.remaining(),
         }
@@ -442,7 +452,7 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
 
     fn chunk(&self) -> &[u8] {
         match self {
-            #[cfg(feature = "mmap")]
+            #[cfg(all(feature = "mmap", feature = "hyper"))]
             Self::Mmap(memory_map) => memory_map.chunk(),
             Self::Bytes(bytes) => bytes.chunk(),
         }
@@ -450,7 +460,7 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
 
     fn advance(&mut self, cnt: usize) {
         match self {
-            #[cfg(feature = "mmap")]
+            #[cfg(all(feature = "mmap", feature = "hyper"))]
             Self::Mmap(memory_map) => memory_map.advance(cnt),
             Self::Bytes(bytes) => bytes.advance(cnt),
         }
@@ -460,6 +470,7 @@ impl bytes::buf::Buf for ProxyCacheBodyData {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) database: database::Database,
+    #[cfg(feature = "hyper")]
     pub(crate) https_client: hyper_conn::HttpClient,
     pub(crate) active_downloads: active_downloads::ActiveDownloads,
 }
@@ -468,6 +479,7 @@ pub(crate) struct AppState {
 pub(crate) enum ContentLength {
     /// An exact size
     Exact(NonZero<u64>),
+    #[cfg(feature = "hyper")]
     /// A limit for an unknown size
     Unknown(NonZero<u64>),
 }
@@ -476,7 +488,9 @@ impl ContentLength {
     #[must_use]
     const fn upper(self) -> NonZero<u64> {
         match self {
-            Self::Exact(s) | Self::Unknown(s) => s,
+            Self::Exact(s) => s,
+            #[cfg(feature = "hyper")]
+            Self::Unknown(s) => s,
         }
     }
 }
@@ -485,9 +499,20 @@ impl Display for ContentLength {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exact(size) => write!(f, "exact {size} bytes"),
+            #[cfg(feature = "hyper")]
             Self::Unknown(limit) => write!(f, "up to {limit} bytes"),
         }
     }
+}
+
+#[must_use]
+#[cfg(not(feature = "hyper"))]
+pub(crate) async fn process_cache_request(
+    conn_details: cache_layout::ConnectionDetails,
+    req: http::Request<http_body_util::Empty<()>>,
+    _appstate: AppState,
+) -> Response<ProxyCacheBody> {
+    splice_conn::splice_cleanup_request(&conn_details, &req).await
 }
 
 #[must_use]
@@ -525,6 +550,7 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
         };
     }
 
+    feature_bool!(feature_hyper, "hyper");
     feature_bool!(feature_mmap, "mmap");
     feature_bool!(feature_sendfile, "sendfile");
     feature_bool!(feature_splice, "splice");
@@ -536,6 +562,9 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
             "\n",
             "TLS=",
             feature_tls!(),
+            "\n",
+            "hyper=",
+            feature_hyper!(),
             "\n",
             "mmap=",
             feature_mmap!(),
@@ -553,6 +582,9 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
         concat!(
             "TLS=",
             feature_tls!(),
+            "\n",
+            "hyper=",
+            feature_hyper!(),
             "\n",
             "mmap=",
             feature_mmap!(),
@@ -943,6 +975,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         }
     };
 
+    #[cfg(feature = "hyper")]
     let config_http_timeout = config.http_timeout;
 
     let checksum_registry = integrity::ChecksumRegistry::new(config.verify_checksums_max_entries);
@@ -1011,11 +1044,18 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         error!("Error during setup:  {err}");
     })?;
 
+    #[cfg(all(feature = "splice", feature = "tls_rustls", not(feature = "hyper")))]
+    {
+        let tls_config = build_rustls_client_config()?;
+        init_splice_tls_client_config(tls_config);
+    }
+
+    #[cfg(feature = "hyper")]
     let https_client = {
         // Disable Nagle on upstream connections.  Mirror requests are mostly
         // small headers followed by a long body read, where TCP_NODELAY shaves
         // up to a 40 ms ACK delay off every request.
-        let mut tcp_connector = HttpConnector::new();
+        let mut tcp_connector = hyper_util::client::legacy::connect::HttpConnector::new();
         tcp_connector.enforce_http(false);
         tcp_connector.set_nodelay(global_config().upstream_tcp_nodelay);
 
@@ -1065,9 +1105,18 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
 
     let _guard = Stopped;
 
-    runtime
-        .block_on(async { main_loop::main_loop(https_client).await })
-        .map(|()| std::process::ExitCode::SUCCESS)
+    let result = {
+        #[cfg(feature = "hyper")]
+        {
+            runtime.block_on(async { main_loop::main_loop(https_client).await })
+        }
+        #[cfg(not(feature = "hyper"))]
+        {
+            runtime.block_on(async { main_loop::main_loop().await })
+        }
+    };
+
+    result.map(|()| std::process::ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

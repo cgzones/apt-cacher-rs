@@ -40,6 +40,7 @@ use crate::{
     channel_body::{ChannelBody, ChannelBodyError},
     client_counter,
     config::HttpsUpgradeMode,
+    connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
     database_task::{
         DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
@@ -61,7 +62,7 @@ use crate::{
     rate_checker::RateCheckDirection,
     rate_log,
     request_dispatch::{DispatchOutcome, dispatch_request},
-    static_assert,
+    static_assert, tunnel_limiter,
     uncacheables::record_uncacheable,
     utils::{
         self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
@@ -3245,12 +3246,6 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
         }
     }
 
-    if !config.https_tunnel_enabled {
-        info!("Rejecting https tunnel request for client {client}");
-        metrics::TUNNEL_REJECTED_POLICY.increment();
-        return quick_response(StatusCode::FORBIDDEN, "HTTPS tunneling disabled");
-    }
-
     /*
      * Received an HTTP request like:
      * ```
@@ -3267,52 +3262,12 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
      * `on_upgrade` future.
      */
 
-    // Bound the authority length before any further work. hyper already
-    // bounds the request line, but defending here keeps the CONNECT path
-    // self-contained against any future relaxation of those limits.
-    if let Some(auth) = req.uri().authority()
-        && auth.as_str().len() > limits::MAX_AUTHORITY_LEN
-    {
-        warn_once_or_info!(
-            "Oversized CONNECT authority from client {client}: {} bytes",
-            auth.as_str().len()
-        );
-        return quick_response(StatusCode::BAD_REQUEST, "Invalid CONNECT address");
-    }
-
-    let Some((host, port)) = req.uri().authority().and_then(|a| {
-        a.port_u16()
-            .and_then(NonZero::new)
-            .map(|p| (a.host().to_string(), p))
-    }) else {
-        warn_once_or_info!(
-            "Invalid CONNECT address from client {client}: {}",
-            req.uri()
-        );
-        return quick_response(StatusCode::BAD_REQUEST, "Invalid CONNECT address");
+    // Shared with the sendfile/splice backend so tunnel policy stays identical
+    // across backends; logs and policy metrics are bumped inside the validator.
+    let (host, port) = match validate_connect_target(config, &client, req.uri()) {
+        Ok(hp) => hp,
+        Err(ConnectReject { status, msg }) => return quick_response(status, msg),
     };
-
-    if !config.https_tunnel_allowed_ports.is_empty()
-        && config
-            .https_tunnel_allowed_ports
-            .binary_search(&port)
-            .is_err()
-    {
-        info!("Rejecting https tunnel request for client {client} to disallowed port {port}");
-        metrics::TUNNEL_REJECTED_POLICY.increment();
-        return quick_response(StatusCode::FORBIDDEN, "HTTPS tunnel port not permitted");
-    }
-
-    if !config.https_tunnel_allowed_mirrors.is_empty()
-        && config
-            .https_tunnel_allowed_mirrors
-            .binary_search_by(|d| str::cmp(d, host.as_str()))
-            .is_err()
-    {
-        info!("Rejecting https tunnel request for client {client} due to disallowed host {host}");
-        metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
-        return quick_response(StatusCode::FORBIDDEN, "HTTPS tunnel target not permitted");
-    }
 
     let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
         let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max) else {
@@ -3757,87 +3712,6 @@ where
                 "Error serving connection for client {client}:  {}",
                 ErrorReport(&err)
             );
-        }
-    }
-}
-
-pub(crate) mod tunnel_limiter {
-    use std::net::IpAddr;
-    use std::num::NonZero;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use hashbrown::HashMap;
-
-    use crate::metrics;
-
-    static TUNNEL_CONNECTIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
-        std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-    /// Total active tunnels across all source IPs. Updated by
-    /// [`ActiveTunnelGuard`] on every CONNECT regardless of whether the
-    /// per-IP cap is configured, so the dashboard reflects real activity.
-    static ACTIVE_TUNNELS: AtomicUsize = AtomicUsize::new(0);
-
-    /// Current number of active HTTPS tunnel connections across all clients.
-    #[must_use]
-    pub(crate) fn active_tunnels() -> usize {
-        ACTIVE_TUNNELS.load(Ordering::Relaxed)
-    }
-
-    /// Unconditionally count an active CONNECT tunnel for the lifetime of
-    /// this guard. Updates [`metrics::CONNECT_TUNNEL_ACTIVE_PEAK`] on
-    /// construction.
-    ///
-    /// Independent from the per-IP rate-limit [`TunnelGuard`] so the
-    /// dashboard's "active" and "peak" counts are maintained even when
-    /// `https_tunnel_max_connections_per_client` is unset.
-    pub(super) struct ActiveTunnelGuard {
-        _private: (),
-    }
-
-    impl ActiveTunnelGuard {
-        pub(super) fn new() -> Self {
-            let current = ACTIVE_TUNNELS.fetch_add(1, Ordering::Relaxed) + 1;
-            metrics::CONNECT_TUNNEL_ACTIVE_PEAK.update(current as u64);
-            Self { _private: () }
-        }
-    }
-
-    impl Drop for ActiveTunnelGuard {
-        fn drop(&mut self) {
-            ACTIVE_TUNNELS.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Try to acquire a per-source-IP tunnel slot.
-    /// Returns `Some(TunnelGuard)` if under the limit, `None` if at capacity.
-    /// Does *not* update the active-tunnel counter — that's
-    /// [`ActiveTunnelGuard`]'s job, and the caller composes both guards.
-    pub(super) fn try_acquire(client_ip: IpAddr, max: NonZero<usize>) -> Option<TunnelGuard> {
-        let mut map = TUNNEL_CONNECTIONS.lock();
-        let count = map.entry(client_ip).or_insert(0);
-        if *count >= max.get() {
-            return None;
-        }
-        *count += 1;
-        drop(map);
-        Some(TunnelGuard { client_ip })
-    }
-
-    pub(super) struct TunnelGuard {
-        client_ip: IpAddr,
-    }
-
-    impl Drop for TunnelGuard {
-        fn drop(&mut self) {
-            let mut map = TUNNEL_CONNECTIONS.lock();
-            if let hashbrown::hash_map::Entry::Occupied(mut entry) = map.entry(self.client_ip) {
-                let count = entry.get_mut();
-                *count -= 1;
-                if *count == 0 {
-                    entry.remove();
-                }
-            }
         }
     }
 }
