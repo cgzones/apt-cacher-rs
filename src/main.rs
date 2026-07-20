@@ -595,7 +595,8 @@ struct Cli {
     /// file (or the built-in default when no file is loaded)
     #[arg(long, value_name = "PATH")]
     database_path: Option<PathBuf>,
-    /// Skip timestamp in log messages
+    /// Skip timestamp in log messages (e.g. under systemd/journald, which
+    /// prepends its own)
     #[arg(long, default_value = "false")]
     skip_log_timestamp: bool,
     /// Permit daemon running as root user (potentially dangerous)
@@ -830,8 +831,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_filter(tracing::level_filters::LevelFilter::WARN);
 
     let skip_timestamp = args.skip_log_timestamp;
-    // journald prepends its own timestamp
-    let skip_stderr_timestamp = skip_timestamp || std::env::var_os("JOURNAL_STREAM").is_some();
     let output_thread_names = output_log_level >= tracing::level_filters::LevelFilter::DEBUG;
     let stderr_is_tty = std::io::stderr().is_terminal();
 
@@ -843,7 +842,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .with_target(false)
                 .with_thread_names(output_thread_names)
                 .with_level(true);
-            let layer = if skip_stderr_timestamp {
+            let layer = if skip_timestamp {
                 base.without_time().with_filter(output_log_level).boxed()
             } else {
                 base.with_timer(UtcTimer)
