@@ -15,7 +15,6 @@ use crate::{
     config::Config,
     deb_mirror::Mirror,
     error::{ProxyCacheError, UpstreamFetchError},
-    hyper_conn::process_cache_request,
     index_parser::{Stanza, hex_encode, structured_lookup_key},
     limits::{
         CappedLine, LimitedReader, MAX_DECOMPRESSED_PACKAGES_SIZE, MAX_DECOMPRESSION_RATIO,
@@ -25,6 +24,13 @@ use crate::{
     precise_instant::PreciseInstant,
     xz_stream::xz_decoder,
 };
+// `process_cache_request` has a hyper implementation and a splice-only stub
+// (in `main.rs`) that bridges to `splice_cleanup_request`; cleanup calls it
+// identically in both builds.
+#[cfg(feature = "hyper")]
+use crate::hyper_conn::process_cache_request;
+#[cfg(not(feature = "hyper"))]
+use crate::process_cache_request;
 
 use super::engine::Candidate;
 use super::invalidate_metadata_for;

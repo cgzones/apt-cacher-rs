@@ -346,11 +346,14 @@ impl DownloadBarrier {
             " for mirror {} downloading file {}",
             data.mirror, data.debname,
         ));
+        #[cfg(feature = "hyper")]
         let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {
             download_rate_err,
             mirror: data.mirror.clone(),
             debname: data.debname.clone(),
         });
+        #[cfg(not(feature = "hyper"))]
+        let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {});
         self.abort_with_reason(reason).await;
         io_err
     }

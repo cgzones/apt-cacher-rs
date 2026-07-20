@@ -4,19 +4,25 @@ use std::{
 };
 
 use coarsetime::Instant;
+#[cfg(feature = "hyper")]
 use futures_util::StreamExt as _;
+#[cfg(feature = "hyper")]
 use http::{Method, Request, Uri, header::USER_AGENT};
+#[cfg(feature = "hyper")]
 use http_body_util::Empty;
 use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(not(feature = "sendfile"))]
 use crate::hyper_conn::handle_hyper_connection;
+#[cfg(feature = "hyper")]
+use crate::hyper_conn::{HttpClient, request_with_retry};
 #[cfg(feature = "sendfile")]
 use crate::sendfile_conn;
+#[cfg(feature = "hyper")]
+use crate::{APP_USER_AGENT, SCHEME_CACHE};
 use crate::{
-    APP_USER_AGENT, AppState, ClientInfo, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
-    SCHEME_CACHE,
+    AppState, ClientInfo, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
     active_downloads::ActiveDownloads,
     cache_layout, cache_metadata,
     cleanup::{
@@ -29,13 +35,12 @@ use crate::{
     error::ErrorReport,
     flat_blocklist, global_config,
     humanfmt::HumanFmt,
-    hyper_conn::{HttpClient, request_with_retry},
     metrics,
     task_cache_scan::task_cache_scan,
 };
 
 pub(crate) async fn main_loop(
-    https_client: HttpClient,
+    #[cfg(feature = "hyper")] https_client: HttpClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = global_config();
 
@@ -183,8 +188,9 @@ pub(crate) async fn main_loop(
         });
     }
 
-    // Scheme cache initialization task
-
+    // Scheme cache initialization task (hyper backend only — the splice-only
+    // build has no upstream HTTP client to issue the warm-up HEAD requests).
+    #[cfg(feature = "hyper")]
     {
         let database = database.clone();
         let client = https_client.clone();
@@ -283,6 +289,7 @@ pub(crate) async fn main_loop(
 
     let appstate = AppState {
         database,
+        #[cfg(feature = "hyper")]
         https_client,
         active_downloads: ActiveDownloads::new(),
     };

@@ -3,29 +3,38 @@ use std::{
     cmp::Reverse,
     fmt::{self, Display, Formatter, Write as _},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::LazyLock,
-    task::{Context, Poll},
     time::SystemTime,
+};
+#[cfg(feature = "hyper")]
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
 };
 
 use coarsetime::Instant;
 use hashbrown::HashMap;
+use http::StatusCode;
+#[cfg(feature = "hyper")]
 use http::{
-    Response, StatusCode,
+    Response,
     header::{
         CACHE_CONTROL, CONNECTION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, DATE, REFERRER_POLICY,
         SERVER, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
     },
 };
+#[cfg(feature = "hyper")]
 use http_body::{Body, Frame, SizeHint};
+#[cfg(feature = "hyper")]
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tracing::{debug, error, trace, warn};
 
+use crate::tunnel_limiter::active_tunnels;
+#[cfg(feature = "hyper")]
+use crate::{APP_NAME, ProxyCacheBody, http_range::format_http_date};
 use crate::{
-    APP_NAME, APP_VERSION, AppState, LOGSTORE, ProxyCacheBody, RUNTIMEDETAILS, RuntimeDetails,
-    cache_metadata,
+    APP_VERSION, AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails, cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
@@ -34,9 +43,7 @@ use crate::{
     deb_mirror::VALID_DEB_EXTENSIONS,
     get_features, global_cache_quota, global_checksum_registry, global_config,
     global_verify_throttle,
-    http_range::format_http_date,
     humanfmt::HumanFmt,
-    hyper_conn::tunnel_limiter::active_tunnels,
     metrics,
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
     warn_once_or_debug,
@@ -2272,6 +2279,7 @@ impl WebResponse {
     }
 
     /// Render this response as a `Response<ProxyCacheBody>` for the hyper path.
+    #[cfg(feature = "hyper")]
     pub(crate) fn into_hyper_response(self) -> Response<ProxyCacheBody> {
         let mut builder = Response::builder()
             .status(self.status)
@@ -2314,11 +2322,13 @@ impl WebResponse {
 /// count as served (`SERVED_*` means "fully delivered", see `metrics.rs`).
 /// The sendfile path instead bumps after its synchronous write succeeds
 /// (`sendfile_conn::serve_webui`).
+#[cfg(feature = "hyper")]
 struct WebUiCountedBody {
     inner: Full<bytes::Bytes>,
     delivered: bool,
 }
 
+#[cfg(feature = "hyper")]
 impl Drop for WebUiCountedBody {
     fn drop(&mut self) {
         if self.delivered {
@@ -2328,6 +2338,7 @@ impl Drop for WebUiCountedBody {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl Body for WebUiCountedBody {
     type Data = bytes::Bytes;
     type Error = std::convert::Infallible;

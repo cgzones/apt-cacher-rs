@@ -1,10 +1,7 @@
+use std::{io::ErrorKind, num::NonZero, os::fd::AsFd as _, path::Path, sync::Arc};
+#[cfg(feature = "hyper")]
 use std::{
-    io::ErrorKind,
-    num::NonZero,
-    os::fd::AsFd as _,
-    path::Path,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -14,19 +11,23 @@ use http::{
     header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE},
 };
 use nix::sys::sendfile::sendfile;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, Interest, ReadBuf},
-    net::TcpStream,
-};
+#[cfg(feature = "hyper")]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncWriteExt as _, Interest};
+use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(feature = "hyper")]
+use crate::hyper_conn::handle_hyper_connection;
 use crate::{
-    APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
+    APP_NAME, APP_VIA, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
     active_downloads::ActiveDownloadStatus,
     cache_conditional::CacheInfo,
     cache_layout::{CachedFlavor, ConnectionDetails},
     cache_metadata::{self, CacheMetadataKeyRef},
-    client_counter, content_type_for_cached_file,
+    client_counter,
+    connect_tunnel::{ConnectReject, validate_connect_target},
+    content_type_for_cached_file,
     database_task::{DatabaseCommand, DbCmdDelivery, send_db_command},
     error::{ErrorReport, errno_to_io_error},
     global_config,
@@ -37,14 +38,13 @@ use crate::{
     },
     http_range::{ParsedRange, format_http_date, http_parse_range},
     humanfmt::HumanFmt,
-    hyper_conn::handle_hyper_connection,
     metrics,
     permitted_host_cache::authorize_cache_access,
     precise_instant::PreciseInstant,
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
     rate_log,
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
-    static_assert,
+    static_assert, tunnel_limiter,
     utils::{hint_sequential_read, is_peer_disconnect, tokio_nofollow_options},
     warn_once_or_debug, warn_once_or_info,
     web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
@@ -87,6 +87,16 @@ pub(crate) enum ZeroCopyResult {
         status: StatusCode,
         conn_action: ConnectionAction,
         msg: &'static str,
+    },
+
+    /// Request is a policy-accepted CONNECT: hand the whole connection to
+    /// [`run_connect_tunnel`], which sends `200` and relays bytes bidirectionally.
+    /// The guards are held for the tunnel's lifetime.
+    Tunnel {
+        host: String,
+        port: NonZero<u16>,
+        tunnel_guard: Option<tunnel_limiter::TunnelGuard>,
+        active_guard: tunnel_limiter::ActiveTunnelGuard,
     },
 
     /// Sending a message to the client failed.
@@ -192,7 +202,13 @@ pub(crate) async fn handle_sendfile_connection(
         let result =
             try_sendfile_request(&buf, &stream, client, &appstate, &mut conn_version).await;
 
-        if !matches!(result, ZeroCopyResult::NotApplicable(_)) {
+        // NotApplicable is excluded from the count only because hyper
+        // re-dispatches (and itself counts) the request in hyper builds; the
+        // splice-only arm below answers it directly with a 503 — which
+        // records a client status — so count it here to keep
+        // REQUESTS_TOTAL >= CLIENT_STATUS_* (same invariant as the
+        // parse-error path above).
+        if cfg!(not(feature = "hyper")) || !matches!(result, ZeroCopyResult::NotApplicable(_)) {
             metrics::REQUESTS_TOTAL.increment();
         }
 
@@ -209,15 +225,34 @@ pub(crate) async fn handle_sendfile_connection(
                 return;
             }
             ZeroCopyResult::NotApplicable(reason) => {
-                // Fall back to hyper for this and all subsequent requests
-                debug!(
-                    "Falling back to hyper for client {client} on request #{req_num} due to: {reason} ({} bytes buffered)",
-                    buf.len()
-                );
+                #[cfg(feature = "hyper")]
+                {
+                    // Fall back to hyper for this and all subsequent requests
+                    debug!(
+                        "Falling back to hyper for client {client} on request #{req_num} due to: {reason} ({} bytes buffered)",
+                        buf.len()
+                    );
 
-                let stream = MaybePrependedStream::new(buf, stream);
+                    let stream = MaybePrependedStream::new(buf, stream);
 
-                return handle_hyper_connection(stream, client, appstate).await;
+                    return handle_hyper_connection(stream, client, appstate).await;
+                }
+                #[cfg(not(feature = "hyper"))]
+                {
+                    warn_once_or_info!(
+                        "Rejecting request from client {client} in splice-only backend due to unsupported sendfile fallback path: {reason}"
+                    );
+                    let _ignore = write_invalid_response(
+                        &stream,
+                        conn_version,
+                        ConnectionAction::Close,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Request not supported by splice backend",
+                        None,
+                    )
+                    .await;
+                    return;
+                }
             }
             ZeroCopyResult::Invalid { status, msg } => {
                 if let Err(err) = write_invalid_response(
@@ -265,6 +300,27 @@ pub(crate) async fn handle_sendfile_connection(
                         return;
                     }
                 }
+            }
+            ZeroCopyResult::Tunnel {
+                host,
+                port,
+                tunnel_guard,
+                active_guard,
+            } => {
+                // CONNECT tunnel consumes the whole connection.
+                run_connect_tunnel(
+                    stream,
+                    buf,
+                    next_header_index,
+                    conn_version,
+                    client,
+                    host,
+                    port,
+                    tunnel_guard,
+                    active_guard,
+                )
+                .await;
+                return;
             }
             ZeroCopyResult::AfterHeaderError | ZeroCopyResult::ClientError => {
                 // Error occurred, should have been already logged.
@@ -542,6 +598,282 @@ fn compute_conn_action(
     }
 }
 
+/// Validate a CONNECT request against tunnel policy and, on success, acquire
+/// the concurrency guards. Writes nothing to the socket — the outer connection
+/// loop owns the stream and drives [`run_connect_tunnel`] on the returned
+/// [`ZeroCopyResult::Tunnel`].
+///
+/// The proxy-client ACL (`allowed_proxy_clients`) is enforced here: the GET
+/// path enforces it via `authorize_cache_access`, which CONNECT never reaches.
+/// This mirrors the hyper backend, which checks the same ACL before tunnel
+/// validation.
+#[must_use]
+fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
+    let config = global_config();
+
+    let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
+    let client_ip = client.ip();
+    if !allowed_proxy_clients.is_empty()
+        && !allowed_proxy_clients
+            .iter()
+            .any(|ac| ac.contains(&client_ip))
+    {
+        warn_once_or_info!("Unauthorized proxy client {client}");
+        metrics::AUTHZ_REJECTED_CLIENT.increment();
+        return ZeroCopyResult::Rejection {
+            status: StatusCode::FORBIDDEN,
+            conn_action: ConnectionAction::Close,
+            msg: "Unauthorized client",
+        };
+    }
+
+    // A CONNECT request target is authority-form ("host:port"); parse it into a
+    // URI so the shared validator sees the same `authority()` the hyper backend
+    // gets from its pre-parsed request.
+    let uri = match target.parse::<http::uri::Uri>() {
+        Ok(uri) => uri,
+        Err(err) => {
+            warn_once_or_info!(
+                "Invalid CONNECT address from client {client}: {}:  {err}",
+                target.escape_debug()
+            );
+            return ZeroCopyResult::Rejection {
+                status: StatusCode::BAD_REQUEST,
+                conn_action: ConnectionAction::Close,
+                msg: "Invalid CONNECT address",
+            };
+        }
+    };
+
+    let (host, port) = match validate_connect_target(config, &client, &uri) {
+        Ok(hp) => hp,
+        Err(ConnectReject { status, msg }) => {
+            return ZeroCopyResult::Rejection {
+                status,
+                conn_action: ConnectionAction::Close,
+                msg,
+            };
+        }
+    };
+
+    let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
+        let Some(guard) = tunnel_limiter::try_acquire(client.ip(), max) else {
+            info!(
+                "Rejecting https tunnel request for client {client}: \
+                 concurrent connection limit ({max}) reached"
+            );
+            metrics::TUNNEL_REJECTED_CAPACITY.increment();
+            return ZeroCopyResult::Rejection {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                conn_action: ConnectionAction::Close,
+                msg: "Too many concurrent HTTPS tunnel connections",
+            };
+        };
+        Some(guard)
+    } else {
+        None
+    };
+
+    // Account for the active tunnel regardless of whether the per-IP cap is
+    // configured, so the dashboard's active/peak counts stay accurate.
+    let active_guard = tunnel_limiter::ActiveTunnelGuard::new();
+
+    ZeroCopyResult::Tunnel {
+        host,
+        port,
+        tunnel_guard,
+        active_guard,
+    }
+}
+
+/// Write a `502 Bad Gateway` (`"Upstream Error"`) for a CONNECT whose upstream
+/// connect failed *before* `200 Connection Established` was sent, then close.
+/// A write failure is logged and swallowed — the connection is being dropped.
+async fn write_tunnel_upstream_error(
+    stream: &TcpStream,
+    conn_version: ConnectionVersion,
+    client: ClientInfo,
+) {
+    if let Err(err) = write_invalid_response(
+        stream,
+        conn_version,
+        ConnectionAction::Close,
+        StatusCode::BAD_GATEWAY,
+        "Upstream Error",
+        None,
+    )
+    .await
+    {
+        info!(
+            "Failed to write tunnel 502 response to client {client}:  {}",
+            ErrorReport(&err)
+        );
+        return;
+    }
+    graceful_close(stream).await;
+}
+
+/// Drive a policy-accepted CONNECT tunnel to completion.
+///
+/// Consumes the connection. This DELIBERATELY diverges from the hyper backend:
+/// hyper emits `200 Connection Established` through its upgrade machinery
+/// *before* dialing upstream, so a failed upstream connect can only reach the
+/// client as `200` followed by an immediate close. Owning the raw socket here
+/// lets us connect upstream FIRST and, on an unreachable/refused/timed-out
+/// upstream, return a real `502 Bad Gateway` (per the 5xx convention) instead.
+/// This is also why the CONNECT integration tests dial a mock upstream rather
+/// than a real host: the connect must succeed for a `200` to be produced.
+///
+/// On a successful connect it writes `200 Connection Established`, forwards any
+/// pipelined bytes already buffered past the request header, then relays bytes
+/// bidirectionally. The guards are held for the whole tunnel lifetime.
+///
+/// `TUNNEL_CONNECTS_TOTAL` is bumped up front (the CONNECT was accepted), so a
+/// connect failure's `TUNNEL_TRANSFER_FAILED` bump stays a subset of it — the
+/// invariant documented on those counters in `metrics.rs`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tunnel relay threads the stream, buffered prefix, target and guards through one call"
+)]
+async fn run_connect_tunnel(
+    stream: TcpStream,
+    buf: BytesMut,
+    next_header_index: usize,
+    conn_version: ConnectionVersion,
+    client: ClientInfo,
+    host: String,
+    port: NonZero<u16>,
+    tunnel_guard: Option<tunnel_limiter::TunnelGuard>,
+    active_guard: tunnel_limiter::ActiveTunnelGuard,
+) {
+    let _tunnel_guard = tunnel_guard;
+    let _active_guard = active_guard;
+
+    let config = global_config();
+
+    metrics::TUNNEL_CONNECTS_TOTAL.increment();
+
+    // Connect upstream BEFORE sending `200`: owning the raw socket lets a failed
+    // connect surface as a real 502 (see the fn doc-comment).
+    let mut upstream = match tokio::time::timeout(
+        config.http_timeout,
+        TcpStream::connect((host.as_str(), port.get())),
+    )
+    .await
+    {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(err)) => {
+            metrics::TUNNEL_TRANSFER_FAILED.increment();
+            warn_once_or_info!(
+                "Tunnel connect to {host}:{port} for client {client} failed:  {}",
+                ErrorReport(&err)
+            );
+            write_tunnel_upstream_error(&stream, conn_version, client).await;
+            return;
+        }
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+            metrics::TUNNEL_TRANSFER_FAILED.increment();
+            info!(
+                "Tunnel connect to {host}:{port} for client {client} timed out after {}",
+                HumanFmt::Time(config.http_timeout)
+            );
+            write_tunnel_upstream_error(&stream, conn_version, client).await;
+            return;
+        }
+    };
+
+    // Disable Nagle on the tunnel: TLS handshake records and HTTP request
+    // headers are interactive, and a tunnel cannot coalesce them on our behalf.
+    if config.upstream_tcp_nodelay
+        && let Err(err) = upstream.set_nodelay(true)
+    {
+        warn_once_or_debug!(
+            "Failed to set TCP_NODELAY on upstream tunnel to {host}:{port}:  {}",
+            ErrorReport(&err)
+        );
+    }
+
+    // Upstream is connected: send `200 Connection Established` so the client may
+    // begin its TLS handshake. Header set mirrors the hyper backend's CONNECT
+    // response (RFC 9110 §7.6.3 requires `Via:` on proxy-generated responses).
+    let established = format!(
+        "{conn_version} 200 Connection Established\r\n\
+         Server: {APP_NAME}\r\n\
+         Via: {APP_VIA}\r\n\
+         Date: {}\r\n\
+         \r\n",
+        format_http_date()
+    );
+    metrics::record_client_status(StatusCode::OK);
+    if let Err(err) = write_all_to_stream(&stream, established.as_bytes(), WritePhase::Header).await
+    {
+        info!(
+            "Failed to send tunnel established response to client {client}:  {}",
+            ErrorReport(&err)
+        );
+        return;
+    }
+
+    info!("Using uncached tunnel for client {client} to {host}:{port}");
+
+    // Flush any client bytes already buffered past the CONNECT header (a
+    // pipelined TLS ClientHello); dropping them would stall the handshake.
+    if next_header_index < buf.len()
+        && let Err(err) = upstream.write_all(&buf[next_header_index..]).await
+    {
+        metrics::TUNNEL_TRANSFER_FAILED.increment();
+        warn_once_or_info!(
+            "Failed to forward buffered tunnel bytes to {host}:{port} for client {client}:  {}",
+            ErrorReport(&err)
+        );
+        return;
+    }
+
+    let mut stream = stream;
+    let start = PreciseInstant::now();
+    match tokio::io::copy_bidirectional_with_sizes(
+        &mut stream,
+        &mut upstream,
+        config.buffer_size,
+        config.buffer_size,
+    )
+    .await
+    {
+        Ok((from_client, from_server)) => {
+            metrics::BYTES_TUNNELED_CLIENT_TO_UPSTREAM.increment_by(from_client);
+            metrics::BYTES_TUNNELED_UPSTREAM_TO_CLIENT.increment_by(from_server);
+            info!(
+                "Tunneled client {client} wrote {} and received {} from {host}:{port} in {}",
+                HumanFmt::Size(from_client),
+                HumanFmt::Size(from_server),
+                HumanFmt::Time(start.elapsed())
+            );
+        }
+        Err(err) => {
+            metrics::TUNNEL_TRANSFER_FAILED.increment();
+            // OS-level `ETIMEDOUT` (TCP keepalive / `TCP_USER_TIMEOUT`) is a
+            // network condition, not a code error; log at info.
+            if err.kind() == ErrorKind::TimedOut {
+                info!(
+                    "Tunnel for client {client} to {host}:{port} timed out:  {}",
+                    ErrorReport(&err)
+                );
+            } else if is_peer_disconnect(&err) {
+                info!(
+                    "Tunnel for client {client} to {host}:{port} closed by peer:  {}",
+                    ErrorReport(&err)
+                );
+            } else {
+                error!(
+                    "Error tunneling connection for client {client} to {host}:{port}:  {}",
+                    ErrorReport(&err)
+                );
+            }
+        }
+    }
+}
+
 /// Try to serve a request using sendfile(2).
 /// Returns a [`ZeroCopyResult`] telling the caller how the request was (or
 /// was not) handled.
@@ -607,7 +939,7 @@ async fn try_sendfile_request(
     // Only handle GET requests via sendfile
     match req.method.expect("complete header parsed") {
         "GET" => {}
-        "CONNECT" => return ZeroCopyResult::NotApplicable("CONNECT method not supported"),
+        "CONNECT" => return handle_connect(client, req.path.expect("complete header parsed")),
         m => {
             warn_once_or_info!(
                 "Unsupported request method from client {client}: {}",
@@ -704,23 +1036,12 @@ async fn try_sendfile_request(
                 | RejectReason::UnsafePath => ZeroCopyResult::Invalid { status, msg },
             };
         }
-        // Pool filename failed the deb-extension or strict-flat-shape check;
-        // hand back to hyper so the simple proxy can handle it without caching.
-        DispatchOutcome::Passthrough {
-            reason: PassthroughReason::NonDebPool,
-            requested_host: _,
-            request_received_at: _,
-        } => return ZeroCopyResult::NotApplicable("unsupported pool filename"),
-        // Structured mirror has claimed this host's `flat/` anchor; hand back
-        // to hyper which will pass the request through uncached.
-        DispatchOutcome::Passthrough {
-            reason: PassthroughReason::FlatBlocked,
-            requested_host: _,
-            request_received_at: _,
-        } => return ZeroCopyResult::NotApplicable("flat host blocked by structured collision"),
         #[cfg(feature = "splice")]
         DispatchOutcome::Passthrough {
-            reason: PassthroughReason::Unrecognized,
+            reason:
+                PassthroughReason::Unrecognized
+                | PassthroughReason::NonDebPool
+                | PassthroughReason::FlatBlocked,
             requested_host,
             request_received_at,
         } => {
@@ -731,9 +1052,7 @@ async fn try_sendfile_request(
             };
 
             // Splice serves this request directly; hyper won't re-enter the
-            // dispatcher, so record here.  The `NotApplicable` arms above
-            // intentionally skip this - hyper records when it re-runs the
-            // dispatcher.
+            // dispatcher, so record here.
             record_uncacheable(&requested_host, uri_path);
 
             // Simple-proxy path: this Mirror is used only for upstream
@@ -800,6 +1119,18 @@ async fn try_sendfile_request(
                 },
             };
         }
+        #[cfg(not(feature = "splice"))]
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::NonDebPool,
+            requested_host: _,
+            request_received_at: _,
+        } => return ZeroCopyResult::NotApplicable("unsupported pool filename"),
+        #[cfg(not(feature = "splice"))]
+        DispatchOutcome::Passthrough {
+            reason: PassthroughReason::FlatBlocked,
+            requested_host: _,
+            request_received_at: _,
+        } => return ZeroCopyResult::NotApplicable("flat host blocked by structured collision"),
         #[cfg(not(feature = "splice"))]
         DispatchOutcome::Passthrough {
             reason: PassthroughReason::Unrecognized,
@@ -2375,6 +2706,10 @@ async fn serve_unfinished_sendfile(
     };
 
     // We need an exact content length to write a Content-Length header.
+    #[cfg_attr(
+        not(feature = "hyper"),
+        expect(irrefutable_let_patterns, reason = "only one variant")
+    )]
     let ContentLength::Exact(exact_size) = total_size else {
         warn_once_or_debug!(
             "Unknown content length for in-progress download of {} from mirror {}{aliased}",
@@ -2554,11 +2889,13 @@ async fn serve_unfinished_sendfile(
 /// A stream that may have prepended data from a previous read.
 /// When all prepended data is consumed, the buffer is dropped and
 /// subsequent reads go straight to the inner TCP stream.
+#[cfg(feature = "hyper")]
 struct MaybePrependedStream {
     prepend: Option<BytesMut>,
     stream: TcpStream,
 }
 
+#[cfg(feature = "hyper")]
 impl MaybePrependedStream {
     fn new(prepend: BytesMut, stream: TcpStream) -> Self {
         let prepend = if prepend.is_empty() {
@@ -2571,6 +2908,7 @@ impl MaybePrependedStream {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl AsyncRead for MaybePrependedStream {
     #[inline]
     fn poll_read(
@@ -2592,6 +2930,7 @@ impl AsyncRead for MaybePrependedStream {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl AsyncWrite for MaybePrependedStream {
     #[inline]
     fn poll_write(

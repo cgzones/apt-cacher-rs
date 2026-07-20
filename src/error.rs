@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+#[cfg(feature = "hyper")]
 use crate::{
     ClientInfo, ContentLength, channel_body::ChannelBodyError, deb_mirror::Mirror,
     rate_checker::InsufficientRate,
@@ -7,8 +8,11 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorDownloadRate {
+    #[cfg(feature = "hyper")]
     pub(crate) download_rate_err: InsufficientRate,
+    #[cfg(feature = "hyper")]
     pub(crate) mirror: Mirror,
+    #[cfg(feature = "hyper")]
     pub(crate) debname: String,
 }
 
@@ -16,6 +20,7 @@ pub(crate) struct MirrorDownloadRate {
 // holding the context fragment cannot outlive an `#[error("...")]` expression
 // -- hence thiserror's `fmt =` hook, whose parameters are the variant's fields
 // followed by the formatter.
+#[cfg(feature = "hyper")]
 fn fmt_mirror_download_rate(
     rate: &MirrorDownloadRate,
     f: &mut std::fmt::Formatter<'_>,
@@ -31,6 +36,7 @@ fn fmt_mirror_download_rate(
     )
 }
 
+#[cfg(feature = "hyper")]
 fn fmt_client_download_rate(
     error: &InsufficientRate,
     client: &ClientInfo,
@@ -51,19 +57,23 @@ fn fmt_client_download_rate(
 pub(crate) enum ProxyCacheError {
     #[error("{}", ErrorReport(.0))]
     Io(std::io::Error),
+    #[cfg(feature = "hyper")]
     #[error("{}", ErrorReport(.0))]
     Hyper(hyper::Error),
     #[error("{}", ErrorReport(.0))]
     Sqlx(sqlx::Error),
+    #[cfg(feature = "hyper")]
     #[error(fmt = fmt_client_download_rate)]
     ClientDownloadRate {
         error: InsufficientRate,
         client: ClientInfo,
     },
+    #[cfg(feature = "hyper")]
     #[error(fmt = fmt_mirror_download_rate)]
     MirrorDownloadRate(MirrorDownloadRate),
     #[error("{}", ErrorReport(.0))]
     Memfd(memfd::Error),
+    #[cfg(feature = "hyper")]
     #[error(
         "Upstream sent {received} bytes, exceeding the announced Content-Length of {announced}"
     )]
@@ -79,6 +89,7 @@ impl From<std::io::Error> for ProxyCacheError {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl From<hyper::Error> for ProxyCacheError {
     fn from(value: hyper::Error) -> Self {
         Self::Hyper(value)
@@ -91,6 +102,7 @@ impl From<sqlx::Error> for ProxyCacheError {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl From<ChannelBodyError> for ProxyCacheError {
     fn from(value: ChannelBodyError) -> Self {
         match value {
@@ -105,6 +117,7 @@ impl From<std::io::Error> for Box<ProxyCacheError> {
     }
 }
 
+#[cfg(feature = "hyper")]
 impl From<hyper::Error> for Box<ProxyCacheError> {
     fn from(value: hyper::Error) -> Self {
         Self::new(ProxyCacheError::Hyper(value))
