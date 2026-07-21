@@ -4364,6 +4364,9 @@ pub(crate) async fn splice_proxy(
         OriginateOutcome::Concurrent { status } => {
             return Ok(SpliceProxyOutcome::Concurrent { status });
         }
+        OriginateOutcome::AtCapacity { max } => {
+            return Ok(SpliceProxyOutcome::AtCapacity { max });
+        }
     };
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
@@ -7664,6 +7667,14 @@ pub(crate) enum SpliceProxyOutcome {
     Served,
     Concurrent {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    },
+    /// Origination refused by the `max_upstream_downloads` cap
+    /// (`OriginateOutcome::AtCapacity`); nothing was written to the client.
+    /// The sendfile caller answers with the canonical 503
+    /// (`"Too many concurrent upstream downloads"`) — not an error, the
+    /// connection stays usable.
+    AtCapacity {
+        max: NonZero<usize>,
     },
 }
 

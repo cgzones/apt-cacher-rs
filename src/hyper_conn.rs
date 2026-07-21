@@ -1821,6 +1821,7 @@ async fn serve_volatile_file(
             )
             .await
         }
+        InsertOutcome::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
     }
 }
 
@@ -2100,6 +2101,27 @@ async fn download_file(
     send_db_command(cmd).await;
 }
 
+/// Log and build the canonical 503 for a download origination refused by the
+/// `max_upstream_downloads` cap (`InsertOutcome::AtCapacity`). The
+/// `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened inside
+/// `ActiveDownloads::lookup_or_insert`, the enforcement site shared with the
+/// splice backend.
+#[must_use]
+fn upstream_cap_rejection(
+    conn_details: &ConnectionDetails,
+    max: NonZero<usize>,
+) -> Response<ProxyCacheBody> {
+    warn_once_or_info!(
+        "Max upstream downloads ({max}) exceeded, rejecting request for {} from client {}",
+        conn_details.debname,
+        conn_details.client
+    );
+    quick_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Too many concurrent upstream downloads",
+    )
+}
+
 #[must_use]
 async fn serve_new_file(
     conn_details: ConnectionDetails,
@@ -2274,21 +2296,6 @@ async fn serve_new_file(
     };
 
     let mut req_uri = std::borrow::Cow::Borrowed(req.uri());
-
-    if let Some(max) = config.max_upstream_downloads
-        && appstate.active_downloads.len() > max.get()
-    {
-        warn_once_or_info!(
-            "Max upstream downloads ({max}) exceeded, rejecting request for {} from client {}",
-            conn_details.debname,
-            conn_details.client
-        );
-        metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.increment();
-        return quick_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many concurrent upstream downloads",
-        );
-    }
 
     // Cleanup probes bypass the throttle: they run once per 24h cycle and a
     // 503 would hard-fail the index-fetch cascade; their commit outcome
@@ -3214,6 +3221,7 @@ pub(crate) async fn process_cache_request(
                     );
                     serve_downloading_file(conn_details, req, status, None).await
                 }
+                InsertOutcome::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
             }
         }
         Err(err) => {
