@@ -1361,6 +1361,20 @@ async fn try_sendfile_request(
                 )
                 .await
             }
+            Ok(SpliceProxyOutcome::AtCapacity { max }) => {
+                // Same log line and canonical 503 as the hyper backend's
+                // `upstream_cap_rejection`; the metric bump happened inside
+                // `ActiveDownloads::lookup_or_insert`.
+                warn_once_or_info!(
+                    "Max upstream downloads ({max}) exceeded, rejecting request for {} from client {client}",
+                    conn_details.debname,
+                );
+                ZeroCopyResult::Rejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    conn_action,
+                    msg: "Too many concurrent upstream downloads",
+                }
+            }
             Err(SpliceProxyError::Upstream) => ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_GATEWAY,
                 msg: "Upstream Error",
