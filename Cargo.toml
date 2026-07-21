@@ -9,7 +9,19 @@ repository = "https://github.com/cgzones/apt-cacher-rs"
 keywords = ["Debian", "proxy", "cache", "deb", "apt"]
 categories = ["caching"]
 edition = "2024"
-exclude = [".env", ".github/", ".gitignore", "dev.conf", "TODO"]
+exclude = [
+    ".cargo/",
+    ".dockerignore",
+    ".env",
+    ".github/",
+    ".gitignore",
+    "Dockerfile",
+    "TODO",
+    "clippy.toml",
+    "db.sqlite",
+    "dev.conf",
+    "deny.toml",
+]
 
 
 [features]
