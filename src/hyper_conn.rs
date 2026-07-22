@@ -61,6 +61,7 @@ use crate::{
     request_dispatch::{DispatchOutcome, dispatch_request},
     scheme_cache, static_assert, tunnel_limiter,
     uncacheables::record_uncacheable,
+    upstream_retry,
     utils::{
         self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
         tokio_tempfile, touch_volatile_mtime,
@@ -107,18 +108,19 @@ pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
 ) -> Result<(Response<Incoming>, http::request::Parts), hyper_util::client::legacy::Error> {
-    const MAX_ATTEMPTS: u32 = 10;
     // Auto-mode's HTTPS-upgrade revert branch only fires once `attempt`
     // has crossed this threshold; below it, transient connect errors
     // retry without reverting the scheme.
     const HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS: u32 = 2;
     // The Always-mode terminal-failure HTTPS_UPGRADE_FAILED bump below
-    // (gated on `attempt > MAX_ATTEMPTS` with `https_upgrade_test` still
+    // (gated on an exhausted retry budget with `https_upgrade_test` still
     // set) relies on the Auto-mode revert firing first. If MAX_ATTEMPTS
     // were ever <= HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS, Auto mode would
     // also fall through here with the flag set and bump HTTPS_UPGRADE_FAILED
-    // instead of HTTPS_UPGRADE_REVERTED.
-    static_assert!(MAX_ATTEMPTS > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS);
+    // instead of HTTPS_UPGRADE_REVERTED. (A wall-clock `upstream_retry_budget`
+    // spent before the third attempt has the same effect; the
+    // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity holds either way.)
+    static_assert!(upstream_retry::MAX_ATTEMPTS > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS);
 
     debug_assert_eq!(
         request.body().size_hint().exact(),
@@ -174,9 +176,10 @@ pub(crate) async fn request_with_retry(
         mut https_upgrade_test: bool,
     ) -> Result<(Response<Incoming>, http::request::Parts), (hyper_util::client::legacy::Error, Uri)>
     {
-        let mut attempt = 1;
-        let mut sleep_prev = 0;
-        let mut sleep_curr = 500;
+        let mut backoff = upstream_retry::Backoff::new(
+            global_config().upstream_retry_budget,
+            coarsetime::Instant::now(),
+        );
 
         loop {
             let req_clone = Request::from_parts(parts.clone(), Empty::new());
@@ -227,6 +230,7 @@ pub(crate) async fn request_with_retry(
                     if is_io_timed_out_in_chain(&err) {
                         metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
                     }
+                    let attempt = backoff.attempt();
                     if attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
                         && https_upgrade_test
                         && revertible
@@ -249,17 +253,15 @@ pub(crate) async fn request_with_retry(
                         uri_parts.scheme.clone_from(&orig_scheme);
                         parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
                         https_upgrade_test = false;
-                        sleep_prev = 0;
-                        sleep_curr = 500;
+                        backoff.reset_delay();
                         // The revert iteration is another upstream attempt
-                        // even though the retry budget (`attempt`) is not
-                        // consumed for it. Match the regular retry arm in
-                        // counting it as a retry.
+                        // even though the retry budget is not consumed for it.
+                        // Match `Backoff::next_retry` in counting it as a retry.
                         metrics::UPSTREAM_RETRIES.increment();
                         continue;
                     }
 
-                    if attempt > MAX_ATTEMPTS {
+                    let Some(delay) = backoff.next_retry(coarsetime::Instant::now()) else {
                         metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
                         if https_upgrade_test {
                             // Terminal connect failure with the upgrade flag
@@ -281,27 +283,26 @@ pub(crate) async fn request_with_retry(
                         // Single WARN authority for upstream-fetch failures: the
                         // non-connect arm above already warns; mirror it here so a
                         // connect-exhaustion terminal is logged once too (callers no
-                        // longer re-warn).
+                        // longer re-warn). The limit names which budget stopped the
+                        // retries -- attempt cap or `upstream_retry_budget`.
                         warn_once_or_info!(
-                            "Request of internal client to {} failed:  {}",
+                            "Request of internal client to {} failed after {attempt} connection attempts ({}):  {}",
                             parts.uri,
+                            backoff.limit(),
                             ErrorReport(&err)
                         );
 
                         return Err((err, parts.uri));
-                    }
+                    };
 
                     debug!(
-                        "Failed to connect to {} after {attempt} connection attempts, will retry in {sleep_curr} ms:  {}",
+                        "Failed to connect to {} after {attempt} connection attempts, will retry in {} ms:  {}",
                         parts.uri,
+                        delay.as_millis(),
                         ErrorReport(&err)
                     );
 
-                    attempt += 1;
-                    metrics::UPSTREAM_RETRIES.increment();
-
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_curr)).await;
-                    (sleep_curr, sleep_prev) = (sleep_curr + sleep_prev, sleep_curr);
+                    tokio::time::sleep(delay).await;
 
                     continue;
                 }
