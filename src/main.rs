@@ -62,6 +62,7 @@ mod rate_checker;
 mod rate_log;
 mod request_dispatch;
 mod ringbuffer;
+mod scheme_cache;
 #[cfg(feature = "ktls")]
 mod secure_vec;
 #[cfg(feature = "sendfile")]
@@ -84,7 +85,6 @@ mod xz_stream;
 use std::{
     fmt::Debug,
     fmt::Display,
-    hash::Hash,
     io::IsTerminal as _,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZero,
@@ -98,7 +98,8 @@ use std::{
 };
 
 use clap::Parser;
-use hashbrown::{Equivalent, HashMap};
+#[cfg(feature = "ktls")]
+use hashbrown::HashMap;
 use http::Response;
 #[cfg(feature = "hyper")]
 use http::{
@@ -263,69 +264,9 @@ impl Display for ClientInfo {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Scheme {
-    Http,
-    Https,
-}
-
-impl Display for Scheme {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Http => "http",
-            Self::Https => "https",
-        })
-    }
-}
-
-impl From<Scheme> for http::uri::Scheme {
-    fn from(scheme: Scheme) -> Self {
-        match scheme {
-            Scheme::Http => Self::HTTP,
-            Scheme::Https => Self::HTTPS,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "splice"))]
-impl Scheme {
-    /// Map an HTTP(S) URI scheme back to a `Scheme`; `None` for any other scheme.
-    pub(crate) fn from_uri_scheme(s: &http::uri::Scheme) -> Option<Self> {
-        if *s == http::uri::Scheme::HTTPS {
-            Some(Self::Https)
-        } else if *s == http::uri::Scheme::HTTP {
-            Some(Self::Http)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SchemeKey {
-    host: String,
-    port: Option<u16>,
-}
-
-#[derive(Hash)]
-pub(crate) struct SchemeKeyRef<'a> {
-    pub(crate) host: &'a str,
-    pub(crate) port: Option<u16>,
-}
-
-impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
-    fn equivalent(&self, key: &SchemeKey) -> bool {
-        let &Self { host, port } = self;
-        let SchemeKey {
-            host: khost,
-            port: kport,
-        } = key;
-        host == khost && port == *kport
-    }
-}
-
-pub(crate) static SCHEME_CACHE: OnceLock<parking_lot::RwLock<HashMap<SchemeKey, Scheme>>> =
-    OnceLock::new();
+pub(crate) use scheme_cache::Scheme;
+#[cfg(feature = "ktls")]
+pub(crate) use scheme_cache::{SchemeKey, SchemeKeyRef};
 
 #[cfg(feature = "ktls")]
 pub(crate) static KTLS_BLOCKED: OnceLock<
@@ -879,10 +820,6 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         .set(logstore::LogStore::new(config.logstore_capacity))
         .expect("Initial set in main() should succeed");
 
-    SCHEME_CACHE
-        .set(parking_lot::RwLock::new(HashMap::new()))
-        .expect("Initial set in main() should succeed");
-
     #[cfg(feature = "ktls")]
     KTLS_BLOCKED
         .set(parking_lot::RwLock::new(HashMap::new()))
@@ -1122,22 +1059,6 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
 #[cfg(test)]
 mod tests {
     use crate::content_type_for_cached_file;
-
-    #[test]
-    fn scheme_from_uri_scheme_roundtrip() {
-        use crate::Scheme;
-
-        assert_eq!(
-            Scheme::from_uri_scheme(&http::uri::Scheme::HTTPS),
-            Some(Scheme::Https)
-        );
-        assert_eq!(
-            Scheme::from_uri_scheme(&http::uri::Scheme::HTTP),
-            Some(Scheme::Http)
-        );
-        let ftp = http::uri::Scheme::try_from("ftp").expect("ftp is a valid scheme");
-        assert_eq!(Scheme::from_uri_scheme(&ftp), None);
-    }
 
     #[test]
     fn content_type_for_text_manifests() {
