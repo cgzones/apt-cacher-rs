@@ -2455,19 +2455,11 @@ impl DirStats {
 }
 
 fn merge_min(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.min(y)),
-        (Some(x), None) | (None, Some(x)) => Some(x),
-        (None, None) => None,
-    }
+    a.into_iter().chain(b).min()
 }
 
 fn merge_max(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.max(y)),
-        (Some(x), None) | (None, Some(x)) => Some(x),
-        (None, None) => None,
-    }
+    a.into_iter().chain(b).max()
 }
 
 type DirStatsCache = parking_lot::Mutex<HashMap<PathBuf, (Instant, DirStats)>>;
