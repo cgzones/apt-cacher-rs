@@ -96,6 +96,22 @@ pub(crate) fn find_header<'a>(
         .and_then(|h| std::str::from_utf8(h.value).ok())
 }
 
+/// Renders `Name: value\r\n` when `value` is `Some`, or nothing when `None`,
+/// writing straight into the formatter.  Lets a response template keep an
+/// optional header inline (`{opt_header}`) without a throwaway per-header
+/// `String` allocation on the hot serve path.
+pub(crate) struct OptHeader<T: std::fmt::Display>(pub(crate) &'static str, pub(crate) Option<T>);
+
+impl<T: std::fmt::Display> std::fmt::Display for OptHeader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(name, value) = self;
+        match value {
+            Some(value) => write!(f, "{name}: {value}\r\n"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Write a 304 Not Modified response to the stream.
 ///
 /// Times out after the configured HTTP timeout.
@@ -109,11 +125,6 @@ pub(crate) async fn write_304_response(
 ) -> std::io::Result<()> {
     let date = format_http_date();
 
-    let etag_header = match etag {
-        Some(etag) => format!("ETag: {etag}\r\n"),
-        None => String::new(),
-    };
-
     let response = format!(
         "{conn_version} 304 Not Modified\r\n\
          Date: {date}\r\n\
@@ -124,7 +135,8 @@ pub(crate) async fn write_304_response(
          {etag_header}\
          Accept-Ranges: bytes\r\n\
          Age: {age}\r\n\
-         \r\n"
+         \r\n",
+        etag_header = OptHeader("ETag", etag),
     );
     trace!("Outgoing 304 response:\n{response}");
     metrics::record_client_status(StatusCode::NOT_MODIFIED);
@@ -177,13 +189,8 @@ pub(crate) async fn write_invalid_response(
         ""
     };
 
-    let retry_after = match retry_after {
-        Some(remaining) => {
-            let secs = u32::try_from(remaining.as_secs().saturating_add(1)).unwrap_or(u32::MAX);
-            format!("Retry-After: {secs}\r\n")
-        }
-        None => String::new(),
-    };
+    let retry_after_secs = retry_after
+        .map(|remaining| u32::try_from(remaining.as_secs().saturating_add(1)).unwrap_or(u32::MAX));
 
     let response = format!(
         "{conn_version} {status}\r\n\
@@ -195,9 +202,10 @@ pub(crate) async fn write_invalid_response(
          Content-Length: {content_length}\r\n\
          Accept-Ranges: bytes\r\n\
          {extra_headers}\
-         {retry_after}\
+         {retry_after_header}\
          \r\n\
-         {msg}"
+         {msg}",
+        retry_after_header = OptHeader("Retry-After", retry_after_secs),
     );
     trace!("Outgoing error response:\n{response}");
     metrics::record_client_status(status);
@@ -225,16 +233,6 @@ pub(crate) async fn write_response_headers(
 ) -> std::io::Result<()> {
     let date = format_http_date();
 
-    let etag_header = match headers.etag {
-        Some(etag) => format!("ETag: {etag}\r\n"),
-        None => String::new(),
-    };
-
-    let content_range_header = match headers.content_range {
-        Some(cr) => format!("Content-Range: {cr}\r\n"),
-        None => String::new(),
-    };
-
     let response = format!(
         "{conn_version} {status}\r\n\
          Date: {date}\r\n\
@@ -255,6 +253,8 @@ pub(crate) async fn write_response_headers(
         content_type = headers.content_type,
         last_modified_str = headers.last_modified_str,
         age = headers.age,
+        content_range_header = OptHeader("Content-Range", headers.content_range),
+        etag_header = OptHeader("ETag", headers.etag),
     );
 
     trace!("Outgoing file response headers:\n{response}");
