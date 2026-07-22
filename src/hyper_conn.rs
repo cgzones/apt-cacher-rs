@@ -5,7 +5,6 @@ use std::{
 
 use bytes::Buf as _;
 use futures_util::TryStreamExt as _;
-use hashbrown::hash_map::EntryRef;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
     header::{
@@ -30,8 +29,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::mmap_body::MmapBody;
 use crate::{
     APP_NAME, APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, ProxyCacheBody,
-    SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef, VOLATILE_CACHE_MAX_AGE,
-    VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
+    Scheme, VOLATILE_CACHE_MAX_AGE, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
     active_downloads::{AbortReason, ActiveDownloadStatus, InsertOutcome},
     cache_conditional::CacheInfo,
     cache_layout::{self, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
@@ -39,7 +37,6 @@ use crate::{
     cache_quota::QuotaExceeded,
     channel_body::{ChannelBody, ChannelBodyError},
     client_counter,
-    config::HttpsUpgradeMode,
     connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
     database_task::{
@@ -62,7 +59,7 @@ use crate::{
     rate_checker::RateCheckDirection,
     rate_log,
     request_dispatch::{DispatchOutcome, dispatch_request},
-    static_assert, tunnel_limiter,
+    scheme_cache, static_assert, tunnel_limiter,
     uncacheables::record_uncacheable,
     utils::{
         self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
@@ -131,60 +128,38 @@ pub(crate) async fn request_with_retry(
 
     let (mut parts, _body) = request.into_parts();
 
-    let https_upgrade_mode = global_config().https_upgrade_mode;
-
     let orig_scheme = parts.uri.scheme().cloned();
 
-    let cached_scheme = parts.uri.authority().and_then(|auth| {
-        let key = SchemeKeyRef {
-            host: auth.host(),
-            port: auth.port_u16(),
-        };
-        SCHEME_CACHE
-            .get()
-            .expect("Initialized in main()")
-            .read()
-            .get(&key)
-            .copied()
-    });
-
     let mut https_upgrade_test = false;
+    let mut revertible = false;
 
     if let Some(os) = &orig_scheme
         && *os != http::uri::Scheme::HTTP
     {
+        // A non-HTTP original scheme (e.g. an explicit https:// proxied URL) is
+        // left untouched; the scheme cache is hyper-specifically not consulted.
         debug!("Not altering {os} scheme for request {}", parts.uri);
-    } else if let Some(scheme) = cached_scheme {
-        debug!(
-            "Using cached scheme {scheme} for host {}, original scheme is {orig_scheme:?}",
-            parts
-                .uri
-                .authority()
-                .expect("authority must exist for a cache entry")
-        );
-
-        let mut uri_parts = parts.uri.into_parts();
-        uri_parts.scheme = Some(scheme.into());
-        parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
     } else if let Some(auth) = parts.uri.authority() {
-        if global_config()
-            .http_only_mirrors
-            .iter()
-            .any(|mirror| mirror.permits(auth.host()))
-        {
-            debug!("Not altering {orig_scheme:?} scheme for http-only host {auth}");
-        } else if https_upgrade_mode != HttpsUpgradeMode::Never {
+        let decision = scheme_cache::resolve(auth.into(), global_config());
+        let scheme = if decision.is_upgrade_attempt() {
             debug!(
                 "No cached scheme for host {auth}, trying https upgrade from original scheme {orig_scheme:?}..."
             );
-
-            // try https upgrade
-            let mut uri_parts = parts.uri.into_parts();
-            uri_parts.scheme = Some(http::uri::Scheme::HTTPS);
-            parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
             https_upgrade_test = true;
+            revertible = decision.revertible();
             metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
-        }
+            http::uri::Scheme::HTTPS
+        } else {
+            let scheme = decision
+                .fixed_scheme()
+                .expect("non-upgrade decision has a fixed scheme");
+            debug!("Using {scheme} scheme for host {auth}, original scheme is {orig_scheme:?}");
+            scheme.into()
+        };
+        // `auth` is last used above; NLL ends its borrow so `parts.uri` can be consumed.
+        let mut uri_parts = parts.uri.into_parts();
+        uri_parts.scheme = Some(scheme);
+        parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
     }
 
     #[expect(
@@ -195,8 +170,7 @@ pub(crate) async fn request_with_retry(
         client: &HttpClient,
         mut parts: http::request::Parts,
         orig_scheme: Option<http::uri::Scheme>,
-        cached_scheme: Option<Scheme>,
-        https_upgrade_mode: HttpsUpgradeMode,
+        revertible: bool,
         mut https_upgrade_test: bool,
     ) -> Result<(Response<Incoming>, http::request::Parts), (hyper_util::client::legacy::Error, Uri)>
     {
@@ -212,38 +186,18 @@ pub(crate) async fn request_with_retry(
                     if https_upgrade_test {
                         metrics::HTTPS_UPGRADE_SUCCEEDED.increment();
                     }
-                    if cached_scheme.is_none()
-                        && let Some(auth) = parts.uri.authority()
-                    {
-                        let scheme = match parts.uri.scheme() {
-                            Some(s) if *s == http::uri::Scheme::HTTP => Some(Scheme::Http),
-                            Some(s) if *s == http::uri::Scheme::HTTPS => Some(Scheme::Https),
-                            s => {
-                                debug!("Not caching unsupported scheme {s:?} for host {auth}");
-                                None
-                            }
-                        };
-                        if let Some(scheme) = scheme {
-                            let key = SchemeKeyRef {
-                                host: auth.host(),
-                                port: auth.port_u16(),
-                            };
-                            let scheme_cache = SCHEME_CACHE.get().expect("Initialized in main()");
-                            if !scheme_cache.read().contains_key(&key)
-                                && let EntryRef::Vacant(ventry) =
-                                    scheme_cache.write().entry_ref(&key)
-                            {
-                                ventry.insert_entry_with_key(
-                                    SchemeKey {
-                                        host: key.host.to_owned(),
-                                        port: key.port,
-                                    },
-                                    scheme,
-                                );
+                    if let Some(auth) = parts.uri.authority() {
+                        if let Some(scheme) = parts.uri.scheme().and_then(Scheme::from_uri_scheme) {
+                            if scheme_cache::record_success(auth.into(), scheme) {
                                 debug!(
                                     "Added cached {scheme} scheme for host {auth}, original scheme was {orig_scheme:?}"
                                 );
                             }
+                        } else {
+                            debug!(
+                                "Not caching unsupported scheme {:?} for host {auth}",
+                                parts.uri.scheme()
+                            );
                         }
                     }
                     metrics::record_upstream_status(response.status());
@@ -275,17 +229,11 @@ pub(crate) async fn request_with_retry(
                     }
                     if attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
                         && https_upgrade_test
-                        && https_upgrade_mode != HttpsUpgradeMode::Always
+                        && revertible
                     {
-                        assert_eq!(
-                            cached_scheme, None,
-                            "https upgrade is only tried when no cached scheme exists"
-                        );
-                        assert_eq!(
-                            https_upgrade_mode,
-                            HttpsUpgradeMode::Auto,
-                            "branch ensures value is not Always, and Never does not perform upgrades"
-                        );
+                        // `revertible` is set only for an uncached Auto-mode upgrade
+                        // (see scheme_cache::decide): no cached scheme exists to
+                        // preserve and the mode is necessarily Auto.
 
                         debug!(
                             "Https upgrade failed for host {} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
@@ -322,23 +270,12 @@ pub(crate) async fn request_with_retry(
                             // identity.
                             metrics::HTTPS_UPGRADE_FAILED.increment();
                         }
-                        if let Some(auth) = parts.uri.authority() {
-                            let key = SchemeKeyRef {
-                                host: auth.host(),
-                                port: auth.port_u16(),
-                            };
-
-                            let value = SCHEME_CACHE
-                                .get()
-                                .expect("Initialized in main()")
-                                .write()
-                                .remove(&key);
-                            if let Some(scheme) = value {
-                                metrics::SCHEME_CACHE_REMOVED.increment();
-                                debug!(
-                                    "Removed cached scheme {scheme} for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}"
-                                );
-                            }
+                        if let Some(auth) = parts.uri.authority()
+                            && let Some(scheme) = scheme_cache::record_failure(auth.into())
+                        {
+                            debug!(
+                                "Removed cached scheme {scheme} for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}"
+                            );
                         }
 
                         // Single WARN authority for upstream-fetch failures: the
@@ -373,18 +310,12 @@ pub(crate) async fn request_with_retry(
     }
 
     if https_upgrade_test {
-        assert_eq!(
-            cached_scheme, None,
-            "https upgrade is only tried when no cached scheme exists"
-        );
-
         let client = client.clone();
 
         // Spawn a new task such that even if the client disconnects,
         // the task will continue to run and initialize the scheme cache.
         tokio::task::spawn(async move {
-            let result =
-                inner_loop(&client, parts, orig_scheme, None, https_upgrade_mode, true).await;
+            let result = inner_loop(&client, parts, orig_scheme, revertible, true).await;
             if let Err(ref err) = result {
                 // inner_loop already logged the transport error at WARN; keep this
                 // background-task framing at DEBUG so request_with_retry stays the
@@ -402,16 +333,9 @@ pub(crate) async fn request_with_retry(
         .await
         .expect("task should not panic")
     } else {
-        inner_loop(
-            client,
-            parts,
-            orig_scheme,
-            cached_scheme,
-            https_upgrade_mode,
-            false,
-        )
-        .await
-        .map_err(|err| err.0)
+        inner_loop(client, parts, orig_scheme, false, false)
+            .await
+            .map_err(|err| err.0)
     }
 }
 

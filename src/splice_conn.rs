@@ -27,7 +27,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_quota::QuotaExceeded;
-use crate::config::{ClientHost, HttpsUpgradeMode};
+use crate::config::ClientHost;
 use crate::database_task::{
     DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
 };
@@ -69,16 +69,17 @@ use crate::utils::{
 };
 use crate::xattr_helpers;
 use crate::{
-    APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, SCHEME_CACHE, Scheme,
-    SchemeKey, SchemeKeyRef, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
+    APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, Scheme,
+    VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
     active_downloads::{ActiveDownloadStatus, OriginateOutcome},
     cache_metadata, client_counter, content_type_for_cached_file, global_cache_quota,
     global_config, global_verify_throttle, metrics,
     permitted_host_cache::is_host_allowed_cached,
-    static_assert, warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
+    scheme_cache, static_assert, warn_on_content_type_mismatch, warn_once_or_debug,
+    warn_once_or_info,
 };
 #[cfg(feature = "ktls")]
-use crate::{KTLS_BLOCKED, warn_once};
+use crate::{KTLS_BLOCKED, SchemeKey, SchemeKeyRef, warn_once};
 #[cfg(not(feature = "hyper"))]
 use crate::{ProxyCacheBody, VOLATILE_CACHE_MAX_AGE, error::UpstreamFetchError, full_body};
 use crate::{cache_layout, integrity};
@@ -618,44 +619,7 @@ fn clear_pipe_writable_cache(sender: &pipe::Sender) {
 /// Returns `Some(Scheme::Http)` or `Some(Scheme::Https)` if known,
 /// `None` if unknown (should try HTTPS upgrade).
 fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
-    let config = global_config();
-
-    // Check scheme cache first
-    let key = SchemeKeyRef {
-        host: mirror.host(),
-        port: mirror.port().map(NonZero::get),
-    };
-    let cached = SCHEME_CACHE
-        .get()
-        .expect("Initialized in main()")
-        .read()
-        .get(&key)
-        .copied();
-    if let Some(cached) = cached {
-        return Some(cached);
-    }
-
-    // If upgrade mode is Never, always use HTTP
-    if config.https_upgrade_mode == HttpsUpgradeMode::Never {
-        return Some(Scheme::Http);
-    }
-
-    // If mirror is in http_only_mirrors, use HTTP
-    if config
-        .http_only_mirrors
-        .iter()
-        .any(|m| m.permits(mirror.host()))
-    {
-        return Some(Scheme::Http);
-    }
-
-    // If upgrade mode is Always, use HTTPS
-    if config.https_upgrade_mode == HttpsUpgradeMode::Always {
-        return Some(Scheme::Https);
-    }
-
-    // Auto mode with no cached scheme: try HTTPS
-    None
+    scheme_cache::resolve(mirror.into(), global_config()).fixed_scheme()
 }
 
 /// Connect to the upstream mirror, optionally establishing TLS.
@@ -1072,10 +1036,7 @@ async fn try_unbuffered_ktls_connect(
     }
 
     // Skip kTLS for mirrors where setup has recently failed (retry after KTLS_BLOCK_DURATION)
-    let key = SchemeKeyRef {
-        host: mirror.host().as_str(),
-        port: mirror.port().map(NonZero::get),
-    };
+    let key = SchemeKeyRef::from(mirror);
     {
         let blocked = KTLS_BLOCKED.get().expect("Initialized in main()");
         let now = coarsetime::Instant::now();
@@ -1929,23 +1890,7 @@ async fn unbuffered_ktls_request(
 
 /// Update the scheme cache for a mirror after successful connection.
 fn cache_scheme(mirror: &Mirror, scheme: Scheme) {
-    let key = SchemeKeyRef {
-        host: mirror.host().as_str(),
-        port: mirror.port().map(NonZero::get),
-    };
-    let scheme_cache = SCHEME_CACHE.get().expect("Initialized in main()");
-    if scheme_cache.read().contains_key(&key) {
-        return;
-    }
-
-    if let EntryRef::Vacant(ventry) = scheme_cache.write().entry_ref(&key) {
-        ventry.insert_entry_with_key(
-            SchemeKey {
-                host: key.host.to_owned(),
-                port: key.port,
-            },
-            scheme,
-        );
+    if scheme_cache::record_success(mirror.into(), scheme) {
         debug!(
             "splice proxy: cached {scheme} scheme for {}",
             mirror.format_authority()
@@ -3695,6 +3640,17 @@ async fn standard_upstream_connect(
         .await
         .map_err(|err| {
             warn_once_or_info!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
+            // Evict a stale cached scheme so the next request re-resolves,
+            // mirroring the hyper backend. Skip when a per-request redirect
+            // forced the scheme (symmetric with the cache_scheme guard below).
+            if scheme_override.is_none()
+                && let Some(scheme) = scheme_cache::record_failure(mirror.into())
+            {
+                debug!(
+                    "splice proxy: removed cached {scheme} scheme for {} after connect failure",
+                    mirror.format_authority()
+                );
+            }
             SpliceProxyError::Upstream
         })?;
     // A redirect's forced scheme is per-request; don't let it reprogram the

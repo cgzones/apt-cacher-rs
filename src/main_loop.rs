@@ -20,7 +20,7 @@ use crate::hyper_conn::{HttpClient, request_with_retry};
 #[cfg(feature = "sendfile")]
 use crate::sendfile_conn;
 #[cfg(feature = "hyper")]
-use crate::{APP_USER_AGENT, SCHEME_CACHE};
+use crate::{APP_USER_AGENT, scheme_cache};
 use crate::{
     AppState, ClientInfo, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
     active_downloads::ActiveDownloads,
@@ -261,10 +261,7 @@ pub(crate) async fn main_loop(
                 .collect::<Vec<_>>()
                 .await;
 
-            trace!(
-                "Scheme cache:  {:?}",
-                *SCHEME_CACHE.get().expect("initialized in main()").read()
-            );
+            trace!("Scheme cache:  {}", scheme_cache::debug_contents());
 
             debug!("Scheme cache initialization task finished");
         });
