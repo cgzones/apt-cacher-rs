@@ -618,26 +618,27 @@ fn clear_pipe_writable_cache(sender: &pipe::Sender) {
 ///
 /// Returns `Some(Scheme::Http)` or `Some(Scheme::Https)` if known,
 /// `None` if unknown (should try HTTPS upgrade).
+///
+/// kTLS-only: `standard_upstream_connect` resolves the richer `SchemeDecision`
+/// once and reuses it, so the kTLS pre-check is the sole remaining caller.
+#[cfg(feature = "ktls")]
 fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
     scheme_cache::resolve(mirror.into(), global_config()).fixed_scheme()
 }
 
 /// Connect to the upstream mirror, optionally establishing TLS.
 ///
-/// When the scheme is known (from cache or config), connects directly.
-/// In Auto mode with no cached scheme, tries HTTPS first and falls back to HTTP.
+/// `scheme` is resolved by the caller: `standard_upstream_connect` resolves the
+/// `SchemeDecision` once and reuses it for the pool-lookup key, the HTTPS-upgrade
+/// accounting, and this connect. `Some(_)` connects with that scheme directly;
+/// `None` is the Auto-upgrade case -- try HTTPS first, fall back to HTTP.
 ///
 /// Times out after the configured HTTP timeout.
 async fn connect_upstream(
     mirror: &Mirror,
-    scheme_override: Option<Scheme>,
+    scheme: Option<Scheme>,
 ) -> std::io::Result<(UpstreamConn, Scheme)> {
     let host = mirror.host().as_str();
-
-    let scheme = match scheme_override {
-        Some(s) => Some(s),
-        None => resolve_mirror_scheme(mirror),
-    };
 
     match scheme {
         Some(Scheme::Http) => {
@@ -3581,13 +3582,23 @@ async fn standard_upstream_connect(
     ),
     SpliceProxyError,
 > {
-    // Try a pooled connection first.
-    // Resolve scheme to determine the port for pool lookup. In Auto mode
-    // without a cached scheme there is no key to look up by, so account
-    // for it as `POOL_MISS_NO_SCHEME` and fall through to the fresh-connect
-    // path — the invariant `POOL_NEW ≈ sum(POOL_MISS_*)` then holds for
-    // first connections too.
-    if let Some(scheme) = scheme_override.or_else(|| resolve_mirror_scheme(mirror)) {
+    // Resolve the scheme decision ONCE per connect: it drives the pool-lookup
+    // key, the HTTPS-upgrade accounting, and the connect itself. `None` when a
+    // per-request redirect forced the scheme -- such a connect carries no
+    // decision and does no upgrade accounting.
+    let decision = scheme_override
+        .is_none()
+        .then(|| scheme_cache::resolve(mirror.into(), global_config()));
+    // The scheme to connect with: an explicit override wins, else the decision's
+    // fixed scheme (`None` = Auto upgrade, i.e. try HTTPS then fall back to HTTP).
+    let resolved_scheme =
+        scheme_override.or_else(|| decision.and_then(scheme_cache::SchemeDecision::fixed_scheme));
+
+    // Try a pooled connection first. In Auto mode without a cached scheme there
+    // is no key to look up by, so account for it as `POOL_MISS_NO_SCHEME` and
+    // fall through to the fresh-connect path — the invariant
+    // `POOL_NEW ≈ sum(POOL_MISS_*)` then holds for first connections too.
+    if let Some(scheme) = resolved_scheme {
         let is_tls = matches!(scheme, Scheme::Https);
         let port = mirror_port(mirror, is_tls);
         if let Some(mut pooled) = pool_checkout(mirror.host(), port, is_tls) {
@@ -3636,7 +3647,16 @@ async fn standard_upstream_connect(
 
     metrics::POOL_NEW.increment();
 
-    let (mut up, scheme) = connect_upstream(mirror, scheme_override)
+    // HTTPS-upgrade accounting (mirrors hyper's ATTEMPTED == SUCCEEDED + REVERTED
+    // + FAILED identity), read off the decision resolved above. A redirect connect
+    // carries no decision, so it does no upgrade accounting -- symmetric with the
+    // cache_scheme / record_failure guards.
+    let upgrade_attempt = decision.is_some_and(scheme_cache::SchemeDecision::is_upgrade_attempt);
+    if upgrade_attempt {
+        metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
+    }
+
+    let (mut up, scheme) = connect_upstream(mirror, resolved_scheme)
         .await
         .map_err(|err| {
             warn_once_or_info!("splice proxy: failed to connect to upstream {host_authority} for {upstream_path}:  {err}");
@@ -3651,12 +3671,30 @@ async fn standard_upstream_connect(
                     mirror.format_authority()
                 );
             }
+            if upgrade_attempt {
+                metrics::HTTPS_UPGRADE_FAILED.increment();
+            }
             SpliceProxyError::Upstream
         })?;
     // A redirect's forced scheme is per-request; don't let it reprogram the
     // global SCHEME_CACHE for this host.
     if scheme_override.is_none() {
         cache_scheme(mirror, scheme);
+        // Loop-exit upgrade outcome: HTTPS connected → SUCCEEDED; fell back to
+        // HTTP → REVERTED. Two deliberate divergences from hyper (the arithmetic
+        // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity holds either way):
+        // (1) a both-schemes-dead Auto host counts FAILED above, where hyper would
+        // count REVERTED; (2) splice counts here on connect/handshake success,
+        // before send_and_read_headers, so SUCCEEDED/REVERTED mean "the HTTPS
+        // upgrade connected" — a later header-read failure is not re-counted as
+        // FAILED (hyper, fusing connect+request, would). metrics.rs's "successful
+        // upstream response" wording describes hyper's timing.
+        if upgrade_attempt {
+            match scheme {
+                Scheme::Https => metrics::HTTPS_UPGRADE_SUCCEEDED.increment(),
+                Scheme::Http => metrics::HTTPS_UPGRADE_REVERTED.increment(),
+            }
+        }
     }
 
     let is_tls = up.is_tls();
@@ -4689,6 +4727,10 @@ async fn splice_proxy_drive(
     ) = match unbuffered_result {
         KtlsResult::Ready(tcp, state) => {
             cache_scheme(mirror, Scheme::Https);
+            // The kTLS fast path is outside HTTPS_UPGRADE_* accounting: a
+            // successful kTLS-served upgrade bumps neither ATTEMPTED nor
+            // SUCCEEDED (see metrics.rs). Not an identity violation -- both
+            // sides are skipped together.
             // kTLS connections must NOT be pooled: the socket has kernel TLS
             // RX configured for this specific session's keys and sequence
             // numbers. Reusing it for a new request would layer a new TLS

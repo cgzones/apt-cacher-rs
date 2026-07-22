@@ -146,8 +146,7 @@ impl SchemeDecision {
     }
 
     /// hyper: is this an HTTPS-upgrade attempt (set `https_upgrade_test`, bump
-    /// `HTTPS_UPGRADE_ATTEMPTED`)? Hyper-only; splice reads `fixed_scheme` instead.
-    #[cfg(any(test, feature = "hyper"))]
+    /// `HTTPS_UPGRADE_ATTEMPTED`)? splice reads it for its own upgrade accounting.
     pub(crate) fn is_upgrade_attempt(self) -> bool {
         matches!(self, Self::AlwaysUpgrade | Self::AutoUpgrade)
     }

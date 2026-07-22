@@ -518,27 +518,39 @@ pub(crate) static CACHE_QUOTA_UTIL_PEAK_BPS: Peak = Peak::new();
 /// HTTPS upgrade attempted on an HTTP request (Auto / uncached scheme).
 /// Every attempt resolves to exactly one of `HTTPS_UPGRADE_SUCCEEDED`,
 /// `HTTPS_UPGRADE_REVERTED`, or `HTTPS_UPGRADE_FAILED`, so the identity
-/// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` holds.
+/// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` holds. Both the hyper and
+/// splice backends write these counters; the identity holds per-backend and
+/// in aggregate, though the mechanism differs (see each subset below). The
+/// splice kTLS fast path is an exception: a successful kTLS-served HTTPS
+/// upgrade caches the scheme and serves without bumping ATTEMPTED/SUCCEEDED,
+/// so on a healthy HTTPS mirror these can stay near zero in a `ktls` build.
 pub(crate) static HTTPS_UPGRADE_ATTEMPTED: Counter = Counter::new();
-/// HTTPS upgrade succeeded: bumped on the first successful upstream
+/// HTTPS upgrade succeeded. hyper: bumped on the first successful upstream
 /// response (any status) after the upgrade flag was set. The host's
 /// https scheme is also cached in this same code path when no entry
 /// exists yet, but the metric fires before the cache-write check, so a
 /// response with an unsupported scheme or a non-2xx status still
-/// counts as a success here.
+/// counts as a success here. splice: bumped at connect/handshake success
+/// (before the response headers are read), so a later header-read failure
+/// is not re-counted as `HTTPS_UPGRADE_FAILED`.
 pub(crate) static HTTPS_UPGRADE_SUCCEEDED: Counter = Counter::new();
-/// HTTPS upgrade reverted: Auto-mode gave up on the upgrade after
-/// `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS` connect failures and reverted
-/// to the original scheme. The request itself may still succeed via the
-/// original scheme — this counter only marks that the upgrade attempt
-/// was abandoned, not that the request as a whole failed.
+/// HTTPS upgrade reverted: the upgrade was abandoned in favour of the
+/// original scheme (the request may still succeed via it; this counter only
+/// marks that the upgrade attempt was abandoned, not that the request as a
+/// whole failed). hyper: Auto-mode gave up after
+/// `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS` connect failures and reverted.
+/// splice: the one-shot HTTPS-then-HTTP fallback in `connect_upstream`
+/// connected via HTTP for an Auto-mode upgrade attempt.
 pub(crate) static HTTPS_UPGRADE_REVERTED: Counter = Counter::new();
-/// HTTPS upgrade failed terminally: the request returned without
-/// the upgrade resolving to a success or a revert. Reached when
-/// Always-mode exhausts all `MAX_ATTEMPTS` connect retries (Auto-mode
-/// would have reverted first, see `HTTPS_UPGRADE_REVERTED`), or when
-/// any mode hits a non-connect transport error (e.g. read timeout,
-/// request framing) that terminates the request without retry.
+/// HTTPS upgrade failed terminally: the upgrade attempt resolved to neither
+/// success nor revert. hyper: Always-mode exhausts the connect-retry budget
+/// (attempt cap or `upstream_retry_budget`; Auto-mode would normally have
+/// reverted first, see `HTTPS_UPGRADE_REVERTED`, unless the wall-clock budget
+/// ran out before the third attempt), or any mode hits a non-connect transport
+/// error (e.g. read timeout, request framing) that terminates the request
+/// without retry. splice: the connect retry loop exhausts its budget with both
+/// schemes failing (including a both-schemes-dead Auto host, which splice
+/// counts here where hyper would count `HTTPS_UPGRADE_REVERTED`).
 pub(crate) static HTTPS_UPGRADE_FAILED: Counter = Counter::new();
 
 /// Scheme-cache entries purged after `MAX_ATTEMPTS` connection failures.
