@@ -36,7 +36,7 @@ use crate::error::{ErrorReport, errno_to_io_error};
 use crate::guards::{DownloadBarrier, InitBarrier};
 use crate::http_etag::{is_valid_etag, write_etag};
 use crate::http_helpers::{
-    ConnectionAction, ConnectionVersion, WritePhase, find_header, write_416_response,
+    ConnectionAction, ConnectionVersion, OptHeader, WritePhase, find_header, write_416_response,
     write_all_to_stream, write_invalid_response,
 };
 use crate::http_last_modified::write_last_modified;
@@ -5646,20 +5646,9 @@ async fn splice_proxy_drive(
          Age: {age}\r\n\
          {content_range_header}\
          \r\n",
-        last_modified_header = if let Some(lm) = last_modified_str {
-            format!("Last-Modified: {lm}\r\n")
-        } else {
-            String::new()
-        },
-        etag_header = match upstream_resp.etag.as_deref() {
-            Some(etag) => format!("ETag: {etag}\r\n"),
-            None => String::new(),
-        },
-        content_range_header = if let Some(ref cr) = content_range_hdr {
-            format!("Content-Range: {cr}\r\n")
-        } else {
-            String::new()
-        },
+        last_modified_header = OptHeader("Last-Modified", last_modified_str),
+        etag_header = OptHeader("ETag", upstream_resp.etag.as_deref()),
+        content_range_header = OptHeader("Content-Range", content_range_hdr.as_ref()),
     );
 
     // Cork the socket to coalesce headers + body prefix into fewer TCP segments
@@ -7215,20 +7204,12 @@ async fn handle_volatile_buffered_download(
          Age: {age}\r\n\
          {content_range_header}\
          \r\n",
-        last_modified_header = if last_modified_str.is_empty() {
-            String::new()
-        } else {
-            format!("Last-Modified: {last_modified_str}\r\n")
-        },
-        etag_header = match upstream_resp.etag.as_deref() {
-            Some(etag) => format!("ETag: {etag}\r\n"),
-            None => String::new(),
-        },
-        content_range_header = if let Some(ref cr) = content_range_hdr {
-            format!("Content-Range: {cr}\r\n")
-        } else {
-            String::new()
-        },
+        last_modified_header = OptHeader(
+            "Last-Modified",
+            (!last_modified_str.is_empty()).then_some(last_modified_str),
+        ),
+        etag_header = OptHeader("ETag", upstream_resp.etag.as_deref()),
+        content_range_header = OptHeader("Content-Range", content_range_hdr.as_ref()),
     );
 
     // Cork to coalesce headers + body into fewer TCP segments.
