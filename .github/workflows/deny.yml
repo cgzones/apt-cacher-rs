@@ -14,6 +14,10 @@ on:
       - "**/Cargo.lock"
       - "**/deny.toml"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   dependency_linting:
     permissions:
