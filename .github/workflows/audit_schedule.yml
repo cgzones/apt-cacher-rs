@@ -1,4 +1,4 @@
-name: Audit Dependencies
+name: Audit Dependencies (Scheduled)
 on:
   schedule:
     - cron: "0 0 * * 1"

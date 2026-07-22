@@ -36,7 +36,7 @@ jobs:
         # `.comment` section that `[profile.release] strip = true` leaves
         # behind. cargo-deb has no option to add an md5sums control file,
         # so it is generated below.
-        run: cargo deb --strip
+        run: cargo deb --locked --strip
 
       - name: Add md5sums control file
         run: |

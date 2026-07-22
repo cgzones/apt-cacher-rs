@@ -1,6 +1,13 @@
 name: Rust
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,13 +32,13 @@ jobs:
           components: clippy
 
       - name: Build
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose build --verbose
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose build --verbose --locked
 
       - name: Lint via Clippy
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose clippy --all-targets -- -D warnings -D clippy::pedantic
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose clippy --all-targets --locked -- -D warnings -D clippy::pedantic
 
       - name: Test
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose test --verbose
+        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --verbose test --verbose --locked
 
   formatting:
     permissions:
