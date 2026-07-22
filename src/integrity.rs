@@ -33,7 +33,7 @@ use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
 use crate::limits::LimitedReader;
-use crate::utils::{nofollow_options, tokio_nofollow_options};
+use crate::utils::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
 use crate::xz_stream::xz_decoder;
 use crate::{
     cache_layout::ResourceKind,
@@ -196,25 +196,12 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 /// Open `path` with `O_NOFOLLOW`, hint sequential read, and hash it.
 fn hash_file(path: &Path, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
     let mut file = nofollow_options().read(true).open(path)?;
-    hint_sequential_read_std(&file, path);
+    // `u64::MAX`: hashing reads the whole file, and no cheap size is on hand
+    // without an extra fstat, so always advise.
+    hint_sequential_read(&file, u64::MAX, path);
     match algo {
         HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut file),
         HashAlgo::Sha512 => index_parser::hash_open_file::<sha2::Sha512>(&mut file),
-    }
-}
-
-/// Hint sequential read on a `std::fs::File`. Mirrors the logic of
-/// `crate::utils::hint_sequential_read`, which requires `&tokio::fs::File`
-/// and cannot be called from a synchronous context.
-fn hint_sequential_read_std(file: &std::fs::File, path: &Path) {
-    use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
-
-    if let Err(errno) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
-        // Non-fatal: fall back to the kernel's default readahead policy.
-        debug!(
-            "posix_fadvise(SEQUENTIAL) failed for `{}`:  {errno}",
-            path.display()
-        );
     }
 }
 

@@ -628,13 +628,15 @@ const SEQUENTIAL_HINT_MIN_SIZE: u64 = 256 * 1024;
 /// Hint to the kernel that `file` will be read sequentially from start to end,
 /// so the page-cache readahead window can grow more aggressively.  Used on
 /// every cache file we are about to stream to a client through the
-/// hyper/sendfile paths.  `transfer_size` is the number of bytes about to be
-/// streamed (`u64::MAX` when unknown, e.g. a still-growing download); small
-/// transfers skip the syscall.  Failure is non-fatal — the first failure is
-/// logged at warn level (subsequent ones at debug) and we fall back to the
-/// kernel's default readahead policy.
+/// hyper/sendfile paths, and on files hashed for integrity verification.
+/// Accepts any `AsFd`, so both `tokio::fs::File` (async serve paths) and
+/// `std::fs::File` (synchronous hashing) can call it.  `transfer_size` is the
+/// number of bytes about to be read (`u64::MAX` when unknown, e.g. a
+/// still-growing download); small transfers skip the syscall.  Failure is
+/// non-fatal — the first failure is logged at warn level (subsequent ones at
+/// debug) and we fall back to the kernel's default readahead policy.
 pub(crate) fn hint_sequential_read(
-    file: &tokio::fs::File,
+    file: impl std::os::fd::AsFd,
     transfer_size: u64,
     display_path: &Path,
 ) {
