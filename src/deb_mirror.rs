@@ -509,6 +509,27 @@ fn needs_normalization(path: &str) -> bool {
     path.split('/').any(|seg| seg == ".")
 }
 
+/// Shared tail parse for the `dists/<dist>/<component>/<scope>/<file>` index
+/// families that differ only by their fixed scope segment (`source` for
+/// `Sources`, `i18n` for `Translation`, `dep11` for `Icon`).  `parts` is the
+/// `rsplit('/')` iterator positioned just after the filename; on success it has
+/// consumed the scope, component, and distribution segments and confirmed
+/// nothing precedes them.  Returns `(component, distribution)`.
+fn scoped_component_dist<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    scope: &str,
+) -> Option<(&'a str, &'a str)> {
+    if parts.next()? != scope {
+        return None;
+    }
+    let component = parts.next()?;
+    let distribution = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((component, distribution))
+}
+
 /// Parses a request path into the mirror path and the filename.
 ///
 /// The directory name "pool" is not supported as part of the mirror path.
@@ -612,17 +633,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if filename == "Sources" || filename == "Sources.gz" || filename == "Sources.xz" {
-            if parts.next()? != "source" {
-                return None;
-            }
-
-            let component = parts.next()?;
-            let distribution = parts.next()?;
-
-            if parts.next().is_some() {
-                return None;
-            }
-
+            let (component, distribution) = scoped_component_dist(&mut parts, "source")?;
             return Some(ResourceFile::Sources {
                 mirror_path,
                 distribution,
@@ -630,17 +641,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if is_translation_filename(filename) {
-            if parts.next()? != "i18n" {
-                return None;
-            }
-
-            let component = parts.next()?;
-            let distribution = parts.next()?;
-
-            if parts.next().is_some() {
-                return None;
-            }
-
+            let (component, distribution) = scoped_component_dist(&mut parts, "i18n")?;
             return Some(ResourceFile::Translation {
                 mirror_path,
                 distribution,
@@ -648,17 +649,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if filename.starts_with("icons-") {
-            if parts.next()? != "dep11" {
-                return None;
-            }
-
-            let component = parts.next()?;
-            let distribution = parts.next()?;
-
-            if parts.next().is_some() {
-                return None;
-            }
-
+            let (component, distribution) = scoped_component_dist(&mut parts, "dep11")?;
             return Some(ResourceFile::Icon {
                 mirror_path,
                 distribution,
