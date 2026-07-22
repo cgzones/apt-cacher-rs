@@ -76,6 +76,7 @@ mod task_setup;
 mod tcp_cork_guard;
 mod tunnel_limiter;
 mod uncacheables;
+mod upstream_retry;
 mod utils;
 mod verify_throttle;
 mod web_interface;

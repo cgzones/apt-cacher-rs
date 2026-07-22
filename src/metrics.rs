@@ -505,7 +505,8 @@ pub(crate) static UPSTREAM_DOWNLOAD_CAP_TRANSITIONS: Counter = Counter::new();
 /// Requests rejected (503) because the active-download set was already at the cap.
 pub(crate) static UPSTREAM_DOWNLOAD_REJECTED_CAP: Counter = Counter::new();
 
-/// Retry attempts in `request_with_retry` past the first (connect failures).
+/// Upstream connect attempts past the first, bumped by
+/// `upstream_retry::Backoff::next_retry` for both backends.
 pub(crate) static UPSTREAM_RETRIES: Counter = Counter::new();
 
 /// Log-ring evictions due to overflow (raise `logstore_capacity` if non-zero).
@@ -553,7 +554,7 @@ pub(crate) static HTTPS_UPGRADE_REVERTED: Counter = Counter::new();
 /// counts here where hyper would count `HTTPS_UPGRADE_REVERTED`).
 pub(crate) static HTTPS_UPGRADE_FAILED: Counter = Counter::new();
 
-/// Scheme-cache entries purged after `MAX_ATTEMPTS` connection failures.
+/// Scheme-cache entries purged after the connect-retry budget was exhausted.
 pub(crate) static SCHEME_CACHE_REMOVED: Counter = Counter::new();
 
 /// Database operations that returned an error. Any non-zero value
