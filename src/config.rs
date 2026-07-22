@@ -52,6 +52,7 @@ const DEFAULT_DATABASE_SLOW_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_DISK_QUOTA: Option<NonZero<u64>> = None;
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
+const DEFAULT_UPSTREAM_RETRY_BUDGET: Duration = Duration::from_secs(30);
 const DEFAULT_HTTPS_UPGRADE_MODE: HttpsUpgradeMode = HttpsUpgradeMode::Auto;
 const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
 const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
@@ -683,6 +684,17 @@ pub(crate) struct Config {
     )]
     pub(crate) client_idle_timeout: Duration,
 
+    /// Wall-clock budget (in seconds) for the whole upstream connect-retry
+    /// envelope. Retries use a Fibonacci backoff capped at ten retries; a retry
+    /// whose delay would finish past this budget is not started and the request
+    /// fails terminally instead, so a dead mirror cannot pin an active-download
+    /// slot for the full schedule.
+    #[serde(
+        default = "default_upstream_retry_budget",
+        deserialize_with = "from_secs_f64"
+    )]
+    pub(crate) upstream_retry_budget: Duration,
+
     /// HTTPS upgrade mode.
     #[serde(default = "default_https_upgrade_mode")]
     pub(crate) https_upgrade_mode: HttpsUpgradeMode,
@@ -1083,6 +1095,10 @@ const fn default_client_idle_timeout() -> Duration {
     DEFAULT_CLIENT_IDLE_TIMEOUT
 }
 
+const fn default_upstream_retry_budget() -> Duration {
+    DEFAULT_UPSTREAM_RETRY_BUDGET
+}
+
 const fn default_https_upgrade_mode() -> HttpsUpgradeMode {
     DEFAULT_HTTPS_UPGRADE_MODE
 }
@@ -1453,6 +1469,15 @@ impl Config {
             );
         }
 
+        if self.upstream_retry_budget < Duration::from_secs(1)
+            || self.upstream_retry_budget > Duration::from_mins(10)
+        {
+            invalid!(
+                "Invalid upstream_retry_budget value of {}s: must be between 1s and 600s",
+                self.upstream_retry_budget.as_secs_f32()
+            );
+        }
+
         if self.client_idle_timeout < self.http_timeout {
             warnings.push(format!(
                 "client_idle_timeout ({}s) is smaller than http_timeout ({}s); slow clients may be disconnected during request-header read while comparable upstream operations are still allowed to complete",
@@ -1465,6 +1490,14 @@ impl Config {
             warnings.push(format!(
                 "database_slow_timeout ({}s) is greater than http_timeout ({}s); HTTP requests will time out before slow-database warnings fire",
                 self.database_slow_timeout.as_secs_f32(),
+                self.http_timeout.as_secs_f32()
+            ));
+        }
+
+        if self.upstream_retry_budget < self.http_timeout {
+            warnings.push(format!(
+                "upstream_retry_budget ({}s) is smaller than http_timeout ({}s); a single slow upstream connect can consume the whole envelope, leaving no room to retry",
+                self.upstream_retry_budget.as_secs_f32(),
                 self.http_timeout.as_secs_f32()
             ));
         }
