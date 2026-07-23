@@ -6,8 +6,9 @@
 //! semantics so probe spam cannot amplify disk writes or DB-channel
 //! traffic (see `cached_health_report`).
 
-use std::fmt::Write as _;
 use std::num::NonZero;
+
+use crate::swrite;
 
 /// Outcome of a single readiness check.
 #[derive(Clone)]
@@ -88,7 +89,7 @@ fn json_escape_into(out: &mut String, s: &str) {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             c if (c as u32) < 0x20 => {
-                write!(out, "\\u{:04x}", c as u32).expect("String write cannot fail");
+                swrite!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }

@@ -1,5 +1,4 @@
 use std::cmp::min;
-use std::fmt::Write as _;
 use std::time::{SystemTime, SystemTimeError};
 
 use time::format_description::FormatItem;
@@ -8,7 +7,7 @@ use time::macros::format_description;
 use time::{OffsetDateTime, macros::offset};
 
 use crate::http_etag::etag_strong_match;
-use crate::warn_once_or_info;
+use crate::{swrite, warn_once_or_info};
 
 const HTTP_DATE_FORMAT: &[FormatItem<'_>] = format_description!(
     "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
@@ -315,8 +314,7 @@ pub(crate) fn http_parse_range(
     );
 
     let mut content_range = String::with_capacity(32);
-    write!(content_range, "bytes {start}-{end}/{file_size}")
-        .expect("writing to a String never fails");
+    swrite!(content_range, "bytes {start}-{end}/{file_size}");
     ParsedRange::Satisfiable(content_range, start, content_length)
 }
 

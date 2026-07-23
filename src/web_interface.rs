@@ -44,7 +44,7 @@ use crate::{
     get_features, global_cache_quota, global_checksum_registry, global_config,
     global_verify_throttle,
     humanfmt::HumanFmt,
-    metrics,
+    metrics, swrite,
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
     warn_once_or_debug,
 };
@@ -461,15 +461,8 @@ impl Display for DiskUsage {
     }
 }
 
-/// `write!` shorthand that panics on the (impossible) failure of in-memory `String` writes.
-macro_rules! w {
-    ($dst:expr, $($arg:tt)*) => {
-        ::std::write!($dst, $($arg)*).expect("string formatting never fails")
-    };
-}
-
 // ---------------------------------------------------------------------------
-// Table builders — append rows directly via `write!`, no per-cell allocation.
+// Table builders — append rows directly via `swrite!`, no per-cell allocation.
 // ---------------------------------------------------------------------------
 
 struct Table {
@@ -496,7 +489,7 @@ impl Table {
     }
 
     fn cell(&mut self, value: impl Display) {
-        w!(self.out, "<td>{value}</td>");
+        swrite!(self.out, "<td>{value}</td>");
     }
 
     fn end_row(&mut self) {
@@ -532,7 +525,7 @@ impl DetailsTable {
     }
 
     fn row(&mut self, label: &'static str, value: impl Display) {
-        w!(self.out, "<tr><td>{label}</td><td>{value}</td></tr>");
+        swrite!(self.out, "<tr><td>{label}</td><td>{value}</td></tr>");
     }
 
     /// Like [`Self::row`], but renders the label cell with a `title` tooltip
@@ -541,7 +534,7 @@ impl DetailsTable {
     /// `&'static str` bound prevents user-controlled values from sneaking
     /// in.
     fn row_tip(&mut self, label: &'static str, tooltip: &'static str, value: impl Display) {
-        w!(
+        swrite!(
             self.out,
             "<tr><td title=\"{tooltip}\">{label}</td><td>{value}</td></tr>"
         );
@@ -555,7 +548,7 @@ impl DetailsTable {
 
 /// Append a `<div class="section">` wrapping a titled HTML body.
 fn write_section(out: &mut String, title: &'static str, body: &str) {
-    w!(out, "<div class=\"section\"><h3>{title}</h3>{body}</div>");
+    swrite!(out, "<div class=\"section\"><h3>{title}</h3>{body}</div>");
 }
 
 /// Append a collapsible `<details>` section. Expanded by default unless empty.
@@ -572,7 +565,7 @@ fn write_collapsible_section(
         Some(total) => format!(" / {total}"),
         None => String::new(),
     };
-    w!(
+    swrite!(
         out,
         "<div class=\"section\"><details{open_attr}>\
          <summary><h3 id=\"{id}\">{title}</h3>\
@@ -583,7 +576,7 @@ fn write_collapsible_section(
 
 /// Per-section error placeholder (so a single failed query doesn't kill the page).
 fn write_section_error(out: &mut String, what: &'static str, err: &sqlx::Error) {
-    w!(
+    swrite!(
         out,
         "<p class=\"section-error\">Failed to query {what}: {}</p>",
         HtmlEscape(&err.to_string()),
@@ -743,7 +736,7 @@ fn build_nav_html(page: Page, options: QueryOptions) -> String {
 
     match page {
         Page::Dashboard { log_count } => {
-            w!(
+            swrite!(
                 html,
                 "<a href=\"{}\">Logs <span class=\"count\">{log_count}</span></a>",
                 QueryUrl {
@@ -760,7 +753,7 @@ fn build_nav_html(page: Page, options: QueryOptions) -> String {
                 ("#metrics-head", "Metrics"),
                 ("#uncacheables-head", "Uncacheables"),
             ] {
-                w!(html, "<a href=\"{href}\">{label}</a>");
+                swrite!(html, "<a href=\"{href}\">{label}</a>");
             }
             html.push_str("<span class=\"dim\">|</span>");
             let target = QueryUrl {
@@ -774,13 +767,14 @@ fn build_nav_html(page: Page, options: QueryOptions) -> String {
                     },
                 },
             };
-            match options.refresh_secs {
-                Some(secs) => w!(html, "<a href=\"{target}\">Stop auto-refresh ({secs}s)</a>"),
-                None => w!(html, "<a href=\"{target}\">Auto-refresh (30s)</a>"),
+            if let Some(secs) = options.refresh_secs {
+                swrite!(html, "<a href=\"{target}\">Stop auto-refresh ({secs}s)</a>");
+            } else {
+                swrite!(html, "<a href=\"{target}\">Auto-refresh (30s)</a>");
             }
         }
         Page::Logs => {
-            w!(
+            swrite!(
                 html,
                 "<a href=\"{}\">Dashboard</a>",
                 QueryUrl { path: "/", options },
@@ -794,7 +788,7 @@ fn build_nav_html(page: Page, options: QueryOptions) -> String {
         Theme::Light => (Theme::Dark, "Theme: light \u{2192} dark"),
         Theme::Dark => (Theme::Auto, "Theme: dark \u{2192} auto"),
     };
-    w!(
+    swrite!(
         html,
         "<a href=\"{}\">{label}</a>",
         QueryUrl {
@@ -2134,7 +2128,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_section(&mut body, "Cache Statistics", &data.cache_stats_html);
 
     // Metrics: long & diagnostic; collapsed by default.
-    w!(
+    swrite!(
         body,
         "<div class=\"section\"><details>\
          <summary><h3 id=\"metrics-head\">Metrics</h3></summary>\
@@ -2173,7 +2167,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     let mut top_packages_body = String::with_capacity(
         data.top_packages_by_count_html.len() + data.top_packages_by_size_html.len() + 128,
     );
-    w!(
+    swrite!(
         top_packages_body,
         "<div class=\"grid-2\">\
          <div><h4 class=\"mini\">By Delivery Count</h4>{}</div>\
@@ -2200,7 +2194,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &data.uncacheable_html,
     );
 
-    w!(
+    swrite!(
         body,
         "<footer><hr><p>All dates are in UTC.&nbsp;&nbsp;&nbsp;--&nbsp;&nbsp;&nbsp;\
          Generated in {} (db {}, disk {}).</p></footer>",
@@ -2978,7 +2972,7 @@ async fn serve_logs(options: QueryOptions) -> WebResponse {
     let escaped_logs = tokio::task::spawn_blocking(move || {
         let mut buf = String::with_capacity(entries.iter().map(|e| e.len() + 8).sum());
         for entry in &entries {
-            w!(buf, "{}\n", HtmlEscape(entry));
+            swrite!(buf, "{}\n", HtmlEscape(entry));
         }
         buf
     })

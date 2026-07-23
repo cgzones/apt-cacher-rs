@@ -71,6 +71,7 @@ mod sendfile_conn;
 mod small_vec_deque;
 #[cfg(feature = "splice")]
 mod splice_conn;
+mod string_write;
 mod task_cache_scan;
 mod task_setup;
 #[cfg(feature = "splice")]
