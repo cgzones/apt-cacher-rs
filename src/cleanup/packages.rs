@@ -32,7 +32,7 @@ use crate::hyper_conn::process_cache_request;
 #[cfg(not(feature = "hyper"))]
 use crate::process_cache_request;
 
-use super::engine::Candidate;
+use super::engine::{Candidate, UnitStats};
 use super::sweep::invalidate_metadata_for;
 use super::verify::{Verdict, verify_cache_file};
 
@@ -141,8 +141,10 @@ pub(super) async fn packages_body_to_memfd(
 pub(super) struct ReduceContext<'a> {
     pub(super) mirror: &'a Mirror,
     pub(super) layout: CacheLayout,
-    pub(super) mismatch_files: &'a mut u64,
-    pub(super) mismatch_bytes: &'a mut u64,
+    /// The unit's running tally; checksum-mismatch evictions are accounted
+    /// straight into it, so deletions performed before a mid-cascade group
+    /// failure are never lost.
+    pub(super) tally: &'a mut UnitStats,
     /// Derives the lookup key from a `Filename:` relpath. Replaces the old
     /// `flat_lookup_prefix` + `layout.is_flat()` branch.
     pub(super) keymap: &'a KeyMapper<'a>,
@@ -245,8 +247,7 @@ async fn process_stanza(
                     } else {
                         invalidate_metadata_for(&path, ctx.mirror, ctx.layout);
                         metrics::CLEANUP_CHECKSUM_MISMATCHES.increment();
-                        *ctx.mismatch_files += 1;
-                        *ctx.mismatch_bytes += pre_size;
+                        ctx.tally.record_mismatch(pre_size);
                     }
                 }
                 Verdict::Raced => {
@@ -894,8 +895,7 @@ mod tests {
             "apt/amd64".to_owned(),
             MirrorKind::Flat,
         );
-        let mut mismatch_files = 0u64;
-        let mut mismatch_bytes = 0u64;
+        let mut tally = UnitStats::default();
 
         // Sibling subtree: `arm64/sibling.deb` does not start with the
         // `amd64/` prefix — must be a no-op on file_list.
@@ -904,8 +904,7 @@ mod tests {
             let mut ctx = ReduceContext {
                 mirror: &mirror,
                 layout: CacheLayout::Flat,
-                mismatch_files: &mut mismatch_files,
-                mismatch_bytes: &mut mismatch_bytes,
+                tally: &mut tally,
                 keymap: &km,
             };
             let mut stanza = Stanza::new();
@@ -923,8 +922,7 @@ mod tests {
             let mut ctx = ReduceContext {
                 mirror: &mirror,
                 layout: CacheLayout::Flat,
-                mismatch_files: &mut mismatch_files,
-                mismatch_bytes: &mut mismatch_bytes,
+                tally: &mut tally,
                 keymap: &km,
             };
             let mut stanza = Stanza::new();
@@ -991,14 +989,12 @@ mod tests {
             "never-matched.deb".to_owned(),
             cand(PathBuf::from("/tmp/x.deb")),
         );
-        let mut mismatch_files = 0u64;
-        let mut mismatch_bytes = 0u64;
+        let mut tally = UnitStats::default();
         let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
         let mut ctx = ReduceContext {
             mirror: &mirror,
             layout: CacheLayout::Flat,
-            mismatch_files: &mut mismatch_files,
-            mismatch_bytes: &mut mismatch_bytes,
+            tally: &mut tally,
             keymap: &km,
         };
 
@@ -1065,14 +1061,12 @@ mod tests {
             "keep-me.deb".to_owned(),
             cand(PathBuf::from("/tmp/keep.deb")),
         );
-        let mut mismatch_files = 0u64;
-        let mut mismatch_bytes = 0u64;
+        let mut tally = UnitStats::default();
         let km = KeyMapper::Basename;
         let mut ctx = ReduceContext {
             mirror: &mirror,
             layout: CacheLayout::StructuredPool,
-            mismatch_files: &mut mismatch_files,
-            mismatch_bytes: &mut mismatch_bytes,
+            tally: &mut tally,
             keymap: &km,
         };
 
@@ -1115,14 +1109,12 @@ mod tests {
             "keep-me.deb".to_owned(),
             cand(PathBuf::from("/tmp/keep.deb")),
         );
-        let mut mismatch_files = 0u64;
-        let mut mismatch_bytes = 0u64;
+        let mut tally = UnitStats::default();
         let km = KeyMapper::Basename;
         let mut ctx = ReduceContext {
             mirror: &mirror,
             layout: CacheLayout::StructuredPool,
-            mismatch_files: &mut mismatch_files,
-            mismatch_bytes: &mut mismatch_bytes,
+            tally: &mut tally,
             keymap: &km,
         };
 
