@@ -33,6 +33,7 @@ mod deb_mirror;
 mod error;
 mod flat_blocklist;
 mod guards;
+mod healthcheck;
 mod http_etag;
 #[cfg(feature = "sendfile")]
 mod http_helpers;
