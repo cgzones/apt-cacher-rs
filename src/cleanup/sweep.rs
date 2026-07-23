@@ -57,6 +57,18 @@ pub(super) struct SpanTable {
     pub byhash_uncovered: Duration,
 }
 
+impl SpanTable {
+    /// One span for every class — the shape of every policy that does not
+    /// distinguish by-hash coverage.
+    pub(super) const fn uniform(span: Duration) -> Self {
+        Self {
+            deb: span,
+            byhash_covered: span,
+            byhash_uncovered: span,
+        }
+    }
+}
+
 /// Return the reference time to use for age-based eviction of a cached file.
 ///
 /// Prefers `created()` (birthtime); falls back to `modified()` if birthtime is
