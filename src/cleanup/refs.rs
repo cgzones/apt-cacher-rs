@@ -252,23 +252,20 @@ pub(super) async fn byhash_dir_present(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
     use super::*;
-    use crate::index_parser::hex_encode;
+    use crate::{index_parser::hex_encode, swrite};
 
     fn release_with_sha256(digests: &[[u8; 32]]) -> String {
         let mut s = String::from(
             "Origin: Test\nMD5Sum:\n cccccccccccccccccccccccccccccccc 9 ignored\nSHA256:\n",
         );
         for (i, d) in digests.iter().enumerate() {
-            writeln!(
+            swrite!(
                 s,
-                " {} {} main/binary-amd64/file{i}",
+                " {} {} main/binary-amd64/file{i}\n",
                 hex_encode(d),
                 100 + i
-            )
-            .unwrap();
+            );
         }
         s
     }
