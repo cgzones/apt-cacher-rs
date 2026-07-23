@@ -21,9 +21,9 @@ use crate::{
 use http::{StatusCode, header::CONTENT_LENGTH};
 
 use crate::cleanup::model::{
-    CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource, KeymapSpec,
-    OriginOwner, ReconcilePolicy, RepoFacet, RetentionPolicy, SkipReason, SourceGroup, SweepAction,
-    SweepReason, decide_sweep,
+    ByHashUnit, CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource,
+    KeymapSpec, MetadataUnit, OriginOwner, PartialsUnit, ReconcileFacet, ReconcilePolicy,
+    ReconcileUnit, SkipReason, SourceGroup, SweepAction, SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{
     DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, body_is_incomplete,
@@ -399,28 +399,21 @@ enum GroupResolution {
     Skipped,
 }
 
-/// Execute one [`CleanupUnit`]. The candidate-reconcile facets (`StructuredPool`
-/// / `FlatTree`) route through the generic reconcile engine; the by-hash,
-/// metadata, and partials facets each run their own narrow arm.
+/// Execute one [`CleanupUnit`]: hand each variant's payload to the arm that
+/// consumes it. The dispatch is the whole of it — every arm's signature names
+/// exactly the inputs that shape carries, so there is no facet -> layout table
+/// to drift from the roots the classifier built and no policy-shape guard to
+/// fall through.
 async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, ProxyCacheError> {
-    // The single facet -> `CacheLayout` map. Every arm names the layout its
-    // sweep keys `cache_metadata` invalidation on, so a new facet cannot be
-    // added without deciding one -- there is deliberately no second map to
-    // forget.
-    match unit.facet {
-        RepoFacet::StructuredPool => {
-            run_reconcile_unit(unit, CacheLayout::StructuredPool, ctx).await
-        }
-        RepoFacet::FlatTree => run_reconcile_unit(unit, CacheLayout::Flat, ctx).await,
-        RepoFacet::StructuredByHash => run_byhash_unit(unit, ctx, CacheLayout::DistsByHash).await,
-        RepoFacet::FlatByHash => run_byhash_unit(unit, ctx, CacheLayout::FlatByHash).await,
-        RepoFacet::StructuredMetadata => Ok(run_metadata_unit(unit, ctx, CacheLayout::Dists).await),
-        RepoFacet::FlatMetadata => Ok(run_metadata_unit(unit, ctx, CacheLayout::Flat).await),
-        RepoFacet::Partials => Ok(run_partials_unit(unit, ctx).await),
+    match unit {
+        CleanupUnit::Reconcile(unit) => run_reconcile_unit(unit, ctx).await,
+        CleanupUnit::ByHash(unit) => run_byhash_unit(unit, ctx).await,
+        CleanupUnit::Metadata(unit) => Ok(run_metadata_unit(unit, ctx).await),
+        CleanupUnit::Partials(unit) => Ok(run_partials_unit(unit, ctx).await),
     }
 }
 
-/// Reap one `Partials` unit's `tmp/` directory (the classifier emits one for
+/// Reap one [`PartialsUnit`]'s `tmp/` directory (the classifier emits one for
 /// the structured tree, one for the flat tree — see `model::classify_mirror`).
 ///
 /// Delegates to [`partials::cleanup_tmp_dir`] for the actual sweep and logs
@@ -430,28 +423,23 @@ async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, 
 /// scratch files are not cached content, so they must not inflate
 /// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED` or the quota reconcile, exactly
 /// matching the old pre-pass, which only ever logged its total.
-async fn run_partials_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
+async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
-    let RetentionPolicy::AgeOnly { span } = unit.policy else {
-        // The classifier only ever pairs `Partials` with `AgeOnly`; a mismatch
-        // means a mis-built unit, so do nothing rather than guess a span.
-        return UnitStats::default();
-    };
 
-    let removed = cleanup_tmp_dir(&unit.tree.root, ctx.now, span).await;
+    let removed = cleanup_tmp_dir(&unit.root, ctx.now, unit.span).await;
 
     if removed > 0 {
         info!(
             "Removed {removed} stale tmp entries for mirror {mirror} in `{}`",
-            unit.tree.root.display()
+            unit.root.display()
         );
     }
 
     UnitStats::default()
 }
 
-/// Age out stale index metadata for a `StructuredMetadata` / `FlatMetadata`
-/// unit: a direct [`sweep_aged_metadata`] over the unit's tree root. Structured
+/// Age out stale index metadata for a [`MetadataUnit`]: a direct
+/// [`sweep_aged_metadata`] over the unit's root. Structured
 /// (`CacheLayout::Dists`) sweeps the pure `dists/` metadata tree; flat
 /// (`CacheLayout::Flat`) sweeps the flat root, leaving co-mingled `.deb` files
 /// to the flat-deb cleanup. The summary line is
@@ -461,24 +449,15 @@ async fn run_partials_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> UnitStats
 /// The always-fired debug marker documents the unit ordering: the metadata sweep runs
 /// (and logs) before this mirror's by-hash units in the same cycle, so a stale
 /// `Release` freed now unpins its digests this cycle.
-async fn run_metadata_unit(
-    unit: &CleanupUnit,
-    ctx: &MirrorCtx<'_>,
-    layout: CacheLayout,
-) -> UnitStats {
+async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
-    let RetentionPolicy::AgeOnly { span } = unit.policy else {
-        // The classifier only ever pairs a metadata facet with `AgeOnly`; a
-        // mismatch means a mis-built unit, so do nothing rather than guess a span.
-        return UnitStats::default();
-    };
 
     debug!(
         "Sweeping aged index metadata for mirror {mirror} in `{}`",
-        unit.tree.root.display()
+        unit.root.display()
     );
 
-    let swept = sweep_aged_metadata(&unit.tree.root, span, ctx.now, mirror, layout).await;
+    let swept = sweep_aged_metadata(&unit.root, unit.span, ctx.now, mirror, unit.layout).await;
 
     if swept.files_removed > 0 {
         info!(
@@ -511,8 +490,8 @@ struct ByHashOutcome {
     bytes_removed: u64,
 }
 
-/// Execute a `StructuredByHash` / `FlatByHash` unit: probe the by-hash tree,
-/// build its `Release` reference set, and sweep the leftovers.
+/// Execute a [`ByHashUnit`]: probe the by-hash tree, build its `Release`
+/// reference set, and sweep the leftovers.
 ///
 /// Invariant 5 (reference mode preconditions) is enforced entirely by
 /// [`build_byhash_reference_set`] / [`active_origin_distributions`]: structured
@@ -525,53 +504,38 @@ struct ByHashOutcome {
 /// `byhash_dir_present` is probed up front so an absent tree (the common case
 /// for a mirror without by-hash) skips the origins query and Release reads.
 async fn run_byhash_unit(
-    unit: &CleanupUnit,
+    unit: &ByHashUnit,
     ctx: &MirrorCtx<'_>,
-    layout: CacheLayout,
 ) -> Result<UnitStats, ProxyCacheError> {
     let mirror = ctx.mirror;
-    let byhash_path = &unit.tree.root;
+    let layout = unit.layout;
 
     // Cheap absence check: skip the origins query + Release reads for a mirror
     // whose per-layout by-hash tree does not exist.
-    if !byhash_dir_present(byhash_path).await {
+    if !byhash_dir_present(&unit.root).await {
         return Ok(UnitStats::default());
     }
-
-    let Some(group) = unit.groups.first() else {
-        return Ok(UnitStats::default());
-    };
-    let IndexSource::LocalReleaseDigests {
-        release_dir,
-        dist_gate,
-    } = &group.source
-    else {
-        return Ok(UnitStats::default());
-    };
-    let RetentionPolicy::ByHash { grace, backstop } = unit.policy else {
-        return Ok(UnitStats::default());
-    };
 
     // Build the union reference set (`None` ⇒ age-based fallback for the whole
     // tree). Structured trees gate reference mode on the complete active-origin
     // distribution set; a DB error there forces age mode (never reconcile
     // against a possibly-incomplete origin set). Flat trees have a single root
     // Release and no per-dist union, so they pass an empty expected list.
-    let reference = match dist_gate {
+    let reference = match unit.dist_gate {
         DistGate::ActiveOriginDists => match active_origin_distributions(ctx.self_origins) {
             Some(expected_dists) => {
-                build_byhash_reference_set(release_dir, layout, &expected_dists).await
+                build_byhash_reference_set(&unit.release_dir, layout, &expected_dists).await
             }
             None => None,
         },
-        DistGate::None => build_byhash_reference_set(release_dir, layout, &[]).await,
+        DistGate::None => build_byhash_reference_set(&unit.release_dir, layout, &[]).await,
     };
 
     let outcome = sweep_byhash_dir(
-        byhash_path,
+        &unit.root,
         reference.as_ref(),
-        grace,
-        backstop,
+        unit.grace,
+        unit.backstop,
         ctx.now,
         mirror,
         layout,
@@ -734,10 +698,11 @@ async fn sweep_byhash_dir(
 /// *decision* is shared, so adding a facet is a new
 /// resolver arm, not a second decision path.
 async fn run_reconcile_unit(
-    unit: &CleanupUnit,
-    layout: CacheLayout,
+    unit: &ReconcileUnit,
     mirror_ctx: &MirrorCtx<'_>,
 ) -> Result<UnitStats, ProxyCacheError> {
+    let layout = unit.facet.cache_layout();
+    let policy = unit.policy;
     let &MirrorCtx {
         mirror,
         entry,
@@ -746,12 +711,6 @@ async fn run_reconcile_unit(
         self_origins,
         now,
     } = mirror_ctx;
-    let RetentionPolicy::Reconcile(policy) = unit.policy else {
-        // The classifier only ever pairs a reconcile facet with a reconcile
-        // policy; a mismatch means a mis-built unit, so do nothing rather than
-        // guess a retention rule.
-        return Ok(UnitStats::default());
-    };
 
     let mut cached_files = scan_candidates(&unit.tree, &entry.path)
         .await
@@ -901,9 +860,9 @@ async fn run_reconcile_unit(
 }
 
 /// Dispatch one [`SourceGroup`] to its resolver: the structured-pool, hybrid
-/// archive-root, and flat (root-segment / co-located) sources. The by-hash
-/// `LocalReleaseDigests` source is resolved by [`run_byhash_unit`] and never
-/// reaches this reconcile path.
+/// archive-root, and flat (root-segment / co-located) sources. Every
+/// [`IndexSource`] variant has an arm here — the by-hash `Release` digest set is
+/// not one of them, it lives on the [`ByHashUnit`] payload.
 async fn resolve_group(
     ctx: &ReconcileCtx<'_>,
     group: &SourceGroup,
@@ -937,13 +896,6 @@ async fn resolve_group(
         IndexSource::FlatPackages {
             fetch: FlatFetch::RootSegment { seg, prefix },
         } => resolve_flat_root_segment(ctx, seg, prefix, cached_files, tally).await,
-        // By-hash units resolve their local `Release` digest sets in
-        // `run_byhash_unit`, never through the reconcile tail, so this arm is
-        // unreachable in practice; skip defensively rather than fetch.
-        IndexSource::LocalReleaseDigests {
-            release_dir: _,
-            dist_gate: _,
-        } => Ok(GroupResolution::Skipped),
     }
 }
 
@@ -961,11 +913,7 @@ fn archive_root_segment(source: &IndexSource) -> Option<&str> {
             keymap: _,
             cache_layout: _,
         }
-        | IndexSource::FlatPackages { fetch: _ }
-        | IndexSource::LocalReleaseDigests {
-            release_dir: _,
-            dist_gate: _,
-        } => None,
+        | IndexSource::FlatPackages { fetch: _ } => None,
     }
 }
 
@@ -984,10 +932,6 @@ fn flat_root_segment(source: &IndexSource) -> Option<&str> {
             origin_rows_of: _,
             keymap: _,
             cache_layout: _,
-        }
-        | IndexSource::LocalReleaseDigests {
-            release_dir: _,
-            dist_gate: _,
         } => None,
     }
 }
@@ -1429,23 +1373,18 @@ async fn resolve_origin_packages_self(
 /// only the structured-pool and flat facets reach it (the by-hash units emit
 /// their own summary in `run_byhash_unit`). The flat `AgeFallback` path emits
 /// its own "aged flat deb files" line rather than routing through here.
-fn log_reconcile_removed(facet: RepoFacet, mirror: &Mirror, swept: &SweepResult) {
+fn log_reconcile_removed(facet: ReconcileFacet, mirror: &Mirror, swept: &SweepResult) {
     match facet {
-        RepoFacet::StructuredPool => info!(
+        ReconcileFacet::StructuredPool => info!(
             "Removed {} unreferenced deb files for mirror {mirror} ({})",
             swept.files_removed,
             HumanFmt::Size(swept.bytes_removed)
         ),
-        RepoFacet::FlatTree => info!(
+        ReconcileFacet::FlatTree => info!(
             "Removed {} unreferenced flat deb files for mirror {mirror} ({})",
             swept.files_removed,
             HumanFmt::Size(swept.bytes_removed)
         ),
-        RepoFacet::StructuredByHash
-        | RepoFacet::FlatByHash
-        | RepoFacet::StructuredMetadata
-        | RepoFacet::FlatMetadata
-        | RepoFacet::Partials => {}
     }
 }
 

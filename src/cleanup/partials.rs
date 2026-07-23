@@ -11,8 +11,8 @@ use super::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry};
 /// Remove stale entries from a single `tmp/` directory.
 ///
 /// `.partial` files are deleted when zero-byte (no useful resume state) or older
-/// than `partial_max_age` — the `Partials` unit's `RetentionPolicy` span, so
-/// tuning it in `model.rs` actually moves this threshold. Any other artifact
+/// than `partial_max_age` — the `PartialsUnit` span, so tuning it in
+/// `model.rs` actually moves this threshold. Any other artifact
 /// (defensive — current code only writes `.partial` here) is deleted once it has
 /// aged past `FOREIGN_MAX_AGE`, the longer threshold acknowledging that we don't
 /// know what produced it.
