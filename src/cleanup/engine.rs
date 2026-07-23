@@ -31,9 +31,7 @@ use crate::cleanup::partials::cleanup_tmp_dir;
 use crate::cleanup::refs::{
     ByHashReferenceSet, active_origin_distributions, build_byhash_reference_set, byhash_dir_present,
 };
-use crate::cleanup::scan::{
-    AnomalyOutcome, DirAction, ScanSpec, handle_anomalous_entry, scan_candidates,
-};
+use crate::cleanup::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry, scan_candidates};
 use crate::cleanup::sweep::{SpanTable, SweepResult, sweep_aged_metadata, sweep_candidates};
 
 /// A scanned cache-tree entry: its on-disk path plus the retention class that
@@ -758,22 +756,14 @@ async fn run_reconcile_unit(
     config: &Config,
     now: SystemTime,
 ) -> Result<UnitStats, ProxyCacheError> {
-    let mut cached_files = scan_candidates(
-        &unit.tree.root,
-        &entry.path,
-        &ScanSpec {
-            recurse: unit.tree.recurse,
-            skip_subdirs: unit.tree.skip_subdirs,
-            boundaries: unit.tree.boundaries.clone(),
-        },
-    )
-    .await
-    .inspect_err(|err| {
-        error!(
-            "Error listing files in `{}`:  {err}",
-            unit.tree.root.display()
-        );
-    })?;
+    let mut cached_files = scan_candidates(&unit.tree, &entry.path)
+        .await
+        .inspect_err(|err| {
+            error!(
+                "Error listing files in `{}`:  {err}",
+                unit.tree.root.display()
+            );
+        })?;
 
     trace!("Cached files ({}): {cached_files:?}", cached_files.len());
 
