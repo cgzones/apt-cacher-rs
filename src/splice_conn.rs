@@ -914,16 +914,31 @@ enum KtlsError {
 }
 
 /// Result of attempting an unbuffered kTLS connection.
+///
+/// Socket contract: only `Ready` carries a live socket, and it is a *fresh*
+/// TCP connection kept out of the pool. `try_unbuffered_ktls_connect` connects
+/// its own socket, attaches the TLS ULP irrevocably, and — because the
+/// unbuffered path fuses handshake + request-send + response-read into one shot
+/// (the request is on the wire before `setup_rx`, see `unbuffered_ktls_request`)
+/// — no non-`Ready` outcome leaves a reusable socket: every failure path has
+/// already dropped it. So a caller must **reconnect from scratch** on
+/// `ResponseNotSpliceable`/`Failed`; it must never try to salvage the kTLS
+/// socket into a userspace-TLS handshake (that would layer TLS over an
+/// in-flight session and corrupt the stream). This is why the fall-through
+/// arms below re-enter `standard_upstream_connect` rather than reusing.
 #[cfg(feature = "ktls")]
 enum KtlsResult {
-    /// kTLS fully set up — ready for zero-copy splice
+    /// kTLS fully set up — ready for zero-copy splice. Carries a fresh,
+    /// non-poolable socket (see the socket contract above).
     Ready(TcpStream, KtlsReadyState),
     /// TLS+HTTP succeeded but response is not splice-eligible (non-200, no CL).
     /// Carries only the parsed response so the caller can choose to serve cached
     /// data (304) or reconnect via the standard path for a clean full fetch.
+    /// The kTLS socket is already dropped (socket contract above).
     ResponseNotSpliceable { response: UpstreamResponse },
-    /// Failed — must reconnect. `tls_succeeded` indicates whether HTTPS works
-    /// for this mirror, so scheme can be cached to avoid double-HTTPS in auto mode.
+    /// Failed — must reconnect from scratch (socket contract above); the kTLS
+    /// socket is gone. `tls_succeeded` indicates whether HTTPS works for this
+    /// mirror, so scheme can be cached to avoid double-HTTPS in auto mode.
     Failed { tls_succeeded: bool },
 }
 
@@ -4841,6 +4856,8 @@ async fn splice_proxy_drive(
         KtlsResult::ResponseNotSpliceable { .. } => {
             // Normally handled above, but during resume 206/416 fall through here
             // to use the standard buffered path for proper resume handling.
+            // A full reconnect, not a reuse of the kTLS socket: that socket is
+            // already dropped and would be unsound to reuse (KtlsResult contract).
             let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
                 mirror,
                 &host_authority,
