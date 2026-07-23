@@ -5,6 +5,7 @@ use hashbrown::HashMap;
 use tracing::{debug, error, trace, warn};
 
 use crate::cleanup::engine::{Candidate, SpanClass};
+use crate::cleanup::model::TreeSpec;
 use crate::deb_mirror::{is_deb_package, is_strict_path_descendant, path_starts_with_segment};
 use crate::error::ProxyCacheError;
 use crate::metrics;
@@ -89,41 +90,22 @@ pub(super) async fn handle_anomalous_entry(
     }
 }
 
-/// Parameters controlling [`scan_candidates`]' traversal behaviour.
-pub(super) struct ScanSpec {
-    /// When `false`, behaves like the old `scan_cached_files`: depth-1,
-    /// basename keys, deb-named-directory warning.  When `true`, behaves
-    /// like the old `scan_flat_cached_debs`: recursive, relpath keys, skips
-    /// `skip_subdirs` and nested-mirror boundaries.
-    pub recurse: bool,
-    /// Sub-directory names to skip entirely during recursive traversal
-    /// (e.g. `by-hash/` and `tmp/` for flat mirrors).  Unused when
-    /// `recurse` is `false`.
-    pub skip_subdirs: &'static [&'static str],
-    /// Mirror paths of registered siblings that live *inside* `mirror_path`.
-    /// When the recursive walk reaches a directory whose mirror-path
-    /// equivalent hits one of these, the subtree is skipped.  Unused when
-    /// `recurse` is `false`.
-    pub boundaries: Vec<String>,
-}
-
-/// Unified on-disk candidate scanner.
+/// Unified on-disk candidate scanner, driven by the unit's [`TreeSpec`].
 ///
-/// With `spec.recurse = false` reproduces the old `scan_cached_files` exactly:
+/// With `tree.recurse = false` reproduces the old `scan_cached_files` exactly:
 /// depth-1, basename keys, deb-named-directory warning (`CACHE_DIRECTORY_UNEXPECTED`),
 /// inline removal of non-regular non-directory entries (`CACHE_NON_REGULAR`).
 ///
-/// With `spec.recurse = true` reproduces the old `scan_flat_cached_debs` exactly:
+/// With `tree.recurse = true` reproduces the old `scan_flat_cached_debs` exactly:
 /// stack-based recursive walk, relpath keys (forward-slash joined), skips
-/// `spec.skip_subdirs` and nested-mirror boundaries, inline removal of
+/// `tree.skip_subdirs` and nested-mirror boundaries, inline removal of
 /// symlinks and other non-regular entries.
 pub(super) async fn scan_candidates(
-    root: &Path,
+    tree: &TreeSpec,
     mirror_path: &str,
-    spec: &ScanSpec,
 ) -> Result<HashMap<String, Candidate>, ProxyCacheError> {
     let mut ret = HashMap::new();
-    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    let mut stack: Vec<(PathBuf, String)> = vec![(tree.root.clone(), String::new())];
 
     while let Some((current, rel_prefix)) = stack.pop() {
         let mut dir = match tokio::fs::read_dir(&current).await {
@@ -168,7 +150,7 @@ pub(super) async fn scan_candidates(
                         );
                     }
                 }
-                if spec.recurse {
+                if tree.recurse {
                     warn!("Skipping unrecognized entry `{}`", entry.path().display());
                 } else {
                     warn!(
@@ -182,7 +164,7 @@ pub(super) async fn scan_candidates(
             // Structured (depth-1): mirror `scan_flat_cached_debs` — structured
             // Pool admits `.deb`/`.udeb`/`.ddeb`, so filter by name before
             // touching disk.  Flat (recursive): filter after all type checks.
-            if !spec.recurse && !is_deb_package(name_str) {
+            if !tree.recurse && !is_deb_package(name_str) {
                 continue;
             }
 
@@ -202,11 +184,11 @@ pub(super) async fn scan_candidates(
             };
 
             if file_type.is_dir() {
-                if spec.recurse {
+                if tree.recurse {
                     // Skip the by-hash subtree (handled by the by-hash
                     // cleanup), the tmp partial-download dir, and recurse
                     // everything else.
-                    if spec.skip_subdirs.contains(&name_str) {
+                    if tree.skip_subdirs.contains(&name_str) {
                         continue;
                     }
                     let child_rel = if rel_prefix.is_empty() {
@@ -227,7 +209,7 @@ pub(super) async fn scan_candidates(
                         owned_full = format!("{mirror_path}/{child_rel}");
                         owned_full.as_str()
                     };
-                    if is_nested_mirror_boundary(candidate_full, &spec.boundaries) {
+                    if is_nested_mirror_boundary(candidate_full, &tree.boundaries) {
                         trace!(
                             "Skipping `{}` during flat cleanup: nested mirror root for `{candidate_full}`",
                             entry.path().display(),
@@ -248,11 +230,11 @@ pub(super) async fn scan_candidates(
             }
 
             // Flat (recursive): filter by deb name after all type checks.
-            if spec.recurse && !is_deb_package(name_str) {
+            if tree.recurse && !is_deb_package(name_str) {
                 continue;
             }
 
-            let key = if spec.recurse && !rel_prefix.is_empty() {
+            let key = if tree.recurse && !rel_prefix.is_empty() {
                 format!("{rel_prefix}/{name_str}")
             } else {
                 name_str.to_owned()
@@ -393,14 +375,13 @@ mod tests {
         tokio::fs::write(dir.path().join("dists/b_1.0_amd64.deb"), b"y")
             .await
             .expect("nested");
-        let spec = ScanSpec {
+        let tree = TreeSpec {
+            root: dir.path().to_path_buf(),
             recurse: false,
             skip_subdirs: &[],
-            boundaries: vec![],
+            boundaries: Vec::new(),
         };
-        let map = scan_candidates(dir.path(), "debian", &spec)
-            .await
-            .expect("scan");
+        let map = scan_candidates(&tree, "debian").await.expect("scan");
         assert!(map.contains_key("a_1.0_amd64.deb"));
         assert!(!map.keys().any(|k| k.contains("b_1.0_amd64.deb"))); // never recurses
     }
@@ -414,14 +395,13 @@ mod tests {
         tokio::fs::write(dir.path().join("amd64/c_1.0_amd64.deb"), b"z")
             .await
             .expect("deb");
-        let spec = ScanSpec {
+        let tree = TreeSpec {
+            root: dir.path().to_path_buf(),
             recurse: true,
             skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
-            boundaries: vec![],
+            boundaries: Vec::new(),
         };
-        let map = scan_candidates(dir.path(), "apt", &spec)
-            .await
-            .expect("scan");
+        let map = scan_candidates(&tree, "apt").await.expect("scan");
         assert!(map.contains_key("amd64/c_1.0_amd64.deb"));
     }
 

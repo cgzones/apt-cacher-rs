@@ -2,7 +2,7 @@
 //! how leftovers are retained. No I/O — classification and the sweep decision
 //! are unit-testable truth tables.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use http::StatusCode;
@@ -62,13 +62,37 @@ pub(super) struct CleanupUnit {
     pub policy: RetentionPolicy,
 }
 
-/// Where a [`CleanupUnit`] scans on disk and how the walk is bounded.
+/// Where a [`CleanupUnit`] scans on disk and how the walk is bounded. Consumed
+/// verbatim by [`scan::scan_candidates`](crate::cleanup::scan::scan_candidates).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TreeSpec {
+    /// On-disk root of the tree to scan.
     pub root: PathBuf,
+    /// When `false`: depth-1 walk, basename keys, deb-named-directory warning.
+    /// When `true`: recursive walk, relpath keys, honouring `skip_subdirs` and
+    /// `boundaries`.
     pub recurse: bool,
+    /// Sub-directory names to skip entirely during recursive traversal (e.g.
+    /// `by-hash/` and `tmp/` for flat mirrors). Unused when `recurse` is `false`.
     pub skip_subdirs: &'static [&'static str],
+    /// Mirror paths of registered siblings that live *inside* this mirror's
+    /// path. When the recursive walk reaches a directory whose mirror-path
+    /// equivalent hits one of these, the subtree is skipped (the nested mirror
+    /// owns it and runs its own cleanup). Unused when `recurse` is `false`.
     pub boundaries: Vec<String>,
+}
+
+impl TreeSpec {
+    /// A depth-1, unbounded walk of `root` — the shape every unit except
+    /// `FlatTree` uses.
+    fn shallow(root: PathBuf) -> Self {
+        Self {
+            root,
+            recurse: false,
+            skip_subdirs: &[],
+            boundaries: Vec::new(),
+        }
+    }
 }
 
 /// One source *description* applied to the unit's candidate map. Per-origin
@@ -350,44 +374,24 @@ pub(super) fn classify_mirror(
     let is_flat = entry.kind() == MirrorKind::Flat;
 
     let cache_path = entry.cache_path_with_aliases(&config.aliases);
-    let cache_root: PathBuf = [config.cache_directory.as_path(), cache_path.as_path()]
-        .iter()
-        .collect();
+    let cache_root: PathBuf = config.cache_directory.join(&cache_path);
     let flat_root = entry.flat_root_path_with_aliases(&config.cache_directory, &config.aliases);
 
     let byhash_backstop = Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get());
 
     let mut units = Vec::with_capacity(8);
 
-    units.push(CleanupUnit {
-        facet: RepoFacet::Partials,
-        tree: TreeSpec {
-            root: [cache_root.as_path(), Path::new(SUBDIR_TMP)]
-                .iter()
-                .collect(),
-            recurse: false,
-            skip_subdirs: &[],
-            boundaries: Vec::new(),
-        },
-        groups: Vec::new(),
-        policy: RetentionPolicy::AgeOnly {
-            span: PARTIALS_KEEP_SPAN,
-        },
-    });
-
-    units.push(CleanupUnit {
-        facet: RepoFacet::Partials,
-        tree: TreeSpec {
-            root: flat_root.join(SUBDIR_TMP),
-            recurse: false,
-            skip_subdirs: &[],
-            boundaries: Vec::new(),
-        },
-        groups: Vec::new(),
-        policy: RetentionPolicy::AgeOnly {
-            span: PARTIALS_KEEP_SPAN,
-        },
-    });
+    // Structured `tmp/` first, then flat `tmp/`.
+    for root in [cache_root.join(SUBDIR_TMP), flat_root.join(SUBDIR_TMP)] {
+        units.push(CleanupUnit {
+            facet: RepoFacet::Partials,
+            tree: TreeSpec::shallow(root),
+            groups: Vec::new(),
+            policy: RetentionPolicy::AgeOnly {
+                span: PARTIALS_KEEP_SPAN,
+            },
+        });
+    }
 
     if is_flat {
         trace!(
@@ -397,12 +401,7 @@ pub(super) fn classify_mirror(
     } else {
         units.push(CleanupUnit {
             facet: RepoFacet::StructuredPool,
-            tree: TreeSpec {
-                root: cache_root.clone(),
-                recurse: false,
-                skip_subdirs: &[],
-                boundaries: Vec::new(),
-            },
+            tree: TreeSpec::shallow(cache_root.clone()),
             groups: vec![SourceGroup {
                 source: IndexSource::OriginPackages {
                     origin_rows_of: OriginOwner::SelfRow,
@@ -466,14 +465,7 @@ pub(super) fn classify_mirror(
     if !is_flat {
         units.push(CleanupUnit {
             facet: RepoFacet::StructuredMetadata,
-            tree: TreeSpec {
-                root: [cache_root.as_path(), Path::new(SUBDIR_DISTS)]
-                    .iter()
-                    .collect(),
-                recurse: false,
-                skip_subdirs: &[],
-                boundaries: Vec::new(),
-            },
+            tree: TreeSpec::shallow(cache_root.join(SUBDIR_DISTS)),
             groups: Vec::new(),
             policy: RetentionPolicy::AgeOnly {
                 span: METADATA_KEEP_SPAN,
@@ -483,12 +475,7 @@ pub(super) fn classify_mirror(
 
     units.push(CleanupUnit {
         facet: RepoFacet::FlatMetadata,
-        tree: TreeSpec {
-            root: flat_root.clone(),
-            recurse: false,
-            skip_subdirs: &[],
-            boundaries: Vec::new(),
-        },
+        tree: TreeSpec::shallow(flat_root.clone()),
         groups: Vec::new(),
         policy: RetentionPolicy::AgeOnly {
             span: METADATA_KEEP_SPAN,
@@ -498,19 +485,10 @@ pub(super) fn classify_mirror(
     if !is_flat {
         units.push(CleanupUnit {
             facet: RepoFacet::StructuredByHash,
-            tree: TreeSpec {
-                root: [cache_root.as_path(), Path::new(SUBDIR_DISTS_BYHASH)]
-                    .iter()
-                    .collect(),
-                recurse: false,
-                skip_subdirs: &[],
-                boundaries: Vec::new(),
-            },
+            tree: TreeSpec::shallow(cache_root.join(SUBDIR_DISTS_BYHASH)),
             groups: vec![SourceGroup {
                 source: IndexSource::LocalReleaseDigests {
-                    release_dir: [cache_root.as_path(), Path::new(SUBDIR_DISTS)]
-                        .iter()
-                        .collect(),
+                    release_dir: cache_root.join(SUBDIR_DISTS),
                     dist_gate: DistGate::ActiveOriginDists,
                 },
                 owning: false,
@@ -524,12 +502,7 @@ pub(super) fn classify_mirror(
 
     units.push(CleanupUnit {
         facet: RepoFacet::FlatByHash,
-        tree: TreeSpec {
-            root: flat_root.join(SUBDIR_FLAT_BYHASH),
-            recurse: false,
-            skip_subdirs: &[],
-            boundaries: Vec::new(),
-        },
+        tree: TreeSpec::shallow(flat_root.join(SUBDIR_FLAT_BYHASH)),
         groups: vec![SourceGroup {
             source: IndexSource::LocalReleaseDigests {
                 release_dir: flat_root,
