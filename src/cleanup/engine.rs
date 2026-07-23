@@ -317,7 +317,7 @@ pub(super) async fn run_mirror_units(
     units: Vec<CleanupUnit>,
     appstate: AppState,
     config: &'static Config,
-) -> Result<CleanupDone, ProxyCacheError> {
+) -> CleanupDone {
     let mirror: Mirror = entry.clone().into();
 
     // One reference instant per mirror, injected into every unit's sweep so a
@@ -333,11 +333,11 @@ pub(super) async fn run_mirror_units(
 
     for unit in &units {
         match run_unit(unit, &mirror, &entry, &appstate, config, now).await {
-            Ok(stats) => {
-                scanned += stats.scanned;
-                removed += stats.removed;
-                bytes_removed += stats.bytes_removed;
-                removed_unreferenced += stats.removed_unreferenced;
+            Ok(unit_stats) => {
+                scanned += unit_stats.scanned;
+                removed += unit_stats.removed;
+                bytes_removed += unit_stats.bytes_removed;
+                removed_unreferenced += unit_stats.removed_unreferenced;
             }
             Err(err) => {
                 error!("Error in cleanup task:  {err}");
@@ -345,13 +345,13 @@ pub(super) async fn run_mirror_units(
         }
     }
 
-    Ok(CleanupDone::tally(
+    CleanupDone::tally(
         mirror,
         scanned,
         removed,
         bytes_removed,
         removed_unreferenced,
-    ))
+    )
 }
 
 /// Immutable context threaded through the reconcile-unit resolvers (the
@@ -403,10 +403,10 @@ pub(super) async fn run_unit(
             run_byhash_unit(unit, mirror, entry, appstate, now, CacheLayout::FlatByHash).await
         }
         RepoFacet::StructuredMetadata => {
-            run_metadata_unit(unit, mirror, now, CacheLayout::Dists, false).await
+            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Dists, false).await)
         }
         RepoFacet::FlatMetadata => {
-            run_metadata_unit(unit, mirror, now, CacheLayout::Flat, true).await
+            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Flat, true).await)
         }
         RepoFacet::Partials => Ok(run_partials_unit(unit, mirror, now).await),
     }
@@ -452,11 +452,11 @@ async fn run_metadata_unit(
     now: SystemTime,
     layout: CacheLayout,
     skip_debs: bool,
-) -> Result<UnitStats, ProxyCacheError> {
+) -> UnitStats {
     let RetentionPolicy::AgeOnly { span } = unit.policy else {
         // The classifier only ever pairs a metadata facet with `AgeOnly`; a
         // mismatch means a mis-built unit, so do nothing rather than guess a span.
-        return Ok(UnitStats::default());
+        return UnitStats::default();
     };
 
     debug!(
@@ -474,12 +474,12 @@ async fn run_metadata_unit(
         );
     }
 
-    Ok(UnitStats {
+    UnitStats {
         scanned: swept.files_removed,
         removed: swept.files_removed,
         bytes_removed: swept.bytes_removed,
         removed_unreferenced: 0,
-    })
+    }
 }
 
 /// Counters from a single [`sweep_byhash_dir`] pass, mirroring the fields the
