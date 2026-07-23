@@ -9,7 +9,7 @@ use crate::{
     database::{Database, MirrorEntry},
     deb_mirror::{MirrorKind, is_deb_package, is_strict_path_descendant},
     error::ProxyCacheError,
-    global_config, metrics,
+    global_config, healthcheck, metrics,
     utils::probe_dir,
 };
 
@@ -116,6 +116,11 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
                 continue;
             }
             Ok(mdata) if mdata.is_file() => {
+                // The healthcheck probe is created and unlinked at the
+                // cache root; a scan racing that window must not flag it.
+                if entry.file_name() == healthcheck::PROBE_FILENAME {
+                    continue;
+                }
                 // A regular file at the cache root is an operator
                 // artefact (the cache root only ever holds host
                 // directories), not a tampering signal — bucket it
