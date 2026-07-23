@@ -18,10 +18,7 @@ use http::StatusCode;
 #[cfg(feature = "hyper")]
 use http::{
     Response,
-    header::{
-        CACHE_CONTROL, CONNECTION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, DATE, REFERRER_POLICY,
-        SERVER, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
-    },
+    header::{CONNECTION, CONTENT_TYPE, DATE, SERVER},
 };
 #[cfg(feature = "hyper")]
 use http_body::{Body, Frame, SizeHint};
@@ -43,6 +40,7 @@ use crate::{
     deb_mirror::VALID_DEB_EXTENSIONS,
     get_features, global_cache_quota, global_checksum_registry, global_config,
     global_verify_throttle,
+    healthcheck::cached_health_report,
     humanfmt::HumanFmt,
     metrics, swrite,
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
@@ -2235,6 +2233,9 @@ pub(crate) enum WebResponseKind {
     Html,
     /// Static asset (CSS/SVG) with long-lived caching and `nosniff`.
     Static { content_type: &'static str },
+    /// Machine-readable healthcheck payload; `no-store` like Html, none of
+    /// the document-oriented security headers.
+    Json,
     /// Plain-text error response.
     Error,
 }
@@ -2256,6 +2257,14 @@ impl WebResponse {
         }
     }
 
+    fn json(status: StatusCode, body: String) -> Self {
+        Self {
+            status,
+            body: bytes::Bytes::from(body),
+            kind: WebResponseKind::Json,
+        }
+    }
+
     fn not_found(msg: &'static str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -2268,7 +2277,34 @@ impl WebResponse {
         match self.kind {
             WebResponseKind::Html => "text/html; charset=utf-8",
             WebResponseKind::Static { content_type } => content_type,
+            WebResponseKind::Json => "application/json",
             WebResponseKind::Error => "text/plain; charset=utf-8",
+        }
+    }
+
+    /// Per-kind headers beyond the common Server/Date/Connection/Content-* set.
+    /// The single owner of this table: the hyper path feeds it to the response
+    /// builder, the sendfile path formats it onto the wire
+    /// (`sendfile_conn::write_webui_response`), so the two cannot drift.
+    pub(crate) fn extra_headers(&self) -> &'static [(&'static str, &'static str)] {
+        match self.kind {
+            WebResponseKind::Html => &[
+                ("Cache-Control", "no-store"),
+                ("Content-Security-Policy", HTML_CSP),
+                ("X-Content-Type-Options", "nosniff"),
+                ("X-Frame-Options", "DENY"),
+                ("X-Robots-Tag", "noindex"),
+                ("Referrer-Policy", "no-referrer"),
+            ],
+            WebResponseKind::Static { .. } => &[
+                ("Cache-Control", "public, max-age=86400"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+            WebResponseKind::Json => &[
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+            WebResponseKind::Error => &[],
         }
     }
 
@@ -2281,22 +2317,8 @@ impl WebResponse {
             .header(DATE, &*format_http_date())
             .header(CONNECTION, "keep-alive")
             .header(CONTENT_TYPE, self.content_type());
-        match self.kind {
-            WebResponseKind::Html => {
-                builder = builder
-                    .header(CACHE_CONTROL, "no-store")
-                    .header(CONTENT_SECURITY_POLICY, HTML_CSP)
-                    .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
-                    .header(X_FRAME_OPTIONS, "DENY")
-                    .header("X-Robots-Tag", "noindex")
-                    .header(REFERRER_POLICY, "no-referrer");
-            }
-            WebResponseKind::Static { .. } => {
-                builder = builder
-                    .header(CACHE_CONTROL, "public, max-age=86400")
-                    .header(X_CONTENT_TYPE_OPTIONS, "nosniff");
-            }
-            WebResponseKind::Error => {}
+        for &(name, value) in self.extra_headers() {
+            builder = builder.header(name, value);
         }
         let body = WebUiCountedBody {
             inner: Full::new(self.body),
@@ -2381,6 +2403,7 @@ pub(crate) async fn serve_web_interface(uri: &http::Uri, appstate: &AppState) ->
     let response = match location {
         "/" => serve_dashboard(appstate, options).await,
         "/logs" => serve_logs(options).await,
+        "/healthcheck" => serve_healthcheck().await,
         "/style.css" => WebResponse::static_resource("text/css; charset=utf-8", CSS),
         "/favicon.svg" | "/favicon.ico" => {
             WebResponse::static_resource("image/svg+xml", FAVICON_SVG)
@@ -2405,6 +2428,16 @@ async fn serve_dashboard(appstate: &AppState, options: QueryOptions) -> WebRespo
     let data = gather_dashboard_data(appstate).await;
     let html = build_dashboard_page(&data, options);
     WebResponse::html(html)
+}
+
+async fn serve_healthcheck() -> WebResponse {
+    let report = cached_health_report().await;
+    let status = if report.healthy() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    WebResponse::json(status, report.to_json())
 }
 
 // ---------------------------------------------------------------------------
