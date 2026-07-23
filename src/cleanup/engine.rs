@@ -831,32 +831,6 @@ async fn run_reconcile_unit(
         }
     }
 
-    // Strict-hybrid early finish: the owning archive-root group reconciled the
-    // flat-pool mirror against the structured `dists/` index of its archive
-    // root. Grace-sweep the leftover unreferenced debs and emit the strict
-    // summary, folding through the shared tally so deletions performed before
-    // a mid-cascade failure stay accounted. The generic
-    // `decide_sweep` for `[owning(Complete)]` also returns `Grace`, but the
-    // early break preserves the old behavior of never probing the root/colocated
-    // sources once strict succeeds, plus the strict-specific summary line.
-    if let Some(archive_root) = owning_root {
-        let swept = sweep_candidates(
-            &cached_files,
-            span_table_grace(&unit.policy),
-            now,
-            mirror,
-            CacheLayout::Flat,
-        )
-        .await;
-        info!(
-            "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
-            swept.files_removed,
-            HumanFmt::Size(swept.bytes_removed)
-        );
-        tally.fold(swept);
-        return Ok(tally);
-    }
-
     // Nothing to sweep (the tree scanned empty; a reduce that emptied the map
     // already short-circuited as `Exhausted`). Skip the no-op sweep + its
     // summary, matching the previous empty-cache early return.
@@ -877,7 +851,20 @@ async fn run_reconcile_unit(
                 reconcile_layout(unit.facet),
             )
             .await;
-            log_reconcile_removed(unit.facet, mirror, &swept);
+            match owning_root {
+                // Strict-hybrid finish: the owning archive-root group
+                // reconciled this flat-pool mirror against the structured
+                // `dists/` index of its archive root, so name the root instead
+                // of emitting the generic per-facet summary. Reaching the sweep
+                // with an empty map is impossible here: a reduce that empties it
+                // returns `Exhausted`, which short-circuits above.
+                Some(archive_root) => info!(
+                    "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
+                    swept.files_removed,
+                    HumanFmt::Size(swept.bytes_removed)
+                ),
+                None => log_reconcile_removed(unit.facet, mirror, &swept),
+            }
             tally.fold(swept);
         }
         // Conservative bail: no sweep this cycle. The resolver
@@ -1458,50 +1445,26 @@ async fn resolve_origin_packages_self(
 fn span_table_grace(policy: &RetentionPolicy) -> SpanTable {
     match policy {
         RetentionPolicy::ReferencedOrBail { grace }
-        | RetentionPolicy::ReferencedOrAge { grace, fallback: _ } => SpanTable {
-            deb: *grace,
-            byhash_covered: *grace,
-            byhash_uncovered: *grace,
-        },
+        | RetentionPolicy::ReferencedOrAge { grace, fallback: _ } => SpanTable::uniform(*grace),
         RetentionPolicy::ByHash { grace, backstop } => SpanTable {
             deb: *grace,
             byhash_covered: *grace,
             byhash_uncovered: *backstop,
         },
-        RetentionPolicy::AgeOnly { span } => SpanTable {
-            deb: *span,
-            byhash_covered: *span,
-            byhash_uncovered: *span,
-        },
+        RetentionPolicy::AgeOnly { span } => SpanTable::uniform(*span),
     }
 }
 
 /// Per-class sweep spans for the [`SweepAction::AgeFallback`] action (flat
 /// time-based retention). Only [`RetentionPolicy::ReferencedOrAge`] ever yields
-/// that action; the other arms are a defensive identity so this stays a total
-/// function (`StructuredPool` never reaches it).
+/// that action; every other policy defers to [`span_table_grace`], keeping this
+/// a total function without a second copy of its table.
 fn span_table_fallback(policy: &RetentionPolicy) -> SpanTable {
     match policy {
-        RetentionPolicy::ReferencedOrAge { grace: _, fallback } => SpanTable {
-            deb: *fallback,
-            byhash_covered: *fallback,
-            byhash_uncovered: *fallback,
-        },
-        RetentionPolicy::ReferencedOrBail { grace } => SpanTable {
-            deb: *grace,
-            byhash_covered: *grace,
-            byhash_uncovered: *grace,
-        },
-        RetentionPolicy::ByHash { grace, backstop } => SpanTable {
-            deb: *grace,
-            byhash_covered: *grace,
-            byhash_uncovered: *backstop,
-        },
-        RetentionPolicy::AgeOnly { span } => SpanTable {
-            deb: *span,
-            byhash_covered: *span,
-            byhash_uncovered: *span,
-        },
+        RetentionPolicy::ReferencedOrAge { grace: _, fallback } => SpanTable::uniform(*fallback),
+        RetentionPolicy::ReferencedOrBail { .. }
+        | RetentionPolicy::ByHash { .. }
+        | RetentionPolicy::AgeOnly { .. } => span_table_grace(policy),
     }
 }
 
