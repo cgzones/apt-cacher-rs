@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use coarsetime::Clock;
@@ -35,19 +36,16 @@ use crate::cleanup::refs::{
 use crate::cleanup::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry, scan_candidates};
 use crate::cleanup::sweep::{SpanTable, SweepResult, sweep_aged_metadata, sweep_candidates};
 
-/// A scanned cache-tree entry: its on-disk path plus the retention class that
-/// selects which sweep span gates its removal. Produced by
+/// Retention class of a scanned cache-tree entry, selecting its sweep span from
+/// the `SpanTable`.
+///
+/// Candidates live in a `HashMap<OsString, SpanClass>` keyed by the entry's path
+/// *relative to the unit's tree root*: produced by
 /// [`scan_candidates`](crate::cleanup::scan::scan_candidates), reduced by the
-/// index sources, and swept by
-/// [`sweep_candidates`](crate::cleanup::sweep::sweep_candidates).
-#[derive(Debug, Clone)]
-pub(super) struct Candidate {
-    pub path: PathBuf,
-    pub class: SpanClass,
-}
-
-/// Retention class of a [`Candidate`], selecting its sweep span from the
-/// `SpanTable`.
+/// index sources (which match that key against a `Filename:` value), and swept
+/// by [`sweep_candidates`](crate::cleanup::sweep::sweep_candidates), which
+/// rejoins it onto the root. Storing the full path per entry instead would cost
+/// megabytes on a large mirror for no lookup the key cannot already serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpanClass {
     /// A pool/flat `.deb`: swept past the policy grace (or age fallback).
@@ -166,7 +164,8 @@ pub(super) enum ReduceOutcome {
 /// `Err`; every caller now treats that conservatively too.
 pub(super) async fn reduce_against(
     plan: &FetchPlan<'_>,
-    candidates: &mut HashMap<String, Candidate>,
+    root: &Path,
+    candidates: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
     appstate: &AppState,
     config: &Config,
@@ -216,6 +215,7 @@ pub(super) async fn reduce_against(
     }
 
     let mut ctx = ReduceContext {
+        root,
         mirror: &plan.owner_mirror,
         layout: plan.cache_layout,
         tally,
@@ -314,6 +314,10 @@ pub(super) async fn run_mirror_units(
 /// candidate map and tally are the only mutable state, kept separate).
 struct ReconcileCtx<'a> {
     policy: ReconcilePolicy,
+    /// The unit's tree root: candidate keys are relative to it, so a resolver
+    /// needs it to turn a matched key back into an on-disk path. Named apart
+    /// from the archive-root / flat-root *segments* the resolvers call `root`.
+    tree_root: &'a Path,
     mirror: &'a Mirror,
     entry: &'a MirrorEntry,
     appstate: &'a AppState,
@@ -596,7 +600,7 @@ async fn sweep_byhash_dir(
     mirror: &Mirror,
     layout: CacheLayout,
 ) -> Result<ByHashOutcome, ProxyCacheError> {
-    let mut candidates: HashMap<String, Candidate> = HashMap::new();
+    let mut candidates: HashMap<OsString, SpanClass> = HashMap::new();
     let mut anomaly_removed = 0u64;
     let mut referenced_kept = 0u64;
 
@@ -626,15 +630,14 @@ async fn sweep_byhash_dir(
                 return Err(ProxyCacheError::Io(err));
             }
         };
-        let path = entry.path();
-
         // lstat semantics on tokio's `DirEntry`, so a planted symlink is seen as
-        // itself (non-regular) rather than followed.
+        // itself (non-regular) rather than followed. The full path is built only
+        // on the two branches that need it, never per surviving entry.
         let file_type = match entry.file_type().await {
             Ok(ft) => ft,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
-                error!("Error inspecting file `{}`:  {err}", path.display());
+                error!("Error inspecting file `{}`:  {err}", entry.path().display());
                 continue;
             }
         };
@@ -643,7 +646,7 @@ async fn sweep_byhash_dir(
             // A symlink/FIFO/socket/device is removed (counted); a stray dir is
             // skipped — the DirAction::Skip anomaly routing the old walk used.
             if matches!(
-                handle_anomalous_entry(&path, file_type, DirAction::Skip).await,
+                handle_anomalous_entry(&entry.path(), file_type, DirAction::Skip).await,
                 AnomalyOutcome::Removed
             ) {
                 anomaly_removed += 1;
@@ -654,7 +657,7 @@ async fn sweep_byhash_dir(
         // Classify against the reference set inline (reference mode). A
         // referenced digest is kept forever regardless of age, so it never
         // enters the candidate map — in a healthy tree that is the bulk of the
-        // directory, and skipping it saves a key + path allocation each. An
+        // directory, and skipping it saves an owned key plus a map slot. An
         // unreferenced covered digest gets the grace span; an uncovered
         // algorithm, an unclassifiable name, or age mode (`reference` is `None`)
         // gets the backstop, exactly as the old walk treated them.
@@ -671,18 +674,12 @@ async fn sweep_byhash_dir(
             Some(_) | None => SpanClass::ByHashUncovered,
         };
 
-        // Key on the file name (a bare hex digest); a non-UTF-8 name — never a
-        // real by-hash file — falls back to the lossy path so it still ages out
-        // via the backstop.
-        let key = match name.to_str() {
-            Some(digest) => digest.to_owned(),
-            None => path.to_string_lossy().into_owned(),
-        };
-        candidates.insert(key, Candidate { path, class });
+        candidates.insert(name, class);
     }
 
     let survivors = candidates.len() as u64;
     let swept = sweep_candidates(
+        byhash_path,
         &candidates,
         SpanTable {
             // No `Deb`-class candidates in a by-hash tree; the covered/uncovered
@@ -750,6 +747,7 @@ async fn run_reconcile_unit(
 
     let ctx = ReconcileCtx {
         policy,
+        tree_root: &unit.tree.root,
         mirror,
         entry,
         appstate,
@@ -845,7 +843,7 @@ async fn run_reconcile_unit(
         );
     }
 
-    let swept = sweep_candidates(&cached_files, spans, now, mirror, layout).await;
+    let swept = sweep_candidates(&unit.tree.root, &cached_files, spans, now, mirror, layout).await;
 
     match reason {
         SweepReason::AgeFallback {
@@ -882,7 +880,7 @@ async fn run_reconcile_unit(
 async fn resolve_group(
     ctx: &ReconcileCtx<'_>,
     group: &SourceGroup,
-    cached_files: &mut HashMap<String, Candidate>,
+    cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     match &group.source {
@@ -998,11 +996,12 @@ async fn resolve_origin_packages_archive_root(
     root: &str,
     keymap: &KeymapSpec,
     cache_layout: CacheLayout,
-    cached_files: &mut HashMap<String, Candidate>,
+    cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy: _,
+        tree_root,
         mirror,
         entry: _,
         appstate,
@@ -1089,7 +1088,7 @@ async fn resolve_origin_packages_archive_root(
             },
             keymap: keymapper_for(keymap),
         };
-        match reduce_against(&plan, cached_files, tally, appstate, config).await {
+        match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
             Ok(ReduceOutcome::Reduced) => {}
             Ok(ReduceOutcome::Exhausted) => return Ok(GroupResolution::Exhausted),
             Ok(ReduceOutcome::FetchFailed(status)) => {
@@ -1124,11 +1123,12 @@ async fn resolve_flat_root_segment(
     ctx: &ReconcileCtx<'_>,
     seg: &str,
     prefix: &str,
-    cached_files: &mut HashMap<String, Candidate>,
+    cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy: _,
+        tree_root,
         mirror,
         entry: _,
         appstate,
@@ -1164,7 +1164,7 @@ async fn resolve_flat_root_segment(
     }
 
     let plan = flat_root_fetch_plan(mirror, seg, prefix);
-    match reduce_against(&plan, cached_files, tally, appstate, config).await {
+    match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
         Ok(ReduceOutcome::Reduced) => Ok(GroupResolution::Ran(GroupOutcome::Complete)),
         Ok(ReduceOutcome::Exhausted) => {
             debug!(
@@ -1191,11 +1191,12 @@ async fn resolve_flat_root_segment(
 /// grace vs age fallback.
 async fn resolve_flat_colocated(
     ctx: &ReconcileCtx<'_>,
-    cached_files: &mut HashMap<String, Candidate>,
+    cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy: _,
+        tree_root,
         mirror,
         entry: _,
         appstate,
@@ -1221,7 +1222,7 @@ async fn resolve_flat_colocated(
         debname: DebnameKind::Flat,
         keymap: KeyMapper::Relpath,
     };
-    match reduce_against(&plan, cached_files, tally, appstate, config).await {
+    match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
         Ok(ReduceOutcome::Reduced) => Ok(GroupResolution::Ran(GroupOutcome::Complete)),
         Ok(ReduceOutcome::Exhausted) => {
             debug!(
@@ -1251,11 +1252,12 @@ async fn resolve_flat_colocated(
 /// and status are in hand) before handing back `FetchFailed`.
 async fn resolve_origin_packages_self(
     ctx: &ReconcileCtx<'_>,
-    cached_files: &mut HashMap<String, Candidate>,
+    cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy,
+        tree_root,
         mirror,
         entry,
         appstate,
@@ -1352,7 +1354,7 @@ async fn resolve_origin_packages_self(
             },
             keymap: KeyMapper::Basename,
         };
-        match reduce_against(&plan, cached_files, tally, appstate, config).await {
+        match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
             Ok(ReduceOutcome::Reduced) => {}
             Ok(ReduceOutcome::Exhausted) => {
                 debug!(

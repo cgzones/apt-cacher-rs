@@ -1,5 +1,7 @@
 use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
 use std::num::NonZero;
+use std::path::Path;
 
 use bytes::Buf as _;
 use hashbrown::HashMap;
@@ -32,7 +34,7 @@ use crate::hyper_conn::process_cache_request;
 #[cfg(not(feature = "hyper"))]
 use crate::process_cache_request;
 
-use super::engine::{Candidate, UnitStats};
+use super::engine::{SpanClass, UnitStats};
 use super::sweep::invalidate_metadata_for;
 use super::verify::{Verdict, verify_cache_file};
 
@@ -139,6 +141,9 @@ pub(super) async fn packages_body_to_memfd(
 /// per-file `cache_metadata` entries and to attribute checksum-mismatch
 /// removals back to the per-mirror `CleanupDone` totals.
 pub(super) struct ReduceContext<'a> {
+    /// Tree root the candidate keys are relative to; a matched key is rejoined
+    /// onto it to reach the cached file.
+    pub(super) root: &'a Path,
     pub(super) mirror: &'a Mirror,
     pub(super) layout: CacheLayout,
     /// The unit's running tally; checksum-mismatch evictions are accounted
@@ -161,7 +166,7 @@ pub(super) struct ReduceContext<'a> {
 /// is the on-disk path verbatim, so the lookup key is the relpath itself.
 async fn flush_stanza(
     stanza: &mut Stanza,
-    file_list: &mut HashMap<String, Candidate>,
+    file_list: &mut HashMap<OsString, SpanClass>,
     ctx: &mut ReduceContext<'_>,
 ) {
     process_stanza(stanza, file_list, ctx).await;
@@ -173,7 +178,7 @@ async fn flush_stanza(
 /// responsible for clearing it afterwards.
 async fn process_stanza(
     stanza: &Stanza,
-    file_list: &mut HashMap<String, Candidate>,
+    file_list: &mut HashMap<OsString, SpanClass>,
     ctx: &mut ReduceContext<'_>,
 ) {
     let Some(filename) = stanza.filename.as_deref() else {
@@ -186,11 +191,11 @@ async fn process_stanza(
     let lookup_key: &str = &lookup_key;
 
     // Every path below drops the entry from the reference set, so take it out
-    // once (owning the path) rather than looking it up again per exit.
-    let Some(candidate) = file_list.remove(lookup_key) else {
+    // once rather than looking it up again per exit.
+    if file_list.remove(OsStr::new(lookup_key)).is_none() {
         return;
-    };
-    let path = candidate.path;
+    }
+    let path = ctx.root.join(lookup_key);
 
     match stanza.chosen() {
         None => {
@@ -298,7 +303,7 @@ impl PackageFormat {
         self,
         file: tokio::fs::File,
         filename: &str,
-        file_list: &mut HashMap<String, Candidate>,
+        file_list: &mut HashMap<OsString, SpanClass>,
         ctx: &mut ReduceContext<'_>,
         config: &Config,
     ) -> Result<(), ProxyCacheError> {
@@ -607,8 +612,6 @@ pub(super) async fn try_fetch_packages_file(
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
-
     use crate::cleanup::engine::SpanClass;
     use crate::config::Config;
     use crate::{
@@ -618,13 +621,12 @@ mod tests {
         nonzero,
     };
 
-    /// Build a `Deb`-class candidate for the reduce tests (the reduce path only
-    /// reads `candidate.path`).
-    fn cand(path: PathBuf) -> Candidate {
-        Candidate {
-            path,
-            class: SpanClass::Deb,
-        }
+    /// A candidate map for the reduce tests: every entry is `Deb`-class and
+    /// keyed by its path relative to the `ReduceContext` root.
+    fn cands(keys: &[&str]) -> HashMap<OsString, SpanClass> {
+        keys.iter()
+            .map(|k| (OsString::from(*k), SpanClass::Deb))
+            .collect()
     }
 
     #[test]
@@ -942,15 +944,7 @@ mod tests {
         // the basename-keyed entry inside our subtree.
         use std::num::NonZero;
 
-        let mut file_list: HashMap<String, Candidate> = HashMap::new();
-        file_list.insert(
-            "pkg.deb".to_owned(),
-            cand(PathBuf::from("/tmp/cache/pkg.deb")),
-        );
-        file_list.insert(
-            "other.deb".to_owned(),
-            cand(PathBuf::from("/tmp/cache/other.deb")),
-        );
+        let mut file_list = cands(&["pkg.deb", "other.deb"]);
 
         let mirror = Mirror::new(
             ClientHost::new("example.com".to_owned()).expect("valid host"),
@@ -965,6 +959,7 @@ mod tests {
         {
             let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
             let mut ctx = ReduceContext {
+                root: Path::new("/tmp/cache"),
                 mirror: &mirror,
                 layout: CacheLayout::Flat,
                 tally: &mut tally,
@@ -975,14 +970,15 @@ mod tests {
             process_stanza(&stanza, &mut file_list, &mut ctx).await;
         }
         assert_eq!(file_list.len(), 2);
-        assert!(file_list.contains_key("pkg.deb"));
-        assert!(file_list.contains_key("other.deb"));
+        assert!(file_list.contains_key(OsStr::new("pkg.deb")));
+        assert!(file_list.contains_key(OsStr::new("other.deb")));
 
         // In-subtree: `amd64/pkg.deb` strips to `pkg.deb`; with no SHA
         // advertised, the stanza warn-retains and removes the lookup key.
         {
             let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
             let mut ctx = ReduceContext {
+                root: Path::new("/tmp/cache"),
                 mirror: &mirror,
                 layout: CacheLayout::Flat,
                 tally: &mut tally,
@@ -992,8 +988,8 @@ mod tests {
             stanza.ingest("Filename: amd64/pkg.deb\n");
             process_stanza(&stanza, &mut file_list, &mut ctx).await;
         }
-        assert!(!file_list.contains_key("pkg.deb"));
-        assert!(file_list.contains_key("other.deb"));
+        assert!(!file_list.contains_key(OsStr::new("pkg.deb")));
+        assert!(file_list.contains_key(OsStr::new("other.deb")));
     }
 
     #[test]
@@ -1047,14 +1043,11 @@ mod tests {
         );
         // A non-matching entry keeps `file_list` non-empty so the reducer
         // streams the whole (bomb) input instead of early-returning.
-        let mut file_list: HashMap<String, Candidate> = HashMap::new();
-        file_list.insert(
-            "never-matched.deb".to_owned(),
-            cand(PathBuf::from("/tmp/x.deb")),
-        );
+        let mut file_list = cands(&["never-matched.deb"]);
         let mut tally = UnitStats::default();
         let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
         let mut ctx = ReduceContext {
+            root: Path::new("/tmp"),
             mirror: &mirror,
             layout: CacheLayout::Flat,
             tally: &mut tally,
@@ -1114,19 +1107,14 @@ mod tests {
         // the Filename: above; reaching `flush_stanza` with the stanza
         // intact removes the entry from the candidate list, proving the
         // parser kept its place through the oversize line.
-        let mut file_list: HashMap<String, Candidate> = HashMap::new();
-        let deb_path = dir.path().join("dummy_1.0_amd64.deb");
-        tokio::fs::write(&deb_path, deb_body)
+        tokio::fs::write(dir.path().join("dummy_1.0_amd64.deb"), deb_body)
             .await
             .expect("write deb");
-        file_list.insert("dummy_1.0_amd64.deb".to_owned(), cand(deb_path));
-        file_list.insert(
-            "keep-me.deb".to_owned(),
-            cand(PathBuf::from("/tmp/keep.deb")),
-        );
+        let mut file_list = cands(&["dummy_1.0_amd64.deb", "keep-me.deb"]);
         let mut tally = UnitStats::default();
         let km = KeyMapper::Basename;
         let mut ctx = ReduceContext {
+            root: dir.path(),
             mirror: &mirror,
             layout: CacheLayout::StructuredPool,
             tally: &mut tally,
@@ -1139,11 +1127,11 @@ mod tests {
             .expect("oversize lines must be skipped, not aborted");
 
         assert!(
-            !file_list.contains_key("dummy_1.0_amd64.deb"),
+            !file_list.contains_key(OsStr::new("dummy_1.0_amd64.deb")),
             "matching stanza after a skipped line must still remove the file"
         );
         assert!(
-            file_list.contains_key("keep-me.deb"),
+            file_list.contains_key(OsStr::new("keep-me.deb")),
             "unrelated entries must be left in place"
         );
     }
@@ -1167,14 +1155,11 @@ mod tests {
             "debian".to_owned(),
             MirrorKind::Structured,
         );
-        let mut file_list: HashMap<String, Candidate> = HashMap::new();
-        file_list.insert(
-            "keep-me.deb".to_owned(),
-            cand(PathBuf::from("/tmp/keep.deb")),
-        );
+        let mut file_list = cands(&["keep-me.deb"]);
         let mut tally = UnitStats::default();
         let km = KeyMapper::Basename;
         let mut ctx = ReduceContext {
+            root: Path::new("/tmp"),
             mirror: &mirror,
             layout: CacheLayout::StructuredPool,
             tally: &mut tally,
@@ -1187,7 +1172,7 @@ mod tests {
             .expect("an empty raw Packages file must be treated as zero stanzas");
 
         assert!(
-            file_list.contains_key("keep-me.deb"),
+            file_list.contains_key(OsStr::new("keep-me.deb")),
             "empty Packages must leave the candidate list untouched"
         );
     }
