@@ -8,7 +8,7 @@ use hashbrown::HashMap;
 use http::{Method, Request, Response, StatusCode, header::CACHE_CONTROL};
 use http_body_util::{BodyExt as _, Empty};
 use memfd::MemfdOptions;
-use tokio::io::{AsyncBufRead, AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
+use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -19,12 +19,11 @@ use crate::{
     error::{ProxyCacheError, UpstreamFetchError},
     index_parser::{Stanza, hex_encode, structured_lookup_key},
     limits::{
-        CappedLine, LimitedReader, MAX_DECOMPRESSED_PACKAGES_SIZE, MAX_DECOMPRESSION_RATIO,
-        MAX_METADATA_LINE_LEN, read_line_capped,
+        CappedLine, MAX_DECOMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN, PackagesCompression,
+        decompressed_limit, packages_reader, read_line_capped,
     },
     metrics,
     precise_instant::PreciseInstant,
-    xz_stream::xz_decoder,
 };
 // `process_cache_request` has a hyper implementation and a splice-only stub
 // (in `main.rs`) that bridges to `splice_cleanup_request`; cleanup calls it
@@ -137,7 +136,7 @@ pub(super) async fn packages_body_to_memfd(
         })
 }
 
-/// Per-call context for [`PackageFormat::reduce_file_list`]: needed to invalidate
+/// Per-call context for [`reduce_file_list`]: needed to invalidate
 /// per-file `cache_metadata` entries and to attribute checksum-mismatch
 /// removals back to the per-mirror `CleanupDone` totals.
 pub(super) struct ReduceContext<'a> {
@@ -259,146 +258,108 @@ async fn process_stanza(
     }
 }
 
-/// Compute the effective decompressed-output ceiling for a `Packages` file of
-/// `compressed_size` bytes: the smaller of the absolute cap and the
-/// compression-ratio cap.
-#[must_use]
-fn decompressed_limit(compressed_size: NonZero<u64>) -> NonZero<u64> {
-    MAX_DECOMPRESSED_PACKAGES_SIZE.min(compressed_size.saturating_mul(MAX_DECOMPRESSION_RATIO))
-}
+/// Stream a (possibly compressed) Debian `Packages` file stanza by stanza,
+/// reducing the candidate `file_list` by basename and verifying matched
+/// cache files against the stanza's `SHA256:`/`SHA512:` digest.
+///
+/// Cleanup is conservative about an index it cannot read in full: an unreadable
+/// or malformed file bails the mirror this cycle rather than reconciling against
+/// a partial reference set (which would grace-sweep still-referenced debs). That
+/// is the deliberate difference from `integrity::ingest_packages_file`, which
+/// shares the decode ladder via [`packages_reader`] but degrades to a
+/// less-populated registry instead.
+pub(super) async fn reduce_file_list(
+    compression: PackagesCompression,
+    file: tokio::fs::File,
+    filename: &str,
+    file_list: &mut HashMap<OsString, SpanClass>,
+    ctx: &mut ReduceContext<'_>,
+    config: &Config,
+) -> Result<(), ProxyCacheError> {
+    debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
 
-#[derive(Clone, Copy)]
-pub(super) enum PackageFormat {
-    Raw,
-    Gz,
-    Xz,
-}
+    let buffer_size = config.buffer_size;
 
-impl PackageFormat {
-    #[must_use]
-    pub(super) const fn extension(self) -> &'static str {
-        match self {
-            Self::Raw => "",
-            Self::Gz => ".gz",
-            Self::Xz => ".xz",
+    let mdata = match file.metadata().await {
+        Ok(m) => m,
+        Err(err) => {
+            error!(
+                "Failed to stat Packages file `{filename}` for decompression-ratio guard:  {err}"
+            );
+            return Err(ProxyCacheError::Io(err));
         }
-    }
+    };
 
-    /// Stream a (possibly compressed) Debian `Packages` file stanza by stanza,
-    /// reducing the candidate `file_list` by basename and verifying matched
-    /// cache files against the stanza's `SHA256:`/`SHA512:` digest.
-    pub(super) async fn reduce_file_list(
-        self,
-        file: tokio::fs::File,
-        filename: &str,
-        file_list: &mut HashMap<OsString, SpanClass>,
-        ctx: &mut ReduceContext<'_>,
-        config: &Config,
-    ) -> Result<(), ProxyCacheError> {
-        debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
+    let Some(compressed_size) = NonZero::new(mdata.len()) else {
+        return match compression {
+            // A raw Packages file with zero stanzas is legal (e.g.
+            // a freshly-created component with no published debs); the
+            // read loop would hit EOF immediately and treat
+            // file_list as the empty reference set, which is the
+            // correct cleanup behaviour. Avoid turning that into a
+            // mirror-cleanup failure.
+            PackagesCompression::Raw => Ok(()),
+            // For compressed formats an empty file is malformed:
+            // both gzip and xz require at least a header.
+            PackagesCompression::Gz | PackagesCompression::Xz => {
+                warn!("Packages file `{filename}` has zero size");
+                Err(ProxyCacheError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "zero size",
+                )))
+            }
+        };
+    };
 
-        let buffer_size = config.buffer_size;
+    let mut reader = packages_reader(
+        file,
+        compression,
+        decompressed_limit(Some(compressed_size)),
+        buffer_size,
+    );
 
-        let mdata = match file.metadata().await {
-            Ok(m) => m,
+    let mut buffer = String::with_capacity(128);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(128);
+    let mut stanza = Stanza::new();
+    loop {
+        buffer.clear();
+        match read_line_capped(
+            &mut *reader,
+            &mut buffer,
+            &mut line_buf,
+            MAX_METADATA_LINE_LEN,
+        )
+        .await
+        {
+            Ok(CappedLine::Eof) => {
+                // Flush the final stanza if the Packages file doesn't end
+                // with a blank line.
+                if !stanza.is_empty() {
+                    flush_stanza(&mut stanza, file_list, ctx).await;
+                }
+                return Ok(());
+            }
             Err(err) => {
-                error!(
-                    "Failed to stat Packages file `{filename}` for decompression-ratio guard:  {err}"
-                );
-                return Err(ProxyCacheError::Io(err));
+                error!("Failed to read Packages file `{filename}` (may exceed size limit):  {err}");
+                return Err(err.into());
             }
-        };
-
-        let Some(compressed_size) = NonZero::new(mdata.len()) else {
-            return match self {
-                // A raw Packages file with zero stanzas is legal (e.g.
-                // a freshly-created component with no published debs); the
-                // read loop would hit EOF immediately and treat
-                // file_list as the empty reference set, which is the
-                // correct cleanup behaviour. Avoid turning that into a
-                // mirror-cleanup failure.
-                Self::Raw => Ok(()),
-                // For compressed formats an empty file is malformed:
-                // both gzip and xz require at least a header.
-                Self::Gz | Self::Xz => {
-                    warn!("Packages file `{filename}` has zero size");
-                    Err(ProxyCacheError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "zero size",
-                    )))
-                }
-            };
-        };
-
-        let decompressed_limit = decompressed_limit(compressed_size);
-
-        let reader: &mut (dyn AsyncBufRead + Unpin + Send) = match self {
-            Self::Raw => {
-                let limited = LimitedReader::new(file, decompressed_limit);
-
-                &mut tokio::io::BufReader::with_capacity(buffer_size, limited)
+            Ok(CappedLine::Skipped) => {
+                // A line longer than MAX_METADATA_LINE_LEN can't be one
+                // of the fields the stanza parser cares about (Filename,
+                // SHA256, SHA512 are all well under the cap); some
+                // packages legitimately ship multi-kilobyte `Provides:`
+                // or `Depends:` fields. Treat it as a non-blank line so
+                // the stanza isn't flushed prematurely.
             }
-            Self::Gz => {
-                let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
-                let decoder = async_compression::tokio::bufread::GzipDecoder::new(file_reader);
-                let limited = LimitedReader::new(decoder, decompressed_limit);
-
-                &mut tokio::io::BufReader::with_capacity(buffer_size, limited)
-            }
-            Self::Xz => {
-                let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
-                let decoder = xz_decoder(file_reader);
-                let limited = LimitedReader::new(decoder, decompressed_limit);
-
-                &mut tokio::io::BufReader::with_capacity(buffer_size, limited)
-            }
-        };
-
-        let mut buffer = String::with_capacity(128);
-        let mut line_buf: Vec<u8> = Vec::with_capacity(128);
-        let mut stanza = Stanza::new();
-        loop {
-            buffer.clear();
-            match read_line_capped(
-                &mut *reader,
-                &mut buffer,
-                &mut line_buf,
-                MAX_METADATA_LINE_LEN,
-            )
-            .await
-            {
-                Ok(CappedLine::Eof) => {
-                    // Flush the final stanza if the Packages file doesn't end
-                    // with a blank line.
-                    if !stanza.is_empty() {
-                        flush_stanza(&mut stanza, file_list, ctx).await;
+            Ok(CappedLine::Line { .. }) => {
+                if buffer.trim().is_empty() {
+                    flush_stanza(&mut stanza, file_list, ctx).await;
+                    if file_list.is_empty() {
+                        return Ok(());
                     }
-                    return Ok(());
+                    continue;
                 }
-                Err(err) => {
-                    error!(
-                        "Failed to read Packages file `{filename}` (may exceed size limit):  {err}"
-                    );
-                    return Err(err.into());
-                }
-                Ok(CappedLine::Skipped) => {
-                    // A line longer than MAX_METADATA_LINE_LEN can't be one
-                    // of the fields the stanza parser cares about (Filename,
-                    // SHA256, SHA512 are all well under the cap); some
-                    // packages legitimately ship multi-kilobyte `Provides:`
-                    // or `Depends:` fields. Treat it as a non-blank line so
-                    // the stanza isn't flushed prematurely.
-                }
-                Ok(CappedLine::Line { .. }) => {
-                    if buffer.trim().is_empty() {
-                        flush_stanza(&mut stanza, file_list, ctx).await;
-                        if file_list.is_empty() {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    stanza.ingest(&buffer);
-                }
+                stanza.ingest(&buffer);
             }
         }
     }
@@ -443,7 +404,7 @@ pub(super) enum DebnameKind {
 }
 
 impl DebnameKind {
-    fn cache_name(&self, fmt: PackageFormat) -> String {
+    fn cache_name(&self, fmt: PackagesCompression) -> String {
         match self {
             Self::OriginScoped {
                 distribution,
@@ -459,7 +420,7 @@ impl DebnameKind {
         }
     }
 
-    pub(super) fn memfd_name(&self, fmt: PackageFormat) -> String {
+    pub(super) fn memfd_name(&self, fmt: PackagesCompression) -> String {
         match self {
             Self::OriginScoped {
                 distribution,
@@ -505,7 +466,7 @@ pub(super) async fn try_fetch_packages_file(
     layout: PackagesLayout,
     debname: &DebnameKind,
     appstate: &AppState,
-) -> Result<(Response<ProxyCacheBody>, PackageFormat), FetchFailure> {
+) -> Result<(Response<ProxyCacheBody>, PackagesCompression), FetchFailure> {
     let resource_kind = layout.resource_kind();
 
     let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
@@ -518,7 +479,11 @@ pub(super) async fn try_fetch_packages_file(
     // beat 404 (generic); among non-404 statuses, the first one seen wins.
     let mut last_missing: Option<StatusCode> = None;
 
-    for pkgfmt in [PackageFormat::Xz, PackageFormat::Gz, PackageFormat::Raw] {
+    for pkgfmt in [
+        PackagesCompression::Xz,
+        PackagesCompression::Gz,
+        PackagesCompression::Raw,
+    ] {
         uri_buffer.clear();
         uri_buffer.push_str(base_uri);
         uri_buffer.push_str(pkgfmt.extension());
@@ -625,19 +590,19 @@ mod tests {
             architecture: "amd64".to_owned(),
         };
         assert_eq!(
-            o.cache_name(PackageFormat::Xz),
+            o.cache_name(PackagesCompression::Xz),
             "bookworm_main_amd64_Packages.xz"
         );
         assert_eq!(
-            o.memfd_name(PackageFormat::Xz),
+            o.memfd_name(PackagesCompression::Xz),
             "bookworm_main_amd64_packages.xz"
         );
         assert_eq!(
-            DebnameKind::Flat.cache_name(PackageFormat::Gz),
+            DebnameKind::Flat.cache_name(PackagesCompression::Gz),
             "Packages.gz"
         );
         assert_eq!(
-            DebnameKind::Flat.memfd_name(PackageFormat::Gz),
+            DebnameKind::Flat.memfd_name(PackagesCompression::Gz),
             "flat_packages.gz"
         );
     }
@@ -980,24 +945,6 @@ mod tests {
         assert!(file_list.contains_key(OsStr::new("other.deb")));
     }
 
-    #[test]
-    fn decompressed_limit_ratio_caps_small_input() {
-        // A tiny compressed file: the ratio cap (size * MAX_DECOMPRESSION_RATIO) dominates.
-        assert_eq!(
-            decompressed_limit(nonzero!(1000)),
-            MAX_DECOMPRESSION_RATIO.checked_mul(nonzero!(1000)).unwrap()
-        );
-    }
-
-    #[test]
-    fn decompressed_limit_absolute_caps_large_input() {
-        // A huge compressed file: the absolute cap dominates.
-        assert_eq!(
-            decompressed_limit(nonzero!(u64::MAX)),
-            MAX_DECOMPRESSED_PACKAGES_SIZE
-        );
-    }
-
     #[tokio::test]
     async fn reduce_file_list_rejects_decompression_bomb() {
         use std::num::NonZero;
@@ -1042,9 +989,15 @@ mod tests {
             keymap: &km,
         };
 
-        let result = PackageFormat::Gz
-            .reduce_file_list(file, "Packages.gz", &mut file_list, &mut ctx, &config)
-            .await;
+        let result = reduce_file_list(
+            PackagesCompression::Gz,
+            file,
+            "Packages.gz",
+            &mut file_list,
+            &mut ctx,
+            &config,
+        )
+        .await;
         assert!(
             result.is_err(),
             "a decompression bomb must abort reduce_file_list"
@@ -1109,10 +1062,16 @@ mod tests {
             keymap: &km,
         };
 
-        PackageFormat::Raw
-            .reduce_file_list(file, "Packages", &mut file_list, &mut ctx, &config)
-            .await
-            .expect("oversize lines must be skipped, not aborted");
+        reduce_file_list(
+            PackagesCompression::Raw,
+            file,
+            "Packages",
+            &mut file_list,
+            &mut ctx,
+            &config,
+        )
+        .await
+        .expect("oversize lines must be skipped, not aborted");
 
         assert!(
             !file_list.contains_key(OsStr::new("dummy_1.0_amd64.deb")),
@@ -1154,10 +1113,16 @@ mod tests {
             keymap: &km,
         };
 
-        PackageFormat::Raw
-            .reduce_file_list(file, "Packages", &mut file_list, &mut ctx, &config)
-            .await
-            .expect("an empty raw Packages file must be treated as zero stanzas");
+        reduce_file_list(
+            PackagesCompression::Raw,
+            file,
+            "Packages",
+            &mut file_list,
+            &mut ctx,
+            &config,
+        )
+        .await
+        .expect("an empty raw Packages file must be treated as zero stanzas");
 
         assert!(
             file_list.contains_key(OsStr::new("keep-me.deb")),

@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncRead, ReadBuf};
 
 use crate::nonzero;
+use crate::xz_stream::xz_decoder;
 
 /// Maximum size (bytes) of an upstream HTTP response header block.
 #[cfg_attr(
@@ -206,6 +207,109 @@ where
     })
 }
 
+/// Compression of a `Packages` file.
+///
+/// [`extension`](Self::extension) and [`from_filename`](Self::from_filename) are
+/// inverses of one table, so a new format is one edit here rather than two in
+/// separate modules: the cleanup fetch cascade builds URL/cache names from the
+/// former, the registry-ingest router classifies committed leaves with the
+/// latter.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PackagesCompression {
+    Raw,
+    Gz,
+    Xz,
+}
+
+impl PackagesCompression {
+    /// The filename suffix this compression carries.
+    #[must_use]
+    pub(crate) const fn extension(self) -> &'static str {
+        match self {
+            Self::Raw => "",
+            Self::Gz => ".gz",
+            Self::Xz => ".xz",
+        }
+    }
+
+    /// Derive from a filename leaf. `None` if the leaf does not look like a
+    /// `Packages` file at all.
+    #[must_use]
+    pub(crate) fn from_filename(name: &str) -> Option<Self> {
+        if name == "Packages" {
+            Some(Self::Raw)
+        } else if name == "Packages.gz" {
+            Some(Self::Gz)
+        } else if name == "Packages.xz" {
+            Some(Self::Xz)
+        } else {
+            None
+        }
+    }
+}
+
+/// The effective decompressed-output ceiling for a `Packages` file of
+/// `compressed_size` bytes: the smaller of [`MAX_DECOMPRESSED_PACKAGES_SIZE`]
+/// and the size multiplied by [`MAX_DECOMPRESSION_RATIO`].
+///
+/// `None` — an empty file, or a size the caller could not stat — yields the
+/// absolute cap: with no compressed size to anchor it, the ratio bound has
+/// nothing to say.
+#[must_use]
+pub(crate) fn decompressed_limit(compressed_size: Option<NonZero<u64>>) -> NonZero<u64> {
+    match compressed_size {
+        Some(size) => {
+            MAX_DECOMPRESSED_PACKAGES_SIZE.min(size.saturating_mul(MAX_DECOMPRESSION_RATIO))
+        }
+        None => MAX_DECOMPRESSED_PACKAGES_SIZE,
+    }
+}
+
+/// Wrap an open `Packages` file in its decompression layer with the
+/// decompression-bomb guard applied, ready for [`read_line_capped`].
+///
+/// `limit` bounds the *decompressed* byte count (see [`decompressed_limit`]), so
+/// the [`LimitedReader`] sits above the decoder, not below it. A compression
+/// layer is fed from its own [`BufReader`](tokio::io::BufReader) because it
+/// benefits from amortising reads of its compressed input; raw bytes need no
+/// such inner buffer.
+///
+/// Shared by cleanup's candidate reduce (`cleanup::packages`) and checksum
+/// registry ingest (`integrity`) — the two differ in how they *derive* the
+/// compression and what they do when the file is unreadable, never in how the
+/// bytes are decoded or bounded. The returned reader is boxed: one allocation on
+/// a path that then streams the whole index through it, in exchange for the
+/// three branches having one home.
+pub(crate) fn packages_reader(
+    file: tokio::fs::File,
+    compression: PackagesCompression,
+    limit: NonZero<u64>,
+    buffer_size: usize,
+) -> Box<dyn AsyncBufRead + Unpin + Send> {
+    match compression {
+        PackagesCompression::Raw => Box::new(tokio::io::BufReader::with_capacity(
+            buffer_size,
+            LimitedReader::new(file, limit),
+        )),
+        PackagesCompression::Gz => {
+            let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
+            let decoder = async_compression::tokio::bufread::GzipDecoder::new(file_reader);
+            Box::new(tokio::io::BufReader::with_capacity(
+                buffer_size,
+                LimitedReader::new(decoder, limit),
+            ))
+        }
+        PackagesCompression::Xz => {
+            let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
+            let decoder = xz_decoder(file_reader);
+            Box::new(tokio::io::BufReader::with_capacity(
+                buffer_size,
+                LimitedReader::new(decoder, limit),
+            ))
+        }
+    }
+}
+
 /// Consume bytes from `reader` up to and including the next `\n`, or until
 /// EOF. Used to skip the tail of an over-length line after the in-memory
 /// accumulator has been abandoned.
@@ -235,6 +339,46 @@ where
 mod tests {
     use super::*;
     use crate::nonzero;
+
+    #[test]
+    fn decompressed_limit_ratio_caps_small_input() {
+        // A tiny compressed file: the ratio cap (size * MAX_DECOMPRESSION_RATIO) dominates.
+        assert_eq!(
+            decompressed_limit(Some(nonzero!(1000))),
+            MAX_DECOMPRESSION_RATIO.checked_mul(nonzero!(1000)).unwrap()
+        );
+    }
+
+    #[test]
+    fn decompressed_limit_absolute_caps_large_input() {
+        // A huge compressed file: the absolute cap dominates, and the ratio
+        // multiply must saturate rather than wrap.
+        assert_eq!(
+            decompressed_limit(Some(nonzero!(u64::MAX))),
+            MAX_DECOMPRESSED_PACKAGES_SIZE
+        );
+    }
+
+    #[test]
+    fn decompressed_limit_unknown_size_is_absolute_cap() {
+        // Zero-length, or a size the caller could not stat: the ratio bound has
+        // no anchor, so only the absolute cap applies.
+        assert_eq!(decompressed_limit(None), MAX_DECOMPRESSED_PACKAGES_SIZE);
+    }
+
+    #[test]
+    fn compression_extension_and_from_filename_are_inverses() {
+        for c in [
+            PackagesCompression::Raw,
+            PackagesCompression::Gz,
+            PackagesCompression::Xz,
+        ] {
+            let leaf = format!("Packages{}", c.extension());
+            assert_eq!(PackagesCompression::from_filename(&leaf), Some(c), "{leaf}");
+        }
+        assert_eq!(PackagesCompression::from_filename("Release"), None);
+        assert_eq!(PackagesCompression::from_filename("Packages.bz2"), None);
+    }
 
     #[tokio::test]
     async fn limited_reader_allows_within_limit() {
