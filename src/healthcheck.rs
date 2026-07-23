@@ -7,6 +7,21 @@
 //! traffic (see `cached_health_report`).
 
 use std::num::NonZero;
+use std::path::Path;
+use std::time::Duration;
+
+use tokio::io::AsyncWriteExt as _;
+use tracing::debug;
+
+use crate::{error::ErrorReport, utils::tokio_nofollow_options};
+
+/// Filename of the transient cache-writability probe, created and unlinked
+/// at the cache-directory root. `task_cache_scan` skips it by name so a
+/// scan racing the probe window does not flag `CACHE_UNEXPECTED_REGULAR`.
+pub(crate) const PROBE_FILENAME: &str = ".apt-cacher-rs.healthprobe";
+
+/// Upper bound for each individual check.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::swrite;
 
@@ -109,6 +124,47 @@ fn check_quota(current_size: u64, limit: Option<NonZero<u64>>) -> CheckResult {
     }
 }
 
+/// Cache-directory writability: create, write, and unlink a small probe
+/// file at the cache root. `O_NOFOLLOW` (via `tokio_nofollow_options`)
+/// means a planted symlink fails the check - correct, since that indicates
+/// a compromised cache directory. `.create(true)` (not `create_new`) so an
+/// orphaned probe from a crashed run is reopened and truncated.
+async fn check_cache_write(cache_dir: &Path) -> CheckResult {
+    let probe = cache_dir.join(PROBE_FILENAME);
+    match tokio::time::timeout(CHECK_TIMEOUT, probe_write(&probe)).await {
+        Ok(Ok(())) => CheckResult::Pass,
+        Ok(Err(err)) => CheckResult::Fail(format!("{}", ErrorReport(&err))),
+        Err(_elapsed) => CheckResult::Fail(format!(
+            "timed out after {}s",
+            CHECK_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn probe_write(probe: &Path) -> std::io::Result<()> {
+    let mut file = tokio_nofollow_options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(probe)
+        .await?;
+    file.write_all(b"ok").await?;
+    // tokio's File parks a failed background write in `last_write_err` and
+    // `write_all` still returns Ok; only flush surfaces it. Without this a
+    // full disk passes the very check meant to detect it.
+    file.flush().await?;
+    drop(file);
+    // A failed unlink still passes the check: the file is scanner-ignored
+    // and rewritten by the next probe.
+    if let Err(err) = tokio::fs::remove_file(probe).await {
+        debug!(
+            "Failed to remove healthcheck probe `{}`:  {err}",
+            probe.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +215,36 @@ mod tests {
         let mut out = String::new();
         json_escape_into(&mut out, "");
         assert_eq!(out, "");
+    }
+
+    #[tokio::test]
+    async fn cache_write_probe_passes_and_cleans_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = check_cache_write(dir.path()).await;
+        assert_eq!(r, CheckResult::Pass);
+        assert!(
+            !dir.path().join(PROBE_FILENAME).exists(),
+            "probe file must be unlinked after a successful check"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_write_probe_fails_on_missing_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("nonexistent");
+        let r = check_cache_write(&gone).await;
+        assert!(matches!(r, CheckResult::Fail(_)), "unexpected: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn cache_write_probe_refuses_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"x").expect("write target");
+        std::os::unix::fs::symlink(&target, dir.path().join(PROBE_FILENAME))
+            .expect("symlink");
+        let r = check_cache_write(dir.path()).await;
+        assert!(!r.ok(), "O_NOFOLLOW must refuse a planted symlink");
     }
 
     #[test]
