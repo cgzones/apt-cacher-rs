@@ -6,9 +6,8 @@ use coarsetime::Clock;
 use hashbrown::HashSet;
 use tracing::{debug, error, warn};
 
-use crate::AppState;
 use crate::cache_layout::CacheLayout;
-use crate::database::MirrorEntry;
+use crate::database::OriginEntry;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
 use crate::integrity::read_release_to_string;
 use crate::metrics;
@@ -194,32 +193,20 @@ pub(super) async fn build_byhash_reference_set(
 /// structured by-hash reconciliation. Stale dists are excluded so their by-hash
 /// files age out normally.
 ///
-/// Returns `None` on a DB error - the caller then forces age-based retention for
-/// the structured tree this cycle rather than reconciling against a possibly
+/// `origins` is the mirror's own rows, read once per cycle by the engine and
+/// shared with the structured-pool reconcile. `None` there means the read failed;
+/// it propagates to `None` here so the caller forces age-based retention for the
+/// structured tree this cycle rather than reconciling against a possibly
 /// incomplete origin set (a missing still-active dist would otherwise let
 /// reference mode orphan its by-hash files). `Some(vec![])` is a genuine "no
 /// active origins", distinct from the error case.
-pub(super) async fn active_origin_distributions(
-    appstate: &AppState,
-    mirror: &MirrorEntry,
-) -> Option<Vec<String>> {
-    let origins = match appstate
-        .database
-        .get_origins_by_mirror(&mirror.host, mirror.port(), &mirror.path)
-        .await
-    {
-        Ok(o) => o,
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!("Error looking up origins for by-hash cleanup:  {err}");
-            return None;
-        }
-    };
+#[must_use]
+pub(super) fn active_origin_distributions(origins: Option<&[OriginEntry]>) -> Option<Vec<String>> {
     let now: Duration = Clock::now_since_epoch().into();
-    let mut dists: Vec<String> = origins
-        .into_iter()
+    let mut dists: Vec<String> = origins?
+        .iter()
         .filter(|origin| origin.is_active(now))
-        .map(|origin| origin.distribution)
+        .map(|origin| origin.distribution.clone())
         .collect();
     dists.sort_unstable();
     dists.dedup();
@@ -247,7 +234,44 @@ pub(super) async fn byhash_dir_present(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RETENTION_TIME;
+    use crate::config::ClientHost;
     use crate::{index_parser::hex_encode, swrite};
+
+    fn origin(distribution: &str, age: Duration) -> OriginEntry {
+        let now = Clock::now_since_epoch().as_secs();
+        OriginEntry::new_for_test(
+            ClientHost::new("deb.example.org".to_owned()).expect("valid host"),
+            "debian".to_owned(),
+            distribution.to_owned(),
+            i64::try_from(now.saturating_sub(age.as_secs())).expect("in range"),
+        )
+    }
+
+    #[test]
+    fn active_origin_distributions_sorts_dedups_and_drops_stale() {
+        let fresh = Duration::from_mins(1);
+        let stale = RETENTION_TIME + Duration::from_mins(1);
+        let origins = [
+            origin("trixie", fresh),
+            origin("sid", fresh),
+            origin("sid", fresh),
+            origin("retired", stale),
+        ];
+        assert_eq!(
+            active_origin_distributions(Some(&origins)),
+            Some(vec!["sid".to_owned(), "trixie".to_owned()])
+        );
+    }
+
+    #[test]
+    fn active_origin_distributions_distinguishes_unread_from_empty() {
+        // `None` (the read failed) must NOT collapse to "no active origins":
+        // the caller uses it to force age mode instead of reconciling against
+        // an origin set it never saw.
+        assert_eq!(active_origin_distributions(None), None);
+        assert_eq!(active_origin_distributions(Some(&[])), Some(Vec::new()));
+    }
 
     fn release_with_sha256(digests: &[[u8; 32]]) -> String {
         let mut s = String::from(

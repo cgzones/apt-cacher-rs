@@ -296,8 +296,19 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
         ReconcilePolicy::ReferencedOrBail { grace: _ } => {
             for g in groups {
                 match &g.outcome {
-                    GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => {}
-                    GroupOutcome::FetchFailed(_) | GroupOutcome::ParseError => {
+                    // A gate that legitimately did not apply (no row, no active
+                    // origins) means there is no reference set to be had, which
+                    // the grace sweep already handles.
+                    GroupOutcome::Complete
+                    | GroupOutcome::NotApplicable(
+                        SkipReason::NoRow { seg: _ } | SkipReason::NoActiveOrigins,
+                    ) => {}
+                    // A DB error is different: the reference set is *unknown*,
+                    // not empty, so sweeping could delete a still-referenced
+                    // deb. Bail like a failed fetch.
+                    GroupOutcome::NotApplicable(SkipReason::DbError)
+                    | GroupOutcome::FetchFailed(_)
+                    | GroupOutcome::ParseError => {
                         return SweepAction::Bail;
                     }
                 }
@@ -633,6 +644,30 @@ mod tests {
         assert_eq!(
             decide_sweep(BAIL, &[gr(GroupOutcome::FetchFailed(ff(404)))]),
             SweepAction::Bail
+        );
+    }
+
+    #[test]
+    fn bail_db_error_bails() {
+        // The reference set is unknown rather than empty, so a grace sweep
+        // could delete a deb the unread origins still reference.
+        assert_eq!(
+            decide_sweep(
+                BAIL,
+                &[gr(GroupOutcome::NotApplicable(SkipReason::DbError))]
+            ),
+            SweepAction::Bail
+        );
+    }
+
+    #[test]
+    fn bail_no_active_origins_is_grace() {
+        assert_eq!(
+            decide_sweep(
+                BAIL,
+                &[gr(GroupOutcome::NotApplicable(SkipReason::NoActiveOrigins))]
+            ),
+            grace()
         );
     }
 
