@@ -292,6 +292,29 @@ impl OriginEntry {
     }
 }
 
+#[cfg(test)]
+impl OriginEntry {
+    /// Test-only constructor: production code only builds an `OriginEntry` from
+    /// a SQL row, but `cleanup::refs`' pure unit tests need to build one
+    /// directly.
+    pub(crate) fn new_for_test(
+        host: ClientHost,
+        mirror_path: String,
+        distribution: String,
+        last_seen: i64,
+    ) -> Self {
+        Self {
+            host,
+            port: 0,
+            mirror_path,
+            distribution,
+            component: "main".to_owned(),
+            architecture: "amd64".to_owned(),
+            last_seen,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ClientStatEntry {
     pub(crate) client_ip: IpAddr,

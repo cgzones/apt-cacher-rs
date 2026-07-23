@@ -11,7 +11,7 @@ use crate::{
     AppState, RETENTION_TIME,
     cache_layout::CacheLayout,
     config::Config,
-    database::MirrorEntry,
+    database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
     error::ProxyCacheError,
     humanfmt::HumanFmt,
@@ -275,12 +275,27 @@ pub(super) async fn run_mirror_units(
     config: &'static Config,
 ) -> CleanupDone {
     let mirror: Mirror = entry.clone().into();
-
-    // One reference instant per mirror, injected into every unit's sweep so a
-    // single cleanup cycle ages every tree against the same `now` (and so the
-    // by-hash / metadata deletion paths are testable, birthtime not being
-    // backdatable on Linux).
     let now = SystemTime::now();
+
+    // The mirror's own `origins` rows, read once: the structured-pool reconcile
+    // and the structured by-hash completeness gate both reconcile against them
+    // and used to issue this identical query one apiece. A `MirrorKind::Flat`
+    // row emits neither unit, so it still issues none -- and never observes the
+    // `None` that a failed read would produce.
+    let self_origins = if entry.kind() == MirrorKind::Flat {
+        None
+    } else {
+        read_self_origins(&appstate, &mirror, &entry).await
+    };
+
+    let ctx = MirrorCtx {
+        mirror: &mirror,
+        entry: &entry,
+        appstate: &appstate,
+        config,
+        self_origins: self_origins.as_deref(),
+        now,
+    };
 
     let mut scanned = 0u64;
     let mut removed = 0u64;
@@ -288,7 +303,7 @@ pub(super) async fn run_mirror_units(
     let mut removed_unreferenced = 0u64;
 
     for unit in &units {
-        match run_unit(unit, &mirror, &entry, &appstate, config, now).await {
+        match run_unit(unit, &ctx).await {
             Ok(unit_stats) => {
                 scanned += unit_stats.scanned;
                 removed += unit_stats.removed;
@@ -310,10 +325,53 @@ pub(super) async fn run_mirror_units(
     )
 }
 
+/// Everything a unit needs that is fixed for the whole mirror: its identity, the
+/// DB/config handles, the once-per-cycle origins read, and the single reference
+/// instant every one of its trees is aged against.
+struct MirrorCtx<'a> {
+    mirror: &'a Mirror,
+    entry: &'a MirrorEntry,
+    appstate: &'a AppState,
+    config: &'a Config,
+    /// This mirror's own `origins` rows; `None` = unread (see
+    /// [`read_self_origins`]).
+    self_origins: Option<&'a [OriginEntry]>,
+    /// One instant per mirror, so a single cycle ages every tree against the
+    /// same `now` (and so the by-hash / metadata deletion paths are testable,
+    /// birthtime not being backdatable on Linux).
+    now: SystemTime,
+}
+
+/// Read this mirror's own `origins` rows. `None` means the lookup failed --
+/// logged and counted here, once, rather than at each consumer -- and every
+/// consumer must treat it as *unknown*, never as "this mirror has no origins":
+/// grace-sweeping on an unread origin set would delete still-referenced debs.
+async fn read_self_origins(
+    appstate: &AppState,
+    mirror: &Mirror,
+    entry: &MirrorEntry,
+) -> Option<Vec<OriginEntry>> {
+    match appstate
+        .database
+        .get_origins_by_mirror(&entry.host, entry.port(), &entry.path)
+        .await
+    {
+        Ok(origins) => Some(origins),
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!("Error looking up origins for mirror {mirror}:  {err}");
+            None
+        }
+    }
+}
+
 /// Immutable context threaded through the reconcile-unit resolvers (the
 /// candidate map and tally are the only mutable state, kept separate).
 struct ReconcileCtx<'a> {
     policy: ReconcilePolicy,
+    /// This mirror's own `origins` rows, read once per cycle by
+    /// [`run_mirror_units`]; `None` = unread (see [`read_self_origins`]).
+    self_origins: Option<&'a [OriginEntry]>,
     /// The unit's tree root: candidate keys are relative to it, so a resolver
     /// needs it to turn a matched key back into an on-disk path. Named apart
     /// from the archive-root / flat-root *segments* the resolvers call `root`.
@@ -344,56 +402,21 @@ enum GroupResolution {
 /// Execute one [`CleanupUnit`]. The candidate-reconcile facets (`StructuredPool`
 /// / `FlatTree`) route through the generic reconcile engine; the by-hash,
 /// metadata, and partials facets each run their own narrow arm.
-pub(super) async fn run_unit(
-    unit: &CleanupUnit,
-    mirror: &Mirror,
-    entry: &MirrorEntry,
-    appstate: &AppState,
-    config: &Config,
-    now: SystemTime,
-) -> Result<UnitStats, ProxyCacheError> {
+async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, ProxyCacheError> {
     // The single facet -> `CacheLayout` map. Every arm names the layout its
     // sweep keys `cache_metadata` invalidation on, so a new facet cannot be
     // added without deciding one -- there is deliberately no second map to
     // forget.
     match unit.facet {
         RepoFacet::StructuredPool => {
-            run_reconcile_unit(
-                unit,
-                CacheLayout::StructuredPool,
-                mirror,
-                entry,
-                appstate,
-                config,
-                now,
-            )
-            .await
+            run_reconcile_unit(unit, CacheLayout::StructuredPool, ctx).await
         }
-        RepoFacet::FlatTree => {
-            run_reconcile_unit(
-                unit,
-                CacheLayout::Flat,
-                mirror,
-                entry,
-                appstate,
-                config,
-                now,
-            )
-            .await
-        }
-        RepoFacet::StructuredByHash => {
-            run_byhash_unit(unit, mirror, entry, appstate, now, CacheLayout::DistsByHash).await
-        }
-        RepoFacet::FlatByHash => {
-            run_byhash_unit(unit, mirror, entry, appstate, now, CacheLayout::FlatByHash).await
-        }
-        RepoFacet::StructuredMetadata => {
-            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Dists).await)
-        }
-        RepoFacet::FlatMetadata => {
-            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Flat).await)
-        }
-        RepoFacet::Partials => Ok(run_partials_unit(unit, mirror, now).await),
+        RepoFacet::FlatTree => run_reconcile_unit(unit, CacheLayout::Flat, ctx).await,
+        RepoFacet::StructuredByHash => run_byhash_unit(unit, ctx, CacheLayout::DistsByHash).await,
+        RepoFacet::FlatByHash => run_byhash_unit(unit, ctx, CacheLayout::FlatByHash).await,
+        RepoFacet::StructuredMetadata => Ok(run_metadata_unit(unit, ctx, CacheLayout::Dists).await),
+        RepoFacet::FlatMetadata => Ok(run_metadata_unit(unit, ctx, CacheLayout::Flat).await),
+        RepoFacet::Partials => Ok(run_partials_unit(unit, ctx).await),
     }
 }
 
@@ -407,14 +430,15 @@ pub(super) async fn run_unit(
 /// scratch files are not cached content, so they must not inflate
 /// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED` or the quota reconcile, exactly
 /// matching the old pre-pass, which only ever logged its total.
-async fn run_partials_unit(unit: &CleanupUnit, mirror: &Mirror, now: SystemTime) -> UnitStats {
+async fn run_partials_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
+    let mirror = ctx.mirror;
     let RetentionPolicy::AgeOnly { span } = unit.policy else {
         // The classifier only ever pairs `Partials` with `AgeOnly`; a mismatch
         // means a mis-built unit, so do nothing rather than guess a span.
         return UnitStats::default();
     };
 
-    let removed = cleanup_tmp_dir(&unit.tree.root, now, span).await;
+    let removed = cleanup_tmp_dir(&unit.tree.root, ctx.now, span).await;
 
     if removed > 0 {
         info!(
@@ -439,10 +463,10 @@ async fn run_partials_unit(unit: &CleanupUnit, mirror: &Mirror, now: SystemTime)
 /// `Release` freed now unpins its digests this cycle.
 async fn run_metadata_unit(
     unit: &CleanupUnit,
-    mirror: &Mirror,
-    now: SystemTime,
+    ctx: &MirrorCtx<'_>,
     layout: CacheLayout,
 ) -> UnitStats {
+    let mirror = ctx.mirror;
     let RetentionPolicy::AgeOnly { span } = unit.policy else {
         // The classifier only ever pairs a metadata facet with `AgeOnly`; a
         // mismatch means a mis-built unit, so do nothing rather than guess a span.
@@ -454,7 +478,7 @@ async fn run_metadata_unit(
         unit.tree.root.display()
     );
 
-    let swept = sweep_aged_metadata(&unit.tree.root, span, now, mirror, layout).await;
+    let swept = sweep_aged_metadata(&unit.tree.root, span, ctx.now, mirror, layout).await;
 
     if swept.files_removed > 0 {
         info!(
@@ -502,12 +526,10 @@ struct ByHashOutcome {
 /// for a mirror without by-hash) skips the origins query and Release reads.
 async fn run_byhash_unit(
     unit: &CleanupUnit,
-    mirror: &Mirror,
-    entry: &MirrorEntry,
-    appstate: &AppState,
-    now: SystemTime,
+    ctx: &MirrorCtx<'_>,
     layout: CacheLayout,
 ) -> Result<UnitStats, ProxyCacheError> {
+    let mirror = ctx.mirror;
     let byhash_path = &unit.tree.root;
 
     // Cheap absence check: skip the origins query + Release reads for a mirror
@@ -536,7 +558,7 @@ async fn run_byhash_unit(
     // against a possibly-incomplete origin set). Flat trees have a single root
     // Release and no per-dist union, so they pass an empty expected list.
     let reference = match dist_gate {
-        DistGate::ActiveOriginDists => match active_origin_distributions(appstate, entry).await {
+        DistGate::ActiveOriginDists => match active_origin_distributions(ctx.self_origins) {
             Some(expected_dists) => {
                 build_byhash_reference_set(release_dir, layout, &expected_dists).await
             }
@@ -550,7 +572,7 @@ async fn run_byhash_unit(
         reference.as_ref(),
         grace,
         backstop,
-        now,
+        ctx.now,
         mirror,
         layout,
     )
@@ -714,12 +736,16 @@ async fn sweep_byhash_dir(
 async fn run_reconcile_unit(
     unit: &CleanupUnit,
     layout: CacheLayout,
-    mirror: &Mirror,
-    entry: &MirrorEntry,
-    appstate: &AppState,
-    config: &Config,
-    now: SystemTime,
+    mirror_ctx: &MirrorCtx<'_>,
 ) -> Result<UnitStats, ProxyCacheError> {
+    let &MirrorCtx {
+        mirror,
+        entry,
+        appstate,
+        config,
+        self_origins,
+        now,
+    } = mirror_ctx;
     let RetentionPolicy::Reconcile(policy) = unit.policy else {
         // The classifier only ever pairs a reconcile facet with a reconcile
         // policy; a mismatch means a mis-built unit, so do nothing rather than
@@ -747,6 +773,7 @@ async fn run_reconcile_unit(
 
     let ctx = ReconcileCtx {
         policy,
+        self_origins,
         tree_root: &unit.tree.root,
         mirror,
         entry,
@@ -1001,6 +1028,7 @@ async fn resolve_origin_packages_archive_root(
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy: _,
+        self_origins: _,
         tree_root,
         mirror,
         entry: _,
@@ -1128,6 +1156,7 @@ async fn resolve_flat_root_segment(
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy: _,
+        self_origins: _,
         tree_root,
         mirror,
         entry: _,
@@ -1196,6 +1225,7 @@ async fn resolve_flat_colocated(
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy: _,
+        self_origins: _,
         tree_root,
         mirror,
         entry: _,
@@ -1257,6 +1287,7 @@ async fn resolve_origin_packages_self(
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
         policy,
+        self_origins,
         tree_root,
         mirror,
         entry,
@@ -1268,13 +1299,15 @@ async fn resolve_origin_packages_self(
     // the sweep spans from the same policy.
     let grace = policy.grace();
 
-    let origins = appstate
-        .database
-        .get_origins_by_mirror(&entry.host, entry.port(), &entry.path)
-        .await
-        .inspect_err(|err| {
-            error!("Error looking up origins:  {err}");
-        })?;
+    let Some(origins) = self_origins else {
+        // The origins read failed (logged and counted at the read site): we
+        // cannot tell which cached debs are still referenced. Hand the tail a
+        // `DbError`, which `decide_sweep` turns into a bail -- treating it as
+        // "no origins" would grace-sweep files we never got to check.
+        return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
+            SkipReason::DbError,
+        )));
+    };
 
     trace!("Origins ({}): {origins:?}", origins.len());
 
@@ -1288,7 +1321,7 @@ async fn resolve_origin_packages_self(
     let most_recent_origin: i64 = origins.iter().map(|o| o.last_seen).max().unwrap_or(0);
 
     let active_origins = origins
-        .into_iter()
+        .iter()
         .filter(|origin| origin.is_active(now))
         .collect::<Vec<_>>();
 
@@ -1340,7 +1373,7 @@ async fn resolve_origin_packages_self(
     // would allocate for origins that are never probed. `keymap: Basename`
     // because the structured pool flattens `Filename:` relpaths to basename;
     // `layout: Dists` is where the referencing `Packages` index lives.
-    for origin in &active_origins {
+    for origin in active_origins {
         let plan = FetchPlan {
             mirror: mirror.clone(),
             owner_mirror: mirror.clone(),
