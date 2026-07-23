@@ -17,7 +17,20 @@ use crate::config::Config;
 use crate::database::MirrorEntry;
 use crate::deb_mirror::{MirrorKind, flat_pool_archive_root};
 
-use super::{METADATA_KEEP_SPAN, UNREFERENCED_KEEP_SPAN};
+/// Grace period for unreferenced cached deb files. Apt updates that bypass
+/// the proxy register their origin lazily; this delay prevents a freshly
+/// cached file from being wiped before its origin row is observed.
+const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
+
+/// Retention span for volatile index metadata (`Release`/`InRelease`/`Packages*`
+/// /...) in a structured `dists/` directory. Unlike per-`.deb` files these are
+/// refreshed in place (a fresh inode, hence a fresh birthtime) while a
+/// distribution is in use, so aging past this span marks the distribution as
+/// retired. Nothing else reclaims these files, and while a retired dist's
+/// `Release` lingers, reference-mode by-hash cleanup keeps every digest it lists
+/// pinned; removing the metadata bounds the growth and unblocks that reclaim.
+/// See `sweep::sweep_aged_metadata`.
+const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
 
 /// Which on-disk repository shape a [`CleanupUnit`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,10 +8,35 @@ use tracing::{debug, error, warn};
 use crate::cache_layout::CacheLayout;
 use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::humanfmt::HumanFmt;
-use crate::{info_once, metrics};
+use crate::{cache_metadata, info_once, metrics};
 
 use super::engine::{Candidate, SpanClass};
-use super::invalidate_metadata_for;
+
+/// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
+/// Non-UTF-8 filenames are silently skipped: debnames are URL-decoded ASCII,
+/// so any non-UTF-8 path can't be in the metadata store to begin with.
+///
+/// The key uses `path.file_name()` (basename) rather than a relpath because the
+/// stored `cache_metadata` key already carries the on-disk directory in
+/// `Mirror.path` (URL-directory-verbatim under the host-anchored flat layout),
+/// so basename + the cleanup mirror is the exact key — as long as the file's
+/// directory equals the cleanup mirror's registered path. That holds for every
+/// deb reached through its own mirror row: each flat-deb URL directory registers
+/// a row that `derive_nested_paths` turns into a walk boundary, so the handling
+/// task always sees a single-segment relpath. The one gap is the recursive-scan
+/// safety net: a deb nested *below* the cleanup mirror's path whose own row is
+/// missing (e.g. pruned by `cleanup_invalid_rows`, or a DB reset with files left
+/// behind) is keyed here under the wrong `Mirror.path` and the invalidation
+/// misses. That only leaks an in-memory entry (the on-disk file is still removed
+/// correctly), and the store rebuilds lazily from xattrs, so it self-heals on
+/// restart.
+pub(super) fn invalidate_metadata_for(path: &Path, mirror: &Mirror, layout: CacheLayout) {
+    if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
+        cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
+            mirror, debname, layout,
+        ));
+    }
+}
 
 /// Return value of [`sweep_candidates`].
 #[derive(Copy, Clone)]

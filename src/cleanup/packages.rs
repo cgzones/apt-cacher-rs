@@ -33,7 +33,7 @@ use crate::hyper_conn::process_cache_request;
 use crate::process_cache_request;
 
 use super::engine::Candidate;
-use super::invalidate_metadata_for;
+use super::sweep::invalidate_metadata_for;
 use super::verify::{Verdict, verify_cache_file};
 
 /// How a `Filename:` value from a Packages stanza maps to a key in the
