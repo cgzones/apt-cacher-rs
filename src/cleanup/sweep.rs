@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -10,7 +11,7 @@ use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::humanfmt::HumanFmt;
 use crate::{cache_metadata, info_once, metrics};
 
-use super::engine::{Candidate, SpanClass};
+use super::engine::SpanClass;
 
 /// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
 /// Non-UTF-8 filenames are silently skipped: debnames are URL-decoded ASCII,
@@ -101,8 +102,17 @@ pub(super) fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Optio
     }
 }
 
-/// Remove cached files in `candidates` older than their per-class span,
-/// dropping any matching `cache_metadata` entries on success.
+/// Remove cached files older than their per-class span, dropping any matching
+/// `cache_metadata` entries on success.
+///
+/// Each candidate is `(name, class)` where `name` is the entry's path *relative
+/// to `root`* — a bare basename for the depth-1 trees, a `/`-joined relpath for
+/// the recursive flat walk. The full path is rebuilt here rather than carried on
+/// the candidate: the map is filled by the scan over the whole tree (~100k
+/// entries, ten mirrors at once) and only *then* reduced against the Packages
+/// index, so a `PathBuf` per *scanned* entry would be megabytes held for the
+/// whole unit — to spare the surviving candidates one join apiece. The sweep
+/// itself does allocate one joined path per candidate it inspects.
 ///
 /// A candidate's [`SpanClass`] selects its span from `spans`: `.deb` files use
 /// `spans.deb`; by-hash files use `spans.byhash_covered`/`byhash_uncovered`.
@@ -114,7 +124,8 @@ pub(super) fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Optio
 /// Packages index is unfetchable (long span, since we cannot tell which entries
 /// are still referenced).
 pub(super) async fn sweep_candidates(
-    candidates: &HashMap<String, Candidate>,
+    root: &Path,
+    candidates: &HashMap<OsString, SpanClass>,
     spans: SpanTable,
     now: SystemTime,
     mirror: &Mirror,
@@ -124,15 +135,15 @@ pub(super) async fn sweep_candidates(
     let mut files_removed = 0u64;
     let mut removed_unreferenced = 0u64;
 
-    for candidate in candidates.values() {
-        let path = &candidate.path;
-        let keep_span = match candidate.class {
+    for (name, &class) in candidates {
+        let path = root.join(name);
+        let keep_span = match class {
             SpanClass::Deb => spans.deb,
             SpanClass::ByHashCovered => spans.byhash_covered,
             SpanClass::ByHashUncovered => spans.byhash_uncovered,
         };
 
-        let data = match tokio::fs::symlink_metadata(path).await {
+        let data = match tokio::fs::symlink_metadata(&path).await {
             Ok(d) if d.file_type().is_file() => Some(d),
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
@@ -156,7 +167,7 @@ pub(super) async fn sweep_candidates(
             continue;
         };
 
-        let Some(created) = age_reference_time(&data, path) else {
+        let Some(created) = age_reference_time(&data, &path) else {
             continue;
         };
 
@@ -182,19 +193,19 @@ pub(super) async fn sweep_candidates(
 
         let size = data.len();
 
-        if let Err(err) = tokio::fs::remove_file(path).await {
+        if let Err(err) = tokio::fs::remove_file(&path).await {
             metrics::CACHE_IO_FAILURE.increment();
             error!("Error removing cached file `{}`:  {err}", path.display());
             continue;
         }
 
-        invalidate_metadata_for(path, mirror, layout);
+        invalidate_metadata_for(&path, mirror, layout);
 
         debug!("Removed cached file `{}`", path.display());
 
         bytes_removed += size;
         files_removed += 1;
-        if matches!(candidate.class, SpanClass::ByHashCovered) {
+        if matches!(class, SpanClass::ByHashCovered) {
             removed_unreferenced += 1;
         }
     }
@@ -371,8 +382,10 @@ mod tests {
     async fn sweep_candidates_selects_span_by_class_and_counts_unreferenced() {
         use hashbrown::HashMap;
 
+        use std::ffi::OsString;
+
         use super::{SpanTable, sweep_candidates};
-        use crate::cleanup::engine::{Candidate, SpanClass};
+        use crate::cleanup::engine::SpanClass;
 
         // `invalidate_metadata_for` reaches `cache_metadata::store()`, which
         // panics unless initialised. Idempotent across the test binary.
@@ -388,28 +401,13 @@ mod tests {
             std::fs::write(p, b"x").expect("write");
         }
 
-        let mut candidates: HashMap<String, Candidate> = HashMap::new();
-        candidates.insert(
-            "deb".to_owned(),
-            Candidate {
-                path: deb.clone(),
-                class: SpanClass::Deb,
-            },
-        );
-        candidates.insert(
-            "covered".to_owned(),
-            Candidate {
-                path: covered.clone(),
-                class: SpanClass::ByHashCovered,
-            },
-        );
-        candidates.insert(
-            "uncovered".to_owned(),
-            Candidate {
-                path: uncovered.clone(),
-                class: SpanClass::ByHashUncovered,
-            },
-        );
+        let candidates: HashMap<OsString, SpanClass> = [
+            (OsString::from("pkg_1.0_amd64.deb"), SpanClass::Deb),
+            (OsString::from("covered"), SpanClass::ByHashCovered),
+            (OsString::from("uncovered"), SpanClass::ByHashUncovered),
+        ]
+        .into_iter()
+        .collect();
 
         // Birthtime is not backdatable on Linux, so inject `now` ~100 days
         // ahead: every file's age is ~100 days. Only the class whose span is
@@ -422,6 +420,7 @@ mod tests {
             byhash_uncovered: Duration::from_hours(200 * 24),
         };
         let res = sweep_candidates(
+            dir.path(),
             &candidates,
             spans,
             now,

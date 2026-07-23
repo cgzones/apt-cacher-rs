@@ -1,10 +1,11 @@
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use hashbrown::HashMap;
 use tracing::{debug, error, trace, warn};
 
-use crate::cleanup::engine::{Candidate, SpanClass};
+use crate::cleanup::engine::SpanClass;
 use crate::cleanup::model::TreeSpec;
 use crate::deb_mirror::{is_deb_package, is_strict_path_descendant, path_starts_with_segment};
 use crate::error::ProxyCacheError;
@@ -103,7 +104,7 @@ pub(super) async fn handle_anomalous_entry(
 pub(super) async fn scan_candidates(
     tree: &TreeSpec,
     mirror_path: &str,
-) -> Result<HashMap<String, Candidate>, ProxyCacheError> {
+) -> Result<HashMap<OsString, SpanClass>, ProxyCacheError> {
     let mut ret = HashMap::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(tree.root.clone(), String::new())];
 
@@ -239,13 +240,15 @@ pub(super) async fn scan_candidates(
             } else {
                 name_str.to_owned()
             };
-            ret.insert(
-                key,
-                Candidate {
-                    path: entry.path(),
-                    class: SpanClass::Deb,
-                },
+            // The key is the entry's path relative to `tree.root`, which is
+            // what `sweep_candidates` rejoins to reach the file -- so it must
+            // stay exactly that and never, say, a basename for a nested entry.
+            debug_assert_eq!(
+                entry.path(),
+                tree.root.join(&key),
+                "candidate key must rejoin onto the tree root"
             );
+            ret.insert(OsString::from(key), SpanClass::Deb);
         }
     }
 
@@ -311,6 +314,8 @@ fn is_nested_mirror_boundary(candidate: &str, nested_mirror_paths: &[String]) ->
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
     use super::*;
     use crate::cache_layout::{SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
     use crate::metrics;
@@ -382,8 +387,12 @@ mod tests {
             boundaries: Vec::new(),
         };
         let map = scan_candidates(&tree, "debian").await.expect("scan");
-        assert!(map.contains_key("a_1.0_amd64.deb"));
-        assert!(!map.keys().any(|k| k.contains("b_1.0_amd64.deb"))); // never recurses
+        assert!(map.contains_key(OsStr::new("a_1.0_amd64.deb")));
+        assert!(
+            !map.keys()
+                .any(|k| k.to_string_lossy().contains("b_1.0_amd64.deb")),
+            "never recurses"
+        );
     }
 
     #[tokio::test]
@@ -402,7 +411,7 @@ mod tests {
             boundaries: Vec::new(),
         };
         let map = scan_candidates(&tree, "apt").await.expect("scan");
-        assert!(map.contains_key("amd64/c_1.0_amd64.deb"));
+        assert!(map.contains_key(OsStr::new("amd64/c_1.0_amd64.deb")));
     }
 
     fn sorted(paths: &[&'static str]) -> Vec<&'static str> {
