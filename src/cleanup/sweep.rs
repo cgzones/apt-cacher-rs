@@ -215,11 +215,12 @@ pub(super) async fn sweep_candidates(
 /// by-hash cycle reclaim the now-unreferenced files.
 ///
 /// Sub-directories -- notably the `by-hash/` and `tmp/` subtrees, swept
-/// separately -- and non-regular entries are skipped. With `skip_debs` (the flat
-/// root, which co-mingles indexes with `.deb` files) any deb-named entry is left
-/// to the reference-based flat-deb cleanup; the structured `dists/` tree holds no
-/// debs and passes `false`. Only the direct children are scanned (no recursion),
-/// so nested mirrors -- which own their own flat root and cleanup -- are untouched.
+/// separately -- and non-regular entries are skipped. A flat `layout` (the flat
+/// root co-mingles indexes with `.deb` files) leaves any deb-named entry to the
+/// reference-based flat-deb cleanup; the structured `dists/` tree holds no debs,
+/// so the filter is skipped there. Only the direct children are scanned (no
+/// recursion), so nested mirrors -- which own their own flat root and cleanup --
+/// are untouched.
 ///
 /// `now` is injected for testability, matching [`sweep_candidates`]: birthtime is
 /// not backdatable on Linux, so removal cannot be exercised via mtime alone.
@@ -229,8 +230,9 @@ pub(super) async fn sweep_aged_metadata(
     now: SystemTime,
     mirror: &Mirror,
     layout: CacheLayout,
-    skip_debs: bool,
 ) -> SweepResult {
+    let skip_debs = layout.is_flat();
+
     let mut result = SweepResult {
         files_removed: 0,
         bytes_removed: 0,
@@ -470,15 +472,8 @@ mod tests {
         // `now` far in the future so both regular files are past the span
         // (birthtime is not backdatable on Linux, so inject `now` instead).
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
-        let res = sweep_aged_metadata(
-            dir.path(),
-            keep_span,
-            now,
-            &mirror,
-            CacheLayout::Dists,
-            false,
-        )
-        .await;
+        let res =
+            sweep_aged_metadata(dir.path(), keep_span, now, &mirror, CacheLayout::Dists).await;
         assert_eq!(res.files_removed, 2);
         assert!(res.bytes_removed >= 2);
         assert!(!dir.path().join("sid_Release").exists());
@@ -495,15 +490,8 @@ mod tests {
         // A young file (within the span) is retained.
         std::fs::write(dir.path().join("trixie_Release"), b"r").expect("write release");
         let now = SystemTime::now() + Duration::from_hours(24);
-        let res = sweep_aged_metadata(
-            dir.path(),
-            keep_span,
-            now,
-            &mirror,
-            CacheLayout::Dists,
-            false,
-        )
-        .await;
+        let res =
+            sweep_aged_metadata(dir.path(), keep_span, now, &mirror, CacheLayout::Dists).await;
         assert_eq!(res.files_removed, 0);
         assert!(dir.path().join("trixie_Release").exists());
     }
@@ -532,8 +520,7 @@ mod tests {
         let keep_span = Duration::from_hours(90 * 24);
         let now = SystemTime::now() + Duration::from_hours(91 * 24);
 
-        let res =
-            sweep_aged_metadata(dir.path(), keep_span, now, &mirror, CacheLayout::Flat, true).await;
+        let res = sweep_aged_metadata(dir.path(), keep_span, now, &mirror, CacheLayout::Flat).await;
         assert_eq!(res.files_removed, 2, "only the two index files are swept");
         assert!(!dir.path().join("Release").exists());
         assert!(!dir.path().join("Packages").exists());
@@ -552,7 +539,6 @@ mod tests {
             SystemTime::now() + Duration::from_hours(91 * 24),
             &test_mirror(),
             CacheLayout::Dists,
-            false,
         )
         .await;
         assert_eq!(res.files_removed, 0);
