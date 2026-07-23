@@ -6,13 +6,13 @@ use coarsetime::Clock;
 use hashbrown::HashSet;
 use tracing::{debug, error, warn};
 
+use crate::AppState;
 use crate::cache_layout::CacheLayout;
 use crate::database::MirrorEntry;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
 use crate::integrity::read_release_to_string;
 use crate::metrics;
 use crate::utils::probe_dir;
-use crate::{AppState, RETENTION_TIME};
 
 /// The set of by-hash digests referenced by a mirror's current
 /// `Release`/`InRelease` files, for one by-hash directory. Built by
@@ -218,13 +218,7 @@ pub(super) async fn active_origin_distributions(
     let now: Duration = Clock::now_since_epoch().into();
     let mut dists: Vec<String> = origins
         .into_iter()
-        .filter(|origin| {
-            Duration::from_secs(
-                u64::try_from(origin.last_seen)
-                    .expect("Database should never store negative timestamp"),
-            ) + RETENTION_TIME
-                > now
-        })
+        .filter(|origin| origin.is_active(now))
         .map(|origin| origin.distribution)
         .collect();
     dists.sort_unstable();
