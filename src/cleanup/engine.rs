@@ -8,7 +8,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     AppState, RETENTION_TIME,
-    cache_layout::CacheLayout,
+    cache_layout::{CacheLayout, dists_debname},
     config::Config,
     database::MirrorEntry,
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
@@ -123,9 +123,11 @@ impl DebnameKind {
                 distribution,
                 component,
                 architecture,
-            } => format!(
-                "{distribution}_{component}_{architecture}_Packages{}",
-                fmt.extension()
+            } => dists_debname(
+                distribution,
+                component,
+                architecture,
+                &format!("Packages{}", fmt.extension()),
             ),
             Self::Flat => format!("Packages{}", fmt.extension()),
         }

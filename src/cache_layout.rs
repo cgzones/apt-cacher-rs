@@ -389,6 +389,24 @@ pub(crate) fn is_pseudo_arch(arch: &str) -> bool {
     matches!(arch, "dep11" | "i18n" | "source")
 }
 
+/// Flatten an architecture-scoped `dists/` index into its cache debname.
+///
+/// Single source of truth for the `{distribution}_{component}_{architecture}_
+/// {filename}` convention: [`classify_request`] mints the name for a client
+/// request, and `cleanup::engine::DebnameKind` mints the same name for the
+/// index fetches cleanup issues itself. If the two ever disagree, cleanup
+/// caches every index under a path the serve path never reads — an invisible
+/// shadow copy plus a re-download every cycle.
+#[must_use]
+pub(crate) fn dists_debname(
+    distribution: &str,
+    component: &str,
+    architecture: &str,
+    filename: &str,
+) -> String {
+    format!("{distribution}_{component}_{architecture}_{filename}")
+}
+
 /// The result of [`classify_request`]: the decoded, validated mirror path,
 /// the per-variant `(debname, cached_flavor, layout)` triple needed to build
 /// [`ConnectionDetails`], and any deferred origin record to be sent post-hoc.
@@ -618,7 +636,7 @@ pub(crate) fn classify_request<'a>(
             // fetch path), so `origin_fields` is unconditionally `None`.
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
-                debname: format!("{distribution}_{component}_{architecture}_{filename}"),
+                debname: dists_debname(&distribution, &component, &architecture, &filename),
                 cached_flavor: CachedFlavor::Volatile,
                 layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::ComponentRelease,
@@ -656,7 +674,7 @@ pub(crate) fn classify_request<'a>(
 
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
-                debname: format!("{distribution}_{component}_{architecture}_{filename}"),
+                debname: dists_debname(&distribution, &component, &architecture, &filename),
                 cached_flavor: CachedFlavor::Volatile,
                 layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::Packages,
