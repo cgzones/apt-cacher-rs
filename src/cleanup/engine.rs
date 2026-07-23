@@ -617,6 +617,7 @@ async fn sweep_byhash_dir(
 ) -> Result<ByHashOutcome, ProxyCacheError> {
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
     let mut anomaly_removed = 0u64;
+    let mut referenced_kept = 0u64;
 
     let mut dir = match tokio::fs::read_dir(byhash_path).await {
         Ok(d) => d,
@@ -648,8 +649,8 @@ async fn sweep_byhash_dir(
 
         // lstat semantics on tokio's `DirEntry`, so a planted symlink is seen as
         // itself (non-regular) rather than followed.
-        let file_type = match entry.metadata().await {
-            Ok(m) => m.file_type(),
+        let file_type = match entry.file_type().await {
+            Ok(ft) => ft,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!("Error inspecting file `{}`:  {err}", path.display());
@@ -669,55 +670,34 @@ async fn sweep_byhash_dir(
             continue;
         }
 
-        // Every regular entry starts uncovered (age mode); the reference-set
-        // pass below promotes covered digests and drops referenced ones. Key on
-        // the file name (a bare hex digest); a non-UTF-8 name — never a real
-        // by-hash file — falls back to the lossy path so it still ages out via
-        // the backstop, exactly as the old walk treated an unclassifiable name.
-        let key = match path.file_name().and_then(|n| n.to_str()) {
-            Some(name) => name.to_owned(),
+        // Classify against the reference set inline (reference mode). A
+        // referenced digest is kept forever regardless of age, so it never
+        // enters the candidate map — in a healthy tree that is the bulk of the
+        // directory, and skipping it saves a key + path allocation each. An
+        // unreferenced covered digest gets the grace span; an uncovered
+        // algorithm, an unclassifiable name, or age mode (`reference` is `None`)
+        // gets the backstop, exactly as the old walk treated them.
+        let name = entry.file_name();
+        let classified = reference
+            .zip(name.to_str())
+            .and_then(|(refset, digest)| refset.classify(digest).map(|c| (refset, c)));
+        let class = match classified {
+            Some((_refset, (_algo, true))) => {
+                referenced_kept += 1;
+                continue;
+            }
+            Some((refset, (algo, false))) if refset.covers(algo) => SpanClass::ByHashCovered,
+            Some(_) | None => SpanClass::ByHashUncovered,
+        };
+
+        // Key on the file name (a bare hex digest); a non-UTF-8 name — never a
+        // real by-hash file — falls back to the lossy path so it still ages out
+        // via the backstop.
+        let key = match name.to_str() {
+            Some(digest) => digest.to_owned(),
             None => path.to_string_lossy().into_owned(),
         };
-        candidates.insert(
-            key,
-            Candidate {
-                path,
-                class: SpanClass::ByHashUncovered,
-            },
-        );
-    }
-
-    // Classify against the reference set (reference mode). A referenced digest
-    // is dropped from the map — kept forever, regardless of age. An unreferenced
-    // covered digest is promoted to `ByHashCovered` (grace span); an uncovered
-    // algorithm or unclassifiable name stays `ByHashUncovered` (backstop).
-    let mut referenced_kept = 0u64;
-    if let Some(refset) = reference {
-        candidates.retain(|_key, candidate| {
-            let classified = candidate
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| refset.classify(n));
-            match classified {
-                Some((_algo, true)) => {
-                    referenced_kept += 1;
-                    false
-                }
-                Some((algo, false)) => {
-                    candidate.class = if refset.covers(algo) {
-                        SpanClass::ByHashCovered
-                    } else {
-                        SpanClass::ByHashUncovered
-                    };
-                    true
-                }
-                None => {
-                    candidate.class = SpanClass::ByHashUncovered;
-                    true
-                }
-            }
-        });
+        candidates.insert(key, Candidate { path, class });
     }
 
     let survivors = candidates.len() as u64;
@@ -1376,12 +1356,13 @@ async fn resolve_origin_packages_self(
         return Ok(GroupResolution::Skipped);
     }
 
-    // One fetch-buffer-reduce plan per active origin. `keymap: Basename`
+    // One fetch-buffer-reduce plan per active origin, built as its turn comes:
+    // the loop bails on the first failure, so materialising every plan up front
+    // would allocate for origins that are never probed. `keymap: Basename`
     // because the structured pool flattens `Filename:` relpaths to basename;
     // `layout: Dists` is where the referencing `Packages` index lives.
-    let structured_plans: Vec<FetchPlan<'_>> = active_origins
-        .iter()
-        .map(|origin| FetchPlan {
+    for origin in &active_origins {
+        let plan = FetchPlan {
             mirror: mirror.clone(),
             owner_mirror: mirror.clone(),
             base_uri: origin.uri(),
@@ -1393,11 +1374,8 @@ async fn resolve_origin_packages_self(
                 architecture: origin.architecture.clone(),
             },
             keymap: KeyMapper::Basename,
-        })
-        .collect();
-
-    for (origin, plan) in active_origins.iter().zip(&structured_plans) {
-        match reduce_against(plan, cached_files, tally, appstate, config).await {
+        };
+        match reduce_against(&plan, cached_files, tally, appstate, config).await {
             Ok(ReduceOutcome::Reduced) => {}
             Ok(ReduceOutcome::Exhausted) => {
                 debug!(

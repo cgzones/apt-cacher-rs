@@ -185,12 +185,12 @@ async fn process_stanza(
     };
     let lookup_key: &str = &lookup_key;
 
-    let Some(path) = file_list
-        .get(lookup_key)
-        .map(|candidate| candidate.path.clone())
-    else {
+    // Every path below drops the entry from the reference set, so take it out
+    // once (owning the path) rather than looking it up again per exit.
+    let Some(candidate) = file_list.remove(lookup_key) else {
         return;
     };
+    let path = candidate.path;
 
     match stanza.chosen() {
         None => {
@@ -198,7 +198,6 @@ async fn process_stanza(
                 "Packages stanza for `{filename}` advertises no SHA256/SHA512; retaining cache file `{}` without verification",
                 path.display(),
             );
-            file_list.remove(lookup_key);
         }
         Some((algo, expected)) => {
             // lstat (not stat) so a hostile symlink planted between
@@ -214,7 +213,6 @@ async fn process_stanza(
                         "Cache file `{}` changed to non-regular between cleanup-collect and verify (concurrent swap); retaining without verification",
                         path.display(),
                     );
-                    file_list.remove(lookup_key);
                     return;
                 }
                 Err(err) => {
@@ -224,7 +222,6 @@ async fn process_stanza(
                         path.display(),
                         algo.as_str(),
                     );
-                    file_list.remove(lookup_key);
                     return;
                 }
             };
@@ -265,7 +262,6 @@ async fn process_stanza(
                     );
                 }
             }
-            file_list.remove(lookup_key);
         }
     }
 }

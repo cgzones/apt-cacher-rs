@@ -266,6 +266,15 @@ pub(super) async fn sweep_aged_metadata(
             }
         };
 
+        // The flat root co-mingles volatile indexes with `.deb` files; the debs
+        // are reconciled (with checksums) by the flat-deb cleanup, so leave them
+        // be and sweep only the index metadata. `dists/` has no debs. Filtered
+        // by name before the stat, so the whole deb population costs no syscalls.
+        let file_name = entry.file_name();
+        if skip_debs && file_name.to_str().is_some_and(is_deb_package) {
+            continue;
+        }
+
         // `entry.metadata()` has lstat semantics on tokio's `DirEntry`, so a
         // symlink planted here is seen as itself (non-regular) and skipped.
         let data = match entry.metadata().await {
@@ -287,18 +296,6 @@ pub(super) async fn sweep_aged_metadata(
         }
 
         let path = entry.path();
-
-        // The flat root co-mingles volatile indexes with `.deb` files; the debs
-        // are reconciled (with checksums) by the flat-deb cleanup, so leave them
-        // be and sweep only the index metadata. `dists/` has no debs.
-        if skip_debs
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(is_deb_package)
-        {
-            continue;
-        }
 
         let Some(created) = age_reference_time(&data, &path) else {
             continue;
