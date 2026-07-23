@@ -98,7 +98,7 @@ pub(super) async fn cleanup_tmp_dir(
                 .file_name()
                 .to_str()
                 .is_some_and(|name| name.ends_with(".partial"));
-        let should_remove = if is_partial {
+        let stale = if is_partial {
             // Zero-byte partials carry no resume state; aged partials are stale.
             mdata.len() == 0 || mtime < partial_cutoff
         } else if mtime < foreign_cutoff {
@@ -108,30 +108,32 @@ pub(super) async fn cleanup_tmp_dir(
                 "Keeping unexpected tmp entry `{}` (not yet past foreign cutoff)",
                 entry.path().display()
             );
-            continue;
+            false
         };
 
-        if should_remove {
-            let path = entry.path();
-            // The tmp/ producer (`download_file`) only writes regular files,
-            // so a directory or non-regular entry here is anomalous.
-            // Centralized handler covers both (`RemoveAll` for directories,
-            // `remove_file` for everything else).
-            if file_type.is_dir() || !file_type.is_file() {
-                let outcome = handle_anomalous_entry(&path, file_type, DirAction::RemoveAll).await;
-                if matches!(outcome, AnomalyOutcome::Removed) {
-                    removed += 1;
-                }
-            } else if let Err(err) = tokio::fs::remove_file(&path).await {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to remove stale tmp entry `{}`:  {err}",
-                    path.display()
-                );
-            } else {
-                debug!("Removed stale tmp entry `{}`", path.display());
+        if !stale {
+            continue;
+        }
+
+        let path = entry.path();
+        // The tmp/ producer (`download_file`) only writes regular files, so a
+        // directory or non-regular entry here is anomalous. Centralized handler
+        // covers both (`RemoveAll` for directories, `remove_file` for everything
+        // else).
+        if file_type.is_dir() || !file_type.is_file() {
+            let outcome = handle_anomalous_entry(&path, file_type, DirAction::RemoveAll).await;
+            if matches!(outcome, AnomalyOutcome::Removed) {
                 removed += 1;
             }
+        } else if let Err(err) = tokio::fs::remove_file(&path).await {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to remove stale tmp entry `{}`:  {err}",
+                path.display()
+            );
+        } else {
+            debug!("Removed stale tmp entry `{}`", path.display());
+            removed += 1;
         }
     }
 
