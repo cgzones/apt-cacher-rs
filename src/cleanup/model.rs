@@ -32,6 +32,11 @@ const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 /// See `sweep::sweep_aged_metadata`.
 const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
 
+/// Age threshold for a `.partial` scratch file, carried as the `Partials` units'
+/// [`RetentionPolicy::AgeOnly`] span and applied by `partials::cleanup_tmp_dir`
+/// (which keeps its own, longer backstop for foreign entries).
+const PARTIALS_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
+
 /// Which on-disk repository shape a [`CleanupUnit`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RepoFacet {
@@ -336,14 +341,6 @@ pub(super) fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
     prefix.push('/');
     Some((head, prefix))
 }
-
-/// Age threshold the Partials units' policy documents, matching
-/// `cleanup_tmp_dir`'s `.partial`-file threshold (`partials.rs`) — the more
-/// common case there (a zero-byte or stale `.partial`) rather than the
-/// defensive, longer foreign-entry threshold. Documentation only: the engine
-/// still delegates the actual sweep to `cleanup_tmp_dir`, whose own two-tier
-/// policy is unaffected by this field.
-const PARTIALS_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 
 /// Classify one `mirrors_v2` row into the ordered [`CleanupUnit`]s the engine
 /// will probe and sweep this cycle.

@@ -10,22 +10,26 @@ use super::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry};
 
 /// Remove stale entries from a single `tmp/` directory.
 ///
-/// `.partial` files are deleted when zero-byte (no useful resume state) or
-/// older than `PARTIAL_MAX_AGE`. Any other artifact (defensive — current code
-/// only writes `.partial` here) is deleted once it has aged past
-/// `FOREIGN_MAX_AGE`, the longer threshold acknowledging that we don't know
-/// what produced it.
+/// `.partial` files are deleted when zero-byte (no useful resume state) or older
+/// than `partial_max_age` — the `Partials` unit's `RetentionPolicy` span, so
+/// tuning it in `model.rs` actually moves this threshold. Any other artifact
+/// (defensive — current code only writes `.partial` here) is deleted once it has
+/// aged past `FOREIGN_MAX_AGE`, the longer threshold acknowledging that we don't
+/// know what produced it.
 ///
 /// Called by the engine's `Partials` unit arm once per mirror per layout
 /// (structured `<cache>/<cache_path>/tmp` and flat `<cache>/flat/<flat_root>/tmp`
 /// — see `model::classify_mirror`'s two `Partials` units). The returned count
 /// is logged only, never folded into `UnitStats::removed`/`bytes_removed`:
 /// partial-download scratch files are not cached content.
-pub(super) async fn cleanup_tmp_dir(tmp_dir: &Path, now: SystemTime) -> u64 {
-    const PARTIAL_MAX_AGE: Duration = Duration::from_hours(3 * 24);
+pub(super) async fn cleanup_tmp_dir(
+    tmp_dir: &Path,
+    now: SystemTime,
+    partial_max_age: Duration,
+) -> u64 {
     const FOREIGN_MAX_AGE: Duration = Duration::from_hours(7 * 24);
 
-    let partial_cutoff = now - PARTIAL_MAX_AGE;
+    let partial_cutoff = now - partial_max_age;
     let foreign_cutoff = now - FOREIGN_MAX_AGE;
 
     let mut entries = match tokio::fs::read_dir(tmp_dir).await {

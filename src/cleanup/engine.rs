@@ -403,10 +403,10 @@ pub(super) async fn run_unit(
             run_byhash_unit(unit, mirror, entry, appstate, now, CacheLayout::FlatByHash).await
         }
         RepoFacet::StructuredMetadata => {
-            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Dists, false).await)
+            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Dists).await)
         }
         RepoFacet::FlatMetadata => {
-            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Flat, true).await)
+            Ok(run_metadata_unit(unit, mirror, now, CacheLayout::Flat).await)
         }
         RepoFacet::Partials => Ok(run_partials_unit(unit, mirror, now).await),
     }
@@ -423,7 +423,13 @@ pub(super) async fn run_unit(
 /// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED` or the quota reconcile, exactly
 /// matching the old pre-pass, which only ever logged its total.
 async fn run_partials_unit(unit: &CleanupUnit, mirror: &Mirror, now: SystemTime) -> UnitStats {
-    let removed = cleanup_tmp_dir(&unit.tree.root, now).await;
+    let RetentionPolicy::AgeOnly { span } = unit.policy else {
+        // The classifier only ever pairs `Partials` with `AgeOnly`; a mismatch
+        // means a mis-built unit, so do nothing rather than guess a span.
+        return UnitStats::default();
+    };
+
+    let removed = cleanup_tmp_dir(&unit.tree.root, now, span).await;
 
     if removed > 0 {
         info!(
@@ -437,9 +443,9 @@ async fn run_partials_unit(unit: &CleanupUnit, mirror: &Mirror, now: SystemTime)
 
 /// Age out stale index metadata for a `StructuredMetadata` / `FlatMetadata`
 /// unit: a direct [`sweep_aged_metadata`] over the unit's tree root. Structured
-/// (`CacheLayout::Dists`, `skip_debs = false`) sweeps the pure `dists/` metadata
-/// tree; flat (`CacheLayout::Flat`, `skip_debs = true`) sweeps the flat root,
-/// leaving co-mingled `.deb` files to the flat-deb cleanup. The summary line is
+/// (`CacheLayout::Dists`) sweeps the pure `dists/` metadata tree; flat
+/// (`CacheLayout::Flat`) sweeps the flat root, leaving co-mingled `.deb` files
+/// to the flat-deb cleanup. The summary line is
 /// emitted only when something was removed; the metadata units contribute nothing to `files_retained` (their
 /// `scanned` equals `removed`, so the derived retained count is zero).
 ///
@@ -451,7 +457,6 @@ async fn run_metadata_unit(
     mirror: &Mirror,
     now: SystemTime,
     layout: CacheLayout,
-    skip_debs: bool,
 ) -> UnitStats {
     let RetentionPolicy::AgeOnly { span } = unit.policy else {
         // The classifier only ever pairs a metadata facet with `AgeOnly`; a
@@ -464,7 +469,7 @@ async fn run_metadata_unit(
         unit.tree.root.display()
     );
 
-    let swept = sweep_aged_metadata(&unit.tree.root, span, now, mirror, layout, skip_debs).await;
+    let swept = sweep_aged_metadata(&unit.tree.root, span, now, mirror, layout).await;
 
     if swept.files_removed > 0 {
         info!(
