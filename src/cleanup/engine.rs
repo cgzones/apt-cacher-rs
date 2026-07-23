@@ -1091,13 +1091,7 @@ async fn resolve_origin_packages_archive_root(
     let now: Duration = Clock::now_since_epoch().into();
     let active_origins: Vec<_> = origins
         .into_iter()
-        .filter(|origin| {
-            Duration::from_secs(
-                u64::try_from(origin.last_seen)
-                    .expect("Database should never store negative timestamp"),
-            ) + RETENTION_TIME
-                > now
-        })
+        .filter(|origin| origin.is_active(now))
         .collect();
 
     if active_origins.is_empty() {
@@ -1363,13 +1357,7 @@ async fn resolve_origin_packages_self(
 
     let active_origins = origins
         .into_iter()
-        .filter(|origin| {
-            Duration::from_secs(
-                u64::try_from(origin.last_seen)
-                    .expect("Database should never store negative timestamp"),
-            ) + RETENTION_TIME
-                > now
-        })
+        .filter(|origin| origin.is_active(now))
         .collect::<Vec<_>>();
 
     info!(

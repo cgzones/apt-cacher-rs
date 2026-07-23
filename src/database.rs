@@ -16,7 +16,7 @@ use sqlx::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    CLEANUP_CLIENT_ADDR,
+    CLEANUP_CLIENT_ADDR, RETENTION_TIME,
     cache_layout::SUBDIR_FLAT,
     config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
     deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
@@ -252,6 +252,17 @@ impl OriginEntry {
     #[must_use]
     pub(crate) const fn port(&self) -> Option<NonZero<u16>> {
         NonZero::new(self.port)
+    }
+
+    /// Whether this origin was seen within [`RETENTION_TIME`] of `now` (seconds
+    /// since the epoch). Cleanup reconciles only against active origins: a stale
+    /// one's `Packages` index no longer describes what the mirror still serves.
+    #[must_use]
+    pub(crate) fn is_active(&self, now: Duration) -> bool {
+        Duration::from_secs(
+            u64::try_from(self.last_seen).expect("Database should never store negative timestamp"),
+        ) + RETENTION_TIME
+            > now
     }
 
     /// Render `host[:port]/mirror_path` directly into a `Formatter` without
