@@ -614,25 +614,87 @@ fn clear_pipe_writable_cache(sender: &pipe::Sender) {
 // Socket-to-socket splice proxy
 // ---------------------------------------------------------------------------
 
+/// An upstream connect failure, tagged with whether retrying it can plausibly
+/// succeed. Retrying a deterministic failure costs a full TCP connect plus a
+/// full TLS handshake per attempt and buys nothing.
+enum ConnectError {
+    /// DNS/TCP failure, timeout, or a network error mid-handshake -- retry may help.
+    Transient(std::io::Error),
+    /// Deterministic for this (host, scheme): unparsable server name, certificate
+    /// rejection. Retrying re-runs the same handshake and fails identically.
+    Permanent(std::io::Error),
+}
+
+impl ConnectError {
+    /// The wrapped error, for `ErrorReport` logging.
+    fn io_err(&self) -> &std::io::Error {
+        match self {
+            Self::Transient(err) | Self::Permanent(err) => err,
+        }
+    }
+}
+
+/// The retry disposition of a connect failure -- the pure half of
+/// [`ConnectError`], split out so [`classify_tls_error`] stays unit-testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectRetry {
+    Transient,
+    Permanent,
+}
+
+impl ConnectRetry {
+    /// Pair the disposition with the error it was derived from.
+    fn attach(self, err: std::io::Error) -> ConnectError {
+        match self {
+            Self::Transient => ConnectError::Transient(err),
+            Self::Permanent => ConnectError::Permanent(err),
+        }
+    }
+}
+
+/// Decide whether a failed TLS handshake is worth retrying.
+///
+/// `InvalidData` (rustls rejecting the peer certificate or its TLS records) and
+/// `InvalidInput` (an unparsable server name) are a pure function of the host
+/// string and the peer's certificate chain: a retry re-runs the identical
+/// handshake and fails identically. Everything else -- including `TimedOut` --
+/// may be a transport hiccup.
+///
+/// Pass the kind of the *original* error, before it is wrapped: a wrapper
+/// reports its own kind and keeps the cause behind `source()`.
+const fn classify_tls_error(kind: ErrorKind) -> ConnectRetry {
+    if matches!(kind, ErrorKind::InvalidData | ErrorKind::InvalidInput) {
+        ConnectRetry::Permanent
+    } else {
+        ConnectRetry::Transient
+    }
+}
+
 /// Connect to the upstream mirror, optionally establishing TLS.
 ///
 /// `scheme` is resolved by the caller: `Some(_)` connects with that scheme
 /// directly, `None` is the Auto-upgrade case -- try HTTPS first, fall back to HTTP.
+/// Only the error that escapes here is classified for the caller's retry loop;
+/// a permanent TLS failure inside the Auto branch still falls back to HTTP.
 ///
 /// Times out after the configured HTTP timeout.
 async fn connect_upstream(
     mirror: &Mirror,
     scheme: Option<Scheme>,
-) -> std::io::Result<(UpstreamConn, Scheme)> {
+) -> Result<(UpstreamConn, Scheme), ConnectError> {
     let host = mirror.host().as_str();
 
     match scheme {
         Some(Scheme::Http) => {
-            let tcp = tcp_connect(host, mirror_port(mirror, false)).await?;
+            let tcp = tcp_connect(host, mirror_port(mirror, false))
+                .await
+                .map_err(ConnectError::Transient)?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
         Some(Scheme::Https) => {
-            let tcp = tcp_connect(host, mirror_port(mirror, true)).await?;
+            let tcp = tcp_connect(host, mirror_port(mirror, true))
+                .await
+                .map_err(ConnectError::Transient)?;
             let tls = tls_connect(tcp, host).await.inspect_err(|_| {
                 metrics::UPSTREAM_TLS_FAILED.increment();
             })?;
@@ -651,11 +713,14 @@ async fn connect_upstream(
                         return Ok((UpstreamConn::Tls(tls), Scheme::Https));
                     }
                     Err(err) => {
+                        // Deliberately not propagated: the HTTP fallback below is
+                        // the point of Auto mode, so even a permanent TLS failure
+                        // must not abort it.
                         metrics::UPSTREAM_TLS_FAILED.increment();
                         debug!(
                             "splice proxy: TLS handshake failed for {}, trying HTTP:  {}",
                             mirror.format_authority(),
-                            ErrorReport(&err)
+                            ErrorReport(err.io_err())
                         );
                     }
                 },
@@ -668,7 +733,9 @@ async fn connect_upstream(
                 }
             }
 
-            let tcp = tcp_connect(host, mirror_port(mirror, false)).await?;
+            let tcp = tcp_connect(host, mirror_port(mirror, false))
+                .await
+                .map_err(ConnectError::Transient)?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
     }
@@ -724,16 +791,17 @@ async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
 async fn tls_connect(
     tcp: TcpStream,
     host: &str,
-) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
     let connector = tokio_rustls::TlsConnector::from(Arc::clone(
         TLS_CLIENT_CONFIG.get().expect("initialized in main()"),
     ));
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|err| {
-        std::io::Error::new(
+        // Pure function of the host string: never retryable.
+        ConnectError::Permanent(std::io::Error::new(
             ErrorKind::InvalidInput,
             format!("failed to parse server name:  {err}"),
-        )
+        ))
     })?;
 
     debug!("splice proxy: starting TLS handshake with {host}");
@@ -742,19 +810,22 @@ async fn tls_connect(
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            std::io::Error::new(
+            ConnectError::Transient(std::io::Error::new(
                 ErrorKind::TimedOut,
                 format!(
                     "TLS handshake timed out after {}",
                     HumanFmt::Time(http_timeout)
                 ),
-            )
+            ))
         })?
         .map_err(|err| {
-            std::io::Error::new(
+            // Classify before wrapping: the wrapper keeps the cause on
+            // `source()`, and only the original kind tells a certificate
+            // rejection (`InvalidData`) from a transport error.
+            classify_tls_error(err.kind()).attach(std::io::Error::new(
                 err.kind(),
                 format!("failed to complete TLS handshake:  {err}"),
-            )
+            ))
         })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
@@ -767,9 +838,12 @@ async fn tls_connect(
 async fn tls_connect(
     tcp: TcpStream,
     host: &str,
-) -> std::io::Result<tokio_native_tls::TlsStream<TcpStream>> {
-    let native_connector =
-        tokio_native_tls::native_tls::TlsConnector::new().map_err(std::io::Error::other)?;
+) -> Result<tokio_native_tls::TlsStream<TcpStream>, ConnectError> {
+    let native_connector = tokio_native_tls::native_tls::TlsConnector::new().map_err(|err| {
+        // Building the connector touches no network: a failure here is the
+        // local TLS stack refusing to initialise and repeats identically.
+        ConnectError::Permanent(std::io::Error::other(err))
+    })?;
     let connector = tokio_native_tls::TlsConnector::from(native_connector);
 
     debug!("splice proxy: starting TLS handshake with {host}");
@@ -778,15 +852,22 @@ async fn tls_connect(
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            std::io::Error::new(
+            ConnectError::Transient(std::io::Error::new(
                 ErrorKind::TimedOut,
                 format!(
                     "TLS handshake timed out after {}",
                     HumanFmt::Time(http_timeout)
                 ),
-            )
+            ))
         })?
-        .map_err(std::io::Error::other)?;
+        .map_err(|err| {
+            // `native_tls::Error` is opaque: it carries no `io::ErrorKind`, so a
+            // certificate rejection is indistinguishable from a transport error
+            // and lands on `ErrorKind::Other`. Classify conservatively (i.e.
+            // transient, keep retrying) rather than guess from the message.
+            let err = std::io::Error::other(err);
+            classify_tls_error(err.kind()).attach(err)
+        })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
 }
@@ -3565,13 +3646,12 @@ async fn standard_upstream_connect(
     // key, the HTTPS-upgrade accounting, and the connect itself. A per-request
     // redirect forcing the scheme carries no decision, and so does none of the
     // scheme-cache / upgrade-metric bookkeeping below.
-    let (resolved_scheme, decision) = match scheme_override {
-        Some(scheme) => (Some(scheme), None),
-        None => {
-            let decision = scheme_cache::resolve(mirror.into(), global_config());
-            // `None` = Auto upgrade, i.e. try HTTPS then fall back to HTTP.
-            (decision.fixed_scheme(), Some(decision))
-        }
+    let (resolved_scheme, decision) = if let Some(scheme) = scheme_override {
+        (Some(scheme), None)
+    } else {
+        let decision = scheme_cache::resolve(mirror.into(), global_config());
+        // `None` = Auto upgrade, i.e. try HTTPS then fall back to HTTP.
+        (decision.fixed_scheme(), Some(decision))
     };
 
     // Try a pooled connection first. In Auto mode without a cached scheme there
@@ -3644,14 +3724,30 @@ async fn standard_upstream_connect(
             Err(err) => err,
         };
         let attempt = backoff.attempt();
-        let Some(delay) = backoff.next_retry(coarsetime::Instant::now()) else {
-            // The limit names which budget stopped the retries -- attempt cap
-            // or `upstream_retry_budget`.
-            warn_once_or_info!(
-                "splice proxy: failed to connect to upstream {host_authority} for {upstream_path} after {attempt} connection attempts ({}):  {}",
-                backoff.limit(),
-                ErrorReport(&err)
-            );
+        // A permanent failure repeats identically on every retry, so it skips
+        // the budget and drops straight into the terminal branch below --
+        // sparing 10 pointless TCP connects and TLS handshakes.
+        let permanent = matches!(err, ConnectError::Permanent(_));
+        let next = if permanent {
+            None
+        } else {
+            backoff.next_retry(coarsetime::Instant::now())
+        };
+        let Some(delay) = next else {
+            if permanent {
+                warn_once_or_info!(
+                    "splice proxy: not retrying permanent connect failure to upstream {host_authority} for {upstream_path}:  {}",
+                    ErrorReport(err.io_err())
+                );
+            } else {
+                // The limit names which budget stopped the retries -- attempt
+                // cap or `upstream_retry_budget`.
+                warn_once_or_info!(
+                    "splice proxy: failed to connect to upstream {host_authority} for {upstream_path} after {attempt} connection attempts ({}):  {}",
+                    backoff.limit(),
+                    ErrorReport(err.io_err())
+                );
+            }
             if let Some(decision) = decision {
                 // Evict a stale cached scheme so the next request re-resolves,
                 // mirroring the hyper backend.
@@ -3670,7 +3766,7 @@ async fn standard_upstream_connect(
         debug!(
             "splice proxy: failed to connect to {host_authority} after {attempt} connection attempts, will retry in {} ms:  {}",
             delay.as_millis(),
-            ErrorReport(&err)
+            ErrorReport(err.io_err())
         );
         tokio::time::sleep(delay).await;
     };
@@ -7638,6 +7734,37 @@ mod tests {
     use nix::fcntl::{FcntlArg, fcntl};
 
     use super::*;
+
+    #[test]
+    fn classify_tls_error_marks_deterministic_kinds_permanent() {
+        // rustls surfaces a rejected certificate chain as InvalidData and an
+        // unparsable server name as InvalidInput; both repeat identically.
+        assert_eq!(
+            classify_tls_error(ErrorKind::InvalidData),
+            ConnectRetry::Permanent,
+            "certificate rejection must not be retried"
+        );
+        assert_eq!(
+            classify_tls_error(ErrorKind::InvalidInput),
+            ConnectRetry::Permanent,
+            "server-name parse failure must not be retried"
+        );
+    }
+
+    #[test]
+    fn classify_tls_error_marks_network_kinds_transient() {
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                classify_tls_error(kind),
+                ConnectRetry::Transient,
+                "{kind:?} may succeed on retry"
+            );
+        }
+    }
 
     #[test]
     fn test_rewrite_simple_proxy_headers_single_connection() {
