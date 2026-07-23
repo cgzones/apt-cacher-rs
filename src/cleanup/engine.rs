@@ -21,7 +21,8 @@ use http::{StatusCode, header::CONTENT_LENGTH};
 
 use crate::cleanup::model::{
     CleanupUnit, DistGate, FlatFetch, GroupOutcome, GroupResult, IndexSource, KeymapSpec,
-    OriginOwner, RepoFacet, RetentionPolicy, SkipReason, SourceGroup, SweepAction, decide_sweep,
+    OriginOwner, ReconcilePolicy, RepoFacet, RetentionPolicy, SkipReason, SourceGroup, SweepAction,
+    SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{
     DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, body_is_incomplete,
@@ -312,7 +313,7 @@ pub(super) async fn run_mirror_units(
 /// Immutable context threaded through the reconcile-unit resolvers (the
 /// candidate map and tally are the only mutable state, kept separate).
 struct ReconcileCtx<'a> {
-    unit: &'a CleanupUnit,
+    policy: ReconcilePolicy,
     mirror: &'a Mirror,
     entry: &'a MirrorEntry,
     appstate: &'a AppState,
@@ -347,9 +348,34 @@ pub(super) async fn run_unit(
     config: &Config,
     now: SystemTime,
 ) -> Result<UnitStats, ProxyCacheError> {
+    // The single facet -> `CacheLayout` map. Every arm names the layout its
+    // sweep keys `cache_metadata` invalidation on, so a new facet cannot be
+    // added without deciding one -- there is deliberately no second map to
+    // forget.
     match unit.facet {
-        RepoFacet::StructuredPool | RepoFacet::FlatTree => {
-            run_reconcile_unit(unit, mirror, entry, appstate, config, now).await
+        RepoFacet::StructuredPool => {
+            run_reconcile_unit(
+                unit,
+                CacheLayout::StructuredPool,
+                mirror,
+                entry,
+                appstate,
+                config,
+                now,
+            )
+            .await
+        }
+        RepoFacet::FlatTree => {
+            run_reconcile_unit(
+                unit,
+                CacheLayout::Flat,
+                mirror,
+                entry,
+                appstate,
+                config,
+                now,
+            )
+            .await
         }
         RepoFacet::StructuredByHash => {
             run_byhash_unit(unit, mirror, entry, appstate, now, CacheLayout::DistsByHash).await
@@ -690,12 +716,20 @@ async fn sweep_byhash_dir(
 /// resolver arm, not a second decision path.
 async fn run_reconcile_unit(
     unit: &CleanupUnit,
+    layout: CacheLayout,
     mirror: &Mirror,
     entry: &MirrorEntry,
     appstate: &AppState,
     config: &Config,
     now: SystemTime,
 ) -> Result<UnitStats, ProxyCacheError> {
+    let RetentionPolicy::Reconcile(policy) = unit.policy else {
+        // The classifier only ever pairs a reconcile facet with a reconcile
+        // policy; a mismatch means a mis-built unit, so do nothing rather than
+        // guess a retention rule.
+        return Ok(UnitStats::default());
+    };
+
     let mut cached_files = scan_candidates(&unit.tree, &entry.path)
         .await
         .inspect_err(|err| {
@@ -715,7 +749,7 @@ async fn run_reconcile_unit(
     };
 
     let ctx = ReconcileCtx {
-        unit,
+        policy,
         mirror,
         entry,
         appstate,
@@ -768,87 +802,75 @@ async fn run_reconcile_unit(
         return Ok(tally);
     }
 
-    // The shared decision core: policy + group results -> sweep action.
-    match decide_sweep(&unit.policy, &results) {
-        // At least one source reconciled (or none needed to): reap leftovers on
-        // the short grace span.
-        SweepAction::Grace => {
-            let swept = sweep_candidates(
-                &cached_files,
-                span_table_grace(&unit.policy),
-                now,
-                mirror,
-                reconcile_layout(unit.facet),
-            )
-            .await;
-            match owning_root {
-                // Strict-hybrid finish: the owning archive-root group
-                // reconciled this flat-pool mirror against the structured
-                // `dists/` index of its archive root, so name the root instead
-                // of emitting the generic per-facet summary. Reaching the sweep
-                // with an empty map is impossible here: a reduce that empties it
-                // returns `Exhausted`, which short-circuits above.
-                Some(archive_root) => info!(
-                    "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
-                    swept.files_removed,
-                    HumanFmt::Size(swept.bytes_removed)
-                ),
-                None => log_reconcile_removed(unit.facet, mirror, &swept),
-            }
-            tally.fold(swept);
-        }
+    // The shared decision core: policy + group results -> spans + reason.
+    let (spans, reason) = match decide_sweep(policy, &results) {
+        SweepAction::Sweep { spans, reason } => (spans, reason),
         // Conservative bail: no sweep this cycle. The resolver
         // already emitted the per-origin warn with the failing host/path/status.
-        SweepAction::Bail => {}
-        // Flat time-based fallback: every index source failed, so
-        // the reference set is incomplete and leftovers age out on the long
-        // `RETENTION_TIME` span instead of the short grace. Only the flat facet
-        // (`ReferencedOrAge`) ever reaches here.
-        SweepAction::AgeFallback {
-            primary,
-            root_failed,
-        } => {
-            // Diagnostic: the root fallback was unavailable because the
-            // flat-repo root has no `mirrors_v2` row (root-segment groups carry
-            // `root_seg`; the hybrid group does not, so it is not reported here).
-            for result in &results {
-                if result.root_seg.is_some()
-                    && let GroupOutcome::NotApplicable(SkipReason::NoRow { seg }) = &result.outcome
-                {
-                    info!(
-                        "Flat mirror {mirror}: no `mirrors_v2` row for flat-repo root `{seg}`; skipping root fallback"
-                    );
-                }
+        SweepAction::Bail => return Ok(tally),
+    };
+
+    // The age fallback announces itself before sweeping: every index source
+    // failed, so the reference set is incomplete and leftovers age out on the
+    // long span instead of the short grace. Only the flat facet
+    // (`ReferencedOrAge`) ever gets here.
+    if let SweepReason::AgeFallback {
+        primary,
+        root_failed,
+    } = &reason
+    {
+        // Diagnostic: the root fallback was unavailable because the
+        // flat-repo root has no `mirrors_v2` row (root-segment groups carry
+        // `root_seg`; the hybrid group does not, so it is not reported here).
+        for result in &results {
+            if result.root_seg.is_some()
+                && let GroupOutcome::NotApplicable(SkipReason::NoRow { seg }) = &result.outcome
+            {
+                info!(
+                    "Flat mirror {mirror}: no `mirrors_v2` row for flat-repo root `{seg}`; skipping root fallback"
+                );
             }
-            // Suffix only when the root fallback was attempted and failed with a
-            // status *differing* from the co-located probe.
-            let suffix = match &root_failed {
-                Some((seg, root_status)) if *root_status != primary => {
-                    format!(", flat-root `{seg}` {root_status}")
-                }
-                _ => String::new(),
-            };
-            let spans = span_table_fallback(&unit.policy);
-            warn!(
-                "Could not fetch flat Packages file for mirror {mirror} ({primary}{suffix}); falling back to {} time-based retention",
-                HumanFmt::Time(spans.deb)
-            );
-            let swept = sweep_candidates(
-                &cached_files,
-                spans,
-                now,
-                mirror,
-                reconcile_layout(unit.facet),
-            )
-            .await;
-            info!(
-                "Removed {} aged flat deb files for mirror {mirror} ({})",
+        }
+        // Suffix only when the root fallback was attempted and failed with a
+        // status *differing* from the co-located probe.
+        let suffix = match root_failed {
+            Some((seg, root_status)) if root_status != primary => {
+                format!(", flat-root `{seg}` {root_status}")
+            }
+            _ => String::new(),
+        };
+        warn!(
+            "Could not fetch flat Packages file for mirror {mirror} ({primary}{suffix}); falling back to {} time-based retention",
+            HumanFmt::Time(spans.deb)
+        );
+    }
+
+    let swept = sweep_candidates(&cached_files, spans, now, mirror, layout).await;
+
+    match reason {
+        SweepReason::AgeFallback {
+            primary: _,
+            root_failed: _,
+        } => info!(
+            "Removed {} aged flat deb files for mirror {mirror} ({})",
+            swept.files_removed,
+            HumanFmt::Size(swept.bytes_removed)
+        ),
+        // Strict-hybrid finish: the owning archive-root group reconciled this
+        // flat-pool mirror against the structured `dists/` index of its archive
+        // root, so name the root instead of emitting the generic per-facet
+        // summary. Reaching the sweep with an empty map is impossible here: a
+        // reduce that empties it returns `Exhausted`, which short-circuits above.
+        SweepReason::Grace => match owning_root {
+            Some(archive_root) => info!(
+                "Strict-reconciled flat-pool mirror {mirror} against archive root `{archive_root}`: removed {} unreferenced deb files ({})",
                 swept.files_removed,
                 HumanFmt::Size(swept.bytes_removed)
-            );
-            tally.fold(swept);
-        }
+            ),
+            None => log_reconcile_removed(unit.facet, mirror, &swept),
+        },
     }
+    tally.fold(swept);
 
     Ok(tally)
 }
@@ -980,7 +1002,7 @@ async fn resolve_origin_packages_archive_root(
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
-        unit: _,
+        policy: _,
         mirror,
         entry: _,
         appstate,
@@ -1106,7 +1128,7 @@ async fn resolve_flat_root_segment(
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
-        unit: _,
+        policy: _,
         mirror,
         entry: _,
         appstate,
@@ -1173,7 +1195,7 @@ async fn resolve_flat_colocated(
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
-        unit: _,
+        policy: _,
         mirror,
         entry: _,
         appstate,
@@ -1233,16 +1255,16 @@ async fn resolve_origin_packages_self(
     tally: &mut UnitStats,
 ) -> Result<GroupResolution, ProxyCacheError> {
     let &ReconcileCtx {
-        unit,
+        policy,
         mirror,
         entry,
         appstate,
         config,
     } = ctx;
 
-    // The grace window is used only for the diagnostics below; the sweep
-    // span is re-derived from the policy in the tail.
-    let grace = span_table_grace(&unit.policy).deb;
+    // The grace window is used only for the diagnostics below; the tail derives
+    // the sweep spans from the same policy.
+    let grace = policy.grace();
 
     let origins = appstate
         .database
@@ -1366,49 +1388,6 @@ async fn resolve_origin_packages_self(
     // unreferenced. `decide_sweep(ReferencedOrBail, [Complete])` returns
     // `Grace`, so the tail reaps them on the short grace span.
     Ok(GroupResolution::Ran(GroupOutcome::Complete))
-}
-
-/// Per-class sweep spans for the [`SweepAction::Grace`] action: leftovers reaped
-/// past the policy's short grace span (by-hash uncovered past its backstop).
-fn span_table_grace(policy: &RetentionPolicy) -> SpanTable {
-    match policy {
-        RetentionPolicy::ReferencedOrBail { grace }
-        | RetentionPolicy::ReferencedOrAge { grace, fallback: _ } => SpanTable::uniform(*grace),
-        RetentionPolicy::ByHash { grace, backstop } => SpanTable {
-            deb: *grace,
-            byhash_covered: *grace,
-            byhash_uncovered: *backstop,
-        },
-        RetentionPolicy::AgeOnly { span } => SpanTable::uniform(*span),
-    }
-}
-
-/// Per-class sweep spans for the [`SweepAction::AgeFallback`] action (flat
-/// time-based retention). Only [`RetentionPolicy::ReferencedOrAge`] ever yields
-/// that action; every other policy defers to [`span_table_grace`], keeping this
-/// a total function without a second copy of its table.
-fn span_table_fallback(policy: &RetentionPolicy) -> SpanTable {
-    match policy {
-        RetentionPolicy::ReferencedOrAge { grace: _, fallback } => SpanTable::uniform(*fallback),
-        RetentionPolicy::ReferencedOrBail { .. }
-        | RetentionPolicy::ByHash { .. }
-        | RetentionPolicy::AgeOnly { .. } => span_table_grace(policy),
-    }
-}
-
-/// The [`CacheLayout`] the reconcile sweep keys `cache_metadata` invalidation
-/// on, by facet.
-fn reconcile_layout(facet: RepoFacet) -> CacheLayout {
-    match facet {
-        RepoFacet::StructuredPool => CacheLayout::StructuredPool,
-        RepoFacet::StructuredByHash => CacheLayout::DistsByHash,
-        RepoFacet::FlatByHash => CacheLayout::FlatByHash,
-        // By-hash, metadata and partials units never route through the
-        // reconcile sweep (`run_reconcile_unit` handles only StructuredPool
-        // and FlatTree); defined layouts keep this match total.
-        RepoFacet::StructuredMetadata => CacheLayout::Dists,
-        RepoFacet::FlatTree | RepoFacet::FlatMetadata | RepoFacet::Partials => CacheLayout::Flat,
-    }
 }
 
 /// Per-facet reconcile-sweep completion summary for the `Grace` action —
