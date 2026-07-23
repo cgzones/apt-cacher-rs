@@ -768,6 +768,13 @@ impl Database {
         Ok((row.downloaded, row.delivered))
     }
 
+    /// Trivial liveness query backing the `/healthcheck` database check.
+    /// Uses the non-macro `query()` so no offline `.sqlx` snapshot is needed.
+    pub(crate) async fn ping(&self) -> Result<(), Error> {
+        query("SELECT 1;").fetch_one(&self.conn).await?;
+        Ok(())
+    }
+
     pub(crate) async fn get_top_packages(&self, limit: u32) -> Result<Vec<TopPackageEntry>, Error> {
         // Exclude volatile resources (Release/Packages/Translation/...) — their
         // filename does not change, so they would otherwise dominate by count.

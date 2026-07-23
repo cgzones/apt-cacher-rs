@@ -33,10 +33,15 @@ pub(crate) struct DbCmdOrigin {
     pub(crate) origin: Origin,
 }
 
+pub(crate) struct DbCmdPing {
+    pub(crate) reply: tokio::sync::oneshot::Sender<Result<(), sqlx::Error>>,
+}
+
 pub(crate) enum DatabaseCommand {
     Delivery(DbCmdDelivery),
     Download(DbCmdDownload),
     Origin(DbCmdOrigin),
+    Ping(DbCmdPing),
 }
 
 pub(crate) static DB_TASK_QUEUE_SENDER: OnceLock<tokio::sync::mpsc::Sender<DatabaseCommand>> =
@@ -275,6 +280,18 @@ async fn stage(
             // origin rows are a small fraction, so a linear scan is fine.
             if !buf.origins.contains(&row) {
                 buf.origins.push(row);
+            }
+        }
+        DatabaseCommand::Ping(c) => {
+            let result = db.ping().await;
+            if let Err(err) = &result {
+                metrics::DB_OPERATION_FAILED.increment();
+                error!("Database ping failed:  {err}");
+            }
+            // Replied-to-nobody is fine: the healthcheck timed out and
+            // stopped waiting.
+            if c.reply.send(result).is_err() {
+                debug!("Healthcheck ping requester vanished before reply");
             }
         }
     }
