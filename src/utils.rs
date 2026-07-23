@@ -316,6 +316,27 @@ pub(crate) fn nofollow_options() -> std::fs::OpenOptions {
     options
 }
 
+/// [`nofollow_options`] plus `O_NONBLOCK`, for opening a cache path that may
+/// have been replaced by a non-regular file since it was last stat'd.
+///
+/// `open(O_RDONLY)` on a FIFO with no writer blocks indefinitely, which on a
+/// blocking-pool thread strands that thread for the life of the process; the
+/// same applies to some character devices. `O_NONBLOCK` is inert for regular
+/// files, so the expected case is unaffected and the caller can reject anything
+/// else after `fstat`. Use this instead of pre-stat'ing the path: an lstat only
+/// narrows the race, it does not close it.
+pub(crate) fn nofollow_nonblock_options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "single blessed construction site"
+    )]
+    let mut options = std::fs::OpenOptions::new();
+    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    options
+}
+
 /// [`tokio::fs::OpenOptions`] with `O_NOFOLLOW` pre-set: every open of a path
 /// under the cache directory must refuse a symlink at the final component.
 /// Callers chain the remaining flags on the returned options.
