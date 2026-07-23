@@ -13,7 +13,11 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 use tracing::debug;
 
-use crate::{error::ErrorReport, utils::tokio_nofollow_options};
+use crate::{
+    database_task::{DatabaseCommand, DbCmdPing, send_db_command},
+    error::ErrorReport,
+    utils::tokio_nofollow_options,
+};
 
 /// Filename of the transient cache-writability probe, created and unlinked
 /// at the cache-directory root. `task_cache_scan` skips it by name so a
@@ -134,10 +138,7 @@ async fn check_cache_write(cache_dir: &Path) -> CheckResult {
     match tokio::time::timeout(CHECK_TIMEOUT, probe_write(&probe)).await {
         Ok(Ok(())) => CheckResult::Pass,
         Ok(Err(err)) => CheckResult::Fail(format!("{}", ErrorReport(&err))),
-        Err(_elapsed) => CheckResult::Fail(format!(
-            "timed out after {}s",
-            CHECK_TIMEOUT.as_secs()
-        )),
+        Err(_elapsed) => CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
     }
 }
 
@@ -163,6 +164,25 @@ async fn probe_write(probe: &Path) -> std::io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Database readiness: a `Ping` round-trip through the bounded DB channel.
+/// Proves the DB task is alive and draining its queue AND that the pool
+/// answers queries - not merely that the channel accepts sends. Only
+/// callable inside a running daemon (`DB_TASK_QUEUE_SENDER` is initialized
+/// in `main_loop()`), hence integration-tested, not unit-tested.
+async fn check_database() -> CheckResult {
+    let round_trip = async {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        send_db_command(DatabaseCommand::Ping(DbCmdPing { reply: tx })).await;
+        rx.await
+    };
+    match tokio::time::timeout(CHECK_TIMEOUT, round_trip).await {
+        Ok(Ok(Ok(()))) => CheckResult::Pass,
+        Ok(Ok(Err(err))) => CheckResult::Fail(format!("query failed: {err}")),
+        Ok(Err(_recv_err)) => CheckResult::Fail(String::from("database task unavailable")),
+        Err(_elapsed) => CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
+    }
 }
 
 #[cfg(test)]
@@ -241,8 +261,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("target");
         std::fs::write(&target, b"x").expect("write target");
-        std::os::unix::fs::symlink(&target, dir.path().join(PROBE_FILENAME))
-            .expect("symlink");
+        std::os::unix::fs::symlink(&target, dir.path().join(PROBE_FILENAME)).expect("symlink");
         let r = check_cache_write(dir.path()).await;
         assert!(!r.ok(), "O_NOFOLLOW must refuse a planted symlink");
     }
