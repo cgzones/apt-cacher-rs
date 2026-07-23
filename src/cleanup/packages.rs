@@ -11,7 +11,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     AppState, ClientInfo, Never, ProxyCacheBody,
-    cache_layout::{CacheLayout, CachedFlavor, ConnectionDetails, ResourceKind},
+    cache_layout::{CacheLayout, CachedFlavor, ConnectionDetails, ResourceKind, dists_debname},
     config::Config,
     deb_mirror::Mirror,
     error::{ProxyCacheError, UpstreamFetchError},
@@ -436,6 +436,51 @@ impl PackagesLayout {
     }
 }
 
+/// Which `Packages` index a fetch targets, and therefore how its cached/buffered
+/// file is named. `cache_name` is the on-disk debname under which the fetched
+/// index is cached (capital-P `Packages`); `memfd_name` is the throwaway
+/// in-memory buffer name (lowercase-p `packages`).
+pub(super) enum DebnameKind {
+    OriginScoped {
+        distribution: String,
+        component: String,
+        architecture: String,
+    },
+    Flat,
+}
+
+impl DebnameKind {
+    fn cache_name(&self, fmt: PackageFormat) -> String {
+        match self {
+            Self::OriginScoped {
+                distribution,
+                component,
+                architecture,
+            } => dists_debname(
+                distribution,
+                component,
+                architecture,
+                &format!("Packages{}", fmt.extension()),
+            ),
+            Self::Flat => format!("Packages{}", fmt.extension()),
+        }
+    }
+
+    pub(super) fn memfd_name(&self, fmt: PackageFormat) -> String {
+        match self {
+            Self::OriginScoped {
+                distribution,
+                component,
+                architecture,
+            } => format!(
+                "{distribution}_{component}_{architecture}_packages{}",
+                fmt.extension()
+            ),
+            Self::Flat => format!("flat_packages{}", fmt.extension()),
+        }
+    }
+}
+
 /// Typed reason a cleanup `Packages` fetch failed. Replaces the bare `StatusCode`
 /// error channel so an upstream transport failure surfaces its real reason (e.g.
 /// `... timed out`) in the cleanup decision log instead of a laundered
@@ -459,18 +504,15 @@ impl std::fmt::Display for FetchFailure {
 
 /// Try each of `.xz`, `.gz`, raw in turn — first format that returns 200 wins.
 /// Each request is a self-issued `process_cache_request` against `base_uri` +
-/// extension; the caller supplies the per-format `debname` and the
-/// `PackagesLayout` under which to cache the result.
-pub(super) async fn try_fetch_packages_file<F>(
+/// extension; `debname` names the cache entry each format lands in and `layout`
+/// picks the layout it is cached under.
+pub(super) async fn try_fetch_packages_file(
     mirror: &Mirror,
     base_uri: &str,
     layout: PackagesLayout,
-    debname_for: F,
+    debname: &DebnameKind,
     appstate: &AppState,
-) -> Result<(Response<ProxyCacheBody>, PackageFormat), FetchFailure>
-where
-    F: Fn(PackageFormat) -> String,
-{
+) -> Result<(Response<ProxyCacheBody>, PackageFormat), FetchFailure> {
     let resource_kind = layout.resource_kind();
 
     let mut uri_buffer = String::with_capacity(base_uri.len() + 3);
@@ -501,7 +543,7 @@ where
             request_received_at: PreciseInstant::now(),
             mirror: mirror.clone(),
             aliased_host: None,
-            debname: debname_for(pkgfmt),
+            debname: debname.cache_name(pkgfmt),
             cached_flavor: CachedFlavor::Volatile,
             layout: layout.cache_layout(),
             resource_kind,
@@ -583,6 +625,31 @@ mod tests {
             path,
             class: SpanClass::Deb,
         }
+    }
+
+    #[test]
+    fn debname_kind_derives_cache_and_memfd_names() {
+        let o = DebnameKind::OriginScoped {
+            distribution: "bookworm".to_owned(),
+            component: "main".to_owned(),
+            architecture: "amd64".to_owned(),
+        };
+        assert_eq!(
+            o.cache_name(PackageFormat::Xz),
+            "bookworm_main_amd64_Packages.xz"
+        );
+        assert_eq!(
+            o.memfd_name(PackageFormat::Xz),
+            "bookworm_main_amd64_packages.xz"
+        );
+        assert_eq!(
+            DebnameKind::Flat.cache_name(PackageFormat::Gz),
+            "Packages.gz"
+        );
+        assert_eq!(
+            DebnameKind::Flat.memfd_name(PackageFormat::Gz),
+            "flat_packages.gz"
+        );
     }
 
     #[test]

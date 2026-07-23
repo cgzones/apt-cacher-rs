@@ -8,7 +8,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     AppState, RETENTION_TIME,
-    cache_layout::{CacheLayout, dists_debname},
+    cache_layout::CacheLayout,
     config::Config,
     database::MirrorEntry,
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
@@ -24,7 +24,7 @@ use crate::cleanup::model::{
     OriginOwner, RepoFacet, RetentionPolicy, SkipReason, SourceGroup, SweepAction, decide_sweep,
 };
 use crate::cleanup::packages::{
-    FetchFailure, KeyMapper, PackageFormat, PackagesLayout, ReduceContext, body_is_incomplete,
+    DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, body_is_incomplete,
     packages_body_to_memfd, try_fetch_packages_file,
 };
 use crate::cleanup::partials::cleanup_tmp_dir;
@@ -124,51 +124,6 @@ impl UnitStats {
     }
 }
 
-/// Which `Packages` index a [`FetchPlan`] targets, and therefore how its
-/// cached/buffered file is named. `cache_name` is the on-disk debname under
-/// which the fetched index is cached (capital-P `Packages`); `memfd_name` is
-/// the throwaway in-memory buffer name (lowercase-p `packages`).
-pub(super) enum DebnameKind {
-    OriginScoped {
-        distribution: String,
-        component: String,
-        architecture: String,
-    },
-    Flat,
-}
-
-impl DebnameKind {
-    fn cache_name(&self, fmt: PackageFormat) -> String {
-        match self {
-            Self::OriginScoped {
-                distribution,
-                component,
-                architecture,
-            } => dists_debname(
-                distribution,
-                component,
-                architecture,
-                &format!("Packages{}", fmt.extension()),
-            ),
-            Self::Flat => format!("Packages{}", fmt.extension()),
-        }
-    }
-
-    fn memfd_name(&self, fmt: PackageFormat) -> String {
-        match self {
-            Self::OriginScoped {
-                distribution,
-                component,
-                architecture,
-            } => format!(
-                "{distribution}_{component}_{architecture}_packages{}",
-                fmt.extension()
-            ),
-            Self::Flat => format!("flat_packages{}", fmt.extension()),
-        }
-    }
-}
-
 /// A single fetch-buffer-reduce unit: where to fetch a `Packages` index, how
 /// to name it, and how to map its `Filename:` values onto scanned candidates.
 pub(super) struct FetchPlan<'a> {
@@ -219,7 +174,7 @@ pub(super) async fn reduce_against(
         &plan.mirror,
         &plan.base_uri,
         plan.layout,
-        |fmt| plan.debname.cache_name(fmt),
+        &plan.debname,
         appstate,
     )
     .await
@@ -1505,31 +1460,6 @@ mod tests {
         // The fetch mirror is the truncated flat-repo root, distinct from owner.
         assert_ne!(plan.mirror, owner);
         assert_eq!(plan.mirror.path(), "apt");
-    }
-
-    #[test]
-    fn debname_kind_derives_cache_and_memfd_names() {
-        let o = DebnameKind::OriginScoped {
-            distribution: "bookworm".to_owned(),
-            component: "main".to_owned(),
-            architecture: "amd64".to_owned(),
-        };
-        assert_eq!(
-            o.cache_name(PackageFormat::Xz),
-            "bookworm_main_amd64_Packages.xz"
-        );
-        assert_eq!(
-            o.memfd_name(PackageFormat::Xz),
-            "bookworm_main_amd64_packages.xz"
-        );
-        assert_eq!(
-            DebnameKind::Flat.cache_name(PackageFormat::Gz),
-            "Packages.gz"
-        );
-        assert_eq!(
-            DebnameKind::Flat.memfd_name(PackageFormat::Gz),
-            "flat_packages.gz"
-        );
     }
 
     #[test]
