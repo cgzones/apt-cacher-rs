@@ -13,6 +13,7 @@ use crate::cache_layout::{
     CacheLayout, SUBDIR_DISTS, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH, SUBDIR_TMP,
 };
 use crate::cleanup::packages::FetchFailure;
+use crate::cleanup::sweep::SpanTable;
 use crate::config::Config;
 use crate::database::MirrorEntry;
 use crate::deb_mirror::{MirrorKind, flat_pool_archive_root};
@@ -169,10 +170,12 @@ pub(super) enum DistGate {
     None,
 }
 
-/// How leftover candidates (nothing referenced them) are retained after a
-/// unit's groups have run.
+/// How a *candidate-reconcile* unit (`StructuredPool` / `FlatTree`) retains
+/// leftovers once its ordered [`SourceGroup`]s have run. This is the only input
+/// [`decide_sweep`] takes a policy from: the by-hash and age-only facets never
+/// reach it, so their retention is deliberately not representable here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RetentionPolicy {
+pub(super) enum ReconcilePolicy {
     /// Structured pool: any group fetch/parse failure bails the whole unit
     /// (no sweep this cycle); otherwise sweep past `grace`
     /// (`UNREFERENCED_KEEP_SPAN`).
@@ -182,6 +185,27 @@ pub(super) enum RetentionPolicy {
     /// forces the fallback even when the root group completed); otherwise
     /// fall back to age-based `fallback` (`RETENTION_TIME`).
     ReferencedOrAge { grace: Duration, fallback: Duration },
+}
+
+impl ReconcilePolicy {
+    /// The short span leftovers are reaped past once the reference set proved
+    /// usable. Also the window the structured resolver names in its
+    /// no-active-origins diagnostics.
+    pub(super) const fn grace(self) -> Duration {
+        match self {
+            Self::ReferencedOrBail { grace } | Self::ReferencedOrAge { grace, fallback: _ } => {
+                grace
+            }
+        }
+    }
+}
+
+/// How leftover candidates (nothing referenced them) are retained after a
+/// unit's groups have run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetentionPolicy {
+    /// A candidate-reconcile unit; see [`ReconcilePolicy`].
+    Reconcile(ReconcilePolicy),
     /// By-hash: a complete reference set keeps referenced digests and sweeps
     /// unreferenced-but-covered past `grace`; anything uncovered (or the
     /// reference set incomplete) sweeps past the `backstop`.
@@ -228,29 +252,48 @@ pub(super) struct GroupResult {
 }
 
 /// Final sweep decision for a unit, derived from its policy and the group
-/// results.
+/// results. Carries the spans, so the engine never re-derives them from the
+/// policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SweepAction {
-    /// Sweep leftover candidates past the policy's short grace span.
-    Grace,
-    /// Sweep leftover candidates past the policy's age-based fallback span,
-    /// carrying the primary fetch failure and, when the root fallback was
-    /// attempted and fetch-failed, the root-segment failure (the warn site
-    /// only renders it when its status differs from the primary).
-    AgeFallback {
-        primary: FetchFailure,
-        root_failed: Option<(String, FetchFailure)>,
+    /// Sweep leftover candidates on `spans`; `reason` selects the engine's
+    /// diagnostics and completion summary.
+    Sweep {
+        spans: SpanTable,
+        reason: SweepReason,
     },
     /// Bail: no sweep this cycle.
     Bail,
 }
 
+/// Why a [`SweepAction::Sweep`] is happening, and on what evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SweepReason {
+    /// At least one source reconciled (or none needed to): leftovers are
+    /// genuinely unreferenced and reaped past the policy's short grace span.
+    Grace,
+    /// Every index source failed, so the reference set is incomplete and
+    /// leftovers age out on the long fallback span instead. Carries the primary
+    /// fetch failure and, when the root fallback was attempted and fetch-failed,
+    /// the root-segment failure (the warn site only renders it when its status
+    /// differs from the primary).
+    AgeFallback {
+        primary: FetchFailure,
+        root_failed: Option<(String, FetchFailure)>,
+    },
+}
+
 /// Final sweep decision for a unit from its policy and the ordered results of
 /// the groups that ran. The whole flat-cascade fallback table lives here —
 /// replacing the ad-hoc state threading of the previous implementation.
-pub(super) fn decide_sweep(policy: &RetentionPolicy, groups: &[GroupResult]) -> SweepAction {
+pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> SweepAction {
+    let grace_sweep = || SweepAction::Sweep {
+        spans: SpanTable::uniform(policy.grace()),
+        reason: SweepReason::Grace,
+    };
+
     match policy {
-        RetentionPolicy::ReferencedOrBail { grace: _ } => {
+        ReconcilePolicy::ReferencedOrBail { grace: _ } => {
             for g in groups {
                 match &g.outcome {
                     GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => {}
@@ -259,23 +302,28 @@ pub(super) fn decide_sweep(policy: &RetentionPolicy, groups: &[GroupResult]) -> 
                     }
                 }
             }
-            SweepAction::Grace
+            grace_sweep()
         }
-        RetentionPolicy::ReferencedOrAge {
-            grace: _,
-            fallback: _,
-        } => {
+        ReconcilePolicy::ReferencedOrAge { grace: _, fallback } => {
+            let age_sweep = |primary, root_failed| SweepAction::Sweep {
+                spans: SpanTable::uniform(fallback),
+                reason: SweepReason::AgeFallback {
+                    primary,
+                    root_failed,
+                },
+            };
+
             // An owning group that completed ended reconciliation (the engine
             // stops early), so its presence as the last result means Grace.
             if let Some(last) = groups.last()
                 && last.owning
                 && matches!(last.outcome, GroupOutcome::Complete)
             {
-                return SweepAction::Grace;
+                return grace_sweep();
             }
             // Otherwise the last group is the always-present co-located probe.
             let Some(colocated) = groups.last() else {
-                return SweepAction::Grace;
+                return grace_sweep();
             };
             let root = groups
                 .iter()
@@ -283,37 +331,27 @@ pub(super) fn decide_sweep(policy: &RetentionPolicy, groups: &[GroupResult]) -> 
                 .skip(1)
                 .find(|g| g.root_seg.is_some() && !g.owning);
             match &colocated.outcome {
-                GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => SweepAction::Grace,
+                GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => grace_sweep(),
                 // A parse error falls back to age retention even when the
                 // root index reduced fine — quirk preserved from the previous
                 // implementation. See truth-table test.
-                GroupOutcome::ParseError => SweepAction::AgeFallback {
-                    primary: FetchFailure {
+                GroupOutcome::ParseError => age_sweep(
+                    FetchFailure {
                         status: StatusCode::BAD_GATEWAY,
                         upstream: None,
                     },
-                    root_failed: None,
-                },
+                    None,
+                ),
                 GroupOutcome::FetchFailed(primary) => match root.map(|g| (&g.outcome, g)) {
-                    Some((GroupOutcome::Complete, _)) => SweepAction::Grace,
-                    Some((GroupOutcome::FetchFailed(rf), g)) => SweepAction::AgeFallback {
-                        primary: primary.clone(),
-                        root_failed: g.root_seg.clone().map(|seg| (seg, rf.clone())),
-                    },
-                    _ => SweepAction::AgeFallback {
-                        primary: primary.clone(),
-                        root_failed: None,
-                    },
+                    Some((GroupOutcome::Complete, _)) => grace_sweep(),
+                    Some((GroupOutcome::FetchFailed(rf), g)) => age_sweep(
+                        primary.clone(),
+                        g.root_seg.clone().map(|seg| (seg, rf.clone())),
+                    ),
+                    _ => age_sweep(primary.clone(), None),
                 },
             }
         }
-        // Reference-set availability is expressed through candidate classes
-        // (covered ⇒ grace span, uncovered ⇒ backstop), not the action.
-        RetentionPolicy::ByHash {
-            grace: _,
-            backstop: _,
-        }
-        | RetentionPolicy::AgeOnly { span: _ } => SweepAction::Grace,
     }
 }
 
@@ -407,9 +445,9 @@ pub(super) fn classify_mirror(
                 },
                 owning: false,
             }],
-            policy: RetentionPolicy::ReferencedOrBail {
+            policy: RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrBail {
                 grace: UNREFERENCED_KEEP_SPAN,
-            },
+            }),
         });
     }
 
@@ -453,10 +491,10 @@ pub(super) fn classify_mirror(
             boundaries: nested,
         },
         groups: flat_groups,
-        policy: RetentionPolicy::ReferencedOrAge {
+        policy: RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrAge {
             grace: UNREFERENCED_KEEP_SPAN,
             fallback: RETENTION_TIME,
-        },
+        }),
     });
 
     if !is_flat {
@@ -543,6 +581,25 @@ mod tests {
         }
     }
 
+    /// The `Grace` decision both test policies produce (their grace is 1s).
+    fn grace() -> SweepAction {
+        SweepAction::Sweep {
+            spans: SpanTable::uniform(Duration::from_secs(1)),
+            reason: SweepReason::Grace,
+        }
+    }
+
+    /// The `AgeFallback` decision `AGE` produces (its fallback is 2s).
+    fn age_back(primary: FetchFailure, root_failed: Option<(String, FetchFailure)>) -> SweepAction {
+        SweepAction::Sweep {
+            spans: SpanTable::uniform(Duration::from_secs(2)),
+            reason: SweepReason::AgeFallback {
+                primary,
+                root_failed,
+            },
+        }
+    }
+
     fn owning(outcome: GroupOutcome) -> GroupResult {
         GroupResult {
             owning: true,
@@ -551,40 +608,30 @@ mod tests {
         }
     }
 
-    const BAIL: RetentionPolicy = RetentionPolicy::ReferencedOrBail {
+    const BAIL: ReconcilePolicy = ReconcilePolicy::ReferencedOrBail {
         grace: Duration::from_secs(1),
     };
-    const AGE: RetentionPolicy = RetentionPolicy::ReferencedOrAge {
+    const AGE: ReconcilePolicy = ReconcilePolicy::ReferencedOrAge {
         grace: Duration::from_secs(1),
         fallback: Duration::from_secs(2),
-    };
-    const BYHASH: RetentionPolicy = RetentionPolicy::ByHash {
-        grace: Duration::from_secs(1),
-        backstop: Duration::from_secs(2),
-    };
-    const AGE_ONLY: RetentionPolicy = RetentionPolicy::AgeOnly {
-        span: Duration::from_secs(1),
     };
 
     // ReferencedOrBail (structured pool)
 
     #[test]
     fn bail_no_groups_is_grace() {
-        assert_eq!(decide_sweep(&BAIL, &[]), SweepAction::Grace);
+        assert_eq!(decide_sweep(BAIL, &[]), grace());
     }
 
     #[test]
     fn bail_complete_is_grace() {
-        assert_eq!(
-            decide_sweep(&BAIL, &[gr(GroupOutcome::Complete)]),
-            SweepAction::Grace
-        );
+        assert_eq!(decide_sweep(BAIL, &[gr(GroupOutcome::Complete)]), grace());
     }
 
     #[test]
     fn bail_fetch_failed_bails() {
         assert_eq!(
-            decide_sweep(&BAIL, &[gr(GroupOutcome::FetchFailed(ff(404)))]),
+            decide_sweep(BAIL, &[gr(GroupOutcome::FetchFailed(ff(404)))]),
             SweepAction::Bail
         );
     }
@@ -592,7 +639,7 @@ mod tests {
     #[test]
     fn bail_parse_error_bails() {
         assert_eq!(
-            decide_sweep(&BAIL, &[gr(GroupOutcome::ParseError)]),
+            decide_sweep(BAIL, &[gr(GroupOutcome::ParseError)]),
             SweepAction::Bail
         );
     }
@@ -602,38 +649,29 @@ mod tests {
     #[test]
     fn age_owning_complete_is_grace() {
         assert_eq!(
-            decide_sweep(&AGE, &[owning(GroupOutcome::Complete)]),
-            SweepAction::Grace
+            decide_sweep(AGE, &[owning(GroupOutcome::Complete)]),
+            grace()
         );
     }
 
     #[test]
     fn age_colocated_only_complete_is_grace() {
-        assert_eq!(
-            decide_sweep(&AGE, &[gr(GroupOutcome::Complete)]),
-            SweepAction::Grace
-        );
+        assert_eq!(decide_sweep(AGE, &[gr(GroupOutcome::Complete)]), grace());
     }
 
     #[test]
     fn age_colocated_only_fetch_failed_falls_back() {
         assert_eq!(
-            decide_sweep(&AGE, &[gr(GroupOutcome::FetchFailed(ff(404)))]),
-            SweepAction::AgeFallback {
-                primary: ff(404),
-                root_failed: None
-            }
+            decide_sweep(AGE, &[gr(GroupOutcome::FetchFailed(ff(404)))]),
+            age_back(ff(404), None)
         );
     }
 
     #[test]
     fn age_colocated_only_parse_error_falls_back_with_bad_gateway() {
         assert_eq!(
-            decide_sweep(&AGE, &[gr(GroupOutcome::ParseError)]),
-            SweepAction::AgeFallback {
-                primary: ff(502),
-                root_failed: None
-            }
+            decide_sweep(AGE, &[gr(GroupOutcome::ParseError)]),
+            age_back(ff(502), None)
         );
     }
 
@@ -641,13 +679,13 @@ mod tests {
     fn age_root_complete_is_grace() {
         assert_eq!(
             decide_sweep(
-                &AGE,
+                AGE,
                 &[
                     root("apt", GroupOutcome::Complete),
                     gr(GroupOutcome::FetchFailed(ff(404)))
                 ]
             ),
-            SweepAction::Grace
+            grace()
         );
     }
 
@@ -655,16 +693,13 @@ mod tests {
     fn age_root_failed_and_colocated_failed_falls_back_with_root_context() {
         assert_eq!(
             decide_sweep(
-                &AGE,
+                AGE,
                 &[
                     root("apt", GroupOutcome::FetchFailed(ff(403))),
                     gr(GroupOutcome::FetchFailed(ff(404)))
                 ]
             ),
-            SweepAction::AgeFallback {
-                primary: ff(404),
-                root_failed: Some(("apt".to_owned(), ff(403)))
-            }
+            age_back(ff(404), Some(("apt".to_owned(), ff(403))))
         );
     }
 
@@ -672,7 +707,7 @@ mod tests {
     fn age_root_not_applicable_falls_back_without_root_context() {
         assert_eq!(
             decide_sweep(
-                &AGE,
+                AGE,
                 &[
                     root(
                         "apt",
@@ -683,10 +718,7 @@ mod tests {
                     gr(GroupOutcome::FetchFailed(ff(404)))
                 ]
             ),
-            SweepAction::AgeFallback {
-                primary: ff(404),
-                root_failed: None
-            }
+            age_back(ff(404), None)
         );
     }
 
@@ -694,16 +726,13 @@ mod tests {
     fn age_root_parse_error_falls_back_without_root_context() {
         assert_eq!(
             decide_sweep(
-                &AGE,
+                AGE,
                 &[
                     root("apt", GroupOutcome::ParseError),
                     gr(GroupOutcome::FetchFailed(ff(404)))
                 ]
             ),
-            SweepAction::AgeFallback {
-                primary: ff(404),
-                root_failed: None
-            }
+            age_back(ff(404), None)
         );
     }
 
@@ -714,16 +743,13 @@ mod tests {
     fn age_colocated_parse_error_ignores_completed_root() {
         assert_eq!(
             decide_sweep(
-                &AGE,
+                AGE,
                 &[
                     root("apt", GroupOutcome::Complete),
                     gr(GroupOutcome::ParseError)
                 ]
             ),
-            SweepAction::AgeFallback {
-                primary: ff(502),
-                root_failed: None
-            }
+            age_back(ff(502), None)
         );
     }
 
@@ -731,43 +757,15 @@ mod tests {
     fn age_failed_strict_defers_without_prejudice() {
         assert_eq!(
             decide_sweep(
-                &AGE,
+                AGE,
                 &[
                     owning(GroupOutcome::FetchFailed(ff(404))),
                     root("apt", GroupOutcome::Complete),
                     gr(GroupOutcome::FetchFailed(ff(404)))
                 ]
             ),
-            SweepAction::Grace
+            grace()
         );
-    }
-
-    // ByHash
-
-    #[test]
-    fn byhash_complete_is_always_grace() {
-        assert_eq!(
-            decide_sweep(&BYHASH, &[gr(GroupOutcome::Complete)]),
-            SweepAction::Grace
-        );
-    }
-
-    #[test]
-    fn byhash_db_error_is_always_grace() {
-        assert_eq!(
-            decide_sweep(
-                &BYHASH,
-                &[gr(GroupOutcome::NotApplicable(SkipReason::DbError))]
-            ),
-            SweepAction::Grace
-        );
-    }
-
-    // AgeOnly
-
-    #[test]
-    fn age_only_no_groups_is_grace() {
-        assert_eq!(decide_sweep(&AGE_ONLY, &[]), SweepAction::Grace);
     }
 
     // classify_mirror
@@ -870,16 +868,16 @@ mod tests {
         );
         assert_eq!(
             units[2].policy,
-            RetentionPolicy::ReferencedOrBail {
+            RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrBail {
                 grace: UNREFERENCED_KEEP_SPAN
-            }
+            })
         );
         assert_eq!(
             units[3].policy,
-            RetentionPolicy::ReferencedOrAge {
+            RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrAge {
                 grace: UNREFERENCED_KEEP_SPAN,
                 fallback: RETENTION_TIME
-            }
+            })
         );
         assert_eq!(
             units[4].policy,

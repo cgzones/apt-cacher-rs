@@ -50,7 +50,10 @@ pub(super) struct SweepResult {
 }
 
 /// Per-[`SpanClass`] retention spans consulted by [`sweep_candidates`]: each
-/// candidate's class selects which span gates its removal.
+/// candidate's class selects which span gates its removal. Chosen by
+/// [`decide_sweep`](crate::cleanup::model::decide_sweep) for the reconcile
+/// facets, and inline by `sweep_byhash_dir` for the by-hash ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SpanTable {
     pub deb: Duration,
     pub byhash_covered: Duration,
