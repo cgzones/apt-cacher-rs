@@ -2,16 +2,14 @@
 //! how leftovers are retained. No I/O — classification and the sweep decision
 //! are unit-testable truth tables.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use http::StatusCode;
 use tracing::trace;
 
 use crate::RETENTION_TIME;
-use crate::cache_layout::{
-    CacheLayout, SUBDIR_DISTS, SUBDIR_DISTS_BYHASH, SUBDIR_FLAT_BYHASH, SUBDIR_TMP,
-};
+use crate::cache_layout::{CacheLayout, SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
 use crate::cleanup::packages::FetchFailure;
 use crate::cleanup::sweep::SpanTable;
 use crate::config::Config;
@@ -33,43 +31,108 @@ const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 /// See `sweep::sweep_aged_metadata`.
 const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
 
-/// Age threshold for a `.partial` scratch file, carried as the `Partials` units'
-/// [`RetentionPolicy::AgeOnly`] span and applied by `partials::cleanup_tmp_dir`
-/// (which keeps its own, longer backstop for foreign entries).
+/// Age threshold for a `.partial` scratch file, carried as the [`PartialsUnit`]
+/// span and applied by `partials::cleanup_tmp_dir` (which keeps its own, longer
+/// backstop for foreign entries).
 const PARTIALS_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
 
-/// Which on-disk repository shape a [`CleanupUnit`] targets.
+/// Which candidate-reconcile tree a [`ReconcileUnit`] targets. Both shapes run
+/// the same engine and differ only in where they anchor and how their
+/// completion summary reads — the other three unit shapes need no such
+/// discriminator, their [`CleanupUnit`] variant *is* the shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RepoFacet {
+pub(super) enum ReconcileFacet {
     /// Structured pool tree: `{host}/{path}/`, depth-1, basename-keyed.
     StructuredPool,
     /// Flat repository tree: `{host}/flat/{path}/`, recursive, relpath-keyed.
     FlatTree,
-    /// Structured by-hash tree: `{host}/{path}/dists/.../by-hash/`.
-    StructuredByHash,
-    /// Flat by-hash tree: `{host}/flat/{path}/by-hash/`.
-    FlatByHash,
-    /// Structured dists-tree index metadata (age-only reap).
-    StructuredMetadata,
-    /// Flat-root index metadata (age-only reap).
-    FlatMetadata,
-    /// Stale partial-download temp files (age-only reap).
-    Partials,
 }
 
-/// One independently-cleaned tree: which facet it is, where to scan, the
-/// ordered index sources that reduce its candidate map, and how leftover
-/// candidates are retained.
+impl ReconcileFacet {
+    /// The layout this facet's tree is anchored under: it *places* the tree
+    /// (see [`unit_root`]) and is the key its sweep invalidates `cache_metadata`
+    /// on. Derived here rather than carried alongside the facet so the root the
+    /// classifier builds and the key the engine invalidates on cannot disagree.
+    pub(super) const fn cache_layout(self) -> CacheLayout {
+        match self {
+            Self::StructuredPool => CacheLayout::StructuredPool,
+            Self::FlatTree => CacheLayout::Flat,
+        }
+    }
+}
+
+/// One independently-cleaned tree, in the shape its executor consumes.
+///
+/// The variant *is* the retention rule: each payload carries exactly the inputs
+/// its `engine.rs` arm needs and nothing else, so a tree paired with a rule that
+/// cannot execute it — a by-hash tree with an age-only span, a `tmp/` reap with
+/// a `Release` digest set — is unrepresentable rather than guarded against at
+/// runtime.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct CleanupUnit {
-    pub facet: RepoFacet,
+pub(super) enum CleanupUnit {
+    /// Scan a tree into a candidate map, reduce it against ordered index
+    /// sources, sweep what survives. The only shape carrying [`SourceGroup`]s.
+    Reconcile(ReconcileUnit),
+    /// Sweep a by-hash tree against an on-disk `Release` digest set. Fetches
+    /// nothing and reduces nothing.
+    ByHash(ByHashUnit),
+    /// Age out stale index metadata in place.
+    Metadata(MetadataUnit),
+    /// Reap stale partial-download scratch files from one `tmp/` directory.
+    Partials(PartialsUnit),
+}
+
+/// A [`CleanupUnit::Reconcile`] unit: the tree to scan, the ordered index
+/// sources that reduce its candidate map, and how leftovers are retained.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ReconcileUnit {
+    pub facet: ReconcileFacet,
     pub tree: TreeSpec,
     pub groups: Vec<SourceGroup>,
-    pub policy: RetentionPolicy,
+    pub policy: ReconcilePolicy,
 }
 
-/// Where a [`CleanupUnit`] scans on disk and how the walk is bounded. Consumed
-/// verbatim by [`scan::scan_candidates`](crate::cleanup::scan::scan_candidates).
+/// A [`CleanupUnit::ByHash`] unit. `release_dir`/`dist_gate` name the on-disk
+/// `Release` set that *defines* "referenced" — the by-hash counterpart of a
+/// reconcile unit's [`SourceGroup`]s, except nothing is fetched. A complete
+/// reference set keeps referenced digests and sweeps unreferenced-but-covered
+/// ones past `grace`; anything uncovered (or the whole tree, when the reference
+/// set is incomplete) sweeps past `backstop`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ByHashUnit {
+    /// Places the tree (see [`unit_root`]) and keys its `cache_metadata`
+    /// invalidation.
+    pub layout: CacheLayout,
+    pub root: PathBuf,
+    pub release_dir: PathBuf,
+    pub dist_gate: DistGate,
+    pub grace: Duration,
+    pub backstop: Duration,
+}
+
+/// A [`CleanupUnit::Metadata`] unit: a pure age sweep of `root`, with no
+/// reference source at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct MetadataUnit {
+    /// Places the tree (see [`unit_root`]) and keys its `cache_metadata`
+    /// invalidation.
+    pub layout: CacheLayout,
+    pub root: PathBuf,
+    pub span: Duration,
+}
+
+/// A [`CleanupUnit::Partials`] unit: a pure age reap of one `tmp/` directory.
+/// Carries no [`CacheLayout`] — the layout only ever placed the root, and `tmp/`
+/// scratch files never enter the metadata store.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct PartialsUnit {
+    pub root: PathBuf,
+    pub span: Duration,
+}
+
+/// Where a [`ReconcileUnit`] scans on disk and how the walk is bounded. Consumed
+/// verbatim by [`scan::scan_candidates`](crate::cleanup::scan::scan_candidates);
+/// the three non-reconcile shapes scan nothing and carry a plain root instead.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct TreeSpec {
     /// On-disk root of the tree to scan.
@@ -89,8 +152,8 @@ pub(super) struct TreeSpec {
 }
 
 impl TreeSpec {
-    /// A depth-1, unbounded walk of `root` — the shape every unit except
-    /// `FlatTree` uses.
+    /// A depth-1, unbounded walk of `root` — the structured pool's shape;
+    /// [`ReconcileFacet::FlatTree`] is the only recursive tree.
     fn shallow(root: PathBuf) -> Self {
         Self {
             root,
@@ -111,7 +174,9 @@ pub(super) struct SourceGroup {
     pub owning: bool,
 }
 
-/// A reference-set source that reduces a unit's candidate map.
+/// A reference-set source that reduces a *reconcile* unit's candidate map. The
+/// by-hash facets carry their `Release` digest source on their retention policy
+/// instead, so every variant here is one `resolve_group` can actually dispatch.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum IndexSource {
     /// Per-active-origin structured `Packages` fetch.
@@ -122,12 +187,6 @@ pub(super) enum IndexSource {
     },
     /// A flat-repository `Packages` fetch (co-located or root-segment).
     FlatPackages { fetch: FlatFetch },
-    /// On-disk `Release` by-hash digest sets, gated on distribution
-    /// completeness.
-    LocalReleaseDigests {
-        release_dir: PathBuf,
-        dist_gate: DistGate,
-    },
 }
 
 /// Whose `mirrors_v2` row the active origins are read from for an
@@ -158,9 +217,8 @@ pub(super) enum FlatFetch {
     RootSegment { seg: String, prefix: String },
 }
 
-/// Whether an [`IndexSource::LocalReleaseDigests`] group requires every
-/// expected active-origin distribution to be present before it counts as
-/// complete.
+/// Whether a [`ByHashUnit`] requires every expected active-origin distribution
+/// to be present before its `Release` digest set counts as complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DistGate {
     /// Complete only when every active-origin distribution's `Release` is
@@ -170,10 +228,9 @@ pub(super) enum DistGate {
     None,
 }
 
-/// How a *candidate-reconcile* unit (`StructuredPool` / `FlatTree`) retains
-/// leftovers once its ordered [`SourceGroup`]s have run. This is the only input
-/// [`decide_sweep`] takes a policy from: the by-hash and age-only facets never
-/// reach it, so their retention is deliberately not representable here.
+/// How a [`ReconcileUnit`] retains leftovers once its ordered [`SourceGroup`]s
+/// have run. The only policy [`decide_sweep`] takes: the by-hash and age-only
+/// shapes carry their retention on their own payloads and never reach it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReconcilePolicy {
     /// Structured pool: any group fetch/parse failure bails the whole unit
@@ -198,20 +255,6 @@ impl ReconcilePolicy {
             }
         }
     }
-}
-
-/// How leftover candidates (nothing referenced them) are retained after a
-/// unit's groups have run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RetentionPolicy {
-    /// A candidate-reconcile unit; see [`ReconcilePolicy`].
-    Reconcile(ReconcilePolicy),
-    /// By-hash: a complete reference set keeps referenced digests and sweeps
-    /// unreferenced-but-covered past `grace`; anything uncovered (or the
-    /// reference set incomplete) sweeps past the `backstop`.
-    ByHash { grace: Duration, backstop: Duration },
-    /// Metadata, Partials: no reference source at all, pure age sweep.
-    AgeOnly { span: Duration },
 }
 
 /// Outcome of resolving one [`SourceGroup`] against the candidate map.
@@ -391,21 +434,41 @@ pub(super) fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
     Some((head, prefix))
 }
 
+/// On-disk root of the tree a unit with this `layout` scans, derived exactly the
+/// way the serve path builds its cache directory: [`CacheLayout::is_flat`] picks
+/// the anchor, [`CacheLayout::cache_subdir`] appends the layout's subdirectory.
+///
+/// Sharing that derivation with `ConnectionDetails::cache_dir_path` is the point.
+/// Cleanup used to hand-join the same `SUBDIR_*` constants, so if a layout's
+/// on-disk position ever moved, cleanup would keep scanning the old one — finding
+/// nothing, reaping nothing, and saying nothing.
+fn unit_root(layout: CacheLayout, cache_root: &Path, flat_root: &Path) -> PathBuf {
+    let anchor = if layout.is_flat() {
+        flat_root
+    } else {
+        cache_root
+    };
+    match layout.cache_subdir() {
+        Some(subdir) => anchor.join(subdir),
+        None => anchor.to_path_buf(),
+    }
+}
+
 /// Classify one `mirrors_v2` row into the ordered [`CleanupUnit`]s the engine
 /// will probe and sweep this cycle.
 ///
 /// Pure: no I/O, no DB — an absent on-disk tree just means the engine's unit
 /// finds nothing to remove. Units are emitted in the exact order the engine
 /// executes them: `[Partials(structured tmp), Partials(flat tmp),
-/// StructuredPool?, FlatTree, StructuredMetadata?, FlatMetadata,
-/// StructuredByHash?, FlatByHash]`. The three `?` units are omitted for a
-/// `MirrorKind::Flat` row: `kind` latches one-way to `Structured` (see
-/// `upsert_mirror_get_id`), so a `Flat` row is guaranteed to have no
-/// structured pool tree, dists tree, or dists by-hash tree on disk.
+/// Reconcile(StructuredPool)?, Reconcile(FlatTree), Metadata(Dists)?,
+/// Metadata(Flat), ByHash(DistsByHash)?, ByHash(FlatByHash)]`. The three `?`
+/// units are omitted for a `MirrorKind::Flat` row: `kind` latches one-way to
+/// `Structured` (see `upsert_mirror_get_id`), so a `Flat` row is guaranteed to
+/// have no structured pool tree, dists tree, or dists by-hash tree on disk.
 ///
 /// `nested` is the caller's pre-computed list of sibling mirror paths nested
 /// under `entry.path` (`scan::derive_nested_paths`); it becomes the
-/// [`FlatTree`](RepoFacet::FlatTree) unit's walk boundaries.
+/// [`ReconcileFacet::FlatTree`] unit's walk boundaries.
 ///
 /// On-disk paths are computed via `entry.cache_path_with_aliases`/
 /// `flat_root_path_with_aliases` (using `config.aliases`) rather than
@@ -427,16 +490,14 @@ pub(super) fn classify_mirror(
 
     let mut units = Vec::with_capacity(8);
 
-    // Structured `tmp/` first, then flat `tmp/`.
-    for root in [cache_root.join(SUBDIR_TMP), flat_root.join(SUBDIR_TMP)] {
-        units.push(CleanupUnit {
-            facet: RepoFacet::Partials,
-            tree: TreeSpec::shallow(root),
-            groups: Vec::new(),
-            policy: RetentionPolicy::AgeOnly {
-                span: PARTIALS_KEEP_SPAN,
-            },
-        });
+    // Structured `tmp/` first, then flat `tmp/`. `tmp/` hangs off each anchor
+    // rather than off a layout subdirectory, so it is the one root not fully
+    // derived from the layout.
+    for layout in [CacheLayout::StructuredPool, CacheLayout::Flat] {
+        units.push(CleanupUnit::Partials(PartialsUnit {
+            root: unit_root(layout, &cache_root, &flat_root).join(SUBDIR_TMP),
+            span: PARTIALS_KEEP_SPAN,
+        }));
     }
 
     if is_flat {
@@ -445,9 +506,10 @@ pub(super) fn classify_mirror(
             cache_path.display()
         );
     } else {
-        units.push(CleanupUnit {
-            facet: RepoFacet::StructuredPool,
-            tree: TreeSpec::shallow(cache_root.clone()),
+        let facet = ReconcileFacet::StructuredPool;
+        units.push(CleanupUnit::Reconcile(ReconcileUnit {
+            facet,
+            tree: TreeSpec::shallow(unit_root(facet.cache_layout(), &cache_root, &flat_root)),
             groups: vec![SourceGroup {
                 source: IndexSource::OriginPackages {
                     origin_rows_of: OriginOwner::SelfRow,
@@ -456,10 +518,10 @@ pub(super) fn classify_mirror(
                 },
                 owning: false,
             }],
-            policy: RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrBail {
+            policy: ReconcilePolicy::ReferencedOrBail {
                 grace: UNREFERENCED_KEEP_SPAN,
-            }),
-        });
+            },
+        }));
     }
 
     let mut flat_groups = Vec::with_capacity(3);
@@ -493,74 +555,62 @@ pub(super) fn classify_mirror(
         owning: false,
     });
 
-    units.push(CleanupUnit {
-        facet: RepoFacet::FlatTree,
+    let facet = ReconcileFacet::FlatTree;
+    units.push(CleanupUnit::Reconcile(ReconcileUnit {
+        facet,
         tree: TreeSpec {
-            root: flat_root.clone(),
+            root: unit_root(facet.cache_layout(), &cache_root, &flat_root),
             recurse: true,
             skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
             boundaries: nested,
         },
         groups: flat_groups,
-        policy: RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrAge {
+        policy: ReconcilePolicy::ReferencedOrAge {
             grace: UNREFERENCED_KEEP_SPAN,
             fallback: RETENTION_TIME,
-        }),
-    });
-
-    if !is_flat {
-        units.push(CleanupUnit {
-            facet: RepoFacet::StructuredMetadata,
-            tree: TreeSpec::shallow(cache_root.join(SUBDIR_DISTS)),
-            groups: Vec::new(),
-            policy: RetentionPolicy::AgeOnly {
-                span: METADATA_KEEP_SPAN,
-            },
-        });
-    }
-
-    units.push(CleanupUnit {
-        facet: RepoFacet::FlatMetadata,
-        tree: TreeSpec::shallow(flat_root.clone()),
-        groups: Vec::new(),
-        policy: RetentionPolicy::AgeOnly {
-            span: METADATA_KEEP_SPAN,
         },
-    });
+    }));
 
     if !is_flat {
-        units.push(CleanupUnit {
-            facet: RepoFacet::StructuredByHash,
-            tree: TreeSpec::shallow(cache_root.join(SUBDIR_DISTS_BYHASH)),
-            groups: vec![SourceGroup {
-                source: IndexSource::LocalReleaseDigests {
-                    release_dir: cache_root.join(SUBDIR_DISTS),
-                    dist_gate: DistGate::ActiveOriginDists,
-                },
-                owning: false,
-            }],
-            policy: RetentionPolicy::ByHash {
-                grace: UNREFERENCED_KEEP_SPAN,
-                backstop: byhash_backstop,
-            },
-        });
+        let layout = CacheLayout::Dists;
+        units.push(CleanupUnit::Metadata(MetadataUnit {
+            layout,
+            root: unit_root(layout, &cache_root, &flat_root),
+            span: METADATA_KEEP_SPAN,
+        }));
     }
 
-    units.push(CleanupUnit {
-        facet: RepoFacet::FlatByHash,
-        tree: TreeSpec::shallow(flat_root.join(SUBDIR_FLAT_BYHASH)),
-        groups: vec![SourceGroup {
-            source: IndexSource::LocalReleaseDigests {
-                release_dir: flat_root,
-                dist_gate: DistGate::None,
-            },
-            owning: false,
-        }],
-        policy: RetentionPolicy::ByHash {
+    let layout = CacheLayout::Flat;
+    units.push(CleanupUnit::Metadata(MetadataUnit {
+        layout,
+        root: unit_root(layout, &cache_root, &flat_root),
+        span: METADATA_KEEP_SPAN,
+    }));
+
+    if !is_flat {
+        let layout = CacheLayout::DistsByHash;
+        units.push(CleanupUnit::ByHash(ByHashUnit {
+            layout,
+            root: unit_root(layout, &cache_root, &flat_root),
+            // The dists metadata tree -- the same root the structured
+            // `Metadata` unit sweeps.
+            release_dir: unit_root(CacheLayout::Dists, &cache_root, &flat_root),
+            dist_gate: DistGate::ActiveOriginDists,
             grace: UNREFERENCED_KEEP_SPAN,
             backstop: byhash_backstop,
-        },
-    });
+        }));
+    }
+
+    let layout = CacheLayout::FlatByHash;
+    units.push(CleanupUnit::ByHash(ByHashUnit {
+        layout,
+        root: unit_root(layout, &cache_root, &flat_root),
+        // The flat root -- the same root the flat `Metadata` unit sweeps.
+        release_dir: unit_root(CacheLayout::Flat, &cache_root, &flat_root),
+        dist_gate: DistGate::None,
+        grace: UNREFERENCED_KEEP_SPAN,
+        backstop: byhash_backstop,
+    }));
 
     units
 }
@@ -822,124 +872,133 @@ mod tests {
         config
     }
 
+    /// The single [`ReconcileFacet::FlatTree`] unit every row emits.
+    fn flat_tree_unit(units: &[CleanupUnit]) -> &ReconcileUnit {
+        units
+            .iter()
+            .find_map(|u| match u {
+                CleanupUnit::Reconcile(r) => (r.facet == ReconcileFacet::FlatTree).then_some(r),
+                CleanupUnit::ByHash(_) | CleanupUnit::Metadata(_) | CleanupUnit::Partials(_) => {
+                    None
+                }
+            })
+            .expect("FlatTree unit present")
+    }
+
+    /// The classifier's whole contract for a structured row, asserted as one
+    /// value: shape, order, layout, root, sources and retention together. Every
+    /// payload is a struct literal, so a new field on any unit shape is a
+    /// compile error here rather than an untested default.
     #[test]
     fn structured_row_emits_all_eight_units_in_order() {
         let entry = test_entry("deb.debian.org", "debian", MirrorKind::Structured);
         let config = test_config("/cache");
+        let backstop = Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get());
 
         let units = classify_mirror(&entry, Vec::new(), &config);
 
-        assert_eq!(units.len(), 8);
-        let facets: Vec<RepoFacet> = units.iter().map(|u| u.facet).collect();
+        // The roots are spelled out rather than derived so this test pins the
+        // on-disk positions themselves; `unit_root` derives them from
+        // `CacheLayout::cache_subdir`, the same helper the serve path uses, so a
+        // layout that moves on disk moves cleanup's scan with it.
         assert_eq!(
-            facets,
+            units,
             vec![
-                RepoFacet::Partials,
-                RepoFacet::Partials,
-                RepoFacet::StructuredPool,
-                RepoFacet::FlatTree,
-                RepoFacet::StructuredMetadata,
-                RepoFacet::FlatMetadata,
-                RepoFacet::StructuredByHash,
-                RepoFacet::FlatByHash,
+                CleanupUnit::Partials(PartialsUnit {
+                    root: PathBuf::from("/cache/deb.debian.org/debian/tmp"),
+                    span: PARTIALS_KEEP_SPAN,
+                }),
+                CleanupUnit::Partials(PartialsUnit {
+                    root: PathBuf::from("/cache/deb.debian.org/flat/debian/tmp"),
+                    span: PARTIALS_KEEP_SPAN,
+                }),
+                CleanupUnit::Reconcile(ReconcileUnit {
+                    facet: ReconcileFacet::StructuredPool,
+                    tree: TreeSpec::shallow(PathBuf::from("/cache/deb.debian.org/debian")),
+                    groups: vec![SourceGroup {
+                        source: IndexSource::OriginPackages {
+                            origin_rows_of: OriginOwner::SelfRow,
+                            keymap: KeymapSpec::Basename,
+                            cache_layout: CacheLayout::StructuredPool,
+                        },
+                        owning: false,
+                    }],
+                    policy: ReconcilePolicy::ReferencedOrBail {
+                        grace: UNREFERENCED_KEEP_SPAN,
+                    },
+                }),
+                CleanupUnit::Reconcile(ReconcileUnit {
+                    facet: ReconcileFacet::FlatTree,
+                    tree: TreeSpec {
+                        root: PathBuf::from("/cache/deb.debian.org/flat/debian"),
+                        recurse: true,
+                        skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
+                        boundaries: Vec::new(),
+                    },
+                    groups: vec![SourceGroup {
+                        source: IndexSource::FlatPackages {
+                            fetch: FlatFetch::Colocated,
+                        },
+                        owning: false,
+                    }],
+                    policy: ReconcilePolicy::ReferencedOrAge {
+                        grace: UNREFERENCED_KEEP_SPAN,
+                        fallback: RETENTION_TIME,
+                    },
+                }),
+                CleanupUnit::Metadata(MetadataUnit {
+                    layout: CacheLayout::Dists,
+                    root: PathBuf::from("/cache/deb.debian.org/debian/dists"),
+                    span: METADATA_KEEP_SPAN,
+                }),
+                CleanupUnit::Metadata(MetadataUnit {
+                    layout: CacheLayout::Flat,
+                    root: PathBuf::from("/cache/deb.debian.org/flat/debian"),
+                    span: METADATA_KEEP_SPAN,
+                }),
+                CleanupUnit::ByHash(ByHashUnit {
+                    layout: CacheLayout::DistsByHash,
+                    root: PathBuf::from("/cache/deb.debian.org/debian/dists/by-hash"),
+                    // Exactly the root the structured `Metadata` unit above
+                    // sweeps: retiring a `Release` this cycle unpins its digests
+                    // in the same cycle.
+                    release_dir: PathBuf::from("/cache/deb.debian.org/debian/dists"),
+                    dist_gate: DistGate::ActiveOriginDists,
+                    grace: UNREFERENCED_KEEP_SPAN,
+                    backstop,
+                }),
+                CleanupUnit::ByHash(ByHashUnit {
+                    layout: CacheLayout::FlatByHash,
+                    root: PathBuf::from("/cache/deb.debian.org/flat/debian/by-hash"),
+                    release_dir: PathBuf::from("/cache/deb.debian.org/flat/debian"),
+                    dist_gate: DistGate::None,
+                    grace: UNREFERENCED_KEEP_SPAN,
+                    backstop,
+                }),
             ]
         );
+    }
 
-        assert_eq!(
-            units[0].tree.root,
-            PathBuf::from("/cache/deb.debian.org/debian/tmp")
-        );
-        assert_eq!(
-            units[1].tree.root,
-            PathBuf::from("/cache/deb.debian.org/flat/debian/tmp")
-        );
-        assert_eq!(
-            units[2].tree.root,
-            PathBuf::from("/cache/deb.debian.org/debian")
-        );
-        assert_eq!(
-            units[2].groups,
-            vec![SourceGroup {
-                source: IndexSource::OriginPackages {
-                    origin_rows_of: OriginOwner::SelfRow,
-                    keymap: KeymapSpec::Basename,
-                    cache_layout: CacheLayout::StructuredPool,
-                },
-                owning: false,
-            }]
-        );
-        assert_eq!(
-            units[3].tree.root,
-            PathBuf::from("/cache/deb.debian.org/flat/debian")
-        );
-        assert_eq!(
-            units[4].tree.root,
-            PathBuf::from("/cache/deb.debian.org/debian/dists")
-        );
-        assert_eq!(
-            units[5].tree.root,
-            PathBuf::from("/cache/deb.debian.org/flat/debian")
-        );
-        assert_eq!(
-            units[6].tree.root,
-            PathBuf::from("/cache/deb.debian.org/debian/dists/by-hash")
-        );
-        assert_eq!(
-            units[7].tree.root,
-            PathBuf::from("/cache/deb.debian.org/flat/debian/by-hash")
-        );
-
-        assert_eq!(
-            units[0].policy,
-            RetentionPolicy::AgeOnly {
-                span: PARTIALS_KEEP_SPAN
-            }
-        );
-        assert_eq!(
-            units[1].policy,
-            RetentionPolicy::AgeOnly {
-                span: PARTIALS_KEEP_SPAN
-            }
-        );
-        assert_eq!(
-            units[2].policy,
-            RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrBail {
-                grace: UNREFERENCED_KEEP_SPAN
-            })
-        );
-        assert_eq!(
-            units[3].policy,
-            RetentionPolicy::Reconcile(ReconcilePolicy::ReferencedOrAge {
-                grace: UNREFERENCED_KEEP_SPAN,
-                fallback: RETENTION_TIME
-            })
-        );
-        assert_eq!(
-            units[4].policy,
-            RetentionPolicy::AgeOnly {
-                span: METADATA_KEEP_SPAN
-            }
-        );
-        assert_eq!(
-            units[5].policy,
-            RetentionPolicy::AgeOnly {
-                span: METADATA_KEEP_SPAN
-            }
-        );
-        assert_eq!(
-            units[6].policy,
-            RetentionPolicy::ByHash {
-                grace: UNREFERENCED_KEEP_SPAN,
-                backstop: Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get())
-            }
-        );
-        assert_eq!(
-            units[7].policy,
-            RetentionPolicy::ByHash {
-                grace: UNREFERENCED_KEEP_SPAN,
-                backstop: Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get())
-            }
-        );
+    #[test]
+    fn unit_root_matches_the_serve_path_layout_positions() {
+        // The on-disk position of every layout comes from
+        // `CacheLayout::cache_subdir`/`is_flat`, which is what
+        // `ConnectionDetails::cache_path_impl` builds the serve path from.
+        let cache_root = PathBuf::from("/cache/host/debian");
+        let flat_root = PathBuf::from("/cache/host/flat/debian");
+        for (layout, expected) in [
+            (CacheLayout::StructuredPool, "/cache/host/debian"),
+            (CacheLayout::Dists, "/cache/host/debian/dists"),
+            (CacheLayout::DistsByHash, "/cache/host/debian/dists/by-hash"),
+            (CacheLayout::Flat, "/cache/host/flat/debian"),
+            (CacheLayout::FlatByHash, "/cache/host/flat/debian/by-hash"),
+        ] {
+            assert_eq!(
+                unit_root(layout, &cache_root, &flat_root),
+                PathBuf::from(expected),
+                "{layout:?} root"
+            );
+        }
     }
 
     #[test]
@@ -949,17 +1008,39 @@ mod tests {
 
         let units = classify_mirror(&entry, Vec::new(), &config);
 
-        let facets: Vec<RepoFacet> = units.iter().map(|u| u.facet).collect();
-        assert_eq!(
-            facets,
-            vec![
-                RepoFacet::Partials,
-                RepoFacet::Partials,
-                RepoFacet::FlatTree,
-                RepoFacet::FlatMetadata,
-                RepoFacet::FlatByHash,
-            ]
-        );
+        // No structured pool, dists metadata or dists by-hash unit: `kind`
+        // latches one-way to Structured, so a Flat row cannot have those trees.
+        assert_eq!(units.len(), 5);
+        assert!(matches!(units[0], CleanupUnit::Partials(_)));
+        assert!(matches!(units[1], CleanupUnit::Partials(_)));
+        assert!(matches!(
+            units[2],
+            CleanupUnit::Reconcile(ReconcileUnit {
+                facet: ReconcileFacet::FlatTree,
+                tree: _,
+                groups: _,
+                policy: _,
+            })
+        ));
+        assert!(matches!(
+            units[3],
+            CleanupUnit::Metadata(MetadataUnit {
+                layout: CacheLayout::Flat,
+                root: _,
+                span: _,
+            })
+        ));
+        assert!(matches!(
+            units[4],
+            CleanupUnit::ByHash(ByHashUnit {
+                layout: CacheLayout::FlatByHash,
+                root: _,
+                release_dir: _,
+                dist_gate: _,
+                grace: _,
+                backstop: _,
+            })
+        ));
     }
 
     #[test]
@@ -972,10 +1053,7 @@ mod tests {
         let config = test_config("/cache");
 
         let units = classify_mirror(&entry, Vec::new(), &config);
-        let flat_tree = units
-            .iter()
-            .find(|u| u.facet == RepoFacet::FlatTree)
-            .expect("FlatTree unit present");
+        let flat_tree = flat_tree_unit(&units);
 
         assert_eq!(
             flat_tree.groups[0],
@@ -1000,10 +1078,7 @@ mod tests {
         let config = test_config("/cache");
 
         let units = classify_mirror(&entry, Vec::new(), &config);
-        let flat_tree = units
-            .iter()
-            .find(|u| u.facet == RepoFacet::FlatTree)
-            .expect("FlatTree unit present");
+        let flat_tree = flat_tree_unit(&units);
 
         assert_eq!(
             flat_tree.groups,
@@ -1033,10 +1108,7 @@ mod tests {
         let config = test_config("/cache");
 
         let units = classify_mirror(&entry, Vec::new(), &config);
-        let flat_tree = units
-            .iter()
-            .find(|u| u.facet == RepoFacet::FlatTree)
-            .expect("FlatTree unit present");
+        let flat_tree = flat_tree_unit(&units);
 
         assert_eq!(
             flat_tree.groups,
@@ -1056,10 +1128,7 @@ mod tests {
         let nested = vec!["debian/security".to_owned(), "debian/x".to_owned()];
 
         let units = classify_mirror(&entry, nested.clone(), &config);
-        let flat_tree = units
-            .iter()
-            .find(|u| u.facet == RepoFacet::FlatTree)
-            .expect("FlatTree unit present");
+        let flat_tree = flat_tree_unit(&units);
 
         assert_eq!(flat_tree.tree.boundaries, nested);
         assert!(flat_tree.tree.recurse);
