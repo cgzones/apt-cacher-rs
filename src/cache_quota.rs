@@ -90,6 +90,12 @@ impl CacheQuota {
         *self.cache_size.lock()
     }
 
+    /// Configured quota limit, if any. `None` means unlimited.
+    #[must_use]
+    pub(crate) const fn quota_limit(&self) -> Option<NonZero<u64>> {
+        self.quota_config
+    }
+
     /// Update `CACHE_QUOTA_UTIL_PEAK_BPS` with the current utilization
     /// (in basis points: hundredths of a percent). No-op when no quota is
     /// configured, since utilization is not well defined.

@@ -197,6 +197,7 @@ async fn resolve_mirror_id(
 
 /// Stage a command into the batch buffers, resolving the mirror id first.
 /// Errors during mirror resolution are logged and the command is dropped.
+/// The Ping arm is a pass-through: no mirror resolution, replies inline.
 async fn stage(
     db: &Database,
     cache: &mut HashMap<Mirror, CachedMirror>,

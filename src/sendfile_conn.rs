@@ -44,10 +44,10 @@ use crate::{
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
     rate_log,
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
-    static_assert, tunnel_limiter,
+    static_assert, swrite, tunnel_limiter,
     utils::{hint_sequential_read, is_peer_disconnect, tokio_nofollow_options},
     warn_once_or_debug, warn_once_or_info,
-    web_interface::{HTML_CSP, WebResponse, WebResponseKind, serve_web_interface},
+    web_interface::{WebResponse, serve_web_interface},
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -518,22 +518,10 @@ async fn write_webui_response(
     let body_len = response.body.len();
     let status = response.status;
 
-    // Per-kind extra headers, kept in lockstep with `WebResponse::into_hyper_response`.
-    let extra_headers: String = match response.kind {
-        WebResponseKind::Html => format!(
-            "Cache-Control: no-store\r\n\
-             Content-Security-Policy: {HTML_CSP}\r\n\
-             X-Content-Type-Options: nosniff\r\n\
-             X-Frame-Options: DENY\r\n\
-             X-Robots-Tag: noindex\r\n\
-             Referrer-Policy: no-referrer\r\n",
-        ),
-        WebResponseKind::Static { .. } => String::from(
-            "Cache-Control: public, max-age=86400\r\n\
-             X-Content-Type-Options: nosniff\r\n",
-        ),
-        WebResponseKind::Error => String::new(),
-    };
+    let mut extra_headers = String::new();
+    for &(name, value) in response.extra_headers() {
+        swrite!(extra_headers, "{name}: {value}\r\n");
+    }
 
     let header = format!(
         "{conn_version} {status}\r\n\

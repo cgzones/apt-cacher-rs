@@ -10,13 +10,17 @@ use std::num::NonZero;
 use std::path::Path;
 use std::time::Duration;
 
+use coarsetime::Instant;
 use tokio::io::AsyncWriteExt as _;
 use tracing::debug;
 
 use crate::{
+    cache_quota::CacheQuota,
     database_task::{DatabaseCommand, DbCmdPing, send_db_command},
     error::ErrorReport,
+    global_cache_quota, global_config, swrite,
     utils::tokio_nofollow_options,
+    warn_once_or_info,
 };
 
 /// Filename of the transient cache-writability probe, created and unlinked
@@ -26,8 +30,6 @@ pub(crate) const PROBE_FILENAME: &str = ".apt-cacher-rs.healthprobe";
 
 /// Upper bound for each individual check.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-
-use crate::swrite;
 
 /// Outcome of a single readiness check.
 #[derive(Clone)]
@@ -183,6 +185,52 @@ async fn check_database() -> CheckResult {
         Ok(Err(_recv_err)) => CheckResult::Fail(String::from("database task unavailable")),
         Err(_elapsed) => CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
     }
+}
+
+/// Memoized report + timestamp. A `tokio::sync::Mutex` (held across the
+/// checks) gives single-flight semantics: concurrent requests coalesce
+/// into one probe run, capping cost at one disk probe + one DB ping per
+/// `CACHE_TTL` regardless of request rate.
+static HEALTH_CACHE: tokio::sync::Mutex<Option<(Instant, HealthReport)>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// Memoization window. Long enough to defang probe spam, short enough
+/// that a 5s-interval orchestrator probe never sees stale state.
+const CACHE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1);
+
+/// Run all readiness checks concurrently; wall-clock is bounded by the
+/// slowest single check timeout, not the sum.
+async fn run_healthcheck(quota: &CacheQuota, cache_dir: &Path) -> HealthReport {
+    let (database, cache_write) = tokio::join!(check_database(), check_cache_write(cache_dir));
+    let quota = check_quota(quota.current_size(), quota.quota_limit());
+    HealthReport {
+        database,
+        cache_write,
+        quota,
+    }
+}
+
+/// Daemon-facing entry: serve the memoized report, refreshing it when
+/// older than [`CACHE_TTL`]. Reaches for the globals, so only callable in
+/// a running daemon; the pure pieces live in [`run_healthcheck`] and the
+/// individual checks.
+///
+/// The memoized entry's timestamp is captured after the checks complete,
+/// not before, so slow checks (up to ~5s each) don't pre-expire the entry.
+pub(crate) async fn cached_health_report() -> HealthReport {
+    let mut cache = HEALTH_CACHE.lock().await;
+    let now = Instant::now();
+    if let Some((at, report)) = cache.as_ref()
+        && now.duration_since(*at) < CACHE_TTL
+    {
+        return report.clone();
+    }
+    let report = run_healthcheck(global_cache_quota(), &global_config().cache_directory).await;
+    if !report.healthy() {
+        warn_once_or_info!("Health check failing: {}", report.to_json());
+    }
+    *cache = Some((Instant::now(), report.clone()));
+    report
 }
 
 #[cfg(test)]
