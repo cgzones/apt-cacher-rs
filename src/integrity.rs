@@ -28,19 +28,17 @@ use std::sync::Arc;
 
 use hashbrown::{Equivalent, HashMap};
 use parking_lot::Mutex;
-use tokio::io::AsyncBufRead;
 use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
-use crate::limits::LimitedReader;
+use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::utils::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
-use crate::xz_stream::xz_decoder;
 use crate::{
     cache_layout::ResourceKind,
     index_parser::{self, HashAlgo, IndexFormat},
     metrics,
 };
-use crate::{global_checksum_registry, global_config, limits, warn_once_or_info};
+use crate::{global_checksum_registry, global_config, warn_once_or_info};
 
 /// Why a download could not be committed to the cache. All three variants are
 /// handled by callers exactly as a pre-existing rename failure is handled
@@ -740,30 +738,6 @@ fn byhash_algo_from_uri_path(raw_uri_path: &str) -> Option<HashAlgo> {
     None
 }
 
-/// Compression of a `Packages` file, derived from its filename extension.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PackagesCompression {
-    Raw,
-    Gz,
-    Xz,
-}
-
-impl PackagesCompression {
-    /// Derive from a filename leaf. `None` if the leaf does not look like a
-    /// `Packages` file at all.
-    pub(crate) fn from_filename(name: &str) -> Option<Self> {
-        if name == "Packages" {
-            Some(Self::Raw)
-        } else if name == "Packages.gz" {
-            Some(Self::Gz)
-        } else if name == "Packages.xz" {
-            Some(Self::Xz)
-        } else {
-            None
-        }
-    }
-}
-
 /// Detect Packages compression by reading magic bytes from the file. Used for
 /// by-hash content whose URL leaf is a hex digest and so carries no extension.
 /// Falls back to `Raw` if no recognised magic is found (best-effort: a
@@ -829,39 +803,12 @@ pub(crate) async fn ingest_packages_file(
             u64::MAX
         }
     };
-    let decompressed_limit = match NonZero::new(compressed_size) {
-        Some(cs) => limits::MAX_DECOMPRESSED_PACKAGES_SIZE
-            .min(cs.saturating_mul(limits::MAX_DECOMPRESSION_RATIO)),
-        None => limits::MAX_DECOMPRESSED_PACKAGES_SIZE,
-    };
-
-    let mut raw;
-    let mut gz;
-    let mut xz;
-    let reader: &mut (dyn AsyncBufRead + Unpin + Send) = match compression {
-        PackagesCompression::Raw => {
-            // No inner BufReader here: file -> LimitedReader -> BufReader.
-            // A decompression layer (Gz/Xz) benefits from buffering its
-            // compressed input; raw bytes need no such amortisation.
-            let limited = LimitedReader::new(file, decompressed_limit);
-            raw = tokio::io::BufReader::with_capacity(buffer_size, limited);
-            &mut raw
-        }
-        PackagesCompression::Gz => {
-            let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
-            let decoder = async_compression::tokio::bufread::GzipDecoder::new(file_reader);
-            let limited = LimitedReader::new(decoder, decompressed_limit);
-            gz = tokio::io::BufReader::with_capacity(buffer_size, limited);
-            &mut gz
-        }
-        PackagesCompression::Xz => {
-            let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
-            let decoder = xz_decoder(file_reader);
-            let limited = LimitedReader::new(decoder, decompressed_limit);
-            xz = tokio::io::BufReader::with_capacity(buffer_size, limited);
-            &mut xz
-        }
-    };
+    let mut reader = limits::packages_reader(
+        file,
+        compression,
+        limits::decompressed_limit(NonZero::new(compressed_size)),
+        buffer_size,
+    );
 
     let mut line = String::with_capacity(128);
     let mut line_buf: Vec<u8> = Vec::with_capacity(128);
@@ -1385,6 +1332,51 @@ mod tests {
         assert_eq!(
             reg.lookup("deb.debian.org", "debian", "b_2_amd64.deb"),
             Some(sha_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_packages_rejects_decompression_bomb() {
+        use std::num::NonZero;
+        use tokio::io::AsyncWriteExt as _;
+        // Registry ingest shares `limits::packages_reader` with cleanup's
+        // reduce, so the ratio cap must bound it too: a gzip stream whose
+        // decompressed size exceeds `compressed * MAX_DECOMPRESSION_RATIO` has
+        // to fail rather than populate the registry from a bomb.
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+
+        // Highly-compressible payload: ~4 MiB of zero bytes gzips to a few KiB,
+        // far past the 100x ratio cap.
+        let mut encoder =
+            async_compression::tokio::write::GzipEncoder::new(Vec::<u8>::with_capacity(4096));
+        encoder
+            .write_all(&vec![0u8; 4 * 1024 * 1024])
+            .await
+            .expect("write");
+        encoder.shutdown().await.expect("shutdown");
+        let compressed = encoder.into_inner();
+
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(&compressed).expect("write");
+        f.flush().expect("flush");
+
+        let err = ingest_packages_file(
+            &reg,
+            "deb.debian.org",
+            "debian",
+            f.path(),
+            PackagesCompression::Gz,
+            IndexFormat::Structured,
+            64 * 1024,
+        )
+        .await
+        .expect_err("a decompression bomb must abort Packages ingestion");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // Pin it to the ratio guard rather than any incidental InvalidData
+        // (a malformed gzip stream would also surface as InvalidData).
+        assert!(
+            err.to_string().contains("decompressed size exceeds limit"),
+            "unexpected error: {err}"
         );
     }
 

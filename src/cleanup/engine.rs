@@ -27,7 +27,7 @@ use crate::cleanup::model::{
 };
 use crate::cleanup::packages::{
     DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, body_is_incomplete,
-    packages_body_to_memfd, try_fetch_packages_file,
+    packages_body_to_memfd, reduce_file_list, try_fetch_packages_file,
 };
 use crate::cleanup::partials::cleanup_tmp_dir;
 use crate::cleanup::refs::{
@@ -221,9 +221,7 @@ pub(super) async fn reduce_against(
         tally,
         keymap: &plan.keymap,
     };
-    pkgfmt
-        .reduce_file_list(file, &memfdname, candidates, &mut ctx, config)
-        .await?;
+    reduce_file_list(pkgfmt, file, &memfdname, candidates, &mut ctx, config).await?;
 
     Ok(if candidates.is_empty() {
         ReduceOutcome::Exhausted
