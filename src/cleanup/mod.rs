@@ -212,12 +212,10 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let mut removed_unreferenced = 0;
 
     for res in results {
+        // A unit's hard error is logged and swallowed inside `run_mirror_units`,
+        // so the only failure that can surface here is a panicked task.
         let cleanup_result = match res {
-            Ok(Ok(cr)) => cr,
-            Ok(Err(err)) => {
-                error!("Error in cleanup task:  {err}");
-                continue;
-            }
+            Ok(cr) => cr,
             Err(join_err) => {
                 error!("Error joining cleanup task:  {join_err}");
                 continue;
