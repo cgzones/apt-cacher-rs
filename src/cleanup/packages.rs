@@ -205,34 +205,22 @@ async fn process_stanza(
             );
         }
         Some((algo, expected)) => {
-            // lstat (not stat) so a hostile symlink planted between
-            // `scan_candidates` (which filters via `file_type()`,
-            // lstat-semantics) and now is detected here rather than
-            // followed.  A non-regular result therefore indicates a
-            // concurrent type swap.
-            let pre_size = match tokio::fs::symlink_metadata(&path).await {
-                Ok(m) if m.file_type().is_file() => m.len(),
-                Ok(_) => {
-                    metrics::CACHE_NON_REGULAR.increment();
+            // No pre-verify stat: `verify_file_sync` opens the file `O_NOFOLLOW
+            // | O_NONBLOCK` and `fstat`s the descriptor it actually hashed, so
+            // it detects a concurrent type swap without a second syscall (and
+            // without the lstat-then-open race an extra stat would only narrow).
+            match verify_cache_file(path.clone(), algo, expected.to_vec()).await {
+                Verdict::Match => {}
+                Verdict::NonRegular => {
                     warn!(
                         "Cache file `{}` changed to non-regular between cleanup-collect and verify (concurrent swap); retaining without verification",
                         path.display(),
                     );
-                    return;
                 }
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to stat cache file `{}` before {} verification:  {err}; retaining",
-                        path.display(),
-                        algo.as_str(),
-                    );
-                    return;
-                }
-            };
-            match verify_cache_file(path.clone(), algo, expected.to_vec()).await {
-                Verdict::Match => {}
-                Verdict::Mismatch { computed } => {
+                Verdict::Mismatch {
+                    computed,
+                    size: pre_size,
+                } => {
                     warn!(
                         "Cache file `{}` failed {} verification: expected={}, computed={}",
                         path.display(),

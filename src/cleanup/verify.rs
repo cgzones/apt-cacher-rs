@@ -1,11 +1,10 @@
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use xattr::FileExt as _;
 
 use crate::index_parser::{HashAlgo, hash_open_file, hex_encode};
 use crate::metrics;
-use crate::utils::nofollow_options;
+use crate::utils::nofollow_nonblock_options;
 
 /// Xattr recording a successful cleanup digest verification, formatted as
 /// `"{ino}:{size}:{algo}:{expected-digest-hex}"`.
@@ -59,11 +58,16 @@ pub(super) enum Verdict {
     /// Computed digest equals the expected one.
     Match,
     /// Computed digest differs from the expected one and the underlying file
-    /// did not change inode/size during hashing.
-    Mismatch { computed: Vec<u8> },
+    /// did not change inode/size during hashing. `size` is the on-disk size
+    /// observed before hashing, which the caller bills to the eviction.
+    Mismatch { computed: Vec<u8>, size: u64 },
     /// The file's `(inode, size)` changed between hash start and finish, so a
     /// concurrent writer raced us; the cleanup leaves the file alone.
     Raced,
+    /// The path is no longer a regular file — a type swap since the scan
+    /// classified it. Counted as `CACHE_NON_REGULAR` here; the caller retains
+    /// the entry without verifying it.
+    NonRegular,
     /// Open/read failed; cleanup leaves the file alone.
     IoError(std::io::Error),
 }
@@ -73,7 +77,7 @@ pub(super) enum Verdict {
 pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     use std::os::unix::fs::MetadataExt as _;
 
-    let mut file = match nofollow_options().read(true).open(path) {
+    let mut file = match nofollow_nonblock_options().read(true).open(path) {
         Ok(f) => f,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -84,10 +88,7 @@ pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> 
         Ok(m) if m.file_type().is_file() => m,
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
-            return Verdict::IoError(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "Not a regular file",
-            ));
+            return Verdict::NonRegular;
         }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -150,7 +151,10 @@ pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> 
         Ok(post_meta) if post_meta.ino() != pre_ino || post_meta.len() != pre_size => {
             Verdict::Raced
         }
-        Ok(_) => Verdict::Mismatch { computed },
+        Ok(_) => Verdict::Mismatch {
+            computed,
+            size: pre_size,
+        },
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             Verdict::IoError(err)
@@ -190,10 +194,11 @@ mod tests {
 
         let wrong: Vec<u8> = vec![0u8; 32];
         let v = verify_file_sync(&path, HashAlgo::Sha256, &wrong);
-        let Verdict::Mismatch { computed } = v else {
+        let Verdict::Mismatch { computed, size } = v else {
             unreachable!("expected Mismatch verdict, got {v:?}")
         };
         assert_eq!(computed, expected_sha256);
+        assert_eq!(size, payload.len() as u64, "size is billed to the eviction");
 
         let expected_sha512 = sha2::Sha512::digest(payload).to_vec();
         assert!(matches!(
