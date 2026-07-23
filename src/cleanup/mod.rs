@@ -12,7 +12,6 @@ use model::classify_mirror;
 use scan::derive_nested_paths;
 
 use std::{
-    path::Path,
     sync::{
         LazyLock,
         atomic::{AtomicI64, Ordering},
@@ -26,9 +25,9 @@ use hashbrown::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    AppState, cache_layout::CacheLayout, cache_metadata, config::CacheHost,
-    database::resolved_cache_host, deb_mirror::Mirror, error::ProxyCacheError, global_cache_quota,
-    global_config, humanfmt::HumanFmt, metrics, task_cache_scan::task_cache_scan,
+    AppState, config::CacheHost, database::resolved_cache_host, error::ProxyCacheError,
+    global_cache_quota, global_config, humanfmt::HumanFmt, metrics,
+    task_cache_scan::task_cache_scan,
 };
 
 /// Delay between daemon startup and the first scheduled cleanup run.
@@ -36,21 +35,6 @@ pub(crate) const FIRST_CLEANUP_DELAY_SECS: u64 = 60 * 60;
 
 /// Interval between recurring cleanup runs.
 pub(crate) const CLEANUP_INTERVAL_SECS: u64 = 24 * 60 * 60;
-
-/// Grace period for unreferenced cached deb files. Apt updates that bypass
-/// the proxy register their origin lazily; this delay prevents a freshly
-/// cached file from being wiped before its origin row is observed.
-const UNREFERENCED_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
-
-/// Retention span for volatile index metadata (`Release`/`InRelease`/`Packages*`
-/// /...) in a structured `dists/` directory. Unlike per-`.deb` files these are
-/// refreshed in place (a fresh inode, hence a fresh birthtime) while a
-/// distribution is in use, so aging past this span marks the distribution as
-/// retired. Nothing else reclaims these files, and while a retired dist's
-/// `Release` lingers, reference-mode by-hash cleanup keeps every digest it lists
-/// pinned; removing the metadata bounds the growth and unblocks that reclaim.
-/// See `sweep::sweep_aged_metadata`.
-const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
 
 /// Unix-timestamp of the next scheduled cleanup. Updated by main.rs at startup,
 /// after each scheduled tick, and after a SIGUSR2-triggered reset. A value of
@@ -64,32 +48,6 @@ pub(crate) fn set_next_cleanup_epoch(epoch: i64) {
 #[must_use]
 pub(crate) fn next_cleanup_epoch() -> i64 {
     NEXT_CLEANUP_EPOCH.load(Ordering::Relaxed)
-}
-
-/// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
-/// Non-UTF-8 filenames are silently skipped: debnames are URL-decoded ASCII,
-/// so any non-UTF-8 path can't be in the metadata store to begin with.
-///
-/// The key uses `path.file_name()` (basename) rather than a relpath because the
-/// stored `cache_metadata` key already carries the on-disk directory in
-/// `Mirror.path` (URL-directory-verbatim under the host-anchored flat layout),
-/// so basename + the cleanup mirror is the exact key — as long as the file's
-/// directory equals the cleanup mirror's registered path. That holds for every
-/// deb reached through its own mirror row: each flat-deb URL directory registers
-/// a row that `derive_nested_paths` turns into a walk boundary, so the handling
-/// task always sees a single-segment relpath. The one gap is the recursive-scan
-/// safety net: a deb nested *below* the cleanup mirror's path whose own row is
-/// missing (e.g. pruned by `cleanup_invalid_rows`, or a DB reset with files left
-/// behind) is keyed here under the wrong `Mirror.path` and the invalidation
-/// misses. That only leaks an in-memory entry (the on-disk file is still removed
-/// correctly), and the store rebuilds lazily from xattrs, so it self-heals on
-/// restart.
-fn invalidate_metadata_for(path: &Path, mirror: &Mirror, layout: CacheLayout) {
-    if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-        cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
-            mirror, debname, layout,
-        ));
-    }
 }
 
 /// RAII guard that releases the `task_cleanup` active flag on drop, so a
