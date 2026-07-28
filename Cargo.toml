@@ -254,6 +254,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.aws-lc-sys]
 opt-level = 3
+# its C sources carry ~28 MiB of DWARF nothing ever reads
+debug = false
 
 [profile.profiling]
 inherits = "release"
