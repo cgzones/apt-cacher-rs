@@ -8,7 +8,7 @@
 //! `current_thread` runtime (including `#[tokio::test]` without
 //! `flavor = "multi_thread"`) will **panic**.
 
-use std::{num::ParseIntError, path::Path};
+use std::{num::ParseIntError, path::Path, sync::atomic::AtomicBool, sync::atomic::Ordering};
 
 use nix::libc;
 use tracing::warn;
@@ -29,12 +29,27 @@ impl xattr::FileExt for XattrFile<'_> {}
 /// Remove the extended attribute for the given key from the file.
 /// Logs warnings on failure but never propagates errors.
 pub(crate) fn remove_helper(file: &tokio::fs::File, display_path: &Path, key: &'static str) {
-    if let Err(err) = tokio::task::block_in_place(|| XattrFile(file).remove_xattr(key)) {
+    if let Err(err) = tokio::task::block_in_place(|| XattrFile(file).remove_xattr(key))
+        && err.kind() != std::io::ErrorKind::Unsupported
+    {
         warn!(
             "Failed to remove invalid xattr from `{}` for key `{key}`:  {err}",
             display_path.display()
         );
     }
+}
+
+/// Whether the cache filesystem supports the `user.apt_cacher_rs.*`
+/// namespace, recorded once by `task_setup`'s startup probe. Consumed by
+/// cleanup to announce that digest-verification memoization cannot stick.
+static XATTR_SUPPORTED: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn set_xattr_supported(supported: bool) {
+    XATTR_SUPPORTED.store(supported, Ordering::Relaxed);
+}
+
+pub(crate) fn xattr_supported() -> bool {
+    XATTR_SUPPORTED.load(Ordering::Relaxed)
 }
 
 /// Marker returned by [`try_read_helper`] (and the typed wrappers in

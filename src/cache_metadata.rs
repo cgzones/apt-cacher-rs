@@ -431,17 +431,17 @@ mod tests {
 
         let key = fixture_key();
         let first = store.resolve(&key, &file, &path);
+        // Skip entirely on filesystems that reject xattr writes (the prior
+        // `write_etag` would have silently been a no-op).
+        if first.etag.is_none() && first.last_modified.is_none() {
+            return;
+        }
         assert_eq!(first.etag.as_deref(), Some("\"abc\""));
         assert!(first.last_modified.is_some());
         assert_eq!(store.len(), 1);
 
         // Mutate the file's xattr to confirm the second resolve returns the
-        // cached value, not a fresh disk read.  We also skip the assertion
-        // entirely on filesystems that reject xattr writes (the prior
-        // `write_etag` would have silently been a no-op).
-        if first.etag.is_none() && first.last_modified.is_none() {
-            return;
-        }
+        // cached value, not a fresh disk read.
         write_etag(&file, &path, "\"xyz\"");
         let second = store.resolve(&key, &file, &path);
         assert_eq!(second.etag.as_deref(), Some("\"abc\""));

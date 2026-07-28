@@ -27,7 +27,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     AppState, config::CacheHost, database::resolved_cache_host, error::ProxyCacheError,
     global_cache_quota, global_config, humanfmt::HumanFmt, metrics,
-    task_cache_scan::task_cache_scan,
+    task_cache_scan::task_cache_scan, xattr_helpers,
 };
 
 /// Delay between daemon startup and the first scheduled cleanup run.
@@ -89,6 +89,12 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
     let config = global_config();
 
     let start = Instant::now();
+
+    if !xattr_helpers::xattr_supported() {
+        info!(
+            "No extended attribute support on the cache filesystem, digest verification cannot be memoized - re-hashing all files"
+        );
+    }
 
     if let Err(err) = appstate.database.cleanup_invalid_rows().await {
         metrics::DB_OPERATION_FAILED.increment();
