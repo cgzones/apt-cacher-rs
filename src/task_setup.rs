@@ -1,5 +1,8 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
@@ -21,6 +24,11 @@ pub(crate) enum SetupError {
     NotADirectory(PathBuf),
     #[error("No file modification timestamp (mtime) support")]
     NoMtimeSupport(#[source] std::io::Error),
+    #[error(
+        "Cache directory `{}` is already in use by another apt-cacher-rs instance{holder}",
+        path.display()
+    )]
+    LockInUse { path: PathBuf, holder: String },
 }
 
 impl SetupError {
@@ -30,6 +38,56 @@ impl SetupError {
             path: path.to_path_buf(),
             source,
         }
+    }
+}
+
+/// Name of the instance lock file at the cache-directory root. Unlike the
+/// healthcheck probe it persists for the process lifetime, so the cache
+/// scan skips it alongside `healthcheck::PROBE_FILENAME`.
+pub(crate) const LOCK_FILENAME: &str = ".apt-cacher-rs.lock";
+
+/// Take an exclusive advisory `flock(2)` on the cache-directory lock file,
+/// refusing startup when another instance holds it: a second instance
+/// sharing the cache would purge `tmp/` under live downloads, double-count
+/// the quota, and run cleanup against files the other is serving.
+fn lock_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupError> {
+    let lock_path = cache_path.join(LOCK_FILENAME);
+    // `.create(true)` so the lock file from a previous run is reused.
+    let file = nofollow_options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(SetupError::io("open lock file", &lock_path))?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            // Best-effort PID stamp for operator diagnostics.
+            let stamp = lock
+                .set_len(0)
+                .and_then(|()| writeln!(&*lock, "{}", std::process::id()));
+            if let Err(err) = stamp {
+                debug!(
+                    "Failed to stamp lock file `{}`:  {err}",
+                    lock_path.display()
+                );
+            }
+            Ok(lock)
+        }
+        Err((mut file, errno)) if errno == Errno::EWOULDBLOCK => {
+            use std::io::Read as _;
+            let mut buf = [0u8; 32];
+            let holder = file
+                .read(&mut buf)
+                .ok()
+                .and_then(|n| std::str::from_utf8(&buf[..n]).ok())
+                .and_then(|content| content.trim().parse::<u32>().ok())
+                .map_or_else(String::new, |pid| format!(" (process {pid})"));
+            Err(SetupError::LockInUse {
+                path: cache_path.to_path_buf(),
+                holder,
+            })
+        }
+        Err((_file, errno)) => Err(SetupError::io("lock", &lock_path)(errno.into())),
     }
 }
 
@@ -59,7 +117,7 @@ fn remove_dir_contents(path: &Path) -> Result<(), SetupError> {
     Ok(())
 }
 
-pub(crate) fn task_setup() -> Result<(), SetupError> {
+pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
     let cache_path = &global_config().cache_directory;
 
     std::fs::create_dir_all(cache_path).map_err(SetupError::io("create directory", cache_path))?;
@@ -70,6 +128,10 @@ pub(crate) fn task_setup() -> Result<(), SetupError> {
     if !mdata.file_type().is_dir() {
         return Err(SetupError::NotADirectory(cache_path.clone()));
     }
+
+    // Locked before anything below mutates the cache (the xattr probe write,
+    // the `tmp/` purge — destructive to a live instance's partial downloads).
+    let cache_lock = lock_cache_dir(cache_path)?;
     mdata.modified().map_err(SetupError::NoMtimeSupport)?;
     if let Err(err) = mdata.created() {
         info!(
@@ -133,5 +195,31 @@ pub(crate) fn task_setup() -> Result<(), SetupError> {
 
     remove_dir_contents(&cache_tmp_path)?;
 
-    Ok(())
+    Ok(cache_lock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_dir_lock_excludes_second_instance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = lock_cache_dir(tmp.path()).expect("first lock");
+        let err = lock_cache_dir(tmp.path()).expect_err("second lock must fail");
+        assert!(
+            err.to_string().contains("already in use"),
+            "unexpected error: {err}"
+        );
+        drop(first);
+        let _relock = lock_cache_dir(tmp.path()).expect("relock after release");
+    }
+
+    #[test]
+    fn cache_dir_lock_stamps_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _lock = lock_cache_dir(tmp.path()).expect("lock");
+        let content = std::fs::read_to_string(tmp.path().join(LOCK_FILENAME)).expect("read");
+        assert_eq!(content.trim().parse::<u32>().ok(), Some(std::process::id()));
+    }
 }
