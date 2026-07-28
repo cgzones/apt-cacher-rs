@@ -6,7 +6,10 @@ use nix::fcntl::{Flock, FlockArg};
 use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
-use crate::{cache_layout::SUBDIR_TMP, global_config, utils::nofollow_options};
+use crate::{
+    cache_layout::SUBDIR_TMP, global_config, utils::nofollow_options,
+    xattr_helpers::set_xattr_supported,
+};
 
 /// Failure while preparing the cache directory at startup.
 ///
@@ -181,9 +184,11 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
                     "Extended attribute support test failed on `{}`: got {val:?}, expected `probe`",
                     xattr_probe_path.display()
                 );
+                set_xattr_supported(false);
             }
             Err(err) => {
                 warn!("No extended file attribute support, ETags unavailable:  {err}");
+                set_xattr_supported(false);
             }
         }
     }
