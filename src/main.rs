@@ -980,7 +980,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         global_config().cache_directory.display()
     );
 
-    task_setup::task_setup().inspect_err(|err| {
+    let _cache_lock = task_setup::task_setup().inspect_err(|err| {
         error!("Error during setup:  {err}");
     })?;
 

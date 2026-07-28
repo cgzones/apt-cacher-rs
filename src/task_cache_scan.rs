@@ -9,7 +9,7 @@ use crate::{
     database::{Database, MirrorEntry},
     deb_mirror::{MirrorKind, is_deb_package, is_strict_path_descendant},
     error::ProxyCacheError,
-    global_config, healthcheck, metrics,
+    global_config, healthcheck, metrics, task_setup,
     utils::probe_dir,
 };
 
@@ -117,8 +117,12 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
             }
             Ok(mdata) if mdata.is_file() => {
                 // The healthcheck probe is created and unlinked at the
-                // cache root; a scan racing that window must not flag it.
-                if entry.file_name() == healthcheck::PROBE_FILENAME {
+                // cache root (a scan racing that window must not flag it),
+                // and the instance lock file lives there for the whole
+                // process lifetime.
+                if entry.file_name() == healthcheck::PROBE_FILENAME
+                    || entry.file_name() == task_setup::LOCK_FILENAME
+                {
                     continue;
                 }
                 // A regular file at the cache root is an operator
