@@ -1,10 +1,11 @@
 //! Readiness checks backing the `GET /healthcheck` web-interface endpoint.
 //!
-//! Three checks: a `Ping` round-trip through the bounded DB channel, a
-//! create-write-unlink probe at the cache-directory root, and disk-quota
-//! headroom. Results are memoized for one second with single-flight
-//! semantics so probe spam cannot amplify disk writes or DB-channel
-//! traffic (see `cached_health_report`).
+//! Four checks: a `Ping` round-trip through the bounded DB channel, a
+//! create-write-unlink probe at the cache-directory root, disk-quota
+//! headroom, and free disk space on the cache filesystem. Results are
+//! memoized for one second with single-flight semantics so probe spam
+//! cannot amplify disk writes or DB-channel traffic (see
+//! `cached_health_report`).
 
 use std::num::NonZero;
 use std::path::Path;
@@ -19,7 +20,7 @@ use crate::{
     database_task::{DatabaseCommand, DbCmdPing, send_db_command},
     error::ErrorReport,
     global_cache_quota, global_config, swrite,
-    utils::tokio_nofollow_options,
+    utils::{free_disk_space, tokio_nofollow_options},
     warn_once_or_info,
 };
 
@@ -63,6 +64,7 @@ pub(crate) struct HealthReport {
     database: CheckResult,
     cache_write: CheckResult,
     quota: CheckResult,
+    disk_free: CheckResult,
 }
 
 impl HealthReport {
@@ -72,8 +74,9 @@ impl HealthReport {
             database,
             cache_write,
             quota,
+            disk_free,
         } = self;
-        database.ok() && cache_write.ok() && quota.ok()
+        database.ok() && cache_write.ok() && quota.ok() && disk_free.ok()
     }
 
     #[must_use]
@@ -82,6 +85,7 @@ impl HealthReport {
             database,
             cache_write,
             quota,
+            disk_free,
         } = self;
         let mut out = String::with_capacity(128);
         out.push_str("{\"status\":\"");
@@ -96,6 +100,8 @@ impl HealthReport {
         cache_write.write_json(&mut out);
         out.push_str(",\"quota\":");
         quota.write_json(&mut out);
+        out.push_str(",\"disk_free\":");
+        disk_free.write_json(&mut out);
         out.push_str("}}");
         out
     }
@@ -127,6 +133,36 @@ fn check_quota(current_size: u64, limit: Option<NonZero<u64>>) -> CheckResult {
         Some(quota) => CheckResult::Fail(format!(
             "disk quota exhausted: cache size {current_size} of {quota} bytes"
         )),
+    }
+}
+
+/// Free-disk-space headroom on the cache filesystem: healthy when no
+/// minimum is configured or the available space is at or above it. Unlike
+/// the quota check this also fires on default installs — a full disk breaks
+/// every new download regardless of quota configuration. `free = None`
+/// (statvfs failed) fails the check: a healthcheck that cannot measure a
+/// required signal must not claim health.
+fn check_disk_free(free: Option<u64>, min_free: NonZero<u64>) -> CheckResult {
+    match free {
+        Some(free) if free >= min_free.get() => CheckResult::Pass,
+        Some(free) => CheckResult::Fail(format!(
+            "low disk space: {free} bytes free, minimum {min_free} bytes"
+        )),
+        None => CheckResult::Fail(String::from("could not determine free disk space")),
+    }
+}
+
+/// Probe wrapper for [`check_disk_free`]: skips the statvfs entirely when
+/// no minimum is configured, and bounds the (blocking-pool) statvfs with
+/// [`CHECK_TIMEOUT`] like the other probes.
+async fn probe_disk_free(cache_dir: &Path, min_free: Option<NonZero<u64>>) -> CheckResult {
+    let Some(min_free) = min_free else {
+        return CheckResult::Pass;
+    };
+
+    match tokio::time::timeout(CHECK_TIMEOUT, free_disk_space(cache_dir)).await {
+        Ok(free) => check_disk_free(free, min_free),
+        Err(_elapsed) => CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
     }
 }
 
@@ -200,13 +236,22 @@ const CACHE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1);
 
 /// Run all readiness checks concurrently; wall-clock is bounded by the
 /// slowest single check timeout, not the sum.
-async fn run_healthcheck(quota: &CacheQuota, cache_dir: &Path) -> HealthReport {
-    let (database, cache_write) = tokio::join!(check_database(), check_cache_write(cache_dir));
+async fn run_healthcheck(
+    quota: &CacheQuota,
+    cache_dir: &Path,
+    min_disk_free: Option<NonZero<u64>>,
+) -> HealthReport {
+    let (database, cache_write, disk_free) = tokio::join!(
+        check_database(),
+        check_cache_write(cache_dir),
+        probe_disk_free(cache_dir, min_disk_free)
+    );
     let quota = check_quota(quota.current_size(), quota.quota_limit());
     HealthReport {
         database,
         cache_write,
         quota,
+        disk_free,
     }
 }
 
@@ -225,7 +270,13 @@ pub(crate) async fn cached_health_report() -> HealthReport {
     {
         return report.clone();
     }
-    let report = run_healthcheck(global_cache_quota(), &global_config().cache_directory).await;
+    let config = global_config();
+    let report = run_healthcheck(
+        global_cache_quota(),
+        &config.cache_directory,
+        config.min_disk_free,
+    )
+    .await;
     if !report.healthy() {
         warn_once_or_info!("Health check failing: {}", report.to_json());
     }
@@ -262,6 +313,50 @@ mod tests {
     #[test]
     fn quota_above_limit_fails() {
         assert!(!check_quota(101, Some(nonzero!(100_u64))).ok());
+    }
+
+    #[test]
+    fn disk_free_at_or_above_minimum_passes() {
+        assert_eq!(
+            check_disk_free(Some(100), nonzero!(100_u64)),
+            CheckResult::Pass
+        );
+        assert_eq!(
+            check_disk_free(Some(101), nonzero!(100_u64)),
+            CheckResult::Pass
+        );
+    }
+
+    #[test]
+    fn disk_free_below_minimum_fails() {
+        assert_eq!(
+            check_disk_free(Some(99), nonzero!(100_u64)),
+            CheckResult::Fail(String::from(
+                "low disk space: 99 bytes free, minimum 100 bytes"
+            ))
+        );
+    }
+
+    #[test]
+    fn disk_free_unknown_fails() {
+        assert_eq!(
+            check_disk_free(None, nonzero!(100_u64)),
+            CheckResult::Fail(String::from("could not determine free disk space"))
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_free_probe_uses_real_statvfs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 1 byte of required headroom passes on any writable filesystem.
+        let r = probe_disk_free(dir.path(), Some(nonzero!(1_u64))).await;
+        assert_eq!(r, CheckResult::Pass);
+        // A missing directory must fail the probe, not silently pass.
+        let r = probe_disk_free(&dir.path().join("nonexistent"), Some(nonzero!(1_u64))).await;
+        assert_eq!(
+            r,
+            CheckResult::Fail(String::from("could not determine free disk space"))
+        );
     }
 
     #[test]
@@ -320,12 +415,14 @@ mod tests {
             database: CheckResult::Pass,
             cache_write: CheckResult::Pass,
             quota: CheckResult::Pass,
+            disk_free: CheckResult::Pass,
         };
         assert!(report.healthy());
         assert_eq!(
             report.to_json(),
             "{\"status\":\"healthy\",\"checks\":{\"database\":{\"ok\":true},\
-             \"cache_write\":{\"ok\":true},\"quota\":{\"ok\":true}}}"
+             \"cache_write\":{\"ok\":true},\"quota\":{\"ok\":true},\
+             \"disk_free\":{\"ok\":true}}}"
         );
     }
 
@@ -335,13 +432,14 @@ mod tests {
             database: CheckResult::Pass,
             cache_write: CheckResult::Fail(String::from("boom \"quoted\"")),
             quota: CheckResult::Pass,
+            disk_free: CheckResult::Pass,
         };
         assert!(!report.healthy());
         assert_eq!(
             report.to_json(),
             "{\"status\":\"unhealthy\",\"checks\":{\"database\":{\"ok\":true},\
              \"cache_write\":{\"ok\":false,\"detail\":\"boom \\\"quoted\\\"\"},\
-             \"quota\":{\"ok\":true}}}"
+             \"quota\":{\"ok\":true},\"disk_free\":{\"ok\":true}}}"
         );
     }
 }

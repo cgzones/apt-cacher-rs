@@ -74,6 +74,27 @@ pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
     )
 }
 
+/// Free disk space (in bytes) available to unprivileged processes on the
+/// filesystem holding `path`, via `statvfs(3)`. Returns `None` when the probe
+/// fails (logged once at warn, then debug) or the byte count overflows.
+/// statvfs can stall on slow/hung filesystems (NFS, FUSE, dying disks); it
+/// runs on the blocking pool so it cannot wedge the tokio worker. Used by the
+/// `/healthcheck` disk-space check.
+pub(crate) async fn free_disk_space(path: &Path) -> Option<u64> {
+    let owned = path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(&owned))
+        .await
+        .expect("task should not panic");
+
+    let stat = result
+        .inspect_err(|err| {
+            warn_once_or_debug!("statvfs({}) failed:  {err}", path.display());
+        })
+        .ok();
+
+    stat.and_then(|s| s.blocks_available().checked_mul(s.fragment_size()))
+}
+
 /// Probe whether `path` is a real directory.
 ///
 /// Uses `symlink_metadata` (lstat semantics) so a hostile symlink cannot

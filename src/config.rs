@@ -50,6 +50,7 @@ const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
 const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 KiB
 const DEFAULT_DATABASE_SLOW_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_DISK_QUOTA: Option<NonZero<u64>> = None;
+const DEFAULT_MIN_DISK_FREE: Option<NonZero<u64>> = Some(nonzero!(512 * 1024 * 1024)); // 512 MiB
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 const DEFAULT_UPSTREAM_RETRY_BUDGET: Duration = Duration::from_secs(30);
@@ -717,6 +718,16 @@ pub(crate) struct Config {
     )]
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
+    /// Minimum free disk space (in bytes) on the cache filesystem for the
+    /// `/healthcheck` endpoint to report healthy. Also intended as the
+    /// headroom floor for future serve-path disk-space gating. `None`
+    /// (config value `0`) disables the check.
+    #[serde(
+        default = "default_min_disk_free",
+        deserialize_with = "from_nonzero_u64_with_magnitude"
+    )]
+    pub(crate) min_disk_free: Option<NonZero<u64>>,
+
     /// Maximum size (in bytes) of a single upstream object that will be
     /// downloaded and cached. An upstream response declaring a larger
     /// Content-Length is rejected with 502 Bad Gateway before any bytes are
@@ -1129,6 +1140,10 @@ const fn default_http_only_mirrors() -> Vec<ConfigDomainName> {
 
 const fn default_disk_quota() -> Option<NonZero<u64>> {
     DEFAULT_DISK_QUOTA
+}
+
+const fn default_min_disk_free() -> Option<NonZero<u64>> {
+    DEFAULT_MIN_DISK_FREE
 }
 
 const fn default_https_tunnel_enabled() -> bool {
