@@ -5842,7 +5842,18 @@ async fn splice_proxy_drive(
         // later observes the broken client connection, it will continue via
         // its disconnect/cache-only handling instead of dropping these prefix
         // bytes from the cache entirely.
-        tempfile.write_all(body_prefix).await.map_err(|err| {
+        // `tokio::fs::File::write_all` only queues the write on the blocking
+        // pool; the follow-up `flush` waits for it, so a failure (e.g. disk
+        // full) surfaces HERE at the classified site. Without it the error
+        // stays parked in the file handle -- `sync_all` below never reports a
+        // deferred write error -- and a truncated file would be renamed in as
+        // a success. Flushing before the splice loop also keeps the queued
+        // write from racing the loop's raw `splice(2)` appends to the same fd.
+        let write_res = match tempfile.write_all(body_prefix).await {
+            Ok(()) => tempfile.flush().await,
+            Err(err) => Err(err),
+        };
+        write_res.map_err(|err| {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
@@ -5898,7 +5909,13 @@ async fn splice_proxy_drive(
         // the upstream sends fast enough that the entire body lands inside
         // the kTLS handshake drain, ktls_extra_body holds the full file —
         // dropping it on a disconnected client would lose everything.
-        tempfile.write_all(&ktls_extra_body).await.map_err(|err| {
+        // Flush for the same deferred-write-error reason as the body_prefix
+        // branch above.
+        let write_res = match tempfile.write_all(&ktls_extra_body).await {
+            Ok(()) => tempfile.flush().await,
+            Err(err) => Err(err),
+        };
+        write_res.map_err(|err| {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
@@ -7154,7 +7171,15 @@ async fn handle_volatile_buffered_download(
     // already-downloaded body (late joiners and future requests keep it).
 
     // Write the full body to the cache temp file (best-effort).
-    let cache_write_ok = match tempfile.write_all(&body).await {
+    // `tokio::fs::File::write_all` only queues the write on the blocking
+    // pool; the follow-up `flush` waits for it, so a failure (e.g. disk full)
+    // surfaces here -- `sync_all` below never reports a deferred write error,
+    // and without the flush a truncated file would be committed as a success.
+    let write_res = match tempfile.write_all(&body).await {
+        Ok(()) => tempfile.flush().await,
+        Err(err) => Err(err),
+    };
+    let cache_write_ok = match write_res {
         Ok(()) => true,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
