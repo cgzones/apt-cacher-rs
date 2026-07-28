@@ -439,6 +439,7 @@ pub(crate) async fn db_loop(
                     flush_batches(&database, &mut buf, FlushReason::ByTime).await;
                 }
                 flush_last_seen(&database, &mut cache).await;
+                debug!("db batch: periodic flush cycle complete");
             }
             maybe = db_thread_rx.recv() => {
                 let Some(cmd) = maybe else {

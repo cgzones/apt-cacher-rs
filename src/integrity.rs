@@ -681,6 +681,8 @@ fn spawn_ingest(plan: &RenamePlan) {
                 dest.display(),
                 ErrorReport(&err),
             );
+        } else {
+            debug!("Index ingestion completed for `{}`", dest.display());
         }
     });
 }
