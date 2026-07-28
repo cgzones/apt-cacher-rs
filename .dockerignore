@@ -1,6 +1,10 @@
-/.git/
-/.github/
-/apt-cacher-rs.db
-/cache/
-/debian/
-/target/
+# Allow-list: excluding everything first keeps new repo-root files (docs, dev
+# tooling, local databases and their WAL sidecars) out of the build context
+# automatically, instead of needing an entry here before they invalidate layers.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+# Compile-time inputs: sqlx::migrate!() embeds migrations/, query macros read .sqlx/.
+!migrations/
+!.sqlx/
