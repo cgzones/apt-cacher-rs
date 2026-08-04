@@ -2,6 +2,7 @@ name: Audit Dependencies
 
 on:
   push:
+    branches: [main]
     paths:
       - ".github/workflows/audit.yml"
       - "**/audit.toml"
@@ -28,5 +29,5 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/audit@v1
-        name: Audit Rust Dependencies
+      - name: Audit Rust Dependencies
+        uses: actions-rust-lang/audit@v1

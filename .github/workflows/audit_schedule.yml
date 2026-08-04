@@ -2,6 +2,7 @@ name: Audit Dependencies (Scheduled)
 on:
   schedule:
     - cron: "0 0 * * 1"
+  workflow_dispatch:
 
 jobs:
   audit:
@@ -13,5 +14,5 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/audit@v1
-        name: Audit Rust Dependencies
+      - name: Audit Rust Dependencies
+        uses: actions-rust-lang/audit@v1
