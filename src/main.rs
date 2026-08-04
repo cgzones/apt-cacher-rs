@@ -800,7 +800,21 @@ fn init_splice_tls_client_config(tls_config: rustls::ClientConfig) {
         .expect("function should only be called once");
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+#[expect(clippy::print_stderr, reason = "logging may not be set up yet")]
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            // Not `error!`: a failure before logging is initialised (config
+            // load) would otherwise be swallowed entirely.  `ErrorReport`
+            // walks `source()`, which the default `Debug` print would not.
+            eprintln!("Error: {}", error::ErrorReport(&*err));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sync>> {
     let mut args = Cli::parse();
 
     let is_run_as_root = nix::unistd::geteuid().is_root();
@@ -808,7 +822,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[expect(clippy::print_stderr, reason = "print to stderr before log setup")]
     if is_run_as_root && !args.permit_running_daemon_as_root {
         eprintln!("Running as root is not recommended and not permitted by default");
-        std::process::exit(1);
+        return Ok(std::process::ExitCode::FAILURE);
     }
 
     tracing_log::LogTracer::init()?;
@@ -886,11 +900,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "Failed to open log file `{}`:  {err}; symlinks are not supported",
                         path.display()
                     );
-                    std::process::exit(1);
+                    return Ok(std::process::ExitCode::FAILURE);
                 }
                 Err(err) => {
                     eprintln!("Failed to open log file `{}`:  {err}", path.display());
-                    std::process::exit(1);
+                    return Ok(std::process::ExitCode::FAILURE);
                 }
             };
             OUTPUT_LOG_FILE
@@ -1046,7 +1060,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Stopped.");
     }
 
-    runtime.block_on(async { main_loop::main_loop(https_client).await })
+    runtime
+        .block_on(async { main_loop::main_loop(https_client).await })
+        .map(|()| std::process::ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

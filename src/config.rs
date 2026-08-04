@@ -8,7 +8,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, anyhow, bail};
 use http::StatusCode;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer};
@@ -16,6 +15,31 @@ use tracing::level_filters::LevelFilter;
 
 use crate::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::nonzero;
+
+/// Failure while loading or validating the configuration.
+///
+/// `Display` renders this error only; the underlying cause hangs off
+/// [`std::error::Error::source`], so log it via [`crate::error::ErrorReport`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConfigError {
+    #[error("Failed to read file `{}`", path.display())]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Failed to parse configuration")]
+    Parse(#[source] toml::de::Error),
+    /// A cross-field validation rule rejected the configuration.
+    #[error("{0}")]
+    Invalid(String),
+}
+
+/// `return`s a [`ConfigError::Invalid`] built from the given format arguments.
+macro_rules! invalid {
+    ($($arg:tt)*) => {
+        return Err(ConfigError::Invalid(format!($($arg)*)))
+    };
+}
 
 const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
 pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = "/etc/apt-cacher-rs/apt-cacher-rs.conf";
@@ -139,9 +163,7 @@ impl<'de> Deserialize<'de> for ConfigDomainName {
         use serde::de::Error as _;
         let s: String = Deserialize::deserialize(deserializer)?;
 
-        Self::new(s)
-            .map_err(|s| anyhow!("Invalid configuration domain `{s}`"))
-            .map_err(D::Error::custom)
+        Self::new(s).map_err(|s| D::Error::custom(format!("Invalid configuration domain `{s}`")))
     }
 }
 
@@ -277,9 +299,7 @@ impl<'de> Deserialize<'de> for DomainName {
         use serde::de::Error as _;
         let s: String = Deserialize::deserialize(deserializer)?;
 
-        Self::new(s)
-            .map_err(|s| anyhow!("Invalid domain `{s}`"))
-            .map_err(D::Error::custom)
+        Self::new(s).map_err(|s| D::Error::custom(format!("Invalid domain `{s}`")))
     }
 }
 
@@ -919,9 +939,25 @@ where
     parse_usize_with_magnitude(&s).map_err(D::Error::custom)
 }
 
+/// Failure while parsing a magnitude-suffixed size (`42 Gi`).
+///
+/// Reaches the user through `serde::de::Error::custom`, which only needs
+/// `Display`.
+#[derive(Debug, thiserror::Error)]
+enum MagnitudeError {
+    #[error("Could not split input")]
+    NoSplit,
+    #[error("Invalid number:  {0}")]
+    Number(#[from] std::num::ParseIntError),
+    #[error("Multiplication overflow")]
+    Overflow,
+    #[error("Invalid magnitude `{0}`, expected `k`, `Ki`, `M`, `Mi`, `G` or `Gi`")]
+    InvalidMagnitude(Box<str>),
+}
+
 macro_rules! impl_parse_with_magnitude {
     ($name:ident, $T:ty) => {
-        fn $name(s: &str) -> anyhow::Result<$T> {
+        fn $name(s: &str) -> Result<$T, MagnitudeError> {
             let s = s.trim();
 
             if let Ok(val) = s.parse::<$T>() {
@@ -929,7 +965,7 @@ macro_rules! impl_parse_with_magnitude {
             }
 
             let Some(x) = s.find(|c| !char::is_ascii_digit(&c)) else {
-                bail!("Could not split input");
+                return Err(MagnitudeError::NoSplit);
             };
 
             let (val, mag) = s.split_at(x);
@@ -937,27 +973,17 @@ macro_rules! impl_parse_with_magnitude {
             let val = val.parse::<$T>()?;
             let mag = mag.trim();
 
-            match mag {
-                "k" => val
-                    .checked_mul(1000)
-                    .ok_or_else(|| anyhow!("Multiplication overflow")),
-                "Ki" => val
-                    .checked_mul(1024)
-                    .ok_or_else(|| anyhow!("Multiplication overflow")),
-                "M" => val
-                    .checked_mul(1000 * 1000)
-                    .ok_or_else(|| anyhow!("Multiplication overflow")),
-                "Mi" => val
-                    .checked_mul(1024 * 1024)
-                    .ok_or_else(|| anyhow!("Multiplication overflow")),
-                "G" => val
-                    .checked_mul(1000 * 1000 * 1000)
-                    .ok_or_else(|| anyhow!("Multiplication overflow")),
-                "Gi" => val
-                    .checked_mul(1024 * 1024 * 1024)
-                    .ok_or_else(|| anyhow!("Multiplication overflow")),
-                _ => bail!("Invalid magnitude `{mag}`, expected `k`, `Ki`, `M`, `Mi`, `G` or `Gi`"),
-            }
+            let factor: $T = match mag {
+                "k" => 1000,
+                "Ki" => 1024,
+                "M" => 1000 * 1000,
+                "Mi" => 1024 * 1024,
+                "G" => 1000 * 1000 * 1000,
+                "Gi" => 1024 * 1024 * 1024,
+                _ => return Err(MagnitudeError::InvalidMagnitude(mag.into())),
+            };
+
+            val.checked_mul(factor).ok_or(MagnitudeError::Overflow)
         }
     };
 }
@@ -1349,10 +1375,10 @@ impl Config {
         file: &Path,
         cache_directory: Option<PathBuf>,
         database_path: Option<PathBuf>,
-    ) -> anyhow::Result<(Self, bool, Vec<String>)> {
+    ) -> Result<(Self, bool, Vec<String>), ConfigError> {
         let (mut config, fallback) = match std::fs::read_to_string(file) {
             Ok(content) => (
-                toml::from_str::<Self>(&content).context("Failed to parse configuration")?,
+                toml::from_str::<Self>(&content).map_err(ConfigError::Parse)?,
                 false,
             ),
             Err(err)
@@ -1365,8 +1391,10 @@ impl Config {
                 )
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("Failed to read file `{}`", file.display()));
+                return Err(ConfigError::Read {
+                    path: file.to_path_buf(),
+                    source: err,
+                });
             }
         };
 
@@ -1382,13 +1410,13 @@ impl Config {
         Ok((config, fallback, warnings))
     }
 
-    fn validate(&mut self) -> anyhow::Result<Vec<String>> {
+    fn validate(&mut self) -> Result<Vec<String>, ConfigError> {
         let mut warnings: Vec<String> = Vec::new();
         // TODO: check bind_addr.is_documentation() once stable: https://github.com/rust-lang/rust/issues/27709
 
         if let LogDestination::File(ref path) = self.log_file {
             if path.as_os_str().is_empty() {
-                bail!("Invalid log_file value: must not be empty");
+                invalid!("Invalid log_file value: must not be empty");
             }
 
             if !path.is_absolute() {
@@ -1402,7 +1430,7 @@ impl Config {
         if self.database_slow_timeout < Duration::from_secs(1)
             || self.database_slow_timeout > Duration::from_mins(1)
         {
-            bail!(
+            invalid!(
                 "Invalid database_slow_timeout value of {}s: must be between 1s and 60s",
                 self.database_slow_timeout.as_secs_f32()
             );
@@ -1410,7 +1438,7 @@ impl Config {
 
         if self.http_timeout < Duration::from_secs(1) || self.http_timeout > Duration::from_mins(6)
         {
-            bail!(
+            invalid!(
                 "Invalid http_timeout value of {}s: must be between 1s and 360s",
                 self.http_timeout.as_secs_f32()
             );
@@ -1419,7 +1447,7 @@ impl Config {
         if self.client_idle_timeout < Duration::from_secs(1)
             || self.client_idle_timeout > Duration::from_hours(1)
         {
-            bail!(
+            invalid!(
                 "Invalid client_idle_timeout value of {}s: must be between 1s and 3600s",
                 self.client_idle_timeout.as_secs_f32()
             );
@@ -1442,7 +1470,7 @@ impl Config {
         }
 
         if self.buffer_size < 1024 || self.buffer_size > 1024 * 1024 * 1024 {
-            bail!(
+            invalid!(
                 "Invalid buffer_size value of {}: must be between 1KiB and 1GiB",
                 self.buffer_size
             );
@@ -1466,7 +1494,7 @@ impl Config {
 
         if let Some(max_object_size) = self.max_object_size {
             if max_object_size < VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER {
-                bail!(
+                invalid!(
                     "Invalid max_object_size value of {max_object_size}: must be at least the volatile unknown content length upper bound of {VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER}"
                 )
             }
@@ -1500,7 +1528,7 @@ impl Config {
             .checked_mul(nonzero!(24 * 60 * 60))
             .is_none()
         {
-            bail!(
+            invalid!(
                 "Invalid byhash_retention_days value of {}: Overflow",
                 self.byhash_retention_days
             );
@@ -1516,28 +1544,28 @@ impl Config {
         if let Some(days) = self.usage_retention_days
             && days.checked_mul(nonzero!(24 * 60 * 60)).is_none()
         {
-            bail!(
+            invalid!(
                 "Invalid usage_retention_days value of {}: Overflow",
                 days.get()
             );
         }
 
         if self.db_channel_capacity > nonzero!(4096) {
-            bail!(
+            invalid!(
                 "Invalid db_channel_capacity value of {}: must be between 1 and 4096",
                 self.db_channel_capacity
             );
         }
 
         if self.db_batch_flush_max_count > nonzero!(4096) {
-            bail!(
+            invalid!(
                 "Invalid db_batch_flush_max_count value of {}: must be between 1 and 4096",
                 self.db_batch_flush_max_count
             );
         }
 
         if self.db_batch_flush_interval_secs > nonzero!(300) {
-            bail!(
+            invalid!(
                 "Invalid db_batch_flush_interval_secs value of {}: must be between 1 and 300",
                 self.db_batch_flush_interval_secs
             );
@@ -1564,7 +1592,7 @@ impl Config {
                             .is_ok()
                         || intersect(&ialias.aliases, &alias.aliases)
                 }) {
-                    bail!("Alias {} conflicts with alias {}", alias.main, falias.main);
+                    invalid!("Alias {} conflicts with alias {}", alias.main, falias.main);
                 }
             }
         }
@@ -1668,14 +1696,14 @@ impl Config {
         if self.min_download_rate.is_none()
             && self.rate_check_timeframe != default_rate_check_timeframe()
         {
-            bail!(
+            invalid!(
                 "rate_check_timeframe is set to {}s but min_download_rate is disabled",
                 self.rate_check_timeframe
             );
         }
 
         if self.rate_check_timeframe > nonzero!(360) {
-            bail!(
+            invalid!(
                 "Invalid rate_check_timeframe value of {}s: must be between 1s and 360s",
                 self.rate_check_timeframe
             );
@@ -1724,7 +1752,7 @@ impl Config {
             || self.experimental_parallel_hack_factor <= 0.0
             || self.experimental_parallel_hack_factor > 1.0
         {
-            bail!(
+            invalid!(
                 "Invalid experimental_parallel_hack_factor of {}: must be between 0 and 1",
                 self.experimental_parallel_hack_factor
             );
@@ -1733,7 +1761,7 @@ impl Config {
         if self.experimental_parallel_hack_retryafter < 1
             || self.experimental_parallel_hack_retryafter > 300
         {
-            bail!(
+            invalid!(
                 "Invalid experimental_parallel_hack_retryafter value of {}: must be between 1 and 300",
                 self.experimental_parallel_hack_retryafter
             );
@@ -1788,7 +1816,7 @@ impl Config {
         }
 
         if self.cache_directory.as_os_str().is_empty() {
-            bail!("Invalid cache_directory value: must not be empty");
+            invalid!("Invalid cache_directory value: must not be empty");
         }
 
         if !self.cache_directory.is_absolute() {
@@ -1799,7 +1827,7 @@ impl Config {
         }
 
         if self.database_path.as_os_str().is_empty() {
-            bail!("Invalid database_path value: must not be empty");
+            invalid!("Invalid database_path value: must not be empty");
         }
 
         if !self.database_path.is_absolute() {
