@@ -1,52 +1,76 @@
-use anyhow::Context as _;
+use std::path::{Path, PathBuf};
+
 use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
 use crate::{cache_layout::SUBDIR_TMP, global_config, utils::nofollow_options};
 
-fn remove_dir_contents<P: AsRef<std::path::Path>>(path: P) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(path)? {
-        let entry_path = entry?.path();
+/// Failure while preparing the cache directory at startup.
+///
+/// `Display` renders this error only; the underlying cause hangs off
+/// [`std::error::Error::source`], so log it via [`crate::error::ErrorReport`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SetupError {
+    #[error("Failed to {action} `{}`", path.display())]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("Cache directory `{}` is not a directory", .0.display())]
+    NotADirectory(PathBuf),
+    #[error("No file modification timestamp (mtime) support")]
+    NoMtimeSupport(#[source] std::io::Error),
+}
+
+impl SetupError {
+    fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> Self {
+        move |source| Self::Io {
+            action,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+fn remove_dir_contents(path: &Path) -> Result<(), SetupError> {
+    for entry in std::fs::read_dir(path).map_err(SetupError::io("read directory", path))? {
+        let entry_path = entry
+            .map_err(SetupError::io("read directory", path))?
+            .path();
         let file_type = std::fs::symlink_metadata(&entry_path)
-            .with_context(|| format!("Failed to stat entry `{}`", entry_path.display()))?
+            .map_err(SetupError::io("stat entry", &entry_path))?
             .file_type();
 
         if file_type.is_dir() {
             debug!("Removing directory `{}`", entry_path.display());
-            std::fs::remove_dir_all(&entry_path).with_context(|| {
-                format!("Failed to remove directory `{}`", entry_path.display())
-            })?;
+            std::fs::remove_dir_all(&entry_path)
+                .map_err(SetupError::io("remove directory", &entry_path))?;
         } else if file_type.is_symlink() {
             debug!("Removing symlink `{}`", entry_path.display());
             std::fs::remove_file(&entry_path)
-                .with_context(|| format!("Failed to remove symlink `{}`", entry_path.display()))?;
+                .map_err(SetupError::io("remove symlink", &entry_path))?;
         } else {
             debug!("Removing file `{}`", entry_path.display());
             std::fs::remove_file(&entry_path)
-                .with_context(|| format!("Failed to remove file `{}`", entry_path.display()))?;
+                .map_err(SetupError::io("remove file", &entry_path))?;
         }
     }
     Ok(())
 }
 
-pub(crate) fn task_setup() -> anyhow::Result<()> {
+pub(crate) fn task_setup() -> Result<(), SetupError> {
     let cache_path = &global_config().cache_directory;
 
-    std::fs::create_dir_all(cache_path)
-        .with_context(|| format!("Failed to create directory `{}`", cache_path.display()))?;
+    std::fs::create_dir_all(cache_path).map_err(SetupError::io("create directory", cache_path))?;
 
     // Check for creation and modification timestamp support
-    let mdata = std::fs::metadata(cache_path)
-        .with_context(|| format!("Failed to inspect directory `{}`", cache_path.display()))?;
+    let mdata =
+        std::fs::metadata(cache_path).map_err(SetupError::io("inspect directory", cache_path))?;
     if !mdata.file_type().is_dir() {
-        anyhow::bail!(
-            "Cache directory `{}` is not a directory",
-            cache_path.display()
-        );
+        return Err(SetupError::NotADirectory(cache_path.clone()));
     }
-    mdata
-        .modified()
-        .context("No file modification timestamp (mtime) support")?;
+    mdata.modified().map_err(SetupError::NoMtimeSupport)?;
     if let Err(err) = mdata.created() {
         info!(
             "No file creation timestamp (btime) support, volatile file caching is limited:  {err}"
@@ -70,12 +94,10 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
             .create(true)
             .truncate(true)
             .open(&xattr_probe_path)
-            .with_context(|| {
-                format!(
-                    "Failed to create extended attribute probe file `{}`",
-                    xattr_probe_path.display()
-                )
-            })?;
+            .map_err(SetupError::io(
+                "create extended attribute probe file",
+                &xattr_probe_path,
+            ))?;
 
         let xattr_result = xattr_probe_file
             .set_xattr(XATTR_PROBE, XATTR_PROBE_VALUE)
@@ -107,14 +129,9 @@ pub(crate) fn task_setup() -> anyhow::Result<()> {
     let cache_tmp_path = cache_path.join(SUBDIR_TMP);
 
     std::fs::create_dir_all(&cache_tmp_path)
-        .with_context(|| format!("Failed to create directory `{}`", cache_tmp_path.display()))?;
+        .map_err(SetupError::io("create directory", &cache_tmp_path))?;
 
-    remove_dir_contents(&cache_tmp_path).with_context(|| {
-        format!(
-            "Failed to empty out temporary directory `{}`",
-            cache_tmp_path.display()
-        )
-    })?;
+    remove_dir_contents(&cache_tmp_path)?;
 
     Ok(())
 }

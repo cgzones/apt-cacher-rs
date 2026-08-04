@@ -103,20 +103,19 @@ impl From<hyper::Error> for Box<ProxyCacheError> {
 #[must_use]
 pub(crate) struct ErrorReport<'a, E>(pub(crate) &'a E)
 where
-    E: std::error::Error;
+    E: ?Sized + std::error::Error;
 
 impl<E> Display for ErrorReport<'_, E>
 where
-    E: std::error::Error,
+    E: ?Sized + std::error::Error,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)?;
 
-        let mut cause: &dyn std::error::Error = self.0;
-
-        while let Some(c) = cause.source() {
+        let mut cause = self.0.source();
+        while let Some(c) = cause {
             write!(f, ":  {c}")?;
-            cause = c;
+            cause = c.source();
         }
 
         Ok(())
