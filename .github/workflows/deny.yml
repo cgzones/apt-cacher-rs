@@ -2,6 +2,7 @@ name: Dependency Linting
 
 on:
   push:
+    branches: [main]
     paths:
       - ".github/workflows/deny.yml"
       - "**/Cargo.toml"

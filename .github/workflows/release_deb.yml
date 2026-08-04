@@ -19,15 +19,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Setup Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
         with:
           toolchain: stable
 
       - name: Install cargo-deb
-        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2.85.4
         with:
           tool: cargo-deb
 
@@ -41,7 +41,8 @@ jobs:
       - name: Add md5sums control file
         run: |
           set -euo pipefail
-          deb=$(ls target/debian/*.deb)
+          set -- target/debian/*.deb
+          deb=$1
           tmp=$(mktemp -d)
           dpkg-deb -R "$deb" "$tmp"
           (cd "$tmp" && find . -type f ! -path './DEBIAN/*' -printf '%P\0' \
@@ -59,7 +60,7 @@ jobs:
                   --tag-display-limit 0 --color auto target/debian/*.deb
 
       - name: Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           draft: true
           files: target/debian/*.deb

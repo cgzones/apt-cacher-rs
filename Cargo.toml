@@ -11,6 +11,7 @@ categories = ["caching"]
 edition = "2024"
 exclude = [
     ".cargo/",
+    ".codespellrc",
     ".dockerignore",
     ".env",
     ".github/",

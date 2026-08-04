@@ -1,0 +1,3 @@
+[codespell]
+ignore-words-list = crate,ment,te,thik,uptodate,ue
+skip = ./.git,./target,./cache,./Cargo.lock,*.db

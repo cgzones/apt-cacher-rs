@@ -9,20 +9,29 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    permissions:
-      contents: read
-
     name: Rust Build
     runs-on: ubuntu-latest
 
     env:
       RUSTFLAGS: "-D warnings"
       SQLX_OFFLINE: true
+      # `default` resolves identically to the explicit `hyper,mmap,sendfile,tls_rustls`
+      # combination, so excluding it drops two duplicate runs from the powerset.
+      HACK: >-
+        --feature-powerset
+        --exclude-features default
+        --at-least-one-of tls_hyper,tls_rustls
+        --mutually-exclusive-features tls_hyper,tls_rustls
+        --at-least-one-of hyper,splice
+        --verbose
 
     steps:
       - uses: actions/checkout@v7
@@ -32,18 +41,15 @@ jobs:
           components: clippy
 
       - name: Build
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --at-least-one-of hyper,splice --verbose build --verbose --locked
+        run: cargo hack $HACK build --locked
 
       - name: Lint via Clippy
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --at-least-one-of hyper,splice --verbose clippy --all-targets --locked -- -D warnings -D clippy::pedantic
+        run: cargo hack $HACK clippy --all-targets --locked -- -D warnings -D clippy::pedantic
 
       - name: Test
-        run: cargo hack --feature-powerset --at-least-one-of tls_hyper,tls_rustls --mutually-exclusive-features tls_hyper,tls_rustls --at-least-one-of hyper,splice --verbose test --verbose --locked
+        run: cargo hack $HACK test --locked
 
   formatting:
-    permissions:
-      contents: read
-
     name: Rust source formatting
     runs-on: ubuntu-latest
 
@@ -52,6 +58,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
+          cache: false
 
       - name: Rustfmt Check
         uses: actions-rust-lang/rustfmt@v1
