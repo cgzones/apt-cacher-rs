@@ -404,8 +404,8 @@ impl ClientHost {
         // attribute is not directly checkable in `const`, but layout
         // equivalence implies these two equalities.
         const _: () = assert!(
-            std::mem::size_of::<ClientHost>() == std::mem::size_of::<CacheHost>()
-                && std::mem::align_of::<ClientHost>() == std::mem::align_of::<CacheHost>(),
+            size_of::<ClientHost>() == size_of::<CacheHost>()
+                && align_of::<ClientHost>() == align_of::<CacheHost>(),
             "ClientHost and CacheHost must share layout - one of them lost its #[repr(transparent)] or gained a second field",
         );
         // `transmute` is well-typed only when both sides share an
@@ -1290,7 +1290,7 @@ fn is_valid_config_domain(domain: &str) -> bool {
 
     // IPv6 addresses contain colons; wildcards don't apply to them
     if domain.contains(':') {
-        return domain.parse::<std::net::Ipv6Addr>().is_ok();
+        return domain.parse::<Ipv6Addr>().is_ok();
     }
 
     let mut is_wildcard = false;

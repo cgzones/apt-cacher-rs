@@ -77,7 +77,7 @@ pub(crate) fn is_host_allowed_cached(requested_host: &str) -> bool {
 pub(crate) fn authorize_cache_access(
     client: &ClientInfo,
     requested_host: &str,
-) -> Result<ClientHost, (http::StatusCode, &'static str)> {
+) -> Result<ClientHost, (StatusCode, &'static str)> {
     let config = global_config();
 
     let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
@@ -114,7 +114,7 @@ pub(crate) fn authorize_cache_access(
 fn finalize_host_result(
     result: Result<ClientHost, HostReject>,
     raw_host: &str,
-) -> Result<ClientHost, (http::StatusCode, &'static str)> {
+) -> Result<ClientHost, (StatusCode, &'static str)> {
     match result {
         Ok(d) => Ok(d),
         Err(HostReject::Unsupported) => {
