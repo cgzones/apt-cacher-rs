@@ -45,34 +45,20 @@ use crate::{global_checksum_registry, global_config, limits, warn_once_or_info};
 /// Why a download could not be committed to the cache. All three variants are
 /// handled by callers exactly as a pre-existing rename failure is handled
 /// today (log, drop the barrier, skip DB records).
-#[derive(Debug)]
+/// `Display` carries the message only; the `io::Error` hangs off `source()`,
+/// so report it through [`ErrorReport`].
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum CommitError {
     /// The downloaded content did not match its expected digest.
+    #[error("checksum mismatch")]
     ChecksumMismatch,
     /// Reading the temp file back for verification failed. Fail-closed: a file
     /// that cannot be verified does not enter the cache.
-    VerifyIo(std::io::Error),
+    #[error("verification I/O error")]
+    VerifyIo(#[source] std::io::Error),
     /// `tokio::fs::rename` of the verified temp file failed.
-    Rename(std::io::Error),
-}
-
-impl std::fmt::Display for CommitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ChecksumMismatch => f.write_str("checksum mismatch"),
-            Self::VerifyIo(e) => write!(f, "verification I/O error: {e}"),
-            Self::Rename(e) => write!(f, "rename failed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for CommitError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ChecksumMismatch => None,
-            Self::VerifyIo(e) | Self::Rename(e) => Some(e),
-        }
-    }
+    #[error("rename failed")]
+    Rename(#[source] std::io::Error),
 }
 
 /// Input for [`verify_temp_file`]. Holds everything the decision needs as

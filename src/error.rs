@@ -12,55 +12,66 @@ pub(crate) struct MirrorDownloadRate {
     pub(crate) debname: String,
 }
 
-#[derive(Debug)]
+// `InsufficientRate` renders through a `Formatter`, and the `format_args!`
+// holding the context fragment cannot outlive an `#[error("...")]` expression
+// -- hence thiserror's `fmt =` hook, whose parameters are the variant's fields
+// followed by the formatter.
+fn fmt_mirror_download_rate(
+    rate: &MirrorDownloadRate,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    let MirrorDownloadRate {
+        download_rate_err,
+        mirror,
+        debname,
+    } = rate;
+    download_rate_err.fmt_with_context(
+        f,
+        format_args!(" for mirror {mirror} downloading file {debname}"),
+    )
+}
+
+fn fmt_client_download_rate(
+    error: &InsufficientRate,
+    client: &ClientInfo,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    error.fmt_with_context(f, format_args!(" for client {client}"))
+}
+
+/// The wrapped transport errors render through [`ErrorReport`] inside
+/// `Display` and are deliberately **not** exposed via `source()`: this type is
+/// reported with a plain `{err}` at its log sites, so the cause has to be part
+/// of `Display`, and `hyper_conn::is_io_timed_out_in_chain` walks `source()`
+/// looking for a `TimedOut` `io::Error` -- re-exposing the same error there
+/// would both duplicate it in reports and change that classification.  Hence
+/// the hand-written `From` impls below rather than `#[from]`, which would
+/// imply `#[source]`.
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ProxyCacheError {
+    #[error("{}", ErrorReport(.0))]
     Io(std::io::Error),
+    #[error("{}", ErrorReport(.0))]
     Hyper(hyper::Error),
+    #[error("{}", ErrorReport(.0))]
     Sqlx(sqlx::Error),
+    #[error(fmt = fmt_client_download_rate)]
     ClientDownloadRate {
         error: InsufficientRate,
         client: ClientInfo,
     },
+    #[error(fmt = fmt_mirror_download_rate)]
     MirrorDownloadRate(MirrorDownloadRate),
+    #[error("{}", ErrorReport(.0))]
     Memfd(memfd::Error),
+    #[error(
+        "Upstream sent {received} bytes, exceeding the announced Content-Length of {announced}"
+    )]
     ContentTooLarge {
         announced: ContentLength,
         received: u64,
     },
 }
-
-impl Display for ProxyCacheError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "{}", ErrorReport(e)),
-            Self::Hyper(e) => write!(f, "{}", ErrorReport(e)),
-            Self::Sqlx(e) => write!(f, "{}", ErrorReport(e)),
-            Self::ClientDownloadRate { error, client } => {
-                error.fmt_with_context(f, format_args!(" for client {client}"))
-            }
-            Self::MirrorDownloadRate(MirrorDownloadRate {
-                download_rate_err,
-                mirror,
-                debname,
-            }) => download_rate_err.fmt_with_context(
-                f,
-                format_args!(" for mirror {mirror} downloading file {debname}"),
-            ),
-            Self::Memfd(e) => write!(f, "{}", ErrorReport(e)),
-            Self::ContentTooLarge {
-                announced,
-                received,
-            } => {
-                write!(
-                    f,
-                    "Upstream sent {received} bytes, exceeding the announced Content-Length of {announced}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProxyCacheError {}
 
 impl From<std::io::Error> for ProxyCacheError {
     fn from(value: std::io::Error) -> Self {
@@ -126,41 +137,26 @@ where
 /// `502 Bad Gateway`. Attached to that response as an `http::Extensions` value so an
 /// internal caller (cleanup) can recover the real transport error instead of seeing
 /// only the laundered status code. The wire response never carries it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
 pub(crate) struct UpstreamFetchError {
     /// Full `source()`-chain rendering of the transport error (e.g. `... timed out`).
     pub(crate) reason: String,
 }
 
-impl Display for UpstreamFetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.reason)
-    }
-}
-
 #[cfg(feature = "sendfile")]
 pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> std::io::Error {
-    #[derive(Debug)]
+    // `Display` prints only the context message; the errno text lives on the
+    // inner io::Error exposed via `source()` and is appended by `ErrorReport`.
+    // Embedding it here would duplicate the errno string because
+    // `io::Error::new(_, custom)` makes the outer io::Error's `source()`
+    // delegate to this struct's source, so `ErrorReport` would walk through
+    // this struct to the inner io::Error and print the errno a second time.
+    #[derive(Debug, thiserror::Error)]
+    #[error("{msg}")]
     struct ErrnoIoError {
         msg: &'static str,
         source: std::io::Error,
-    }
-    impl Display for ErrnoIoError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            // Print only the context message; the errno text lives on the
-            // inner io::Error exposed via `source()` and is appended by
-            // `ErrorReport`. Embedding it here would duplicate the errno
-            // string because `io::Error::new(_, custom)` makes the outer
-            // io::Error's `source()` delegate to this struct's source, so
-            // `ErrorReport` would walk through this struct to the inner
-            // io::Error and print the errno a second time.
-            f.write_str(self.msg)
-        }
-    }
-    impl std::error::Error for ErrnoIoError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(&self.source)
-        }
     }
 
     let err = std::io::Error::from(errno);
@@ -198,6 +194,24 @@ mod tests {
             1,
             "context message duplicated in report: {report}"
         );
+    }
+
+    /// `hyper_conn::is_io_timed_out_in_chain` walks `source()` for a `TimedOut`
+    /// `io::Error`. `ProxyCacheError` puts its cause in `Display` instead, so
+    /// exposing it here too would both duplicate it in reports and flip that
+    /// classification -- which is why the `From` impls are hand-written rather
+    /// than `#[from]`.
+    #[test]
+    fn proxy_cache_error_has_no_source() {
+        use std::error::Error as _;
+
+        let err = ProxyCacheError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+
+        assert!(err.source().is_none(), "ProxyCacheError must not chain");
+        assert_eq!(err.to_string(), "timed out");
     }
 
     #[test]
