@@ -170,7 +170,6 @@ pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> 
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "sendfile")]
     use super::*;
 
     #[cfg(feature = "sendfile")]
