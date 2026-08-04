@@ -38,7 +38,7 @@ tls_rustls = ["dep:hyper-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:
 [dependencies]
 async-compression = { version = "0.4.41", features = ["tokio", "gzip"] }
 bytes = "1.6.0"
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.5.60", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 coarsetime = "0.1.36"
 futures-util = { version = "0.3.30", default-features = false, features = ["std"] }
 hashbrown = "0.17.0"
