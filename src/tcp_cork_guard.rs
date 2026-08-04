@@ -54,7 +54,7 @@ impl<'a> CorkGuard<'a> {
 
     fn set_tcp_cork(stream: &TcpStream, cork: bool) -> std::io::Result<()> {
         let val: nix::libc::c_int = cork.into();
-        static_assert!(std::mem::size_of::<nix::libc::c_int>() == 4);
+        static_assert!(size_of::<nix::libc::c_int>() == 4);
 
         // TODO: refactor once https://github.com/nix-rust/nix/pull/2769 is merged
         // SAFETY: stream.as_raw_fd() is a valid socket fd; val is a stack-local c_int.
@@ -69,7 +69,7 @@ impl<'a> CorkGuard<'a> {
                     reason = "size_of c_int (4) always fits in socklen_t (u32)"
                 )]
                 {
-                    std::mem::size_of_val(&val) as nix::libc::socklen_t
+                    size_of_val(&val) as nix::libc::socklen_t
                 },
             )
         };

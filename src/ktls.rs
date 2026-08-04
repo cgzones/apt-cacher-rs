@@ -678,7 +678,7 @@ pub(crate) fn setup_rx<F: AsFd>(
         }
     };
 
-    nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpTlsRx, &crypto.0)
+    socket::setsockopt(fd, socket::sockopt::TcpTlsRx, &crypto.0)
         .map_err(|errno| errno_to_io_error(errno, "kTLS: failed to set TcpTlsRx"))?;
 
     // `crypto` drops here, zeroing the enum payload (both success and panic paths).
@@ -778,7 +778,7 @@ pub(crate) enum UlpAttachError {
 pub(crate) fn attach_ulp<F: AsFd>(fd: &F) -> Result<(), UlpAttachError> {
     // No logging here: the caller logs the returned error (with host context)
     // and decides between transient fallback and a kTLS block for the mirror.
-    match nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::TcpUlp::default(), b"tls") {
+    match socket::setsockopt(fd, socket::sockopt::TcpUlp::default(), b"tls") {
         Ok(()) => Ok(()),
         Err(errno) => {
             let err = errno_to_io_error(errno, "kTLS: setsockopt TLS ULP failed");
@@ -1271,7 +1271,7 @@ fn extract_record_type(
 mod tests {
     use super::*;
 
-    use std::io::{Read as _, Write as _};
+    use std::io::{ErrorKind, Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Barrier};
     use std::thread::JoinHandle;
@@ -1474,7 +1474,7 @@ mod tests {
     fn build_tls_configs(
         tls_versions: &[&'static rustls::SupportedProtocolVersion],
         cipher_suite_filter: Option<&[rustls::SupportedCipherSuite]>,
-    ) -> (std::sync::Arc<rustls::ServerConfig>, rustls::ClientConfig) {
+    ) -> (Arc<rustls::ServerConfig>, rustls::ClientConfig) {
         let (certs, key) = generate_test_cert();
 
         let build_provider = || {
@@ -1482,10 +1482,10 @@ mod tests {
             if let Some(filter) = cipher_suite_filter {
                 provider.cipher_suites = filter.to_vec();
             }
-            std::sync::Arc::new(provider)
+            Arc::new(provider)
         };
 
-        let server_config = std::sync::Arc::new(
+        let server_config = Arc::new(
             rustls::ServerConfig::builder_with_provider(build_provider())
                 .with_protocol_versions(tls_versions)
                 .expect("server protocol versions")
@@ -1562,9 +1562,8 @@ mod tests {
         attach_ulp(&tcp_client).expect("attach_ulp");
         let server_name =
             rustls::pki_types::ServerName::try_from("localhost").expect("server name");
-        let mut client_conn =
-            rustls::ClientConnection::new(std::sync::Arc::new(client_config), server_name)
-                .expect("client conn");
+        let mut client_conn = rustls::ClientConnection::new(Arc::new(client_config), server_name)
+            .expect("client conn");
 
         let mut tcp_ref: &TcpStream = &tcp_client;
         while client_conn.is_handshaking() {
@@ -1621,7 +1620,7 @@ mod tests {
                 Ok(_) => {}
             }
             match tcp.read(&mut buf) {
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
                 Ok(0) | Err(_) => break,
                 Ok(n) => all_data.extend_from_slice(&buf[..n]),
             }
@@ -1745,9 +1744,8 @@ mod tests {
         attach_ulp(&tcp_client).expect("attach_ulp");
         let server_name =
             rustls::pki_types::ServerName::try_from("localhost").expect("server name");
-        let mut client_conn =
-            rustls::ClientConnection::new(std::sync::Arc::new(client_config), server_name)
-                .expect("client conn");
+        let mut client_conn = rustls::ClientConnection::new(Arc::new(client_config), server_name)
+            .expect("client conn");
         let mut tcp_ref: &TcpStream = &tcp_client;
         while client_conn.is_handshaking() {
             client_conn.complete_io(&mut tcp_ref).expect("handshake io");
@@ -1762,16 +1760,16 @@ mod tests {
         // reported once the peer's shutdown reached this socket, making
         // "socket is in CLOSE_WAIT" deterministic rather than sleep-based.
         // nix 0.31 does not expose POLLRDHUP, so use the raw libc poll.
-        let mut pfd = nix::libc::pollfd {
+        let mut pfd = libc::pollfd {
             fd: tcp_client.as_raw_fd(),
-            events: nix::libc::POLLIN | nix::libc::POLLRDHUP,
+            events: libc::POLLIN | libc::POLLRDHUP,
             revents: 0,
         };
         // SAFETY: `pfd` is a valid pollfd for an open socket, nfds is 1.
-        let nready = unsafe { nix::libc::poll(&raw mut pfd, 1, 5000) };
+        let nready = unsafe { libc::poll(&raw mut pfd, 1, 5000) };
         assert_eq!(nready, 1, "expected socket readable after server exit");
         assert!(
-            pfd.revents & nix::libc::POLLRDHUP != 0,
+            pfd.revents & libc::POLLRDHUP != 0,
             "expected POLLRDHUP after server FIN, got {:#x}",
             pfd.revents
         );
@@ -1867,7 +1865,7 @@ mod tests {
         // record so a truncated response cannot pass as complete.
         let err = drain_control_messages(harness.tcp_client.as_fd(), DrainExpect::DataReady)
             .expect_err("DataReady drain must reject a close_notify");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     /// Clean `close_notify` handling in the post-setup drain, TLS 1.2.

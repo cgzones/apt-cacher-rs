@@ -10,8 +10,6 @@ use std::{
 };
 
 use bytes::BytesMut;
-#[cfg(feature = "ktls")]
-use coarsetime::Duration;
 use hashbrown::hash_map::EntryRef;
 use http::{
     StatusCode,
@@ -95,7 +93,7 @@ static_assert!(nix::errno::Errno::EAGAIN as i32 == nix::errno::Errno::EWOULDBLOC
 /// Sent to upstream when a cached volatile file is stale (>30s).
 struct VolatileCondHeaders {
     if_modified_since: String,
-    if_none_match: Option<std::sync::Arc<str>>,
+    if_none_match: Option<Arc<str>>,
 }
 
 /// Pre-computed byte offsets for range-filtering the splice loop output.
@@ -147,7 +145,7 @@ const VOLATILE_BODY_MAX: usize = 1024 * 1024;
 
 /// How long to remember kTLS setup failures before retrying.
 #[cfg(feature = "ktls")]
-const KTLS_BLOCK_DURATION: Duration = Duration::from_secs(600);
+const KTLS_BLOCK_DURATION: coarsetime::Duration = coarsetime::Duration::from_secs(600);
 
 /// `tls_label` value for a kTLS-offloaded upstream connection. Doubles as the
 /// kTLS marker at body-transfer time: every reconnect helper updates
@@ -602,13 +600,11 @@ fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
 // variants live there so the sendfile path can share them).
 
 fn clear_pipe_readable_cache(receiver: &pipe::Receiver) {
-    let _ignore =
-        receiver.try_io(|| -> std::io::Result<()> { Err(std::io::ErrorKind::WouldBlock.into()) });
+    let _ignore = receiver.try_io(|| -> std::io::Result<()> { Err(ErrorKind::WouldBlock.into()) });
 }
 
 fn clear_pipe_writable_cache(sender: &pipe::Sender) {
-    let _ignore =
-        sender.try_io(|| -> std::io::Result<()> { Err(std::io::ErrorKind::WouldBlock.into()) });
+    let _ignore = sender.try_io(|| -> std::io::Result<()> { Err(ErrorKind::WouldBlock.into()) });
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +621,7 @@ fn resolve_mirror_scheme(mirror: &Mirror) -> Option<Scheme> {
     // Check scheme cache first
     let key = SchemeKeyRef {
         host: mirror.host(),
-        port: mirror.port().map(std::num::NonZero::get),
+        port: mirror.port().map(NonZero::get),
     };
     let cached = SCHEME_CACHE
         .get()
@@ -679,12 +675,12 @@ async fn connect_upstream(
 
     match scheme {
         Some(Scheme::Http) => {
-            let port = mirror.port().map_or(80, std::num::NonZero::get);
+            let port = mirror.port().map_or(80, NonZero::get);
             let tcp = tcp_connect(host, port).await?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
         Some(Scheme::Https) => {
-            let port = mirror.port().map_or(443, std::num::NonZero::get);
+            let port = mirror.port().map_or(443, NonZero::get);
             let tcp = tcp_connect(host, port).await?;
             let tls = tls_connect(tcp, host).await.inspect_err(|_| {
                 metrics::UPSTREAM_TLS_FAILED.increment();
@@ -694,7 +690,7 @@ async fn connect_upstream(
         None => {
             // Auto mode: try HTTPS first, fall back to HTTP
             // TODO: retry HTTPS after small period, fall back to HTTP
-            let https_port = mirror.port().map_or(443, std::num::NonZero::get);
+            let https_port = mirror.port().map_or(443, NonZero::get);
             match tcp_connect(host, https_port).await {
                 Ok(tcp) => match tls_connect(tcp, host).await {
                     Ok(tls) => {
@@ -722,7 +718,7 @@ async fn connect_upstream(
                 }
             }
 
-            let plain_port = mirror.port().map_or(80, std::num::NonZero::get);
+            let plain_port = mirror.port().map_or(80, NonZero::get);
             let tcp = tcp_connect(host, plain_port).await?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
@@ -969,7 +965,7 @@ async fn drain_buffered_records(
                 while let Some(result) = rt.next_record() {
                     let AppDataRecord { payload, discard } = result.map_err(|err| {
                         KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
+                            ErrorKind::InvalidData,
                             format!("TLS record error:  {err}"),
                         ))
                     })?;
@@ -1076,7 +1072,7 @@ async fn try_unbuffered_ktls_connect(
     // Skip kTLS for mirrors where setup has recently failed (retry after KTLS_BLOCK_DURATION)
     let key = SchemeKeyRef {
         host: mirror.host().as_str(),
-        port: mirror.port().map(std::num::NonZero::get),
+        port: mirror.port().map(NonZero::get),
     };
     {
         let blocked = KTLS_BLOCKED.get().expect("Initialized in main()");
@@ -1112,7 +1108,7 @@ async fn try_unbuffered_ktls_connect(
     }
 
     let host = mirror.host().as_str();
-    let port = mirror.port().map_or(443, std::num::NonZero::get);
+    let port = mirror.port().map_or(443, NonZero::get);
 
     let mut tcp = match tcp_connect(host, port).await {
         Ok(tcp) => tcp,
@@ -1933,7 +1929,7 @@ async fn unbuffered_ktls_request(
 fn cache_scheme(mirror: &Mirror, scheme: Scheme) {
     let key = SchemeKeyRef {
         host: mirror.host().as_str(),
-        port: mirror.port().map(std::num::NonZero::get),
+        port: mirror.port().map(NonZero::get),
     };
     let scheme_cache = SCHEME_CACHE.get().expect("Initialized in main()");
     if scheme_cache.read().contains_key(&key) {
@@ -2124,7 +2120,7 @@ enum BodyFraming {
 
 /// Parsed upstream response header info.
 struct UpstreamResponse {
-    status_code: http::StatusCode,
+    status_code: StatusCode,
     framing: BodyFraming,
     content_type: Option<String>,
     last_modified: Option<String>,
@@ -2174,7 +2170,7 @@ fn parse_upstream_response(
     }
 
     let raw_code = resp.code.expect("complete header parsed");
-    let status_code = http::StatusCode::from_u16(raw_code).map_err(|_err| {
+    let status_code = StatusCode::from_u16(raw_code).map_err(|_err| {
         std::io::Error::new(
             ErrorKind::InvalidData,
             "invalid HTTP status code from upstream",
@@ -2655,7 +2651,7 @@ async fn pwrite_buf_to_file(
                     "should have written less than the requested number of bytes"
                 );
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
+                    ErrorKind::WriteZero,
                     "pwrite returned 0",
                 ));
             }
@@ -4314,10 +4310,10 @@ async fn discard_partial_and_retry(
     // always a fresh full request: resume_offset=0, no If-Range/volatile cond).
     if matches!(
         upstream_resp.status_code,
-        http::StatusCode::MOVED_PERMANENTLY
-            | http::StatusCode::FOUND
-            | http::StatusCode::TEMPORARY_REDIRECT
-            | http::StatusCode::PERMANENT_REDIRECT
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
     ) {
         follow_redirect(
             upstream_resp,
@@ -4538,7 +4534,7 @@ async fn splice_proxy_drive(
             .await
             {
                 Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
-                Err((err, guard)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err((err, guard)) if err.kind() == ErrorKind::NotFound => {
                     (0, None, None, utils::PartialDownload::Fresh(guard))
                 }
                 Err((_err, guard)) => {
@@ -4561,7 +4557,7 @@ async fn splice_proxy_drive(
 
         let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
             Ok(f) => Some(f),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -4875,10 +4871,10 @@ async fn splice_proxy_drive(
     // redirect before its NOT_MODIFIED check.
     let redirected_path_owned = if matches!(
         upstream_resp.status_code,
-        http::StatusCode::MOVED_PERMANENTLY
-            | http::StatusCode::FOUND
-            | http::StatusCode::TEMPORARY_REDIRECT
-            | http::StatusCode::PERMANENT_REDIRECT
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
     ) {
         follow_redirect(
             &mut upstream_resp,
@@ -7052,7 +7048,7 @@ fn rewrite_simple_proxy_headers(
     raw_headers: &[u8],
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
-    status_code: http::StatusCode,
+    status_code: StatusCode,
 ) -> std::io::Result<String> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut parsed = httparse::Response::new(&mut headers);
@@ -7383,7 +7379,7 @@ mod tests {
             raw,
             ConnectionVersion::Http11,
             ConnectionAction::KeepAlive,
-            http::StatusCode::OK,
+            StatusCode::OK,
         )
         .expect("rewrite should succeed");
 
@@ -7415,7 +7411,7 @@ mod tests {
             raw,
             ConnectionVersion::Http11,
             ConnectionAction::Close,
-            http::StatusCode::OK,
+            StatusCode::OK,
         )
         .expect("rewrite should succeed");
         assert!(!out.to_ascii_lowercase().contains("content-length:"));
@@ -7435,7 +7431,7 @@ mod tests {
             raw,
             ConnectionVersion::Http11,
             ConnectionAction::KeepAlive,
-            http::StatusCode::OK,
+            StatusCode::OK,
         )
         .expect("rewrite should succeed");
 

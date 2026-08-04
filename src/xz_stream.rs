@@ -47,11 +47,11 @@ where
         // handoffs 8x. The explicit flush surfaces write errors before the
         // result send (BufWriter's Drop swallows them).
         let mut bridge_out =
-            std::io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
+            io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
         let mut decoder =
             lzma_rust2::XzReader::new(bridge_in, /* allow_multiple_streams = */ true);
-        let result = std::io::copy(&mut decoder, &mut bridge_out)
-            .and_then(|_| std::io::Write::flush(&mut bridge_out));
+        let result =
+            io::copy(&mut decoder, &mut bridge_out).and_then(|_| io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
         // EOF on `inner` before polling `tail`. Without this, the consumer can
         // observe Pending on the oneshot while the duplex still has an open
@@ -111,6 +111,8 @@ impl AsyncRead for XzDecoderStream {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use tokio::io::AsyncReadExt as _;
 
@@ -125,7 +127,7 @@ mod tests {
 
     #[tokio::test]
     async fn decodes_hello_world() {
-        let mut decoder = xz_decoder(std::io::Cursor::new(HELLO_XZ));
+        let mut decoder = xz_decoder(Cursor::new(HELLO_XZ));
         let mut out = Vec::new();
         decoder
             .read_to_end(&mut out)
@@ -140,7 +142,7 @@ mod tests {
         // inside the compressed block, past the stream header).
         let mut bad = HELLO_XZ.to_vec();
         bad[32] ^= 0xFF;
-        let mut decoder = xz_decoder(std::io::Cursor::new(bad));
+        let mut decoder = xz_decoder(Cursor::new(bad));
         let mut out = Vec::new();
         let result = decoder.read_to_end(&mut out).await;
         assert!(
@@ -157,7 +159,7 @@ mod tests {
         // normal AsyncRead and return Ok(()) immediately.
         let mut bad = HELLO_XZ.to_vec();
         bad[32] ^= 0xFF;
-        let mut decoder = xz_decoder(std::io::Cursor::new(bad));
+        let mut decoder = xz_decoder(Cursor::new(bad));
 
         // Let the blocking task run to completion so the Err is sitting in
         // the oneshot. 100ms is ample for decoding ~70 bytes.
@@ -190,7 +192,7 @@ mod tests {
         // Ready(Ok(())). Without the fix, the wrapper polls the (still
         // pending) tail oneshot and returns Pending — which would never
         // resolve under a noop waker.
-        let mut decoder = xz_decoder(std::io::Cursor::new(HELLO_XZ));
+        let mut decoder = xz_decoder(Cursor::new(HELLO_XZ));
 
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
@@ -216,7 +218,7 @@ mod tests {
         // Spawn a decode, read one byte, drop the wrapper. The blocking task
         // should observe BrokenPipe on its next write and exit cleanly without
         // panicking the runtime.
-        let mut decoder = xz_decoder(std::io::Cursor::new(HELLO_XZ));
+        let mut decoder = xz_decoder(Cursor::new(HELLO_XZ));
         let mut one = [0u8; 1];
         let n = decoder.read(&mut one).await.expect("first byte ok");
         assert_eq!(n, 1);

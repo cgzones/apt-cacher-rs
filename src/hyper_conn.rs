@@ -33,7 +33,7 @@ use crate::{
     SCHEME_CACHE, Scheme, SchemeKey, SchemeKeyRef, VOLATILE_CACHE_MAX_AGE,
     VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
     active_downloads::{AbortReason, ActiveDownloadStatus, InsertOutcome},
-    cache_conditional::{self, CacheInfo},
+    cache_conditional::CacheInfo,
     cache_layout::{self, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
     cache_metadata::{self, UpstreamMetadata},
     cache_quota::QuotaExceeded,
@@ -477,7 +477,7 @@ where
     type Error = E;
 
     fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.as_mut().project().stream.poll_next(cx) {
@@ -511,7 +511,7 @@ where
 
 #[pinned_drop]
 impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
-    fn drop(self: std::pin::Pin<&mut Self>) {
+    fn drop(self: Pin<&mut Self>) {
         let size = self.size;
         let partial = self.partial;
         let duration = self.start.elapsed();
@@ -770,7 +770,7 @@ fn serve_cached_file_mmap(
     content_start: u64,
     content_range: Option<String>,
     partial: bool,
-    etag: Option<std::sync::Arc<str>>,
+    etag: Option<Arc<str>>,
 ) -> Response<ProxyCacheBody> {
     trace!(
         "Using mmap(2) with start={content_start} and length={content_length} from content_range={content_range:?} for file `{}`",
@@ -884,7 +884,7 @@ async fn serve_unfinished_file(
         }
     };
 
-    let cache_conditional::CacheInfo {
+    let CacheInfo {
         file_etag,
         last_modified_str,
         age,
@@ -1208,7 +1208,7 @@ async fn serve_cached_file(
     let cache_info = CacheInfo::with_meta(&mdata, &resolved_meta);
     let serve_304 = cache_info.decide_serve_304(if_none_match_str, if_modified_since_str);
 
-    let cache_conditional::CacheInfo {
+    let CacheInfo {
         file_etag,
         last_modified_for_ims,
         last_modified_str,
@@ -1368,14 +1368,14 @@ async fn serve_cached_file_buf(
     mut file: tokio::fs::File,
     file_path: PathBuf,
     file_size: u64,
-    last_modified_str: std::sync::Arc<str>,
+    last_modified_str: Arc<str>,
     age: u32,
     http_status: StatusCode,
     content_length: u64,
     start: u64,
     content_range: Option<String>,
     partial: bool,
-    etag: Option<std::sync::Arc<str>>,
+    etag: Option<Arc<str>>,
 ) -> Response<ProxyCacheBody> {
     debug_assert!(
         start + content_length <= file_size,
@@ -1390,7 +1390,7 @@ async fn serve_cached_file_buf(
         error!(
             "Error seeking cached file `{}` to {start}/{file_size}:  {}",
             file_path.display(),
-            crate::error::ErrorReport(&err)
+            ErrorReport(&err)
         );
         return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
     }
@@ -1456,7 +1456,7 @@ fn serve_cached_file_response(
     content_type: &'static str,
     body: ProxyCacheBody,
     content_range: Option<String>,
-    etag: Option<std::sync::Arc<str>>,
+    etag: Option<Arc<str>>,
 ) -> Response<ProxyCacheBody> {
     /*
      * Original headers:
@@ -2406,7 +2406,7 @@ async fn serve_new_file(
         .headers()
         .get(LOCATION)
         .and_then(|lc| lc.to_str().ok())
-        .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
+        .and_then(|lc_str| lc_str.parse::<Uri>().ok())
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
@@ -2613,7 +2613,7 @@ async fn serve_new_file(
                 // Cross-check declared Content-Length (if present) matches the range span.
                 if let Some(cl) = fwd_response
                     .headers()
-                    .get(http::header::CONTENT_LENGTH)
+                    .get(CONTENT_LENGTH)
                     .and_then(|hv| hv.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     && cl != remaining
@@ -3573,7 +3573,7 @@ async fn pre_process_client_request(
         .headers()
         .get(LOCATION)
         .and_then(|lc| lc.to_str().ok())
-        .and_then(|lc_str| lc_str.parse::<hyper::Uri>().ok())
+        .and_then(|lc_str| lc_str.parse::<Uri>().ok())
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri}", parts.uri);
 
@@ -3690,11 +3690,7 @@ fn host_header_from_uri(auth: &Authority) -> HeaderValue {
 
 pub(crate) async fn handle_hyper_connection<T>(stream: T, client: ClientInfo, appstate: AppState)
 where
-    T: tokio::io::AsyncRead
-        + tokio::io::AsyncWrite
-        + std::marker::Unpin
-        + std::marker::Send
-        + 'static,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     #[must_use]
     fn hyper_is_peer_disconnect(err: &hyper::Error) -> bool {

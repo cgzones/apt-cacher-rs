@@ -18,7 +18,7 @@ use crate::{
     CLEANUP_CLIENT_ADDR,
     cache_layout::SUBDIR_FLAT,
     config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
-    deb_mirror::{self, Mirror, MirrorKind, mirror_cache_path_impl},
+    deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
     flat_blocklist, global_config, warn_once_or_info,
 };
 
@@ -165,7 +165,7 @@ impl MirrorEntry {
     }
 }
 
-impl std::convert::From<MirrorEntry> for deb_mirror::Mirror {
+impl From<MirrorEntry> for Mirror {
     fn from(entry: MirrorEntry) -> Self {
         let port = entry.port();
         let MirrorEntry {
@@ -349,7 +349,7 @@ async fn upsert_mirror_get_id(
     mirror: &Mirror,
 ) -> Result<(i64, bool), Error> {
     let host = mirror.host();
-    let port = mirror.port().map_or(0, std::num::NonZero::get);
+    let port = mirror.port().map_or(0, NonZero::get);
     let path = mirror.path();
     let kind = mirror.kind().as_db_int();
     let row = query!(
@@ -397,10 +397,7 @@ async fn upsert_mirror_get_id(
 }
 
 impl Database {
-    pub(crate) async fn connect(
-        path: &std::path::Path,
-        slow_timeout: Duration,
-    ) -> Result<Self, Error> {
+    pub(crate) async fn connect(path: &Path, slow_timeout: Duration) -> Result<Self, Error> {
         let url = format!("sqlite://{}", path.display());
 
         debug!("Opening database `{url}` with slow timeout of {slow_timeout:?}...");
@@ -613,7 +610,7 @@ impl Database {
         port: Option<NonZero<u16>>,
         path: &str,
     ) -> Result<Vec<OriginEntry>, Error> {
-        let port = port.map_or(0, std::num::NonZero::get);
+        let port = port.map_or(0, NonZero::get);
 
         query_as!(
             OriginEntry,
@@ -649,7 +646,7 @@ impl Database {
         port: Option<NonZero<u16>>,
         path: &str,
     ) -> Result<bool, Error> {
-        let port = port.map_or(0, std::num::NonZero::get);
+        let port = port.map_or(0, NonZero::get);
         let row = query!(
             r#"SELECT id AS "id!: i64" FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ? LIMIT 1;"#,
             host,
@@ -663,7 +660,7 @@ impl Database {
 
     pub(crate) async fn mirror_cleanup(&self, mirror: &Mirror) -> Result<(), Error> {
         let host = mirror.host();
-        let port = mirror.port().map_or(0, std::num::NonZero::get);
+        let port = mirror.port().map_or(0, NonZero::get);
         let path = mirror.path();
 
         query!(

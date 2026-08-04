@@ -823,7 +823,7 @@ pub(crate) async fn ingest_packages_file(
     registry: &ChecksumRegistry,
     host: &str,
     mirror_path: &str,
-    path: &std::path::Path,
+    path: &Path,
     compression: PackagesCompression,
     format: IndexFormat,
     buffer_size: usize,
@@ -928,7 +928,7 @@ pub(crate) async fn ingest_packages_file(
 ///
 /// Shared by registry ingest ([`ingest_release_file`]) and the by-hash cleanup
 /// reference-set builder.
-pub(crate) async fn read_release_to_string(path: &std::path::Path) -> std::io::Result<String> {
+pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<String> {
     let file = tokio_nofollow_options().read(true).open(path).await?;
     let mut limited = LimitedReader::new(file, limits::MAX_RELEASE_SIZE);
     let mut buf = String::new();
@@ -947,7 +947,7 @@ pub(crate) async fn ingest_release_file(
     registry: &ChecksumRegistry,
     host: &str,
     mirror_path: &str,
-    path: &std::path::Path,
+    path: &Path,
     release_dir: &str,
 ) -> std::io::Result<()> {
     let content = read_release_to_string(path).await?;
@@ -1065,7 +1065,7 @@ mod tests {
                 algo: Some(HashAlgo::Sha256),
                 filename: HELLO_SHA256.to_string(),
             },
-            temp_path: std::path::Path::new("/nonexistent/apt-cacher-rs/x"),
+            temp_path: Path::new("/nonexistent/apt-cacher-rs/x"),
         };
         assert!(matches!(
             verify_temp_file(&plan),

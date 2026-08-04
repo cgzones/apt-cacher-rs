@@ -78,13 +78,13 @@ pub(crate) enum ZeroCopyResult {
 
     /// Request is invalid, reject and close the connection
     Invalid {
-        status: http::StatusCode,
+        status: StatusCode,
         msg: &'static str,
     },
 
     /// Request should be rejected, but the connection might be kept alive
     Rejection {
-        status: http::StatusCode,
+        status: StatusCode,
         conn_action: ConnectionAction,
         msg: &'static str,
     },
@@ -1558,14 +1558,14 @@ async fn wait_socket_rated(
 #[cfg(feature = "splice")]
 pub(crate) fn clear_tcp_readable_cache(socket: &TcpStream) {
     let _ignore = socket.try_io(Interest::READABLE, || -> std::io::Result<()> {
-        Err(std::io::ErrorKind::WouldBlock.into())
+        Err(ErrorKind::WouldBlock.into())
     });
 }
 
 #[cfg(feature = "splice")]
 pub(crate) fn clear_tcp_writable_cache(socket: &TcpStream) {
     let _ignore = socket.try_io(Interest::WRITABLE, || -> std::io::Result<()> {
-        Err(std::io::ErrorKind::WouldBlock.into())
+        Err(ErrorKind::WouldBlock.into())
     });
 }
 
@@ -2021,7 +2021,7 @@ pub(crate) async fn async_sendfile_unfinished(
     content_start: u64,
     content_length: u64,
     mut receiver: tokio::sync::watch::Receiver<()>,
-    status: std::sync::Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> Result<u64, (u64, std::io::Error)> {
     let _counter = client_counter::ClientDownload::new();
 
@@ -2071,7 +2071,7 @@ pub(crate) async fn async_sendfile_unfinished(
                 let transferred = content_length - remaining;
                 return Err((
                     transferred,
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Not a regular file"),
+                    std::io::Error::new(ErrorKind::InvalidData, "Not a regular file"),
                 ));
             }
             Err(errno) => {
@@ -2203,7 +2203,7 @@ async fn serve_unfinished_sendfile(
     stream: &TcpStream,
     conn_details: &ConnectionDetails,
     aliased: &str,
-    dl_status: std::sync::Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    dl_status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     headers: RangeRequestHeaders<'_>,
@@ -2331,7 +2331,7 @@ async fn serve_unfinished_sendfile(
                         .await
                     {
                         Ok(f) => f,
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();
                             error!(
