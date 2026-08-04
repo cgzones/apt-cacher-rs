@@ -815,6 +815,13 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sync>> {
+    struct Stopped;
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            info!("Stopped.");
+        }
+    }
+
     let mut args = Cli::parse();
 
     let is_run_as_root = nix::unistd::geteuid().is_root();
@@ -1056,9 +1063,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
 
     drop(args);
 
-    scopeguard::defer! {
-        info!("Stopped.");
-    }
+    let _guard = Stopped;
 
     runtime
         .block_on(async { main_loop::main_loop(https_client).await })
