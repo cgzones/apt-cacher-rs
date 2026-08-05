@@ -1,5 +1,6 @@
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZero,
     time::Duration,
 };
 
@@ -33,12 +34,48 @@ use crate::{
     database_task::{self, db_loop},
     deb_mirror,
     error::ErrorReport,
-    flat_blocklist, global_config,
+    flat_blocklist, global_config, healthcheck,
     humanfmt::HumanFmt,
     metrics,
     task_cache_scan::task_cache_scan,
+    utils::filesystem_space,
 };
 
+/// One-line accounting emitted on every shutdown path: what the process did
+/// over its lifetime, and what it is dropping on the floor. Without it a
+/// stopped daemon leaves no record of whether it was in the middle of
+/// serving anything when the signal arrived, which is the first question
+/// after an unexpected restart -- and the counters behind the dashboard die
+/// with the process.
+fn log_shutdown_summary(signal: &str, active_downloads: &ActiveDownloads) {
+    let rd = RUNTIMEDETAILS.get().expect("global set in main()");
+    let uptime = (time::OffsetDateTime::now_utc() - rd.start_time).unsigned_abs();
+
+    let bytes_served = [
+        metrics::BYTES_SERVED_MMAP.get(),
+        metrics::BYTES_SERVED_SENDFILE.get(),
+        metrics::BYTES_SERVED_SPLICE.get(),
+        metrics::BYTES_SERVED_COPY.get(),
+        metrics::BYTES_SERVED_CHANNEL.get(),
+        metrics::BYTES_SERVED_PASSTHROUGH.get(),
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add);
+
+    info!(
+        "{signal} shutdown summary after {}: {} requests, {} fully served, {} cache hits, {} misses, {} served to clients, {} fetched upstream; dropping {} client connections, {} client downloads, {} upstream downloads",
+        HumanFmt::Time(uptime),
+        metrics::REQUESTS_TOTAL.get(),
+        metrics::SERVED_TOTAL.get(),
+        metrics::CACHE_HITS.get(),
+        metrics::CACHE_MISSES.get(),
+        HumanFmt::Size(bytes_served),
+        HumanFmt::Size(metrics::BYTES_DOWNLOADED_UPSTREAM.get()),
+        client_counter::connected_clients(),
+        client_counter::active_client_downloads(),
+        active_downloads.len(),
+    );
+}
 pub(crate) async fn main_loop(
     #[cfg(feature = "hyper")] https_client: HttpClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -150,39 +187,74 @@ pub(crate) async fn main_loop(
     {
         let database = database.clone();
         tokio::task::spawn(async move {
+            let scan_start = Instant::now();
             match task_cache_scan(&database).await {
-                Ok(cache_size) => {
+                Ok(totals) => {
+                    let scanned = HumanFmt::Time(scan_start.elapsed().into());
+                    let cache_size = totals.bytes;
+                    let files = totals.files;
                     let rd = RUNTIMEDETAILS.get().expect("global set in main()");
 
                     rd.cache_quota.add(cache_size);
 
-                    match rd.config.disk_quota {
-                        Some(val) => {
-                            let val = val.get();
-                            if cache_size > val {
-                                warn!(
-                                    "Startup cache size of {} exceeds quota {}",
-                                    HumanFmt::Size(cache_size),
-                                    HumanFmt::Size(val)
-                                );
-                            } else {
-                                info!(
-                                    "Startup cache size: {} (quota={})",
-                                    HumanFmt::Size(cache_size),
-                                    HumanFmt::Size(val)
-                                );
+                    // The quota is only the bound this daemon enforces; what
+                    // actually runs out is the filesystem -- and it can run
+                    // out of inodes long before it runs out of bytes, which
+                    // is exactly the ENOSPC an operator cannot explain from
+                    // a byte figure alone. A failed statvfs is already
+                    // warned about inside `filesystem_space`.
+                    let space = filesystem_space(&rd.config.cache_directory).await;
+                    let free = match space {
+                        Some(space) => format!(
+                            "free disk space: {}, free inodes: {}",
+                            HumanFmt::Size(space.free_bytes),
+                            match space.inodes {
+                                Some(inodes) => format!("{} of {}", inodes.free, inodes.total),
+                                None => "unlimited".to_owned(),
                             }
+                        ),
+                        None => "free disk space: unknown".to_owned(),
+                    };
+
+                    match rd.config.disk_quota.map(NonZero::get) {
+                        Some(quota) if cache_size > quota => {
+                            warn!(
+                                "Startup cache size of {} in {files} files exceeds quota {} ({free}, scanned in {scanned})",
+                                HumanFmt::Size(cache_size),
+                                HumanFmt::Size(quota)
+                            );
+                        }
+                        Some(quota) => {
+                            info!(
+                                "Startup cache size: {} in {files} files (quota={}, {free}, scanned in {scanned})",
+                                HumanFmt::Size(cache_size),
+                                HumanFmt::Size(quota)
+                            );
                         }
                         None => {
                             info!(
-                                "Startup cache size: {} (quota=unlimited)",
+                                "Startup cache size: {} in {files} files (quota=unlimited, {free}, scanned in {scanned})",
                                 HumanFmt::Size(cache_size)
                             );
                         }
                     }
+
+                    // Inode exhaustion produces an ENOSPC that no byte
+                    // figure explains; same floors as the readiness check.
+                    if let Some(detail) =
+                        healthcheck::low_inodes_detail(space.and_then(|s| s.inodes))
+                    {
+                        warn!(
+                            "Cache filesystem `{}` is running out of inodes ({detail}); cache writes will fail with ENOSPC while disk space still looks free",
+                            rd.config.cache_directory.display()
+                        );
+                    }
                 }
                 Err(err) => {
-                    error!("Startup cache scan failed; cache size unset:  {err}");
+                    error!(
+                        "Startup cache scan failed after {}; cache size unset:  {err}",
+                        HumanFmt::Time(scan_start.elapsed().into())
+                    );
                 }
             }
         });
@@ -335,11 +407,13 @@ pub(crate) async fn main_loop(
         let next = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("SIGINT received, stopping...");
+                log_shutdown_summary("SIGINT", &appstate.active_downloads);
                 drain_db_task.as_mut().await;
                 return Ok(());
             },
             _ = term_signal.recv() => {
                 info!("SIGTERM received, stopping...");
+                log_shutdown_summary("SIGTERM", &appstate.active_downloads);
                 drain_db_task.as_mut().await;
                 return Ok(());
             },

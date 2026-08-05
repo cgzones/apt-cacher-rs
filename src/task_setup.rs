@@ -94,7 +94,9 @@ fn lock_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupError>
     }
 }
 
-fn remove_dir_contents(path: &Path) -> Result<(), SetupError> {
+/// Returns the number of removed entries.
+fn remove_dir_contents(path: &Path) -> Result<usize, SetupError> {
+    let mut removed = 0usize;
     for entry in std::fs::read_dir(path).map_err(SetupError::io("read directory", path))? {
         let entry_path = entry
             .map_err(SetupError::io("read directory", path))?
@@ -116,8 +118,9 @@ fn remove_dir_contents(path: &Path) -> Result<(), SetupError> {
             std::fs::remove_file(&entry_path)
                 .map_err(SetupError::io("remove file", &entry_path))?;
         }
+        removed = removed.saturating_add(1);
     }
-    Ok(())
+    Ok(removed)
 }
 
 pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
@@ -198,7 +201,16 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
     std::fs::create_dir_all(&cache_tmp_path)
         .map_err(SetupError::io("create directory", &cache_tmp_path))?;
 
-    remove_dir_contents(&cache_tmp_path)?;
+    // Leftovers here are partial downloads from a previous run that never
+    // committed; a non-empty purge is the one startup-visible trace of an
+    // unclean shutdown.
+    let purged = remove_dir_contents(&cache_tmp_path)?;
+    if purged > 0 {
+        info!(
+            "Purged {purged} leftover entries from `{}`",
+            cache_tmp_path.display()
+        );
+    }
 
     Ok(cache_lock)
 }

@@ -950,6 +950,14 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     debug!("Logger initialized");
     trace!("Tracing enabled");
 
+    // First line of every log: which build is talking. Feature flags decide
+    // which backend serves a request (sendfile/splice/hyper) and which TLS
+    // stack is used, so a log without them cannot be read confidently.
+    info!(
+        "apt-cacher-rs {APP_VERSION} ({}) starting...",
+        get_features(false).replace('\n', " ")
+    );
+
     #[expect(clippy::print_stderr, reason = "print to stderr for panic hook")]
     std::panic::set_hook(Box::new(move |info| {
         error!("Panic: {info}");
