@@ -2458,8 +2458,9 @@ async fn splice_proxy_body(
                     if let Err(drain_err) =
                         ktls::drain_control_messages(upstream.as_fd(), ktls::DrainExpect::DataReady)
                     {
-                        warn!(
-                            "splice proxy: mid-stream kTLS control-record drain failed:  {}",
+                        warn_once!(
+                            "splice proxy (kTLS): mid-stream control-record drain failed for `{}`, aborting the transfer:  {}",
+                            cache_path.display(),
                             ErrorReport(&drain_err)
                         );
                         return Err(errno_to_io_error(err, "splice failed on kTLS record"));
@@ -2558,7 +2559,8 @@ async fn splice_proxy_body(
                 let demote_remaining_percent =
                     100.0 * demote_remaining as f32 / range_filter.send as f32;
                 info!(
-                    "splice proxy: demoting slow client to file-serve at cache offset {} with {} remaining out of {} ({:.1}%)",
+                    "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%)",
+                    cache_path.display(),
                     HumanFmt::Size(demote_pos),
                     HumanFmt::Size(demote_remaining),
                     HumanFmt::Size(range_filter.send),
@@ -2962,7 +2964,8 @@ async fn splice_proxy_body_tls(
                 let demote_remaining_percent =
                     100.0 * demote_remaining as f32 / range_filter.send as f32;
                 info!(
-                    "splice proxy: demoting slow client to file-serve at cache offset {} with {} remaining out of {} ({:.1}%)",
+                    "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%)",
+                    cache_path.display(),
                     HumanFmt::Size(demote_pos),
                     HumanFmt::Size(demote_remaining),
                     HumanFmt::Size(range_filter.send),
@@ -3173,7 +3176,8 @@ async fn serve_remaining_from_file(
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> DeliveryResult {
     debug!(
-        "splice proxy: starting to serve remaining bytes from cache file for demoted client at offset {content_start} ({content_length} bytes remaining)",
+        "splice proxy: starting to serve remaining bytes of `{}` from the cache file for the demoted client at offset {content_start} ({content_length} bytes remaining)",
+        cache_path.display()
     );
 
     // Demoted clients keep reading the partial cache file linearly via
@@ -3205,12 +3209,14 @@ async fn serve_remaining_from_file(
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
                 debug!(
-                    "splice proxy: demoted client disconnected during file-serve from cache offset {content_start}:  {}",
+                    "splice proxy: demoted client disconnected during file-serve of `{}` from cache offset {content_start}:  {}",
+                    cache_path.display(),
                     ErrorReport(&err)
                 );
             } else {
                 info!(
-                    "splice proxy: demoted client file-serve error from cache offset {content_start}:  {}",
+                    "splice proxy: demoted client file-serve of `{}` failed at cache offset {content_start}, the client did not get the full body:  {}",
+                    cache_path.display(),
                     ErrorReport(&err)
                 );
             }
@@ -3930,8 +3936,12 @@ async fn follow_redirect(
         return Ok(None);
     }
     let Ok(moved_domain) = ClientHost::new(moved_host.to_owned()) else {
-        warn!(
-            "splice proxy: {status} redirect host `{moved_host}` is not a valid domain, not following"
+        // Upstream-controlled and per request, like its sibling branches.
+        warn_once_or_info!(
+            "splice proxy: upstream {} sent {status} for {} with an invalid redirect host `{}`, not followed and not cached",
+            conn_details.mirror,
+            conn_details.debname,
+            moved_host.escape_debug()
         );
         return Ok(None);
     };
@@ -4736,7 +4746,7 @@ async fn splice_proxy_drive(
                 Ok(_) => {
                     metrics::CACHE_NON_REGULAR.increment();
                     error!(
-                        "splice proxy: cache file `{}` is not a regular file",
+                        "splice proxy: cache file `{}` is not a regular file, refusing to serve and returning 500",
                         cache_path.display()
                     );
                     return Err(SpliceProxyError::Cache);
@@ -4810,7 +4820,9 @@ async fn splice_proxy_drive(
             } else {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "splice proxy: no usable Content-Length (from kTLS attempt), returning 502"
+                    "splice proxy: upstream {} sent no usable Content-Length for {} (from kTLS attempt), returning 502",
+                    conn_details.mirror,
+                    conn_details.debname
                 );
                 // Honoring the kTLS-parsed response: record its status before
                 // emitting our own 502 to the client. (The standard path is not
@@ -5628,7 +5640,8 @@ async fn splice_proxy_drive(
             };
             if current_size != resume_offset {
                 error!(
-                    "splice proxy: partial file size {current_size} != expected {resume_offset} despite held fd"
+                    "splice proxy: partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd, returning 500",
+                    conn_details.debname, conn_details.mirror
                 );
                 write_invalid_response(
                     client_stream,
@@ -5961,7 +5974,11 @@ async fn splice_proxy_drive(
             .await
             {
                 info!(
-                    "splice proxy: failed to write body prefix to client (continuing cache-only):  {err}"
+                    "splice proxy: failed to write body prefix to client {} for {} from mirror {} (continuing cache-only):  {}",
+                    conn_details.client,
+                    conn_details.debname,
+                    conn_details.mirror,
+                    ErrorReport(&err)
                 );
                 prefix_client_failed = true;
             } else {
@@ -6023,7 +6040,11 @@ async fn splice_proxy_drive(
             .await
             {
                 info!(
-                    "splice proxy: failed to write kTLS extra body to client (continuing cache-only):  {err}"
+                    "splice proxy: failed to write kTLS extra body to client {} for {} from mirror {} (continuing cache-only):  {}",
+                    conn_details.client,
+                    conn_details.debname,
+                    conn_details.mirror,
+                    ErrorReport(&err)
                 );
                 prefix_client_failed = true;
             } else {
@@ -6552,7 +6573,7 @@ async fn serve_cached_cleanup_file(
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
             error!(
-                "Cache file `{}` is not a regular file",
+                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
                 cache_path.display()
             );
             return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
@@ -6572,8 +6593,8 @@ async fn serve_cached_cleanup_file(
         .modified()
         .expect("Platform should support modification timestamps via setup check");
     let Ok(elapsed) = modified.elapsed() else {
-        warn!(
-            "Volatile file `{}` was modified in the future, ignoring modification time",
+        warn_once_or_info!(
+            "Volatile file `{}` was modified in the future, treating it as stale and refetching from upstream",
             cache_path.display()
         );
         return None;
@@ -6727,7 +6748,9 @@ async fn cleanup_upstream_fetch(
             }
         };
         if let Err(err) = drained {
-            debug!("splice cleanup request to {upstream_path} failed to drain error body: {err}");
+            debug!(
+                "splice cleanup request to {host_authority}{upstream_path} failed to drain the error body:  {err}"
+            );
         }
         return cleanup_response(status);
     }
@@ -6757,7 +6780,9 @@ async fn cleanup_upstream_fetch(
             .body(full_body(body))
             .expect("upstream response is valid"),
         Err(err) => {
-            debug!("splice cleanup request to {upstream_path} failed to read body: {err}");
+            debug!(
+                "splice cleanup request to {host_authority}{upstream_path} failed to read the body:  {err}"
+            );
             let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
             resp.extensions_mut().insert(UpstreamFetchError {
                 reason: ErrorReport(&err).to_string(),
