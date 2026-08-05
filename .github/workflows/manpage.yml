@@ -1,0 +1,40 @@
+name: Man page
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  manpage-lint:
+    name: Man page lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mandoc and groff
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mandoc groff
+
+      - name: Lint via mandoc
+        run: mandoc -T lint debian/*.[1-8]
+
+      - name: Lint via groff
+        # groff exits 0 even when it warns, so any diagnostic on stderr fails
+        # the step.  It catches a different class than mandoc (undefined
+        # macros and strings), hence both.
+        run: |
+          warnings=$(groff -man -ww -z debian/*.[1-8] 2>&1 >/dev/null)
+          if [ -n "$warnings" ]; then
+            echo "$warnings" >&2
+            exit 1
+          fi
