@@ -185,7 +185,7 @@ fn check_inodes_free(inodes: Option<InodeSpace>) -> CheckResult {
 
 /// Returns the operator-facing detail when either floor is breached, `None` otherwise.
 #[must_use]
-fn low_inodes_detail(inodes: Option<InodeSpace>) -> Option<String> {
+pub(crate) fn low_inodes_detail(inodes: Option<InodeSpace>) -> Option<String> {
     let inodes = inodes?;
     let InodeSpace { free, total } = inodes;
     if free < MIN_FREE_INODES {

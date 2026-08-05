@@ -20,7 +20,10 @@ use crate::{
     cache_layout::SUBDIR_FLAT,
     config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
     deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
-    flat_blocklist, global_config, warn_once_or_info,
+    error::ErrorReport,
+    flat_blocklist, global_config,
+    humanfmt::HumanFmt,
+    warn_once_or_info,
 };
 
 /// Resolve `host` through the configured aliases and return a reference to the
@@ -432,6 +435,32 @@ async fn upsert_mirror_get_id(
     Ok((row.id, row.was_inserted))
 }
 
+/// On-disk footprint of the `SQLite` database: the main file plus its `-wal`
+/// sidecar, which in WAL mode can hold a sizeable share of the rows (an
+/// unclean shutdown leaves it uncheckpointed). `None` when the main file
+/// cannot be stat'ed; a missing/unreadable WAL simply contributes zero.
+async fn database_file_size(path: &Path) -> Option<u64> {
+    let main = tokio::fs::metadata(path)
+        .await
+        .inspect_err(|err| {
+            warn!(
+                "Failed to stat database `{}`:  {}",
+                path.display(),
+                ErrorReport(err)
+            );
+        })
+        .ok()?
+        .len();
+
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let wal = tokio::fs::metadata(PathBuf::from(wal))
+        .await
+        .map_or(0, |md| md.len());
+
+    Some(main.saturating_add(wal))
+}
+
 impl Database {
     pub(crate) async fn connect(path: &Path, slow_timeout: Duration) -> Result<Self, Error> {
         let url = format!("sqlite://{}", path.display());
@@ -455,7 +484,15 @@ impl Database {
             .log_slow_statements(log::LevelFilter::Warn, slow_timeout);
         let conn = SqlitePool::connect_with(opts).await?;
 
-        info!("Database `{}` opened", path.display());
+        if let Some(size) = database_file_size(path).await {
+            info!(
+                "Database `{}` opened (size: {})",
+                path.display(),
+                HumanFmt::Size(size)
+            );
+        } else {
+            info!("Database `{}` opened", path.display());
+        }
 
         Ok(Self { conn })
     }

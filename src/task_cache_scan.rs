@@ -13,6 +13,30 @@ use crate::{
     utils::probe_dir,
 };
 
+/// Tally of one scan pass: the bytes counted towards the cache size and the
+/// number of regular files they came from.  The file count is what makes an
+/// `ENOSPC` from inode exhaustion legible next to a modest byte total, and it
+/// is directly comparable with cleanup's `retained`/`removed` file counts.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ScanTotals {
+    pub(crate) bytes: u64,
+    pub(crate) files: u64,
+}
+
+impl ScanTotals {
+    fn add_file(&mut self, size: u64) {
+        self.bytes = self.bytes.saturating_add(size);
+        self.files = self.files.saturating_add(1);
+    }
+}
+
+impl std::ops::AddAssign for ScanTotals {
+    fn add_assign(&mut self, rhs: Self) {
+        self.bytes = self.bytes.saturating_add(rhs.bytes);
+        self.files = self.files.saturating_add(rhs.files);
+    }
+}
+
 /// Mode that drives [`scan_sub_dir_recursive`].  The scanner is shared
 /// between the structured-mirror subtree (e.g. `dists/`), the host-level
 /// flat tree, and the by-hash leaves so the surrounding `read_dir` / lstat /
@@ -38,9 +62,9 @@ impl SubDirMode {
     }
 }
 
-/// Returns the size in bytes of the entire cache.
+/// Returns the size in bytes and the file count of the entire cache.
 /// Files that cannot be accessed are not included; a message is logged for each.
-pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCacheError> {
+pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, ProxyCacheError> {
     let config = global_config();
 
     let mirrors = match database.get_mirrors().await {
@@ -89,7 +113,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         mirrors_by_dir.entry(dir_name).or_default().push(mirror);
     }
 
-    let mut cache_size = 0;
+    let mut totals = ScanTotals::default();
 
     loop {
         let entry = match cache_dir.next_entry().await {
@@ -194,7 +218,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
             .unwrap_or_default();
 
         for mirror in mirrors_here {
-            cache_size += scan_mirror_dir(&entry, mirror, host_paths).await;
+            totals += scan_mirror_dir(&entry, mirror, host_paths).await;
         }
 
         // The host-level `flat/` subtree is a sibling of mirror dirs.
@@ -203,7 +227,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         let flat_path = entry.path().join(SUBDIR_FLAT);
         match probe_dir(&flat_path, "host-level flat root").await {
             Ok(true) => {
-                cache_size += scan_sub_dir_recursive(flat_path, SubDirMode::Flat).await;
+                totals += scan_sub_dir_recursive(flat_path, SubDirMode::Flat).await;
             }
             Ok(false) => {}
             Err(err) => {
@@ -216,7 +240,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<u64, ProxyCac
         }
     }
 
-    Ok(cache_size)
+    Ok(totals)
 }
 
 #[must_use]
@@ -224,7 +248,7 @@ async fn scan_mirror_dir(
     host: &DirEntry,
     mirror: &MirrorEntry,
     other_mirror_paths: &[&str],
-) -> u64 {
+) -> ScanTotals {
     let mirror_path = {
         let mut p = host.path();
         let mpath = Path::new(&mirror.path);
@@ -263,7 +287,7 @@ async fn scan_mirror_dir(
                     mirror_path.display()
                 );
             }
-            return 0;
+            return ScanTotals::default();
         }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -271,11 +295,11 @@ async fn scan_mirror_dir(
                 "Failed to read mirror directory `{}`:  {err}",
                 mirror_path.display()
             );
-            return 0;
+            return ScanTotals::default();
         }
     };
 
-    let mut dir_size = 0;
+    let mut totals = ScanTotals::default();
 
     loop {
         let entry = match mirror_dir.next_entry().await {
@@ -287,7 +311,7 @@ async fn scan_mirror_dir(
                     "Failed to iterate mirror directory `{}`:  {err}",
                     mirror_path.display()
                 );
-                return dir_size;
+                return totals;
             }
         };
 
@@ -318,7 +342,7 @@ async fn scan_mirror_dir(
         }
 
         if file_type.is_file() {
-            dir_size += mdata.len();
+            totals.add_file(mdata.len());
 
             if name.to_str().is_some_and(is_deb_package) {
                 continue;
@@ -334,7 +358,7 @@ async fn scan_mirror_dir(
             // `<host>/flat/` (host-level sibling of mirror dirs), not
             // below any mirror, so no `flat/` arm here.
             if KNOWN_MIRROR_SUBDIRS.iter().any(|known| name == *known) {
-                dir_size += scan_sub_dir_recursive(entry.path(), SubDirMode::Structured).await;
+                totals += scan_sub_dir_recursive(entry.path(), SubDirMode::Structured).await;
                 continue;
             }
             if name == SUBDIR_TMP {
@@ -396,12 +420,13 @@ async fn scan_mirror_dir(
     }
 
     trace!(
-        "Size of mirror directory `{}`: {}",
+        "Size of mirror directory `{}`: {} in {} files",
         mirror_path.display(),
-        dir_size
+        totals.bytes,
+        totals.files
     );
 
-    dir_size
+    totals
 }
 
 /// Whether `expected` (the would-be full mirror-path of a subdir found
@@ -431,10 +456,13 @@ fn contains_nested_mirror_path(expected: &str, other_paths: &[&str]) -> bool {
 /// (`Structured`/`Flat` on a `by-hash` name), skipped (`tmp/` under `Flat`),
 /// or warned about (everything else).
 #[must_use]
-async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubDirMode) -> u64 {
+async fn scan_sub_dir_recursive(
+    subdir_path: std::path::PathBuf,
+    root_mode: SubDirMode,
+) -> ScanTotals {
     // Iterative DFS using an in-place stack avoids Box::pin'ing the
     // recursive future shape (async fn recursion).
-    let mut dir_size = 0u64;
+    let mut totals = ScanTotals::default();
     let mut stack: Vec<(std::path::PathBuf, SubDirMode)> = vec![(subdir_path, root_mode)];
 
     'outer: while let Some((current, mode)) = stack.pop() {
@@ -494,7 +522,7 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
             }
 
             if file_type.is_file() {
-                dir_size += mdata.len();
+                totals.add_file(mdata.len());
                 continue;
             }
 
@@ -537,7 +565,7 @@ async fn scan_sub_dir_recursive(subdir_path: std::path::PathBuf, root_mode: SubD
         }
     }
 
-    dir_size
+    totals
 }
 
 #[cfg(test)]
