@@ -309,7 +309,9 @@ pub(super) async fn run_mirror_units(
                 removed_unreferenced += unit_stats.removed_unreferenced;
             }
             Err(err) => {
-                error!("Error in cleanup task:  {err}");
+                error!(
+                    "Error in cleanup task for mirror {mirror}, skipping this unit and continuing with the mirror's remaining units:  {err}"
+                );
             }
         }
     }
@@ -1268,7 +1270,7 @@ async fn resolve_origin_packages_self(
         .collect::<Vec<_>>();
 
     info!(
-        "Found {} active origins and {} cached deb files for mirror {}",
+        "Found {} active origins and {} cached deb files for mirror {mirror} (`{}`)",
         active_origins.len(),
         cached_files.len(),
         entry.cache_path().display(),
@@ -1282,8 +1284,7 @@ async fn resolve_origin_packages_self(
     if !cached_files.is_empty() && active_origins.is_empty() {
         if origins_count == 0 {
             info!(
-                "Mirror {}: no origin records - cached debs cannot be reconciled against any Packages index; aging out via the {} grace window",
-                entry.cache_path().display(),
+                "Mirror {mirror}: no origin records - cached debs cannot be reconciled against any Packages index; aging out via the {} grace window",
                 HumanFmt::Time(grace),
             );
         } else {
@@ -1291,8 +1292,7 @@ async fn resolve_origin_packages_self(
             let age_secs = u64::try_from(now_secs.saturating_sub(most_recent_origin)).unwrap_or(0);
             let most_recent_age = Duration::from_secs(age_secs);
             info!(
-                "Mirror {}: all {origins_count} origin records stale (most recent seen {} ago, retention window {}); cached debs will age out via the {} grace window",
-                entry.cache_path().display(),
+                "Mirror {mirror}: all {origins_count} origin records stale (most recent seen {} ago, retention window {}); cached debs will age out via the {} grace window",
                 HumanFmt::Time(most_recent_age),
                 HumanFmt::Time(RETENTION_TIME),
                 HumanFmt::Time(grace),

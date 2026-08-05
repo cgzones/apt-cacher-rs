@@ -257,8 +257,13 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
 
             if difference != 0 {
                 warn!(
-                    "Repaired cache size discrepancy of {difference}: actual={actual_cache_size} ({} files) stored={stored} corrected={csize} active={active_downloading_size}",
-                    scanned.files
+                    "Repaired cache size discrepancy of {}: actual={} ({} files) stored={} corrected={} active={}",
+                    HumanFmt::Size(difference),
+                    HumanFmt::Size(actual_cache_size),
+                    scanned.files,
+                    HumanFmt::Size(stored),
+                    HumanFmt::Size(csize),
+                    HumanFmt::Size(active_downloading_size)
                 );
             } else {
                 debug!(

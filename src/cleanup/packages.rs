@@ -24,6 +24,7 @@ use crate::{
     },
     metrics,
     precise_instant::PreciseInstant,
+    warn_once_or_debug,
 };
 // `process_cache_request` has a hyper implementation and a splice-only stub
 // (in `main.rs`) that bridges to `splice_cleanup_request`; cleanup calls it
@@ -198,8 +199,13 @@ async fn process_stanza(
 
     match stanza.chosen() {
         None => {
-            warn!(
-                "Packages stanza for `{filename}` advertises no SHA256/SHA512; retaining cache file `{}` without verification",
+            // Fires once per cached file per cycle on a digest-less index,
+            // so degrade after the first; matches `integrity.rs`'s handling of
+            // the same condition.
+            warn_once_or_debug!(
+                "cleanup: Packages stanza for `{}` from mirror {} advertises no SHA256/SHA512; retaining cache file `{}` without verification",
+                filename.escape_debug(),
+                ctx.mirror,
                 path.display(),
             );
         }
@@ -302,7 +308,12 @@ pub(super) async fn reduce_file_list(
             // For compressed formats an empty file is malformed:
             // both gzip and xz require at least a header.
             PackagesCompression::Gz | PackagesCompression::Xz => {
-                warn!("Packages file `{filename}` has zero size");
+                // `filename` is the synthetic memfd name, so name the mirror:
+                // this bails the mirror's whole reconcile for the cycle.
+                warn!(
+                    "cleanup: compressed Packages index `{filename}` for mirror {} is zero bytes; skipping this mirror's reconcile for this cycle (nothing reclaimed)",
+                    ctx.mirror
+                );
                 Err(ProxyCacheError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "zero size",
@@ -546,7 +557,11 @@ pub(super) async fn try_fetch_packages_file(
                 continue;
             }
             _ => {
-                warn!("Cleanup request {uri} failed with status code {status}");
+                // The caller logs the same failure with the mirror and the
+                // consequence; keep this one for the format-fallback detail.
+                debug!(
+                    "cleanup request {uri} failed with status code {status}; aborting the Packages format-fallback chain"
+                );
                 return Err(FetchFailure {
                     status,
                     upstream: None,
@@ -566,7 +581,6 @@ mod tests {
     use super::*;
 
     use crate::cleanup::engine::SpanClass;
-    use crate::config::Config;
     use crate::{
         config::ClientHost,
         deb_mirror::MirrorKind,

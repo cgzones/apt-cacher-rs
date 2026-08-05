@@ -130,8 +130,8 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
                 // reaching this branch indicates a future divergence between
                 // the parser and the digest decoder. Keep the warning visible.
                 warn_once_or_info!(
-                    "By-hash digest did not decode for its URL algorithm; caching unverified: `{}`",
-                    filename
+                    "integrity: by-hash digest did not decode for its URL algorithm; caching `{}` unverified",
+                    filename.escape_debug()
                 );
             }
             decoded
@@ -567,8 +567,8 @@ pub(crate) async fn verify_and_rename(plan: &RenamePlan) -> Result<(), CommitErr
     if let VerifyOutcome::Reject(err) = outcome {
         if matches!(err, CommitError::ChecksumMismatch) {
             warn!(
-                "Checksum mismatch for `{}` from host `{}`; not caching",
-                plan.debname, plan.host,
+                "Checksum mismatch for `{}` from host `{}` mirror `{}`; discarding the download, not caching",
+                plan.debname, plan.host, plan.mirror_path,
             );
         }
         return Err(err);
@@ -729,8 +729,11 @@ fn spawn_ingest(plan: &RenamePlan) {
             }
         };
         if let Err(err) = result {
-            debug!(
-                "Index ingestion of `{}` failed:  {}",
+            // A persistent ingest failure leaves the registry empty, so every
+            // deb from this mirror is committed unverified -- so far visible
+            // only as a climbing CHECKSUM_UNVERIFIED.
+            warn_once_or_debug!(
+                "integrity: index ingestion of `{}` for host `{host}` mirror `{mirror_path}` failed, debs from this mirror stay unverified until an ingest succeeds:  {}",
                 dest.display(),
                 ErrorReport(&err),
             );
@@ -851,7 +854,7 @@ pub(crate) async fn ingest_packages_file(
         Ok(m) => m.len(),
         Err(err) => {
             warn!(
-                "Could not stat `{}` for decompression-ratio guard during Packages ingestion:  {}",
+                "Could not stat `{}` for the decompression-ratio guard during Packages ingestion, ingesting with the guard disabled:  {}",
                 path.display(),
                 ErrorReport(&err),
             );

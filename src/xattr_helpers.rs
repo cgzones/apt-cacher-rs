@@ -14,6 +14,8 @@ use nix::libc;
 use tracing::warn;
 use xattr::FileExt as _;
 
+use crate::warn_once_or_debug;
+
 /// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
 pub(crate) struct XattrFile<'a>(pub(crate) &'a tokio::fs::File);
 
@@ -104,8 +106,11 @@ pub(crate) fn try_read_helper(
             {
                 Ok(None)
             } else {
-                warn!(
-                    "Unexpected error reading xattr from `{}` for key `{key}`:  {err}",
+                // ENOTSUP/ENODATA are filtered above, so what reaches here is
+                // the persistent failure class (LSM denial, EIO) on a
+                // per-request path: warn once, then degrade.
+                warn_once_or_debug!(
+                    "Unexpected error reading xattr from `{}` for key `{key}`, treating the value as absent for this request:  {err}",
                     display_path.display()
                 );
                 Err(XattrIoError)
@@ -137,8 +142,8 @@ pub(crate) fn write_helper(
     if let Err(err) = data {
         let kind = err.kind();
         if kind != std::io::ErrorKind::Unsupported {
-            warn!(
-                "Failed to write xattr to `{}` for key `{key}`:  {err}",
+            warn_once_or_debug!(
+                "Failed to write xattr to `{}` for key `{key}`, the value will not survive a restart:  {err}",
                 display_path.display()
             );
         }

@@ -155,7 +155,7 @@ pub(super) async fn build_byhash_reference_set(
                 // for the whole directory and fall back to age-based retention.
                 metrics::CACHE_IO_FAILURE.increment();
                 warn!(
-                    "Could not read Release file `{}` for by-hash reconciliation ({err}); falling back to age-based retention",
+                    "Could not read Release file `{}` for by-hash reconciliation, falling back to age-based retention:  {err}",
                     path.display()
                 );
                 return None;
