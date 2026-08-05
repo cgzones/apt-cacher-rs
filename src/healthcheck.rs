@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use coarsetime::Instant;
 use tokio::io::AsyncWriteExt as _;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::{
     cache_quota::CacheQuota,
     database_task::{DatabaseCommand, DbCmdPing, send_db_command},
     error::ErrorReport,
     global_cache_quota, global_config, swrite,
-    utils::{free_disk_space, tokio_nofollow_options},
+    utils::{InodeSpace, filesystem_space, tokio_nofollow_options},
     warn_once_or_info,
 };
 
@@ -65,6 +65,7 @@ pub(crate) struct HealthReport {
     cache_write: CheckResult,
     quota: CheckResult,
     disk_free: CheckResult,
+    inodes_free: CheckResult,
 }
 
 impl HealthReport {
@@ -75,8 +76,9 @@ impl HealthReport {
             cache_write,
             quota,
             disk_free,
+            inodes_free,
         } = self;
-        database.ok() && cache_write.ok() && quota.ok() && disk_free.ok()
+        database.ok() && cache_write.ok() && quota.ok() && disk_free.ok() && inodes_free.ok()
     }
 
     #[must_use]
@@ -86,6 +88,7 @@ impl HealthReport {
             cache_write,
             quota,
             disk_free,
+            inodes_free,
         } = self;
         let mut out = String::with_capacity(128);
         out.push_str("{\"status\":\"");
@@ -102,6 +105,8 @@ impl HealthReport {
         quota.write_json(&mut out);
         out.push_str(",\"disk_free\":");
         disk_free.write_json(&mut out);
+        out.push_str(",\"inodes_free\":");
+        inodes_free.write_json(&mut out);
         out.push_str("}}");
         out
     }
@@ -152,18 +157,77 @@ fn check_disk_free(free: Option<u64>, min_free: NonZero<u64>) -> CheckResult {
     }
 }
 
-/// Probe wrapper for [`check_disk_free`]: skips the statvfs entirely when
-/// no minimum is configured, and bounds the (blocking-pool) statvfs with
-/// [`CHECK_TIMEOUT`] like the other probes.
-async fn probe_disk_free(cache_dir: &Path, min_free: Option<NonZero<u64>>) -> CheckResult {
-    let Some(min_free) = min_free else {
-        return CheckResult::Pass;
+/// Free inodes below which the cache filesystem is reported unhealthy.
+/// Deliberately a constant rather than a config knob: unlike free bytes,
+/// where the operator picks a policy floor, a filesystem this close to inode
+/// exhaustion cannot create cache files at all -- the daemon is broken
+/// regardless of policy, and the failure arrives as `ENOSPC` with plenty of
+/// bytes still free.
+const MIN_FREE_INODES: u64 = 1000;
+
+/// Second inode floor, relative to the filesystem's inode table: a big
+/// filesystem can hold far more than [`MIN_FREE_INODES`] and still be one
+/// large mirror sync away from exhaustion, so anything under this fraction
+/// of the total counts as unhealthy too.
+const MIN_FREE_INODE_FRACTION: u64 = 10;
+
+/// Free-inode headroom on the cache filesystem. Passes when the filesystem
+/// reports no inode limit (btrfs and friends report a total of 0) or when
+/// the probe produced no sample: `disk_free` already owns the
+/// "cannot measure" verdict wherever a minimum is configured, and inode
+/// accounting has no configured minimum to make it required.
+fn check_inodes_free(inodes: Option<InodeSpace>) -> CheckResult {
+    match low_inodes_detail(inodes) {
+        Some(detail) => CheckResult::Fail(detail),
+        None => CheckResult::Pass,
+    }
+}
+
+/// Returns the operator-facing detail when either floor is breached, `None` otherwise.
+#[must_use]
+fn low_inodes_detail(inodes: Option<InodeSpace>) -> Option<String> {
+    let inodes = inodes?;
+    let InodeSpace { free, total } = inodes;
+    if free < MIN_FREE_INODES {
+        return Some(format!(
+            "low free inodes: {free} of {total} total, minimum {MIN_FREE_INODES}"
+        ));
+    }
+    if inodes.free_below_fraction(MIN_FREE_INODE_FRACTION) {
+        return Some(format!(
+            "low free inodes: {free} of {total} total, minimum {}% of the inode table",
+            100 / MIN_FREE_INODE_FRACTION
+        ));
+    }
+    None
+}
+
+/// One statvfs feeding both filesystem checks, bounded by [`CHECK_TIMEOUT`]
+/// like the other probes. Returns `(disk_free, inodes_free)`. The probe runs
+/// even without a configured `min_disk_free`, because inode exhaustion is
+/// invisible to that setting.
+async fn probe_filesystem(
+    cache_dir: &Path,
+    min_free: Option<NonZero<u64>>,
+) -> (CheckResult, CheckResult) {
+    let space = match tokio::time::timeout(CHECK_TIMEOUT, filesystem_space(cache_dir)).await {
+        Ok(space) => space,
+        Err(_elapsed) => {
+            let disk_free = match min_free {
+                Some(_) => {
+                    CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs()))
+                }
+                None => CheckResult::Pass,
+            };
+            return (disk_free, CheckResult::Pass);
+        }
     };
 
-    match tokio::time::timeout(CHECK_TIMEOUT, free_disk_space(cache_dir)).await {
-        Ok(free) => check_disk_free(free, min_free),
-        Err(_elapsed) => CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
-    }
+    let disk_free = match min_free {
+        Some(min_free) => check_disk_free(space.map(|s| s.free_bytes), min_free),
+        None => CheckResult::Pass,
+    };
+    (disk_free, check_inodes_free(space.and_then(|s| s.inodes)))
 }
 
 /// Cache-directory writability: create, write, and unlink a small probe
@@ -241,10 +305,10 @@ async fn run_healthcheck(
     cache_dir: &Path,
     min_disk_free: Option<NonZero<u64>>,
 ) -> HealthReport {
-    let (database, cache_write, disk_free) = tokio::join!(
+    let (database, cache_write, (disk_free, inodes_free)) = tokio::join!(
         check_database(),
         check_cache_write(cache_dir),
-        probe_disk_free(cache_dir, min_disk_free)
+        probe_filesystem(cache_dir, min_disk_free)
     );
     let quota = check_quota(quota.current_size(), quota.quota_limit());
     HealthReport {
@@ -252,6 +316,7 @@ async fn run_healthcheck(
         cache_write,
         quota,
         disk_free,
+        inodes_free,
     }
 }
 
@@ -270,6 +335,12 @@ pub(crate) async fn cached_health_report() -> HealthReport {
     {
         return report.clone();
     }
+    // Captured for the recovery line: naming what had been failing is the
+    // difference between "it is fine now" and an actionable record.
+    let previous_failure = cache
+        .as_ref()
+        .filter(|(_at, prev)| !prev.healthy())
+        .map(|(_at, prev)| prev.to_json());
     let config = global_config();
     let report = run_healthcheck(
         global_cache_quota(),
@@ -279,6 +350,10 @@ pub(crate) async fn cached_health_report() -> HealthReport {
     .await;
     if !report.healthy() {
         warn_once_or_info!("Health check failing: {}", report.to_json());
+    } else if let Some(previous) = previous_failure {
+        // Without this the log records only that the daemon went unhealthy,
+        // never that it came back -- leaving the failure looking open-ended.
+        info!("Health check recovered, was: {previous}");
     }
     *cache = Some((Instant::now(), report.clone()));
     report
@@ -345,18 +420,82 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn disk_free_probe_uses_real_statvfs() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // 1 byte of required headroom passes on any writable filesystem.
-        let r = probe_disk_free(dir.path(), Some(nonzero!(1_u64))).await;
-        assert_eq!(r, CheckResult::Pass);
-        // A missing directory must fail the probe, not silently pass.
-        let r = probe_disk_free(&dir.path().join("nonexistent"), Some(nonzero!(1_u64))).await;
+    #[expect(clippy::unnecessary_wraps, reason = "used for unit testing")]
+    fn inodes(free: u64, total: u64) -> Option<InodeSpace> {
+        Some(InodeSpace {
+            free,
+            total: NonZero::new(total).expect("non-zero total"),
+        })
+    }
+
+    #[test]
+    fn inodes_free_above_both_floors_passes() {
+        // 10% of the table and above the absolute floor.
         assert_eq!(
-            r,
+            check_inodes_free(inodes(10_000, 100_000)),
+            CheckResult::Pass
+        );
+    }
+
+    #[test]
+    fn inodes_free_below_absolute_floor_fails() {
+        // Above 10% of a small table, but under the absolute floor.
+        assert_eq!(
+            check_inodes_free(inodes(MIN_FREE_INODES - 1, 2000)),
+            CheckResult::Fail(format!(
+                "low free inodes: {} of 2000 total, minimum {MIN_FREE_INODES}",
+                MIN_FREE_INODES - 1
+            ))
+        );
+        assert!(!check_inodes_free(inodes(0, 2000)).ok());
+    }
+
+    #[test]
+    fn inodes_free_below_fraction_fails() {
+        // Comfortably above the absolute floor, but under 10% of the table.
+        assert_eq!(
+            check_inodes_free(inodes(9_999, 100_000)),
+            CheckResult::Fail(String::from(
+                "low free inodes: 9999 of 100000 total, minimum 10% of the inode table"
+            ))
+        );
+    }
+
+    #[test]
+    fn inodes_free_unmeasured_passes() {
+        // No inode limit (btrfs) and a failed probe both fail open: unlike
+        // free bytes there is no configured policy making the figure
+        // required.
+        assert_eq!(check_inodes_free(None), CheckResult::Pass);
+    }
+
+    #[tokio::test]
+    async fn filesystem_probe_uses_real_statvfs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 1 byte of required headroom passes on any writable filesystem, and
+        // a real filesystem is never within 1000 inodes of exhaustion here.
+        let (disk_free, inodes_free) = probe_filesystem(dir.path(), Some(nonzero!(1_u64))).await;
+        assert_eq!(disk_free, CheckResult::Pass);
+        assert_eq!(inodes_free, CheckResult::Pass);
+        // A missing directory must fail the disk-free probe, not silently
+        // pass; the inode check fails open on the same failed sample.
+        let (disk_free, inodes_free) =
+            probe_filesystem(&dir.path().join("nonexistent"), Some(nonzero!(1_u64))).await;
+        assert_eq!(
+            disk_free,
             CheckResult::Fail(String::from("could not determine free disk space"))
         );
+        assert_eq!(inodes_free, CheckResult::Pass);
+    }
+
+    #[tokio::test]
+    async fn filesystem_probe_checks_inodes_without_configured_minimum() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Without `min_disk_free` the byte check is skipped, but the statvfs
+        // still runs so inode exhaustion stays visible.
+        let (disk_free, inodes_free) = probe_filesystem(dir.path(), None).await;
+        assert_eq!(disk_free, CheckResult::Pass);
+        assert_eq!(inodes_free, CheckResult::Pass);
     }
 
     #[test]
@@ -416,13 +555,14 @@ mod tests {
             cache_write: CheckResult::Pass,
             quota: CheckResult::Pass,
             disk_free: CheckResult::Pass,
+            inodes_free: CheckResult::Pass,
         };
         assert!(report.healthy());
         assert_eq!(
             report.to_json(),
             "{\"status\":\"healthy\",\"checks\":{\"database\":{\"ok\":true},\
              \"cache_write\":{\"ok\":true},\"quota\":{\"ok\":true},\
-             \"disk_free\":{\"ok\":true}}}"
+             \"disk_free\":{\"ok\":true},\"inodes_free\":{\"ok\":true}}}"
         );
     }
 
@@ -433,13 +573,15 @@ mod tests {
             cache_write: CheckResult::Fail(String::from("boom \"quoted\"")),
             quota: CheckResult::Pass,
             disk_free: CheckResult::Pass,
+            inodes_free: CheckResult::Pass,
         };
         assert!(!report.healthy());
         assert_eq!(
             report.to_json(),
             "{\"status\":\"unhealthy\",\"checks\":{\"database\":{\"ok\":true},\
              \"cache_write\":{\"ok\":false,\"detail\":\"boom \\\"quoted\\\"\"},\
-             \"quota\":{\"ok\":true},\"disk_free\":{\"ok\":true}}}"
+             \"quota\":{\"ok\":true},\"disk_free\":{\"ok\":true},\
+             \"inodes_free\":{\"ok\":true}}}"
         );
     }
 }

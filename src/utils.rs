@@ -1,4 +1,5 @@
 use std::{
+    num::NonZero,
     ops::Deref,
     path::{Path, PathBuf},
 };
@@ -74,25 +75,68 @@ pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
     )
 }
 
-/// Free disk space (in bytes) available to unprivileged processes on the
-/// filesystem holding `path`, via `statvfs(3)`. Returns `None` when the probe
-/// fails (logged once at warn, then debug) or the byte count overflows.
-/// statvfs can stall on slow/hung filesystems (NFS, FUSE, dying disks); it
-/// runs on the blocking pool so it cannot wedge the tokio worker. Used by the
-/// `/healthcheck` disk-space check.
-pub(crate) async fn free_disk_space(path: &Path) -> Option<u64> {
-    let owned = path.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(&owned))
-        .await
-        .expect("task should not panic");
+/// One `statvfs(3)` snapshot of a filesystem's remaining capacity.
+///
+/// Both figures are what an unprivileged process may still consume. They
+/// fail independently in practice: a cache can be byte-rich and inode-poor
+/// (a mirror of many tiny index files on a small-inode ext4) and then
+/// `ENOSPC` arrives with gigabytes still free.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FsSpace {
+    /// Bytes available to unprivileged processes.
+    pub(crate) free_bytes: u64,
+    /// Inode accounting. `None` when the filesystem reports no inode limit
+    /// at all (btrfs and other dynamically-allocating filesystems report a
+    /// total of 0), which is not the same as "none left".
+    pub(crate) inodes: Option<InodeSpace>,
+}
 
+/// Inode accounting of a filesystem that has a fixed inode table.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InodeSpace {
+    /// Inodes available to unprivileged processes.
+    pub(crate) free: u64,
+    /// Inodes the filesystem was created with.
+    pub(crate) total: NonZero<u64>,
+}
+
+impl InodeSpace {
+    /// Whether fewer than `1/divisor` of all inodes are still available.
+    /// Integer math: no rounding surprises near the boundary.
+    #[must_use]
+    pub(crate) fn free_below_fraction(self, divisor: u64) -> bool {
+        self.free.saturating_mul(divisor) < self.total.get()
+    }
+}
+
+/// Remaining capacity of the filesystem holding `path`, via `statvfs(3)`.
+/// Returns `None` when the blocking task is lost or the probe fails.
+/// Free-byte accounting saturates at `u64::MAX` if the `statvfs` product
+/// does not fit in `u64`. The blocking pool keeps a slow filesystem from
+/// wedging a Tokio worker.
+pub(crate) async fn filesystem_space(path: &Path) -> Option<FsSpace> {
+    let owned = path.to_path_buf();
+    let joined = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(&owned)).await;
+    let result = match joined {
+        Ok(result) => result,
+        Err(err) => {
+            warn_once_or_debug!("statvfs task for `{}` was lost:  {err}", path.display());
+            return None;
+        }
+    };
     let stat = result
         .inspect_err(|err| {
             warn_once_or_debug!("statvfs({}) failed:  {err}", path.display());
         })
-        .ok();
-
-    stat.and_then(|s| s.blocks_available().checked_mul(s.fragment_size()))
+        .ok()?;
+    let free_bytes = stat.blocks_available().saturating_mul(stat.fragment_size());
+    Some(FsSpace {
+        free_bytes,
+        inodes: NonZero::new(stat.files()).map(|total| InodeSpace {
+            free: stat.files_available(),
+            total,
+        }),
+    })
 }
 
 /// Probe whether `path` is a real directory.
