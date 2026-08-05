@@ -2531,7 +2531,7 @@ async fn mirror_directory_size(
 
     if depth >= MAX_DIR_DEPTH {
         warn!(
-            "Reached depth limit of {} while scanning mirror directory `{}`",
+            "Reached depth limit of {} while scanning mirror directory `{}`; everything below it is excluded from the reported cache size",
             MAX_DIR_DEPTH,
             path.display()
         );

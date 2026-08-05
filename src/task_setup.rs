@@ -140,8 +140,9 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
     let cache_lock = lock_cache_dir(cache_path)?;
     mdata.modified().map_err(SetupError::NoMtimeSupport)?;
     if let Err(err) = mdata.created() {
-        info!(
-            "No file creation timestamp (btime) support, volatile file caching is limited:  {err}"
+        warn!(
+            "No file creation timestamp (btime) support on `{}`; volatile index files cannot have their freshness window refreshed and are revalidated upstream more often:  {err}",
+            cache_path.display()
         );
     }
 
@@ -190,7 +191,10 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
                 set_xattr_supported(false);
             }
             Err(err) => {
-                warn!("No extended file attribute support, ETags unavailable:  {err}");
+                warn!(
+                    "No extended file attribute support on `{}`; ETag/Last-Modified revalidation and cleanup checksum memoization are disabled - mount the cache filesystem with user_xattr support:  {err}",
+                    cache_path.display()
+                );
                 set_xattr_supported(false);
             }
         }

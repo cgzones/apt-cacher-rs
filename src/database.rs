@@ -809,8 +809,9 @@ impl Database {
                 let octets: [u8; 16] = match r.client_ip.try_into() {
                     Ok(o) => o,
                     Err(blob) => {
-                        warn!(
-                            "get_clients_with_stats: dropping row with malformed client_ip blob ({} bytes)",
+                        // One line per bad row per dashboard render otherwise.
+                        warn_once_or_info!(
+                            "database: dropping clients-stats row with malformed client_ip blob ({} bytes); restart to purge it via cleanup_invalid_rows",
                             blob.len()
                         );
                         return None;
