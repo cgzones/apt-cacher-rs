@@ -1,6 +1,6 @@
 //! Infallible formatted appends to a [`String`].
 
-/// Destination of [`swrite!`], implemented for [`String`] only — so the macro
+/// Destination of [`swrite!`](crate::swrite), implemented for [`String`] only — so the macro
 /// cannot be aimed at a genuinely fallible [`std::fmt::Write`] sink, where
 /// discarding the `Result` would hide a real I/O error.
 pub(crate) trait StringWrite {

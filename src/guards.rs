@@ -331,7 +331,7 @@ impl DownloadBarrier {
         Err(self.abort_with_rate_timeout(rate).await)
     }
 
-    /// Mid-stream variant of [`check_upstream_rate`] for callers that already
+    /// Mid-stream variant of [`Self::check_upstream_rate`] for callers that already
     /// obtained an `InsufficientRate` outside of an awaitable barrier-owning
     /// context (e.g. surfaced from a closure that does not own the barrier).
     pub(crate) async fn abort_with_rate_timeout(

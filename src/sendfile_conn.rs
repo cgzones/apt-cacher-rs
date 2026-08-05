@@ -2336,7 +2336,7 @@ pub(crate) async fn async_sendfile(
 /// Like [`async_sendfile`], but for a file that is still being written to by
 /// a concurrent download task.  Waits for `watch::Receiver` pings to learn
 /// about new data.  The sender batches notifications (see
-/// [`DownloadBarrier::ping_batched`]), so each ping indicates a meaningful
+/// [`crate::guards::DownloadBarrier::ping_batched`]), so each ping indicates a meaningful
 /// amount of new data on disk.
 ///
 /// `content_start` / `content_length` may describe a sub-range (HTTP Range).

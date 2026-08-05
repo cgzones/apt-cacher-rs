@@ -11,7 +11,7 @@
 //! # Source-of-truth split
 //!
 //! - **In-flight downloads** carry their etag/last-modified on
-//!   [`crate::ActiveDownloadStatus::Download`] and on `Finished { meta:
+//!   [`crate::active_downloads::ActiveDownloadStatus::Download`] and on `Finished { meta:
 //!   Some(_) }`; late-joiners read those directly. `Finished { meta:
 //!   None }` (volatile-304 in `InitBarrier::finished`, error fallback
 //!   in `RenameBarrier::commit`) falls through to
@@ -78,7 +78,7 @@ use crate::{
 };
 
 /// Upstream-supplied metadata for a single cached file.  Used both as the
-/// in-flight value carried on [`crate::ActiveDownloadStatus::Download`] and
+/// in-flight value carried on [`crate::active_downloads::ActiveDownloadStatus::Download`] and
 /// as the post-flight cache entry.
 ///
 /// `last_modified` stores both the raw header string (for `Last-Modified`

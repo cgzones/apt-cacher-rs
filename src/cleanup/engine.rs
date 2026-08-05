@@ -41,9 +41,9 @@ use crate::cleanup::sweep::{SpanTable, SweepResult, sweep_aged_metadata, sweep_c
 ///
 /// Candidates live in a `HashMap<OsString, SpanClass>` keyed by the entry's path
 /// *relative to the unit's tree root*: produced by
-/// [`scan_candidates`](crate::cleanup::scan::scan_candidates), reduced by the
+/// [`scan_candidates`], reduced by the
 /// index sources (which match that key against a `Filename:` value), and swept
-/// by [`sweep_candidates`](crate::cleanup::sweep::sweep_candidates), which
+/// by [`sweep_candidates`], which
 /// rejoins it onto the root. Storing the full path per entry instead would cost
 /// megabytes on a large mirror for no lookup the key cannot already serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,7 +414,7 @@ async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, 
 /// Reap one [`PartialsUnit`]'s `tmp/` directory (the classifier emits one for
 /// the structured tree, one for the flat tree — see `model::classify_mirror`).
 ///
-/// Delegates to [`partials::cleanup_tmp_dir`] for the actual sweep and logs
+/// Delegates to [`cleanup_tmp_dir`] for the actual sweep and logs
 /// the same summary line `cleanup_stale_partials` used to emit (formerly
 /// aggregated across every mirror in one pre-pass; now per-unit). The count is
 /// deliberately NOT returned in `UnitStats` — partial-download

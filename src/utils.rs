@@ -441,7 +441,7 @@ pub(crate) async fn tokio_tempfile(
 /// - Flat:        `{cache_directory}/{host}/flat/{mirror_path}/tmp/{debname}.partial`
 ///
 /// `{host}` is the alias-resolved host when the request was redirected
-/// (mirroring [`ConnectionDetails::cache_dir_path`]); otherwise it is the
+/// (mirroring [`crate::cache_layout::ConnectionDetails::cache_dir_path`]); otherwise it is the
 /// mirror's own host.  Using the same host on both sides keeps the
 /// `.partial` co-located with its rename target so the sibling guarantee
 /// holds.

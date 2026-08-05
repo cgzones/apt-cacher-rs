@@ -2724,7 +2724,7 @@ async fn pwrite_buf_to_file(
 /// Transfer body from TLS upstream to client+cache in userspace.
 ///
 /// Data flow:
-///   `tls_stream` →[async read]→ buffer →[pwrite]→ `cache_file`
+///   `tls_stream` →[async read]→ buffer →\[pwrite\]→ `cache_file`
 ///                                       →[write]→ `client_socket`
 ///
 /// Once the bytes have been decrypted into userspace a pipe+tee fan-out
@@ -7727,7 +7727,7 @@ pub(crate) async fn splice_simple_proxy(
 /// originate race, and the carried `status` lets the caller serve the client
 /// from the in-flight partial via the sendfile backend without falling back
 /// to hyper. Late-joiner accounting was already performed inside
-/// [`crate::ActiveDownloads::originate`].
+/// [`crate::active_downloads::ActiveDownloads::originate`].
 pub(crate) enum SpliceProxyOutcome {
     Served,
     Concurrent {

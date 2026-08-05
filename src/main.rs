@@ -548,7 +548,7 @@ pub(crate) const fn get_features(version: bool) -> &'static str {
 #[derive(Parser)]
 #[command(author, version, long_version(get_features(true)), about)]
 struct Cli {
-    /// Log file path (log to file instead of console [default])
+    /// Log file path (log to file instead of console, the default)
     #[arg(long, value_name = "PATH")]
     log_file: Option<config::LogDestination>,
     /// Logging level
