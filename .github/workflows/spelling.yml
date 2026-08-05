@@ -37,3 +37,15 @@ jobs:
 
       - name: Run codespell
         run: codespell
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Picks up _typos.toml automatically.  Complements codespell: the two
+      # carry different dictionaries and disagree on what is a typo.
+      - name: Run typos
+        uses: crate-ci/typos@v1.49.0

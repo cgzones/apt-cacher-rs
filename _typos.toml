@@ -1,0 +1,10 @@
+[default.extend-words]
+ment = "ment"
+UE = "UE"
+mis = "mis"
+CONNEC = "CONNEC"
+Iz = "Iz"
+
+[default.extend-identifiers]
+flate2 = "flate2"
+test_origin_from_path_byhash_does_not_mis_parse_filename = "test_origin_from_path_byhash_does_not_mis_parse_filename"
