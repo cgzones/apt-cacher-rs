@@ -4,15 +4,15 @@
 //! this (mirror, debname) currently in flight?", shared between the hyper,
 //! splice, and sendfile delivery backends. It is also the single enforcement
 //! site for `max_upstream_downloads`: a new origination at the cap returns
-//! `AtCapacity` from [`ActiveDownloads::insert`] /
-//! [`ActiveDownloads::originate`] (late joiners are exempt — they open no new
+//! `AtCapacity` from `ActiveDownloads::insert` /
+//! `ActiveDownloads::originate` (late joiners are exempt — they open no new
 //! upstream connection), which every backend maps to the canonical 503. It
 //! also drives the related metric accounting so callers don't have to:
 //!
 //! - Late-joiner counts ([`metrics::LATE_JOINERS_TOTAL`] /
 //!   [`metrics::LATE_JOINER_PEAK_PER_DOWNLOAD`]) — bumped atomically when
-//!   [`ActiveDownloads::insert`] joins, [`ActiveDownloads::attach`] hits, or
-//!   [`ActiveDownloads::originate`] returns `Concurrent`.
+//!   `ActiveDownloads::insert` joins, `ActiveDownloads::attach` hits, or
+//!   `ActiveDownloads::originate` returns `Concurrent`.
 //! - Saturation transitions for `max_upstream_downloads`
 //!   ([`metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS`]) — debounced via the
 //!   module-private [`AT_CAP`] latch so each saturation episode counts once.
@@ -154,7 +154,7 @@ impl std::fmt::Debug for ActiveDownloads {
     }
 }
 
-/// Outcome of [`ActiveDownloads::insert`]: either this caller originates the
+/// Outcome of `ActiveDownloads::insert`: either this caller originates the
 /// download, or it attaches as a late joiner to one already in flight. The
 /// late-joiner accounting (per-entry count + global metrics) is performed
 /// inside `insert()` itself — callers do not need any follow-up helper.
@@ -175,7 +175,7 @@ pub(crate) enum InsertOutcome {
     AtCapacity { max: NonZero<usize> },
 }
 
-/// Outcome of [`ActiveDownloads::originate`]: either this caller originates
+/// Outcome of `ActiveDownloads::originate`: either this caller originates
 /// the download, or another download is already in flight for the same key.
 /// `Concurrent` carries the existing download's status so the caller can hand
 /// it straight to the sendfile late-joiner path without a separate `attach()`
@@ -198,7 +198,7 @@ pub(crate) enum OriginateOutcome {
 }
 
 /// Neutral result of [`ActiveDownloads::lookup_or_insert`], the shared
-/// body of [`ActiveDownloads::insert`] and [`ActiveDownloads::originate`].
+/// body of `ActiveDownloads::insert` and `ActiveDownloads::originate`.
 /// Each public method maps this onto its own outcome enum.
 ///
 /// Late-joiner metrics (`LATE_JOINERS_TOTAL`, `LATE_JOINER_PEAK_PER_DOWNLOAD`)
@@ -260,8 +260,8 @@ impl ActiveDownloads {
         self.inner.read().len()
     }
 
-    /// Common locked-region body shared by [`Self::insert`] and
-    /// [`Self::originate`]: pre-allocate channel + status, perform the
+    /// Common locked-region body shared by `Self::insert` and
+    /// `Self::originate`: pre-allocate channel + status, perform the
     /// `entry()` Occupied / Vacant transition, do the cap-saturation +
     /// peak + late-joiner accounting, return the neutral [`LookupResult`].
     ///
@@ -404,7 +404,7 @@ impl ActiveDownloads {
         }
     }
 
-    /// Originate-only variant of [`Self::insert`]: returns `Concurrent`
+    /// Originate-only variant of `Self::insert`: returns `Concurrent`
     /// when a download for the same key is already in flight, while still
     /// bumping the existing entry's late-joiner accounting to mirror
     /// [`Self::attach`]. `Concurrent` carries the existing entry's status,

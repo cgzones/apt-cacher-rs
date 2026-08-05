@@ -44,7 +44,7 @@ impl CacheInfo {
 
     /// Build a [`CacheInfo`] from a caller-supplied [`UpstreamMetadata`]
     /// snapshot — typically the one carried on
-    /// [`crate::ActiveDownloadStatus::Download`] for late-joiner reads, so
+    /// [`crate::active_downloads::ActiveDownloadStatus::Download`] for late-joiner reads, so
     /// no xattr/cache lookup happens at all.
     #[must_use]
     pub(crate) fn with_meta(metadata: &std::fs::Metadata, meta: &UpstreamMetadata) -> Self {
