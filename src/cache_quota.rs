@@ -140,7 +140,7 @@ impl CacheQuota {
         } else {
             metrics::CACHE_SIZE_CORRUPTION.increment();
             error!(
-                "Cache size corruption: reconcile: actual_cache_size={actual_cache_size} active_downloading_size={active_downloading_size}"
+                "cache quota: reconcile overflow: actual_cache_size={actual_cache_size} active_downloading_size={active_downloading_size}; recording the cache as full, downloads are rejected as over quota until the next reconcile"
             );
             u64::MAX
         };
@@ -166,7 +166,10 @@ impl CacheQuota {
             *mg = val;
         } else {
             metrics::CACHE_SIZE_CORRUPTION.increment();
-            error!("Cache size corruption: add: current={} added={amount}", *mg);
+            error!(
+                "cache quota: size accounting overflow on add: current={} added={amount}; clamping to u64::MAX, all further downloads are rejected as over quota until the next cleanup reconcile",
+                *mg
+            );
             *mg = u64::MAX;
         }
         let new_size = *mg;
@@ -181,7 +184,7 @@ impl CacheQuota {
         } else {
             metrics::CACHE_SIZE_CORRUPTION.increment();
             error!(
-                "Cache size corruption: subtract: current={} removed={amount}",
+                "cache quota: size accounting underflow on subtract: current={} removed={amount}; clamping to 0, the accounted cache size now understates the on-disk size until the next cleanup reconcile",
                 *mg
             );
             *mg = 0;

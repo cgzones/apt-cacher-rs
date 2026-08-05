@@ -152,10 +152,13 @@ pub(super) async fn scan_candidates(
                     }
                 }
                 if tree.recurse {
-                    warn!("Skipping unrecognized entry `{}`", entry.path().display());
+                    warn!(
+                        "Unrecognized entry in mirror directory, retaining it and excluding it from cleanup: `{}`",
+                        entry.path().display()
+                    );
                 } else {
                     warn!(
-                        "Unrecognized entry in mirror root directory: `{}`",
+                        "Unrecognized entry in mirror root directory, retaining it and excluding it from cleanup: `{}`",
                         entry.path().display()
                     );
                 }

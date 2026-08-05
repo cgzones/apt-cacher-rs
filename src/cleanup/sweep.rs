@@ -92,7 +92,7 @@ pub(super) fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Optio
                 Err(modified_err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get create timestamp ({created_err}) and modify timestamp ({modified_err}) of file `{}`",
+                        "Failed to get create timestamp ({created_err}) and modify timestamp ({modified_err}) of file `{}`; retaining it indefinitely - it can never be aged out",
                         path.display()
                     );
                     None
