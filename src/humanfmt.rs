@@ -19,6 +19,8 @@ impl std::fmt::Display for HumanFmt {
             }
         }
 
+        const NEXT_UNIT: f64 = 999.5;
+
         #[expect(clippy::cast_precision_loss, reason = "only used for display purposes")]
         match *self {
             Self::Size(bytes) => {
@@ -26,15 +28,15 @@ impl std::fmt::Display for HumanFmt {
                     return write!(f, "{bytes}B");
                 }
                 let size = bytes as f64 / 1000.0;
-                if size < 1000.0 {
+                if size < NEXT_UNIT {
                     return write!(f, "{size:.0$}kB", precision(size));
                 }
                 let size = size / 1000.0;
-                if size < 1000.0 {
+                if size < NEXT_UNIT {
                     return write!(f, "{size:.0$}MB", precision(size));
                 }
                 let size = size / 1000.0;
-                if size < 1000.0 {
+                if size < NEXT_UNIT {
                     return write!(f, "{size:.0$}GB", precision(size));
                 }
                 let size = size / 1000.0;
@@ -46,19 +48,19 @@ impl std::fmt::Display for HumanFmt {
                     return write!(f, "???B/s");
                 }
                 let rate = bytes as f64 / time;
-                if rate < 1000.0 {
+                if rate < NEXT_UNIT {
                     return write!(f, "{rate:.0$}B/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
-                if rate < 1000.0 {
+                if rate < NEXT_UNIT {
                     return write!(f, "{rate:.0$}kB/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
-                if rate < 1000.0 {
+                if rate < NEXT_UNIT {
                     return write!(f, "{rate:.0$}MB/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
-                if rate < 1000.0 {
+                if rate < NEXT_UNIT {
                     return write!(f, "{rate:.0$}GB/s", precision(rate));
                 }
                 let rate = rate / 1000.0;
@@ -71,12 +73,12 @@ impl std::fmt::Display for HumanFmt {
                 }
 
                 let time = time as f64 / 1000.0;
-                if time < 1000.0 {
+                if time < NEXT_UNIT {
                     return write!(f, "{time:.0$}us", precision(time));
                 }
 
                 let time = time / 1000.0;
-                if time < 1000.0 {
+                if time < NEXT_UNIT {
                     return write!(f, "{time:.0$}ms", precision(time));
                 }
 
@@ -154,6 +156,18 @@ mod tests {
     }
 
     #[test]
+    fn size_unit_boundary_promotes_instead_of_rounding_to_1000() {
+        // Just below the promotion threshold: still the smaller unit.
+        assert_eq!(format!("{}", HumanFmt::Size(999_499)), "999kB");
+        // From here the zero-decimal rendering would read `1000kB`.
+        assert_eq!(format!("{}", HumanFmt::Size(999_500)), "1.00MB");
+        assert_eq!(format!("{}", HumanFmt::Size(999_999)), "1.00MB");
+        assert_eq!(format!("{}", HumanFmt::Size(1_000_000)), "1.00MB");
+        assert_eq!(format!("{}", HumanFmt::Size(999_999_999)), "1.00GB");
+        assert_eq!(format!("{}", HumanFmt::Size(999_999_999_999)), "1.00TB");
+    }
+
+    #[test]
     fn rate_test() {
         // Zero window is unmeasurable -> sentinel (essentially unreachable with
         // the std::time::Instant ns clock, but guards against a 0/0 divide).
@@ -228,6 +242,31 @@ mod tests {
         assert_eq!(
             format!("{}", HumanFmt::Time(Duration::from_nanos(u64::MAX))),
             "213503d 23h 34m 33s"
+        );
+    }
+
+    #[test]
+    fn time_and_rate_unit_boundaries_promote() {
+        // Would render as `1000us` / `1000ms` without the promotion threshold.
+        assert_eq!(
+            format!("{}", HumanFmt::Time(Duration::from_nanos(999_999))),
+            "1.00ms"
+        );
+        assert_eq!(
+            format!("{}", HumanFmt::Time(Duration::from_nanos(999_499))),
+            "999us"
+        );
+        assert_eq!(
+            format!("{}", HumanFmt::Time(Duration::from_nanos(999_999_999))),
+            "1.00s"
+        );
+        assert_eq!(
+            format!("{}", HumanFmt::Rate(999_999, Duration::from_secs(1))),
+            "1.00MB/s"
+        );
+        assert_eq!(
+            format!("{}", HumanFmt::Rate(999_499, Duration::from_secs(1))),
+            "999kB/s"
         );
     }
 }
