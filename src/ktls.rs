@@ -41,7 +41,7 @@ use rustls::crypto::cipher::NONCE_LEN;
 use tracing::{debug, info, warn};
 
 use crate::error::errno_to_io_error;
-use crate::{Never, static_assert, warn_once};
+use crate::{Never, static_assert, warn_once, warn_once_or_debug};
 
 /// Overwrite every byte of a mutable POD value with zeros via `explicit_bzero`,
 /// which the compiler is not permitted to elide.
@@ -1014,9 +1014,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                     // control record may have been delivered without us seeing
                     // it (or raced with some other consumer). Fail closed so
                     // the caller falls back to userspace TLS.
-                    warn!(
+                    warn_once_or_debug!(
                         "kTLS: initial drain peek returned EAGAIN despite POLLIN; \
-                         aborting kTLS setup"
+                         abandoning kTLS and falling back to userspace TLS for this request"
                     );
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
@@ -1027,7 +1027,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
             }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::EMSGSIZE) => {
-                warn!("kTLS: oversized TLS record from peer (EMSGSIZE); aborting kTLS setup");
+                warn_once_or_debug!(
+                    "kTLS: oversized TLS record from peer (EMSGSIZE); abandoning kTLS and falling back to userspace TLS for this request"
+                );
                 return Err(errno_to_io_error(
                     nix::errno::Errno::EMSGSIZE,
                     "kTLS: recvmsg peek EMSGSIZE (oversized record)",
@@ -1044,7 +1046,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
         let record_type = match extract_record_type(&recv) {
             Ok(rt) => rt,
             Err(err) => {
-                warn!("kTLS: drain peek cmsg decode failed; aborting kTLS setup:  {err}");
+                warn_once_or_debug!(
+                    "kTLS: drain peek cmsg decode failed; abandoning kTLS and falling back to userspace TLS for this request:  {err}"
+                );
                 return Err(err);
             }
         };
@@ -1058,7 +1062,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
         // set rather than letting a possibly-stale ApplicationData type
         // pass through classify_drain_action as safe.
         if flags.contains(MsgFlags::MSG_CTRUNC) {
-            warn!("kTLS: cmsg buffer truncated (record_type={record_type:?}); aborting kTLS setup");
+            warn_once_or_debug!(
+                "kTLS: cmsg buffer truncated (record_type={record_type:?}); abandoning kTLS and falling back to userspace TLS for this request"
+            );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "kTLS: cmsg buffer truncated",
@@ -1081,9 +1087,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                     );
                     return Ok(());
                 }
-                warn!(
+                warn_once_or_debug!(
                     "kTLS: peeked TLS Alert record ({peeked_bytes} bytes, left on socket); \
-                     aborting kTLS setup so userspace TLS can read and decode it"
+                     falling back to userspace TLS for this request so it can read and decode it"
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1091,9 +1097,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                 ));
             }
             DrainAction::AbortUnknown => {
-                warn!(
+                warn_once_or_debug!(
                     "kTLS: peeked unknown TLS record ({peeked_bytes} bytes, \
-                     record_type={record_type:?}, left on socket); aborting kTLS setup"
+                     record_type={record_type:?}, left on socket); abandoning kTLS and falling back to userspace TLS for this request"
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1101,9 +1107,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                 ));
             }
             DrainAction::AbortChangeCipherSpec => {
-                warn!(
+                warn_once_or_debug!(
                     "kTLS: peeked post-handshake ChangeCipherSpec record ({peeked_bytes} bytes, \
-                     left on socket); aborting kTLS setup"
+                     left on socket); abandoning kTLS and falling back to userspace TLS for this request"
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1120,9 +1126,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
         // with a clear error rather than let every later record fail with
         // sticky EBADMSG.
         if handshake_contains_key_update(&buf[..peeked_bytes]) {
-            warn!(
+            warn_once_or_debug!(
                 "kTLS: peer sent KeyUpdate ({peeked_bytes} bytes, left on socket); \
-                 kernel TLS cannot rekey; aborting kTLS setup"
+                 kernel TLS cannot rekey, falling back to userspace TLS for this request"
             );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1132,9 +1138,9 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
 
         consumed_records += 1;
         if consumed_records > MAX_DRAIN_RECORDS {
-            warn!(
+            warn_once_or_debug!(
                 "kTLS: more than {MAX_DRAIN_RECORDS} control records queued without \
-                 reaching application data; aborting kTLS setup"
+                 reaching application data; abandoning kTLS and falling back to userspace TLS for this request"
             );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

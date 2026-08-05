@@ -220,7 +220,7 @@ pub(crate) async fn request_with_retry(
                         metrics::HTTPS_UPGRADE_FAILED.increment();
                     }
                     warn_once_or_info!(
-                        "Request of internal client to {} failed:  {}",
+                        "Upstream request to {} failed, returning 502:  {}",
                         parts.uri,
                         ErrorReport(&err)
                     );
@@ -290,7 +290,7 @@ pub(crate) async fn request_with_retry(
                         // longer re-warn). The limit names which budget stopped the
                         // retries -- attempt cap or `upstream_retry_budget`.
                         warn_once_or_info!(
-                            "Request of internal client to {} failed after {attempt} connection attempts ({}):  {}",
+                            "Upstream request to {} failed after {attempt} connection attempts ({}), returning 502:  {}",
                             parts.uri,
                             backoff.limit(),
                             ErrorReport(&err)
@@ -800,7 +800,10 @@ async fn serve_unfinished_file(
         Ok(data) if data.file_type().is_file() => data,
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
-            error!("Cache file `{}` is not a regular file", file_path.display());
+            error!(
+                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                file_path.display()
+            );
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
         Err(err) => {
@@ -1074,7 +1077,10 @@ async fn serve_cached_file(
             Ok(m) if m.file_type().is_file() => m,
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
-                error!("Cache file `{}` is not a regular file", file_path.display());
+                error!(
+                    "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                    file_path.display()
+                );
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
             }
             Err(err) => {
@@ -1677,7 +1683,10 @@ async fn serve_volatile_file(
         Ok(data) if data.file_type().is_file() => data,
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
-            error!("Cache file `{}` is not a regular file", file_path.display());
+            error!(
+                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                file_path.display()
+            );
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
         Err(err) => {
@@ -1721,8 +1730,8 @@ async fn serve_volatile_file(
             return serve_cached_file(conn_details, &req, file, file_path, None, Some(mdata)).await;
         }
     } else {
-        warn!(
-            "Volatile file `{}` was modified in the future, ignoring modification time",
+        warn_once_or_info!(
+            "Volatile file `{}` was modified in the future, treating it as stale and refetching from upstream",
             file_path.display()
         );
     }
@@ -3682,7 +3691,7 @@ where
             // backend is the sole owner of that counter).
             debug!("Client {client} idle-timed out before sending request headers");
         } else if let Some(perr) = is_rate_timeout(&err) {
-            info!("{perr}");
+            info!("Closing connection to client {client} after a rate timeout: {perr}");
         } else {
             error!(
                 "Error serving connection for client {client}:  {}",

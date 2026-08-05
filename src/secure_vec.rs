@@ -24,7 +24,7 @@ use std::sync::{LazyLock, OnceLock};
 
 use hashbrown::HashMap;
 use nix::libc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{nonzero, warn_once_or_debug};
 
@@ -283,31 +283,36 @@ fn pool_parked_bytes() -> usize {
 // Mapping helpers
 // ---------------------------------------------------------------------------
 
-static PAGE_SIZE: LazyLock<Option<NonZero<usize>>> =
-    LazyLock::new(
-        || match nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE) {
-            Ok(Some(size))
-                if let Ok(size) = usize::try_from(size)
-                    && let Some(size) = NonZero::new(size) =>
-            {
-                debug!("Page size: {size} bytes");
-                Some(size)
-            }
-            Ok(Some(size)) => {
-                error!("Invalid page size of {size} bytes");
-                None
-            }
-            Ok(None) => {
-                error!("Page size is not available");
-                None
-            }
+static PAGE_SIZE: LazyLock<Option<NonZero<usize>>> = LazyLock::new(|| {
+    match nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE) {
+        Ok(Some(size))
+            if let Ok(size) = usize::try_from(size)
+                && let Some(size) = NonZero::new(size) =>
+        {
+            debug!("Page size: {size} bytes");
+            Some(size)
+        }
+        Ok(Some(size)) => {
+            // Not fatal: `page_size()` falls back to 4 KiB, which only
+            // affects pool keying granularity.
+            warn!(
+                "secure buffer: invalid page size of {size} bytes, falling back to 4 KiB mappings"
+            );
+            None
+        }
+        Ok(None) => {
+            warn!("secure buffer: page size is not available, falling back to 4 KiB mappings");
+            None
+        }
 
-            Err(errno) => {
-                error!("Failed to get page size:  {errno}");
-                None
-            }
-        },
-    );
+        Err(errno) => {
+            warn!(
+                "secure buffer: failed to get the page size, falling back to 4 KiB mappings:  {errno}"
+            );
+            None
+        }
+    }
+});
 
 /// Effective page size for sizing mappings: the runtime value when available,
 /// 4 KiB otherwise. `mmap`/`munmap`/`madvise` round lengths internally, so a
@@ -360,7 +365,7 @@ fn map_region(map_len: usize) -> NonNull<u8> {
     };
     if ptr == libc::MAP_FAILED {
         error!(
-            "mmap({map_len}) failed:  {}",
+            "secure buffer: mmap({map_len}) for a TLS secret failed:  {}",
             std::io::Error::last_os_error()
         );
         secure_alloc_failure(map_len);

@@ -1242,8 +1242,8 @@ async fn try_sendfile_request(
                     } else {
                         // Served from cache all the same - keep the
                         // hit/miss metrics complete via the shared bump below.
-                        warn!(
-                            "Volatile file `{}` was modified in the future, ignoring modification time",
+                        warn_once_or_info!(
+                            "Volatile file `{}` was modified in the future, serving the cached copy anyway",
                             cache_path.display()
                         );
                     }
@@ -1253,7 +1253,7 @@ async fn try_sendfile_request(
                 Ok(_) => {
                     metrics::CACHE_NON_REGULAR.increment();
                     error!(
-                        "Cache file `{}` is not a regular file",
+                        "Cache file `{}` is not a regular file, refusing to serve and returning 500",
                         cache_path.display()
                     );
                     return ZeroCopyResult::Invalid {
@@ -1589,7 +1589,10 @@ pub(crate) async fn serve_file_via_sendfile(
             Ok(m) if m.file_type().is_file() => m,
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
-                error!("Cache file `{}` is not a regular file", file_path.display());
+                error!(
+                    "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                    file_path.display()
+                );
                 return SendfileResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     msg: "Cache Access Failure",
@@ -2411,7 +2414,10 @@ pub(crate) async fn async_sendfile_unfinished(
                 .expect("file size is non-negative by construction"),
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
-                error!("Cache file `{}` is not a regular file", file_path.display());
+                error!(
+                    "Cache file `{}` is not a regular file, aborting the transfer",
+                    file_path.display()
+                );
                 let transferred = content_length - remaining;
                 return Err((
                     transferred,
@@ -2747,7 +2753,10 @@ async fn serve_unfinished_sendfile(
         Ok(m) if m.file_type().is_file() => m,
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
-            error!("Cache file `{}` is not a regular file", file_path.display());
+            error!(
+                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                file_path.display()
+            );
             return ZeroCopyResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",

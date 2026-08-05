@@ -32,7 +32,9 @@ pub(crate) fn validate_connect_target(
     uri: &Uri,
 ) -> Result<(String, NonZero<u16>), ConnectReject> {
     if !config.https_tunnel_enabled {
-        info!("Rejecting https tunnel request for client {client}");
+        info!(
+            "Rejecting https tunnel request for client {client} to {uri}: https tunneling is disabled (`https_tunnel_enabled`)"
+        );
         metrics::TUNNEL_REJECTED_POLICY.increment();
         return Err(ConnectReject {
             status: StatusCode::FORBIDDEN,
