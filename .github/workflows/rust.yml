@@ -49,6 +49,13 @@ jobs:
       - name: Test
         run: cargo hack $HACK test --locked
 
+      # Over the powerset, not one config: an intra-doc link to a cfg-gated
+      # item resolves in the build that compiles it and dangles in the others.
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo hack $HACK doc --no-deps --locked
+
   formatting:
     name: Rust source formatting
     runs-on: ubuntu-latest
