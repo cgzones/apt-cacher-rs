@@ -50,6 +50,9 @@ The most relevant flags (see `apt-cacher-rs --help` for the full list):
   If the default file is missing the built-in defaults are used; a missing non-default file is an error.
 - `--cache-path=<PATH>`: overrides the `cache_directory` field from the configuration file (or its default).
 - `--database-path=<PATH>`: overrides the `database_path` field from the configuration file (or its default).
+- `--bind=<ADDR[:PORT]>`: overrides the `bind_addr` and/or `bind_port` fields from the configuration file (or their defaults).
+  Accepted forms are `ADDR` (e.g. `127.0.0.1`, `::1`, `[::1]`), `ADDR:PORT` (e.g. `127.0.0.1:3143`, `[::1]:3143`) and `:PORT` (e.g. `:3143`).
+  An omitted component keeps its configured value.
 
 ## How to use
 
