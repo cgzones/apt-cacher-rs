@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZero,
     path::{Path, PathBuf},
-    str::FromStr as _,
+    str::FromStr,
     time::Duration,
 };
 
@@ -631,6 +631,87 @@ impl From<String> for LogDestination {
         } else {
             Self::File(PathBuf::from(s))
         }
+    }
+}
+
+/// A `--bind` command line override of [`Config::bind_addr`] and/or
+/// [`Config::bind_port`].
+///
+/// Accepted forms: `ADDR` (`1.2.3.4`, `::1`, `[::1]`), `ADDR:PORT`
+/// (`1.2.3.4:3143`, `[::1]:3143`) and `:PORT` (`:3143`).  A bare number is
+/// rejected: without a leading colon the value must start with an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BindOverride {
+    addr: Option<IpAddr>,
+    port: Option<NonZero<u16>>,
+}
+
+/// Parses a bracketed IPv6 address, e.g. `[::1]`.  Brackets enclose an IPv6
+/// address only (RFC 3986 §3.2.2), so `[1.2.3.4]` stays rejected.
+fn parse_bracketed_addr(s: &str) -> Option<IpAddr> {
+    s.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+        .map(IpAddr::V6)
+}
+
+/// Parses the port of a `--bind` value; `input` is the whole value, quoted in
+/// the error so the diagnostic names what the user typed.
+fn parse_bind_port(port: &str, input: &str) -> Result<NonZero<u16>, String> {
+    let value = port
+        .parse::<u16>()
+        .map_err(|err| format!("invalid port `{port}` in `{input}`: {err}"))?;
+
+    NonZero::new(value)
+        .ok_or_else(|| format!("invalid port `{port}` in `{input}`: must not be zero"))
+}
+
+impl FromStr for BindOverride {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        const EXPECTED: &str = "expected `ADDR`, `ADDR:PORT` or `:PORT`";
+
+        // An unbracketed IPv6 address is full of colons, so try the whole
+        // value as a bare address before the `:PORT` and `ADDR:PORT` forms.
+        // `::3143` is a valid IPv6 address and lands here; `:3143` is not
+        // (RFC 4291 elision needs `::`) and falls through to the port form.
+        if let Ok(addr) = s.parse::<IpAddr>() {
+            return Ok(Self {
+                addr: Some(addr),
+                port: None,
+            });
+        }
+
+        if let Some(addr) = parse_bracketed_addr(s) {
+            return Ok(Self {
+                addr: Some(addr),
+                port: None,
+            });
+        }
+
+        // Whatever is left must carry a port.  Split at the last colon rather
+        // than parsing a `SocketAddr`, so an out-of-range or zero port is
+        // reported as such instead of the whole value being rejected as
+        // malformed.  The address half stays empty for the `:PORT` form.
+        let Some((addr, port)) = s.rsplit_once(':') else {
+            return Err(format!("invalid bind value `{s}`: {EXPECTED}"));
+        };
+
+        let addr = if addr.is_empty() {
+            None
+        } else if let Ok(addr) = addr.parse::<IpAddr>() {
+            Some(addr)
+        } else if let Some(addr) = parse_bracketed_addr(addr) {
+            Some(addr)
+        } else {
+            return Err(format!("invalid bind value `{s}`: {EXPECTED}"));
+        };
+
+        Ok(Self {
+            addr,
+            port: Some(parse_bind_port(port, s)?),
+        })
     }
 }
 
@@ -1397,15 +1478,17 @@ impl Config {
     /// configuration file was not found and the built-in defaults were used
     /// instead, and a list of validation warnings.
     ///
-    /// When supplied, `cache_directory` overrides [`Self::cache_directory`]
-    /// and `database_path` overrides [`Self::database_path`], applied on top
-    /// of the values from the configuration file (or the built-in defaults
-    /// when no file is loaded). A non-default `file` that does not exist is
-    /// always an error, even when both overrides are supplied.
+    /// When supplied, `cache_directory` overrides [`Self::cache_directory`],
+    /// `database_path` overrides [`Self::database_path`] and `bind` overrides
+    /// [`Self::bind_addr`] and/or [`Self::bind_port`], applied on top of the
+    /// values from the configuration file (or the built-in defaults when no
+    /// file is loaded). A non-default `file` that does not exist is always an
+    /// error, even when the overrides are supplied.
     pub(crate) fn new(
         file: &Path,
         cache_directory: Option<PathBuf>,
         database_path: Option<PathBuf>,
+        bind: Option<BindOverride>,
     ) -> Result<(Self, bool, Vec<String>), ConfigError> {
         let (mut config, fallback) = match std::fs::read_to_string(file) {
             Ok(content) => (
@@ -1435,10 +1518,24 @@ impl Config {
         if let Some(path) = database_path {
             config.database_path = path;
         }
+        if let Some(bind) = bind {
+            config.apply_bind(bind);
+        }
 
         let warnings = config.validate()?;
 
         Ok((config, fallback, warnings))
+    }
+
+    fn apply_bind(&mut self, bind: BindOverride) {
+        let BindOverride { addr, port } = bind;
+
+        if let Some(addr) = addr {
+            self.bind_addr = addr;
+        }
+        if let Some(port) = port {
+            self.bind_port = port;
+        }
     }
 
     fn validate(&mut self) -> Result<Vec<String>, ConfigError> {
@@ -1892,6 +1989,153 @@ impl Config {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn bind(s: &str) -> BindOverride {
+        let parsed = s.parse::<BindOverride>();
+        assert!(parsed.is_ok(), "`{s}` should parse: {parsed:?}");
+        parsed.expect("asserted above")
+    }
+
+    #[test]
+    fn test_bind_override_address_only() {
+        for (input, expected) in [
+            ("1.2.3.4", IpAddr::from(Ipv4Addr::new(1, 2, 3, 4))),
+            ("0.0.0.0", IpAddr::from(Ipv4Addr::UNSPECIFIED)),
+            ("::1", IpAddr::from(Ipv6Addr::LOCALHOST)),
+            ("::", IpAddr::from(Ipv6Addr::UNSPECIFIED)),
+            ("[::1]", IpAddr::from(Ipv6Addr::LOCALHOST)),
+            // A valid IPv6 address, not port 3143 - RFC 4291 elision needs `::`.
+            (
+                "::3143",
+                IpAddr::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0x3143)),
+            ),
+        ] {
+            assert_eq!(
+                bind(input),
+                BindOverride {
+                    addr: Some(expected),
+                    port: None,
+                },
+                "input `{input}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bind_override_address_and_port() {
+        assert_eq!(
+            bind("1.2.3.4:3143"),
+            BindOverride {
+                addr: Some(IpAddr::from(Ipv4Addr::new(1, 2, 3, 4))),
+                port: Some(nonzero!(3143_u16)),
+            }
+        );
+        assert_eq!(
+            bind("[::1]:3143"),
+            BindOverride {
+                addr: Some(IpAddr::from(Ipv6Addr::LOCALHOST)),
+                port: Some(nonzero!(3143_u16)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_bind_override_port_only() {
+        assert_eq!(
+            bind(":3143"),
+            BindOverride {
+                addr: None,
+                port: Some(nonzero!(3143_u16)),
+            }
+        );
+        assert_eq!(
+            bind(":1"),
+            BindOverride {
+                addr: None,
+                port: Some(nonzero!(1_u16)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_bind_override_rejected() {
+        for input in [
+            "",                // empty
+            "3143",            // bare port needs a leading colon
+            ":",               // no port digits
+            ":0",              // port zero
+            ":65536",          // port out of range
+            ":-1",             // negative port
+            "0.0.0.0:0",       // port zero
+            "1.2.3.4:",        // no port digits
+            "1.2.3.4:70000",   // port out of range
+            "1.2.3.256",       // not an address
+            "localhost",       // no name resolution
+            "localhost:3143",  // no name resolution
+            "[::1",            // unbalanced bracket
+            "::1]",            // unbalanced bracket
+            "[1.2.3.4]",       // brackets are IPv6-only
+            "1.2.3.4:3143:80", // trailing garbage
+        ] {
+            assert!(
+                input.parse::<BindOverride>().is_err(),
+                "`{input}` should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bind_override_error_messages() {
+        for (input, expected) in [
+            (":0", "invalid port `0` in `:0`: must not be zero"),
+            (
+                "0.0.0.0:0",
+                "invalid port `0` in `0.0.0.0:0`: must not be zero",
+            ),
+            (
+                ":65536",
+                "invalid port `65536` in `:65536`: number too large to fit in target type",
+            ),
+            (
+                "1.2.3.4:70000",
+                "invalid port `70000` in `1.2.3.4:70000`: number too large to fit in target type",
+            ),
+            (
+                "localhost:3143",
+                "invalid bind value `localhost:3143`: expected `ADDR`, `ADDR:PORT` or `:PORT`",
+            ),
+            (
+                "3143",
+                "invalid bind value `3143`: expected `ADDR`, `ADDR:PORT` or `:PORT`",
+            ),
+        ] {
+            assert_eq!(
+                input.parse::<BindOverride>().unwrap_err(),
+                expected,
+                "input `{input}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bind_override_applied() {
+        let base = || toml::from_str::<Config>("").expect("built-in defaults must parse");
+
+        let mut config = base();
+        config.apply_bind(bind("127.0.0.1"));
+        assert_eq!(config.bind_addr, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(config.bind_port, DEFAULT_BIND_PORT);
+
+        let mut config = base();
+        config.apply_bind(bind(":3143"));
+        assert_eq!(config.bind_addr, DEFAULT_BIND_ADDRESS);
+        assert_eq!(config.bind_port, nonzero!(3143_u16));
+
+        let mut config = base();
+        config.apply_bind(bind("127.0.0.1:3143"));
+        assert_eq!(config.bind_addr, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(config.bind_port, nonzero!(3143_u16));
+    }
 
     #[test]
     fn test_parse_size_with_magnitude() {

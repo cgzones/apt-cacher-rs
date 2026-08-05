@@ -571,6 +571,11 @@ struct Cli {
     /// file (or the built-in default when no file is loaded)
     #[arg(long, value_name = "PATH")]
     database_path: Option<PathBuf>,
+    /// Listening address and/or port (`ADDR`, `ADDR:PORT` or `:PORT`);
+    /// overrides `bind_addr`/`bind_port` from the configuration file (or the
+    /// built-in defaults when no file is loaded)
+    #[arg(long, value_name = "ADDR[:PORT]")]
+    bind: Option<config::BindOverride>,
     /// Skip timestamp in log messages (e.g. under systemd/journald, which
     /// prepends its own)
     #[arg(long, default_value = "false")]
@@ -814,6 +819,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         &args.config_file,
         args.cache_path.take(),
         args.database_path.take(),
+        args.bind.take(),
     )?;
 
     let output_log_level = args.log_level.unwrap_or(config.log_level);

@@ -32,6 +32,16 @@ Database file path; overrides
 .I database_path
 from the configuration file.
 .TP
+.BI \-\-bind= ADDR [: PORT ]
+Listening address and/or port; overrides
+.I bind_addr
+and/or
+.I bind_port
+from the configuration file. Accepted forms are
+.IR ADDR " (e.g. " 127.0.0.1 ", " ::1 ", " [::1] "), " ADDR : PORT
+.RI "(e.g. " 127.0.0.1:3143 ", " [::1]:3143 ") and :" PORT " (e.g. " :3143 ).
+An omitted component keeps its configured value.
+.TP
 .BI \-\-log\-file= PATH
 Log file path. Logs are written to the given file instead of the
 console (the default).
