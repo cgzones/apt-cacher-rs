@@ -21,6 +21,7 @@ use hashbrown::{Equivalent, HashMap};
 
 use crate::cache_layout::CacheLayout;
 use crate::deb_mirror::Mirror;
+use crate::warn_once;
 
 /// Soft cap on the entry count. Every entry requires an actual upstream
 /// download that failed verification, so realistic workloads stay tiny;
@@ -178,6 +179,13 @@ impl VerifyThrottle {
             let cap = self.cap;
             map.retain(|_, entry| now <= entry.until + cap);
             if map.len() >= MAX_THROTTLE_ENTRIES {
+                // Clearing drops live backoff windows, so every throttled
+                // resource becomes re-downloadable at once and the proxy
+                // resumes fetching content it knows fails verification --
+                // exactly the mass-corruption case the throttle exists for.
+                warn_once!(
+                    "Verification throttle reached {MAX_THROTTLE_ENTRIES} entries; clearing all backoff windows"
+                );
                 map.clear();
             }
         }

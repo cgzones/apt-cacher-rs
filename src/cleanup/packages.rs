@@ -320,7 +320,7 @@ pub(super) async fn reduce_file_list(
 
     let mut buffer = String::with_capacity(128);
     let mut line_buf: Vec<u8> = Vec::with_capacity(128);
-    let mut stanza = Stanza::new();
+    let mut stanza = Stanza::new().with_source(format!("index `{filename}`"));
     loop {
         buffer.clear();
         match read_line_capped(

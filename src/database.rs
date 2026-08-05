@@ -26,6 +26,25 @@ use crate::{
     warn_once_or_info,
 };
 
+/// Decode a `mirrors_v2.kind` column, defaulting to `Structured`.
+///
+/// `cleanup_invalid_rows` purges out-of-range encodings before any reader
+/// observes them, so the fallback is defence in depth -- but a `Flat` row
+/// silently read as `Structured` makes cleanup emit structured units and
+/// reconcile against an index that does not exist, so say so. Matches the
+/// `load_all_mirror_ids` reader, which already warns on the same condition.
+fn decode_mirror_kind(kind: i64, path: &str) -> MirrorKind {
+    if let Some(kind) = MirrorKind::from_db_int(kind) {
+        kind
+    } else {
+        warn_once_or_info!(
+            "database: mirror row for `{}` has out-of-range kind value {kind}; treating as structured",
+            path.escape_debug()
+        );
+        MirrorKind::Structured
+    }
+}
+
 /// Resolve `host` through the configured aliases and return a reference to the
 /// alias-resolved [`CacheHost`] (the `main` host under which files are actually
 /// stored on disk).  Falls back to `host.as_cache_host()` when no alias matches.
@@ -81,7 +100,7 @@ impl MirrorEntry {
     /// fallback used by `From<MirrorEntry> for Mirror`.
     #[must_use]
     pub(crate) fn kind(&self) -> MirrorKind {
-        MirrorKind::from_db_int(self.kind).unwrap_or(MirrorKind::Structured)
+        decode_mirror_kind(self.kind, &self.path)
     }
 
     #[cfg(feature = "hyper")]
@@ -179,7 +198,7 @@ impl From<MirrorEntry> for Mirror {
             path,
             kind,
         } = entry;
-        let kind = MirrorKind::from_db_int(kind).unwrap_or(MirrorKind::Structured);
+        let kind = decode_mirror_kind(kind, &path);
         Self::new(host, port, path, kind)
     }
 }
