@@ -74,7 +74,7 @@ use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::{
     cache_layout::CacheLayout, deb_mirror::Mirror, http_etag::try_read_etag,
-    http_last_modified::try_read_last_modified, http_range::HttpDate,
+    http_last_modified::try_read_last_modified, http_range::HttpDate, warn_once, warn_once_or_info,
 };
 
 /// Upstream-supplied metadata for a single cached file.  Used both as the
@@ -197,6 +197,16 @@ pub(crate) struct CacheMetadataStore {
 /// best-effort approach as `verify_throttle` and `permitted_host_cache`.
 const CACHE_METADATA_MAX_ENTRIES: usize = 64 * 1024;
 
+/// The clear is silent otherwise: serves go back to two `fgetxattr(2)`
+/// round-trips through `block_in_place` -- the cost this cache exists to
+/// remove -- and on a cache larger than the cap that repeats indefinitely.
+/// The dashboard only ever shows the post-clear count, which looks idle.
+fn log_metadata_cache_cleared() {
+    warn_once_or_info!(
+        "Cache metadata store reached {CACHE_METADATA_MAX_ENTRIES} entries; clearing it (xattr reads resume until it refills)"
+    );
+}
+
 impl std::fmt::Debug for CacheMetadataStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Avoid dumping the entire map (could be large and mostly noise)
@@ -275,13 +285,15 @@ impl CacheMetadataStore {
         let owned = <Self as ResolveOwn<K>>::own(key);
         let mut map = self.map.write();
         if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&owned) {
+            log_metadata_cache_cleared();
             map.clear();
         }
         match map.entry(owned) {
             Entry::Occupied(occ) => {
+                let disagrees = !(meta.etag.is_none() && meta.last_modified.is_none())
+                    && occ.get().as_ref() != meta.as_ref();
                 debug_assert!(
-                    (meta.etag.is_none() && meta.last_modified.is_none())
-                        || occ.get().as_ref() == meta.as_ref(),
+                    !disagrees,
                     "publication invariant violated: a concurrent `set` published \
                      metadata that disagrees with the on-disk xattrs; every caller \
                      of `set` must persist matching xattrs first (published={:?}, \
@@ -289,6 +301,18 @@ impl CacheMetadataStore {
                     occ.get().as_ref(),
                     meta.as_ref(),
                 );
+                if disagrees {
+                    // Release builds accept the published value, so clients
+                    // can be served validators that permanently disagree with
+                    // the file's xattrs -- conditional requests then behave
+                    // differently before and after a restart.
+                    warn_once!(
+                        "Cache metadata publication invariant violated for `{}`: published {:?} disagrees with the on-disk xattrs {:?}",
+                        path.display(),
+                        occ.get().as_ref(),
+                        meta.as_ref()
+                    );
+                }
                 Arc::clone(occ.get())
             }
             Entry::Vacant(vac) => {
@@ -314,6 +338,7 @@ impl CacheMetadataStore {
     pub(crate) fn set(&self, key: CacheMetadataKey, meta: Arc<UpstreamMetadata>) {
         let mut map = self.map.write();
         if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&key) {
+            log_metadata_cache_cleared();
             map.clear();
         }
         map.insert(key, meta);

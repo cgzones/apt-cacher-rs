@@ -8,21 +8,49 @@
 
 use std::path::Path;
 
+use crate::warn_once;
+
 /// Extract the `Filename:` field's relative-path value from a Debian
-/// `Packages` stanza line. Returns the path verbatim.
+/// `Packages` stanza line, discarding the reject reason. Production code
+/// goes through [`Stanza::ingest`], which keeps the reason so it can log a
+/// rejected value against its mirror.
+#[cfg(test)]
+pub(crate) fn parse_filename_field(line: &str) -> Option<&str> {
+    match classify_filename_field(line) {
+        FilenameField::Value(filepath) => Some(filepath),
+        FilenameField::Absent | FilenameField::Unsafe(_) => None,
+    }
+}
+
+/// What one stanza line says about the `Filename:` field. Separating
+/// [`FilenameField::Unsafe`] from [`FilenameField::Absent`] is what lets
+/// [`Stanza::ingest`] log a rejected value: a bare `None` is
+/// indistinguishable from the every-other-line case.
+enum FilenameField<'a> {
+    /// Not a `Filename:` line.
+    Absent,
+    /// A `Filename:` line whose value failed the traversal gate.
+    Unsafe(&'a str),
+    Value(&'a str),
+}
+
+/// Classify one stanza line as a `Filename:` field.
 ///
 /// **Security**: rejects empty values, absolute paths, ASCII control bytes
-/// (including NUL and DEL), backslash,
-/// and any segment equal to `..` or `.`. An attacker-controlled upstream
-/// `Packages` stanza could otherwise inject a traversal sequence; rejecting
-/// here keeps downstream `HashMap` keys and filesystem joins honest.
-pub(crate) fn parse_filename_field(line: &str) -> Option<&str> {
+/// (including NUL and DEL), backslash, and any segment equal to `..` or `.`.
+/// An attacker-controlled upstream `Packages` stanza could otherwise inject a
+/// traversal sequence; rejecting here keeps downstream `HashMap` keys and
+/// filesystem joins honest.
+fn classify_filename_field(line: &str) -> FilenameField<'_> {
     let line = line.trim();
-    let filepath = line.strip_prefix("Filename: ")?.trim_start();
+    let Some(filepath) = line.strip_prefix("Filename: ") else {
+        return FilenameField::Absent;
+    };
+    let filepath = filepath.trim_start();
     if !is_safe_filename_relpath(filepath) {
-        return None;
+        return FilenameField::Unsafe(filepath);
     }
-    Some(filepath)
+    FilenameField::Value(filepath)
 }
 
 /// `true` iff `s` is a safe relative path: non-empty, no leading `/`, no
@@ -118,6 +146,10 @@ pub(crate) struct Stanza {
     /// registry ingest only ever reads `sha256`, so it skips the 128-char
     /// hex decode per stanza on mirrors that publish SHA512.
     want_sha512: bool,
+    /// Which index these stanzas came from (`<host>/<mirror_path>/<file>`),
+    /// used only to make a rejected `Filename:` value actionable. Set via
+    /// [`Self::with_source`]; empty in tests.
+    source: String,
 }
 
 impl Stanza {
@@ -127,6 +159,7 @@ impl Stanza {
             sha256: None,
             sha512: None,
             want_sha512: true,
+            source: String::new(),
         }
     }
 
@@ -137,6 +170,23 @@ impl Stanza {
             sha256: None,
             sha512: None,
             want_sha512: false,
+            source: String::new(),
+        }
+    }
+
+    /// Name the index being parsed, so a rejected `Filename:` value points
+    /// at the mirror that published it.
+    #[must_use]
+    pub(crate) fn with_source(mut self, source: String) -> Self {
+        self.source = source;
+        self
+    }
+
+    fn source_label(&self) -> &str {
+        if self.source.is_empty() {
+            "<unknown index>"
+        } else {
+            &self.source
         }
     }
 
@@ -151,11 +201,27 @@ impl Stanza {
     }
 
     pub(crate) fn ingest(&mut self, line: &str) {
-        if self.filename.is_none()
-            && let Some(name) = parse_filename_field(line)
-        {
-            self.filename = Some(name.to_owned());
-            return;
+        if self.filename.is_none() {
+            match classify_filename_field(line) {
+                FilenameField::Value(name) => {
+                    self.filename = Some(name.to_owned());
+                    return;
+                }
+                FilenameField::Unsafe(bad) => {
+                    // Dropping the field drops a real entry: integrity loses
+                    // this package's expected digest and cleanup loses its
+                    // reference, so the cached deb looks unreferenced and is
+                    // grace-swept. Name the index so the mirror is
+                    // identifiable.
+                    warn_once!(
+                        "index parser: rejecting unsafe Filename value in a Packages stanza from {}: {}",
+                        self.source_label(),
+                        bad.escape_debug()
+                    );
+                    return;
+                }
+                FilenameField::Absent => {}
+            }
         }
         if self.sha256.is_none()
             && let Some(h) = parse_hex_field::<32>(line, "SHA256: ")

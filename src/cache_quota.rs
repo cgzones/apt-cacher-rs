@@ -1,8 +1,8 @@
 use std::{cmp::Ordering, num::NonZero, sync::Arc};
 
-use tracing::{error, trace, warn};
+use tracing::{error, trace};
 
-use crate::{ContentLength, metrics};
+use crate::{ContentLength, humanfmt::HumanFmt, metrics, warn_once_or_info};
 
 /// Represents a quota violation.
 pub(crate) struct QuotaExceeded;
@@ -53,8 +53,14 @@ impl CacheQuota {
                 .saturating_add(reserved.get());
             if new_size > quota.get() {
                 drop(mg);
-                warn!(
-                    "Disk quota reached: file={debname} cache_size={curr} content_length={content_length:?} quota={quota}"
+                // A cache sitting at its quota rejects on *every* cacheable
+                // miss until cleanup runs, so only the first rejection is a
+                // warning -- the rest stay visible at info.
+                warn_once_or_info!(
+                    "Disk quota reached: file={debname} cache_size={} reserving={} quota={}",
+                    HumanFmt::Size(curr),
+                    HumanFmt::Size(reserved.get()),
+                    HumanFmt::Size(quota.get()),
                 );
                 metrics::DOWNLOAD_REJECTED_QUOTA.increment();
                 return Err(QuotaExceeded);

@@ -38,7 +38,9 @@ use crate::{
     index_parser::{self, HashAlgo, IndexFormat},
     metrics,
 };
-use crate::{global_checksum_registry, global_config, warn_once_or_info};
+use crate::{
+    global_checksum_registry, global_config, info_once, warn_once_or_debug, warn_once_or_info,
+};
 
 /// Why a download could not be committed to the cache. All three variants are
 /// handled by callers exactly as a pre-existing rename failure is handled
@@ -374,6 +376,13 @@ impl ChecksumRegistry {
         inner.order.push_back((scope, rel, generation));
 
         if inner.len > self.cap {
+            // The dashboard only ever shows the post-eviction count, so a
+            // registry permanently sized below its working set looks idle
+            // while verification coverage quietly drops.
+            info_once!(
+                "integrity: checksum registry reached its {} entry cap; evicting oldest entries (verification coverage drops for evicted keys)",
+                self.cap
+            );
             evict(&mut inner, self.cap);
         }
         if inner.order.len() > 2 * self.cap {
@@ -457,6 +466,39 @@ fn compact_order(inner: &mut RegistryInner) {
 /// skipped/best-effort) and the rename succeeded. Returns `Err(CommitError)`
 /// on mismatch, verification I/O failure, or rename failure -- in every case
 /// the temp file is left for its `TempPath` drop guard to unlink.
+/// A registry lookup that came up empty means this download is cached
+/// unverified. Expected while the registry is still cold (the first
+/// `apt install` after startup), but a *persistent* miss means the key
+/// derived here disagrees with the key ingest inserted, and the only symptom
+/// otherwise is `CHECKSUM_UNVERIFIED` climbing with no identity attached.
+fn log_registry_miss(plan: &RenamePlan, key: &str) {
+    warn_once_or_debug!(
+        "integrity: no expected digest in the checksum registry for host `{}` mirror `{}` key `{}`; caching {} unverified",
+        plan.host,
+        plan.mirror_path,
+        key.escape_debug(),
+        plan.debname
+    );
+}
+
+/// A `Packages` index cached in a compression the ingest ladder does not
+/// know (`.zst`, `.bz2`, `.lz4` on third-party repos): the file is served
+/// from cache, but its digests never reach the registry, so every deb it
+/// lists is cached unverified. The early return is otherwise shared with the
+/// deliberate no-op kinds, which is why nothing marks this case today.
+fn log_unsupported_packages_compression(leaf: &str, host: &str) {
+    // `Packages` and the two supported suffixes always classify; anything
+    // else with the `Packages.` prefix is an unsupported compression. Other
+    // metadata leaves (Release, InRelease) legitimately have none.
+    if !leaf.starts_with("Packages.") {
+        return;
+    }
+    warn_once_or_debug!(
+        "integrity: unsupported Packages compression `{}` from host `{host}`; skipping registry ingest, its debs stay unverified",
+        leaf.escape_debug()
+    );
+}
+
 pub(crate) async fn verify_and_rename(plan: &RenamePlan) -> Result<(), CommitError> {
     let verify_enabled = global_config().verify_checksums;
 
@@ -469,20 +511,23 @@ pub(crate) async fn verify_and_rename(plan: &RenamePlan) -> Result<(), CommitErr
                 algo: byhash_algo_from_uri_path(&plan.raw_uri_path),
                 filename: plan.debname.clone(),
             },
-            ResourceKind::Pool => VerifyKind::Registry {
-                digest: global_checksum_registry().lookup(
-                    &plan.host,
-                    &plan.mirror_path,
-                    &index_parser::registry_key_for_download(&plan.debname),
-                ),
-            },
+            ResourceKind::Pool => {
+                let key = index_parser::registry_key_for_download(&plan.debname);
+                let digest = global_checksum_registry().lookup(&plan.host, &plan.mirror_path, &key);
+                if digest.is_none() {
+                    log_registry_miss(plan, &key);
+                }
+                VerifyKind::Registry { digest }
+            }
             ResourceKind::Packages => {
                 // Layer C: a Packages file's key is its full host-relative URI
                 // path (what ingest_release_file inserted: "<release_dir>/<rel>").
                 let key = plan.raw_uri_path.trim_start_matches('/');
-                VerifyKind::Registry {
-                    digest: global_checksum_registry().lookup(&plan.host, &plan.mirror_path, key),
+                let digest = global_checksum_registry().lookup(&plan.host, &plan.mirror_path, key);
+                if digest.is_none() {
+                    log_registry_miss(plan, key);
                 }
+                VerifyKind::Registry { digest }
             }
             ResourceKind::Release
             | ResourceKind::ComponentRelease
@@ -577,7 +622,11 @@ fn spawn_ingest(plan: &RenamePlan) {
     #[expect(clippy::match_same_arms, reason = "prefer clarity")]
     let kind = match plan.resource_kind {
         ResourceKind::Packages => {
-            PackagesCompression::from_filename(leaf).map(|c| IngestKind::Packages {
+            let compression = PackagesCompression::from_filename(leaf);
+            if compression.is_none() {
+                log_unsupported_packages_compression(leaf, &plan.host);
+            }
+            compression.map(|c| IngestKind::Packages {
                 compression: c,
                 format: IndexFormat::Structured,
             })
@@ -587,7 +636,11 @@ fn spawn_ingest(plan: &RenamePlan) {
         // a flat Release) is not implemented - consistent with flat-pool layer-B
         // also being deferred.
         ResourceKind::FlatMetadata => {
-            PackagesCompression::from_filename(leaf).map(|c| IngestKind::Packages {
+            let compression = PackagesCompression::from_filename(leaf);
+            if compression.is_none() {
+                log_unsupported_packages_compression(leaf, &plan.host);
+            }
+            compression.map(|c| IngestKind::Packages {
                 compression: c,
                 format: IndexFormat::Flat,
             })
@@ -814,7 +867,8 @@ pub(crate) async fn ingest_packages_file(
 
     let mut line = String::with_capacity(128);
     let mut line_buf: Vec<u8> = Vec::with_capacity(128);
-    let mut stanza = index_parser::Stanza::new_sha256_only();
+    let mut stanza = index_parser::Stanza::new_sha256_only()
+        .with_source(format!("{host}/{mirror_path} index `{}`", path.display()));
     loop {
         line.clear();
         match limits::read_line_capped(
@@ -916,6 +970,16 @@ fn flush_stanza_into_registry(
         && let Some(key) = index_parser::registry_key_from_filename_field(filename, format)
     {
         registry.insert(host, mirror_path, &key, sha256);
+    } else if let Some(filename) = stanza.filename.as_deref()
+        && stanza.sha256.is_none()
+    {
+        // A mirror publishing only SHA512 leaves every stanza digest-less,
+        // so the registry stays empty and deb verification is silently off
+        // for that whole archive.
+        warn_once_or_debug!(
+            "integrity: Packages stanza for `{}` from host `{host}` carries no SHA256; deb verification unavailable for this mirror",
+            filename.escape_debug()
+        );
     }
     stanza.reset();
 }

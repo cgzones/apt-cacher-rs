@@ -9,6 +9,7 @@ use tracing::{debug, error, warn};
 use crate::cache_layout::CacheLayout;
 use crate::database::OriginEntry;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
+use crate::info_once;
 use crate::integrity::read_release_to_string;
 use crate::metrics;
 use crate::utils::probe_dir;
@@ -185,6 +186,15 @@ pub(super) async fn build_byhash_reference_set(
         }
     }
 
+    if !found {
+        // Sibling bail-outs above all log; this one is the quiet exit. It
+        // means the by-hash tree exists but no Release names it, so the
+        // whole tree drops to the age backstop instead of the 3-day grace.
+        info_once!(
+            "cleanup: no Release files in `{}` for by-hash reconciliation; falling back to age-based retention",
+            release_dir.display()
+        );
+    }
     found.then_some(set)
 }
 

@@ -5,6 +5,7 @@ use xattr::FileExt as _;
 use crate::index_parser::{HashAlgo, hash_open_file, hex_encode};
 use crate::metrics;
 use crate::utils::nofollow_nonblock_options;
+use crate::warn_once_or_debug;
 
 /// Xattr recording a successful cleanup digest verification, formatted as
 /// `"{ino}:{size}:{algo}:{expected-digest-hex}"`.
@@ -40,15 +41,25 @@ fn has_valid_marker(
 /// Stamp the verified marker after a successful digest match. Best-effort:
 /// failure (e.g. filesystem without xattr support) just means the next
 /// cycle re-hashes.
-fn stamp_marker(file: &std::fs::File, ino: u64, size: u64, algo: HashAlgo, expected: &[u8]) {
+fn stamp_marker(
+    file: &std::fs::File,
+    path: &Path,
+    ino: u64,
+    size: u64,
+    algo: HashAlgo,
+    expected: &[u8],
+) {
     let value = verified_marker(ino, size, algo, expected);
-    if file
-        .set_xattr(XATTR_CLEANUP_VERIFIED, value.as_bytes())
-        .is_err()
-    {
-        // Same graceful degradation as xattr_helpers::write_helper; the
-        // warn there is skipped here because cleanup would emit it once
-        // per referenced file per cycle on xattr-less filesystems.
+    if let Err(err) = file.set_xattr(XATTR_CLEANUP_VERIFIED, value.as_bytes()) {
+        // Same graceful degradation as xattr_helpers::write_helper, which
+        // warns per file -- here that would be once per referenced file per
+        // cycle on an xattr-less filesystem, hence the once-macro. Without
+        // any log a per-file stamp failure is indistinguishable from working
+        // memoization, and every cycle silently re-hashes the whole cache.
+        warn_once_or_debug!(
+            "cleanup: failed to stamp the verified marker on `{}`; digest verification will not be memoized and every cycle re-hashes:  {err}",
+            path.display()
+        );
     }
 }
 
@@ -127,7 +138,7 @@ pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> 
         // mid-hash must not mark the *new* content as verified.
         match std::fs::symlink_metadata(path) {
             Ok(post_meta) if post_meta.ino() == pre_ino && post_meta.len() == pre_size => {
-                stamp_marker(&file, pre_ino, pre_size, algo, expected);
+                stamp_marker(&file, path, pre_ino, pre_size, algo, expected);
             }
             Ok(_) | Err(_) => {}
         }
