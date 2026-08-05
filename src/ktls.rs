@@ -397,7 +397,13 @@ pub(crate) fn is_available() -> bool {
                 combo_bit(version, cipher),
                 dummy_crypto_info(version, cipher),
             ) else {
-                // PROBE_COMBOS entries always map; defensive skip only.
+                // PROBE_COMBOS entries always map; defensive skip only. A
+                // skipped combo leaves its bit clear, so kTLS is refused for
+                // that cipher for the process lifetime -- and in the support
+                // summary that is indistinguishable from a kernel gap.
+                warn_once!(
+                    "kTLS: availability test: no crypto-info mapping for {name}; treating it as unsupported"
+                );
                 continue;
             };
             match setsockopt(&client, TcpTlsRx, &crypto) {
@@ -493,6 +499,13 @@ pub(crate) fn rx_supported(
     }
     let mask = KTLS_RX_SUPPORT.load(Ordering::Relaxed);
     if mask == 0 {
+        // `is_available` latches unavailable when the mask is empty, so
+        // AVAILABLE plus an empty matrix is a state bug. Failing open cannot
+        // make things worse (setup_rx still decides), but it earns the host
+        // a 600s block per attempt, so record that the matrix was lost.
+        warn_once!(
+            "kTLS: RX support matrix is empty although the probe latched available; deferring to setup_rx"
+        );
         return true;
     }
     mask & (1u32 << bit) != 0

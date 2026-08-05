@@ -275,8 +275,12 @@ pub(crate) async fn request_with_retry(
                         if let Some(auth) = parts.uri.authority()
                             && let Some(scheme) = scheme_cache::record_failure(auth.into())
                         {
-                            debug!(
-                                "Removed cached scheme {scheme} for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}"
+                            // A learned scheme is sticky, so losing it silently
+                            // changes how every later request to this host is
+                            // dialled (an evicted https entry can hand the host
+                            // back to plain http under Auto mode).
+                            warn_once_or_info!(
+                                "Evicted cached {scheme} scheme for host {auth} after {attempt} connection attempts, original scheme was {orig_scheme:?}; the next request re-decides the scheme"
                             );
                         }
 
@@ -1172,48 +1176,64 @@ async fn serve_cached_file(
         return response;
     }
 
-    let (http_status, content_start, content_length, content_range, partial) =
-        if let Some(range) = req.headers().get(RANGE).and_then(|val| val.to_str().ok()) {
-            let if_range = req
-                .headers()
-                .get(IF_RANGE)
-                .and_then(|val| val.to_str().ok());
-            match http_parse_range(
-                range,
-                if_range,
-                file_size,
-                last_modified_for_ims,
-                file_etag.as_deref(),
-            ) {
-                ParsedRange::Satisfiable(content_range, start, content_length) => (
-                    StatusCode::PARTIAL_CONTENT,
-                    start,
-                    content_length,
-                    Some(content_range),
-                    true,
-                ),
-                ParsedRange::NotSatisfiable => {
-                    return Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(SERVER, APP_NAME)
-                        .header(VIA, APP_VIA)
-                        .header(DATE, &*format_http_date())
-                        .header(CONNECTION, "keep-alive")
-                        .header(
-                            CONTENT_RANGE,
-                            HeaderValue::try_from(format!("bytes */{file_size}"))
-                                .expect("content range is valid"),
-                        )
-                        .body(empty_body())
-                        .expect("HTTP response is valid");
-                }
-                ParsedRange::Invalid | ParsedRange::IfRangeFailed => {
-                    (StatusCode::OK, 0, file_size, None, false)
+    let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
+        req.headers().get(RANGE).and_then(|val| val.to_str().ok())
+    {
+        // A dropped If-Range is worse than a dropped Range: the parser
+        // reads `None` as "no precondition sent" and answers an
+        // unconditional 206, so a resuming client can staple bytes onto
+        // a different revision. Same shape as the If-None-Match and
+        // If-Modified-Since sites above.
+        let if_range = match req.headers().get(IF_RANGE) {
+            Some(v) => {
+                if let Ok(s) = v.to_str() {
+                    Some(s)
+                } else {
+                    warn_once!(
+                        "Client {} sent an invalid If-Range header, serving the range unconditionally: {v:?}",
+                        conn_details.client
+                    );
+                    None
                 }
             }
-        } else {
-            (StatusCode::OK, 0, file_size, None, false)
+            None => None,
         };
+        match http_parse_range(
+            range,
+            if_range,
+            file_size,
+            last_modified_for_ims,
+            file_etag.as_deref(),
+        ) {
+            ParsedRange::Satisfiable(content_range, start, content_length) => (
+                StatusCode::PARTIAL_CONTENT,
+                start,
+                content_length,
+                Some(content_range),
+                true,
+            ),
+            ParsedRange::NotSatisfiable => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(SERVER, APP_NAME)
+                    .header(VIA, APP_VIA)
+                    .header(DATE, &*format_http_date())
+                    .header(CONNECTION, "keep-alive")
+                    .header(
+                        CONTENT_RANGE,
+                        HeaderValue::try_from(format!("bytes */{file_size}"))
+                            .expect("content range is valid"),
+                    )
+                    .body(empty_body())
+                    .expect("HTTP response is valid");
+            }
+            ParsedRange::Invalid | ParsedRange::IfRangeFailed => {
+                (StatusCode::OK, 0, file_size, None, false)
+            }
+        }
+    } else {
+        (StatusCode::OK, 0, file_size, None, false)
+    };
 
     #[cfg(feature = "mmap")]
     if content_length >= global_config().mmap_threshold.get() {
@@ -2032,6 +2052,33 @@ async fn download_file(
 /// `ActiveDownloads::lookup_or_insert`, the enforcement site shared with the
 /// splice backend.
 #[must_use]
+/// Parse a redirect response's `Location` into a URI.
+///
+/// The two *other* reasons a redirect is not followed (unsupported scheme,
+/// host not permitted) each log at the call site; a `Location` that does not
+/// parse -- or is missing entirely -- would otherwise leave nothing but a
+/// bare "failed with code 302" further down. `source` and `what` only name
+/// the mirror and resource for the log line.
+fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) -> Option<Uri> {
+    let status = response.status();
+    let Some(location) = response.headers().get(LOCATION) else {
+        warn_once_or_debug!(
+            "Upstream mirror {source} answered {status} without a Location header for {what}"
+        );
+        return None;
+    };
+    let parsed = location
+        .to_str()
+        .ok()
+        .and_then(|lc_str| lc_str.parse::<Uri>().ok());
+    if parsed.is_none() {
+        warn_once_or_debug!(
+            "Upstream mirror {source} sent an unparsable Location header on {status} for {what}: {location:?}"
+        );
+    }
+    parsed
+}
+
 fn upstream_cap_rejection(
     conn_details: &ConnectionDetails,
     max: NonZero<usize>,
@@ -2335,12 +2382,11 @@ async fn serve_new_file(
             | StatusCode::FOUND
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
-    ) && let Some(moved_uri) = fwd_response
-        .headers()
-        .get(LOCATION)
-        .and_then(|lc| lc.to_str().ok())
-        .and_then(|lc_str| lc_str.parse::<Uri>().ok())
-    {
+    ) && let Some(moved_uri) = parse_redirect_location(
+        &fwd_response,
+        &conn_details.mirror.to_string(),
+        &conn_details.debname,
+    ) {
         debug!("Requested URI: {}, Moved URI: {moved_uri:?}", req.uri());
 
         if moved_uri.scheme().is_some_and(|scheme| {
@@ -3457,11 +3503,8 @@ async fn pre_process_client_request(
             | StatusCode::FOUND
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
-    ) && let Some(moved_uri) = fwd_response
-        .headers()
-        .get(LOCATION)
-        .and_then(|lc| lc.to_str().ok())
-        .and_then(|lc_str| lc_str.parse::<Uri>().ok())
+    ) && let Some(moved_uri) =
+        parse_redirect_location(&fwd_response, requested_host.as_str(), parts.uri.path())
     {
         debug!("Requested URI: {}, Moved URI: {moved_uri}", parts.uri);
 

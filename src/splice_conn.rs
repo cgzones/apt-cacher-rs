@@ -75,11 +75,11 @@ use crate::{
     cache_metadata, client_counter, content_type_for_cached_file, global_cache_quota,
     global_config, global_verify_throttle, metrics,
     permitted_host_cache::is_host_allowed_cached,
-    scheme_cache, static_assert, upstream_retry, warn_on_content_type_mismatch, warn_once_or_debug,
-    warn_once_or_info,
+    scheme_cache, static_assert, upstream_retry, warn_on_content_type_mismatch, warn_once,
+    warn_once_or_debug, warn_once_or_info,
 };
 #[cfg(feature = "ktls")]
-use crate::{KTLS_BLOCKED, SchemeKey, SchemeKeyRef, warn_once};
+use crate::{KTLS_BLOCKED, SchemeKey, SchemeKeyRef};
 #[cfg(not(feature = "hyper"))]
 use crate::{ProxyCacheBody, VOLATILE_CACHE_MAX_AGE, error::UpstreamFetchError, full_body};
 use crate::{cache_layout, integrity};
@@ -1234,10 +1234,23 @@ async fn try_unbuffered_ktls_connect(
             }
         }
         Ok(Err(KtlsError::ResponseNotSpliceable { response })) => {
-            debug!(
-                "kTLS: response not spliceable (status={})",
-                response.status_code
-            );
+            if response.status_code == 304 {
+                // Resolved from the buffered response; no second fetch.
+                debug!(
+                    "kTLS: response not spliceable (status={})",
+                    response.status_code
+                );
+            } else {
+                // The kTLS socket is one-shot, so anything not resolvable
+                // from the buffered response costs a reconnect and a second
+                // full fetch of the same object -- permanently doubling
+                // upstream traffic for a mirror that always answers this way.
+                warn_once_or_info!(
+                    "kTLS: upstream {} response not spliceable (status {}), refetching over a fresh connection",
+                    mirror.format_authority(),
+                    response.status_code
+                );
+            }
             KtlsResult::ResponseNotSpliceable {
                 response: *response,
             }
@@ -2202,8 +2215,22 @@ fn parse_upstream_response(
 
     let headers = resp.headers;
 
-    let content_length =
-        find_header(headers, &CONTENT_LENGTH).and_then(|v| v.trim().parse::<u64>().ok());
+    // A present-but-unparsable Content-Length (junk, a folded duplicate like
+    // `100, 100`, non-UTF8) silently degrades framing to close-delimited:
+    // permanent files then 502 with "no Content-Length" (reading as if the
+    // header were absent), volatile ones take the buffered path, and
+    // passthrough burns the pooled connection. It is also a response-
+    // smuggling signal, so say the value out loud.
+    let content_length = find_header(headers, &CONTENT_LENGTH).and_then(|v| {
+        let parsed = v.trim().parse::<u64>().ok();
+        if parsed.is_none() {
+            warn_once_or_info!(
+                "splice proxy: upstream {host_authority} sent an unparsable Content-Length, treating the body as close-delimited: {}",
+                v.escape_debug()
+            );
+        }
+        parsed
+    });
 
     let content_type = find_header(headers, &CONTENT_TYPE).map(String::from);
 
@@ -2454,6 +2481,22 @@ async fn splice_proxy_body(
                         "upstream sent TLS KeyUpdate (kernel paused RX awaiting rekey); \
                          kernel TLS cannot rekey",
                     ));
+                }
+                // Budget spent: the same errno now falls through to the
+                // generic arm, which surfaces as a plain "splice failed:
+                // Invalid argument" attributed to client delivery. Say that
+                // the kTLS drain budget is what ran out.
+                #[cfg(feature = "ktls")]
+                Err(
+                    err @ (nix::errno::Errno::EINVAL
+                    | nix::errno::Errno::EIO
+                    | nix::errno::Errno::EBADMSG),
+                ) if upstream_is_ktls => {
+                    warn_once!(
+                        "splice proxy (kTLS): mid-stream control-record drain budget exhausted for `{}`, aborting the transfer:  {err}",
+                        cache_path.display()
+                    );
+                    return Err(errno_to_io_error(err, "splice failed after kTLS drains"));
                 }
                 Err(err) => return Err(errno_to_io_error(err, "splice failed")),
             };
@@ -3767,8 +3810,12 @@ async fn standard_upstream_connect(
                 // Evict a stale cached scheme so the next request re-resolves,
                 // mirroring the hyper backend.
                 if let Some(scheme) = scheme_cache::record_failure(mirror.into()) {
-                    debug!(
-                        "splice proxy: removed cached {scheme} scheme for {} after connect failure",
+                    // A learned scheme is sticky, so losing it silently changes
+                    // how every later request to this host is dialled (an
+                    // evicted https entry can hand the host back to plain http
+                    // under Auto mode).
+                    warn_once_or_info!(
+                        "splice proxy: evicted cached {scheme} scheme for {} after connect failure; the next request re-decides the scheme",
                         mirror.format_authority()
                     );
                 }
@@ -3846,6 +3893,14 @@ async fn follow_redirect(
 ) -> Result<Option<String>, SpliceProxyError> {
     let status = upstream_resp.status_code;
     let Some(location) = upstream_resp.location.as_deref() else {
+        // Every other reject branch below logs; without this one a broken
+        // upstream's 3xx is forwarded to the client with nothing cached and
+        // no explanation anywhere.
+        warn_once_or_info!(
+            "splice proxy: upstream {} answered {status} for {} without a Location header, forwarding to the client",
+            conn_details.mirror,
+            conn_details.debname
+        );
         return Ok(None);
     };
     let Ok(moved_uri) = location.parse::<http::Uri>() else {
@@ -3857,6 +3912,15 @@ async fn follow_redirect(
         return Ok(None);
     };
     let Some(moved_host) = moved_uri.host() else {
+        // A relative Location (`/pool/...`) is legal per RFC 9110 and common
+        // on redirectors, but this backend only follows absolute targets, so
+        // the resource is forwarded uncached on every request.
+        warn_once_or_info!(
+            "splice proxy: upstream {} sent {status} for {} with relative Location `{}`, not followed and not cached",
+            conn_details.mirror,
+            conn_details.debname,
+            location.escape_debug()
+        );
         return Ok(None);
     };
     if !is_host_allowed_cached(moved_host) {
@@ -5547,7 +5611,21 @@ async fn splice_proxy_drive(
             // Verify the file size matches expectations (should always hold since
             // we've held the fd open, but check as defense-in-depth).
             use tokio::io::AsyncSeekExt as _;
-            let current_size = file.seek(std::io::SeekFrom::End(0)).await.unwrap_or(0);
+            let current_size = match file.seek(std::io::SeekFrom::End(0)).await {
+                Ok(size) => size,
+                Err(err) => {
+                    // Substituting 0 makes the mismatch branch below report an
+                    // empty partial file, which is not what happened -- the
+                    // discarded errno is the whole diagnosis.
+                    error!(
+                        "splice proxy: failed to determine partial file size for {} from mirror {}:  {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        ErrorReport(&err)
+                    );
+                    0
+                }
+            };
             if current_size != resume_offset {
                 error!(
                     "splice proxy: partial file size {current_size} != expected {resume_offset} despite held fd"
@@ -6984,9 +7062,21 @@ async fn handle_volatile_buffered_download(
                 .await
                 .inspect_err(|_err| upstream.unset_poolable())
         }
-        // Close-delimited: read until EOF. (A `ContentLength` body never
-        // reaches the buffered path; treat it as close-delimited defensively.)
-        BodyFraming::ContentLength(_) | BodyFraming::CloseDelimited => {
+        // A `ContentLength` body never reaches the buffered path (the caller
+        // routes here only when `content_length()` is `None`); handled as
+        // close-delimited defensively. Reading a length-delimited body until
+        // EOF against a keep-alive upstream hangs until `http_timeout`, so
+        // do not let a refactor break that invariant quietly.
+        BodyFraming::ContentLength(len) => {
+            warn_once!(
+                "splice proxy: volatile buffered download of {} reached with a Content-Length body ({len} bytes), reading until EOF",
+                conn_details.debname
+            );
+            upstream.unset_poolable();
+            read_body_to_vec_until_eof(upstream, body_prefix, max_bytes).await
+        }
+        // Close-delimited: read until EOF.
+        BodyFraming::CloseDelimited => {
             upstream.unset_poolable();
             read_body_to_vec_until_eof(upstream, body_prefix, max_bytes).await
         }
@@ -7074,13 +7164,23 @@ async fn handle_volatile_buffered_download(
     // Parse client Range against the now-known total size.
     let cache_time = HttpDate::now();
     let client_range_result = client_range.range.map(|range| {
-        http_parse_range(
+        let parsed = http_parse_range(
             range,
             client_range.if_range,
             total_content_length.get(),
             cache_time,
             upstream_resp.etag.as_deref(),
-        )
+        );
+        if matches!(parsed, ParsedRange::Invalid) {
+            // Same as the streaming path: RFC 9110 says ignore and serve the
+            // whole entity, but a client expecting a resume gets everything.
+            warn_once_or_debug!(
+                "splice proxy: ignoring malformed Range header from client {}, serving the full file: {}",
+                conn_details.client,
+                range.escape_debug()
+            );
+        }
+        parsed
     });
 
     // Range is not satisfiable — return 416.

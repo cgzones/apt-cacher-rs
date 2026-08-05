@@ -46,7 +46,7 @@ use crate::{
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
     static_assert, swrite, tunnel_limiter,
     utils::{hint_sequential_read, is_peer_disconnect, tokio_nofollow_options},
-    warn_once_or_debug, warn_once_or_info,
+    warn_once, warn_once_or_debug, warn_once_or_info,
     web_interface::{WebResponse, serve_web_interface},
 };
 
@@ -1530,7 +1530,18 @@ async fn evaluate_conditional_and_range(
 
                 return Ok(ConditionalOutcome::RangeNotSatisfiable(conn_action));
             }
-            ParsedRange::Invalid | ParsedRange::IfRangeFailed => {}
+            ParsedRange::Invalid => {
+                // RFC 9110 says to ignore a malformed Range and serve the
+                // whole entity, which is what happens here -- but a client
+                // that expected a resume silently receives the full object.
+                warn_once_or_debug!(
+                    "Ignoring malformed Range header from client {client}, serving the full file: {}",
+                    range.escape_debug()
+                );
+            }
+            // An If-Range that did not match is an ordinary outcome: the
+            // client asked for the full entity if the validator moved on.
+            ParsedRange::IfRangeFailed => {}
         }
     }
 
@@ -2518,6 +2529,17 @@ pub(crate) async fn async_sendfile_unfinished(
                 }
                 if is_finished {
                     finished = true;
+                } else if transferred < sendable {
+                    // Neither finished nor aborted: the writer still claims
+                    // the download is in flight while the file is shorter
+                    // than the fstat two lines above reported. The loop
+                    // re-runs with the same inputs, so a stuck writer shows
+                    // up as a spin, not as an error.
+                    warn_once!(
+                        "sendfile: EOF at offset {file_offset} for `{}` while the download is still in progress ({} bytes owed), retrying",
+                        file_path.display(),
+                        sendable - transferred
+                    );
                 }
                 transferred
             }

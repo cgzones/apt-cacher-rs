@@ -14,6 +14,7 @@ use rustls::{
 };
 
 use crate::secure_vec::SecureVec;
+use crate::warn_once;
 
 /// Shift `discard` processed bytes out of the front of `buf[..used]`.
 pub(crate) fn discard_incoming(buf: &mut [u8], used: &mut usize, discard: usize) {
@@ -22,7 +23,17 @@ pub(crate) fn discard_incoming(buf: &mut [u8], used: &mut usize, discard: usize)
         "discard ({discard}) exceeds used ({used})",
         used = *used
     );
-    if discard >= *used {
+    if discard > *used {
+        // Release builds compile the debug_assert out, and zeroing `used`
+        // here drops unprocessed ciphertext *and* defeats the `incoming_used
+        // != 0` guard that stops kTLS being configured with a stale record
+        // sequence -- the resulting garbage decrypts as a peer error later.
+        warn_once!(
+            "kTLS: rustls asked to discard {discard} bytes but only {} are buffered; dropping the buffer",
+            *used
+        );
+        *used = 0;
+    } else if discard == *used {
         // All data consumed — skip the copy_within entirely
         *used = 0;
     } else if discard > 0 {
@@ -80,7 +91,18 @@ pub(crate) fn encode_tls_data(
             Err(EncodeError::InsufficientSize(isz)) => {
                 outgoing.resize(isz.required_size + *outgoing_used, 0);
             }
-            Err(EncodeError::AlreadyEncoded) => break,
+            Err(EncodeError::AlreadyEncoded) => {
+                // Unreachable today (the caller encodes once per state, and
+                // `InsufficientSize` does not set rustls' encoded flag).
+                // Breaking here leaves `outgoing_used` unadvanced, so the
+                // following TransmitTlsData sends nothing and the handshake
+                // stalls into a round-cap or http_timeout error that points
+                // at the network instead of the state machine.
+                warn_once!(
+                    "kTLS: rustls reported handshake data already encoded; no bytes queued for transmit"
+                );
+                break;
+            }
         }
     }
 }
