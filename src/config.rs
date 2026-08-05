@@ -14,6 +14,7 @@ use serde::{Deserialize, Deserializer};
 use tracing::level_filters::LevelFilter;
 
 use crate::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
+use crate::humanfmt::HumanFmt;
 use crate::nonzero;
 
 /// Failure while loading or validating the configuration.
@@ -1549,7 +1550,7 @@ impl Config {
 
             if !path.is_absolute() {
                 warnings.push(format!(
-                    "log_file `{}` is not an absolute path",
+                    "log_file `{}` is not an absolute path; it resolves against the daemon working directory (`/` under systemd) - use an absolute path",
                     path.display()
                 ));
             }
@@ -1633,7 +1634,7 @@ impl Config {
         {
             warnings.push(format!(
                 "disk_quota of {} is very small; consider a larger value to avoid requests being rejected",
-                quota.get()
+                HumanFmt::Size(quota.get())
             ));
         }
 
@@ -1654,7 +1655,7 @@ impl Config {
             if max_object_size < nonzero!(100 * 1024 * 1024) {
                 warnings.push(format!(
                     "max_object_size of {} is very small; consider a larger value to avoid requests being rejected",
-                    max_object_size.get()
+                    HumanFmt::Size(max_object_size.get())
                 ));
             }
             if let Some(quota) = self.disk_quota
@@ -1792,7 +1793,8 @@ impl Config {
             && self.https_tunnel_allowed_ports != default_https_tunnel_allowed_ports()
         {
             warnings.push(
-                "https_tunnel_allowed_ports is set but https_tunnel_enabled is false".to_string(),
+                "https_tunnel_allowed_ports is set but has no effect while https_tunnel_enabled is false"
+                    .to_string(),
             );
         }
 
@@ -1800,7 +1802,8 @@ impl Config {
             && self.https_tunnel_allowed_mirrors != default_https_tunnel_allowed_mirrors()
         {
             warnings.push(
-                "https_tunnel_allowed_mirrors is set but https_tunnel_enabled is false".to_string(),
+                "https_tunnel_allowed_mirrors is set but has no effect while https_tunnel_enabled is false"
+                    .to_string(),
             );
         }
 
@@ -1809,7 +1812,7 @@ impl Config {
                 != default_https_tunnel_max_connections_per_client()
         {
             warnings.push(
-                "https_tunnel_max_connections_per_client is set but https_tunnel_enabled is false"
+                "https_tunnel_max_connections_per_client is set but has no effect while https_tunnel_enabled is false"
                     .to_string(),
             );
         }
@@ -1966,7 +1969,7 @@ impl Config {
 
         if !self.cache_directory.is_absolute() {
             warnings.push(format!(
-                "cache_directory `{}` is not an absolute path",
+                "cache_directory `{}` is not an absolute path; it resolves against the daemon working directory (`/` under systemd) - use an absolute path",
                 self.cache_directory.display()
             ));
         }
@@ -1977,7 +1980,7 @@ impl Config {
 
         if !self.database_path.is_absolute() {
             warnings.push(format!(
-                "database_path `{}` is not an absolute path",
+                "database_path `{}` is not an absolute path; it resolves against the daemon working directory (`/` under systemd) - use an absolute path",
                 self.database_path.display()
             ));
         }

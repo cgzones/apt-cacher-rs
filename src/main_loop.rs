@@ -39,6 +39,7 @@ use crate::{
     metrics,
     task_cache_scan::task_cache_scan,
     utils::filesystem_space,
+    warn_once_or_debug,
 };
 
 /// One-line accounting emitted on every shutdown path: what the process did
@@ -390,7 +391,7 @@ pub(crate) async fn main_loop(
             Ok(Ok(())) => {}
             Ok(Err(err)) => error!("Database task did not exit cleanly:  {err}"),
             Err(_) => error!(
-                "Database task did not drain within {} seconds, abandoning",
+                "Database task did not drain within {} seconds, abandoning; buffered download/delivery/origin rows are lost",
                 DB_DRAIN_TIMEOUT.as_secs()
             ),
         }
@@ -470,9 +471,10 @@ pub(crate) async fn main_loop(
             client.ip(),
             config.max_connections_per_client_ip,
         ) else {
-            info!(
+            // Per rejected connection, on exactly the path a flood exercises.
+            warn_once_or_debug!(
                 "Rejecting connection from client {client}: \
-                 per-client-IP connection limit ({}) reached",
+                 `max_connections_per_client_ip` ({}) reached, closing the socket without a response",
                 config
                     .max_connections_per_client_ip
                     .expect("limit reached implies a configured cap")

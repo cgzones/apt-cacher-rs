@@ -30,7 +30,7 @@
 use std::{cell::LazyCell, num::NonZero};
 
 use http::StatusCode;
-use tracing::{info, trace};
+use tracing::trace;
 
 use crate::{
     ClientInfo,
@@ -41,7 +41,7 @@ use crate::{
         Mirror, Origin, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path,
         parse_request_path,
     },
-    flat_blocklist, global_config, metrics,
+    flat_blocklist, global_config, info_once, metrics,
     precise_instant::PreciseInstant,
     warn_once_or_debug, warn_once_or_info,
 };
@@ -266,7 +266,10 @@ fn decide_request(
     let is_diff = LazyCell::new(|| is_diff_request_path(uri_path));
 
     if reject_pdiff_requests && *is_diff {
-        info!("Rejecting diff request {uri_path} for client {client}");
+        // Several per `apt update`; the count lives in PDIFF_REJECTED.
+        info_once!(
+            "Rejecting diff request {uri_path} for client {client}; pdiff URLs are uncacheable here and are refused with 410 (further rejections counted in PDIFF_REJECTED)"
+        );
         metrics::PDIFF_REJECTED.increment();
         return Decision::Reject(RejectReason::DiffRequest);
     }

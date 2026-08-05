@@ -460,7 +460,11 @@ pub(crate) async fn db_loop(
                 if curr_capacity == 0 {
                     if !at_cap {
                         let depth = max_capacity - curr_capacity;
-                        info!("Database command channel full ({depth}/{max_capacity})");
+                        // `send_db_command` awaits on a full queue, so request
+                        // paths now block on database writes.
+                        warn!(
+                            "Database command channel full ({depth}/{max_capacity}); request paths now block on database writes - consider raising `db_channel_capacity`"
+                        );
                         metrics::DB_QUEUE_FULL_TRANSITIONS.increment();
                         at_cap = true;
                     }

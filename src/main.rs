@@ -972,7 +972,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     }
 
     for warning in config_warnings {
-        warn!("Configuration:  {warning}");
+        warn!("Configuration `{}`: {warning}", args.config_file.display());
     }
 
     debug!("Configuration: {:?}", global_config());
@@ -986,7 +986,9 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     }
 
     if global_config().allowed_mirrors.is_empty() {
-        warn!("No mirror allowed, consider setting option 'allowed_mirrors'");
+        warn!(
+            "Option `allowed_mirrors` is empty; every proxy request will be rejected with 403 Unauthorized host - set it to the mirrors this cache should serve"
+        );
     }
 
     info!(
