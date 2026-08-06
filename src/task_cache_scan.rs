@@ -2,7 +2,7 @@ use std::{borrow::Cow, path::Path};
 
 use hashbrown::HashMap;
 use tokio::fs::DirEntry;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::{
     cache_layout::{KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
@@ -11,6 +11,7 @@ use crate::{
     error::{ErrorReport, ProxyCacheError},
     global_config, healthcheck, metrics, task_setup,
     utils::probe_dir,
+    warn_once_or_info,
 };
 
 /// Tally of one scan pass: the bytes counted towards the cache size and the
@@ -279,18 +280,18 @@ async fn scan_mirror_dir(
             // not to exist — `kind` latches to `Structured` on the very
             // first structured request (see `upsert_mirror_get_id`), so a
             // `Flat` row has by construction never written to
-            // `<host>/<mirror_path>/`. Logging at info here just adds
-            // noise on every startup / SIGUSR2 cleanup. For `Structured`
-            // rows the absence is potentially a real inconsistency, so
-            // keep the info-level call there.
+            // `<host>/<mirror_path>/`. Logging above debug here would just
+            // add noise on every startup / SIGUSR2 cleanup. For
+            // `Structured` rows the absence is potentially a real
+            // inconsistency, so it warns once there and repeats at info.
             if mirror.kind() == MirrorKind::Flat {
                 debug!(
                     "Mirror directory `{}` not found (flat-kind mirror, expected)",
                     mirror_path.display()
                 );
             } else {
-                info!(
-                    "Structured mirror directory `{}` not found",
+                warn_once_or_info!(
+                    "Structured mirror directory `{}` not found; counting this mirror as empty in the cache size",
                     mirror_path.display()
                 );
             }

@@ -265,10 +265,17 @@ pub(crate) async fn handle_sendfile_connection(
                 )
                 .await
                 {
-                    info!(
-                        "Failed to write error response to client {client}:  {}",
-                        ErrorReport(&err)
-                    );
+                    if is_peer_disconnect(&err) {
+                        info!(
+                            "Failed to write error response to client {client}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    } else {
+                        warn!(
+                            "Failed to write error response to client {client}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    }
                 }
 
                 graceful_close(&stream).await;
@@ -283,10 +290,17 @@ pub(crate) async fn handle_sendfile_connection(
                     write_invalid_response(&stream, conn_version, conn_action, status, msg, None)
                         .await
                 {
-                    info!(
-                        "Failed to write rejection response to client {client}:  {}",
-                        ErrorReport(&err)
-                    );
+                    if is_peer_disconnect(&err) {
+                        info!(
+                            "Failed to write rejection response to client {client}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    } else {
+                        warn!(
+                            "Failed to write rejection response to client {client}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    }
                     return;
                 }
 
@@ -488,10 +502,17 @@ async fn serve_webui(
     let response = serve_web_interface(uri, appstate).await;
 
     if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
-        info!(
-            "Failed to write web-interface response to client {client}:  {}",
-            ErrorReport(&err)
-        );
+        if is_peer_disconnect(&err) {
+            info!(
+                "Failed to write web-interface response to client {client}; closing the connection:  {}",
+                ErrorReport(&err)
+            );
+        } else {
+            warn!(
+                "Failed to write web-interface response to client {client}; closing the connection:  {}",
+                ErrorReport(&err)
+            );
+        }
         return ZeroCopyResult::AfterHeaderError;
     }
     // `SERVED_*` means "fully delivered": bump only after the synchronous
@@ -693,10 +714,17 @@ async fn write_tunnel_upstream_error(
     )
     .await
     {
-        info!(
-            "Failed to write tunnel 502 response to client {client}:  {}",
-            ErrorReport(&err)
-        );
+        if is_peer_disconnect(&err) {
+            info!(
+                "Failed to write tunnel 502 response to client {client}; closing the connection:  {}",
+                ErrorReport(&err)
+            );
+        } else {
+            warn!(
+                "Failed to write tunnel 502 response to client {client}; closing the connection:  {}",
+                ErrorReport(&err)
+            );
+        }
         return;
     }
     graceful_close(stream).await;
@@ -797,10 +825,17 @@ async fn run_connect_tunnel(
     metrics::record_client_status(StatusCode::OK);
     if let Err(err) = write_all_to_stream(&stream, established.as_bytes(), WritePhase::Header).await
     {
-        info!(
-            "Failed to send tunnel established response to client {client}:  {}",
-            ErrorReport(&err)
-        );
+        if is_peer_disconnect(&err) {
+            info!(
+                "Failed to send tunnel established response to client {client}; tearing down the tunnel:  {}",
+                ErrorReport(&err)
+            );
+        } else {
+            warn!(
+                "Failed to send tunnel established response to client {client}; tearing down the tunnel:  {}",
+                ErrorReport(&err)
+            );
+        }
         return;
     }
 
@@ -951,7 +986,7 @@ async fn try_sendfile_request(
     {
         Ok(uri) => uri,
         Err(err) => {
-            info!(
+            warn_once_or_info!(
                 "Failed to parse URI from client {client}; returning 400:  {}",
                 ErrorReport(&err)
             );
@@ -1499,10 +1534,17 @@ async fn evaluate_conditional_and_range(
         )
         .await
         {
-            info!(
-                "Failed to write 304 response to client {client}:  {}",
-                ErrorReport(&err)
-            );
+            if is_peer_disconnect(&err) {
+                info!(
+                    "Failed to write 304 response to client {client}; closing the connection:  {}",
+                    ErrorReport(&err)
+                );
+            } else {
+                warn!(
+                    "Failed to write 304 response to client {client}; closing the connection:  {}",
+                    ErrorReport(&err)
+                );
+            }
             return Err(SendfileResult::ClientError);
         }
 
@@ -1530,10 +1572,17 @@ async fn evaluate_conditional_and_range(
                 if let Err(err) =
                     write_416_response(stream, conn_version, conn_action, file_size).await
                 {
-                    info!(
-                        "Failed to write 416 response to client {client}:  {}",
-                        ErrorReport(&err)
-                    );
+                    if is_peer_disconnect(&err) {
+                        info!(
+                            "Failed to write 416 response to client {client}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    } else {
+                        warn!(
+                            "Failed to write 416 response to client {client}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    }
                     return Err(SendfileResult::ClientError);
                 }
 
@@ -1692,11 +1741,19 @@ pub(crate) async fn serve_file_via_sendfile(
         etag: cache_info.file_etag.as_deref(),
     };
     if let Err(err) = write_response_headers(stream, headers).await {
-        info!(
-            "Failed to write response headers to client {}:  {}",
-            conn_details.client,
-            ErrorReport(&err)
-        );
+        if is_peer_disconnect(&err) {
+            info!(
+                "Failed to write response headers to client {}; closing the connection:  {}",
+                conn_details.client,
+                ErrorReport(&err)
+            );
+        } else {
+            warn!(
+                "Failed to write response headers to client {}; closing the connection:  {}",
+                conn_details.client,
+                ErrorReport(&err)
+            );
+        }
         return SendfileResult::ClientError;
     }
 
@@ -2823,7 +2880,7 @@ async fn serve_unfinished_sendfile(
         Err(result) => return result.into(),
     };
 
-    info!(
+    debug!(
         "Serving downloading file {} from mirror {}{aliased} for joining client {} via sendfile...",
         conn_details.debname, conn_details.mirror, conn_details.client
     );
@@ -2848,11 +2905,19 @@ async fn serve_unfinished_sendfile(
         etag: cache_info.file_etag.as_deref(),
     };
     if let Err(err) = write_response_headers(stream, headers).await {
-        info!(
-            "Failed to write response headers to joining client {}:  {}",
-            conn_details.client,
-            ErrorReport(&err)
-        );
+        if is_peer_disconnect(&err) {
+            info!(
+                "Failed to write response headers to joining client {}; closing the connection:  {}",
+                conn_details.client,
+                ErrorReport(&err)
+            );
+        } else {
+            warn!(
+                "Failed to write response headers to joining client {}; closing the connection:  {}",
+                conn_details.client,
+                ErrorReport(&err)
+            );
+        }
         return ZeroCopyResult::ClientError;
     }
 

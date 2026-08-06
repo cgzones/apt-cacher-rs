@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use tracing::warn;
-
-use crate::{http_range::HttpDate, xattr_helpers};
+use crate::{http_range::HttpDate, warn_once_or_info, xattr_helpers};
 
 /// The extended attribute name used to store upstream `Last-Modified` values.
 const XATTR_LAST_MODIFIED: &str = "user.apt_cacher_rs.last_modified";
@@ -33,7 +31,7 @@ pub(crate) fn try_read_last_modified(
     };
 
     let Some(time) = HttpDate::parse(&data) else {
-        warn!(
+        warn_once_or_info!(
             "Discarding malformed Last-Modified from `{}`: `{}`",
             display_path.display(),
             data.escape_debug()
@@ -52,7 +50,7 @@ pub(crate) fn try_read_last_modified(
 /// Malformed values are skipped. Logs warnings on failure but never propagates errors.
 pub(crate) fn write_last_modified(file: &tokio::fs::File, display_path: &Path, value: &str) {
     if !is_valid_http_date(value) {
-        warn!(
+        warn_once_or_info!(
             "Skipping write of malformed Last-Modified to `{}`: `{}`",
             display_path.display(),
             value.escape_debug()

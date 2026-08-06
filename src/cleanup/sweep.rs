@@ -10,7 +10,7 @@ use crate::cache_layout::CacheLayout;
 use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
-use crate::{cache_metadata, info_once, metrics};
+use crate::{cache_metadata, info_once, metrics, warn_once_or_info};
 
 use super::engine::SpanClass;
 
@@ -188,7 +188,7 @@ pub(super) async fn sweep_candidates(
             }
             Ok(_) => {}
             Err(err) => {
-                info_once!(
+                warn_once_or_info!(
                     "Cache file `{}` has a future timestamp; skipping its removal:  {}",
                     path.display(),
                     ErrorReport(&err)
@@ -332,7 +332,7 @@ pub(super) async fn sweep_aged_metadata(
             Ok(age) if age < keep_span => continue,
             Ok(_) => {}
             Err(err) => {
-                info_once!(
+                warn_once_or_info!(
                     "Metadata file `{}` has a future timestamp; skipping its removal:  {}",
                     path.display(),
                     ErrorReport(&err)

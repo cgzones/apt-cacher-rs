@@ -6010,13 +6010,28 @@ async fn splice_proxy_drive(
             )
             .await
             {
-                info!(
-                    "splice proxy: failed to write body prefix to client {} for {} from mirror {} (continuing cache-only):  {}",
-                    conn_details.client,
-                    conn_details.debname,
-                    conn_details.mirror,
-                    ErrorReport(&err)
-                );
+                // Both of this writer's stall paths surface as `TimedOut`,
+                // which `is_peer_disconnect` deliberately excludes: the
+                // rate-check failure and the `http_timeout` write stall (which
+                // bumps `HTTP_TIMEOUT_CLIENT_BODY`). Pre-branch it so a slow or
+                // stalled client stays `info` like hyper's rate-timeout sibling.
+                if err.kind() == ErrorKind::TimedOut || is_peer_disconnect(&err) {
+                    info!(
+                        "splice proxy: failed to write body prefix to client {} for {} from mirror {}; continuing cache-only:  {}",
+                        conn_details.client,
+                        conn_details.debname,
+                        conn_details.mirror,
+                        ErrorReport(&err)
+                    );
+                } else {
+                    warn!(
+                        "splice proxy: failed to write body prefix to client {} for {} from mirror {}; continuing cache-only:  {}",
+                        conn_details.client,
+                        conn_details.debname,
+                        conn_details.mirror,
+                        ErrorReport(&err)
+                    );
+                }
                 prefix_client_failed = true;
             } else {
                 metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
@@ -6077,13 +6092,26 @@ async fn splice_proxy_drive(
             )
             .await
             {
-                info!(
-                    "splice proxy: failed to write kTLS extra body to client {} for {} from mirror {} (continuing cache-only):  {}",
-                    conn_details.client,
-                    conn_details.debname,
-                    conn_details.mirror,
-                    ErrorReport(&err)
-                );
+                // See the body-prefix site above: `TimedOut` covers both the
+                // rate-check failure and the `http_timeout` write stall, and
+                // neither must escalate to `warn`.
+                if err.kind() == ErrorKind::TimedOut || is_peer_disconnect(&err) {
+                    info!(
+                        "splice proxy: failed to write kTLS extra body to client {} for {} from mirror {}; continuing cache-only:  {}",
+                        conn_details.client,
+                        conn_details.debname,
+                        conn_details.mirror,
+                        ErrorReport(&err)
+                    );
+                } else {
+                    warn!(
+                        "splice proxy: failed to write kTLS extra body to client {} for {} from mirror {}; continuing cache-only:  {}",
+                        conn_details.client,
+                        conn_details.debname,
+                        conn_details.mirror,
+                        ErrorReport(&err)
+                    );
+                }
                 prefix_client_failed = true;
             } else {
                 metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
