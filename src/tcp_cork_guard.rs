@@ -3,7 +3,7 @@ use std::{io::ErrorKind, os::fd::AsRawFd as _};
 use tokio::net::TcpStream;
 use tracing::warn;
 
-use crate::{static_assert, warn_once_or_debug};
+use crate::{error::ErrorReport, static_assert, warn_once_or_debug};
 
 /// RAII guard that sets `TCP_CORK` on creation and clears it on drop.
 /// While corked, the kernel buffers small writes to coalesce them into
@@ -25,26 +25,28 @@ impl<'a> CorkGuard<'a> {
             Ok(guard) => Some(guard),
             Err(err) if err.kind() == ErrorKind::Unsupported => {
                 warn_once_or_debug!(
-                    "Failed to cork TCP socket from {} to {}:  {err}",
+                    "Failed to cork TCP socket from {} to {}; sending without corking:  {}",
                     stream
                         .local_addr()
                         .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
                     stream
                         .peer_addr()
-                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string())
+                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                    ErrorReport(&err)
                 );
 
                 None
             }
             Err(err) => {
                 warn!(
-                    "Failed to cork TCP socket from {} to {}:  {err}",
+                    "Failed to cork TCP socket from {} to {}; sending without corking:  {}",
                     stream
                         .local_addr()
                         .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
                     stream
                         .peer_addr()
-                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string())
+                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                    ErrorReport(&err)
                 );
 
                 None
@@ -87,13 +89,14 @@ impl Drop for CorkGuard<'_> {
 
         if let Err(err) = Self::set_tcp_cork(stream, false) {
             warn!(
-                "Failed to uncork TCP socket from {} to {}:  {err}",
+                "Failed to uncork TCP socket from {} to {}; leaving the socket corked:  {}",
                 stream
                     .local_addr()
                     .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
                 stream
                     .peer_addr()
-                    .map_or_else(|_| String::from("<unknown>"), |a| a.to_string())
+                    .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                ErrorReport(&err)
             );
         }
     }

@@ -26,6 +26,7 @@ use hashbrown::HashMap;
 use nix::libc;
 use tracing::{debug, error, warn};
 
+use crate::error::ErrorReport;
 use crate::{nonzero, warn_once_or_debug};
 
 /// Whether buffers are pinned in RAM via `mlock(2)` — config
@@ -296,18 +297,21 @@ static PAGE_SIZE: LazyLock<Option<NonZero<usize>>> = LazyLock::new(|| {
             // Not fatal: `page_size()` falls back to 4 KiB, which only
             // affects pool keying granularity.
             warn!(
-                "secure buffer: invalid page size of {size} bytes, falling back to 4 KiB mappings"
+                "Invalid page size of {size} bytes reported by sysconf; falling back to 4 KiB mappings for TLS-secret buffers"
             );
             None
         }
         Ok(None) => {
-            warn!("secure buffer: page size is not available, falling back to 4 KiB mappings");
+            warn!(
+                "Page size is unavailable from sysconf; falling back to 4 KiB mappings for TLS-secret buffers"
+            );
             None
         }
 
         Err(errno) => {
             warn!(
-                "secure buffer: failed to get the page size, falling back to 4 KiB mappings:  {errno}"
+                "Failed to query the page size from sysconf; falling back to 4 KiB mappings for TLS-secret buffers:  {}",
+                ErrorReport(&errno)
             );
             None
         }
@@ -365,8 +369,8 @@ fn map_region(map_len: usize) -> NonNull<u8> {
     };
     if ptr == libc::MAP_FAILED {
         error!(
-            "secure buffer: mmap({map_len}) for a TLS secret failed:  {}",
-            std::io::Error::last_os_error()
+            "Failed to mmap {map_len} bytes for a TLS-secret buffer; aborting the process:  {}",
+            ErrorReport(&std::io::Error::last_os_error())
         );
         secure_alloc_failure(map_len);
     }
@@ -389,8 +393,8 @@ unsafe fn unmap_region(ptr: NonNull<u8>, map_len: usize) {
     let rc = unsafe { libc::munmap(ptr.as_ptr().cast::<libc::c_void>(), map_len) };
     if rc != 0 {
         error!(
-            "munmap({map_len}) failed:  {}",
-            std::io::Error::last_os_error()
+            "Failed to munmap {map_len} bytes of a TLS-secret buffer; the mapping leaks until process exit:  {}",
+            ErrorReport(&std::io::Error::last_os_error())
         );
     }
 }
@@ -427,7 +431,10 @@ unsafe fn try_mlock(ptr: *const u8, len: usize) {
     // SAFETY: ptr points to `len` bytes of a valid allocation guaranteed by the caller.
     let rc = unsafe { libc::mlock(ptr.cast(), len) };
     if rc != 0 {
-        warn_once_or_debug!("mlock({len}) failed:  {}", std::io::Error::last_os_error());
+        warn_once_or_debug!(
+            "Failed to mlock {len} bytes of a TLS-secret buffer; the secret may be paged out to swap:  {}",
+            ErrorReport(&std::io::Error::last_os_error())
+        );
     }
 }
 
@@ -453,8 +460,8 @@ unsafe fn try_madvise_dontdump(ptr: *const u8, len: usize) {
     };
     if rc != 0 {
         warn_once_or_debug!(
-            "madvise(MADV_DONTDUMP, {len}) failed:  {}",
-            std::io::Error::last_os_error()
+            "Failed to apply madvise(MADV_DONTDUMP) to {len} bytes of a TLS-secret buffer; the secret may appear in core dumps:  {}",
+            ErrorReport(&std::io::Error::last_os_error())
         );
     }
 }
@@ -484,8 +491,8 @@ unsafe fn try_madvise_wipeonfork(ptr: *const u8, len: usize) {
     };
     if rc != 0 {
         warn_once_or_debug!(
-            "madvise(MADV_WIPEONFORK, {len}) failed:  {}",
-            std::io::Error::last_os_error()
+            "Failed to apply madvise(MADV_WIPEONFORK) to {len} bytes of a TLS-secret buffer; the secret would be inherited by a forked child:  {}",
+            ErrorReport(&std::io::Error::last_os_error())
         );
     }
 }

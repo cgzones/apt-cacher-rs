@@ -181,7 +181,7 @@ pub(crate) fn warn_on_content_type_mismatch(
         return;
     }
     warn_once_or_info!(
-        "Upstream Content-Type `{upstream_ct}` differs from expected `{expected}` for {debname} from {mirror}"
+        "Upstream Content-Type `{upstream_ct}` differs from the expected `{expected}` for {debname} from {mirror}; caching and serving the file anyway"
     );
 }
 
@@ -639,8 +639,9 @@ impl std::io::Write for ReopenableLogFile {
             && let Err(err) = self.reopen()
         {
             eprintln!(
-                "Failed to reopen log file `{}`:  {err}",
-                self.path.display()
+                "Failed to reopen log file `{}`; continuing to write to the previously opened file:  {}",
+                self.path.display(),
+                error::ErrorReport(&err)
             );
         }
         std::io::Write::write(&mut *self.file.lock(), buf)
@@ -731,7 +732,10 @@ fn build_rustls_client_config()
     let tls_config = {
         let result = rustls_native_certs::load_native_certs();
         for err in &result.errors {
-            warn!("native root CA loading error:  {}", error::ErrorReport(err));
+            warn!(
+                "Failed to load a native root CA source; continuing with the roots that did load:  {}",
+                error::ErrorReport(err)
+            );
         }
         if result.certs.is_empty() {
             return Err(format!(
@@ -789,7 +793,10 @@ fn main() -> std::process::ExitCode {
             // Not `error!`: a failure before logging is initialised (config
             // load) would otherwise be swallowed entirely.  `ErrorReport`
             // walks `source()`, which the default `Debug` print would not.
-            eprintln!("Error: {}", error::ErrorReport(&*err));
+            eprintln!(
+                "Failed to run apt-cacher-rs:  {}",
+                error::ErrorReport(&*err)
+            );
             std::process::ExitCode::FAILURE
         }
     }
@@ -799,7 +806,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     struct Stopped;
     impl Drop for Stopped {
         fn drop(&mut self) {
-            info!("Stopped.");
+            info!("Stopped");
         }
     }
 
@@ -882,13 +889,18 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
                 Ok(file) => file,
                 Err(err) if err.raw_os_error() == Some(nix::libc::ELOOP) => {
                     eprintln!(
-                        "Failed to open log file `{}`:  {err}; symlinks are not supported",
-                        path.display()
+                        "Failed to open log file `{}` (symlinks are not supported); exiting:  {}",
+                        path.display(),
+                        error::ErrorReport(&err)
                     );
                     return Ok(std::process::ExitCode::FAILURE);
                 }
                 Err(err) => {
-                    eprintln!("Failed to open log file `{}`:  {err}", path.display());
+                    eprintln!(
+                        "Failed to open log file `{}`; exiting:  {}",
+                        path.display(),
+                        error::ErrorReport(&err)
+                    );
                     return Ok(std::process::ExitCode::FAILURE);
                 }
             };
@@ -987,7 +999,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
 
     if global_config().allowed_mirrors.is_empty() {
         warn!(
-            "Option `allowed_mirrors` is empty; every proxy request will be rejected with 403 Unauthorized host - set it to the mirrors this cache should serve"
+            "Option `allowed_mirrors` is empty; every proxy request is rejected with 403 Unauthorized host until it lists the mirrors this cache should serve"
         );
     }
 
@@ -997,7 +1009,10 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     );
 
     let _cache_lock = task_setup::task_setup().inspect_err(|err| {
-        error!("Error during setup:  {err}");
+        error!(
+            "Failed to prepare the cache directory; aborting startup:  {}",
+            error::ErrorReport(err)
+        );
     })?;
 
     #[cfg(all(feature = "splice", feature = "tls_rustls", not(feature = "hyper")))]

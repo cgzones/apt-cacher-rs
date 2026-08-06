@@ -49,7 +49,7 @@ pub(crate) fn validate_connect_target(
         && auth.as_str().len() > limits::MAX_AUTHORITY_LEN
     {
         warn_once_or_info!(
-            "Oversized CONNECT authority from client {client}: {} bytes",
+            "Oversized CONNECT authority from client {client} ({} bytes); rejecting the tunnel request with 400",
             auth.as_str().len()
         );
         return Err(ConnectReject {
@@ -63,7 +63,9 @@ pub(crate) fn validate_connect_target(
             .and_then(NonZero::new)
             .map(|p| (a.host().to_string(), p))
     }) else {
-        warn_once_or_info!("Invalid CONNECT address from client {client}: {uri}");
+        warn_once_or_info!(
+            "Invalid CONNECT address `{uri}` from client {client}; rejecting the tunnel request with 400"
+        );
         return Err(ConnectReject {
             status: StatusCode::BAD_REQUEST,
             msg: "Invalid CONNECT address",

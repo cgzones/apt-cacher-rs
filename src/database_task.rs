@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     database::{Database, DeliveryRow, DownloadRow, OriginRow},
     deb_mirror::{Mirror, Origin},
+    error::ErrorReport,
     metrics,
 };
 
@@ -209,7 +210,10 @@ async fn stage(
         DatabaseCommand::Delivery(c) => {
             let Some((size, duration)) = convert_size_duration(c.size, c.elapsed) else {
                 metrics::DB_OPERATION_FAILED.increment();
-                error!("Delivery size/duration conversion overflowed; dropping event");
+                error!(
+                    "Delivery size/duration conversion overflowed for {} from mirror {}; dropping the delivery record",
+                    c.debname, c.mirror
+                );
                 return;
             };
             let mirror_id = match resolve_mirror_id(db, cache, &c.mirror, now).await {
@@ -217,7 +221,9 @@ async fn stage(
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
-                        "Failed to resolve mirror for delivery {mirror}:  {err}",
+                        "Failed to resolve the mirror id for a delivery of {debname} from mirror {mirror}; dropping the delivery record:  {}",
+                        ErrorReport(&err),
+                        debname = c.debname,
                         mirror = c.mirror
                     );
                     return;
@@ -235,7 +241,10 @@ async fn stage(
         DatabaseCommand::Download(c) => {
             let Some((size, duration)) = convert_size_duration(c.size, c.elapsed) else {
                 metrics::DB_OPERATION_FAILED.increment();
-                error!("Download size/duration conversion overflowed; dropping event");
+                error!(
+                    "Download size/duration conversion overflowed for {} from mirror {}; dropping the download record",
+                    c.debname, c.mirror
+                );
                 return;
             };
             let mirror_id = match resolve_mirror_id(db, cache, &c.mirror, now).await {
@@ -243,7 +252,9 @@ async fn stage(
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
-                        "Failed to resolve mirror for download {mirror}:  {err}",
+                        "Failed to resolve the mirror id for a download of {debname} from mirror {mirror}; dropping the download record:  {}",
+                        ErrorReport(&err),
+                        debname = c.debname,
                         mirror = c.mirror
                     );
                     return;
@@ -263,7 +274,8 @@ async fn stage(
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
-                        "Failed to resolve mirror for origin {mirror}:  {err}",
+                        "Failed to resolve the mirror id for an origin of mirror {mirror}; dropping the origin record:  {}",
+                        ErrorReport(&err),
                         mirror = c.origin.mirror
                     );
                     return;
@@ -287,7 +299,10 @@ async fn stage(
             let result = db.ping().await;
             if let Err(err) = &result {
                 metrics::DB_OPERATION_FAILED.increment();
-                error!("Database ping failed:  {err}");
+                error!(
+                    "Failed to ping the database; reporting the health check as failing:  {}",
+                    ErrorReport(err)
+                );
             }
             // Replied-to-nobody is fine: the healthcheck timed out and
             // stopped waiting.
@@ -309,21 +324,30 @@ async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReaso
     if let Err(err) = db.batch_insert_deliveries(&buf.deliveries).await {
         metrics::DB_OPERATION_FAILED.increment();
         error!(
-            "Failed to flush {} deliveries:  {err}",
-            buf.deliveries.len()
+            "Failed to flush {} delivery rows, dropping them:  {}",
+            buf.deliveries.len(),
+            ErrorReport(&err)
         );
     }
     buf.deliveries.clear();
 
     if let Err(err) = db.batch_insert_downloads(&buf.downloads).await {
         metrics::DB_OPERATION_FAILED.increment();
-        error!("Failed to flush {} downloads:  {err}", buf.downloads.len());
+        error!(
+            "Failed to flush {} download rows, dropping them:  {}",
+            buf.downloads.len(),
+            ErrorReport(&err)
+        );
     }
     buf.downloads.clear();
 
     if let Err(err) = db.batch_upsert_origins(&buf.origins).await {
         metrics::DB_OPERATION_FAILED.increment();
-        error!("Failed to flush {} origins:  {err}", buf.origins.len());
+        error!(
+            "Failed to flush {} origin rows, dropping them:  {}",
+            buf.origins.len(),
+            ErrorReport(&err)
+        );
     }
     buf.origins.clear();
 
@@ -361,8 +385,9 @@ async fn flush_last_seen(db: &Database, cache: &mut HashMap<Mirror, CachedMirror
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
             error!(
-                "Failed to flush {} mirror last_seen rows:  {err}",
-                pairs.len()
+                "Failed to flush {} mirror last_seen rows, retrying at the next flush:  {}",
+                pairs.len(),
+                ErrorReport(&err)
             );
         }
     }
@@ -395,7 +420,10 @@ pub(crate) async fn db_loop(
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            warn!("Failed to hydrate mirror-id cache; starting empty:  {err}");
+            warn!(
+                "Failed to hydrate the mirror-id cache; starting empty and re-resolving every mirror on first use:  {}",
+                ErrorReport(&err)
+            );
         }
     }
     metrics::DB_MIRROR_CACHE_ENTRIES.set(cache.len() as u64);
@@ -439,7 +467,8 @@ pub(crate) async fn db_loop(
                     flush_batches(&database, &mut buf, FlushReason::ByTime).await;
                 }
                 flush_last_seen(&database, &mut cache).await;
-                debug!("db batch: periodic flush cycle complete");
+                // Sync point for `wait_for_next_db_flush`; keep the wording stable.
+                debug!("Periodic database batch flush cycle complete");
             }
             maybe = db_thread_rx.recv() => {
                 let Some(cmd) = maybe else {
@@ -463,7 +492,7 @@ pub(crate) async fn db_loop(
                         // `send_db_command` awaits on a full queue, so request
                         // paths now block on database writes.
                         warn!(
-                            "Database command channel full ({depth}/{max_capacity}); request paths now block on database writes - consider raising `db_channel_capacity`"
+                            "Database command channel full ({depth}/{max_capacity}); request paths now block on database writes; consider raising `db_channel_capacity`"
                         );
                         metrics::DB_QUEUE_FULL_TRANSITIONS.increment();
                         at_cap = true;

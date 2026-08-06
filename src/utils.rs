@@ -11,7 +11,9 @@ use crate::{
     Never,
     cache_layout::{SUBDIR_FLAT, SUBDIR_TMP},
     config::CacheHost,
-    deb_mirror, global_config,
+    deb_mirror,
+    error::ErrorReport,
+    global_config,
     guards::InitBarrier,
     http_etag::read_etag,
     humanfmt::HumanFmt,
@@ -120,13 +122,21 @@ pub(crate) async fn filesystem_space(path: &Path) -> Option<FsSpace> {
     let result = match joined {
         Ok(result) => result,
         Err(err) => {
-            warn_once_or_debug!("statvfs task for `{}` was lost:  {err}", path.display());
+            warn_once_or_debug!(
+                "Failed to join the statvfs(3) probe of `{}`; treating the free space as unknown:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
             return None;
         }
     };
     let stat = result
         .inspect_err(|err| {
-            warn_once_or_debug!("statvfs({}) failed:  {err}", path.display());
+            warn_once_or_debug!(
+                "Failed to statvfs(3) the filesystem holding `{}`; treating the free space as unknown:  {}",
+                path.display(),
+                ErrorReport(err)
+            );
         })
         .ok()?;
     let free_bytes = stat.blocks_available().saturating_mul(stat.fragment_size());
@@ -257,12 +267,22 @@ pub(crate) async fn prepare_partial_resume(
         Ok((file, size, guard)) if size > 0 => {
             if let Some(if_range) = read_etag(&file, &guard) {
                 let expected_total = xattr_helpers::read_expected_size(&file, &guard);
-                info!(
-                    "{log_prefix}found partial download ({} out of {}) for {debname} from mirror {mirror}, will attempt resume",
-                    HumanFmt::Size(size),
-                    expected_total
-                        .map_or_else(|| "??".to_string(), |s| HumanFmt::Size(s).to_string()),
-                );
+                // The total is only known when the partial carries the
+                // expected-size xattr; narrate its absence instead of
+                // placeholdering it.
+                if let Some(total) = expected_total {
+                    info!(
+                        "{log_prefix}found partial download ({} out of {}) for {debname} from mirror {mirror}, will attempt resume",
+                        HumanFmt::Size(size),
+                        HumanFmt::Size(total),
+                    );
+                } else {
+                    info!(
+                        "{log_prefix}found partial download ({}, total size unknown) for {debname} from mirror {mirror}, will attempt resume",
+                        HumanFmt::Size(size),
+                    );
+                }
+
                 Ok(PartialResume {
                     offset: size,
                     expected_total,
@@ -306,9 +326,17 @@ impl TempPath {
             // lifetime of the TempPath guard, so a missing file means something
             // outside us deleted it (operator, racing cleanup, FS issue).
             if err.kind() == std::io::ErrorKind::NotFound {
-                warn!("Failed to remove partial file `{}`:  {err}", path.display());
+                warn!(
+                    "Failed to remove partial file `{}`; continuing without it:  {}",
+                    path.display(),
+                    ErrorReport(&err)
+                );
             } else {
-                error!("Failed to remove partial file `{}`:  {err}", path.display());
+                error!(
+                    "Failed to remove partial file `{}`; it stays on disk:  {}",
+                    path.display(),
+                    ErrorReport(&err)
+                );
             }
         }
 
@@ -338,8 +366,9 @@ impl Drop for TempPath {
             tokio::task::spawn_blocking(move || {
                 if let Err(err) = std::fs::remove_file(&path) {
                     error!(
-                        "Failed to remove temporary file `{}`:  {err}",
-                        path.display()
+                        "Failed to remove temporary file `{}`; it stays on disk:  {}",
+                        path.display(),
+                        ErrorReport(&err)
                     );
                 } else {
                     debug!("Removed temporary file `{}`", path.display());
@@ -576,8 +605,9 @@ async fn open_partial_file(
                 if err.kind() != tokio::io::ErrorKind::NotFound {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "{log_prefix}failed to open partial file `{}`:  {err}",
-                        path.display()
+                        "{log_prefix}failed to open partial file `{}`; returning 500:  {}",
+                        path.display(),
+                        ErrorReport(err)
                     );
                 }
             })?;
@@ -585,14 +615,15 @@ async fn open_partial_file(
         let mdata = file.metadata().await.inspect_err(|err| {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "{log_prefix}failed to get metadata of partial file `{}`:  {err}",
-                path.display()
+                "{log_prefix}failed to get metadata of partial file `{}`; returning 500:  {}",
+                path.display(),
+                ErrorReport(err)
             );
         })?;
         if !mdata.file_type().is_file() {
             metrics::CACHE_NON_REGULAR.increment();
             warn!(
-                "{log_prefix}partial file `{}` is not a regular file",
+                "{log_prefix}partial file `{}` is not a regular file; returning 500",
                 path.display()
             );
             return Err(tokio::io::Error::new(
@@ -608,8 +639,9 @@ async fn open_partial_file(
             .inspect_err(|err| {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "{log_prefix}failed to seek partial file `{}`:  {err}",
-                    path.display()
+                    "{log_prefix}failed to seek partial file `{}`; returning 500:  {}",
+                    path.display(),
+                    ErrorReport(err)
                 );
             })?;
 
@@ -678,8 +710,9 @@ pub(crate) async fn touch_volatile_mtime(
         Ok(m) => m,
         Err(err) => {
             error!(
-                "Failed to get metadata of file `{}`:  {err}",
-                display_path.display()
+                "Failed to get metadata of cached file `{}`; leaving its volatile freshness window untouched:  {}",
+                display_path.display(),
+                ErrorReport(&err)
             );
             return file;
         }
@@ -698,8 +731,9 @@ pub(crate) async fn touch_volatile_mtime(
     let result = tokio::task::block_in_place(|| std_file.set_modified(now));
     if let Err(err) = result {
         error!(
-            "Failed to update modification time of `{}`:  {err}",
-            display_path.display()
+            "Failed to update the modification time of `{}`; its volatile freshness window is not reset:  {}",
+            display_path.display(),
+            ErrorReport(&err)
         );
     }
     tokio::fs::File::from_std(std_file)
@@ -737,8 +771,9 @@ pub(crate) fn hint_sequential_read(
     // reuse across clients, which NOREUSE would drop after this read.
     if let Err(errno) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL) {
         warn_once_or_debug!(
-            "posix_fadvise(SEQUENTIAL) failed for `{}`:  {errno}",
-            display_path.display()
+            "Failed to hint sequential reads via posix_fadvise(2) for `{}`; falling back to the kernel's default readahead:  {}",
+            display_path.display(),
+            ErrorReport(&errno)
         );
     }
 }

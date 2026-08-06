@@ -112,7 +112,7 @@ pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
         };
 
         warn!(
-            "At startup: structured mirror at `{ha}/{path}` collides with host-level flat layout - flat caching disabled for host `{ha}` (structured wins)",
+            "Structured mirror at {ha}/{path} collides with the host-level flat layout (found at startup); flat caching disabled for host {ha} (structured wins)",
             ha = resolved.format_cache_dir(port)
         );
         set.insert(BlocklistKey {
@@ -150,7 +150,7 @@ pub(crate) fn record_mirror(host: &CacheHost, port: Option<Port>, mirror_path: &
         });
     if was_new {
         warn!(
-            "Newly registered structured mirror at `{ha}/{mirror_path}` collides with host-level flat layout - flat caching disabled for host `{ha}` (structured wins)",
+            "Newly registered structured mirror at {ha}/{mirror_path} collides with the host-level flat layout; flat caching disabled for host {ha} (structured wins)",
             ha = host.format_cache_dir(port)
         );
     }

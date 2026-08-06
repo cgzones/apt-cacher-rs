@@ -261,8 +261,9 @@ async fn probe_write(probe: &Path) -> std::io::Result<()> {
     // and rewritten by the next probe.
     if let Err(err) = tokio::fs::remove_file(probe).await {
         debug!(
-            "Failed to remove healthcheck probe `{}`:  {err}",
-            probe.display()
+            "Failed to remove healthcheck probe `{}`; the next probe rewrites it:  {}",
+            probe.display(),
+            ErrorReport(&err)
         );
     }
     Ok(())
@@ -349,7 +350,10 @@ pub(crate) async fn cached_health_report() -> HealthReport {
     )
     .await;
     if !report.healthy() {
-        warn_once_or_info!("Health check failing: {}", report.to_json());
+        warn_once_or_info!(
+            "Health check failing; /healthcheck answers 503: {}",
+            report.to_json()
+        );
     } else if let Some(previous) = previous_failure {
         // Without this the log records only that the daemon went unhealthy,
         // never that it came back -- leaving the failure looking open-ended.

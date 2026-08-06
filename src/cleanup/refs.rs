@@ -8,6 +8,7 @@ use tracing::{debug, error, warn};
 
 use crate::cache_layout::CacheLayout;
 use crate::database::OriginEntry;
+use crate::error::ErrorReport;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
 use crate::info_once;
 use crate::integrity::read_release_to_string;
@@ -98,8 +99,9 @@ pub(super) async fn build_byhash_reference_set(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read directory `{}`:  {err}",
-                release_dir.display()
+                "Failed to read Release directory `{}` for by-hash reconciliation; falling back to age-based retention:  {}",
+                release_dir.display(),
+                ErrorReport(&err)
             );
             return None;
         }
@@ -121,8 +123,9 @@ pub(super) async fn build_byhash_reference_set(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to iterate directory `{}`:  {err}",
-                    release_dir.display()
+                    "Failed to iterate Release directory `{}` for by-hash reconciliation; falling back to age-based retention:  {}",
+                    release_dir.display(),
+                    ErrorReport(&err)
                 );
                 return None;
             }
@@ -155,8 +158,9 @@ pub(super) async fn build_byhash_reference_set(
                 // for the whole directory and fall back to age-based retention.
                 metrics::CACHE_IO_FAILURE.increment();
                 warn!(
-                    "Could not read Release file `{}` for by-hash reconciliation, falling back to age-based retention:  {err}",
-                    path.display()
+                    "Failed to read Release file `{}` for by-hash reconciliation; falling back to age-based retention:  {}",
+                    path.display(),
+                    ErrorReport(&err)
                 );
                 return None;
             }
@@ -191,7 +195,7 @@ pub(super) async fn build_byhash_reference_set(
         // means the by-hash tree exists but no Release names it, so the
         // whole tree drops to the age backstop instead of the 3-day grace.
         info_once!(
-            "cleanup: no Release files in `{}` for by-hash reconciliation; falling back to age-based retention",
+            "No Release files in `{}` for by-hash reconciliation; falling back to age-based retention",
             release_dir.display()
         );
     }
@@ -233,8 +237,9 @@ pub(super) async fn byhash_dir_present(path: &Path) -> bool {
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to probe by-hash directory `{}`:  {err}",
-                path.display()
+                "Failed to probe by-hash directory `{}`; treating it as absent and skipping its by-hash cleanup:  {}",
+                path.display(),
+                ErrorReport(&err)
             );
             false
         }

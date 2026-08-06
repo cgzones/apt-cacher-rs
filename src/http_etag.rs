@@ -48,7 +48,7 @@ pub(crate) fn try_read_etag(
 
     if !is_valid_etag(&data) {
         warn!(
-            "Discarding malformed ETag from `{}`: {}",
+            "Discarding malformed ETag from `{}`: `{}`",
             display_path.display(),
             data.escape_debug()
         );
@@ -77,7 +77,7 @@ pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<S
 pub(crate) fn write_etag(file: &tokio::fs::File, display_path: &Path, etag: &str) {
     if !is_valid_etag(etag) {
         warn!(
-            "Skipping write of malformed ETag to `{}`: {}",
+            "Skipping write of malformed ETag to `{}`: `{}`",
             display_path.display(),
             etag.escape_debug()
         );

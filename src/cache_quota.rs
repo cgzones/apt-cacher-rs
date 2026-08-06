@@ -57,7 +57,7 @@ impl CacheQuota {
                 // miss until cleanup runs, so only the first rejection is a
                 // warning -- the rest stay visible at info.
                 warn_once_or_info!(
-                    "Disk quota reached: file={debname} cache_size={} reserving={} quota={}",
+                    "Disk quota reached while reserving space for {debname} (cache size {}, reserving {}, quota {}); rejecting the download with 503",
                     HumanFmt::Size(curr),
                     HumanFmt::Size(reserved.get()),
                     HumanFmt::Size(quota.get()),
@@ -140,7 +140,7 @@ impl CacheQuota {
         } else {
             metrics::CACHE_SIZE_CORRUPTION.increment();
             error!(
-                "cache quota: reconcile overflow: actual_cache_size={actual_cache_size} active_downloading_size={active_downloading_size}; recording the cache as full, downloads are rejected as over quota until the next reconcile"
+                "Cache-quota reconcile overflowed: actual_cache_size={actual_cache_size} active_downloading_size={active_downloading_size}; recording the cache as full, downloads are rejected as over quota until the next reconcile"
             );
             u64::MAX
         };
@@ -167,7 +167,7 @@ impl CacheQuota {
         } else {
             metrics::CACHE_SIZE_CORRUPTION.increment();
             error!(
-                "cache quota: size accounting overflow on add: current={} added={amount}; clamping to u64::MAX, all further downloads are rejected as over quota until the next cleanup reconcile",
+                "Cache-size accounting overflowed on add: current={} added={amount}; clamping to u64::MAX, all further downloads are rejected as over quota until the next cleanup reconcile",
                 *mg
             );
             *mg = u64::MAX;
@@ -184,7 +184,7 @@ impl CacheQuota {
         } else {
             metrics::CACHE_SIZE_CORRUPTION.increment();
             error!(
-                "cache quota: size accounting underflow on subtract: current={} removed={amount}; clamping to 0, the accounted cache size now understates the on-disk size until the next cleanup reconcile",
+                "Cache-size accounting underflowed on subtract: current={} removed={amount}; clamping to 0, the accounted cache size now understates the on-disk size until the next cleanup reconcile",
                 *mg
             );
             *mg = 0;

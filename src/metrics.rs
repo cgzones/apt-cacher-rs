@@ -569,7 +569,9 @@ pub(crate) static RECONCILE_EVENTS: Counter = Counter::new();
 /// Total absolute bytes corrected by reconciliation events.
 pub(crate) static RECONCILE_BYTES_REPAIRED: Accumulator = Accumulator::new();
 
-/// `error!("Cache size corruption: …")` events — any non-zero is a bug signal.
+/// `cache_quota.rs` accounting-integrity errors ("Cache-quota reconcile
+/// overflowed", "Cache-size accounting overflowed on add" / "underflowed on
+/// subtract") — any non-zero is a bug signal.
 pub(crate) static CACHE_SIZE_CORRUPTION: Counter = Counter::new();
 
 /// Authorization rejection: client request denied by the mirror allowlist.

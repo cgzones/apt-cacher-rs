@@ -25,9 +25,15 @@ use hashbrown::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    AppState, config::CacheHost, database::resolved_cache_host, error::ProxyCacheError,
-    global_cache_quota, global_config, humanfmt::HumanFmt, metrics,
-    task_cache_scan::task_cache_scan, xattr_helpers,
+    AppState,
+    config::CacheHost,
+    database::resolved_cache_host,
+    error::{ErrorReport, ProxyCacheError},
+    global_cache_quota, global_config,
+    humanfmt::HumanFmt,
+    metrics,
+    task_cache_scan::task_cache_scan,
+    xattr_helpers,
 };
 
 /// Delay between daemon startup and the first scheduled cleanup run.
@@ -92,13 +98,16 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
 
     if !xattr_helpers::xattr_supported() {
         info!(
-            "No extended attribute support on the cache filesystem, digest verification cannot be memoized - re-hashing all files"
+            "No extended attribute support on the cache filesystem; digest verification cannot be memoized, so every cycle re-hashes all files"
         );
     }
 
     if let Err(err) = appstate.database.cleanup_invalid_rows().await {
         metrics::DB_OPERATION_FAILED.increment();
-        error!("Failed to clean up invalid database rows:  {err}");
+        error!(
+            "Failed to clean up invalid database rows; continuing with the cleanup run:  {}",
+            ErrorReport(&err)
+        );
     }
 
     if let Some(usage_retention_days) = config.usage_retention_days {
@@ -110,13 +119,19 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         let keep_date = Duration::from_secs(now_secs.saturating_sub(retention_secs));
         if let Err(err) = appstate.database.delete_usage_logs(keep_date).await {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to delete old usage logs:  {err}");
+            error!(
+                "Failed to delete old usage logs; retaining them until the next cleanup run:  {}",
+                ErrorReport(&err)
+            );
         }
     }
 
     let mirrors = appstate.database.get_mirrors().await.inspect_err(|err| {
         metrics::DB_OPERATION_FAILED.increment();
-        error!("Error looking up hosts:  {err}");
+        error!(
+            "Failed to look up the mirrors to clean up; aborting this cleanup run:  {}",
+            ErrorReport(err)
+        );
         // Earlier steps in this task (cleanup_invalid_rows /
         // delete_usage_logs) may already have run, but no per-mirror
         // cleanup work was done; record the failed-run state so the
@@ -223,7 +238,10 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         let cleanup_result = match res {
             Ok(cr) => cr,
             Err(join_err) => {
-                error!("Error joining cleanup task:  {join_err}");
+                error!(
+                    "Failed to join a mirror cleanup task; skipping that mirror's tally and cleanup timestamp:  {}",
+                    ErrorReport(&join_err)
+                );
                 continue;
             }
         };
@@ -234,7 +252,11 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
             .await
         {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Error setting cleanup timestamp:  {err}");
+            error!(
+                "Failed to record the cleanup timestamp for mirror {}; its last-cleanup time stays stale:  {}",
+                cleanup_result.mirror,
+                ErrorReport(&err)
+            );
         }
 
         files_retained += cleanup_result.files_retained;
@@ -273,7 +295,10 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
             }
         }
         Err(err) => {
-            error!("Skipping cache-size reconciliation after cleanup:  {err}");
+            error!(
+                "Failed to rescan the cache directory after cleanup; skipping the cache-size reconciliation:  {}",
+                ErrorReport(&err)
+            );
         }
     }
 

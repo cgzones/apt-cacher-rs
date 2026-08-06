@@ -214,9 +214,9 @@ impl Stanza {
                     // grace-swept. Name the index so the mirror is
                     // identifiable.
                     warn_once!(
-                        "index parser: rejecting unsafe Filename value in a Packages stanza from {}: {}",
-                        self.source_label(),
-                        bad.escape_debug()
+                        "Rejecting unsafe Filename value `{}` in a Packages stanza from {}; the package it names loses checksum verification and its cleanup reference",
+                        bad.escape_debug(),
+                        self.source_label()
                     );
                     return;
                 }

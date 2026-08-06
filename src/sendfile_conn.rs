@@ -177,7 +177,7 @@ pub(crate) async fn handle_sendfile_connection(
                 }
                 metrics::REQUEST_READ_PROTOCOL_ERROR.increment();
                 warn_once_or_info!(
-                    "Failed to read request number {} from client {client}:  {}",
+                    "Failed to read request number {} from client {client}; returning 400 and closing the connection:  {}",
                     req_num + 1,
                     ErrorReport(&err),
                 );
@@ -240,7 +240,7 @@ pub(crate) async fn handle_sendfile_connection(
                 #[cfg(not(feature = "hyper"))]
                 {
                     warn_once_or_info!(
-                        "Rejecting request from client {client} in splice-only backend due to unsupported sendfile fallback path: {reason}"
+                        "Rejecting request from client {client} in the splice-only backend: unsupported sendfile fallback path ({reason}); returning 503"
                     );
                     let _ignore = write_invalid_response(
                         &stream,
@@ -476,7 +476,7 @@ async fn serve_webui(
             .iter()
             .any(|ac| ac.contains(&client_ip))
     {
-        warn_once_or_info!("Unauthorized web-interface access by client {client}");
+        warn_once_or_info!("Unauthorized web-interface access by client {client}; returning 403");
         metrics::AUTHZ_REJECTED_WEBUI.increment();
         return ZeroCopyResult::Rejection {
             status: StatusCode::FORBIDDEN,
@@ -557,7 +557,7 @@ fn compute_conn_action(
             || h.name.eq_ignore_ascii_case("transfer-encoding")
     }) {
         warn_once_or_info!(
-            "Request with body detected from client {client}, closing connection after response"
+            "Request with body detected from client {client}; closing the connection after the response"
         );
         return ConnectionAction::Close;
     }
@@ -606,7 +606,7 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
             .iter()
             .any(|ac| ac.contains(&client_ip))
     {
-        warn_once_or_info!("Unauthorized proxy client {client}");
+        warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
         metrics::AUTHZ_REJECTED_CLIENT.increment();
         return ZeroCopyResult::Rejection {
             status: StatusCode::FORBIDDEN,
@@ -622,8 +622,9 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
         Ok(uri) => uri,
         Err(err) => {
             warn_once_or_info!(
-                "Invalid CONNECT address from client {client}: {}:  {err}",
-                target.escape_debug()
+                "Invalid CONNECT address `{}` from client {client}; rejecting the tunnel request with 400:  {}",
+                target.escape_debug(),
+                ErrorReport(&err)
             );
             return ZeroCopyResult::Rejection {
                 status: StatusCode::BAD_REQUEST,
@@ -753,7 +754,7 @@ async fn run_connect_tunnel(
         Ok(Err(err)) => {
             metrics::TUNNEL_TRANSFER_FAILED.increment();
             warn_once_or_info!(
-                "Tunnel connect to {host}:{port} for client {client} failed:  {}",
+                "Failed to connect the tunnel to {host}:{port} for client {client}; returning 502:  {}",
                 ErrorReport(&err)
             );
             write_tunnel_upstream_error(&stream, conn_version, client).await;
@@ -763,7 +764,7 @@ async fn run_connect_tunnel(
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
             metrics::TUNNEL_TRANSFER_FAILED.increment();
             info!(
-                "Tunnel connect to {host}:{port} for client {client} timed out after {}",
+                "Tunnel connect to {host}:{port} for client {client} timed out after {}; returning 502",
                 HumanFmt::Time(config.http_timeout)
             );
             write_tunnel_upstream_error(&stream, conn_version, client).await;
@@ -777,7 +778,7 @@ async fn run_connect_tunnel(
         && let Err(err) = upstream.set_nodelay(true)
     {
         warn_once_or_debug!(
-            "Failed to set TCP_NODELAY on upstream tunnel to {host}:{port}:  {}",
+            "Failed to set TCP_NODELAY on the upstream tunnel to {host}:{port}; continuing with Nagle enabled:  {}",
             ErrorReport(&err)
         );
     }
@@ -812,7 +813,7 @@ async fn run_connect_tunnel(
     {
         metrics::TUNNEL_TRANSFER_FAILED.increment();
         warn_once_or_info!(
-            "Failed to forward buffered tunnel bytes to {host}:{port} for client {client}:  {}",
+            "Failed to forward buffered tunnel bytes to {host}:{port} for client {client}; closing the tunnel:  {}",
             ErrorReport(&err)
         );
         return;
@@ -854,7 +855,7 @@ async fn run_connect_tunnel(
                 );
             } else {
                 error!(
-                    "Error tunneling connection for client {client} to {host}:{port}:  {}",
+                    "Failed to tunnel the connection for client {client} to {host}:{port}; closing the tunnel:  {}",
                     ErrorReport(&err)
                 );
             }
@@ -885,7 +886,7 @@ async fn try_sendfile_request(
             1 => *conn_version = ConnectionVersion::Http11,
             0 => *conn_version = ConnectionVersion::Http10,
             v => {
-                warn_once_or_info!("Unsupported HTTP/1.{v} from client {client}");
+                warn_once_or_info!("Unsupported HTTP/1.{v} from client {client}; returning 505");
                 return ZeroCopyResult::Invalid {
                     status: StatusCode::HTTP_VERSION_NOT_SUPPORTED,
                     msg: "HTTP version not supported",
@@ -899,21 +900,24 @@ async fn try_sendfile_request(
                 _ => {}
             }
 
-            warn_once_or_info!("Incomplete HTTP request from client {client}");
+            warn_once_or_info!("Incomplete HTTP request from client {client}; returning 400");
             return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Incomplete request header",
             };
         }
         Err(httparse::Error::Version) => {
-            warn_once_or_info!("Unsupported HTTP version from client {client}");
+            warn_once_or_info!("Unsupported HTTP version from client {client}; returning 505");
             return ZeroCopyResult::Invalid {
                 status: StatusCode::HTTP_VERSION_NOT_SUPPORTED,
                 msg: "HTTP version not supported",
             };
         }
         Err(err) => {
-            warn_once_or_info!("Failed to parse HTTP request from client {client}:  {err}");
+            warn_once_or_info!(
+                "Failed to parse HTTP request from client {client}; returning 400:  {}",
+                ErrorReport(&err)
+            );
             return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Invalid request header",
@@ -930,7 +934,7 @@ async fn try_sendfile_request(
         "CONNECT" => return handle_connect(client, req.path.expect("complete header parsed")),
         m => {
             warn_once_or_info!(
-                "Unsupported request method from client {client}: {}",
+                "Unsupported request method `{}` from client {client}; returning 405",
                 m.escape_debug(),
             );
             return ZeroCopyResult::Invalid {
@@ -947,7 +951,10 @@ async fn try_sendfile_request(
     {
         Ok(uri) => uri,
         Err(err) => {
-            info!("Failed to parse URI from client {client}:  {err}");
+            info!(
+                "Failed to parse URI from client {client}; returning 400:  {}",
+                ErrorReport(&err)
+            );
             return ZeroCopyResult::Invalid {
                 status: StatusCode::BAD_REQUEST,
                 msg: "Invalid URI",
@@ -960,7 +967,7 @@ async fn try_sendfile_request(
     if let Some(scheme) = uri.scheme()
         && *scheme != http::uri::Scheme::HTTP
     {
-        warn_once_or_info!("Unsupported URI scheme from client {client}: {scheme}");
+        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}; returning 400");
         return ZeroCopyResult::Invalid {
             status: StatusCode::BAD_REQUEST,
             msg: "Unsupported URI scheme",
@@ -989,7 +996,9 @@ async fn try_sendfile_request(
     let requested_port = match authority.port_u16() {
         Some(port) => {
             let Some(port) = NonZero::new(port) else {
-                warn_once_or_info!("Unsupported request port 0 from client {client}");
+                warn_once_or_info!(
+                    "Unsupported request port 0 from client {client}; returning 400"
+                );
                 return ZeroCopyResult::Invalid {
                     status: StatusCode::BAD_REQUEST,
                     msg: "Invalid port",
@@ -1205,7 +1214,7 @@ async fn try_sendfile_request(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to open cached file `{}` for client {client}:  {}",
+                    "Failed to open cached file `{}` for client {client}; returning 500:  {}",
                     cache_path.display(),
                     ErrorReport(&err)
                 );
@@ -1234,16 +1243,16 @@ async fn try_sendfile_request(
                         }
 
                         debug!(
-                            "Volatile file `{}` age {} is within the {}s freshness window, serving cached version...",
+                            "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
                             cache_path.display(),
                             HumanFmt::Time(elapsed),
-                            VOLATILE_CACHE_MAX_AGE.as_secs()
+                            HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
                         );
                     } else {
                         // Served from cache all the same - keep the
                         // hit/miss metrics complete via the shared bump below.
                         warn_once_or_info!(
-                            "Volatile file `{}` was modified in the future, serving the cached copy anyway",
+                            "Volatile file `{}` was modified in the future; serving the cached copy anyway",
                             cache_path.display()
                         );
                     }
@@ -1253,7 +1262,7 @@ async fn try_sendfile_request(
                 Ok(_) => {
                     metrics::CACHE_NON_REGULAR.increment();
                     error!(
-                        "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                        "Cache file `{}` is not a regular file; refusing to serve and returning 500",
                         cache_path.display()
                     );
                     return ZeroCopyResult::Invalid {
@@ -1264,7 +1273,7 @@ async fn try_sendfile_request(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get metadata of cached file `{}` for client {client}:  {}",
+                        "Failed to get metadata of cached file `{}` for client {client}; returning 500:  {}",
                         cache_path.display(),
                         ErrorReport(&err)
                     );
@@ -1354,7 +1363,7 @@ async fn try_sendfile_request(
                 // `upstream_cap_rejection`; the metric bump happened inside
                 // `ActiveDownloads::lookup_or_insert`.
                 warn_once_or_info!(
-                    "Max upstream downloads ({max}) exceeded, rejecting request for {} from client {client}",
+                    "Max upstream downloads ({max}) exceeded for {} from client {client}; returning 503",
                     conn_details.debname,
                 );
                 ZeroCopyResult::Rejection {
@@ -1374,7 +1383,7 @@ async fn try_sendfile_request(
             Err(SpliceProxyError::Client(err, location)) => {
                 if is_peer_disconnect(&err) {
                     info!(
-                        "splice proxy: client error writing {location} (peer disconnect) for {} from mirror {}{}:  {}",
+                        "splice proxy: client error writing {location} (peer disconnect) for {} from mirror {}{}; closing the connection:  {}",
                         conn_details.debname,
                         conn_details.mirror,
                         aliased,
@@ -1382,7 +1391,7 @@ async fn try_sendfile_request(
                     );
                 } else {
                     warn!(
-                        "splice proxy: client error writing {location} for {} from mirror {}{}:  {}",
+                        "splice proxy: client error writing {location} for {} from mirror {}{}; closing the connection:  {}",
                         conn_details.debname,
                         conn_details.mirror,
                         aliased,
@@ -1394,7 +1403,7 @@ async fn try_sendfile_request(
             Err(SpliceProxyError::AfterHeaderClient(err, location)) => {
                 if is_peer_disconnect(&err) {
                     info!(
-                        "splice proxy: client response delivery aborted in {location} (peer disconnect) for {} from mirror {}{}:  {}",
+                        "splice proxy: client response delivery aborted in {location} (peer disconnect) for {} from mirror {}{}; closing the connection:  {}",
                         conn_details.debname,
                         conn_details.mirror,
                         aliased,
@@ -1402,7 +1411,7 @@ async fn try_sendfile_request(
                     );
                 } else {
                     warn!(
-                        "splice proxy: client response delivery failed in {location} for {} from mirror {}{}:  {}",
+                        "splice proxy: client response delivery failed in {location} for {} from mirror {}{}; closing the connection:  {}",
                         conn_details.debname,
                         conn_details.mirror,
                         aliased,
@@ -1535,7 +1544,7 @@ async fn evaluate_conditional_and_range(
                 // whole entity, which is what happens here -- but a client
                 // that expected a resume silently receives the full object.
                 warn_once_or_debug!(
-                    "Ignoring malformed Range header from client {client}, serving the full file: {}",
+                    "Ignoring malformed Range header `{}` from client {client}; serving the full file",
                     range.escape_debug()
                 );
             }
@@ -1590,7 +1599,7 @@ pub(crate) async fn serve_file_via_sendfile(
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
                 error!(
-                    "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                    "Cache file `{}` is not a regular file; refusing to serve and returning 500",
                     file_path.display()
                 );
                 return SendfileResult::Invalid {
@@ -1601,7 +1610,7 @@ pub(crate) async fn serve_file_via_sendfile(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to get metadata of cached file `{}` for client {}:  {}",
+                    "Failed to get metadata of cached file `{}` for client {}; returning 500:  {}",
                     file_path.display(),
                     conn_details.client,
                     ErrorReport(&err)
@@ -2150,7 +2159,7 @@ async fn sendfile_chunk_loop(
             SendfileBatchStop::Done => return Ok((ChunkLoopOutcome::Complete, fds)),
             SendfileBatchStop::Eof => {
                 warn_once_or_debug!(
-                    "sendfile returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining"
+                    "sendfile: returned 0 at offset {file_offset} with {remaining}/{amount} bytes remaining; stopping the transfer at that offset"
                 );
                 return Ok((
                     ChunkLoopOutcome::Eof {
@@ -2192,7 +2201,7 @@ async fn sendfile_chunk_loop(
                 }) {
                     Ok(0) => {
                         warn_once_or_debug!(
-                            "sendfile returned 0 at offset {off} with {remaining}/{amount} bytes remaining"
+                            "sendfile: returned 0 at offset {off} with {remaining}/{amount} bytes remaining; stopping the transfer at that offset"
                         );
                         return Ok((
                             ChunkLoopOutcome::Eof {
@@ -2415,7 +2424,7 @@ pub(crate) async fn async_sendfile_unfinished(
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
                 error!(
-                    "Cache file `{}` is not a regular file, aborting the transfer",
+                    "Cache file `{}` is not a regular file; aborting the transfer",
                     file_path.display()
                 );
                 let transferred = content_length - remaining;
@@ -2428,8 +2437,9 @@ pub(crate) async fn async_sendfile_unfinished(
                 if !fstat_error_logged {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to query metadata of downloading file `{}` during sendfile:  {errno}",
-                        file_path.display()
+                        "Failed to query metadata of downloading file `{}` during sendfile; assuming no further data is available yet:  {}",
+                        file_path.display(),
+                        ErrorReport(&errno)
                     );
                     fstat_error_logged = true;
                 }
@@ -2587,7 +2597,7 @@ async fn serve_unfinished_sendfile(
                     );
                     if init_waited {
                         error!(
-                            "Download state still Init after waiting for download of {} from mirror {}{aliased}",
+                            "Download state still Init after waiting for download of {} from mirror {}{aliased}; returning 500",
                             conn_details.debname, conn_details.mirror
                         );
                         return ZeroCopyResult::Invalid {
@@ -2613,7 +2623,7 @@ async fn serve_unfinished_sendfile(
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();
                             error!(
-                                "Failed to open downloading file `{}` for joining client {}:  {}",
+                                "Failed to open downloading file `{}` for joining client {}; returning 500:  {}",
                                 path.display(),
                                 conn_details.client,
                                 ErrorReport(&err)
@@ -2648,7 +2658,7 @@ async fn serve_unfinished_sendfile(
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();
                             error!(
-                                "Failed to open finished file `{}` for joining client {}:  {}",
+                                "Failed to open finished file `{}` for joining client {}; returning 500:  {}",
                                 finished_path.display(),
                                 conn_details.client,
                                 ErrorReport(&err)
@@ -2696,7 +2706,7 @@ async fn serve_unfinished_sendfile(
                         Err(err) => {
                             metrics::CACHE_IO_FAILURE.increment();
                             error!(
-                                "Failed to open verifying file `{}` for joining client {}:  {}",
+                                "Failed to open verifying file `{}` for joining client {}; returning 500:  {}",
                                 verifying_path.display(),
                                 conn_details.client,
                                 ErrorReport(&err)
@@ -2723,7 +2733,7 @@ async fn serve_unfinished_sendfile(
                 ActiveDownloadStatus::Aborted(_) => {
                     drop(st);
                     info!(
-                        "Download of {} from mirror {}{aliased} was aborted, cannot serve joining client {}",
+                        "Download of {} from mirror {}{aliased} was aborted; returning 500 to joining client {}",
                         conn_details.debname, conn_details.mirror, conn_details.client
                     );
                     return ZeroCopyResult::Invalid {
@@ -2742,7 +2752,7 @@ async fn serve_unfinished_sendfile(
     )]
     let ContentLength::Exact(exact_size) = total_size else {
         warn_once_or_debug!(
-            "Unknown content length for in-progress download of {} from mirror {}{aliased}",
+            "Unknown content length for in-progress download of {} from mirror {}{aliased}; not serving the joining client via sendfile",
             conn_details.debname,
             conn_details.mirror,
         );
@@ -2754,7 +2764,7 @@ async fn serve_unfinished_sendfile(
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
             error!(
-                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                "Cache file `{}` is not a regular file; refusing to serve and returning 500",
                 file_path.display()
             );
             return ZeroCopyResult::Invalid {
@@ -2765,7 +2775,7 @@ async fn serve_unfinished_sendfile(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to get metadata of downloading file `{}` for joining client {}:  {}",
+                "Failed to get metadata of downloading file `{}` for joining client {}; returning 500:  {}",
                 file_path.display(),
                 conn_details.client,
                 ErrorReport(&err)

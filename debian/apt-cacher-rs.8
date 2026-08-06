@@ -1,4 +1,4 @@
-.TH APT\-CACHER\-RS 8 "2026-08-05" "apt-cacher-rs" "System Administration"
+.TH APT\-CACHER\-RS 8 "2026-08-06" "apt-cacher-rs" "System Administration"
 .SH NAME
 apt\-cacher\-rs \- caching proxy for Debian style package repositories
 .SH SYNOPSIS
@@ -49,6 +49,16 @@ console (the default).
 .BI \-l " SEVERITY" ", \-\-log\-level=" SEVERITY
 Logging level (e.g. \fItrace\fR, \fIdebug\fR, \fIinfo\fR, \fIwarn\fR,
 \fIerror\fR).
+The
+.I trace
+level dumps full request and response details, and
+.I debug
+narrates per-connection decisions; either can expose upstream credentials,
+such as
+.B Authorization
+headers sent to authenticated repositories. They are intended for
+troubleshooting only; do not enable them in production and do not share
+such logs unredacted.
 .TP
 .B \-\-skip\-log\-timestamp
 Do not include a timestamp in log messages. Useful when the service

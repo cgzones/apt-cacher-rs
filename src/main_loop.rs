@@ -86,20 +86,25 @@ pub(crate) async fn main_loop(
         .await
         .inspect_err(|err| {
             error!(
-                "Error creating database `{}`:  {err}",
-                config.database_path.display()
+                "Failed to open database `{}`; aborting startup:  {}",
+                config.database_path.display(),
+                ErrorReport(err)
             );
         })?;
 
     database.init_tables().await.inspect_err(|err| {
         error!(
-            "Error initializing database `{}`:  {err}",
-            config.database_path.display()
+            "Failed to initialize database `{}`; aborting startup:  {}",
+            config.database_path.display(),
+            ErrorReport(err)
         );
     })?;
 
     database.cleanup_invalid_rows().await.inspect_err(|err| {
-        error!("Failed to clean up invalid database rows:  {err}");
+        error!(
+            "Failed to clean up invalid database rows; aborting startup:  {}",
+            ErrorReport(err)
+        );
     })?;
 
     // Seed the per-host flat-layout collision blocklist from any
@@ -113,7 +118,10 @@ pub(crate) async fn main_loop(
     // init is a programmer error in main-loop ordering (the `.expect`
     // inside `flat_blocklist::init` panics).
     flat_blocklist::init(&database).await.inspect_err(|err| {
-        error!("Failed to load flat-collision mirrors at startup:  {err}");
+        error!(
+            "Failed to load flat-collision mirrors from the database; aborting startup:  {}",
+            ErrorReport(err)
+        );
     })?;
 
     // Database background task
@@ -146,13 +154,16 @@ pub(crate) async fn main_loop(
     // otherwise collide with the layout plumbing for that mirror's
     // sibling).
     let mirrors = database.get_mirrors().await.inspect_err(|err| {
-        error!("Failed to scan mirrors for reserved-segment migration warning:  {err}");
+        error!(
+            "Failed to read the mirror rows for the reserved-segment migration check; aborting startup:  {}",
+            ErrorReport(err)
+        );
     })?;
 
     for mirror in &mirrors {
         if deb_mirror::mirror_path_has_reserved_segment(&mirror.path) {
             warn!(
-                "Pre-existing mirror row `{}/{}` uses a reserved path segment (one of {:?}); cleanup walks may collide with cache plumbing - investigate and consider removing the row",
+                "Pre-existing mirror row {}/{} uses a reserved path segment (one of {:?}); cleanup walks may collide with cache plumbing, so investigate and consider removing the row",
                 mirror.host,
                 mirror.path,
                 deb_mirror::RESERVED_MIRROR_PATH_SEGMENTS,
@@ -220,7 +231,7 @@ pub(crate) async fn main_loop(
                     match rd.config.disk_quota.map(NonZero::get) {
                         Some(quota) if cache_size > quota => {
                             warn!(
-                                "Startup cache size of {} in {files} files exceeds quota {} ({free}, scanned in {scanned})",
+                                "Startup cache size of {} in {files} files exceeds quota {} ({free}, scanned in {scanned}); downloads are rejected as over quota until cleanup frees space",
                                 HumanFmt::Size(cache_size),
                                 HumanFmt::Size(quota)
                             );
@@ -253,8 +264,9 @@ pub(crate) async fn main_loop(
                 }
                 Err(err) => {
                     error!(
-                        "Startup cache scan failed after {}; cache size unset:  {err}",
-                        HumanFmt::Time(scan_start.elapsed().into())
+                        "Failed to scan the cache directory at startup after {}; the accounted cache size stays unset until the next cleanup reconcile:  {}",
+                        HumanFmt::Time(scan_start.elapsed().into()),
+                        ErrorReport(&err)
                     );
                 }
             }
@@ -280,7 +292,10 @@ pub(crate) async fn main_loop(
                 Ok(m) => m,
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
-                    error!("Failed to get list of mirrors to initialize scheme cache:  {err}");
+                    error!(
+                        "Failed to read the mirror list for the scheme-cache warm-up; the scheme cache starts empty and every host's scheme is decided on first use:  {}",
+                        ErrorReport(&err)
+                    );
                     return;
                 }
             };
@@ -313,7 +328,7 @@ pub(crate) async fn main_loop(
                             Ok((response, _parts)) => {
                                 if response.status().is_server_error() {
                                     warn!(
-                                        "Initial scheme cache request to host {authority} returned server error {}",
+                                        "Scheme-cache warm-up request to host {authority} returned server error {}; ignoring the response, only the connection outcome seeds the scheme cache",
                                         response.status()
                                     );
                                 } else {
@@ -370,14 +385,20 @@ pub(crate) async fn main_loop(
         Ok(x) => x,
         Err(err) => {
             if config.bind_addr != Ipv6Addr::UNSPECIFIED {
-                error!("Error binding on {addr}:  {}", ErrorReport(&err));
+                error!(
+                    "Failed to bind the listener to {addr}; aborting startup:  {}",
+                    ErrorReport(&err)
+                );
                 return Err(err.into());
             }
 
             // Fallback to IPv4 to avoid errors when IPv6 is not available and the default configuration is used.
             addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.bind_port.get()));
             TcpListener::bind(addr).await.inspect_err(|err| {
-                error!("Error binding fallback on {addr}:  {}", ErrorReport(err));
+                error!(
+                    "Failed to bind the IPv4 fallback listener to {addr}; aborting startup:  {}",
+                    ErrorReport(err)
+                );
             })?
         }
     };
@@ -385,14 +406,19 @@ pub(crate) async fn main_loop(
 
     let drain_db_task = async move {
         if db_shutdown_tx.send(true).is_err() {
-            warn!("Database task already exited before shutdown signal");
+            warn!(
+                "Database task already exited before the shutdown signal was sent; continuing shutdown without draining it"
+            );
         }
         match tokio::time::timeout(DB_DRAIN_TIMEOUT, db_join).await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => error!("Database task did not exit cleanly:  {err}"),
+            Ok(Err(err)) => error!(
+                "Database task did not exit cleanly; buffered download/delivery/origin rows are lost:  {}",
+                ErrorReport(&err)
+            ),
             Err(_) => error!(
-                "Database task did not drain within {} seconds, abandoning; buffered download/delivery/origin rows are lost",
-                DB_DRAIN_TIMEOUT.as_secs()
+                "Database task did not drain within {}; abandoning it and losing the buffered download/delivery/origin rows",
+                HumanFmt::Time(DB_DRAIN_TIMEOUT)
             ),
         }
     };
@@ -427,7 +453,10 @@ pub(crate) async fn main_loop(
                 let appstate = appstate.clone();
                 tokio::task::spawn(async move {
                     if let Err(err) = task_cleanup(&appstate).await {
-                        error!("Failed to perform daily cleanup task:  {err}");
+                        error!(
+                            "Failed to perform daily cleanup task; retrying at the next scheduled cleanup:  {}",
+                            ErrorReport(&err)
+                        );
                     }
                 });
                 continue;
@@ -451,7 +480,10 @@ pub(crate) async fn main_loop(
                 let appstate = appstate.clone();
                 tokio::task::spawn(async move {
                     if let Err(err) = task_cleanup(&appstate).await {
-                        error!("Failed to perform SIGUSR2-triggered cleanup task:  {err}");
+                        error!(
+                            "Failed to perform SIGUSR2-triggered cleanup task; retrying at the next scheduled cleanup:  {}",
+                            ErrorReport(&err)
+                        );
                     }
                 });
                 continue;
@@ -462,7 +494,10 @@ pub(crate) async fn main_loop(
         let (stream, client) = next
             .map(|(stream, client)| (stream, ClientInfo::new(client)))
             .inspect_err(|err| {
-                error!("Error accepting connection:  {}", ErrorReport(err));
+                error!(
+                    "Failed to accept a client connection; stopping the daemon:  {}",
+                    ErrorReport(err)
+                );
             })?;
 
         metrics::CONNECTIONS_ACCEPTED.increment();

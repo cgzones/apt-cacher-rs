@@ -41,6 +41,7 @@ use crate::{
         Mirror, Origin, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path,
         parse_request_path,
     },
+    error::ErrorReport,
     flat_blocklist, global_config, info_once, metrics,
     precise_instant::PreciseInstant,
     warn_once_or_debug, warn_once_or_info,
@@ -278,7 +279,9 @@ fn decide_request(
     let passthrough_reason: PassthroughReason = match parse_request_path(&normalized) {
         None => {
             if !*is_diff {
-                warn_once_or_debug!("Unrecognized resource path from client {client}: {uri_path}");
+                warn_once_or_debug!(
+                    "Unrecognized resource path {uri_path} from client {client}; forwarding it upstream uncached"
+                );
             }
             PassthroughReason::Unrecognized
         }
@@ -292,7 +295,7 @@ fn decide_request(
                 };
                 if class.layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
                     warn_once_or_info!(
-                        "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing `{uri_path}` through uncached for client {client}"
+                        "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing {uri_path} through uncached for client {client}"
                     );
                     PassthroughReason::FlatBlocked
                 } else {
@@ -327,21 +330,22 @@ fn decide_request(
             }
             Err(ClassifyError::BadEncoding { kind, raw, source }) => {
                 warn_once_or_info!(
-                    "Failed to decode {kind} `{}` from client {client}:  {source}",
-                    raw.escape_debug()
+                    "Failed to decode {kind} `{}` from client {client}; rejecting with 400:  {}",
+                    raw.escape_debug(),
+                    ErrorReport(&source)
                 );
                 return Decision::Reject(RejectReason::BadEncoding);
             }
             Err(ClassifyError::InvalidValue { kind, decoded }) => {
                 warn_once_or_info!(
-                    "Unsupported {kind} `{}` from client {client}",
+                    "Unsupported {kind} `{}` from client {client}; rejecting with 400",
                     decoded.escape_debug()
                 );
                 return Decision::Reject(RejectReason::InvalidValue);
             }
             Err(ClassifyError::NonDebPool { filename }) => {
                 warn_once_or_info!(
-                    "Unsupported pool filename `{}` from client {client}",
+                    "Unsupported pool filename `{}` from client {client}; forwarding it upstream uncached",
                     filename.escape_debug()
                 );
                 PassthroughReason::NonDebPool
@@ -361,7 +365,7 @@ fn decide_request(
             PassthroughReason::FlatBlocked => "flat-blocked",
         };
         warn_once_or_info!(
-            "Rejecting unsafe passthrough path {uri_path} ({passthrough_label}) for client {client}"
+            "Rejecting unsafe passthrough path {uri_path} ({passthrough_label}) for client {client} with 400"
         );
         metrics::UNSAFE_PATH_REJECTED.increment();
         return Decision::Reject(RejectReason::UnsafePath);

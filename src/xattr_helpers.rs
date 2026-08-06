@@ -14,7 +14,7 @@ use nix::libc;
 use tracing::warn;
 use xattr::FileExt as _;
 
-use crate::warn_once_or_debug;
+use crate::{error::ErrorReport, warn_once_or_debug};
 
 /// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
 pub(crate) struct XattrFile<'a>(pub(crate) &'a tokio::fs::File);
@@ -35,8 +35,9 @@ pub(crate) fn remove_helper(file: &tokio::fs::File, display_path: &Path, key: &'
         && err.kind() != std::io::ErrorKind::Unsupported
     {
         warn!(
-            "Failed to remove invalid xattr from `{}` for key `{key}`:  {err}",
-            display_path.display()
+            "Failed to remove invalid xattr from `{}` for key `{key}`; the invalid value stays on the file:  {}",
+            display_path.display(),
+            ErrorReport(&err)
         );
     }
 }
@@ -90,8 +91,9 @@ pub(crate) fn try_read_helper(
             Ok(s) => Ok(Some(s)),
             Err(err @ std::string::FromUtf8Error { .. }) => {
                 warn!(
-                    "Discarding invalid UTF-8 xattr from `{}` for key `{key}`:  {err}",
-                    display_path.display()
+                    "Discarding invalid UTF-8 xattr from `{}` for key `{key}`:  {}",
+                    display_path.display(),
+                    ErrorReport(&err)
                 );
 
                 remove_helper(file, display_path, key);
@@ -110,8 +112,9 @@ pub(crate) fn try_read_helper(
                 // the persistent failure class (LSM denial, EIO) on a
                 // per-request path: warn once, then degrade.
                 warn_once_or_debug!(
-                    "Unexpected error reading xattr from `{}` for key `{key}`, treating the value as absent for this request:  {err}",
-                    display_path.display()
+                    "Failed to read xattr from `{}` for key `{key}`; treating the value as absent for this request:  {}",
+                    display_path.display(),
+                    ErrorReport(&err)
                 );
                 Err(XattrIoError)
             }
@@ -143,8 +146,9 @@ pub(crate) fn write_helper(
         let kind = err.kind();
         if kind != std::io::ErrorKind::Unsupported {
             warn_once_or_debug!(
-                "Failed to write xattr to `{}` for key `{key}`, the value will not survive a restart:  {err}",
-                display_path.display()
+                "Failed to write xattr to `{}` for key `{key}`; the value will not survive a restart:  {}",
+                display_path.display(),
+                ErrorReport(&err)
             );
         }
     }
@@ -164,7 +168,7 @@ pub(crate) fn read_expected_size(file: &tokio::fs::File, display_path: &Path) ->
         Ok(size) => Some(size),
         Err(_err @ ParseIntError { .. }) => {
             warn!(
-                "Discarding malformed expected_size xattr from `{}`: {}",
+                "Discarding malformed expected_size xattr from `{}`: `{}`",
                 display_path.display(),
                 data.escape_debug()
             );

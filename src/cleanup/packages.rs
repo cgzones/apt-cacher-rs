@@ -16,7 +16,7 @@ use crate::{
     cache_layout::{CacheLayout, CachedFlavor, ConnectionDetails, ResourceKind, dists_debname},
     config::Config,
     deb_mirror::Mirror,
-    error::{ProxyCacheError, UpstreamFetchError},
+    error::{ErrorReport, ProxyCacheError, UpstreamFetchError},
     index_parser::{Stanza, hex_encode, structured_lookup_key},
     limits::{
         CappedLine, MAX_DECOMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN, PackagesCompression,
@@ -123,7 +123,10 @@ pub(super) async fn packages_body_to_memfd(
     config: &Config,
 ) -> Result<(tokio::fs::File, u64), ProxyCacheError> {
     let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
-        error!("Error creating in-memory file `{memfdname}`:  {err}");
+        error!(
+            "Failed to create in-memory file `{memfdname}` for the Packages index; skipping this mirror's reconcile this cycle:  {}",
+            ErrorReport(&err)
+        );
         ProxyCacheError::Memfd(err)
     })?;
     let file = tokio::fs::File::from_std(memfd.into_file());
@@ -133,7 +136,10 @@ pub(super) async fn packages_body_to_memfd(
     body_to_file(body, file, MAX_DECOMPRESSED_PACKAGES_SIZE, config)
         .await
         .inspect_err(|err| {
-            error!("Failed to write response to in-memory file `{memfdname}`:  {err}");
+            error!(
+                "Failed to write the Packages response to in-memory file `{memfdname}`; skipping this mirror's reconcile this cycle:  {}",
+                ErrorReport(err)
+            );
         })
 }
 
@@ -203,7 +209,7 @@ async fn process_stanza(
             // so degrade after the first; matches `integrity.rs`'s handling of
             // the same condition.
             warn_once_or_debug!(
-                "cleanup: Packages stanza for `{}` from mirror {} advertises no SHA256/SHA512; retaining cache file `{}` without verification",
+                "Packages stanza for `{}` from mirror {} advertises no SHA256/SHA512; retaining cache file `{}` without verification",
                 filename.escape_debug(),
                 ctx.mirror,
                 path.display(),
@@ -227,7 +233,7 @@ async fn process_stanza(
                     size: pre_size,
                 } => {
                     warn!(
-                        "Cache file `{}` failed {} verification: expected={}, computed={}",
+                        "Cache file `{}` failed {} verification (expected {}, computed {}); removing it",
                         path.display(),
                         algo.as_str(),
                         hex_encode(expected),
@@ -236,8 +242,9 @@ async fn process_stanza(
                     if let Err(err) = tokio::fs::remove_file(&path).await {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Error removing checksum-mismatched cache file `{}`:  {err}",
-                            path.display()
+                            "Failed to remove checksum-mismatched cache file `{}`; retaining it:  {}",
+                            path.display(),
+                            ErrorReport(&err)
                         );
                     } else {
                         invalidate_metadata_for(&path, ctx.mirror, ctx.layout);
@@ -254,9 +261,10 @@ async fn process_stanza(
                 }
                 Verdict::IoError(err) => {
                     error!(
-                        "Failed to {} cache file `{}`:  {err}; retaining",
-                        algo.as_str(),
+                        "Failed to verify cache file `{}` against its {} digest; retaining it:  {}",
                         path.display(),
+                        algo.as_str(),
+                        ErrorReport(&err),
                     );
                 }
             }
@@ -290,7 +298,8 @@ pub(super) async fn reduce_file_list(
         Ok(m) => m,
         Err(err) => {
             error!(
-                "Failed to stat Packages file `{filename}` for decompression-ratio guard:  {err}"
+                "Failed to stat Packages file `{filename}` for the decompression-ratio guard; skipping this mirror's reconcile this cycle:  {}",
+                ErrorReport(&err)
             );
             return Err(ProxyCacheError::Io(err));
         }
@@ -311,7 +320,7 @@ pub(super) async fn reduce_file_list(
                 // `filename` is the synthetic memfd name, so name the mirror:
                 // this bails the mirror's whole reconcile for the cycle.
                 warn!(
-                    "cleanup: compressed Packages index `{filename}` for mirror {} is zero bytes; skipping this mirror's reconcile for this cycle (nothing reclaimed)",
+                    "Compressed Packages index `{filename}` for mirror {} is zero bytes; skipping this mirror's reconcile for this cycle (nothing reclaimed)",
                     ctx.mirror
                 );
                 Err(ProxyCacheError::Io(std::io::Error::new(
@@ -351,7 +360,10 @@ pub(super) async fn reduce_file_list(
                 return Ok(());
             }
             Err(err) => {
-                error!("Failed to read Packages file `{filename}` (may exceed size limit):  {err}");
+                error!(
+                    "Failed to read Packages file `{filename}` (may exceed the size limit); skipping this mirror's reconcile this cycle:  {}",
+                    ErrorReport(&err)
+                );
                 return Err(err.into());
             }
             Ok(CappedLine::Skipped) => {

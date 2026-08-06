@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use xattr::FileExt as _;
 
+use crate::error::ErrorReport;
 use crate::index_parser::{HashAlgo, hash_open_file, hex_encode};
 use crate::metrics;
 use crate::utils::nofollow_nonblock_options;
@@ -57,8 +58,9 @@ fn stamp_marker(
         // any log a per-file stamp failure is indistinguishable from working
         // memoization, and every cycle silently re-hashes the whole cache.
         warn_once_or_debug!(
-            "cleanup: failed to stamp the verified marker on `{}`; digest verification will not be memoized and every cycle re-hashes:  {err}",
-            path.display()
+            "Failed to stamp the cleanup verification marker on `{}`; digest verification is not memoized and every cleanup cycle re-hashes this file:  {}",
+            path.display(),
+            ErrorReport(&err)
         );
     }
 }

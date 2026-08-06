@@ -32,18 +32,19 @@ impl InsufficientRate {
         f: &mut std::fmt::Formatter<'_>,
         context: std::fmt::Arguments<'_>,
     ) -> std::fmt::Result {
+        // Sync point: the prefix "Timeout occurred" plus `{context}` forms the
+        // test needle "Timeout occurred for client"; keep that prefix (and the
+        // `{context}` insertion point) stable.  The tail is free to change.
+        let timeframe = std::time::Duration::from_secs(self.timeframe.get() as u64);
         write!(
             f,
-            "Timeout occurred{context} after a download rate of {} [< {}] for the last {} seconds",
-            HumanFmt::Rate(
-                self.transferred as u64,
-                std::time::Duration::from_secs(self.timeframe.get() as u64)
-            ),
+            "Timeout occurred{context} after a download rate of {} (below {}) for the last {}",
+            HumanFmt::Rate(self.transferred as u64, timeframe),
             HumanFmt::Rate(
                 self.min_rate.get() as u64,
                 std::time::Duration::from_secs(1)
             ),
-            self.timeframe,
+            HumanFmt::Time(timeframe),
         )
     }
 
@@ -95,7 +96,7 @@ impl RateChecker {
         if elapsed_secs >= 1 {
             if elapsed_secs > 1 {
                 debug!(
-                    "RateChecker: {:.2}s elapsed since last poll receiving {} ({})",
+                    "Rate sampling gap of {:.2}s receiving {} ({}); padding the missed seconds with zeros",
                     elapsed.as_f64(),
                     HumanFmt::Size(bytes as u64),
                     HumanFmt::Rate(bytes as u64, elapsed.into())

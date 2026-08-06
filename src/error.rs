@@ -42,17 +42,19 @@ fn fmt_client_download_rate(
     client: &ClientInfo,
     f: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
+    // Sync point: this fragment completes the test needle "Timeout occurred for
+    // client" started in `rate_checker.rs`; keep the " for client " wording stable.
     error.fmt_with_context(f, format_args!(" for client {client}"))
 }
 
 /// The wrapped transport errors render through [`ErrorReport`] inside
-/// `Display` and are deliberately **not** exposed via `source()`: this type is
-/// reported with a plain `{err}` at its log sites, so the cause has to be part
-/// of `Display`, and `hyper_conn::is_io_timed_out_in_chain` walks `source()`
-/// looking for a `TimedOut` `io::Error` -- re-exposing the same error there
-/// would both duplicate it in reports and change that classification.  Hence
-/// the hand-written `From` impls below rather than `#[from]`, which would
-/// imply `#[source]`.
+/// `Display` and are deliberately **not** exposed via `source()`.  Log sites
+/// report this type through [`ErrorReport`] too, which walks `source()`, so
+/// re-exposing the transport error there would print it twice; and
+/// `hyper_conn::is_io_timed_out_in_chain` walks `source()` looking for a
+/// `TimedOut` `io::Error`, which re-exposure would silently reclassify.  The
+/// cause therefore has to be part of `Display`.  Hence the hand-written `From`
+/// impls below rather than `#[from]`, which would imply `#[source]`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProxyCacheError {
     #[error("{}", ErrorReport(.0))]

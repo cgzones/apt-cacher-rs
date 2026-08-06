@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
 use crate::{
-    cache_layout::SUBDIR_TMP, global_config, utils::nofollow_options,
+    cache_layout::SUBDIR_TMP, error::ErrorReport, global_config, utils::nofollow_options,
     xattr_helpers::set_xattr_supported,
 };
 
@@ -70,8 +70,9 @@ fn lock_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupError>
                 .and_then(|()| writeln!(&*lock, "{}", std::process::id()));
             if let Err(err) = stamp {
                 debug!(
-                    "Failed to stamp lock file `{}`:  {err}",
-                    lock_path.display()
+                    "Failed to stamp the PID into lock file `{}`; continuing without it:  {}",
+                    lock_path.display(),
+                    ErrorReport(&err)
                 );
             }
             Ok(lock)
@@ -141,8 +142,9 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
     mdata.modified().map_err(SetupError::NoMtimeSupport)?;
     if let Err(err) = mdata.created() {
         warn!(
-            "No file creation timestamp (btime) support on `{}`; volatile index files cannot have their freshness window refreshed and are revalidated upstream more often:  {err}",
-            cache_path.display()
+            "No file creation timestamp (btime) support on `{}`; volatile index files cannot have their freshness window refreshed and are revalidated upstream more often:  {}",
+            cache_path.display(),
+            ErrorReport(&err)
         );
     }
 
@@ -175,8 +177,9 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
         drop(xattr_probe_file);
         if let Err(err) = std::fs::remove_file(&xattr_probe_path) {
             error!(
-                "Failed to remove extended attribute probe file `{}`:  {err}",
-                xattr_probe_path.display()
+                "Failed to remove extended attribute probe file `{}`; leaving it in the cache directory:  {}",
+                xattr_probe_path.display(),
+                ErrorReport(&err)
             );
         }
         match xattr_result {
@@ -185,15 +188,16 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
             }
             Ok(val) => {
                 warn!(
-                    "Extended attribute support test failed on `{}`: got {val:?}, expected `probe`",
+                    "Failed to verify extended attribute support on `{}` (got {val:?}, expected `probe`); disabling ETag/Last-Modified revalidation and cleanup checksum memoization",
                     xattr_probe_path.display()
                 );
                 set_xattr_supported(false);
             }
             Err(err) => {
                 warn!(
-                    "No extended file attribute support on `{}`; ETag/Last-Modified revalidation and cleanup checksum memoization are disabled - mount the cache filesystem with user_xattr support:  {err}",
-                    cache_path.display()
+                    "No extended file attribute support on `{}`; disabling ETag/Last-Modified revalidation and cleanup checksum memoization (mount the cache filesystem with user_xattr support):  {}",
+                    cache_path.display(),
+                    ErrorReport(&err)
                 );
                 set_xattr_supported(false);
             }

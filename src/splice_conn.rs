@@ -528,14 +528,17 @@ impl UpstreamConn {
                 Ok(pending) => {
                     debug_assert_eq!(pending, 1, "buffer has size of 1");
                     warn_once_or_debug!(
-                        "splice proxy: pooled connection has unexpected data, discarding"
+                        "splice proxy: pooled connection to {host}:{port} has unexpected data; discarding it and connecting fresh"
                     );
                     false
                 }
                 // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                 Err(nix::errno::Errno::EAGAIN) => true,
                 Err(errno) => {
-                    warn_once_or_info!("splice proxy: pooled connection check failed:  {errno}");
+                    warn_once_or_info!(
+                        "splice proxy: failed to check the pooled connection to {host}:{port}; discarding it and connecting fresh:  {}",
+                        ErrorReport(&errno)
+                    );
                     false
                 }
             }
@@ -592,7 +595,10 @@ fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
     // Try to increase pipe buffer size; ignore failure (non-fatal, just fewer bytes per round-trip)
     static_assert!(PIPE_BUFFER_SIZE > 0);
     if let Err(errno) = fcntl(sender.as_fd(), FcntlArg::F_SETPIPE_SZ(PIPE_BUFFER_SIZE)) {
-        warn_once_or_info!("splice proxy: failed to increase pipe buffer size:  {errno}");
+        warn_once_or_info!(
+            "splice proxy: failed to increase the pipe buffer size; continuing with the default size:  {}",
+            ErrorReport(&errno)
+        );
     }
 
     Ok((sender, receiver))
@@ -778,7 +784,8 @@ async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
                 && let Err(err) = tcp.set_nodelay(true)
             {
                 warn_once_or_debug!(
-                    "Failed to set TCP_NODELAY on upstream connection to {host}:{port}:  {err}"
+                    "Failed to set TCP_NODELAY on the upstream connection to {host}:{port}; continuing with Nagle enabled:  {}",
+                    ErrorReport(&err)
                 );
             }
         })
@@ -1040,7 +1047,7 @@ async fn drain_buffered_records(
             }
             other => {
                 warn_once!(
-                    "splice proxy: unexpected ConnectionState variant while draining buffered records: {other:?}"
+                    "splice proxy: unexpected ConnectionState variant while draining buffered records: {other:?}; stopping the drain"
                 );
                 discard_incoming(incoming, incoming_used, discard);
                 break;
@@ -1118,9 +1125,9 @@ async fn try_unbuffered_ktls_connect(
         match blocked_at {
             Some(at) if now.duration_since(at) < KTLS_BLOCK_DURATION => {
                 debug!(
-                    "kTLS: skipping {} (setup blocked {}s ago)",
+                    "kTLS: skipping {} (setup blocked {} ago)",
                     mirror.host(),
-                    now.duration_since(at).as_secs()
+                    HumanFmt::Time(now.duration_since(at).into())
                 );
                 return KtlsResult::Failed {
                     tls_succeeded: false,
@@ -1178,7 +1185,7 @@ async fn try_unbuffered_ktls_connect(
                 // Fires at most once: attach_ulp latched the availability
                 // gate, so is_available() short-circuits later requests.
                 warn!(
-                    "kTLS: TLS ULP no longer available, disabling kTLS for this run:  {}",
+                    "kTLS: TLS ULP no longer available; disabling kTLS for this run:  {}",
                     ErrorReport(&err)
                 );
                 KtlsResult::Failed {
@@ -1199,9 +1206,9 @@ async fn try_unbuffered_ktls_connect(
             UlpAttachError::Persistent(err) => {
                 metrics::KTLS_FALLBACK_PERMANENT.increment();
                 warn!(
-                    "kTLS: ULP attach failed for {}, blocking kTLS for {}s:  {}",
+                    "kTLS: failed to attach the TLS ULP for {}; blocking kTLS for this host for {}:  {}",
                     mirror.format_authority(),
-                    KTLS_BLOCK_DURATION.as_secs(),
+                    HumanFmt::Time(KTLS_BLOCK_DURATION.into()),
                     ErrorReport(&err)
                 );
                 block_ktls_host(&key);
@@ -1228,7 +1235,10 @@ async fn try_unbuffered_ktls_connect(
     {
         Ok(Ok(state)) => KtlsResult::Ready(tcp, state),
         Ok(Err(KtlsError::TlsFailed(err))) => {
-            debug!("kTLS: TLS handshake with {host_authority} failed:  {err}");
+            debug!(
+                "kTLS: TLS handshake with {host_authority} failed:  {}",
+                ErrorReport(&err)
+            );
             KtlsResult::Failed {
                 tls_succeeded: false,
             }
@@ -1246,7 +1256,7 @@ async fn try_unbuffered_ktls_connect(
                 // full fetch of the same object -- permanently doubling
                 // upstream traffic for a mirror that always answers this way.
                 warn_once_or_info!(
-                    "kTLS: upstream {} response not spliceable (status {}), refetching over a fresh connection",
+                    "kTLS: upstream {} response not spliceable (status {}); refetching over a fresh connection",
                     mirror.format_authority(),
                     response.status_code
                 );
@@ -1258,8 +1268,9 @@ async fn try_unbuffered_ktls_connect(
         Ok(Err(KtlsError::UpstreamProtocolError(err))) => {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
             warn_once_or_info!(
-                "kTLS: upstream {} sent malformed HTTP (no host-block):  {err}",
-                mirror.format_authority()
+                "kTLS: upstream {} sent malformed HTTP; refetching over the standard path without blocking kTLS for this host:  {}",
+                mirror.format_authority(),
+                ErrorReport(&err)
             );
             // Do not insert into KTLS_BLOCKED. The TLS layer worked; the upstream's
             // HTTP framing is at fault, and that condition is independent of the
@@ -1271,9 +1282,9 @@ async fn try_unbuffered_ktls_connect(
         Ok(Err(KtlsError::KtlsSetupFailed(err))) => {
             metrics::KTLS_FALLBACK_PERMANENT.increment();
             warn!(
-                "kTLS: setup failed for {}, blocking kTLS for {}s:  {}",
+                "kTLS: failed to set up kernel TLS for {}; blocking kTLS for this host for {}:  {}",
                 mirror.format_authority(),
-                KTLS_BLOCK_DURATION.as_secs(),
+                HumanFmt::Time(KTLS_BLOCK_DURATION.into()),
                 ErrorReport(&err)
             );
             block_ktls_host(&key);
@@ -1284,7 +1295,7 @@ async fn try_unbuffered_ktls_connect(
         Ok(Err(KtlsError::KtlsSetupFailedTransient(err))) => {
             metrics::KTLS_FALLBACK_TRANSIENT.increment();
             info!(
-                "kTLS: transient setup failure for {} (no block):  {}",
+                "kTLS: failed to set up kernel TLS for {} (transient, not blocking kTLS for this host):  {}",
                 mirror.format_authority(),
                 ErrorReport(&err)
             );
@@ -1385,7 +1396,7 @@ async fn unbuffered_ktls_request(
                 | ConnectionState::Closed
                 | ConnectionState::ReadEarlyData(_)) => {
                     warn_once!(
-                        "splice proxy: unexpected terminal ConnectionState during TLS handshake: {unexpected_state:?}"
+                        "splice proxy: unexpected terminal ConnectionState during TLS handshake with upstream {host_authority}: {unexpected_state:?}; aborting the kTLS handshake"
                     );
                     return Err(std::io::Error::other(
                         "unexpected state during TLS handshake",
@@ -1393,7 +1404,7 @@ async fn unbuffered_ktls_request(
                 }
                 other => {
                     warn_once!(
-                        "splice proxy: unexpected ConnectionState variant during TLS handshake: {other:?}"
+                        "splice proxy: unexpected ConnectionState variant during TLS handshake with upstream {host_authority}: {other:?}; aborting the kTLS handshake"
                     );
                     return Err(std::io::Error::other(
                         "unexpected state during TLS handshake",
@@ -1563,13 +1574,13 @@ async fn unbuffered_ktls_request(
             | ConnectionState::Closed
             | ConnectionState::ReadEarlyData(_)) => {
                 warn_once!(
-                    "splice proxy: unexpected ConnectionState during post-handshake request send (peer closed or sent data before request?): {unexpected_state:?}"
+                    "splice proxy: unexpected ConnectionState during post-handshake request send to upstream {host_authority} (peer closed or sent data before request?): {unexpected_state:?}; discarding the buffered TLS records and retrying the send"
                 );
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
             }
             other => {
                 warn_once!(
-                    "splice proxy: unexpected ConnectionState variant during post-handshake request: {other:?}"
+                    "splice proxy: unexpected ConnectionState variant during post-handshake request to upstream {host_authority}: {other:?}; discarding the buffered TLS records and retrying the send"
                 );
                 discard_incoming(&mut incoming, &mut incoming_used, discard);
             }
@@ -1655,7 +1666,7 @@ async fn unbuffered_ktls_request(
                     header_search_offset = header_buf.len().saturating_sub(3);
                     if header_buf.len() > MAX_UPSTREAM_HEADER_SIZE {
                         warn_once_or_info!(
-                            "splice proxy: upstream response header size of {} bytes exceeds {} bytes",
+                            "splice proxy: upstream {host_authority} response header size of {} bytes exceeds {} bytes; abandoning the kTLS attempt",
                             header_buf.len(),
                             MAX_UPSTREAM_HEADER_SIZE
                         );
@@ -1688,13 +1699,15 @@ async fn unbuffered_ktls_request(
                 | ConnectionState::Closed
                 | ConnectionState::ReadEarlyData(_)) => {
                     warn_once_or_debug!(
-                        "kTLS: connection in terminal state during header read (upstream closed before headers complete?): {state:?}"
+                        "kTLS: connection to upstream {host_authority} in terminal state during header read (upstream closed before headers complete?): {state:?}; retrying the upstream read"
                     );
                     discard_incoming(&mut incoming, &mut incoming_used, discard);
                     break true;
                 }
                 other => {
-                    warn_once_or_debug!("kTLS: unexpected ConnectionState variant: {other:?}");
+                    warn_once_or_debug!(
+                        "kTLS: unexpected ConnectionState variant during header read from upstream {host_authority}: {other:?}; retrying the upstream read"
+                    );
                     discard_incoming(&mut incoming, &mut incoming_used, discard);
                     break true;
                 }
@@ -1780,8 +1793,8 @@ async fn unbuffered_ktls_request(
         if let Some(&[_, _, _, hi, lo, ..]) = incoming.get(..incoming_used) {
             let record_len = u16::from_be_bytes([hi, lo]) as usize;
             debug!(
-                "kTLS drain: {incoming_used} bytes buffered, \
-                 current record needs {} total",
+                "kTLS: draining with {incoming_used} bytes buffered, \
+                 current record needs {} bytes total",
                 5 + record_len
             );
         }
@@ -1810,20 +1823,24 @@ async fn unbuffered_ktls_request(
                 }
                 Ok(Ok(0)) => {
                     drain_stop_reason = "upstream EOF";
-                    debug!("kTLS drain: {drain_stop_reason} with {incoming_used} bytes buffered");
+                    debug!(
+                        "kTLS: drain stopped ({drain_stop_reason}) with {incoming_used} bytes buffered"
+                    );
                     break;
                 }
                 Ok(Err(ref err)) => {
                     drain_stop_reason = "read error";
                     debug!(
-                        "kTLS drain: {drain_stop_reason} with {incoming_used} bytes buffered:  {}",
+                        "kTLS: drain stopped ({drain_stop_reason}) with {incoming_used} bytes buffered:  {}",
                         ErrorReport(err)
                     );
                     break;
                 }
                 Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                     drain_stop_reason = "per-read timeout";
-                    debug!("kTLS drain: {drain_stop_reason} with {incoming_used} bytes buffered");
+                    debug!(
+                        "kTLS: drain stopped ({drain_stop_reason}) with {incoming_used} bytes buffered"
+                    );
                     break;
                 }
             }
@@ -2125,7 +2142,7 @@ async fn read_upstream_response_headers(
 
         if buf.len() > MAX_UPSTREAM_HEADER_SIZE {
             warn_once_or_info!(
-                "splice proxy: upstream response header size of {} bytes exceeds {} bytes",
+                "splice proxy: upstream response header size of {} bytes exceeds {} bytes; aborting the upstream request",
                 buf.len(),
                 MAX_UPSTREAM_HEADER_SIZE
             );
@@ -2225,7 +2242,7 @@ fn parse_upstream_response(
         let parsed = v.trim().parse::<u64>().ok();
         if parsed.is_none() {
             warn_once_or_info!(
-                "splice proxy: upstream {host_authority} sent an unparsable Content-Length, treating the body as close-delimited: {}",
+                "splice proxy: upstream {host_authority} sent an unparsable Content-Length `{}`; treating the body as close-delimited",
                 v.escape_debug()
             );
         }
@@ -2241,7 +2258,9 @@ fn parse_upstream_response(
             if is_valid_etag(etag) {
                 true
             } else {
-                warn_once_or_info!("Upstream mirror {host_authority} sent invalid ETag: {etag}");
+                warn_once_or_info!(
+                    "Upstream mirror {host_authority} sent an invalid ETag `{etag}`; discarding it"
+                );
                 false
             }
         })
@@ -2459,7 +2478,7 @@ async fn splice_proxy_body(
                         ktls::drain_control_messages(upstream.as_fd(), ktls::DrainExpect::DataReady)
                     {
                         warn_once!(
-                            "splice proxy (kTLS): mid-stream control-record drain failed for `{}`, aborting the transfer:  {}",
+                            "splice proxy (kTLS): failed to drain mid-stream control records for `{}`; aborting the transfer:  {}",
                             cache_path.display(),
                             ErrorReport(&drain_err)
                         );
@@ -2494,8 +2513,9 @@ async fn splice_proxy_body(
                     | nix::errno::Errno::EBADMSG),
                 ) if upstream_is_ktls => {
                     warn_once!(
-                        "splice proxy (kTLS): mid-stream control-record drain budget exhausted for `{}`, aborting the transfer:  {err}",
-                        cache_path.display()
+                        "splice proxy (kTLS): mid-stream control-record drain budget exhausted for `{}`; aborting the transfer:  {}",
+                        cache_path.display(),
+                        ErrorReport(&err)
                     );
                     return Err(errno_to_io_error(err, "splice failed after kTLS drains"));
                 }
@@ -2636,7 +2656,7 @@ async fn splice_proxy_body(
                     // don't also bump `CLIENT_DISCONNECTED_MID_BODY`.
                     Err(err) if err.kind() == ErrorKind::TimedOut => {
                         info!(
-                            "splice proxy: client {} timed out during boundary chunk, abandoning client:  {}",
+                            "splice proxy: client {} timed out during boundary chunk; abandoning the client:  {}",
                             client
                                 .peer_addr()
                                 .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
@@ -3079,7 +3099,7 @@ async fn write_client_or_demote(
                     // timeout metrics were bumped at error construction).
                     Err(err) if err.kind() == ErrorKind::TimedOut => {
                         info!(
-                            "splice proxy: client {} timed out during TLS body, abandoning client:  {}",
+                            "splice proxy: client {} timed out during TLS body; abandoning the client:  {}",
                             client
                                 .peer_addr()
                                 .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
@@ -3138,8 +3158,9 @@ fn spawn_file_serve_task(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "splice proxy: failed to open cache file `{}` for demoted client:  {err}",
-                cache_path.display()
+                "splice proxy: failed to open cache file `{}` for the demoted client; the demoted client gets no further bytes:  {}",
+                cache_path.display(),
+                ErrorReport(&err)
             );
             return Ok(tokio::task::spawn(async { DeliveryResult::Failure(0) }));
         }
@@ -3215,7 +3236,7 @@ async fn serve_remaining_from_file(
                 );
             } else {
                 info!(
-                    "splice proxy: demoted client file-serve of `{}` failed at cache offset {content_start}, the client did not get the full body:  {}",
+                    "splice proxy: demoted client file-serve of `{}` failed at cache offset {content_start}; the client did not get the full body:  {}",
                     cache_path.display(),
                     ErrorReport(&err)
                 );
@@ -3664,10 +3685,12 @@ async fn send_and_read_headers(
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
-    let mut resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority).map_err(|err| {
+    let mut resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority).inspect_err(|err| {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        warn_once_or_info!("splice proxy: upstream {host_authority} sent malformed HTTP:  {err}");
-        err
+        warn_once_or_info!(
+            "splice proxy: upstream {host_authority} sent malformed HTTP; failing the upstream request:  {}",
+            ErrorReport(err)
+        );
     })?;
     // Credit body bytes that arrived bundled with the response headers
     // in the same read (the body_prefix). Done after parse so an
@@ -3800,14 +3823,14 @@ async fn standard_upstream_connect(
         let Some(delay) = next else {
             if permanent {
                 warn_once_or_info!(
-                    "splice proxy: not retrying permanent connect failure to upstream {host_authority} for {upstream_path}:  {}",
+                    "splice proxy: not retrying permanent connect failure to upstream {host_authority} for {upstream_path}; returning 502:  {}",
                     ErrorReport(err.io_err())
                 );
             } else {
                 // The limit names which budget stopped the retries -- attempt
                 // cap or `upstream_retry_budget`.
                 warn_once_or_info!(
-                    "splice proxy: failed to connect to upstream {host_authority} for {upstream_path} after {attempt} connection attempts ({}):  {}",
+                    "splice proxy: failed to connect to upstream {host_authority} for {upstream_path} after {attempt} connection attempts ({}); returning 502:  {}",
                     backoff.limit(),
                     ErrorReport(err.io_err())
                 );
@@ -3821,7 +3844,7 @@ async fn standard_upstream_connect(
                     // evicted https entry can hand the host back to plain http
                     // under Auto mode).
                     warn_once_or_info!(
-                        "splice proxy: evicted cached {scheme} scheme for {} after connect failure; the next request re-decides the scheme",
+                        "splice proxy: evicted cached {scheme} scheme for host {} after connect failure; the next request re-decides the scheme",
                         mirror.format_authority()
                     );
                 }
@@ -3863,7 +3886,8 @@ async fn standard_upstream_connect(
     .await
     .map_err(|err| {
         warn_once_or_info!(
-            "splice proxy: failed upstream request to {host_authority} for {upstream_path}:  {err}"
+            "splice proxy: failed upstream request to {host_authority} for {upstream_path}; returning 502:  {}",
+            ErrorReport(&err)
         );
         SpliceProxyError::Upstream
     })?;
@@ -3903,14 +3927,17 @@ async fn follow_redirect(
         // upstream's 3xx is forwarded to the client with nothing cached and
         // no explanation anywhere.
         warn_once_or_info!(
-            "splice proxy: upstream {} answered {status} for {} without a Location header, forwarding to the client",
+            "splice proxy: upstream {} answered {status} for {} without a Location header; forwarding the redirect to the client uncached",
             conn_details.mirror,
             conn_details.debname
         );
         return Ok(None);
     };
     let Ok(moved_uri) = location.parse::<http::Uri>() else {
-        debug!("splice proxy: {status} with unparsable Location `{location}`, not following");
+        debug!(
+            "splice proxy: {status} with unparsable Location `{}`, not following",
+            location.escape_debug()
+        );
         return Ok(None);
     };
     let Some(redirect_scheme) = moved_uri.scheme().and_then(Scheme::from_uri_scheme) else {
@@ -3922,7 +3949,7 @@ async fn follow_redirect(
         // on redirectors, but this backend only follows absolute targets, so
         // the resource is forwarded uncached on every request.
         warn_once_or_info!(
-            "splice proxy: upstream {} sent {status} for {} with relative Location `{}`, not followed and not cached",
+            "splice proxy: upstream {} sent {status} for {} with relative Location `{}`; not following the redirect and not caching the response",
             conn_details.mirror,
             conn_details.debname,
             location.escape_debug()
@@ -3938,7 +3965,7 @@ async fn follow_redirect(
     let Ok(moved_domain) = ClientHost::new(moved_host.to_owned()) else {
         // Upstream-controlled and per request, like its sibling branches.
         warn_once_or_info!(
-            "splice proxy: upstream {} sent {status} for {} with an invalid redirect host `{}`, not followed and not cached",
+            "splice proxy: upstream {} sent {status} for {} with an invalid redirect host `{}`; not following the redirect and not caching the response",
             conn_details.mirror,
             conn_details.debname,
             moved_host.escape_debug()
@@ -4007,7 +4034,7 @@ async fn follow_redirect(
         // operator can correlate the connect failure with the redirect that
         // pointed at the now-failing target.
         warn_once_or_info!(
-            "splice proxy: upstream connect failed after {status} redirect from {} to `{moved_uri}`",
+            "splice proxy: failed to connect to the upstream after a {status} redirect from {} to `{moved_uri}`; returning 502",
             conn_details.mirror
         );
     })?;
@@ -4144,7 +4171,7 @@ async fn forward_upstream_body_until_eof(
         total += n as u64;
         if total > max_bytes as u64 {
             warn_once_or_info!(
-                "splice proxy: upstream error response body exceeded {} byte cap",
+                "splice proxy: upstream error response body exceeded {} byte cap; truncating the relayed body",
                 max_bytes
             );
             return Err(std::io::Error::other(
@@ -4272,7 +4299,7 @@ async fn forward_upstream_chunked_body(
                                     total += chunk_size;
                                     if total > Saturating(max_bytes) {
                                         warn_once_or_info!(
-                                            "splice proxy: chunked response body exceeded {} byte cap",
+                                            "splice proxy: chunked response body exceeded {} byte cap; truncating the relayed body",
                                             max_bytes
                                         );
                                         return Err(std::io::Error::other(
@@ -4583,8 +4610,9 @@ async fn serve_volatile_304_via_sendfile(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "splice proxy: failed to open cached file `{}` after 304:  {err}",
-                cache_path.display()
+                "splice proxy: failed to open cached file `{}` after 304; returning 500:  {}",
+                cache_path.display(),
+                ErrorReport(&err)
             );
             return Err(SpliceProxyError::Cache);
         }
@@ -4734,8 +4762,9 @@ async fn splice_proxy_drive(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to open volatile cached file `{}`:  {err}",
-                    cache_path.display()
+                    "Failed to open volatile cached file `{}`; returning 500:  {}",
+                    cache_path.display(),
+                    ErrorReport(&err)
                 );
                 return Err(SpliceProxyError::Cache);
             }
@@ -4746,7 +4775,7 @@ async fn splice_proxy_drive(
                 Ok(_) => {
                     metrics::CACHE_NON_REGULAR.increment();
                     error!(
-                        "splice proxy: cache file `{}` is not a regular file, refusing to serve and returning 500",
+                        "splice proxy: cache file `{}` is not a regular file; refusing to serve and returning 500",
                         cache_path.display()
                     );
                     return Err(SpliceProxyError::Cache);
@@ -4754,8 +4783,9 @@ async fn splice_proxy_drive(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get metadata for volatile cached file `{}`:  {err}",
-                        cache_path.display()
+                        "Failed to get metadata for volatile cached file `{}`; returning 500:  {}",
+                        cache_path.display(),
+                        ErrorReport(&err)
                     );
                     return Err(SpliceProxyError::Cache);
                 }
@@ -4820,7 +4850,7 @@ async fn splice_proxy_drive(
             } else {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "splice proxy: upstream {} sent no usable Content-Length for {} (from kTLS attempt), returning 502",
+                    "splice proxy: upstream {} sent no usable Content-Length for {} (from kTLS attempt); returning 502",
                     conn_details.mirror,
                     conn_details.debname
                 );
@@ -5048,10 +5078,10 @@ async fn splice_proxy_drive(
     // Handle resume: if we got 416 (stale partial), discard and retry without Range
     if resume_offset > 0 && upstream_resp.status_code == 416 {
         warn_once_or_info!(
-            "splice proxy: 416 for resume of {} from mirror {} (partial {} bytes), discarding stale partial and retrying",
+            "splice proxy: server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
             conn_details.debname,
             conn_details.mirror,
-            resume_offset
+            HumanFmt::Size(resume_offset)
         );
         discard_partial_and_retry(
             &mut partial,
@@ -5125,9 +5155,10 @@ async fn splice_proxy_drive(
             Ok(s) => s,
             Err(err) => {
                 warn_once_or_info!(
-                    "splice proxy: failed to rewrite passthrough headers for {} from mirror {}:  {err}",
+                    "splice proxy: failed to rewrite passthrough headers for {} from mirror {}; returning 502:  {}",
                     conn_details.debname,
-                    conn_details.mirror
+                    conn_details.mirror,
+                    ErrorReport(&err)
                 );
                 upstream.unset_poolable();
                 return Err(SpliceProxyError::Upstream);
@@ -5260,7 +5291,7 @@ async fn splice_proxy_drive(
 
         if !content_range_valid {
             warn_once_or_info!(
-                "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}, discarding partial and retrying fresh",
+                "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
                 conn_details.debname,
                 conn_details.mirror
             );
@@ -5288,7 +5319,7 @@ async fn splice_proxy_drive(
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         metrics::UPSTREAM_UNSOLICITED_206.increment();
         warn_once_or_info!(
-            "splice proxy: upstream returned 206 Partial Content without a Range request for {} from mirror {}",
+            "splice proxy: upstream returned 206 Partial Content without a Range request for {} from mirror {}; returning 502",
             conn_details.debname,
             conn_details.mirror
         );
@@ -5328,7 +5359,7 @@ async fn splice_proxy_drive(
                 {
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     warn_once_or_info!(
-                        "splice proxy: Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}",
+                        "splice proxy: Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}; returning 502",
                         conn_details.debname,
                         conn_details.mirror
                     );
@@ -5366,10 +5397,10 @@ async fn splice_proxy_drive(
                 // Defensive fallback in case of unexpected state.
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "splice proxy: unexpected Content-Range state for 206 response of {} from mirror {}: {:?}",
+                    "splice proxy: unexpected Content-Range state {:?} for the 206 response of {} from mirror {}; returning 502",
+                    upstream_resp.content_range,
                     conn_details.debname,
-                    conn_details.mirror,
-                    upstream_resp.content_range
+                    conn_details.mirror
                 );
                 upstream.unset_poolable();
                 write_invalid_response(
@@ -5410,7 +5441,7 @@ async fn splice_proxy_drive(
             }
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
             warn_once_or_info!(
-                "splice proxy: no Content-Length for file {} from mirror {}",
+                "splice proxy: no Content-Length for file {} from mirror {}; returning 502",
                 conn_details.debname,
                 conn_details.mirror
             );
@@ -5437,7 +5468,7 @@ async fn splice_proxy_drive(
     let Some(total_content_length) = NonZero::new(total_file_size) else {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         warn_once_or_info!(
-            "splice proxy: zero total file size for file {} from mirror {}",
+            "splice proxy: zero total file size for file {} from mirror {}; returning 502",
             conn_details.debname,
             conn_details.mirror
         );
@@ -5461,8 +5492,8 @@ async fn splice_proxy_drive(
     ) {
         metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
         warn_once_or_info!(
-            "splice proxy: upstream object size {} for file {} from mirror {} exceeds max_object_size",
-            total_content_length.get(),
+            "splice proxy: upstream object size {} for file {} from mirror {} exceeds `max_object_size`; returning 502",
+            HumanFmt::Size(total_content_length.get()),
             conn_details.debname,
             conn_details.mirror
         );
@@ -5482,7 +5513,7 @@ async fn splice_proxy_drive(
     let Some(body_content_length) = NonZero::new(body_content_length) else {
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         warn_once_or_info!(
-            "splice proxy: zero body content length for file {} from mirror {}",
+            "splice proxy: zero body content length for file {} from mirror {}; returning 502",
             conn_details.debname,
             conn_details.mirror
         );
@@ -5544,8 +5575,9 @@ async fn splice_proxy_drive(
     if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "splice proxy: failed to create cache directory `{}`:  {err}",
-            dest_dir.display()
+            "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
+            dest_dir.display(),
+            ErrorReport(&err)
         );
         return Err(SpliceProxyError::Cache);
     }
@@ -5564,7 +5596,7 @@ async fn splice_proxy_drive(
                 Ok(_) => {
                     metrics::CACHE_NON_REGULAR.increment();
                     error!(
-                        "splice proxy: previous cache file `{}` is not a regular file",
+                        "splice proxy: previous cache file `{}` is not a regular file; counting it as 0 bytes for the quota and overwriting it",
                         prev_path.display()
                     );
                     // `task_cache_scan` skips non-regular entries entirely
@@ -5579,8 +5611,9 @@ async fn splice_proxy_drive(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "splice proxy: failed to stat existing volatile file `{}`:  {err}",
-                        prev_path.display()
+                        "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
+                        prev_path.display(),
+                        ErrorReport(&err)
                     );
                     return Err(SpliceProxyError::Cache);
                 }
@@ -5630,7 +5663,7 @@ async fn splice_proxy_drive(
                     // empty partial file, which is not what happened -- the
                     // discarded errno is the whole diagnosis.
                     error!(
-                        "splice proxy: failed to determine partial file size for {} from mirror {}:  {}",
+                        "splice proxy: failed to determine partial file size for {} from mirror {}; treating the partial as empty and returning 500:  {}",
                         conn_details.debname,
                         conn_details.mirror,
                         ErrorReport(&err)
@@ -5640,7 +5673,7 @@ async fn splice_proxy_drive(
             };
             if current_size != resume_offset {
                 error!(
-                    "splice proxy: partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd, returning 500",
+                    "splice proxy: partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd; aborting the resume and returning 500",
                     conn_details.debname, conn_details.mirror
                 );
                 write_invalid_response(
@@ -5662,8 +5695,9 @@ async fn splice_proxy_drive(
             .map_err(|(err, path)| {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "splice proxy: failed to create partial file `{}`:  {err}",
-                    path.display()
+                    "splice proxy: failed to create partial file `{}`; aborting the download:  {}",
+                    path.display(),
+                    ErrorReport(&err)
                 );
                 SpliceProxyError::Cache
             })?,
@@ -5678,8 +5712,9 @@ async fn splice_proxy_drive(
             tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "splice proxy: failed to create temp file `{}`:  {err}",
-                    tmppath.display()
+                    "splice proxy: failed to create temp file `{}`; aborting the download:  {}",
+                    tmppath.display(),
+                    ErrorReport(&err)
                 );
                 SpliceProxyError::Cache
             })?
@@ -5723,7 +5758,7 @@ async fn splice_proxy_drive(
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         error!(
             "splice proxy: body prefix ({} bytes) exceeds body content length ({} bytes) \
-             for {} from mirror {}",
+             for {} from mirror {}; returning 502",
             body_prefix.len(),
             body_content_length,
             conn_details.debname,
@@ -5753,7 +5788,7 @@ async fn splice_proxy_drive(
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
             error!(
                 "splice proxy: kTLS extra body ({extra_len} bytes) exceeds remaining \
-                 body content length ({splice_count} bytes) for {} from mirror {}",
+                 body content length ({splice_count} bytes) for {} from mirror {}; returning 502",
                 conn_details.debname, conn_details.mirror
             );
             // `upstream_guard` poisons the connection on drop.
@@ -5884,8 +5919,9 @@ async fn splice_proxy_drive(
                 .map_err(|err| {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "splice proxy: failed to reopen partial file `{}` for resume:  {err}",
-                        temppath.display()
+                        "splice proxy: failed to reopen partial file `{}` for resume; aborting the transfer and closing the connection:  {}",
+                        temppath.display(),
+                        ErrorReport(&err)
                     );
                     SpliceProxyError::AfterHeaderIo
                 })?;
@@ -5947,8 +5983,9 @@ async fn splice_proxy_drive(
         write_res.map_err(|err| {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "splice proxy: failed to write body prefix to cache file `{}`:  {err}",
-                temppath.display()
+                "splice proxy: failed to write body prefix to cache file `{}`; aborting the download and closing the connection:  {}",
+                temppath.display(),
+                ErrorReport(&err)
             );
             SpliceProxyError::AfterHeaderIo
         })?;
@@ -6013,8 +6050,9 @@ async fn splice_proxy_drive(
         write_res.map_err(|err| {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "splice proxy: failed to write kTLS extra body to cache file `{}`:  {err}",
-                temppath.display()
+                "splice proxy: failed to write kTLS extra body to cache file `{}`; aborting the download and closing the connection:  {}",
+                temppath.display(),
+                ErrorReport(&err)
             );
             SpliceProxyError::AfterHeaderIo
         })?;
@@ -6148,7 +6186,8 @@ async fn splice_proxy_drive(
             // undelivered bytes. `upstream_guard` (still armed here) poisons
             // the connection on the early return so PoolGuard::drop discards it
             // rather than re-pooling it -- the next checkout would otherwise log
-            // "pooled connection has unexpected data, discarding".
+            // "pooled connection to ... has unexpected data; discarding it and
+            // connecting fresh".
             .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "splice body transfer"))?;
         dbarrier = returned_dbarrier;
         // The splice body block ran: the upstream-rate and client-rate windows
@@ -6178,8 +6217,9 @@ async fn splice_proxy_drive(
     if let Err(err) = tempfile.sync_all().await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "splice proxy: failed to sync cache file `{}`:  {err}",
-            temppath.display()
+            "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
+            temppath.display(),
+            ErrorReport(&err)
         );
     }
     drop(tempfile);
@@ -6235,7 +6275,7 @@ async fn splice_proxy_drive(
             if let integrity::CommitError::Rename(io_err) = &err {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "splice proxy: failed to rename temp file `{}` to `{}`:  {}",
+                    "splice proxy: failed to rename temp file `{}` to `{}`; discarding the temp file and leaving the download uncached:  {}",
                     temppath.display(),
                     dest_file_path.display(),
                     ErrorReport(io_err)
@@ -6298,7 +6338,7 @@ async fn splice_proxy_drive(
             }
             Err(err) => {
                 error!(
-                    "splice proxy: demoted client file-serve task panicked:  {}",
+                    "splice proxy: demoted client file-serve task panicked; treating the delivery as failed and closing the connection:  {}",
                     ErrorReport(&err)
                 );
                 false
@@ -6341,11 +6381,11 @@ async fn splice_proxy_drive(
             )
         };
         info!(
-            "splice proxy{tls_label}: {} {volatile}{} from mirror {} for client {} in {} ({upstream}, {client}){}",
+            "{} {volatile}file {} from mirror {} for client {} in {} via splice{tls_label} ({upstream}, {client}){}",
             if client_succeeded {
-                "served and cached"
+                "Served and cached"
             } else {
-                "cached"
+                "Cached"
             },
             conn_details.debname,
             conn_details.mirror,
@@ -6403,7 +6443,7 @@ async fn read_body_to_vec_until_eof(
     loop {
         if body.len() > max_bytes {
             warn_once_or_info!(
-                "splice proxy: volatile response body exceeded {max_bytes} byte cap"
+                "splice proxy: volatile response body exceeded {max_bytes} byte cap; aborting the download"
             );
             return Err(std::io::Error::other(
                 "volatile response body exceeded size cap",
@@ -6573,7 +6613,7 @@ async fn serve_cached_cleanup_file(
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
             error!(
-                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                "splice cleanup: cache file `{}` is not a regular file; refusing to serve and returning 500",
                 cache_path.display()
             );
             return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
@@ -6581,7 +6621,7 @@ async fn serve_cached_cleanup_file(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to get metadata of file `{}`:  {}",
+                "splice cleanup: failed to get metadata of cached file `{}`; returning 500:  {}",
                 cache_path.display(),
                 ErrorReport(&err)
             );
@@ -6594,7 +6634,7 @@ async fn serve_cached_cleanup_file(
         .expect("Platform should support modification timestamps via setup check");
     let Ok(elapsed) = modified.elapsed() else {
         warn_once_or_info!(
-            "Volatile file `{}` was modified in the future, treating it as stale and refetching from upstream",
+            "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
             cache_path.display()
         );
         return None;
@@ -6607,7 +6647,7 @@ async fn serve_cached_cleanup_file(
     let max_bytes = limits::MAX_DECOMPRESSED_PACKAGES_SIZE.get();
     if mdata.len() > max_bytes {
         warn_once_or_info!(
-            "splice cleanup: cached file `{}` exceeds the {max_bytes} byte buffering cap, refetching",
+            "splice cleanup: cached file `{}` exceeds the {max_bytes} byte buffering cap; refetching from upstream",
             cache_path.display()
         );
         return None;
@@ -6634,7 +6674,7 @@ async fn serve_cached_cleanup_file(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read file `{}`:  {}",
+                "splice cleanup: failed to read cached file `{}`; returning 500:  {}",
                 cache_path.display(),
                 ErrorReport(&err)
             );
@@ -6670,7 +6710,7 @@ pub(crate) async fn splice_cleanup_request(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to open file `{}`:  {}",
+                "splice cleanup: failed to open cached file `{}`; returning 500:  {}",
                 cache_path.display(),
                 ErrorReport(&err)
             );
@@ -6749,7 +6789,8 @@ async fn cleanup_upstream_fetch(
         };
         if let Err(err) = drained {
             debug!(
-                "splice cleanup request to {host_authority}{upstream_path} failed to drain the error body:  {err}"
+                "splice cleanup request to {host_authority}{upstream_path} failed to drain the error body:  {}",
+                ErrorReport(&err)
             );
         }
         return cleanup_response(status);
@@ -6781,7 +6822,8 @@ async fn cleanup_upstream_fetch(
             .expect("upstream response is valid"),
         Err(err) => {
             debug!(
-                "splice cleanup request to {host_authority}{upstream_path} failed to read the body:  {err}"
+                "splice cleanup request to {host_authority}{upstream_path} failed to read the body:  {}",
+                ErrorReport(&err)
             );
             let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
             resp.extensions_mut().insert(UpstreamFetchError {
@@ -6867,7 +6909,7 @@ fn buffered_dechunk_step(
                             .is_none_or(|sum| sum > max_bytes)
                         {
                             warn_once_or_info!(
-                                "splice proxy: chunked volatile body exceeded {max_bytes} byte cap"
+                                "splice proxy: chunked volatile body exceeded {max_bytes} byte cap; aborting the download"
                             );
                             return Err(std::io::Error::other(
                                 "chunked volatile body exceeded size cap",
@@ -7094,7 +7136,7 @@ async fn handle_volatile_buffered_download(
         // do not let a refactor break that invariant quietly.
         BodyFraming::ContentLength(len) => {
             warn_once!(
-                "splice proxy: volatile buffered download of {} reached with a Content-Length body ({len} bytes), reading until EOF",
+                "splice proxy: volatile buffered download of {} reached with a Content-Length body ({len} bytes); reading until EOF",
                 conn_details.debname
             );
             upstream.unset_poolable();
@@ -7108,8 +7150,9 @@ async fn handle_volatile_buffered_download(
     }
     .map_err(|err| {
         warn_once_or_info!(
-            "splice proxy: volatile buffered download failed for {}:  {err}",
-            conn_details.debname
+            "splice proxy: volatile buffered download failed for {}; returning 502:  {}",
+            conn_details.debname,
+            ErrorReport(&err)
         );
         SpliceProxyError::Upstream
     })?;
@@ -7147,7 +7190,7 @@ async fn handle_volatile_buffered_download(
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
                 error!(
-                    "splice proxy: previous cache file `{}` is not a regular file",
+                    "splice proxy: previous cache file `{}` is not a regular file; counting it as 0 bytes for the quota and overwriting it",
                     prev_path.display()
                 );
                 0
@@ -7156,8 +7199,9 @@ async fn handle_volatile_buffered_download(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "splice proxy: failed to stat existing volatile file `{}`:  {err}",
-                    prev_path.display()
+                    "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
+                    prev_path.display(),
+                    ErrorReport(&err)
                 );
                 return Err(SpliceProxyError::Cache);
             }
@@ -7200,9 +7244,9 @@ async fn handle_volatile_buffered_download(
             // Same as the streaming path: RFC 9110 says ignore and serve the
             // whole entity, but a client expecting a resume gets everything.
             warn_once_or_debug!(
-                "splice proxy: ignoring malformed Range header from client {}, serving the full file: {}",
-                conn_details.client,
-                range.escape_debug()
+                "splice proxy: ignoring malformed Range header `{}` from client {}; serving the full file",
+                range.escape_debug(),
+                conn_details.client
             );
         }
         parsed
@@ -7235,8 +7279,9 @@ async fn handle_volatile_buffered_download(
     if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "splice proxy: failed to create cache directory `{}`:  {err}",
-            dest_dir.display()
+            "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
+            dest_dir.display(),
+            ErrorReport(&err)
         );
         return Err(SpliceProxyError::Cache);
     }
@@ -7257,8 +7302,9 @@ async fn handle_volatile_buffered_download(
     let (mut tempfile, temppath) = tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "splice proxy: failed to create temp file `{}`:  {err}",
-            tmppath.display()
+            "splice proxy: failed to create temp file `{}`; aborting the download:  {}",
+            tmppath.display(),
+            ErrorReport(&err)
         );
         SpliceProxyError::Cache
     })?;
@@ -7309,8 +7355,9 @@ async fn handle_volatile_buffered_download(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "splice proxy: failed to write volatile body to cache file `{}`:  {err}",
-                temppath.display()
+                "splice proxy: failed to write volatile body to cache file `{}`; serving the buffered body to the client without caching it:  {}",
+                temppath.display(),
+                ErrorReport(&err)
             );
             false
         }
@@ -7322,8 +7369,9 @@ async fn handle_volatile_buffered_download(
         if let Err(err) = tempfile.sync_all().await {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "splice proxy: failed to sync cache file `{}`:  {err}",
-                temppath.display()
+                "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
+                temppath.display(),
+                ErrorReport(&err)
             );
         }
     }
@@ -7378,7 +7426,7 @@ async fn handle_volatile_buffered_download(
                 if let integrity::CommitError::Rename(io_err) = &err {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "splice proxy: failed to rename temp file `{}` to `{}`:  {}",
+                        "splice proxy: failed to rename temp file `{}` to `{}`; discarding the temp file and leaving the download uncached:  {}",
                         temppath.display(),
                         dest_file_path.display(),
                         ErrorReport(io_err)
@@ -7519,7 +7567,7 @@ async fn handle_volatile_buffered_download(
             ""
         };
         info!(
-            "splice proxy{tls_label}: served and cached {volatile}{} from mirror {} for client {} in {} ({}, {})",
+            "Served and cached {volatile}file {} from mirror {} for client {} in {} via splice{tls_label} ({}, {})",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client,
@@ -7711,7 +7759,8 @@ pub(crate) async fn splice_simple_proxy(
         Ok(s) => s,
         Err(err) => {
             warn_once_or_info!(
-                "splice proxy: failed to rewrite headers for {upstream_path} from {host_authority}:  {err}"
+                "simple proxy: failed to rewrite headers for {upstream_path} from {host_authority}; returning 502:  {}",
+                ErrorReport(&err)
             );
             upstream.unset_poolable();
             return Err(SpliceProxyError::Upstream);
