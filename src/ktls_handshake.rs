@@ -99,7 +99,7 @@ pub(crate) fn encode_tls_data(
                 // stalls into a round-cap or http_timeout error that points
                 // at the network instead of the state machine.
                 warn_once!(
-                    "kTLS: rustls reported handshake data already encoded; no bytes queued for transmit"
+                    "kTLS: rustls reported handshake data already encoded; no bytes queued for transmit, so the handshake stalls and falls back to userspace TLS for this request"
                 );
                 break;
             }

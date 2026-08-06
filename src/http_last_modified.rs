@@ -34,7 +34,7 @@ pub(crate) fn try_read_last_modified(
 
     let Some(time) = HttpDate::parse(&data) else {
         warn!(
-            "Discarding malformed Last-Modified from `{}`: {}",
+            "Discarding malformed Last-Modified from `{}`: `{}`",
             display_path.display(),
             data.escape_debug()
         );
@@ -53,7 +53,7 @@ pub(crate) fn try_read_last_modified(
 pub(crate) fn write_last_modified(file: &tokio::fs::File, display_path: &Path, value: &str) {
     if !is_valid_http_date(value) {
         warn!(
-            "Skipping write of malformed Last-Modified to `{}`: {}",
+            "Skipping write of malformed Last-Modified to `{}`: `{}`",
             display_path.display(),
             value.escape_debug()
         );

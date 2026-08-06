@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use tracing::{debug, error};
 
+use crate::error::ErrorReport;
 use crate::metrics;
 
 use super::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry};
@@ -40,8 +41,9 @@ pub(super) async fn cleanup_tmp_dir(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read tmp directory `{}`:  {err}",
-                tmp_dir.display()
+                "Failed to read tmp directory `{}`; skipping this directory this cycle:  {}",
+                tmp_dir.display(),
+                ErrorReport(&err)
             );
             return 0;
         }
@@ -56,8 +58,9 @@ pub(super) async fn cleanup_tmp_dir(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to iterate tmp directory `{}`:  {err}",
-                    tmp_dir.display()
+                    "Failed to iterate tmp directory `{}`; ending this directory's sweep early:  {}",
+                    tmp_dir.display(),
+                    ErrorReport(&err)
                 );
                 break;
             }
@@ -71,8 +74,9 @@ pub(super) async fn cleanup_tmp_dir(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to stat tmp entry `{}`:  {err}",
-                    entry.path().display()
+                    "Failed to stat tmp entry `{}`; retaining it and skipping it this cycle:  {}",
+                    entry.path().display(),
+                    ErrorReport(&err)
                 );
                 continue;
             }
@@ -83,8 +87,9 @@ pub(super) async fn cleanup_tmp_dir(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to read mtime of tmp entry `{}`:  {err}; treating as epoch (eligible for removal)",
-                    entry.path().display()
+                    "Failed to read mtime of tmp entry `{}`; treating it as epoch, so it is eligible for removal:  {}",
+                    entry.path().display(),
+                    ErrorReport(&err)
                 );
                 SystemTime::UNIX_EPOCH
             }
@@ -128,8 +133,9 @@ pub(super) async fn cleanup_tmp_dir(
         } else if let Err(err) = tokio::fs::remove_file(&path).await {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to remove stale tmp entry `{}`:  {err}",
-                path.display()
+                "Failed to remove stale tmp entry `{}`; retaining it:  {}",
+                path.display(),
+                ErrorReport(&err)
             );
         } else {
             debug!("Removed stale tmp entry `{}`", path.display());

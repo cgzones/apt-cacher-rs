@@ -801,9 +801,8 @@ pub(crate) struct Config {
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
     /// Minimum free disk space (in bytes) on the cache filesystem for the
-    /// `/healthcheck` endpoint to report healthy. Also intended as the
-    /// headroom floor for future serve-path disk-space gating. `None`
-    /// (config value `0`) disables the check.
+    /// `/healthcheck` endpoint to report healthy. `None` (config value `0`)
+    /// disables the check.
     #[serde(
         default = "default_min_disk_free",
         deserialize_with = "from_nonzero_u64_with_magnitude"

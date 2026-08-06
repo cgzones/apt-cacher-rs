@@ -88,7 +88,7 @@ pub(crate) fn authorize_cache_access(
             .any(|ac| ac.contains(&client_ip))
     {
         warn_once_or_info!(
-            "Unauthorized proxy client {client}: not permitted by `allowed_proxy_clients`, rejecting with 403"
+            "Unauthorized proxy client {client}: not permitted by `allowed_proxy_clients`; rejecting with 403"
         );
         metrics::AUTHZ_REJECTED_CLIENT.increment();
         return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
@@ -120,12 +120,15 @@ fn finalize_host_result(
     match result {
         Ok(d) => Ok(d),
         Err(HostReject::Unsupported) => {
-            warn_once_or_info!("Unsupported host `{}`", raw_host.escape_debug());
+            warn_once_or_info!(
+                "Unsupported host `{}`; rejecting with 400",
+                raw_host.escape_debug()
+            );
             Err((StatusCode::BAD_REQUEST, "Unsupported host"))
         }
         Err(HostReject::Forbidden) => {
             warn_once_or_info!(
-                "Unauthorized host `{}`: not permitted by `allowed_mirrors`, rejecting with 403",
+                "Unauthorized host `{}`: not permitted by `allowed_mirrors`; rejecting with 403",
                 raw_host.escape_debug()
             );
             metrics::AUTHZ_REJECTED_MIRROR.increment();

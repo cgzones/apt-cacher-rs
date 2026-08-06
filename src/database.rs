@@ -38,7 +38,7 @@ fn decode_mirror_kind(kind: i64, path: &str) -> MirrorKind {
         kind
     } else {
         warn_once_or_info!(
-            "database: mirror row for `{}` has out-of-range kind value {kind}; treating as structured",
+            "Mirror row for `{}` has out-of-range kind value {kind}; treating the mirror as structured",
             path.escape_debug()
         );
         MirrorKind::Structured
@@ -463,7 +463,7 @@ async fn database_file_size(path: &Path) -> Option<u64> {
         .await
         .inspect_err(|err| {
             warn!(
-                "Failed to stat database `{}`:  {}",
+                "Failed to stat database `{}`; reporting its on-disk size as unknown:  {}",
                 path.display(),
                 ErrorReport(err)
             );
@@ -811,7 +811,7 @@ impl Database {
                     Err(blob) => {
                         // One line per bad row per dashboard render otherwise.
                         warn_once_or_info!(
-                            "database: dropping clients-stats row with malformed client_ip blob ({} bytes); restart to purge it via cleanup_invalid_rows",
+                            "Dropping clients-stats row with malformed client_ip blob ({} bytes) from the dashboard; restart the daemon to purge it from the database",
                             blob.len()
                         );
                         return None;
@@ -960,7 +960,7 @@ impl Database {
                     Ok(h) => h,
                     Err(invalid) => {
                         warn_once_or_info!(
-                            "load_all_mirror_ids: dropping row id={row_id} with invalid host `{}`",
+                            "Dropping mirror row id={row_id} with invalid host `{}` while hydrating the mirror-id cache",
                             invalid.escape_debug()
                         );
                         return None;
@@ -968,7 +968,7 @@ impl Database {
                 };
                 let Some(kind) = MirrorKind::from_db_int(r.kind) else {
                     warn_once_or_info!(
-                        "load_all_mirror_ids: dropping row id={row_id} with out-of-range kind value {}",
+                        "Dropping mirror row id={row_id} with out-of-range kind value {} while hydrating the mirror-id cache",
                         r.kind
                     );
                     return None;

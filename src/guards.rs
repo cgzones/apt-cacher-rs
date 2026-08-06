@@ -269,7 +269,7 @@ impl DownloadBarrier {
                 | ActiveDownloadStatus::Finished { .. }
                 | ActiveDownloadStatus::Aborted(_)) => {
                     error!(
-                        "begin_rename reached with non-Download status for {} from mirror {}: {other:?}",
+                        "Download barrier begin_rename reached with non-Download status for {} from mirror {}; leaving the status untouched: {other:?}",
                         data.debname, data.mirror
                     );
                     other
@@ -465,7 +465,7 @@ impl RenameBarrier {
                 | ActiveDownloadStatus::Finished { .. }
                 | ActiveDownloadStatus::Aborted(_) => {
                     error!(
-                        "RenameBarrier::commit reached with non-Verifying status for {} from mirror {}: {:?}",
+                        "RenameBarrier::commit reached with non-Verifying status for {} from mirror {}; finishing the download without publishing cache metadata: {:?}",
                         data.debname, data.mirror, *lock
                     );
                     None

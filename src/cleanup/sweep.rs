@@ -8,6 +8,7 @@ use tracing::{debug, error, warn};
 
 use crate::cache_layout::CacheLayout;
 use crate::deb_mirror::{Mirror, is_deb_package};
+use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
 use crate::{cache_metadata, info_once, metrics};
 
@@ -84,15 +85,18 @@ pub(super) fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Optio
         Ok(t) => Some(t),
         Err(created_err) => {
             info_once!(
-                "Failed to get create timestamp for file `{}`:  {created_err}",
-                path.display()
+                "Failed to get create timestamp for file `{}`; falling back to the modify timestamp:  {}",
+                path.display(),
+                ErrorReport(&created_err)
             );
             match meta.modified() {
                 Ok(t) => Some(t),
                 Err(modified_err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get create timestamp ({created_err}) and modify timestamp ({modified_err}) of file `{}`; retaining it indefinitely - it can never be aged out",
+                        "Failed to get create timestamp ({}) and modify timestamp ({}) of file `{}`; retaining it indefinitely since it can never be aged out",
+                        ErrorReport(&created_err),
+                        ErrorReport(&modified_err),
                         path.display()
                     );
                     None
@@ -156,8 +160,9 @@ pub(super) async fn sweep_candidates(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Error inspecting cached file `{}`:  {err}; retaining",
-                    path.display()
+                    "Failed to inspect cached file `{}`; retaining it:  {}",
+                    path.display(),
+                    ErrorReport(&err)
                 );
                 None
             }
@@ -184,8 +189,9 @@ pub(super) async fn sweep_candidates(
             Ok(_) => {}
             Err(err) => {
                 info_once!(
-                    "File `{}` has a future timestamp, skipping removal:  {err}",
-                    path.display()
+                    "Cache file `{}` has a future timestamp; skipping its removal:  {}",
+                    path.display(),
+                    ErrorReport(&err)
                 );
                 continue;
             }
@@ -195,7 +201,11 @@ pub(super) async fn sweep_candidates(
 
         if let Err(err) = tokio::fs::remove_file(&path).await {
             metrics::CACHE_IO_FAILURE.increment();
-            error!("Error removing cached file `{}`:  {err}", path.display());
+            error!(
+                "Failed to remove cached file `{}`; retaining it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
             continue;
         }
 
@@ -259,8 +269,9 @@ pub(super) async fn sweep_aged_metadata(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read metadata directory `{}`:  {err}",
-                dir.display()
+                "Failed to read metadata directory `{}`; skipping its metadata sweep this cycle:  {}",
+                dir.display(),
+                ErrorReport(&err)
             );
             return result;
         }
@@ -273,8 +284,9 @@ pub(super) async fn sweep_aged_metadata(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to iterate metadata directory `{}`:  {err}",
-                    dir.display()
+                    "Failed to iterate metadata directory `{}`; ending its metadata sweep early:  {}",
+                    dir.display(),
+                    ErrorReport(&err)
                 );
                 break;
             }
@@ -296,8 +308,9 @@ pub(super) async fn sweep_aged_metadata(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to stat metadata entry `{}`:  {err}",
-                    entry.path().display()
+                    "Failed to stat metadata entry `{}`; retaining it:  {}",
+                    entry.path().display(),
+                    ErrorReport(&err)
                 );
                 continue;
             }
@@ -320,8 +333,9 @@ pub(super) async fn sweep_aged_metadata(
             Ok(_) => {}
             Err(err) => {
                 info_once!(
-                    "Metadata file `{}` has a future timestamp, skipping removal:  {err}",
-                    path.display()
+                    "Metadata file `{}` has a future timestamp; skipping its removal:  {}",
+                    path.display(),
+                    ErrorReport(&err)
                 );
                 continue;
             }
@@ -332,8 +346,9 @@ pub(super) async fn sweep_aged_metadata(
         if let Err(err) = tokio::fs::remove_file(&path).await {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Error removing stale metadata file `{}`:  {err}",
-                path.display()
+                "Failed to remove stale metadata file `{}`; retaining it:  {}",
+                path.display(),
+                ErrorReport(&err)
             );
             continue;
         }

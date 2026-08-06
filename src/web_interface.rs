@@ -38,6 +38,7 @@ use crate::{
     database::{Database, MirrorStatEntry},
     database_task::DB_TASK_QUEUE_SENDER,
     deb_mirror::VALID_DEB_EXTENSIONS,
+    error::ErrorReport,
     get_features, global_cache_quota, global_checksum_registry, global_config,
     global_verify_throttle,
     healthcheck::cached_health_report,
@@ -980,7 +981,10 @@ async fn build_mirror_section(
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query mirrors:  {err}");
+            error!(
+                "Failed to query the mirrors for the dashboard; rendering the mirror section with an error notice:  {}",
+                ErrorReport(&err)
+            );
             let mut buf = String::new();
             write_section_error(&mut buf, "mirrors", &err);
             (Vec::new(), buf, 0, DirStats::default())
@@ -1061,8 +1065,9 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         Ok(data) => Some(data.len()),
         Err(err) => {
             error!(
-                "Failed to access database file `{}`:  {err}",
-                rd.config.database_path.display()
+                "Failed to stat the database file `{}`; reporting its size as unknown on the dashboard:  {}",
+                rd.config.database_path.display(),
+                ErrorReport(&err)
             );
             None
         }
@@ -1432,7 +1437,10 @@ fn build_cache_stats_html(
         Ok(v) => Some(v),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query 24h bandwidth window:  {err}");
+            error!(
+                "Failed to query the 24h bandwidth window; the dashboard reports it as N/A:  {}",
+                ErrorReport(&err)
+            );
             None
         }
     };
@@ -1440,7 +1448,10 @@ fn build_cache_stats_html(
         Ok(v) => Some(v),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query 7d bandwidth window:  {err}");
+            error!(
+                "Failed to query the 7d bandwidth window; the dashboard reports it as N/A:  {}",
+                ErrorReport(&err)
+            );
             None
         }
     };
@@ -2707,8 +2718,9 @@ async fn build_mirror_table(
                 Ok(stats) => Some(stats),
                 Err(err) => {
                     error!(
-                        "Failed to gather size of directory `{}`:  {err}",
-                        mirror_path.display()
+                        "Failed to gather the size of directory `{}`; excluding it from the reported cache size:  {}",
+                        mirror_path.display(),
+                        ErrorReport(&err)
                     );
                     None
                 }
@@ -2807,7 +2819,10 @@ async fn build_origin_table(database: &Database, now_epoch: i64) -> (String, usi
         Ok(o) => o,
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query origins:  {err}");
+            error!(
+                "Failed to query the origins for the dashboard; rendering the origin section with an error notice:  {}",
+                ErrorReport(&err)
+            );
             let mut buf = String::new();
             write_section_error(&mut buf, "origins", &err);
             return (buf, 0);
@@ -2851,7 +2866,10 @@ async fn build_client_table(database: &Database, now_epoch: i64) -> (String, usi
         Ok(o) => o,
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query clients:  {err}");
+            error!(
+                "Failed to query the clients for the dashboard; rendering the client section with an error notice:  {}",
+                ErrorReport(&err)
+            );
             let mut buf = String::new();
             write_section_error(&mut buf, "clients", &err);
             return (buf, 0);
@@ -2939,7 +2957,10 @@ async fn build_top_packages_table(database: &Database, view: TopPackagesView) ->
         Ok(p) => p,
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Failed to query {label}:  {err}");
+            error!(
+                "Failed to query the {label} for the dashboard; rendering that section with an error notice:  {}",
+                ErrorReport(&err)
+            );
             let mut buf = String::new();
             write_section_error(&mut buf, label, &err);
             return (buf, 0);
@@ -3011,7 +3032,10 @@ async fn serve_logs(options: QueryOptions) -> WebResponse {
     })
     .await
     .unwrap_or_else(|err| {
-        error!("Log-page render task panicked:  {err}");
+        error!(
+            "Log-page render task panicked; rendering an error notice instead of the log entries:  {}",
+            ErrorReport(&err)
+        );
         String::from("!! Failed to render log entries !!\n")
     });
 

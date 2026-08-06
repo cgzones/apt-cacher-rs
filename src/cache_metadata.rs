@@ -307,7 +307,7 @@ impl CacheMetadataStore {
                     // the file's xattrs -- conditional requests then behave
                     // differently before and after a restart.
                     warn_once!(
-                        "Cache metadata publication invariant violated for `{}`: published {:?} disagrees with the on-disk xattrs {:?}",
+                        "Cache metadata publication invariant violated for `{}`: published {:?} disagrees with the on-disk xattrs {:?}; keeping the published value",
                         path.display(),
                         occ.get().as_ref(),
                         meta.as_ref()

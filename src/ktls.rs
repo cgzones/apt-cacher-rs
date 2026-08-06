@@ -40,7 +40,7 @@ use rustls::ConnectionTrafficSecrets;
 use rustls::crypto::cipher::NONCE_LEN;
 use tracing::{debug, info, warn};
 
-use crate::error::errno_to_io_error;
+use crate::error::{ErrorReport, errno_to_io_error};
 use crate::{Never, static_assert, warn_once, warn_once_or_debug};
 
 /// Overwrite every byte of a mutable POD value with zeros via `explicit_bzero`,
@@ -314,19 +314,28 @@ pub(crate) fn is_available() -> bool {
         ) {
             Ok(fd) => fd,
             Err(err) => {
-                warn!("kTLS: availability test: failed to create listener socket:  {err}");
+                warn!(
+                    "kTLS: availability probe failed to create the probe listener socket; kTLS stays disabled until a later probe succeeds:  {}",
+                    ErrorReport(&err)
+                );
                 return TestResult::Error;
             }
         };
 
         let addr = SockaddrIn::new(127, 0, 0, 1, 0);
         if let Err(err) = bind(listener.as_raw_fd(), &addr) {
-            warn!("kTLS: availability test: failed to bind socket:  {err}");
+            warn!(
+                "kTLS: availability probe failed to bind the probe listener socket; kTLS stays disabled until a later probe succeeds:  {}",
+                ErrorReport(&err)
+            );
             return TestResult::Error;
         }
 
         if let Err(err) = listen(&listener, Backlog::new(1).expect("valid backlog value")) {
-            warn!("kTLS: availability test: failed to listen on socket:  {err}");
+            warn!(
+                "kTLS: availability probe failed to listen on the probe listener socket; kTLS stays disabled until a later probe succeeds:  {}",
+                ErrorReport(&err)
+            );
             return TestResult::Error;
         }
 
@@ -334,7 +343,10 @@ pub(crate) fn is_available() -> bool {
         let sockname: SockaddrIn = match getsockname(listener.as_raw_fd()) {
             Ok(s) => s,
             Err(err) => {
-                warn!("kTLS: availability test: failed to get sockname:  {err}");
+                warn!(
+                    "kTLS: availability probe failed to read the probe listener address; kTLS stays disabled until a later probe succeeds:  {}",
+                    ErrorReport(&err)
+                );
                 return TestResult::Error;
             }
         };
@@ -361,7 +373,10 @@ pub(crate) fn is_available() -> bool {
         let (probe_client, probe_server) = match make_pair() {
             Ok(pair) => pair,
             Err(err) => {
-                warn!("kTLS: availability test: failed to create loopback pair:  {err}");
+                warn!(
+                    "kTLS: availability probe failed to create the loopback socket pair; kTLS stays disabled until a later probe succeeds:  {}",
+                    ErrorReport(&err)
+                );
                 return TestResult::Error;
             }
         };
@@ -369,7 +384,10 @@ pub(crate) fn is_available() -> bool {
             Ok(()) => {}
             Err(nix::errno::Errno::ENOENT) => return TestResult::Unavailable,
             Err(err) => {
-                warn!("kTLS: availability test: failed to set TCP_ULP:  {err}");
+                warn!(
+                    "kTLS: availability probe failed to set TCP_ULP on the loopback socket; kTLS stays disabled until a later probe succeeds:  {}",
+                    ErrorReport(&err)
+                );
                 return TestResult::Error;
             }
         }
@@ -384,13 +402,17 @@ pub(crate) fn is_available() -> bool {
                 Ok(pair) => pair,
                 Err(err) => {
                     warn!(
-                        "kTLS: availability test: failed to create probe pair for {name}:  {err}"
+                        "kTLS: availability probe failed to create the loopback socket pair for {name}; kTLS stays disabled until a later probe succeeds:  {}",
+                        ErrorReport(&err)
                     );
                     return TestResult::Error;
                 }
             };
             if let Err(err) = setsockopt(&client, TcpUlp::default(), b"tls") {
-                warn!("kTLS: availability test: failed to attach ULP for {name}:  {err}");
+                warn!(
+                    "kTLS: availability probe failed to attach the TLS ULP for {name}; kTLS stays disabled until a later probe succeeds:  {}",
+                    ErrorReport(&err)
+                );
                 return TestResult::Error;
             }
             let (Some(bit), Some(crypto)) = (
@@ -402,14 +424,17 @@ pub(crate) fn is_available() -> bool {
                 // that cipher for the process lifetime -- and in the support
                 // summary that is indistinguishable from a kernel gap.
                 warn_once!(
-                    "kTLS: availability test: no crypto-info mapping for {name}; treating it as unsupported"
+                    "kTLS: availability probe has no crypto-info mapping for {name}; treating the cipher as unsupported"
                 );
                 continue;
             };
             match setsockopt(&client, TcpTlsRx, &crypto) {
                 Ok(()) => mask |= 1u32 << bit,
                 Err(errno) => {
-                    debug!("kTLS: availability test: {name} TLS_RX unsupported:  {errno}");
+                    debug!(
+                        "kTLS: availability probe: {name} TLS_RX unsupported:  {}",
+                        ErrorReport(&errno)
+                    );
                 }
             }
         }
@@ -434,7 +459,7 @@ pub(crate) fn is_available() -> bool {
                 // ULP present but no cipher/version combo has a usable TLS_RX
                 // (e.g. 4.13-4.16 kernels with no RX support at all).
                 info!(
-                    "kTLS: kernel TLS ULP present but TLS_RX unusable for every supported cipher"
+                    "kTLS: kernel TLS ULP present but TLS_RX unusable for every supported cipher; disabling kTLS for this run"
                 );
                 latch_unavailable();
                 return false;
@@ -451,7 +476,7 @@ pub(crate) fn is_available() -> bool {
             true
         }
         TestResult::Unavailable => {
-            info!("kTLS: kernel TLS not available (modprobe tls?)");
+            info!("kTLS: kernel TLS not available (modprobe tls?); disabling kTLS for this run");
             latch_unavailable();
             false
         }
@@ -683,7 +708,9 @@ pub(crate) fn setup_rx<F: AsFd>(
             zci
         }
         _ => {
-            warn_once!("kTLS: unsupported cipher suite in traffic secrets");
+            warn_once!(
+                "kTLS: unsupported cipher suite in traffic secrets; abandoning kTLS and falling back to userspace TLS for this request"
+            );
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "kTLS: unsupported cipher suite",
@@ -738,7 +765,10 @@ fn enable_rx_expect_no_pad<F: AsFd>(fd: &F) {
 
     if ret != 0 {
         let errno = nix::errno::Errno::last();
-        debug!("kTLS: TLS_RX_EXPECT_NO_PAD not supported (kernel < 6.0):  {errno}");
+        debug!(
+            "kTLS: TLS_RX_EXPECT_NO_PAD not supported (kernel < 6.0):  {}",
+            ErrorReport(&errno)
+        );
     }
 }
 
@@ -1036,7 +1066,7 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                 ));
             }
             Err(errno) => {
-                debug!("kTLS: drain peek error:  {errno}");
+                debug!("kTLS: drain peek error:  {}", ErrorReport(&errno));
                 return Err(errno_to_io_error(errno, "kTLS: recvmsg peek failed"));
             }
         };
@@ -1047,7 +1077,8 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
             Ok(rt) => rt,
             Err(err) => {
                 warn_once_or_debug!(
-                    "kTLS: drain peek cmsg decode failed; abandoning kTLS and falling back to userspace TLS for this request:  {err}"
+                    "kTLS: drain peek cmsg decode failed; abandoning kTLS and falling back to userspace TLS for this request:  {}",
+                    ErrorReport(&err)
                 );
                 return Err(err);
             }
@@ -1182,8 +1213,8 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                     // same-type record was coalesced in between the two calls.)
                     if msg.bytes < peeked_bytes {
                         warn!(
-                            "kTLS: consumed {} bytes, but peeked {peeked_bytes} -- \
-                             concurrent reader on kTLS socket?; aborting kTLS setup",
+                            "kTLS: consumed {} bytes but peeked {peeked_bytes} \
+                             (concurrent reader on the kTLS socket?); aborting kTLS setup",
                             msg.bytes
                         );
                         return Err(io::Error::new(
@@ -1195,7 +1226,8 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                         Ok(rt) => rt,
                         Err(err) => {
                             warn!(
-                                "kTLS: drain consume cmsg decode failed; aborting kTLS setup:  {err}"
+                                "kTLS: drain consume cmsg decode failed; aborting kTLS setup:  {}",
+                                ErrorReport(&err)
                             );
                             return Err(err);
                         }
@@ -1206,7 +1238,7 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                     if consumed_rt != Some(rt_to_consume) {
                         warn!(
                             "kTLS: consumed record type {consumed_rt:?} differs from peeked \
-                             {rt_to_consume:?} -- concurrent reader on kTLS socket?; aborting \
+                             {rt_to_consume:?} (concurrent reader on the kTLS socket?); aborting \
                              kTLS setup"
                         );
                         return Err(io::Error::new(
@@ -1226,7 +1258,7 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                     if handshake_contains_key_update(&buf[..consumed_bytes]) {
                         warn!(
                             "kTLS: consumed control record contained KeyUpdate \
-                             ({consumed_bytes} bytes); kernel TLS cannot rekey; \
+                             ({consumed_bytes} bytes) and kernel TLS cannot rekey; \
                              aborting kTLS setup"
                         );
                         return Err(io::Error::new(
@@ -1257,7 +1289,8 @@ pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) ->
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(errno) => {
                     debug!(
-                        "kTLS: drain consume error (peeked {peeked_bytes} bytes, type={rt_to_consume:?}):  {errno}"
+                        "kTLS: drain consume error (peeked {peeked_bytes} bytes, type={rt_to_consume:?}):  {}",
+                        ErrorReport(&errno)
                     );
                     return Err(errno_to_io_error(errno, "kTLS: drain consume error"));
                 }

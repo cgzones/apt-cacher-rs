@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
-    error::ProxyCacheError,
+    error::{ErrorReport, ProxyCacheError},
     humanfmt::HumanFmt,
     metrics,
 };
@@ -205,7 +205,7 @@ pub(super) async fn reduce_against(
     };
     if body_is_incomplete(announced, written) {
         debug!(
-            "cleanup: Packages `{memfdname}` truncated (announced {}, buffered {written}); treating as fetch failure",
+            "Packages index `{memfdname}` truncated (announced {}, buffered {written}); treating as fetch failure",
             announced.unwrap_or(0)
         );
         return Ok(ReduceOutcome::FetchFailed(FetchFailure {
@@ -263,8 +263,8 @@ pub(super) fn flat_root_fetch_plan<'a>(
 }
 
 /// Run every `unit` of one mirror in order, folding their [`UnitStats`] into a
-/// single per-mirror [`CleanupDone`]. A unit's hard error is logged (matching
-/// the old outer-arm `"Error in cleanup task:  {err}"`) and does NOT abort the
+/// single per-mirror [`CleanupDone`]. A unit's hard error is logged
+/// (`"Failed to run a cleanup unit for mirror ..."`) and does NOT abort the
 /// remaining units for that mirror.
 pub(super) async fn run_mirror_units(
     entry: MirrorEntry,
@@ -310,7 +310,8 @@ pub(super) async fn run_mirror_units(
             }
             Err(err) => {
                 error!(
-                    "Error in cleanup task for mirror {mirror}, skipping this unit and continuing with the mirror's remaining units:  {err}"
+                    "Failed to run a cleanup unit for mirror {mirror}; skipping it and continuing with the mirror's remaining units:  {}",
+                    ErrorReport(&err)
                 );
             }
         }
@@ -359,7 +360,10 @@ async fn read_self_origins(
         Ok(origins) => Some(origins),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Error looking up origins for mirror {mirror}:  {err}");
+            error!(
+                "Failed to look up origins for mirror {mirror}; treating its origin set as unknown for this cycle:  {}",
+                ErrorReport(&err)
+            );
             None
         }
     }
@@ -596,8 +600,9 @@ async fn sweep_byhash_dir(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read directory `{}`:  {err}",
-                byhash_path.display()
+                "Failed to read by-hash directory `{}`; abandoning its cleanup this cycle:  {}",
+                byhash_path.display(),
+                ErrorReport(&err)
             );
             return Err(ProxyCacheError::Io(err));
         }
@@ -610,8 +615,9 @@ async fn sweep_byhash_dir(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to iterate directory `{}`:  {err}",
-                    byhash_path.display()
+                    "Failed to iterate by-hash directory `{}`; abandoning its cleanup this cycle:  {}",
+                    byhash_path.display(),
+                    ErrorReport(&err)
                 );
                 return Err(ProxyCacheError::Io(err));
             }
@@ -623,7 +629,11 @@ async fn sweep_byhash_dir(
             Ok(ft) => ft,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
-                error!("Error inspecting file `{}`:  {err}", entry.path().display());
+                error!(
+                    "Failed to inspect by-hash entry `{}`; retaining it:  {}",
+                    entry.path().display(),
+                    ErrorReport(&err)
+                );
                 continue;
             }
         };
@@ -716,8 +726,9 @@ async fn run_reconcile_unit(
         .await
         .inspect_err(|err| {
             error!(
-                "Error listing files in `{}`:  {err}",
-                unit.tree.root.display()
+                "Failed to list the cached files in `{}`; abandoning this cleanup unit:  {}",
+                unit.tree.root.display(),
+                ErrorReport(err)
             );
         })?;
 
@@ -824,7 +835,7 @@ async fn run_reconcile_unit(
             _ => String::new(),
         };
         warn!(
-            "Could not fetch flat Packages file for mirror {mirror} ({primary}{suffix}); falling back to {} time-based retention",
+            "Failed to fetch the flat Packages index for mirror {mirror} ({primary}{suffix}); falling back to time-based retention over {}",
             HumanFmt::Time(spans.deb)
         );
     }
@@ -1003,7 +1014,10 @@ async fn resolve_origin_packages_archive_root(
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Error checking archive-root `{root}` mirror row:  {err}");
+            error!(
+                "Failed to check the mirror row of archive root `{root}`; continuing with the mirror's remaining index sources:  {}",
+                ErrorReport(&err)
+            );
             return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
                 SkipReason::DbError,
             )));
@@ -1018,7 +1032,10 @@ async fn resolve_origin_packages_archive_root(
         Ok(o) => o,
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Error looking up archive-root origins for `{root}`:  {err}");
+            error!(
+                "Failed to look up the origins of archive root `{root}`; continuing with the mirror's remaining index sources:  {}",
+                ErrorReport(&err)
+            );
             return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
                 SkipReason::DbError,
             )));
@@ -1065,12 +1082,15 @@ async fn resolve_origin_packages_archive_root(
             Ok(ReduceOutcome::Exhausted) => return Ok(GroupResolution::Exhausted),
             Ok(ReduceOutcome::FetchFailed(status)) => {
                 debug!(
-                    "strict flat-pool cleanup: could not fetch archive-root Packages for `{root}` ({status}); continuing with fallback index sources for mirror {mirror}"
+                    "Failed to fetch the archive-root Packages index for `{root}` ({status}); continuing with fallback index sources for mirror {mirror}"
                 );
                 return Ok(GroupResolution::Ran(GroupOutcome::FetchFailed(status)));
             }
             Err(err) => {
-                error!("Failed to reduce archive-root Packages for `{root}`:  {err}");
+                error!(
+                    "Failed to reduce the archive-root Packages index for `{root}`; continuing with the mirror's remaining index sources:  {}",
+                    ErrorReport(&err)
+                );
                 return Ok(GroupResolution::Ran(GroupOutcome::ParseError));
             }
         }
@@ -1129,7 +1149,10 @@ async fn resolve_flat_root_segment(
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Error checking flat-repo root `{seg}` mirror row:  {err}");
+            error!(
+                "Failed to check the mirror row of flat-repo root `{seg}`; continuing with the mirror's remaining index sources:  {}",
+                ErrorReport(&err)
+            );
             return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
                 SkipReason::DbError,
             )));
@@ -1150,7 +1173,8 @@ async fn resolve_flat_root_segment(
         }
         Err(err) => {
             error!(
-                "Error reducing flat-root Packages `{seg}` for mirror {mirror}:  {err}; falling back to time-based retention"
+                "Failed to reduce the flat-root Packages index `{seg}` for mirror {mirror}; falling back to time-based retention:  {}",
+                ErrorReport(&err)
             );
             Ok(GroupResolution::Ran(GroupOutcome::ParseError))
         }
@@ -1209,7 +1233,8 @@ async fn resolve_flat_colocated(
         }
         Err(err) => {
             error!(
-                "Error reducing co-located flat Packages for mirror {mirror}:  {err}; falling back to time-based retention"
+                "Failed to reduce the co-located flat Packages index for mirror {mirror}; falling back to time-based retention:  {}",
+                ErrorReport(&err)
             );
             Ok(GroupResolution::Ran(GroupOutcome::ParseError))
         }
@@ -1284,7 +1309,7 @@ async fn resolve_origin_packages_self(
     if !cached_files.is_empty() && active_origins.is_empty() {
         if origins_count == 0 {
             info!(
-                "Mirror {mirror}: no origin records - cached debs cannot be reconciled against any Packages index; aging out via the {} grace window",
+                "Mirror {mirror}: no origin records, so cached debs cannot be reconciled against any Packages index; aging them out via the {} grace window",
                 HumanFmt::Time(grace),
             );
         } else {
@@ -1344,7 +1369,7 @@ async fn resolve_origin_packages_self(
             // so `decide_sweep` returns `Bail` — no sweep this cycle.
             Ok(ReduceOutcome::FetchFailed(status)) => {
                 warn!(
-                    "Could not fetch package file for host {} path {} ({status}); skipping cleanup for mirror {mirror}",
+                    "Failed to fetch the Packages index for host {} path {} ({status}); skipping cleanup for mirror {mirror}",
                     origin.host, origin.mirror_path
                 );
                 return Ok(GroupResolution::Ran(GroupOutcome::FetchFailed(status)));
@@ -1354,7 +1379,8 @@ async fn resolve_origin_packages_self(
             // fetch miss -- hand the tail a `ParseError` so it bails.
             Err(err) => {
                 error!(
-                    "Error reducing Packages index for mirror {mirror}:  {err}; skipping cleanup"
+                    "Failed to reduce the Packages index for mirror {mirror}; skipping cleanup for this mirror:  {}",
+                    ErrorReport(&err)
                 );
                 return Ok(GroupResolution::Ran(GroupOutcome::ParseError));
             }

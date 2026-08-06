@@ -8,7 +8,7 @@ use crate::{
     cache_layout::{KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
     database::{Database, MirrorEntry},
     deb_mirror::{MirrorKind, is_deb_package, is_strict_path_descendant},
-    error::ProxyCacheError,
+    error::{ErrorReport, ProxyCacheError},
     global_config, healthcheck, metrics, task_setup,
     utils::probe_dir,
 };
@@ -71,7 +71,10 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
         Ok(m) => m,
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
-            error!("Error fetching mirrors:  {err}");
+            error!(
+                "Failed to fetch the mirrors for the cache scan; abandoning the scan:  {}",
+                ErrorReport(&err)
+            );
             return Err(ProxyCacheError::Sqlx(err));
         }
     };
@@ -85,8 +88,9 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read cache directory `{}`:  {err}",
-                cache_path.display()
+                "Failed to read cache directory `{}`; abandoning the cache scan:  {}",
+                cache_path.display(),
+                ErrorReport(&err)
             );
             return Err(ProxyCacheError::Io(err));
         }
@@ -122,8 +126,9 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to iterate cache directory `{}`:  {err}",
-                    cache_path.display()
+                    "Failed to iterate cache directory `{}`; abandoning the cache scan:  {}",
+                    cache_path.display(),
+                    ErrorReport(&err)
                 );
                 return Err(ProxyCacheError::Io(err));
             }
@@ -134,7 +139,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
             Ok(mdata) if mdata.file_type().is_symlink() => {
                 metrics::CACHE_NON_REGULAR.increment();
                 warn!(
-                    "Unrecognized symlink entry in cache directory: `{}`",
+                    "Unrecognized symlink entry `{}` in the cache directory; not counting it towards the cache size",
                     entry.path().display()
                 );
                 continue;
@@ -155,7 +160,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
                 // separately from FIFO/socket/device entries.
                 metrics::CACHE_UNEXPECTED_REGULAR.increment();
                 warn!(
-                    "Unrecognized regular file entry in cache directory: `{}`",
+                    "Unrecognized regular file entry `{}` in the cache directory; not counting it towards the cache size",
                     entry.path().display()
                 );
                 continue;
@@ -163,7 +168,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
                 warn!(
-                    "Unrecognized non-regular entry in cache directory: `{}`",
+                    "Unrecognized non-regular entry `{}` in the cache directory; not counting it towards the cache size",
                     entry.path().display()
                 );
                 continue;
@@ -171,8 +176,9 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to get metadata of `{}`:  {err}",
-                    entry.path().display()
+                    "Failed to get metadata of `{}`; excluding it from the cache size:  {}",
+                    entry.path().display(),
+                    ErrorReport(&err)
                 );
                 continue;
             }
@@ -189,7 +195,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
         let Some(name_str) = dir_name.to_str() else {
             metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
             warn!(
-                "Cache directory entry with non-UTF-8 name: `{}`",
+                "Cache directory entry `{}` has a non-UTF-8 name; skipping it and its contents",
                 entry.path().display()
             );
             continue;
@@ -198,7 +204,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
         let Some(mirrors_here) = mirrors_by_dir.get(name_str) else {
             metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
             warn!(
-                "Cache directory entry not matching any mirror: `{}`",
+                "Cache directory entry `{}` matches no known mirror; skipping it and its contents",
                 entry.path().display()
             );
             continue;
@@ -233,8 +239,9 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Error probing host-level flat root `{}`:  {err}",
-                    flat_path.display()
+                    "Failed to probe host-level flat root `{}`; excluding its subtree from the cache size:  {}",
+                    flat_path.display(),
+                    ErrorReport(&err)
                 );
             }
         }
@@ -292,8 +299,9 @@ async fn scan_mirror_dir(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read mirror directory `{}`:  {err}",
-                mirror_path.display()
+                "Failed to read mirror directory `{}`; excluding this mirror from the cache size:  {}",
+                mirror_path.display(),
+                ErrorReport(&err)
             );
             return ScanTotals::default();
         }
@@ -308,8 +316,9 @@ async fn scan_mirror_dir(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to iterate mirror directory `{}`:  {err}",
-                    mirror_path.display()
+                    "Failed to iterate mirror directory `{}`; ending this mirror's scan early:  {}",
+                    mirror_path.display(),
+                    ErrorReport(&err)
                 );
                 return totals;
             }
@@ -323,8 +332,9 @@ async fn scan_mirror_dir(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to get metadata of `{}`:  {err}",
-                    entry.path().display()
+                    "Failed to get metadata of `{}`; excluding it from the cache size:  {}",
+                    entry.path().display(),
+                    ErrorReport(&err)
                 );
                 continue;
             }
@@ -335,7 +345,7 @@ async fn scan_mirror_dir(
         if file_type.is_symlink() {
             metrics::CACHE_NON_REGULAR.increment();
             warn!(
-                "Unrecognized symlink entry in mirror directory: `{}`",
+                "Unrecognized symlink entry `{}` in a mirror directory; not counting it towards the cache size",
                 entry.path().display()
             );
             continue;
@@ -368,7 +378,7 @@ async fn scan_mirror_dir(
             let Some(name_str) = name.to_str() else {
                 metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
                 warn!(
-                    "Unrecognized directory entry in mirror directory: `{}`",
+                    "Unrecognized directory entry `{}` in a mirror directory; skipping it and its contents",
                     entry.path().display()
                 );
                 continue;
@@ -399,22 +409,23 @@ async fn scan_mirror_dir(
             // unrecognized directory falls through to the warn below
         }
 
-        if file_type.is_dir() {
+        // The regular-file arm already tallied the entry above, so its
+        // consequence differs from the directory / non-regular arms.
+        let (kind, consequence) = if file_type.is_dir() {
             metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
+            ("directory", "not counting it towards the cache size")
         } else if file_type.is_file() {
             metrics::CACHE_UNEXPECTED_REGULAR.increment();
+            (
+                "file",
+                "counting it towards the cache size but excluding it from cleanup",
+            )
         } else {
             metrics::CACHE_NON_REGULAR.increment();
-        }
+            ("non-regular file", "not counting it towards the cache size")
+        };
         warn!(
-            "Unrecognized {} entry in mirror directory: `{}`",
-            if file_type.is_dir() {
-                "directory"
-            } else if file_type.is_file() {
-                "file"
-            } else {
-                "non-regular file"
-            },
+            "Unrecognized {kind} entry `{}` in a mirror directory; {consequence}",
             entry.path().display()
         );
     }
@@ -473,9 +484,10 @@ async fn scan_sub_dir_recursive(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to read {} directory `{}`:  {err}",
+                    "Failed to read {} `{}`; excluding it from the cache size:  {}",
                     mode.purpose(),
-                    current.display()
+                    current.display(),
+                    ErrorReport(&err)
                 );
                 continue;
             }
@@ -488,9 +500,10 @@ async fn scan_sub_dir_recursive(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to iterate {} directory `{}`:  {err}",
+                        "Failed to iterate {} `{}`; ending its scan early:  {}",
                         mode.purpose(),
-                        current.display()
+                        current.display(),
+                        ErrorReport(&err)
                     );
                     continue 'outer;
                 }
@@ -504,8 +517,9 @@ async fn scan_sub_dir_recursive(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get metadata of `{}`:  {err}",
-                        entry.path().display()
+                        "Failed to get metadata of `{}`; excluding it from the cache size:  {}",
+                        entry.path().display(),
+                        ErrorReport(&err)
                     );
                     continue;
                 }
@@ -514,9 +528,9 @@ async fn scan_sub_dir_recursive(
             if file_type.is_symlink() {
                 metrics::CACHE_NON_REGULAR.increment();
                 warn!(
-                    "Unrecognized symlink entry in {}: `{}`",
-                    mode.purpose(),
-                    entry.path().display()
+                    "Unrecognized symlink entry `{}` in a {}; not counting it towards the cache size",
+                    entry.path().display(),
+                    mode.purpose()
                 );
                 continue;
             }
@@ -551,16 +565,21 @@ async fn scan_sub_dir_recursive(
                 }
             }
 
-            if file_type.is_dir() {
+            // Only directories and non-regular entries reach here (symlinks and
+            // regular files continue above, the latter after being tallied), so
+            // neither arm is counted -- but a directory also goes unwalked.
+            let consequence = if file_type.is_dir() {
                 metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
+                "not counting it or its contents towards the cache size"
             } else {
                 metrics::CACHE_NON_REGULAR.increment();
-            }
+                "not counting it towards the cache size"
+            };
             warn!(
-                "Unrecognized entry in {} `{}`: `{}`",
+                "Unrecognized entry `{}` in {} `{}`; {consequence}",
+                entry.path().display(),
                 mode.purpose(),
-                current.display(),
-                entry.path().display()
+                current.display()
             );
         }
     }

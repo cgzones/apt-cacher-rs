@@ -130,7 +130,7 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
                 // reaching this branch indicates a future divergence between
                 // the parser and the digest decoder. Keep the warning visible.
                 warn_once_or_info!(
-                    "integrity: by-hash digest did not decode for its URL algorithm; caching `{}` unverified",
+                    "By-hash digest did not decode for its URL algorithm; caching `{}` unverified",
                     filename.escape_debug()
                 );
             }
@@ -157,7 +157,7 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to read `{}` for {} verification:  {}",
+                "Failed to read `{}` for {} verification; discarding the download, not caching:  {}",
                 input.temp_path.display(),
                 algo.as_str(),
                 ErrorReport(&err),
@@ -380,7 +380,7 @@ impl ChecksumRegistry {
             // registry permanently sized below its working set looks idle
             // while verification coverage quietly drops.
             info_once!(
-                "integrity: checksum registry reached its {} entry cap; evicting oldest entries (verification coverage drops for evicted keys)",
+                "Checksum registry reached its {} entry cap; evicting the oldest entries (verification coverage drops for evicted keys)",
                 self.cap
             );
             evict(&mut inner, self.cap);
@@ -473,7 +473,7 @@ fn compact_order(inner: &mut RegistryInner) {
 /// otherwise is `CHECKSUM_UNVERIFIED` climbing with no identity attached.
 fn log_registry_miss(plan: &RenamePlan, key: &str) {
     warn_once_or_debug!(
-        "integrity: no expected digest in the checksum registry for host `{}` mirror `{}` key `{}`; caching {} unverified",
+        "No expected digest in the checksum registry for host {} mirror {} key `{}`; caching {} unverified",
         plan.host,
         plan.mirror_path,
         key.escape_debug(),
@@ -494,7 +494,7 @@ fn log_unsupported_packages_compression(leaf: &str, host: &str) {
         return;
     }
     warn_once_or_debug!(
-        "integrity: unsupported Packages compression `{}` from host `{host}`; skipping registry ingest, its debs stay unverified",
+        "Unsupported Packages compression `{}` from host {host}; skipping registry ingest, its debs stay unverified",
         leaf.escape_debug()
     );
 }
@@ -554,7 +554,7 @@ pub(crate) async fn verify_and_rename(plan: &RenamePlan) -> Result<(), CommitErr
         Ok(outcome) => outcome,
         Err(join_err) => {
             error!(
-                "Verification task failed for `{}` from host `{}`:  {}",
+                "Failed to run the verification task for {} from host {}; discarding the download, not caching:  {}",
                 plan.debname,
                 plan.host,
                 ErrorReport(&join_err),
@@ -567,7 +567,7 @@ pub(crate) async fn verify_and_rename(plan: &RenamePlan) -> Result<(), CommitErr
     if let VerifyOutcome::Reject(err) = outcome {
         if matches!(err, CommitError::ChecksumMismatch) {
             warn!(
-                "Checksum mismatch for `{}` from host `{}` mirror `{}`; discarding the download, not caching",
+                "Checksum mismatch for {} from host {} mirror {}; discarding the download, not caching",
                 plan.debname, plan.host, plan.mirror_path,
             );
         }
@@ -733,11 +733,12 @@ fn spawn_ingest(plan: &RenamePlan) {
             // deb from this mirror is committed unverified -- so far visible
             // only as a climbing CHECKSUM_UNVERIFIED.
             warn_once_or_debug!(
-                "integrity: index ingestion of `{}` for host `{host}` mirror `{mirror_path}` failed, debs from this mirror stay unverified until an ingest succeeds:  {}",
+                "Failed to ingest index `{}` for host {host} mirror {mirror_path}; debs from this mirror stay unverified until an ingest succeeds:  {}",
                 dest.display(),
                 ErrorReport(&err),
             );
         } else {
+            // Sync point for `wait_for_log("Index ingestion completed")`; keep the wording stable.
             debug!("Index ingestion completed for `{}`", dest.display());
         }
     });
@@ -854,7 +855,7 @@ pub(crate) async fn ingest_packages_file(
         Ok(m) => m.len(),
         Err(err) => {
             warn!(
-                "Could not stat `{}` for the decompression-ratio guard during Packages ingestion, ingesting with the guard disabled:  {}",
+                "Failed to stat `{}` for the decompression-ratio guard during Packages ingestion; ingesting with the guard disabled:  {}",
                 path.display(),
                 ErrorReport(&err),
             );
@@ -901,7 +902,7 @@ pub(crate) async fn ingest_packages_file(
             }
             Err(err) => {
                 warn!(
-                    "Failed to read `{}` during Packages ingestion (may exceed size/line limits):  {}",
+                    "Failed to read `{}` during Packages ingestion (may exceed size/line limits); aborting the ingest of this index:  {}",
                     path.display(),
                     ErrorReport(&err),
                 );
@@ -980,7 +981,7 @@ fn flush_stanza_into_registry(
         // so the registry stays empty and deb verification is silently off
         // for that whole archive.
         warn_once_or_debug!(
-            "integrity: Packages stanza for `{}` from host `{host}` carries no SHA256; deb verification unavailable for this mirror",
+            "Packages stanza for `{}` from host {host} carries no SHA256; deb verification stays unavailable for this mirror",
             filename.escape_debug()
         );
     }

@@ -216,7 +216,7 @@ pub(crate) fn http_parse_range(
     };
     if byte_range.contains(',') {
         warn_once_or_info!(
-            "HTTP Range requests with multiple ranges are not supported (`{}`)",
+            "HTTP Range requests with multiple ranges are not supported (`{}`); ignoring the header and serving the full file",
             byte_range.escape_debug()
         );
         return ParsedRange::Invalid;

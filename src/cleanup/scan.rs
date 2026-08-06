@@ -8,7 +8,7 @@ use tracing::{debug, error, trace, warn};
 use crate::cleanup::engine::SpanClass;
 use crate::cleanup::model::TreeSpec;
 use crate::deb_mirror::{is_deb_package, is_strict_path_descendant, path_starts_with_segment};
-use crate::error::ProxyCacheError;
+use crate::error::{ErrorReport, ProxyCacheError};
 use crate::metrics;
 
 /// Specifies how a stray directory anomaly should be handled.
@@ -48,7 +48,7 @@ pub(super) async fn handle_anomalous_entry(
         match action {
             DirAction::Skip => {
                 warn!(
-                    "Skipping unexpected directory in cache: `{}`",
+                    "Unexpected directory `{}` in the cache; retaining it and excluding its contents from cleanup",
                     path.display()
                 );
                 AnomalyOutcome::Skipped
@@ -63,8 +63,9 @@ pub(super) async fn handle_anomalous_entry(
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Failed to remove directory tmp entry `{}`:  {err}",
-                            path.display()
+                            "Failed to remove directory tmp entry `{}`; retaining it:  {}",
+                            path.display(),
+                            ErrorReport(&err)
                         );
                         AnomalyOutcome::Skipped
                     }
@@ -73,7 +74,10 @@ pub(super) async fn handle_anomalous_entry(
         }
     } else {
         metrics::CACHE_NON_REGULAR.increment();
-        warn!("Removing non-regular entry in cache: `{}`", path.display());
+        warn!(
+            "Non-regular entry `{}` in the cache; removing it",
+            path.display()
+        );
         match tokio::fs::remove_file(path).await {
             Ok(()) => {
                 debug!("Removed non-regular entry `{}`", path.display());
@@ -82,8 +86,9 @@ pub(super) async fn handle_anomalous_entry(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to remove non-regular entry `{}`:  {err}",
-                    path.display()
+                    "Failed to remove non-regular entry `{}`; retaining it:  {}",
+                    path.display(),
+                    ErrorReport(&err)
                 );
                 AnomalyOutcome::Skipped
             }
@@ -114,7 +119,11 @@ pub(super) async fn scan_candidates(
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
-                error!("Failed to read directory `{}`:  {err}", current.display());
+                error!(
+                    "Failed to read directory `{}`; abandoning this cleanup unit:  {}",
+                    current.display(),
+                    ErrorReport(&err)
+                );
                 return Err(ProxyCacheError::Io(err));
             }
         };
@@ -126,8 +135,9 @@ pub(super) async fn scan_candidates(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to iterate directory `{}`:  {err}",
-                        current.display()
+                        "Failed to iterate directory `{}`; abandoning this cleanup unit:  {}",
+                        current.display(),
+                        ErrorReport(&err)
                     );
                     return Err(ProxyCacheError::Io(err));
                 }
@@ -146,19 +156,20 @@ pub(super) async fn scan_candidates(
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Failed to get file type of `{}`:  {err}",
-                            entry.path().display()
+                            "Failed to get file type of `{}`; the cache anomaly stays unclassified:  {}",
+                            entry.path().display(),
+                            ErrorReport(&err)
                         );
                     }
                 }
                 if tree.recurse {
                     warn!(
-                        "Unrecognized entry in mirror directory, retaining it and excluding it from cleanup: `{}`",
+                        "Unrecognized entry `{}` in mirror directory; retaining it and excluding it from cleanup",
                         entry.path().display()
                     );
                 } else {
                     warn!(
-                        "Unrecognized entry in mirror root directory, retaining it and excluding it from cleanup: `{}`",
+                        "Unrecognized entry `{}` in mirror root directory; retaining it and excluding it from cleanup",
                         entry.path().display()
                     );
                 }
@@ -180,8 +191,9 @@ pub(super) async fn scan_candidates(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to get file type of `{}`:  {err}",
-                        entry.path().display()
+                        "Failed to get file type of `{}`; retaining the entry and excluding it from cleanup:  {}",
+                        entry.path().display(),
+                        ErrorReport(&err)
                     );
                     continue;
                 }

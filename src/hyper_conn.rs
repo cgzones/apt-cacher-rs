@@ -220,7 +220,7 @@ pub(crate) async fn request_with_retry(
                         metrics::HTTPS_UPGRADE_FAILED.increment();
                     }
                     warn_once_or_info!(
-                        "Upstream request to {} failed, returning 502:  {}",
+                        "Upstream request to {} failed; returning 502:  {}",
                         parts.uri,
                         ErrorReport(&err)
                     );
@@ -290,7 +290,7 @@ pub(crate) async fn request_with_retry(
                         // longer re-warn). The limit names which budget stopped the
                         // retries -- attempt cap or `upstream_retry_budget`.
                         warn_once_or_info!(
-                            "Upstream request to {} failed after {attempt} connection attempts ({}), returning 502:  {}",
+                            "Upstream request to {} failed after {attempt} connection attempts ({}); returning 502:  {}",
                             parts.uri,
                             backoff.limit(),
                             ErrorReport(&err)
@@ -723,7 +723,7 @@ fn serve_cached_file_mmap(
         }
         .inspect_err(|err| {
             error!(
-                "Failed to mmap downloaded file `{}`:  {}",
+                "Failed to mmap downloaded file `{}`; returning 500:  {}",
                 file_path.display(),
                 ErrorReport(err)
             );
@@ -741,7 +741,7 @@ fn serve_cached_file_mmap(
 
         if let Err(err) = memory_map.advise(Advice::Sequential) {
             warn_once_or_info!(
-                "Failed to advise memory mapping of file `{}`:  {}",
+                "Failed to advise memory mapping of file `{}`; serving without the readahead hint:  {}",
                 file_path.display(),
                 ErrorReport(&err)
             );
@@ -801,7 +801,7 @@ async fn serve_unfinished_file(
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
             error!(
-                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                "Cache file `{}` is not a regular file; refusing to serve and returning 500",
                 file_path.display()
             );
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
@@ -809,7 +809,7 @@ async fn serve_unfinished_file(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to get metadata of file `{}`:  {}",
+                "Failed to get metadata of file `{}`; returning 500:  {}",
                 file_path.display(),
                 ErrorReport(&err)
             );
@@ -860,7 +860,7 @@ async fn serve_unfinished_file(
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Failed to read from file `{}`:  {}",
+                            "Failed to read from file `{}`; cancelling the stream:  {}",
                             file_path.display(),
                             ErrorReport(&err)
                         );
@@ -924,7 +924,7 @@ async fn serve_unfinished_file(
                     }
                     ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
                         error!(
-                            "Invalid download state {:?} of file `{}`, cancelling stream",
+                            "Invalid download state {:?} of file `{}`; cancelling the stream",
                             *st,
                             file_path.display()
                         );
@@ -1078,7 +1078,7 @@ async fn serve_cached_file(
             Ok(_) => {
                 metrics::CACHE_NON_REGULAR.increment();
                 error!(
-                    "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                    "Cache file `{}` is not a regular file; refusing to serve and returning 500",
                     file_path.display()
                 );
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
@@ -1086,7 +1086,7 @@ async fn serve_cached_file(
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to get metadata of cached file `{}`:  {}",
+                    "Failed to get metadata of cached file `{}`; returning 500:  {}",
                     file_path.display(),
                     ErrorReport(&err)
                 );
@@ -1118,7 +1118,7 @@ async fn serve_cached_file(
                 Some(s)
             } else {
                 warn_once!(
-                    "Client {} sent an invalid If-None-Match header: {v:?}",
+                    "Client {} sent an invalid If-None-Match header {v:?}; ignoring the precondition",
                     conn_details.client
                 );
                 None
@@ -1132,7 +1132,7 @@ async fn serve_cached_file(
                 Some(s)
             } else {
                 warn_once!(
-                    "Client {} sent an invalid If-Modified-Since header: {v:?}",
+                    "Client {} sent an invalid If-Modified-Since header {v:?}; ignoring the precondition",
                     conn_details.client
                 );
                 None
@@ -1196,7 +1196,7 @@ async fn serve_cached_file(
                     Some(s)
                 } else {
                     warn_once!(
-                        "Client {} sent an invalid If-Range header, serving the range unconditionally: {v:?}",
+                        "Client {} sent an invalid If-Range header {v:?}; serving the range unconditionally",
                         conn_details.client
                     );
                     None
@@ -1247,7 +1247,7 @@ async fn serve_cached_file(
             Ok(c) => c,
             Err(_err @ std::num::TryFromIntError { .. }) => {
                 error!(
-                    "Content length of {} for file `{}` from mirror {}{} for client {} is too large",
+                    "Content-Length of {} bytes for file `{}` from mirror {}{} for client {} is too large; returning 500",
                     content_length,
                     file_path.display(),
                     conn_details.mirror,
@@ -1340,7 +1340,7 @@ async fn serve_cached_file_buf(
     if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "Error seeking cached file `{}` to {start}/{file_size}:  {}",
+            "Failed to seek cached file `{}` to offset {start}/{file_size}; returning 500:  {}",
             file_path.display(),
             ErrorReport(&err)
         );
@@ -1506,7 +1506,7 @@ async fn serve_downloading_file(
                 );
                 if init_waited {
                     error!(
-                        "Download state still Init after waiting for download of {} from mirror {}",
+                        "Download state still Init after waiting for download of {} from mirror {}; returning 500",
                         conn_details.debname, conn_details.mirror
                     );
                     return quick_response(
@@ -1538,7 +1538,7 @@ async fn serve_downloading_file(
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Failed to open downloaded file `{}`:  {}",
+                            "Failed to open downloaded file `{}`; returning 500:  {}",
                             path_clone.display(),
                             ErrorReport(&err)
                         );
@@ -1587,7 +1587,7 @@ async fn serve_downloading_file(
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Failed to open verifying file `{}`:  {}",
+                            "Failed to open verifying file `{}`; returning 500:  {}",
                             path_clone.display(),
                             ErrorReport(&err)
                         );
@@ -1621,7 +1621,7 @@ async fn serve_downloading_file(
                     Err(err) => {
                         metrics::CACHE_IO_FAILURE.increment();
                         error!(
-                            "Failed to open downloading file `{}`:  {}",
+                            "Failed to open downloading file `{}`; returning 500:  {}",
                             path.display(),
                             ErrorReport(&err)
                         );
@@ -1684,7 +1684,7 @@ async fn serve_volatile_file(
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
             error!(
-                "Cache file `{}` is not a regular file, refusing to serve and returning 500",
+                "Cache file `{}` is not a regular file; refusing to serve and returning 500",
                 file_path.display()
             );
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
@@ -1692,7 +1692,7 @@ async fn serve_volatile_file(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to get metadata of file `{}`:  {}",
+                "Failed to get metadata of file `{}`; returning 500:  {}",
                 file_path.display(),
                 ErrorReport(&err)
             );
@@ -1709,10 +1709,10 @@ async fn serve_volatile_file(
     if let Ok(elapsed) = modified_system_time.elapsed() {
         if elapsed < VOLATILE_CACHE_MAX_AGE {
             debug!(
-                "Volatile file `{}` age {} is within the {}s freshness window, serving cached version...",
+                "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
                 file_path.display(),
                 HumanFmt::Time(elapsed),
-                VOLATILE_CACHE_MAX_AGE.as_secs()
+                HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
             );
 
             // Hyper owns hit/refetch accounting for every request it
@@ -1731,7 +1731,7 @@ async fn serve_volatile_file(
         }
     } else {
         warn_once_or_info!(
-            "Volatile file `{}` was modified in the future, treating it as stale and refetching from upstream",
+            "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
             file_path.display()
         );
     }
@@ -1840,7 +1840,7 @@ async fn download_file(
                         }
                         metrics::UPSTREAM_HYPER_BODY_ERR.increment();
                         warn_once_or_info!(
-                            "Error extracting frame from body for file {} from mirror {} (time={}, size={}, upstream_rate={}):  {}",
+                            "Failed to extract frame from body for file {} from mirror {} (time={}, size={}, upstream_rate={}); aborting the download:  {}",
                             conn_details.debname,
                             conn_details.mirror,
                             HumanFmt::Time(start.elapsed()),
@@ -1855,7 +1855,7 @@ async fn download_file(
                 if let Err(err) = writer.flush().await {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to flush partial data to `{}`:  {}",
+                        "Failed to flush partial data to `{}`; abandoning the download:  {}",
                         outpath.display(),
                         ErrorReport(&err)
                     );
@@ -1871,7 +1871,7 @@ async fn download_file(
             if bytes > content_length.upper().get() {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "More bytes received than expected for file {} from mirror {}: {bytes} vs {}",
+                    "More bytes received than expected for file {} from mirror {}: got {bytes} bytes, expected at most {}; aborting the download",
                     conn_details.debname,
                     conn_details.mirror,
                     content_length.upper()
@@ -1882,7 +1882,7 @@ async fn download_file(
             if let Err(err) = writer.write_all_buf(&mut chunk).await {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
-                    "Failed to write to file `{}`:  {}",
+                    "Failed to write to file `{}`; aborting the download:  {}",
                     outpath.display(),
                     ErrorReport(&err)
                 );
@@ -1898,7 +1898,7 @@ async fn download_file(
             if bytes != size.get() {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "Content length mismatch: expected {} but got {} for file {} from mirror {}",
+                    "Content-Length mismatch: expected {} bytes but got {} for file {} from mirror {}; leaving the download uncached",
                     size.get(),
                     bytes,
                     conn_details.debname,
@@ -1911,7 +1911,7 @@ async fn download_file(
             if bytes > size.get() {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "Content exceeded unknown-length limit: got {} but limit is {} for file {} from mirror {}",
+                    "Content exceeded unknown-length limit: got {} bytes but limit is {} for file {} from mirror {}; leaving the download uncached",
                     bytes,
                     size.get(),
                     conn_details.debname,
@@ -1927,7 +1927,7 @@ async fn download_file(
     if let Err(err) = writer.flush().await {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "Failed to flush file `{}`:  {}",
+            "Failed to flush file `{}`; leaving the download uncached:  {}",
             outpath.display(),
             ErrorReport(&err)
         );
@@ -1942,7 +1942,7 @@ async fn download_file(
     {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
-            "Failed to create destination directory `{}`:  {}",
+            "Failed to create destination directory `{}`; leaving the download uncached:  {}",
             dest_dir_path.display(),
             ErrorReport(&err)
         );
@@ -1974,7 +1974,7 @@ async fn download_file(
             match tokio::fs::try_exists(&dest_file_path).await {
                 Ok(true) => {
                     warn!(
-                        "Target file `{}` already exists, overwriting... (aliased={})",
+                        "Target file `{}` already exists; overwriting (aliased={})",
                         dest_file_path.display(),
                         conn_details.aliased_host.is_some()
                     );
@@ -1982,7 +1982,7 @@ async fn download_file(
                 Ok(false) => {}
                 Err(err) => {
                     warn!(
-                        "Failed to check if `{}` exists:  {}",
+                        "Failed to check if `{}` exists; continuing with the rename:  {}",
                         dest_file_path.display(),
                         ErrorReport(&err)
                     );
@@ -2013,7 +2013,7 @@ async fn download_file(
                 if let integrity::CommitError::Rename(io_err) = &err {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to rename file `{}` to `{}`:  {}",
+                        "Failed to rename file `{}` to `{}`; leaving the download uncached:  {}",
                         outpath.display(),
                         dest_file_path.display(),
                         ErrorReport(io_err)
@@ -2072,7 +2072,7 @@ fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) 
     let status = response.status();
     let Some(location) = response.headers().get(LOCATION) else {
         warn_once_or_debug!(
-            "Upstream mirror {source} answered {status} without a Location header for {what}"
+            "Upstream mirror {source} answered {status} for {what} without a Location header; forwarding the response to the client"
         );
         return None;
     };
@@ -2082,7 +2082,7 @@ fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) 
         .and_then(|lc_str| lc_str.parse::<Uri>().ok());
     if parsed.is_none() {
         warn_once_or_debug!(
-            "Upstream mirror {source} sent an unparsable Location header on {status} for {what}: {location:?}"
+            "Upstream mirror {source} sent an unparsable Location header {location:?} on {status} for {what}; forwarding the response to the client"
         );
     }
     parsed
@@ -2093,7 +2093,7 @@ fn upstream_cap_rejection(
     max: NonZero<usize>,
 ) -> Response<ProxyCacheBody> {
     warn_once_or_info!(
-        "Max upstream downloads ({max}) exceeded, rejecting request for {} from client {}",
+        "Max upstream downloads ({max}) exceeded for {} from client {}; returning 503",
         conn_details.debname,
         conn_details.client
     );
@@ -2260,7 +2260,7 @@ async fn serve_new_file(
             _ => {
                 metrics::UNHANDLED_REQUEST_HEADERS.increment();
                 warn_once_or_info!(
-                    "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}",
+                    "Unhandled HTTP header `{name}` with value `{value:?}` in request from client {}; not forwarding it upstream",
                     conn_details.client
                 );
             }
@@ -2434,11 +2434,10 @@ async fn serve_new_file(
             *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
         }) {
             debug!("Scheme of moved URI `{moved_uri:?}` not supported");
+        } else if let Some(moved_host) = moved_uri.host() {
+            debug!("Host `{moved_host}` of moved URI not permitted");
         } else {
-            debug!(
-                "Host `{}` of moved URI not permitted",
-                moved_uri.host().unwrap_or("<none>")
-            );
+            debug!("Moved URI has no host; not following the redirect");
         }
     }
 
@@ -2503,10 +2502,10 @@ async fn serve_new_file(
         false
     } else if resume_offset > 0 && fwd_response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
         warn_once_or_info!(
-            "Server returned 416 for resume of {} from mirror {} (partial {} bytes), discarding stale partial",
+            "Server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
             conn_details.debname,
             conn_details.mirror,
-            resume_offset
+            HumanFmt::Size(resume_offset)
         );
         partial.discard_resume().await;
         resume_offset = 0;
@@ -2536,7 +2535,7 @@ async fn serve_new_file(
             false
         } else {
             warn_once_or_info!(
-                "Invalid or mismatched Content-Range in 206 for {} from mirror {}, discarding partial and retrying fresh",
+                "Invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
                 conn_details.debname,
                 conn_details.mirror
             );
@@ -2573,7 +2572,7 @@ async fn serve_new_file(
         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         metrics::UPSTREAM_UNSOLICITED_206.increment();
         warn_once_or_info!(
-            "Upstream returned 206 Partial Content without a Range request for {} from mirror {}",
+            "Upstream returned 206 Partial Content without a Range request for {} from mirror {}; returning 502",
             conn_details.debname,
             conn_details.mirror
         );
@@ -2608,7 +2607,7 @@ async fn serve_new_file(
                 {
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     warn_once_or_info!(
-                        "Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}",
+                        "Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}; returning 502",
                         conn_details.debname,
                         conn_details.mirror
                     );
@@ -2617,7 +2616,7 @@ async fn serve_new_file(
                 let Some(total_nz) = NonZero::new(total) else {
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     warn_once_or_info!(
-                        "Content-Range total is zero for {} from mirror {}",
+                        "Content-Range total is zero for {} from mirror {}; returning 502",
                         conn_details.debname,
                         conn_details.mirror
                     );
@@ -2630,8 +2629,8 @@ async fn serve_new_file(
                 ) {
                     metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
                     warn_once_or_info!(
-                        "Upstream 206 declares total size {} for file {} from mirror {}, exceeding max_object_size",
-                        total_nz.get(),
+                        "Upstream 206 declares total size {} for file {} from mirror {}, exceeding `max_object_size`; returning 502",
+                        HumanFmt::Size(total_nz.get()),
                         conn_details.debname,
                         conn_details.mirror
                     );
@@ -2642,7 +2641,7 @@ async fn serve_new_file(
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                     // File is already complete — guard drops and cleans up partial
                     warn_once_or_info!(
-                        "Partial file is already complete for {} from mirror {}",
+                        "Partial file is already complete for {} from mirror {}; returning 502",
                         conn_details.debname,
                         conn_details.mirror
                     );
@@ -2670,7 +2669,7 @@ async fn serve_new_file(
             _ => {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "Unexpected Content-Range state for 206 response of {} from mirror {}",
+                    "Unexpected Content-Range state for the 206 response of {} from mirror {}; returning 502",
                     conn_details.debname,
                     conn_details.mirror
                 );
@@ -2692,14 +2691,14 @@ async fn serve_new_file(
                 || conn_details.client.is_cleanup_synthetic()
             {
                 debug!(
-                    "Request for file {} from mirror {} with URI `{req_uri}` failed with code `{}`",
+                    "Request for file {} from mirror {} with URI `{req_uri}` failed with status {}",
                     conn_details.debname,
                     conn_details.mirror,
                     fwd_response.status()
                 );
             } else {
                 warn_once_or_info!(
-                    "Request for file {} from mirror {} with URI `{req_uri}` failed with code `{}`",
+                    "Request for file {} from mirror {} with URI `{req_uri}` failed with status {}; forwarding the response to the client",
                     conn_details.debname,
                     conn_details.mirror,
                     fwd_response.status()
@@ -2761,8 +2760,8 @@ async fn serve_new_file(
                 if !limits::content_length_within_cap(size.get(), global_config().max_object_size) {
                     metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
                     warn_once_or_info!(
-                        "Upstream declared Content-Length {} for file {} from mirror {}, exceeding max_object_size",
-                        size.get(),
+                        "Upstream declared Content-Length {} for file {} from mirror {}, exceeding `max_object_size`; returning 502",
+                        HumanFmt::Size(size.get()),
                         conn_details.debname,
                         conn_details.mirror
                     );
@@ -2776,10 +2775,9 @@ async fn serve_new_file(
             None => {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                 warn_once_or_info!(
-                    "Could not extract content-length from header for file {} from mirror {}: {:?}",
+                    "Failed to extract Content-Length header for file {} from mirror {}; returning 502",
                     conn_details.debname,
-                    conn_details.mirror,
-                    fwd_response.headers()
+                    conn_details.mirror
                 );
                 return quick_response(
                     StatusCode::BAD_GATEWAY,
@@ -2821,7 +2819,7 @@ async fn serve_new_file(
                 true
             } else {
                 warn_once_or_info!(
-                    "Upstream mirror {} sent invalid ETag for {}: {etag}",
+                    "Upstream mirror {} sent an invalid ETag `{etag}` for {}; discarding it",
                     conn_details.mirror,
                     conn_details.debname
                 );
@@ -2839,7 +2837,7 @@ async fn serve_new_file(
                 true
             } else {
                 warn_once_or_info!(
-                    "Upstream mirror {} sent invalid Last-Modified for {}: {lm}",
+                    "Upstream mirror {} sent an invalid Last-Modified `{lm}` for {}; discarding it",
                     conn_details.mirror,
                     conn_details.debname
                 );
@@ -2880,7 +2878,7 @@ async fn serve_new_file(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Failed to seek in partial file for `{}`:  {}",
+                        "Failed to seek in partial file for {}; returning 500:  {}",
                         conn_details.debname,
                         ErrorReport(&err)
                     );
@@ -2892,7 +2890,8 @@ async fn serve_new_file(
             };
             if current_size != resume_offset {
                 error!(
-                    "Partial file size {current_size} != expected {resume_offset} despite held fd, aborting resume"
+                    "Partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd; aborting the resume and returning 500",
+                    conn_details.debname, conn_details.mirror
                 );
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
             }
@@ -2905,7 +2904,7 @@ async fn serve_new_file(
                 Err((err, path)) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Error creating partial file `{}`:  {}",
+                        "Failed to create partial file `{}`; rejecting the request:  {}",
                         path.display(),
                         ErrorReport(&err)
                     );
@@ -2926,7 +2925,7 @@ async fn serve_new_file(
                 Err(err) => {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
-                        "Error creating temporary file `{}`:  {}",
+                        "Failed to create temporary file `{}`; rejecting the request:  {}",
                         tmppath.display(),
                         ErrorReport(&err)
                     );
@@ -3090,7 +3089,7 @@ async fn tunnel(
         && let Err(err) = server.set_nodelay(true)
     {
         warn_once_or_debug!(
-            "Failed to set TCP_NODELAY on upstream tunnel to {host}:{port}:  {}",
+            "Failed to set TCP_NODELAY on the upstream tunnel to {host}:{port}; continuing with Nagle enabled:  {}",
             ErrorReport(&err)
         );
     }
@@ -3207,7 +3206,7 @@ pub(crate) async fn process_cache_request(
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to open file `{}`:  {}",
+                "Failed to open file `{}`; returning 500:  {}",
                 cache_path.display(),
                 ErrorReport(&err)
             );
@@ -3228,7 +3227,7 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
                 .iter()
                 .any(|ac| ac.contains(&client_ip))
         {
-            warn_once_or_info!("Unauthorized proxy client {client}");
+            warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
             metrics::AUTHZ_REJECTED_CLIENT.increment();
             return quick_response(StatusCode::FORBIDDEN, "Unauthorized client");
         }
@@ -3303,7 +3302,7 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
                         );
                     } else {
                         error!(
-                            "Error tunneling connection for client {client} to {host}:{port}:  {}",
+                            "Failed to tunnel the connection for client {client} to {host}:{port}; closing the tunnel:  {}",
                             ErrorReport(&err)
                         );
                     }
@@ -3312,7 +3311,7 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
             Err(err) => {
                 metrics::TUNNEL_TRANSFER_FAILED.increment();
                 error!(
-                    "Error upgrading connection for client {client} to {host}:{port}:  {}",
+                    "Failed to upgrade connection for client {client} to {host}:{port}; abandoning the tunnel:  {}",
                     ErrorReport(&err)
                 );
             }
@@ -3358,7 +3357,9 @@ async fn pre_process_client_request(
         &Method::CONNECT => return connect_response(client, req),
         &Method::GET => {}
         m => {
-            warn_once_or_info!("Unsupported request method {m} from client {client}");
+            warn_once_or_info!(
+                "Unsupported request method `{m}` from client {client}; returning 405"
+            );
             return quick_response(StatusCode::METHOD_NOT_ALLOWED, "Method not supported");
         }
     }
@@ -3368,7 +3369,7 @@ async fn pre_process_client_request(
     if let Some(scheme) = req.uri().scheme()
         && *scheme != http::uri::Scheme::HTTP
     {
-        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}");
+        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}; returning 400");
         return quick_response(StatusCode::BAD_REQUEST, "Unsupported URI scheme");
     }
 
@@ -3393,7 +3394,9 @@ async fn pre_process_client_request(
                     .iter()
                     .any(|ac| ac.contains(&client_ip))
             {
-                warn_once_or_info!("Unauthorized web-interface access by client {client}");
+                warn_once_or_info!(
+                    "Unauthorized web-interface access by client {client}; returning 403"
+                );
                 metrics::AUTHZ_REJECTED_WEBUI.increment();
                 return quick_response(StatusCode::FORBIDDEN, "Unauthorized client");
             }
@@ -3407,7 +3410,9 @@ async fn pre_process_client_request(
     let requested_port = match req.uri().port_u16() {
         Some(port) => {
             let Some(port) = NonZero::new(port) else {
-                warn_once_or_info!("Unsupported request port 0 from client {client}");
+                warn_once_or_info!(
+                    "Unsupported request port 0 from client {client}; returning 400"
+                );
                 return quick_response(StatusCode::BAD_REQUEST, "Invalid port");
             };
             Some(port)
@@ -3423,7 +3428,7 @@ async fn pre_process_client_request(
     if req.body().size_hint().exact() != Some(0) {
         // Also fires for unknown-length bodies, whose lower bound can be 0.
         warn_once_or_info!(
-            "Request from client {client} has a body (at least {} bytes), not forwarding it: {} {}",
+            "Request from client {client} has a body (at least {} bytes); not forwarding it: {} {}",
             req.body().size_hint().lower(),
             req.method(),
             req.uri()
@@ -3691,10 +3696,13 @@ where
             // backend is the sole owner of that counter).
             debug!("Client {client} idle-timed out before sending request headers");
         } else if let Some(perr) = is_rate_timeout(&err) {
-            info!("Closing connection to client {client} after a rate timeout: {perr}");
+            info!(
+                "Closing connection to client {client} after a rate timeout:  {}",
+                ErrorReport(perr)
+            );
         } else {
             error!(
-                "Error serving connection for client {client}:  {}",
+                "Failed to serve connection for client {client}; closing the connection:  {}",
                 ErrorReport(&err)
             );
         }
