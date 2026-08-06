@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use tracing::warn;
-
-use crate::xattr_helpers;
+use crate::{warn_once_or_info, xattr_helpers};
 
 /// The extended attribute name used to store `ETag` values.
 const XATTR_ETAG: &str = "user.apt_cacher_rs.etag";
@@ -47,7 +45,7 @@ pub(crate) fn try_read_etag(
     };
 
     if !is_valid_etag(&data) {
-        warn!(
+        warn_once_or_info!(
             "Discarding malformed ETag from `{}`: `{}`",
             display_path.display(),
             data.escape_debug()
@@ -76,7 +74,7 @@ pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<S
 /// Malformed values are skipped. Logs warnings on failure but never propagates errors.
 pub(crate) fn write_etag(file: &tokio::fs::File, display_path: &Path, etag: &str) {
     if !is_valid_etag(etag) {
-        warn!(
+        warn_once_or_info!(
             "Skipping write of malformed ETag to `{}`: `{}`",
             display_path.display(),
             etag.escape_debug()

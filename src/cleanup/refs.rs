@@ -10,10 +10,10 @@ use crate::cache_layout::CacheLayout;
 use crate::database::OriginEntry;
 use crate::error::ErrorReport;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
-use crate::info_once;
 use crate::integrity::read_release_to_string;
 use crate::metrics;
 use crate::utils::probe_dir;
+use crate::warn_once_or_debug;
 
 /// The set of by-hash digests referenced by a mirror's current
 /// `Release`/`InRelease` files, for one by-hash directory. Built by
@@ -191,10 +191,11 @@ pub(super) async fn build_byhash_reference_set(
     }
 
     if !found {
-        // Sibling bail-outs above all log; this one is the quiet exit. It
-        // means the by-hash tree exists but no Release names it, so the
-        // whole tree drops to the age backstop instead of the 3-day grace.
-        info_once!(
+        // The by-hash tree exists but no Release names it, so the whole tree
+        // drops to the age backstop instead of the 3-day grace. That is a
+        // deliberate degradation, hence warn on first sight; repeats are
+        // per-mirror environmental noise, hence debug after that.
+        warn_once_or_debug!(
             "No Release files in `{}` for by-hash reconciliation; falling back to age-based retention",
             release_dir.display()
         );

@@ -14,7 +14,7 @@ use nix::libc;
 use tracing::warn;
 use xattr::FileExt as _;
 
-use crate::{error::ErrorReport, warn_once_or_debug};
+use crate::{error::ErrorReport, warn_once_or_debug, warn_once_or_info};
 
 /// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
 pub(crate) struct XattrFile<'a>(pub(crate) &'a tokio::fs::File);
@@ -167,7 +167,7 @@ pub(crate) fn read_expected_size(file: &tokio::fs::File, display_path: &Path) ->
     match data.parse::<u64>() {
         Ok(size) => Some(size),
         Err(_err @ ParseIntError { .. }) => {
-            warn!(
+            warn_once_or_info!(
                 "Discarding malformed expected_size xattr from `{}`: `{}`",
                 display_path.display(),
                 data.escape_debug()

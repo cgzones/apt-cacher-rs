@@ -3194,7 +3194,7 @@ pub(crate) async fn process_cache_request(
                         "File {} not found, serving in-download version...",
                         cache_path.display()
                     );
-                    info!(
+                    debug!(
                         "Serving file {} already in download from mirror {} for client {}...",
                         conn_details.debname, conn_details.mirror, conn_details.client
                     );
