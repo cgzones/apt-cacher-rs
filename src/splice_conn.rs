@@ -1244,8 +1244,14 @@ async fn try_unbuffered_ktls_connect(
             }
         }
         Ok(Err(KtlsError::ResponseNotSpliceable { response })) => {
-            if response.status_code == 304 {
-                // Resolved from the buffered response; no second fetch.
+            // Expected routing outcomes, not degradations discovered here: 304
+            // resolves from the buffered response with no second fetch, and
+            // 206/416 answer a Range this very request chose to send -- the
+            // caller's resume branch owns that fallback log.
+            if response.status_code == 304
+                || (resume_offset > 0
+                    && (response.status_code == 206 || response.status_code == 416))
+            {
                 debug!(
                     "kTLS: response not spliceable (status={})",
                     response.status_code
