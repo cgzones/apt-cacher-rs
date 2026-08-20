@@ -454,13 +454,13 @@ mod tests {
     #[test]
     fn derive_nested_paths_excludes_self() {
         let host = sorted(&["debian"]);
-        assert!(derive_nested_paths("debian", &host).is_empty());
+        assert_eq!(derive_nested_paths("debian", &host), [] as [String; 0]);
     }
 
     #[test]
     fn derive_nested_paths_no_match() {
         let host = sorted(&["apt", "debian"]);
-        assert!(derive_nested_paths("ubuntu", &host).is_empty());
+        assert_eq!(derive_nested_paths("ubuntu", &host), [] as [String; 0]);
     }
 
     #[test]

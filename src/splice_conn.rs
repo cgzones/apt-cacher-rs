@@ -8569,7 +8569,7 @@ mod tests {
         // misbehaving upstream cannot poison the connection pool.
         let input: &[u8] = b"0\r\n\r\nGARBAGE";
         let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
-        assert!(body.is_empty());
+        assert_eq!(body, [] as [u8; 0]);
         assert_eq!(
             consumed, 5,
             "decoder must stop right after the closing CRLF, not swallow trailing bytes",

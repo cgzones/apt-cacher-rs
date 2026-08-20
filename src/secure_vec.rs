@@ -317,7 +317,7 @@ fn page_size() -> NonZero<usize> {
 }
 
 fn round_up(a: usize, b: NonZero<usize>) -> Option<usize> {
-    let rem = a % b.get();
+    let rem = a % b;
     if rem == 0 {
         return Some(a);
     }

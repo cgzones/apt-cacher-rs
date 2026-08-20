@@ -444,7 +444,7 @@ mod tests {
             .await
             .expect("over-length line must be skipped, not errored");
         assert!(matches!(result, CappedLine::Skipped));
-        assert!(buf.is_empty());
+        assert_eq!(buf, "");
 
         // The drain must consume past the newline so the next call sees the
         // following line.
@@ -466,7 +466,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(matches!(result, CappedLine::Skipped));
-        assert!(buf.is_empty());
+        assert_eq!(buf, "");
 
         let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
             .await
@@ -484,7 +484,7 @@ mod tests {
             .await
             .expect("ok");
         assert!(matches!(result, CappedLine::Eof));
-        assert!(buf.is_empty());
+        assert_eq!(buf, "");
     }
 
     #[tokio::test]
