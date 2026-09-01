@@ -43,7 +43,9 @@ use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
 use crate::splice_conn::SpliceProxyError;
 use crate::{
     APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
-    active_downloads::{AbortReason, ActiveDownloadStatus, Serveable, await_serveable},
+    active_downloads::{
+        AbortReason, ActiveDownloadStatus, JoinFailure, Serveable, await_serveable,
+    },
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
     cache_metadata::{self},
@@ -2411,7 +2413,9 @@ pub(crate) async fn async_sendfile_unfinished(
                     match *st {
                         ActiveDownloadStatus::Finished { .. }
                         | ActiveDownloadStatus::Verifying { .. }
-                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded) => {
+                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded {
+                            checksum_mismatch: _,
+                        }) => {
                             drop(st);
                             finished = true;
                             continue;
@@ -2466,7 +2470,9 @@ pub(crate) async fn async_sendfile_unfinished(
                     match *st {
                         ActiveDownloadStatus::Finished { .. }
                         | ActiveDownloadStatus::Verifying { .. }
-                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded) => (true, false),
+                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded {
+                            checksum_mismatch: _,
+                        }) => (true, false),
                         ActiveDownloadStatus::Aborted(
                             AbortReason::MirrorDownloadRate(_) | AbortReason::AlreadyLoggedJustFail,
                         ) => (false, true),
@@ -2547,7 +2553,36 @@ async fn serve_unfinished_sendfile(
                 .await
                 .into();
             }
-            Err(failure) => {
+            Err(failure @ JoinFailure::VerifyThrottled { remaining: _ }) => {
+                // Same answer and keep-alive handling as the pre-upstream
+                // throttle gate (`splice_proxy`).
+                let (status, msg) = failure.response_parts();
+                return match write_invalid_response(
+                    stream,
+                    conn_version,
+                    conn_action,
+                    status,
+                    msg,
+                    failure.retry_after(),
+                )
+                .await
+                {
+                    Ok(()) => ZeroCopyResult::Served(conn_action),
+                    Err(err) => {
+                        debug!(
+                            "Failed to write verify-throttle response to client {}:  {}",
+                            conn_details.client,
+                            ErrorReport(&err)
+                        );
+                        ZeroCopyResult::ClientError
+                    }
+                };
+            }
+            Err(
+                failure @ (JoinFailure::Aborted { rate_timeout: _ }
+                | JoinFailure::StateCorrupted
+                | JoinFailure::CacheAccess),
+            ) => {
                 let (status, msg) = failure.response_parts();
                 return ZeroCopyResult::Invalid { status, msg };
             }

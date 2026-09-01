@@ -355,7 +355,12 @@ impl TempPath {
     }
 
     /// Force deletion of the underlying file regardless of `keep_on_drop`.
-    async fn remove(mut self) -> PathBuf {
+    ///
+    /// Used for a partial whose content is known to be bad (checksum
+    /// mismatch): keeping it would only feed a resume of the same wrong
+    /// bytes. Readers still holding the open file are unaffected by the
+    /// unlink.
+    pub(crate) async fn remove(mut self) -> PathBuf {
         let path = std::mem::take(&mut self.path).expect("path has not been taken yet");
 
         if let Err(err) = tokio::fs::remove_file(&path).await {

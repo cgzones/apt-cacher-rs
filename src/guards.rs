@@ -426,8 +426,10 @@ impl RenameBarrier {
     /// read after cancellation.
     ///
     /// `temp_path` is the finished `.partial` / temp file; on success its
-    /// guard is defused (the file now lives at `dest_path`), on failure the
-    /// guard is dropped and removes it. `declared_bytes` is the fallback for
+    /// guard is defused (the file now lives at `dest_path`), on a checksum
+    /// mismatch the file is unlinked (its bytes are known-bad, resuming them
+    /// cannot succeed), on a transient verify/rename failure the guard's
+    /// `keep_on_drop` keeps it for resumption. `declared_bytes` is the fallback for
     /// quota finalisation when the temp file cannot be stat'ed. Rename
     /// failures are logged here (with `CACHE_IO_FAILURE`); mismatch and
     /// verify-IO failures are logged by `verify_and_rename`.
@@ -478,30 +480,37 @@ impl RenameBarrier {
                     ErrorReport(io_err)
                 );
             }
-            // Retire the entry before arming the throttle. Leaving that to
-            // `Drop` (which runs only after the `TempPath` parameter is
-            // dropped and a blocking write lock is won) opened a window in
-            // which the throttle was already armed and logged while the
-            // entry was still joinable in `Verifying` state, so a request
-            // arriving in it was served the mismatching partial as a
-            // finished file (or, once `Aborted`, got a 500) instead of the
-            // throttle's 503. With the entry gone first, such a request
-            // originates anew and hits the pre-upstream throttle gate; the
-            // residual removed-but-unarmed window costs at most one
-            // redundant upstream fetch, never wrong bytes.
-            // `Discarded` (not `AlreadyLoggedJustFail`): every byte is on
-            // disk, so readers that already hold the file drain it instead
-            // of truncating the body they were promised.
+            // Retire the entry here, not in `Drop` (which runs only after
+            // the `TempPath` parameter is dropped and a blocking write lock
+            // is won): a request arriving while the entry was still
+            // joinable in `Verifying` state was served the mismatching
+            // partial as a finished file. Ordering, all under the status
+            // write lock so no joiner can observe an intermediate state:
+            // arm the throttle (genuine content mismatch only; VerifyIo and
+            // Rename are transient local problems), then publish
+            // `Aborted(Discarded)`. A joiner reading the new status finds
+            // the throttle armed and answers its 503 (`await_serveable`);
+            // a request arriving after the removal below originates anew
+            // and hits the pre-upstream throttle gate. `Discarded` (not
+            // `AlreadyLoggedJustFail`): every byte is on disk, so readers
+            // that already hold the file drain it instead of truncating the
+            // body they were promised.
             let data = self.data.take().expect("every sink consumes the instance");
-            *data.status.write().await = ActiveDownloadStatus::Aborted(AbortReason::Discarded);
+            let checksum_mismatch = matches!(err, CommitError::ChecksumMismatch);
+            let throttle = {
+                let mut status = data.status.write().await;
+                let throttle = if checksum_mismatch {
+                    global_verify_throttle().record_failure(data.key.as_ref())
+                } else {
+                    None
+                };
+                *status =
+                    ActiveDownloadStatus::Aborted(AbortReason::Discarded { checksum_mismatch });
+                throttle
+            };
             metrics::DOWNLOADS_ABORTED.increment();
             data.active_downloads.remove(data.key.as_ref());
-            // Arm the re-download throttle only on a genuine content
-            // mismatch; VerifyIo/Rename are transient local problems.
-            if matches!(err, CommitError::ChecksumMismatch)
-                && let Some((window, failures)) =
-                    global_verify_throttle().record_failure(data.key.as_ref())
-            {
+            if let Some((window, failures)) = throttle {
                 // Integration tests use this line as the "throttle is
                 // observable" sync point: it must stay after the entry
                 // removal above.
@@ -512,8 +521,16 @@ impl RenameBarrier {
                     HumanFmt::Time(window),
                 );
             }
-            // `data` (and its quota reservation) drops here; the `TempPath`
-            // guard decides the temp file's fate.
+            // A content mismatch makes the partial worthless: a later resume
+            // would extend the same wrong bytes and fail verification again,
+            // so unlink it now (attached readers keep their open fd and
+            // drain to EOF). Transient VerifyIo/Rename failures keep the
+            // partial for resumption via the `TempPath` guard's
+            // `keep_on_drop`.
+            if checksum_mismatch {
+                temp_path.remove().await;
+            }
+            // `data` (and its quota reservation) drops here.
             return Err(err);
         }
 

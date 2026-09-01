@@ -615,7 +615,9 @@ async fn serve_unfinished_file(
                     // the handle is still ours to drain.
                     ActiveDownloadStatus::Finished { .. }
                     | ActiveDownloadStatus::Verifying { .. }
-                    | ActiveDownloadStatus::Aborted(AbortReason::Discarded) => {
+                    | ActiveDownloadStatus::Aborted(AbortReason::Discarded {
+                        checksum_mismatch: _,
+                    }) => {
                         drop(st);
                         finished = true;
                         continue;
@@ -974,7 +976,11 @@ async fn serve_downloading_file(
         Err(failure) => {
             drop(status);
             let (status_code, msg) = failure.response_parts();
-            quick_response(status_code, msg)
+            let head = ResponseHead {
+                retry_after: failure.retry_after().map(retry_after_secs),
+                ..ResponseHead::error(status_code)
+            };
+            head.into_hyper(full_body(msg))
         }
     }
 }

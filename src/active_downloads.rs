@@ -32,8 +32,9 @@ use crate::ContentLength;
 use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef, ConnectionDetails};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::error::{ErrorReport, MirrorDownloadRate};
+use crate::humanfmt::HumanFmt;
 use crate::utils::tokio_nofollow_options;
-use crate::{global_config, metrics};
+use crate::{global_config, global_verify_throttle, metrics, warn_once_or_info};
 
 #[derive(Debug)]
 pub(crate) enum AbortReason {
@@ -49,8 +50,11 @@ pub(crate) enum AbortReason {
     /// `Verifying` (the clients attached before the verdict get the bytes
     /// they were promised; apt verifies them itself), while anyone still
     /// looking for the file fails like the other abort reasons — the temp
-    /// file may already be unlinked.
-    Discarded,
+    /// file may already be unlinked. `checksum_mismatch` marks the verdict
+    /// that armed the verify throttle (under the same status write lock),
+    /// so a joiner reading this status answers with the throttle's 503
+    /// instead of a generic abort.
+    Discarded { checksum_mismatch: bool },
 }
 
 #[derive(Debug)]
@@ -122,6 +126,10 @@ pub(crate) enum JoinFailure {
     /// The writer aborted; `rate_timeout` when it gave up on a stalled
     /// mirror (`min_download_rate`), which is the client's 504.
     Aborted { rate_timeout: bool },
+    /// The writer discarded the download on a checksum mismatch and the
+    /// verify throttle is armed for the resource: the same 503 the
+    /// pre-upstream gate answers, with `Retry-After`.
+    VerifyThrottled { remaining: std::time::Duration },
     /// Still `Init` after the writer signalled - a logic error.
     StateCorrupted,
     /// Opening the file failed (`CACHE_IO_FAILURE` bumped).
@@ -139,11 +147,24 @@ impl JoinFailure {
             Self::Aborted {
                 rate_timeout: false,
             } => (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted"),
+            Self::VerifyThrottled { remaining: _ } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Recently failed checksum verification",
+            ),
             Self::StateCorrupted => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Download State Corrupted",
             ),
             Self::CacheAccess => (StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure"),
+        }
+    }
+
+    /// `Retry-After` value for the response, when the failure carries one.
+    #[must_use]
+    pub(crate) fn retry_after(self) -> Option<std::time::Duration> {
+        match self {
+            Self::VerifyThrottled { remaining } => Some(remaining),
+            Self::Aborted { rate_timeout: _ } | Self::StateCorrupted | Self::CacheAccess => None,
         }
     }
 }
@@ -276,7 +297,34 @@ pub(crate) async fn await_serveable(
             }
             ActiveDownloadStatus::Aborted(reason) => {
                 let rate_timeout = matches!(reason, AbortReason::MirrorDownloadRate(_));
+                let checksum_mismatch = matches!(
+                    reason,
+                    AbortReason::Discarded {
+                        checksum_mismatch: true
+                    }
+                );
                 drop(st);
+                // The writer armed the throttle before publishing this
+                // status (same write lock), so a joiner landing here gets
+                // the answer it would get from the pre-upstream gate a
+                // moment later; cleanup's synthetic client is exempt there
+                // and stays exempt here.
+                if checksum_mismatch
+                    && !conn_details.client.is_cleanup_synthetic()
+                    && let Some(throttled) = global_verify_throttle().check(conn_details.key())
+                {
+                    warn_once_or_info!(
+                        "Rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+                        conn_details.debname,
+                        conn_details.client,
+                        throttled.failures,
+                        HumanFmt::Time(throttled.remaining)
+                    );
+                    metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
+                    return Err(JoinFailure::VerifyThrottled {
+                        remaining: throttled.remaining,
+                    });
+                }
                 let failure = JoinFailure::Aborted { rate_timeout };
                 info!(
                     "Download of {} from mirror {}{} was aborted; returning {} to joining client {}",
