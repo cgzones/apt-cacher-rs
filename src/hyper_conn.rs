@@ -1,3 +1,14 @@
+//! Hyper client backend: the full request pipeline (pre-flight, dispatch,
+//! cache lookup, upstream fetch, simple proxy) for every request it parses
+//! itself, and the resumption point for requests the sendfile backend has
+//! already classified.
+//!
+//! `handle_hyper_connection` takes an `Option<HandoffPlan>` from
+//! `sendfile_conn`; the plan applies to the first request on the connection
+//! only (see [`HandoffPlan`] for the pairing invariant and the pipeline stage
+//! each variant enters).  Later keep-alive requests run the full pipeline
+//! here.
+
 use std::{
     convert::Infallible, error::Error as _, num::NonZero, os::unix::fs::MetadataExt as _,
     path::Path, path::PathBuf, sync::Arc,

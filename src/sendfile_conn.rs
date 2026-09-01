@@ -1,3 +1,17 @@
+//! Zero-copy client backend: parses requests with httparse, serves cached
+//! files via sendfile(2), fetches misses through `splice_conn` (with
+//! `splice`) and hands everything else to hyper.
+//!
+//! Handoff contract: `ZeroCopyResult::NotApplicable` gives the connection to
+//! hyper for the current and every later request.  The buffered bytes are
+//! prepended to hyper's stream (`MaybePrependedStream`) and the work already
+//! done for that first request travels alongside as `hyper_conn::HandoffPlan`,
+//! so hyper resumes the pipeline (`serve_cache_miss`,
+//! `serve_downloading_file` or the simple proxy) instead of re-parsing,
+//! re-dispatching and re-looking up.  Every `NotApplicable` site builds the
+//! plan variant matching what it has already run and accounted for; the
+//! accounting rules are on `HandoffPlan` and `cache_layout::CacheMiss`.
+
 use std::{
     io::ErrorKind,
     num::NonZero,
