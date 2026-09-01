@@ -24,6 +24,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::cache_conditional::RangeRequestHeaders;
 use crate::cache_layout;
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_quota::QuotaExceeded;
@@ -57,7 +58,6 @@ use crate::rate_log;
 use crate::scheme_cache::SchemeDecision;
 #[cfg(feature = "ktls")]
 use crate::secure_vec::SecureVec;
-use crate::sendfile_conn::RangeRequestHeaders;
 use crate::sendfile_conn::{
     SendfileResult, async_sendfile, async_sendfile_unfinished, clear_tcp_readable_cache,
     clear_tcp_writable_cache, serve_file_via_sendfile, wait_readable_rated, wait_writable_rated,

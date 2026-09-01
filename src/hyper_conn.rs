@@ -32,7 +32,7 @@ use crate::{
     active_downloads::{
         AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
     },
-    cache_conditional::CacheInfo,
+    cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{self, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
     cache_metadata::{self, UpstreamMetadata},
     cache_quota::QuotaExceeded,
@@ -48,7 +48,7 @@ use crate::{
     guards::{DownloadBarrier, InitBarrier},
     http_etag::{is_valid_etag, write_etag},
     http_last_modified::write_last_modified,
-    http_range::{self, HttpDate, ParsedRange, format_http_date, http_parse_range},
+    http_range::{self, HttpDate, format_http_date},
     humanfmt::HumanFmt,
     limits, metrics,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
@@ -68,7 +68,7 @@ use crate::{
         self, CacheAccessFailure, TempPath, hint_sequential_read, is_peer_disconnect,
         regular_file_metadata, tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
     },
-    warn_on_content_type_mismatch, warn_once, warn_once_or_debug, warn_once_or_info,
+    warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
     web_interface::serve_web_interface,
     xattr_helpers,
 };
@@ -387,26 +387,41 @@ where
 }
 
 #[cfg(feature = "mmap")]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "function has only 1 caller and is a tail call"
-)]
 #[inline(always)]
 fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
     file: tokio::fs::File,
     file_path: &Path,
-    last_modified_str: &str,
-    age: u32,
-    http_status: StatusCode,
-    content_length: usize,
-    content_start: u64,
-    content_range: Option<String>,
-    partial: bool,
-    etag: Option<Arc<str>>,
+    aliased: &str,
+    cache_info: &CacheInfo,
+    params: ServeParams,
 ) -> Response<ProxyCacheBody> {
+    let content_start = params.content_start;
+    let content_length: usize = match params.content_length.try_into() {
+        Ok(c) => c,
+        Err(_err @ std::num::TryFromIntError { .. }) => {
+            error!(
+                "Content-Length of {} bytes for file `{}` from mirror {}{aliased} for client {} is too large; returning 500",
+                params.content_length,
+                file_path.display(),
+                conn_details.mirror,
+                conn_details.client
+            );
+            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+        }
+    };
+
+    debug!(
+        "Serving cached file {} from mirror {}{aliased} for client {} via mmap...",
+        conn_details.debname, conn_details.mirror, conn_details.client
+    );
+
+    // mmap path uses madvise(SEQUENTIAL) on the mapping itself, so no
+    // posix_fadvise is needed here.
+
     trace!(
-        "Using mmap(2) with start={content_start} and length={content_length} from content_range={content_range:?} for file `{}`",
+        "Using mmap(2) with start={content_start} and length={content_length} from content_range={:?} for file `{}`",
+        params.content_range,
         file_path.display()
     );
 
@@ -466,7 +481,7 @@ fn serve_cached_file_mmap(
             conn_details,
             mechanism: Mechanism::Mmap,
             size: content_length as u64,
-            partial,
+            partial: params.is_partial(),
         },
         |never| match *never {},
     );
@@ -484,16 +499,7 @@ fn serve_cached_file_mmap(
     );
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
-    serve_cached_file_response(
-        http_status,
-        last_modified_str,
-        age,
-        content_length as u64,
-        content_type,
-        body,
-        content_range,
-        etag,
-    )
+    serve_cached_file_response(cache_info, params, content_type, body)
 }
 
 #[must_use]
@@ -749,179 +755,75 @@ async fn serve_cached_file(
         ),
     };
 
-    let if_none_match_str = match req.headers().get(IF_NONE_MATCH) {
-        Some(v) => {
-            if let Ok(s) = v.to_str() {
-                Some(s)
-            } else {
-                warn_once!(
-                    "Client {} sent an invalid If-None-Match header {v:?}; ignoring the precondition",
-                    conn_details.client
-                );
-                None
-            }
-        }
-        None => None,
-    };
-    let if_modified_since_str = match req.headers().get(IF_MODIFIED_SINCE) {
-        Some(v) => {
-            if let Ok(s) = v.to_str() {
-                Some(s)
-            } else {
-                warn_once!(
-                    "Client {} sent an invalid If-Modified-Since header {v:?}; ignoring the precondition",
-                    conn_details.client
-                );
-                None
-            }
-        }
-        None => None,
-    };
-
     let cache_info = CacheInfo::with_meta(&mdata, &resolved_meta);
-    let serve_304 = cache_info.decide_serve_304(if_none_match_str, if_modified_since_str);
+    let headers = RangeRequestHeaders::from_http(req.headers(), &conn_details.client);
 
-    let CacheInfo {
-        file_etag,
-        last_modified_for_ims,
-        last_modified_str,
-        age,
-    } = cache_info;
-
-    if serve_304 {
-        info!(
-            "Serving 304 Not Modified for cached file {} from mirror {}{} for client {} via hyper",
-            conn_details.debname, conn_details.mirror, aliased, conn_details.client
-        );
-
-        let mut builder = Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header(DATE, &*format_http_date())
-            .header(VIA, APP_VIA)
-            .header(CONNECTION, "keep-alive")
-            .header(
-                LAST_MODIFIED,
-                HeaderValue::try_from(&*last_modified_str).expect("HTTP date is valid"),
-            )
-            .header(AGE, HeaderValue::from(age));
-
-        if let Some(etag) = file_etag {
-            builder = builder.header(
-                ETAG,
-                HeaderValue::try_from(&*etag).expect("ETag is validated by read_etag"),
+    let params = match cache_info.plan(file_size, &headers, &conn_details.client) {
+        ServePlan::Serve(params) => params,
+        ServePlan::NotModified => {
+            info!(
+                "Serving 304 Not Modified for cached file {} from mirror {}{} for client {} via hyper",
+                conn_details.debname, conn_details.mirror, aliased, conn_details.client
             );
+
+            let mut builder = Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(DATE, &*format_http_date())
+                .header(VIA, APP_VIA)
+                .header(CONNECTION, "keep-alive")
+                .header(
+                    LAST_MODIFIED,
+                    HeaderValue::try_from(&*cache_info.last_modified_str)
+                        .expect("HTTP date is valid"),
+                )
+                .header(AGE, HeaderValue::from(cache_info.age));
+
+            if let Some(etag) = cache_info.file_etag.as_deref() {
+                builder = builder.header(
+                    ETAG,
+                    HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
+                );
+            }
+
+            let response = builder.body(empty_body()).expect("HTTP response is valid");
+
+            trace!("Outgoing response: {response:?}");
+
+            return response;
         }
-
-        let response = builder.body(empty_body()).expect("HTTP response is valid");
-
-        trace!("Outgoing response: {response:?}");
-
-        return response;
-    }
-
-    let (http_status, content_start, content_length, content_range, partial) = if let Some(range) =
-        req.headers().get(RANGE).and_then(|val| val.to_str().ok())
-    {
-        // A dropped If-Range is worse than a dropped Range: the parser
-        // reads `None` as "no precondition sent" and answers an
-        // unconditional 206, so a resuming client can staple bytes onto
-        // a different revision. Same shape as the If-None-Match and
-        // If-Modified-Since sites above.
-        let if_range = match req.headers().get(IF_RANGE) {
-            Some(v) => {
-                if let Ok(s) = v.to_str() {
-                    Some(s)
-                } else {
-                    warn_once!(
-                        "Client {} sent an invalid If-Range header {v:?}; serving the range unconditionally",
-                        conn_details.client
-                    );
-                    None
-                }
-            }
-            None => None,
-        };
-        match http_parse_range(
-            range,
-            if_range,
-            file_size,
-            last_modified_for_ims,
-            file_etag.as_deref(),
-        ) {
-            ParsedRange::Satisfiable(content_range, start, content_length) => (
-                StatusCode::PARTIAL_CONTENT,
-                start,
-                content_length,
-                Some(content_range),
-                true,
-            ),
-            ParsedRange::NotSatisfiable => {
-                return Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(SERVER, APP_NAME)
-                    .header(VIA, APP_VIA)
-                    .header(DATE, &*format_http_date())
-                    .header(CONNECTION, "keep-alive")
-                    .header(
-                        CONTENT_RANGE,
-                        HeaderValue::try_from(format!("bytes */{file_size}"))
-                            .expect("content range is valid"),
-                    )
-                    .body(empty_body())
-                    .expect("HTTP response is valid");
-            }
-            ParsedRange::Invalid | ParsedRange::IfRangeFailed => {
-                (StatusCode::OK, 0, file_size, None, false)
-            }
+        ServePlan::NotSatisfiable => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(SERVER, APP_NAME)
+                .header(VIA, APP_VIA)
+                .header(DATE, &*format_http_date())
+                .header(CONNECTION, "keep-alive")
+                .header(
+                    CONTENT_RANGE,
+                    HeaderValue::try_from(format!("bytes */{file_size}"))
+                        .expect("content range is valid"),
+                )
+                .body(empty_body())
+                .expect("HTTP response is valid");
         }
-    } else {
-        (StatusCode::OK, 0, file_size, None, false)
     };
 
     #[cfg(feature = "mmap")]
-    if content_length >= global_config().mmap_threshold.get() {
-        let mmap_content_length: usize = match content_length.try_into() {
-            Ok(c) => c,
-            Err(_err @ std::num::TryFromIntError { .. }) => {
-                error!(
-                    "Content-Length of {} bytes for file `{}` from mirror {}{} for client {} is too large; returning 500",
-                    content_length,
-                    file_path.display(),
-                    conn_details.mirror,
-                    aliased,
-                    conn_details.client
-                );
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
-            }
-        };
-
-        debug!(
-            "Serving cached file {} from mirror {}{} for client {} via mmap...",
-            conn_details.debname, conn_details.mirror, aliased, conn_details.client
-        );
-
-        // mmap path uses madvise(SEQUENTIAL) on the mapping itself, so no
-        // posix_fadvise is needed here.
-
+    if params.content_length >= global_config().mmap_threshold.get() {
         // TODO: use become: https://github.com/rust-lang/rust/issues/112788
         return serve_cached_file_mmap(
             conn_details,
             file,
             &file_path,
-            &last_modified_str,
-            age,
-            http_status,
-            mmap_content_length,
-            content_start,
-            content_range,
-            partial,
-            file_etag,
+            &aliased,
+            &cache_info,
+            params,
         );
     }
 
     // Buf path streams the file straight through; let the kernel grow its
     // readahead window accordingly.
-    hint_sequential_read(&file, content_length, &file_path);
+    hint_sequential_read(&file, params.content_length, &file_path);
 
     debug!(
         "Serving cached file {} from mirror {}{} for client {} via stream...",
@@ -934,20 +836,13 @@ async fn serve_cached_file(
         file,
         file_path,
         file_size,
-        last_modified_str,
-        age,
-        http_status,
-        content_length,
-        content_start,
-        content_range,
-        partial,
-        file_etag,
+        &cache_info,
+        params,
     )
     .await
 }
 
 #[expect(
-    clippy::too_many_arguments,
     clippy::inline_always,
     reason = "function has only 1 caller and is a tail call"
 )]
@@ -957,15 +852,11 @@ async fn serve_cached_file_buf(
     mut file: tokio::fs::File,
     file_path: PathBuf,
     file_size: u64,
-    last_modified_str: Arc<str>,
-    age: u32,
-    http_status: StatusCode,
-    content_length: u64,
-    start: u64,
-    content_range: Option<String>,
-    partial: bool,
-    etag: Option<Arc<str>>,
+    cache_info: &CacheInfo,
+    params: ServeParams,
 ) -> Response<ProxyCacheBody> {
+    let start = params.content_start;
+    let content_length = params.content_length;
     debug_assert!(
         start + content_length <= file_size,
         "range {start}+{content_length} must not exceed file size {file_size}"
@@ -1003,7 +894,7 @@ async fn serve_cached_file_buf(
             conn_details,
             mechanism: Mechanism::Stream,
             size: content_length,
-            partial,
+            partial: params.is_partial(),
         },
         is_peer_disconnect,
     );
@@ -1011,32 +902,23 @@ async fn serve_cached_file_buf(
     let body = rated_client_body(delivery_body, client);
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
-    serve_cached_file_response(
-        http_status,
-        &last_modified_str,
-        age,
-        content_length,
-        content_type,
-        body,
-        content_range,
-        etag,
-    )
+    serve_cached_file_response(cache_info, params, content_type, body)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shared response builder for serve_cached_file_mmap and serve_cached_file_buf; is always called as a tail call"
-)]
+/// Shared response builder for `serve_cached_file_mmap` and
+/// `serve_cached_file_buf`; always called as a tail call.
 fn serve_cached_file_response(
-    http_status: StatusCode,
-    last_modified_str: &str,
-    age: u32,
-    content_length: u64,
+    cache_info: &CacheInfo,
+    params: ServeParams,
     content_type: &'static str,
     body: ProxyCacheBody,
-    content_range: Option<String>,
-    etag: Option<Arc<str>>,
 ) -> Response<ProxyCacheBody> {
+    let ServeParams {
+        http_status,
+        content_start: _,
+        content_length,
+        content_range,
+    } = params;
     /*
      * Original headers:
      *
@@ -1071,10 +953,10 @@ fn serve_cached_file_response(
         .header(CONTENT_TYPE, content_type)
         .header(
             LAST_MODIFIED,
-            HeaderValue::try_from(last_modified_str).expect("date string is valid"),
+            HeaderValue::try_from(&*cache_info.last_modified_str).expect("date string is valid"),
         )
         .header(ACCEPT_RANGES, "bytes")
-        .header(AGE, HeaderValue::from(age));
+        .header(AGE, HeaderValue::from(cache_info.age));
 
     if let Some(ct) = content_range {
         response_builder = response_builder.header(
@@ -1083,10 +965,10 @@ fn serve_cached_file_response(
         );
     }
 
-    if let Some(etag) = etag {
+    if let Some(etag) = cache_info.file_etag.as_deref() {
         response_builder = response_builder.header(
             ETAG,
-            HeaderValue::try_from(&*etag).expect("ETag is validated by read_etag"),
+            HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
         );
     }
 

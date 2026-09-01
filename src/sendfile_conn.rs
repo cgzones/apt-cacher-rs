@@ -8,7 +8,7 @@ use std::{
 use bytes::{BytesMut, buf::Buf as _};
 use http::{
     StatusCode,
-    header::{CONNECTION, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE},
+    header::{CONNECTION, HOST},
 };
 use nix::sys::sendfile::sendfile;
 #[cfg(feature = "hyper")]
@@ -24,7 +24,7 @@ use crate::splice_conn::SpliceProxyError;
 use crate::{
     APP_NAME, APP_VIA, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
     active_downloads::{ActiveDownloadStatus, Serveable, await_serveable},
-    cache_conditional::CacheInfo,
+    cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{CachedFlavor, ConnectionDetails},
     cache_metadata::{self},
     client_counter,
@@ -39,7 +39,7 @@ use crate::{
         find_header_end, write_304_response, write_416_response, write_all_to_stream,
         write_invalid_response, write_response_headers,
     },
-    http_range::{ParsedRange, format_http_date, http_parse_range},
+    http_range::format_http_date,
     humanfmt::HumanFmt,
     metrics,
     permitted_host_cache::authorize_cache_access,
@@ -1403,18 +1403,6 @@ fn splice_error_outcome(
     }
 }
 
-/// Range and status parameters for a successful conditional evaluation.
-///
-/// "Partial" (a 206 delivery) is not stored separately: it is exactly
-/// `content_range.is_some()` (equivalently `http_status == 206`), so deriving
-/// it keeps the flag from drifting out of sync with the Content-Range.
-struct ServeParams {
-    http_status: StatusCode,
-    content_start: u64,
-    content_length: u64,
-    content_range: Option<String>,
-}
-
 /// Outcome of [`evaluate_conditional_and_range`].
 enum ConditionalOutcome {
     /// The 304 Not Modified response has already been written to the stream;
@@ -1427,28 +1415,9 @@ enum ConditionalOutcome {
     Serve(ServeParams),
 }
 
-/// Raw Range / If-Range / conditional headers from a http client request.
-pub(crate) struct RangeRequestHeaders<'a> {
-    pub(crate) range: Option<&'a str>,
-    pub(crate) if_range: Option<&'a str>,
-    pub(crate) if_none_match: Option<&'a str>,
-    pub(crate) if_modified_since: Option<&'a str>,
-}
-
-impl<'a> RangeRequestHeaders<'a> {
-    fn extract(headers: &[httparse::Header<'a>]) -> Self {
-        Self {
-            range: find_header(headers, &RANGE),
-            if_range: find_header(headers, &IF_RANGE),
-            if_none_match: find_header(headers, &IF_NONE_MATCH),
-            if_modified_since: find_header(headers, &IF_MODIFIED_SINCE),
-        }
-    }
-}
-
 /// Evaluate conditional request headers (If-None-Match, If-Modified-Since) and
-/// Range headers, writing 304 or 416 responses directly to the stream when
-/// appropriate.
+/// Range headers via [`CacheInfo::plan`], writing 304 or 416 responses
+/// directly to the stream when the plan says so.
 ///
 /// Returns [`ConditionalOutcome::Serve`] with the resolved range parameters
 /// when the caller should proceed with sending the file body.
@@ -1461,94 +1430,57 @@ async fn evaluate_conditional_and_range(
     file_size: u64,
     headers: RangeRequestHeaders<'_>,
 ) -> Result<ConditionalOutcome, SendfileResult> {
-    let serve_304 = cache_info.decide_serve_304(headers.if_none_match, headers.if_modified_since);
-
-    if serve_304 {
-        if let Err(err) = write_304_response(
-            stream,
-            conn_version,
-            conn_action,
-            &cache_info.last_modified_str,
-            cache_info.age,
-            cache_info.file_etag.as_deref(),
-        )
-        .await
-        {
-            if is_peer_disconnect(&err) {
-                info!(
-                    "Failed to write 304 response to client {client}; closing the connection:  {}",
-                    ErrorReport(&err)
-                );
-            } else {
-                warn!(
-                    "Failed to write 304 response to client {client}; closing the connection:  {}",
-                    ErrorReport(&err)
-                );
-            }
-            return Err(SendfileResult::ClientError);
-        }
-
-        return Ok(ConditionalOutcome::NotModified(conn_action));
-    }
-
-    // Handle Range requests
-    if let Some(range) = headers.range {
-        match http_parse_range(
-            range,
-            headers.if_range,
-            file_size,
-            cache_info.last_modified_for_ims,
-            cache_info.file_etag.as_deref(),
-        ) {
-            ParsedRange::Satisfiable(content_range, start, cl) => {
-                return Ok(ConditionalOutcome::Serve(ServeParams {
-                    http_status: StatusCode::PARTIAL_CONTENT,
-                    content_start: start,
-                    content_length: cl,
-                    content_range: Some(content_range),
-                }));
-            }
-            ParsedRange::NotSatisfiable => {
-                if let Err(err) =
-                    write_416_response(stream, conn_version, conn_action, file_size).await
-                {
-                    if is_peer_disconnect(&err) {
-                        info!(
-                            "Failed to write 416 response to client {client}; closing the connection:  {}",
-                            ErrorReport(&err)
-                        );
-                    } else {
-                        warn!(
-                            "Failed to write 416 response to client {client}; closing the connection:  {}",
-                            ErrorReport(&err)
-                        );
-                    }
-                    return Err(SendfileResult::ClientError);
+    let params = match cache_info.plan(file_size, &headers, client) {
+        ServePlan::Serve(params) => params,
+        ServePlan::NotModified => {
+            if let Err(err) = write_304_response(
+                stream,
+                conn_version,
+                conn_action,
+                &cache_info.last_modified_str,
+                cache_info.age,
+                cache_info.file_etag.as_deref(),
+            )
+            .await
+            {
+                if is_peer_disconnect(&err) {
+                    info!(
+                        "Failed to write 304 response to client {client}; closing the connection:  {}",
+                        ErrorReport(&err)
+                    );
+                } else {
+                    warn!(
+                        "Failed to write 304 response to client {client}; closing the connection:  {}",
+                        ErrorReport(&err)
+                    );
                 }
+                return Err(SendfileResult::ClientError);
+            }
 
-                return Ok(ConditionalOutcome::RangeNotSatisfiable(conn_action));
-            }
-            ParsedRange::Invalid => {
-                // RFC 9110 says to ignore a malformed Range and serve the
-                // whole entity, which is what happens here -- but a client
-                // that expected a resume silently receives the full object.
-                warn_once_or_debug!(
-                    "Ignoring malformed Range header `{}` from client {client}; serving the full file",
-                    range.escape_debug()
-                );
-            }
-            // An If-Range that did not match is an ordinary outcome: the
-            // client asked for the full entity if the validator moved on.
-            ParsedRange::IfRangeFailed => {}
+            return Ok(ConditionalOutcome::NotModified(conn_action));
         }
-    }
+        ServePlan::NotSatisfiable => {
+            if let Err(err) = write_416_response(stream, conn_version, conn_action, file_size).await
+            {
+                if is_peer_disconnect(&err) {
+                    info!(
+                        "Failed to write 416 response to client {client}; closing the connection:  {}",
+                        ErrorReport(&err)
+                    );
+                } else {
+                    warn!(
+                        "Failed to write 416 response to client {client}; closing the connection:  {}",
+                        ErrorReport(&err)
+                    );
+                }
+                return Err(SendfileResult::ClientError);
+            }
 
-    Ok(ConditionalOutcome::Serve(ServeParams {
-        http_status: StatusCode::OK,
-        content_start: 0,
-        content_length: file_size,
-        content_range: None,
-    }))
+            return Ok(ConditionalOutcome::RangeNotSatisfiable(conn_action));
+        }
+    };
+
+    Ok(ConditionalOutcome::Serve(params))
 }
 
 pub(crate) enum SendfileResult {
@@ -1603,12 +1535,7 @@ pub(crate) async fn serve_file_via_sendfile(
         CacheInfo::resolve(&file, file_path, &mdata, &key)
     };
 
-    let ServeParams {
-        http_status,
-        content_start,
-        content_length,
-        content_range,
-    } = match evaluate_conditional_and_range(
+    let params = match evaluate_conditional_and_range(
         stream,
         &conn_details.client,
         conn_version,
@@ -1632,6 +1559,13 @@ pub(crate) async fn serve_file_via_sendfile(
         Ok(ConditionalOutcome::Serve(params)) => params,
         Err(result) => return result,
     };
+    let partial = params.is_partial();
+    let ServeParams {
+        http_status,
+        content_start,
+        content_length,
+        content_range,
+    } = params;
 
     debug!(
         "Serving cached file {} from mirror {}{aliased} for client {} via sendfile...",
@@ -1694,7 +1628,7 @@ pub(crate) async fn serve_file_via_sendfile(
         size: content_length,
         transferred,
         complete,
-        partial: content_range.is_some(),
+        partial,
         elapsed,
         abort: failure
             .as_ref()
@@ -2590,12 +2524,7 @@ async fn serve_unfinished_sendfile(
     let cache_info = CacheInfo::with_meta(&metadata, &status_meta);
 
     // Range handling uses the total upstream size (not the current partial size on disk).
-    let ServeParams {
-        http_status,
-        content_start,
-        content_length,
-        content_range,
-    } = match evaluate_conditional_and_range(
+    let params = match evaluate_conditional_and_range(
         stream,
         &conn_details.client,
         conn_version,
@@ -2619,6 +2548,13 @@ async fn serve_unfinished_sendfile(
         Ok(ConditionalOutcome::Serve(params)) => params,
         Err(result) => return result.into(),
     };
+    let partial = params.is_partial();
+    let ServeParams {
+        http_status,
+        content_start,
+        content_length,
+        content_range,
+    } = params;
 
     debug!(
         "Serving downloading file {} from mirror {}{aliased} for joining client {} via sendfile...",
@@ -2689,7 +2625,7 @@ async fn serve_unfinished_sendfile(
         size: content_length,
         transferred,
         complete,
-        partial: content_range.is_some(),
+        partial,
         elapsed,
         abort: failure
             .as_ref()
