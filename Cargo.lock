@@ -1151,9 +1151,9 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lzma-rust2"
-version = "0.18.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12931b17820a3a0c48e46359d2be49ef57b5d50509fd5baba43e6c654977aa66"
+checksum = "e6effa5c575f68109664a511f378c0e170888e33a426694ee0910a673762bd47"
 dependencies = [
  "sha2 0.11.0",
 ]
