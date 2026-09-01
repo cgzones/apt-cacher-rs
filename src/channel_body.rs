@@ -1,13 +1,14 @@
 use http_body::{Body, Frame, SizeHint};
 
-use crate::{
-    ContentLength,
-    error::{MirrorDownloadRate, ProxyCacheError},
-    metrics,
-};
+use crate::{ContentLength, error::MirrorDownloadRate, metrics};
 
+#[derive(Debug)]
 pub(crate) enum ChannelBodyError {
     MirrorDownloadRate(MirrorDownloadRate),
+    ContentTooLarge {
+        announced: ContentLength,
+        received: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -37,7 +38,7 @@ impl Remaining {
 }
 
 pub(crate) struct ChannelBody {
-    receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, ChannelBodyError>>,
+    receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, MirrorDownloadRate>>,
     content_length: ContentLength,
     remaining: Remaining,
     received: u64,
@@ -56,7 +57,7 @@ pub(crate) struct ChannelBody {
 impl ChannelBody {
     #[must_use]
     pub(crate) fn new(
-        receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, ChannelBodyError>>,
+        receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, MirrorDownloadRate>>,
         content_length: ContentLength,
     ) -> Self {
         let remaining = match content_length {
@@ -100,7 +101,7 @@ impl Drop for ChannelBody {
 
 impl Body for ChannelBody {
     type Data = bytes::Bytes;
-    type Error = Box<ProxyCacheError>;
+    type Error = Box<ChannelBodyError>;
 
     fn size_hint(&self) -> SizeHint {
         self.remaining.to_size_hint()
@@ -141,7 +142,7 @@ impl Body for ChannelBody {
                     if self.delivered_announced && datalen > 0 {
                         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                         self.errored = true;
-                        return Err(Box::new(ProxyCacheError::ContentTooLarge {
+                        return Err(Box::new(ChannelBodyError::ContentTooLarge {
                             announced: self.content_length,
                             received: self.received + datalen,
                         }));
@@ -150,7 +151,7 @@ impl Body for ChannelBody {
                         None => {
                             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                             self.errored = true;
-                            Err(Box::new(ProxyCacheError::ContentTooLarge {
+                            Err(Box::new(ChannelBodyError::ContentTooLarge {
                                 announced: self.content_length,
                                 received: self.received + datalen,
                             }))
@@ -168,7 +169,7 @@ impl Body for ChannelBody {
                 }
                 Err(err) => {
                     self.errored = true;
-                    Err(Box::new(err.into()))
+                    Err(Box::new(ChannelBodyError::MirrorDownloadRate(err)))
                 }
             })
         })
@@ -184,7 +185,7 @@ mod tests {
     use http_body::Body as _;
 
     use super::{ChannelBody, ContentLength};
-    use crate::error::ProxyCacheError;
+    use crate::channel_body::ChannelBodyError;
 
     fn nz(v: u64) -> NonZero<u64> {
         NonZero::new(v).expect("non-zero")
@@ -244,7 +245,7 @@ mod tests {
             .expect("frame present");
         let err = result.expect_err("expected ContentTooLarge, got Ok frame");
         assert!(
-            matches!(*err, ProxyCacheError::ContentTooLarge { received: 5, .. }),
+            matches!(*err, ChannelBodyError::ContentTooLarge { received: 5, .. }),
             "expected ContentTooLarge {{ received: 5, .. }}, got {err:?}"
         );
 
@@ -273,7 +274,7 @@ mod tests {
             .expect("frame present");
         let err = result.expect_err("expected ContentTooLarge, got Ok frame");
         assert!(
-            matches!(*err, ProxyCacheError::ContentTooLarge { received: 4, .. }),
+            matches!(*err, ChannelBodyError::ContentTooLarge { received: 4, .. }),
             "expected ContentTooLarge {{ received: 4, .. }}, got {err:?}"
         );
     }
@@ -297,7 +298,7 @@ mod tests {
             .await
             .expect("frame present");
         let err = result.expect_err("expected ContentTooLarge, got Ok frame");
-        assert!(matches!(*err, ProxyCacheError::ContentTooLarge { .. }));
+        assert!(matches!(*err, ChannelBodyError::ContentTooLarge { .. }));
 
         assert!(
             body.is_end_stream(),

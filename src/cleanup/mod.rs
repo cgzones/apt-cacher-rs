@@ -25,15 +25,9 @@ use hashbrown::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    AppState,
-    config::CacheHost,
-    database::resolved_cache_host,
-    error::{ErrorReport, ProxyCacheError},
-    global_cache_quota, global_config,
-    humanfmt::HumanFmt,
-    metrics,
-    task_cache_scan::task_cache_scan,
-    xattr_helpers,
+    AppState, config::CacheHost, database::resolved_cache_host, error::ErrorReport,
+    global_cache_quota, global_config, humanfmt::HumanFmt, metrics,
+    task_cache_scan::task_cache_scan, xattr_helpers,
 };
 
 /// Delay between daemon startup and the first scheduled cleanup run.
@@ -69,7 +63,7 @@ impl Drop for ActiveGuard<'_> {
     }
 }
 
-pub(crate) async fn task_cleanup(appstate: &AppState) -> Result<(), ProxyCacheError> {
+pub(crate) async fn task_cleanup(appstate: &AppState) {
     static TASK_ACTIVE: LazyLock<parking_lot::Mutex<bool>> =
         LazyLock::new(|| parking_lot::Mutex::new(false));
 
@@ -79,16 +73,16 @@ pub(crate) async fn task_cleanup(appstate: &AppState) -> Result<(), ProxyCacheEr
         let mut val = mutex.lock();
         if *val {
             info!("Skipping cleanup task since already in progress");
-            return Ok(());
+            return;
         }
         *val = true;
     }
     let _guard = ActiveGuard(mutex);
 
-    task_cleanup_impl(appstate).await
+    task_cleanup_impl(appstate).await;
 }
 
-async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
+async fn task_cleanup_impl(appstate: &AppState) {
     // Use buffer_unordered to limit concurrent cleanup tasks and avoid thundering herd
     const MAX_CONCURRENT_CLEANUP_TASKS: usize = 10;
 
@@ -126,21 +120,25 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         }
     }
 
-    let mirrors = appstate.database.get_mirrors().await.inspect_err(|err| {
-        metrics::DB_OPERATION_FAILED.increment();
-        error!(
-            "Failed to look up the mirrors to clean up; aborting this cleanup run:  {}",
-            ErrorReport(err)
-        );
-        // Earlier steps in this task (cleanup_invalid_rows /
-        // delete_usage_logs) may already have run, but no per-mirror
-        // cleanup work was done; record the failed-run state so the
-        // dashboard does not display stale prior-run values.
-        let elapsed = start.elapsed();
-        metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
-        metrics::LAST_CLEANUP_FILES_REMOVED.set(0);
-        metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(0);
-    })?;
+    let mirrors = match appstate.database.get_mirrors().await {
+        Ok(m) => m,
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!(
+                "Failed to look up the mirrors to clean up; aborting this cleanup run:  {}",
+                ErrorReport(&err)
+            );
+            // Earlier steps in this task (cleanup_invalid_rows /
+            // delete_usage_logs) may already have run, but no per-mirror
+            // cleanup work was done; record the failed-run state so the
+            // dashboard does not display stale prior-run values.
+            let elapsed = start.elapsed();
+            metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
+            metrics::LAST_CLEANUP_FILES_REMOVED.set(0);
+            metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(0);
+            return;
+        }
+    };
 
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
@@ -317,6 +315,4 @@ async fn task_cleanup_impl(appstate: &AppState) -> Result<(), ProxyCacheError> {
         files_removed,
         HumanFmt::Size(bytes_removed)
     );
-
-    Ok(())
 }

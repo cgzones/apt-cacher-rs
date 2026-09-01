@@ -77,9 +77,24 @@ fn log_shutdown_summary(signal: &str, active_downloads: &ActiveDownloads) {
         active_downloads.len(),
     );
 }
+/// Why [`main_loop`] gave up.  Every throw site has already logged the cause
+/// with its context, so `Display` only re-renders the wrapped error (through
+/// [`ErrorReport`], with no `source()`) for `main`'s final
+/// `Failed to run apt-cacher-rs` line.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MainLoopError {
+    /// Startup-time database access (open, schema init, row cleanup, mirror
+    /// reads) failed.
+    #[error("{}", ErrorReport(.0))]
+    Database(sqlx::Error),
+    /// Signal registration, listener bind, or accept failed.
+    #[error("{}", ErrorReport(.0))]
+    Io(std::io::Error),
+}
+
 pub(crate) async fn main_loop(
     #[cfg(feature = "hyper")] https_client: HttpClient,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), MainLoopError> {
     let config = global_config();
 
     let database = Database::connect(&config.database_path, config.database_slow_timeout)
@@ -90,22 +105,31 @@ pub(crate) async fn main_loop(
                 config.database_path.display(),
                 ErrorReport(err)
             );
-        })?;
+        })
+        .map_err(MainLoopError::Database)?;
 
-    database.init_tables().await.inspect_err(|err| {
-        error!(
-            "Failed to initialize database `{}`; aborting startup:  {}",
-            config.database_path.display(),
-            ErrorReport(err)
-        );
-    })?;
+    database
+        .init_tables()
+        .await
+        .inspect_err(|err| {
+            error!(
+                "Failed to initialize database `{}`; aborting startup:  {}",
+                config.database_path.display(),
+                ErrorReport(err)
+            );
+        })
+        .map_err(MainLoopError::Database)?;
 
-    database.cleanup_invalid_rows().await.inspect_err(|err| {
-        error!(
-            "Failed to clean up invalid database rows; aborting startup:  {}",
-            ErrorReport(err)
-        );
-    })?;
+    database
+        .cleanup_invalid_rows()
+        .await
+        .inspect_err(|err| {
+            error!(
+                "Failed to clean up invalid database rows; aborting startup:  {}",
+                ErrorReport(err)
+            );
+        })
+        .map_err(MainLoopError::Database)?;
 
     // Seed the per-host flat-layout collision blocklist from any
     // pre-existing structured mirrors whose `mirror_path` starts with
@@ -117,12 +141,15 @@ pub(crate) async fn main_loop(
     // collision sites (propagated via `?` after logging), and a double-
     // init is a programmer error in main-loop ordering (the `.expect`
     // inside `flat_blocklist::init` panics).
-    flat_blocklist::init(&database).await.inspect_err(|err| {
-        error!(
-            "Failed to load flat-collision mirrors from the database; aborting startup:  {}",
-            ErrorReport(err)
-        );
-    })?;
+    flat_blocklist::init(&database)
+        .await
+        .inspect_err(|err| {
+            error!(
+                "Failed to load flat-collision mirrors from the database; aborting startup:  {}",
+                ErrorReport(err)
+            );
+        })
+        .map_err(MainLoopError::Database)?;
 
     // Database background task
     let (db_task_tx, db_task_rx) = tokio::sync::mpsc::channel(config.db_channel_capacity.get());
@@ -153,12 +180,16 @@ pub(crate) async fn main_loop(
     // investigate (cleanup walks against e.g. `<host>/by-hash` would
     // otherwise collide with the layout plumbing for that mirror's
     // sibling).
-    let mirrors = database.get_mirrors().await.inspect_err(|err| {
-        error!(
-            "Failed to read the mirror rows for the reserved-segment migration check; aborting startup:  {}",
-            ErrorReport(err)
-        );
-    })?;
+    let mirrors = database
+        .get_mirrors()
+        .await
+        .inspect_err(|err| {
+            error!(
+                "Failed to read the mirror rows for the reserved-segment migration check; aborting startup:  {}",
+                ErrorReport(err)
+            );
+        })
+        .map_err(MainLoopError::Database)?;
 
     for mirror in &mirrors {
         if deb_mirror::mirror_path_has_reserved_segment(&mirror.path) {
@@ -355,9 +386,12 @@ pub(crate) async fn main_loop(
         });
     }
 
-    let mut term_signal = tokio::signal::unix::signal(SignalKind::terminate())?;
-    let mut usr1_signal = tokio::signal::unix::signal(SignalKind::user_defined1())?;
-    let mut usr2_signal = tokio::signal::unix::signal(SignalKind::user_defined2())?;
+    let mut term_signal =
+        tokio::signal::unix::signal(SignalKind::terminate()).map_err(MainLoopError::Io)?;
+    let mut usr1_signal =
+        tokio::signal::unix::signal(SignalKind::user_defined1()).map_err(MainLoopError::Io)?;
+    let mut usr2_signal =
+        tokio::signal::unix::signal(SignalKind::user_defined2()).map_err(MainLoopError::Io)?;
 
     // The displayed "Next Cleanup" epoch is advanced from now() on each tick;
     // the underlying Tokio interval schedules from the original baseline
@@ -389,17 +423,20 @@ pub(crate) async fn main_loop(
                     "Failed to bind the listener to {addr}; aborting startup:  {}",
                     ErrorReport(&err)
                 );
-                return Err(err.into());
+                return Err(MainLoopError::Io(err));
             }
 
             // Fallback to IPv4 to avoid errors when IPv6 is not available and the default configuration is used.
             addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.bind_port.get()));
-            TcpListener::bind(addr).await.inspect_err(|err| {
-                error!(
-                    "Failed to bind the IPv4 fallback listener to {addr}; aborting startup:  {}",
-                    ErrorReport(err)
-                );
-            })?
+            TcpListener::bind(addr)
+                .await
+                .inspect_err(|err| {
+                    error!(
+                        "Failed to bind the IPv4 fallback listener to {addr}; aborting startup:  {}",
+                        ErrorReport(err)
+                    );
+                })
+                .map_err(MainLoopError::Io)?
         }
     };
     info!("Ready and listening on http://{addr}");
@@ -452,12 +489,7 @@ pub(crate) async fn main_loop(
                 );
                 let appstate = appstate.clone();
                 tokio::task::spawn(async move {
-                    if let Err(err) = task_cleanup(&appstate).await {
-                        error!(
-                            "Failed to perform daily cleanup task; retrying at the next scheduled cleanup:  {}",
-                            ErrorReport(&err)
-                        );
-                    }
+                    task_cleanup(&appstate).await;
                 });
                 continue;
             },
@@ -479,12 +511,7 @@ pub(crate) async fn main_loop(
                 );
                 let appstate = appstate.clone();
                 tokio::task::spawn(async move {
-                    if let Err(err) = task_cleanup(&appstate).await {
-                        error!(
-                            "Failed to perform SIGUSR2-triggered cleanup task; retrying at the next scheduled cleanup:  {}",
-                            ErrorReport(&err)
-                        );
-                    }
+                    task_cleanup(&appstate).await;
                 });
                 continue;
             },
@@ -498,7 +525,8 @@ pub(crate) async fn main_loop(
                     "Failed to accept a client connection; stopping the daemon:  {}",
                     ErrorReport(err)
                 );
-            })?;
+            })
+            .map_err(MainLoopError::Io)?;
 
         metrics::CONNECTIONS_ACCEPTED.increment();
 

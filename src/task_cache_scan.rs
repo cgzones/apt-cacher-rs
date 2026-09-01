@@ -8,11 +8,19 @@ use crate::{
     cache_layout::{KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
     database::{Database, MirrorEntry},
     deb_mirror::{MirrorKind, is_deb_package, is_strict_path_descendant},
-    error::{ErrorReport, ProxyCacheError},
+    error::ErrorReport,
     global_config, healthcheck, metrics, task_setup,
     utils::probe_dir,
     warn_once_or_info,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CacheScanError {
+    #[error("{}", ErrorReport(.0))]
+    Io(std::io::Error),
+    #[error("{}", ErrorReport(.0))]
+    Sqlx(sqlx::Error),
+}
 
 /// Tally of one scan pass: the bytes counted towards the cache size and the
 /// number of regular files they came from.  The file count is what makes an
@@ -65,7 +73,7 @@ impl SubDirMode {
 
 /// Returns the size in bytes and the file count of the entire cache.
 /// Files that cannot be accessed are not included; a message is logged for each.
-pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, ProxyCacheError> {
+pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, CacheScanError> {
     let config = global_config();
 
     let mirrors = match database.get_mirrors().await {
@@ -76,7 +84,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
                 "Failed to fetch the mirrors for the cache scan; abandoning the scan:  {}",
                 ErrorReport(&err)
             );
-            return Err(ProxyCacheError::Sqlx(err));
+            return Err(CacheScanError::Sqlx(err));
         }
     };
 
@@ -93,7 +101,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
                 cache_path.display(),
                 ErrorReport(&err)
             );
-            return Err(ProxyCacheError::Io(err));
+            return Err(CacheScanError::Io(err));
         }
     };
 
@@ -131,7 +139,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, P
                     cache_path.display(),
                     ErrorReport(&err)
                 );
-                return Err(ProxyCacheError::Io(err));
+                return Err(CacheScanError::Io(err));
             }
         };
 

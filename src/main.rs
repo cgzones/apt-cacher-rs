@@ -704,13 +704,29 @@ pub(crate) fn global_verify_throttle() -> &'static verify_throttle::VerifyThrott
         .verify_throttle
 }
 
+/// Why the native root CA store could not be assembled.
+#[cfg(all(feature = "tls_rustls", not(feature = "webpki-roots")))]
+#[derive(Debug, thiserror::Error)]
+enum RootStoreError {
+    /// No native root CA source yielded a certificate; `errors` counts the
+    /// sources that failed to load (each already warned about).
+    #[error("no native root CA certificates found ({errors} errors)")]
+    NoCertificates { errors: usize },
+    /// Certificates were found but none parsed.
+    #[error("no valid native root CA certificates found ({invalid} invalid)")]
+    NoValidCertificates { invalid: usize },
+}
+
+/// The bundled webpki roots cannot fail to load.
+#[cfg(all(feature = "tls_rustls", feature = "webpki-roots"))]
+type RootStoreError = std::convert::Infallible;
+
 #[cfg(feature = "tls_rustls")]
 #[cfg_attr(
     feature = "webpki-roots",
     expect(clippy::unnecessary_wraps, reason = "webpki setup is infallible")
 )]
-fn build_rustls_client_config()
--> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+fn build_rustls_client_config() -> Result<rustls::ClientConfig, RootStoreError> {
     /* Set a process wide default crypto provider. */
     //let _ = rustls::crypto::ring::default_provider().install_default();
     rustls::crypto::aws_lc_rs::default_provider()
@@ -738,20 +754,16 @@ fn build_rustls_client_config()
             );
         }
         if result.certs.is_empty() {
-            return Err(format!(
-                "no native root CA certificates found ({} errors)",
-                result.errors.len()
-            )
-            .into());
+            return Err(RootStoreError::NoCertificates {
+                errors: result.errors.len(),
+            });
         }
 
         let mut root_store = rustls::RootCertStore::empty();
         let (valid, invalid) = root_store.add_parsable_certificates(result.certs);
         debug!("Loaded {valid} native root CA certificates ({invalid} invalid)");
         if root_store.is_empty() {
-            return Err(
-                format!("no valid native root CA certificates found ({invalid} invalid)").into(),
-            );
+            return Err(RootStoreError::NoValidCertificates { invalid });
         }
 
         rustls::ClientConfig::builder()
@@ -1087,7 +1099,9 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         }
     };
 
-    result.map(|()| std::process::ExitCode::SUCCESS)
+    result
+        .map(|()| std::process::ExitCode::SUCCESS)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
