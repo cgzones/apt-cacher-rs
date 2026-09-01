@@ -218,11 +218,15 @@ fn block_ktls_host(key: &SchemeKeyRef<'_>) {
 #[pin_project::pin_project(project = UpstreamConnProj)]
 enum UpstreamConn {
     Tcp(#[pin] TcpStream),
-    #[cfg(feature = "tls_rustls")]
-    Tls(#[pin] tokio_rustls::client::TlsStream<TcpStream>),
-    #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-    Tls(#[pin] tokio_native_tls::TlsStream<TcpStream>),
+    Tls(#[pin] TlsStream),
 }
+
+/// Userspace-TLS upstream stream of the selected TLS backend. The one `cfg`
+/// pair here keeps every `UpstreamConn::Tls` match arm backend-agnostic.
+#[cfg(feature = "tls_rustls")]
+type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+#[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
+type TlsStream = tokio_native_tls::TlsStream<TcpStream>;
 
 impl AsyncRead for UpstreamConn {
     #[inline]
@@ -233,9 +237,6 @@ impl AsyncRead for UpstreamConn {
     ) -> Poll<std::io::Result<()>> {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_read(cx, buf),
-            #[cfg(feature = "tls_rustls")]
-            UpstreamConnProj::Tls(s) => s.poll_read(cx, buf),
-            #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
             UpstreamConnProj::Tls(s) => s.poll_read(cx, buf),
         }
     }
@@ -250,9 +251,6 @@ impl AsyncWrite for UpstreamConn {
     ) -> Poll<std::io::Result<usize>> {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_write(cx, buf),
-            #[cfg(feature = "tls_rustls")]
-            UpstreamConnProj::Tls(s) => s.poll_write(cx, buf),
-            #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
             UpstreamConnProj::Tls(s) => s.poll_write(cx, buf),
         }
     }
@@ -261,9 +259,6 @@ impl AsyncWrite for UpstreamConn {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_flush(cx),
-            #[cfg(feature = "tls_rustls")]
-            UpstreamConnProj::Tls(s) => s.poll_flush(cx),
-            #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
             UpstreamConnProj::Tls(s) => s.poll_flush(cx),
         }
     }
@@ -272,9 +267,6 @@ impl AsyncWrite for UpstreamConn {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_shutdown(cx),
-            #[cfg(feature = "tls_rustls")]
-            UpstreamConnProj::Tls(s) => s.poll_shutdown(cx),
-            #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
             UpstreamConnProj::Tls(s) => s.poll_shutdown(cx),
         }
     }
@@ -285,9 +277,6 @@ impl UpstreamConn {
     const fn is_tls(&self) -> bool {
         match self {
             Self::Tcp(_) => false,
-            #[cfg(feature = "tls_rustls")]
-            Self::Tls(_) => true,
-            #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
             Self::Tls(_) => true,
         }
     }
@@ -298,9 +287,6 @@ impl UpstreamConn {
     const fn as_tcp(&self) -> Option<&TcpStream> {
         match self {
             Self::Tcp(s) => Some(s),
-            #[cfg(feature = "tls_rustls")]
-            Self::Tls(_) => None,
-            #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
             Self::Tls(_) => None,
         }
     }
@@ -551,15 +537,22 @@ impl UpstreamConn {
             }
         }
 
+        /// rustls exposes the underlying TCP socket, so peek at it.
+        #[cfg(feature = "tls_rustls")]
+        fn tls_peek_alive(tls: &TlsStream, host: &str, port: u16) -> bool {
+            let (tcp, _) = tls.get_ref();
+            tcp_peek_alive(tcp.as_raw_fd(), host, port)
+        }
+
+        /// native-tls hides the socket: stay optimistic.
+        #[cfg(not(feature = "tls_rustls"))]
+        fn tls_peek_alive(_tls: &TlsStream, _host: &str, _port: u16) -> bool {
+            true
+        }
+
         match self {
             Self::Tcp(tcp) => tcp_peek_alive(tcp.as_raw_fd(), host, port),
-            #[cfg(feature = "tls_rustls")]
-            Self::Tls(tls) => {
-                let (tcp, _) = tls.get_ref();
-                tcp_peek_alive(tcp.as_raw_fd(), host, port)
-            }
-            #[cfg(not(feature = "tls_rustls"))]
-            Self::Tls(_) => true,
+            Self::Tls(tls) => tls_peek_alive(tls, host, port),
         }
     }
 }
@@ -802,10 +795,7 @@ async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStream> {
 ///
 /// Times out after the configured HTTP timeout.
 #[cfg(feature = "tls_rustls")]
-async fn tls_connect(
-    tcp: TcpStream,
-    host: &str,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectError> {
+async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectError> {
     let connector = tokio_rustls::TlsConnector::from(Arc::clone(
         TLS_CLIENT_CONFIG.get().expect("initialized in main()"),
     ));
@@ -849,10 +839,7 @@ async fn tls_connect(
 ///
 /// Times out after the configured HTTP timeout.
 #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-async fn tls_connect(
-    tcp: TcpStream,
-    host: &str,
-) -> Result<tokio_native_tls::TlsStream<TcpStream>, ConnectError> {
+async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectError> {
     let native_connector = tokio_native_tls::native_tls::TlsConnector::new().map_err(|err| {
         // Building the connector touches no network: a failure here is the
         // local TLS stack refusing to initialise and repeats identically.
