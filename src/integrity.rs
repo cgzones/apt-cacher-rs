@@ -191,8 +191,9 @@ fn hash_file(path: &Path, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Everything `verify_and_rename` needs, assembled by each download backend at
-/// its rename site and handed to `RenameBarrier::commit`.
+/// Everything `verify_and_rename` needs. Built in exactly one place,
+/// `RenameBarrier::commit` (`guards.rs`), from the identity the barrier chain
+/// carries since `InitBarrier::new` - no download backend assembles one.
 pub(crate) struct RenamePlan {
     /// The finished `.partial` / temp file to verify and rename.
     pub(crate) temp_path: PathBuf,

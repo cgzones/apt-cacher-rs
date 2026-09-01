@@ -1,19 +1,21 @@
 use std::{path::PathBuf, sync::Arc};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     ContentLength,
     active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads},
-    cache_layout::CacheLayout,
+    cache_layout::{CacheLayout, ConnectionDetails, ResourceKind},
     cache_metadata::{self, CacheMetadataKey, UpstreamMetadata},
     cache_quota::QuotaReservation,
     config::CacheHost,
     deb_mirror::Mirror,
+    error::ErrorReport,
     global_verify_throttle,
     humanfmt::HumanFmt,
     integrity::{self, CommitError, RenamePlan},
     metrics,
+    utils::TempPath,
 };
 #[cfg(feature = "splice")]
 use crate::{
@@ -33,6 +35,10 @@ struct InitBarrierData<'a> {
     aliased_host: Option<&'static CacheHost>,
     debname: &'a str,
     layout: CacheLayout,
+    resource_kind: ResourceKind,
+    /// The raw client request URI path (pre-normalisation, pre-redirect),
+    /// carried through to `RenameBarrier::commit`'s `RenamePlan`.
+    raw_uri_path: &'a str,
     /// Unused, receivers just need to get notified by drop.
     _tx: tokio::sync::watch::Sender<()>,
 }
@@ -43,23 +49,26 @@ pub(crate) struct InitBarrier<'a> {
 }
 
 impl<'a> InitBarrier<'a> {
+    /// `raw_uri_path` is the client's request path exactly as received
+    /// (pre-normalisation, and for the splice backend pre-redirect and
+    /// query-stripped) - both backends must agree, or registry keys diverge.
     pub(crate) fn new(
         tx: tokio::sync::watch::Sender<()>,
         status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
         active_downloads: &'a ActiveDownloads,
-        mirror: &'a Mirror,
-        aliased_host: Option<&'static CacheHost>,
-        debname: &'a str,
-        layout: CacheLayout,
+        conn_details: &'a ConnectionDetails,
+        raw_uri_path: &'a str,
     ) -> Self {
         Self {
             data: Some(InitBarrierData {
                 status,
                 active_downloads,
-                mirror,
-                aliased_host,
-                debname,
-                layout,
+                mirror: &conn_details.mirror,
+                aliased_host: conn_details.aliased_host,
+                debname: &conn_details.debname,
+                layout: conn_details.layout,
+                resource_kind: conn_details.resource_kind,
+                raw_uri_path,
                 _tx: tx,
             }),
         }
@@ -103,6 +112,8 @@ impl<'a> InitBarrier<'a> {
                 mirror: data.mirror.clone(),
                 debname: data.debname.to_owned(),
                 layout: data.layout,
+                resource_kind: data.resource_kind,
+                raw_uri_path: data.raw_uri_path.to_owned(),
                 tx,
                 quota_reservation,
                 bytes_since_ping: 0,
@@ -168,6 +179,8 @@ struct DownloadBarrierData {
     mirror: Mirror,
     debname: String,
     layout: CacheLayout,
+    resource_kind: ResourceKind,
+    raw_uri_path: String,
     tx: tokio::sync::watch::Sender<()>,
     quota_reservation: Option<QuotaReservation>,
     /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
@@ -285,6 +298,8 @@ impl DownloadBarrier {
                 mirror: data.mirror,
                 debname: data.debname,
                 layout: data.layout,
+                resource_kind: data.resource_kind,
+                raw_uri_path: data.raw_uri_path,
                 quota_reservation: data.quota_reservation,
             }),
         }
@@ -382,6 +397,8 @@ struct RenameBarrierData {
     mirror: Mirror,
     debname: String,
     layout: CacheLayout,
+    resource_kind: ResourceKind,
+    raw_uri_path: String,
     quota_reservation: Option<QuotaReservation>,
 }
 
@@ -418,8 +435,60 @@ impl RenameBarrier {
     /// `cache_metadata::store().resolve(...)` instead of from the in-process
     /// Arc -- benign for correctness, just slightly slower for the first
     /// read after cancellation.
-    pub(crate) async fn commit(mut self, plan: RenamePlan) -> Result<(), CommitError> {
+    ///
+    /// `temp_path` is the finished `.partial` / temp file; on success its
+    /// guard is defused (the file now lives at `dest_path`), on failure the
+    /// guard is dropped and removes it. `declared_bytes` is the fallback for
+    /// quota finalisation when the temp file cannot be stat'ed. Rename
+    /// failures are logged here (with `CACHE_IO_FAILURE`); mismatch and
+    /// verify-IO failures are logged by `verify_and_rename`.
+    pub(crate) async fn commit(
+        mut self,
+        temp_path: TempPath,
+        dest_path: PathBuf,
+        declared_bytes: u64,
+    ) -> Result<(), CommitError> {
+        // Use the actual on-disk size rather than the declared length.
+        // Earlier validation ensures these match today, but the defensive
+        // stat keeps the quota-finalisation input honest if a future change
+        // weakens an upstream invariant.
+        let bytes_received = match tokio::fs::metadata(temp_path.as_ref()).await {
+            Ok(m) => m.len(),
+            Err(err) => {
+                warn!(
+                    "Failed to stat temp file `{}` before rename; using the declared size:  {}",
+                    temp_path.display(),
+                    ErrorReport(&err)
+                );
+                declared_bytes
+            }
+        };
+        let plan = {
+            let data = self
+                .data
+                .as_ref()
+                .expect("every sink consumes the instance");
+            RenamePlan {
+                temp_path: temp_path.to_path_buf(),
+                dest_path,
+                bytes_received,
+                resource_kind: data.resource_kind,
+                debname: data.debname.clone(),
+                host: data.mirror.host().to_string(),
+                mirror_path: data.mirror.path().to_owned(),
+                raw_uri_path: data.raw_uri_path.clone(),
+            }
+        };
         if let Err(err) = integrity::verify_and_rename(&plan).await {
+            if let CommitError::Rename(io_err) = &err {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to rename temp file `{}` to `{}`; leaving the download uncached:  {}",
+                    plan.temp_path.display(),
+                    plan.dest_path.display(),
+                    ErrorReport(io_err)
+                );
+            }
             // Arm the re-download throttle only on a genuine content
             // mismatch; VerifyIo/Rename are transient local problems.
             if matches!(err, CommitError::ChecksumMismatch) {
@@ -440,12 +509,17 @@ impl RenameBarrier {
                     );
                 }
             }
-            // `self.data` is still held: Drop runs the abort path.
+            // `self.data` is still held: Drop runs the abort path; the
+            // `TempPath` guard removes the temp file.
             return Err(err);
         }
 
-        // Verified and renamed. Finalise quota outside the lock, then take the
-        // write lock briefly for the `Verifying -> Finished` status flip.
+        // Verified and renamed: the temp file no longer exists under its
+        // old name, so the guard must not try to remove it.
+        TempPath::defuse(temp_path);
+
+        // Finalise quota outside the lock, then take the write lock briefly
+        // for the `Verifying -> Finished` status flip.
         let data = self.data.take().expect("every sink consumes the instance");
 
         if let Some(reservation) = data.quota_reservation {

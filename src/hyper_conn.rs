@@ -51,7 +51,7 @@ use crate::{
     http_last_modified::write_last_modified,
     http_range::{self, HttpDate, ParsedRange, format_http_date, http_parse_range},
     humanfmt::HumanFmt,
-    integrity, limits, metrics,
+    limits, metrics,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
     quick_response,
@@ -1791,10 +1791,6 @@ async fn serve_volatile_file(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "has only one caller and is task entrypoint"
-)]
 async fn download_file(
     conn_details: &ConnectionDetails,
     warn_on_override: bool,
@@ -1803,7 +1799,6 @@ async fn download_file(
     mut dbarrier: DownloadBarrier,
     resume_offset: u64,
     request_sent: PreciseInstant,
-    raw_uri_path: String,
 ) {
     let config = global_config();
 
@@ -2002,37 +1997,15 @@ async fn download_file(
             }
         }
 
-        let plan = integrity::RenamePlan {
-            temp_path: outpath.to_path_buf(),
-            dest_path: dest_file_path.clone(),
-            bytes_received: total_bytes,
-            resource_kind: conn_details.resource_kind,
-            debname: conn_details.debname.clone(),
-            host: conn_details.mirror.host().to_string(),
-            mirror_path: conn_details.mirror.path().to_owned(),
-            raw_uri_path,
-        };
-        match rbarrier.commit(plan).await {
-            Ok(()) => {
-                // The file was verified and renamed; defuse the temp guard.
-                TempPath::defuse(outpath);
-            }
-            Err(err) => {
-                // commit() already dropped the barrier (abort path) and logged
-                // mismatch / verify-IO; rename failures are logged here. The
-                // TempPath guard removes the temp file on drop. The client was
-                // already served from the live stream.
-                if let integrity::CommitError::Rename(io_err) = &err {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to rename file `{}` to `{}`; leaving the download uncached:  {}",
-                        outpath.display(),
-                        dest_file_path.display(),
-                        ErrorReport(io_err)
-                    );
-                }
-                return;
-            }
+        if rbarrier
+            .commit(outpath, dest_file_path, total_bytes)
+            .await
+            .is_err()
+        {
+            // commit() logged the failure and dropped the barrier (abort
+            // path); its temp-file guard removed the partial. The client was
+            // already served from the live stream.
+            return;
         }
     }
 
@@ -2244,10 +2217,8 @@ async fn serve_new_file(
         init_tx,
         &status,
         &appstate.active_downloads,
-        &conn_details.mirror,
-        conn_details.aliased_host,
-        &conn_details.debname,
-        conn_details.layout,
+        &conn_details,
+        req.uri().path(),
     );
 
     let (warn_on_override, prev_file_size) = match &cfstate {
@@ -2999,7 +2970,6 @@ async fn serve_new_file(
 
     {
         let cd = conn_details.clone();
-        let raw_uri_path = req.uri().path().to_owned();
         tokio::task::spawn(async move {
             download_file(
                 &cd,
@@ -3009,7 +2979,6 @@ async fn serve_new_file(
                 dbarrier,
                 resume_offset,
                 upstream_request_sent,
-                raw_uri_path,
             )
             .await;
         });

@@ -64,7 +64,7 @@ use crate::sendfile_conn::{
 };
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{
-    self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
+    self, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
     tokio_tempfile, touch_volatile_mtime,
 };
 use crate::xattr_helpers;
@@ -82,7 +82,7 @@ use crate::{
 use crate::{KTLS_BLOCKED, SchemeKey, SchemeKeyRef};
 #[cfg(not(feature = "hyper"))]
 use crate::{ProxyCacheBody, VOLATILE_CACHE_MAX_AGE, error::UpstreamFetchError, full_body};
-use crate::{cache_layout, integrity};
+use crate::cache_layout;
 
 // On Linux, EAGAIN and EWOULDBLOCK share the same numeric value, so matching
 // one variant is equivalent to matching both. The nix crate models EWOULDBLOCK
@@ -4797,14 +4797,26 @@ async fn splice_proxy_drive(
     init_tx: tokio::sync::watch::Sender<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> Result<(), SpliceProxyError> {
+    let mirror = &conn_details.mirror;
+    let host_authority = mirror.format_authority();
+    // Capture the original (pre-redirect) client request path. A 301 redirect
+    // below shadows `upstream_path` to the redirected URL; the Origin row and
+    // `handle_volatile_buffered_download` must carry the original path so
+    // registry keys match across all backends (the hyper backend in
+    // hyper_conn.rs always uses the client-request URI).
+    // Strip the query so cache identity (registry keys, Origin rows) stays
+    // path-only; the query still rides on the upstream GET line via
+    // `upstream_path`. Matches the hyper backend.
+    let original_uri_path = upstream_path
+        .split_once('?')
+        .map_or(upstream_path, |(path, _)| path);
+
     let ibarrier = InitBarrier::new(
         init_tx,
         &status,
         &appstate.active_downloads,
-        &conn_details.mirror,
-        conn_details.aliased_host,
-        &conn_details.debname,
-        conn_details.layout,
+        conn_details,
+        original_uri_path,
     );
 
     // Cleanup probes bypass the throttle: they run once per 24h cycle and a
@@ -4839,19 +4851,6 @@ async fn splice_proxy_drive(
         return Ok(());
     }
 
-    let mirror = &conn_details.mirror;
-    let host_authority = mirror.format_authority();
-    // Capture the original (pre-redirect) client request path. A 301 redirect
-    // below shadows `upstream_path` to the redirected URL; the Origin row and
-    // `handle_volatile_buffered_download` must carry the original path so
-    // registry keys match across all backends (the hyper backend in
-    // hyper_conn.rs always uses the client-request URI).
-    // Strip the query so cache identity (registry keys, Origin rows) stays
-    // path-only; the query still rides on the upstream GET line via
-    // `upstream_path`. Matches the hyper backend.
-    let original_uri_path = upstream_path
-        .split_once('?')
-        .map_or(upstream_path, |(path, _)| path);
 
     // Check for a partial download file to resume (permanent files only).
     // Opens the file upfront (if it exists and is non-empty) to get size + mtime
@@ -6425,59 +6424,17 @@ async fn splice_proxy_drive(
     // path of the downloading state is going to be moved.
     let rbarrier = dbarrier.begin_rename().await;
 
-    // Use the actual on-disk size rather than the declared Content-Length.
-    // Earlier validation (Content-Range agreement + EOF check) ensures these
-    // match today, but the defensive stat keeps the quota-finalisation input
-    // honest if a future change weakens an upstream invariant.
-    let actual_bytes = match tokio::fs::metadata(temppath.as_ref()).await {
-        Ok(m) => m.len(),
-        Err(err) => {
-            warn!(
-                "splice proxy: failed to stat temp file `{}` post-sync; using declared Content-Length:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            );
-            total_content_length.get()
-        }
-    };
-    let plan = integrity::RenamePlan {
-        temp_path: temppath.to_path_buf(),
-        dest_path: dest_file_path.clone(),
-        bytes_received: actual_bytes,
-        resource_kind: conn_details.resource_kind,
-        debname: conn_details.debname.clone(),
-        host: conn_details.mirror.host().to_string(),
-        mirror_path: conn_details.mirror.path().to_owned(),
-        // Use the original (pre-redirect) client request path so registry
-        // keys are consistent with the hyper backend (hyper_conn.rs), which always
-        // uses `req.uri().path()` captured before any redirect.
-        raw_uri_path: original_uri_path.to_owned(),
-    };
-    let cache_committed = match rbarrier.commit(plan).await {
-        Ok(()) => {
-            TempPath::defuse(temppath);
-            true
-        }
-        Err(err) => {
-            // commit() dropped the barrier and logged mismatch / verify-IO;
-            // log rename failures here. The body was already fully delivered
-            // to the client; this only leaves the cache without the file
-            // (the TempPath guard removes the temp file, future requests
-            // re-download). The DB records below are skipped because nothing
-            // was cached, but we still finish the client-facing bookkeeping
-            // (await the demoted task, count the delivery) before returning.
-            if let integrity::CommitError::Rename(io_err) = &err {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "splice proxy: failed to rename temp file `{}` to `{}`; discarding the temp file and leaving the download uncached:  {}",
-                    temppath.display(),
-                    dest_file_path.display(),
-                    ErrorReport(io_err)
-                );
-            }
-            false
-        }
-    };
+    let cache_committed = rbarrier
+        .commit(temppath, dest_file_path, total_content_length.get())
+        .await
+        .is_ok();
+    // On failure commit() logged the cause and dropped the barrier; the
+    // temp-file guard removed the partial. The body was already fully
+    // delivered to the client; this only leaves the cache without the file
+    // (future requests re-download). The DB records below are skipped
+    // because nothing was cached, but we still finish the client-facing
+    // bookkeeping (await the demoted task, count the delivery) before
+    // returning.
 
     let elapsed = start.elapsed();
 
@@ -7580,55 +7537,13 @@ async fn handle_volatile_buffered_download(
         // Move temp file to final cache path.
         let rbarrier = dbarrier.begin_rename().await;
 
-        // Use the actual on-disk size rather than the declared Content-Length.
-        // The buffered path writes the entire `body` Vec so these match today,
-        // but the defensive stat keeps the quota-finalisation input honest.
-        let actual_bytes = match tokio::fs::metadata(temppath.as_ref()).await {
-            Ok(m) => m.len(),
-            Err(err) => {
-                warn!(
-                    "splice proxy: failed to stat temp file `{}` post-sync; using buffered body length:  {}",
-                    temppath.display(),
-                    ErrorReport(&err)
-                );
-                total_content_length.get()
-            }
-        };
-        let plan = integrity::RenamePlan {
-            temp_path: temppath.to_path_buf(),
-            dest_path: dest_file_path.clone(),
-            bytes_received: actual_bytes,
-            resource_kind: conn_details.resource_kind,
-            debname: conn_details.debname.clone(),
-            host: conn_details.mirror.host().to_string(),
-            mirror_path: conn_details.mirror.path().to_owned(),
-            // Use the original (pre-redirect) client request path so registry
-            // keys are consistent with the hyper backend (hyper_conn.rs), which always
-            // uses `req.uri().path()` captured before any redirect.
-            raw_uri_path: original_uri_path.to_owned(),
-        };
-        match rbarrier.commit(plan).await {
-            Ok(()) => {
-                TempPath::defuse(temppath);
-                true
-            }
-            Err(err) => {
-                // commit() dropped the barrier and logged mismatch / verify-IO;
-                // log rename failures here. The TempPath guard removes the temp
-                // file, future requests re-download. The DB records below are
-                // skipped because nothing was cached.
-                if let integrity::CommitError::Rename(io_err) = &err {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "splice proxy: failed to rename temp file `{}` to `{}`; discarding the temp file and leaving the download uncached:  {}",
-                        temppath.display(),
-                        dest_file_path.display(),
-                        ErrorReport(io_err)
-                    );
-                }
-                false
-            }
-        }
+        // On failure commit() logged the cause and dropped the barrier; the
+        // temp-file guard removed the partial. The DB records below are
+        // skipped because nothing was cached.
+        rbarrier
+            .commit(temppath, dest_file_path, total_content_length.get())
+            .await
+            .is_ok()
     } else {
         false
     };
