@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::num::NonZero;
 use std::path::Path;
 
@@ -63,6 +64,29 @@ impl KeyMapper<'_> {
     }
 }
 
+/// Why buffering a Packages response into its memfd failed.  Every variant is
+/// logged by [`packages_body_to_memfd`]; the caller maps all of them to a
+/// conservative fetch failure (skip the mirror's reconcile this cycle).
+///
+/// `Display` renders the wrapped error through [`ErrorReport`] and exposes no
+/// `source()`, matching `ProxyCacheError`.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum PackagesBufferError {
+    #[error("{}", ErrorReport(.0))]
+    Memfd(memfd::Error),
+    /// The response body yielded an error frame (e.g. `MirrorDownloadRate`,
+    /// `ContentTooLarge`).
+    #[error("{}", ErrorReport(&**.0))]
+    Body(Box<ProxyCacheError>),
+    /// Writing to or rewinding the memfd failed.
+    #[error("{}", ErrorReport(.0))]
+    Io(io::Error),
+    /// The body exceeded the buffering cap before decompression guards could
+    /// weigh in.
+    #[error("compressed Packages exceeds the size cap of {max} bytes")]
+    TooLarge { max: NonZero<u64> },
+}
+
 /// Buffer `body` into `file`, returning the file (rewound to offset 0) and the
 /// number of bytes written. The caller compares the byte count against the
 /// upstream-announced `Content-Length` to detect a silently-truncated body (a
@@ -81,29 +105,29 @@ async fn body_to_file(
     file: tokio::fs::File,
     max_bytes: NonZero<u64>,
     config: &Config,
-) -> Result<(tokio::fs::File, u64), ProxyCacheError> {
+) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
     let mut writer = BufWriter::with_capacity(config.buffer_size, file);
 
     let mut written: u64 = 0;
     while let Some(next) = body.frame().await {
-        let frame = next.map_err(|err| *err)?;
+        let frame = next.map_err(PackagesBufferError::Body)?;
         if let Ok(mut chunk) = frame.into_data() {
             written = written.saturating_add(chunk.remaining() as u64);
             if written > max_bytes.get() {
-                return Err(ProxyCacheError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "compressed Packages exceeds size cap",
-                )));
+                return Err(PackagesBufferError::TooLarge { max: max_bytes });
             }
-            writer.write_all_buf(&mut chunk).await?;
+            writer
+                .write_all_buf(&mut chunk)
+                .await
+                .map_err(PackagesBufferError::Io)?;
         }
     }
 
-    writer.flush().await?;
+    writer.flush().await.map_err(PackagesBufferError::Io)?;
 
     let mut file = writer.into_inner();
 
-    file.rewind().await?;
+    file.rewind().await.map_err(PackagesBufferError::Io)?;
 
     Ok((file, written))
 }
@@ -121,13 +145,13 @@ pub(super) async fn packages_body_to_memfd(
     memfdname: &str,
     body: &mut ProxyCacheBody,
     config: &Config,
-) -> Result<(tokio::fs::File, u64), ProxyCacheError> {
+) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
     let memfd = MemfdOptions::new().create(memfdname).map_err(|err| {
         error!(
             "Failed to create in-memory file `{memfdname}` for the Packages index; skipping this mirror's reconcile this cycle:  {}",
             ErrorReport(&err)
         );
-        ProxyCacheError::Memfd(err)
+        PackagesBufferError::Memfd(err)
     })?;
     let file = tokio::fs::File::from_std(memfd.into_file());
     // Cap the buffered body at the decompressed ceiling: a compressed index can
@@ -289,7 +313,7 @@ pub(super) async fn reduce_file_list(
     file_list: &mut HashMap<OsString, SpanClass>,
     ctx: &mut ReduceContext<'_>,
     config: &Config,
-) -> Result<(), ProxyCacheError> {
+) -> Result<(), io::Error> {
     debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
 
     let buffer_size = config.buffer_size;
@@ -301,7 +325,7 @@ pub(super) async fn reduce_file_list(
                 "Failed to stat Packages file `{filename}` for the decompression-ratio guard; skipping this mirror's reconcile this cycle:  {}",
                 ErrorReport(&err)
             );
-            return Err(ProxyCacheError::Io(err));
+            return Err(err);
         }
     };
 
@@ -323,10 +347,7 @@ pub(super) async fn reduce_file_list(
                     "Compressed Packages index `{filename}` for mirror {} is zero bytes; skipping this mirror's reconcile for this cycle (nothing reclaimed)",
                     ctx.mirror
                 );
-                Err(ProxyCacheError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "zero size",
-                )))
+                Err(io::Error::new(io::ErrorKind::InvalidData, "zero size"))
             }
         };
     };
@@ -364,7 +385,7 @@ pub(super) async fn reduce_file_list(
                     "Failed to read Packages file `{filename}` (may exceed the size limit); skipping this mirror's reconcile this cycle:  {}",
                     ErrorReport(&err)
                 );
-                return Err(err.into());
+                return Err(err);
             }
             Ok(CappedLine::Skipped) => {
                 // A line longer than MAX_METADATA_LINE_LEN can't be one
@@ -726,10 +747,12 @@ mod tests {
             .expect("memfd");
         let file = tokio::fs::File::from_std(memfd.into_file());
 
-        let res = body_to_file(&mut body, file, nonzero!(1024), &config).await;
+        let err = body_to_file(&mut body, file, nonzero!(1024), &config)
+            .await
+            .expect_err("a body exceeding the cap must error rather than buffer unbounded");
         assert!(
-            res.is_err(),
-            "a body exceeding the cap must error rather than buffer unbounded"
+            matches!(err, PackagesBufferError::TooLarge { max } if max.get() == 1024),
+            "expected TooLarge {{ max: 1024 }}, got {err:?}"
         );
     }
 

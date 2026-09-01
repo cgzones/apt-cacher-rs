@@ -174,8 +174,10 @@ pub(crate) async fn request_with_retry(
         orig_scheme: Option<http::uri::Scheme>,
         revertible: bool,
         mut https_upgrade_test: bool,
-    ) -> Result<(Response<Incoming>, http::request::Parts), (hyper_util::client::legacy::Error, Uri)>
-    {
+    ) -> Result<
+        (Response<Incoming>, http::request::Parts),
+        Box<(hyper_util::client::legacy::Error, Uri)>,
+    > {
         let mut backoff = upstream_retry::Backoff::new(
             global_config().upstream_retry_budget,
             coarsetime::Instant::now(),
@@ -224,7 +226,7 @@ pub(crate) async fn request_with_retry(
                         parts.uri,
                         ErrorReport(&err)
                     );
-                    return Err((err, parts.uri));
+                    return Err(Box::new((err, parts.uri)));
                 }
                 Err(err) => {
                     if is_io_timed_out_in_chain(&err) {
@@ -296,7 +298,7 @@ pub(crate) async fn request_with_retry(
                             ErrorReport(&err)
                         );
 
-                        return Err((err, parts.uri));
+                        return Err(Box::new((err, parts.uri)));
                     };
 
                     debug!(
@@ -902,11 +904,7 @@ async fn serve_unfinished_file(
                             AbortReason::MirrorDownloadRate(mdr) => {
                                 let mdr = (*mdr).clone();
                                 drop(st);
-                                if tx
-                                    .send(Err(ChannelBodyError::MirrorDownloadRate(mdr)))
-                                    .await
-                                    .is_err()
-                                {
+                                if tx.send(Err(mdr)).await.is_err() {
                                     // receiver gone, nothing to recover
                                 }
                             }
@@ -1018,12 +1016,26 @@ async fn serve_unfinished_file(
         RateCheckDirection::Client,
     );
 
-    let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
-        RateCheckedBodyErr::RateTimeout(error) => Box::new(ProxyCacheError::ClientDownloadRate {
-            error,
-            client: conn_details.client,
-        }),
-        RateCheckedBodyErr::Inner(ierr) => ierr,
+    let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| {
+        let new_err = match *err {
+            RateCheckedBodyErr::RateTimeout(error) => ProxyCacheError::ClientDownloadRate {
+                error,
+                client: conn_details.client,
+            },
+            RateCheckedBodyErr::Inner(ierr) => match *ierr {
+                ChannelBodyError::MirrorDownloadRate(rate) => {
+                    ProxyCacheError::MirrorDownloadRate(rate)
+                }
+                ChannelBodyError::ContentTooLarge {
+                    announced,
+                    received,
+                } => ProxyCacheError::ContentTooLarge {
+                    announced,
+                    received,
+                },
+            },
+        };
+        Box::new(new_err)
     })));
 
     let response = response_builder.body(body).expect("HTTP response is valid");

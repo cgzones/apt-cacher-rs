@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use hashbrown::HashMap;
@@ -8,7 +8,7 @@ use tracing::{debug, error, trace, warn};
 use crate::cleanup::engine::SpanClass;
 use crate::cleanup::model::TreeSpec;
 use crate::deb_mirror::{is_deb_package, is_strict_path_descendant, path_starts_with_segment};
-use crate::error::{ErrorReport, ProxyCacheError};
+use crate::error::ErrorReport;
 use crate::metrics;
 
 /// Specifies how a stray directory anomaly should be handled.
@@ -109,7 +109,7 @@ pub(super) async fn handle_anomalous_entry(
 pub(super) async fn scan_candidates(
     tree: &TreeSpec,
     mirror_path: &str,
-) -> Result<HashMap<OsString, SpanClass>, ProxyCacheError> {
+) -> Result<HashMap<OsString, SpanClass>, io::Error> {
     let mut ret = HashMap::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(tree.root.clone(), String::new())];
 
@@ -124,7 +124,7 @@ pub(super) async fn scan_candidates(
                     current.display(),
                     ErrorReport(&err)
                 );
-                return Err(ProxyCacheError::Io(err));
+                return Err(err);
             }
         };
 
@@ -139,7 +139,7 @@ pub(super) async fn scan_candidates(
                         current.display(),
                         ErrorReport(&err)
                     );
-                    return Err(ProxyCacheError::Io(err));
+                    return Err(err);
                 }
             };
             let name = entry.file_name();

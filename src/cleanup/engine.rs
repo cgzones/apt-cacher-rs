@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -13,7 +13,7 @@ use crate::{
     config::Config,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
-    error::{ErrorReport, ProxyCacheError},
+    error::ErrorReport,
     humanfmt::HumanFmt,
     metrics,
 };
@@ -169,7 +169,7 @@ pub(super) async fn reduce_against(
     tally: &mut UnitStats,
     appstate: &AppState,
     config: &Config,
-) -> Result<ReduceOutcome, ProxyCacheError> {
+) -> Result<ReduceOutcome, io::Error> {
     let (mut response, pkgfmt) = match try_fetch_packages_file(
         &plan.mirror,
         &plan.base_uri,
@@ -408,7 +408,7 @@ enum GroupResolution {
 /// exactly the inputs that shape carries, so there is no facet -> layout table
 /// to drift from the roots the classifier built and no policy-shape guard to
 /// fall through.
-async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, ProxyCacheError> {
+async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, io::Error> {
     match unit {
         CleanupUnit::Reconcile(unit) => run_reconcile_unit(unit, ctx).await,
         CleanupUnit::ByHash(unit) => run_byhash_unit(unit, ctx).await,
@@ -507,10 +507,7 @@ struct ByHashOutcome {
 ///
 /// `byhash_dir_present` is probed up front so an absent tree (the common case
 /// for a mirror without by-hash) skips the origins query and Release reads.
-async fn run_byhash_unit(
-    unit: &ByHashUnit,
-    ctx: &MirrorCtx<'_>,
-) -> Result<UnitStats, ProxyCacheError> {
+async fn run_byhash_unit(unit: &ByHashUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, io::Error> {
     let mirror = ctx.mirror;
     let layout = unit.layout;
 
@@ -589,7 +586,7 @@ async fn sweep_byhash_dir(
     now: SystemTime,
     mirror: &Mirror,
     layout: CacheLayout,
-) -> Result<ByHashOutcome, ProxyCacheError> {
+) -> Result<ByHashOutcome, io::Error> {
     let mut candidates: HashMap<OsString, SpanClass> = HashMap::new();
     let mut anomaly_removed = 0u64;
     let mut referenced_kept = 0u64;
@@ -604,7 +601,7 @@ async fn sweep_byhash_dir(
                 byhash_path.display(),
                 ErrorReport(&err)
             );
-            return Err(ProxyCacheError::Io(err));
+            return Err(err);
         }
     };
 
@@ -619,7 +616,7 @@ async fn sweep_byhash_dir(
                     byhash_path.display(),
                     ErrorReport(&err)
                 );
-                return Err(ProxyCacheError::Io(err));
+                return Err(err);
             }
         };
         // lstat semantics on tokio's `DirEntry`, so a planted symlink is seen as
@@ -710,7 +707,7 @@ async fn sweep_byhash_dir(
 async fn run_reconcile_unit(
     unit: &ReconcileUnit,
     mirror_ctx: &MirrorCtx<'_>,
-) -> Result<UnitStats, ProxyCacheError> {
+) -> Result<UnitStats, io::Error> {
     let layout = unit.facet.cache_layout();
     let policy = unit.policy;
     let &MirrorCtx {
@@ -767,7 +764,7 @@ async fn run_reconcile_unit(
     // `try_strict_flat_pool_cleanup` returning `Some(done)` on full success).
     let mut owning_root: Option<&str> = None;
     for group in &unit.groups {
-        match resolve_group(&ctx, group, &mut cached_files, &mut tally).await? {
+        match resolve_group(&ctx, group, &mut cached_files, &mut tally).await {
             GroupResolution::Exhausted => return Ok(tally),
             GroupResolution::Skipped => {}
             GroupResolution::Ran(outcome) => {
@@ -879,7 +876,7 @@ async fn resolve_group(
     group: &SourceGroup,
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
-) -> Result<GroupResolution, ProxyCacheError> {
+) -> GroupResolution {
     match &group.source {
         IndexSource::OriginPackages {
             origin_rows_of: OriginOwner::SelfRow,
@@ -980,7 +977,7 @@ async fn resolve_origin_packages_archive_root(
     cache_layout: CacheLayout,
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
-) -> Result<GroupResolution, ProxyCacheError> {
+) -> GroupResolution {
     let &ReconcileCtx {
         policy: _,
         self_origins: _,
@@ -996,7 +993,7 @@ async fn resolve_origin_packages_archive_root(
     // debug-assert). Mirrors the structured resolver's empty-cache guard; the
     // unit's post-group empty check then returns without a sweep.
     if cached_files.is_empty() {
-        return Ok(GroupResolution::Skipped);
+        return GroupResolution::Skipped;
     }
 
     match appstate
@@ -1006,11 +1003,9 @@ async fn resolve_origin_packages_archive_root(
     {
         Ok(true) => {}
         Ok(false) => {
-            return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
-                SkipReason::NoRow {
-                    seg: root.to_owned(),
-                },
-            )));
+            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::NoRow {
+                seg: root.to_owned(),
+            }));
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
@@ -1018,9 +1013,7 @@ async fn resolve_origin_packages_archive_root(
                 "Failed to check the mirror row of archive root `{root}`; continuing with the mirror's remaining index sources:  {}",
                 ErrorReport(&err)
             );
-            return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
-                SkipReason::DbError,
-            )));
+            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
         }
     }
 
@@ -1036,9 +1029,7 @@ async fn resolve_origin_packages_archive_root(
                 "Failed to look up the origins of archive root `{root}`; continuing with the mirror's remaining index sources:  {}",
                 ErrorReport(&err)
             );
-            return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
-                SkipReason::DbError,
-            )));
+            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
         }
     };
 
@@ -1049,9 +1040,7 @@ async fn resolve_origin_packages_archive_root(
         .collect();
 
     if active_origins.is_empty() {
-        return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
-            SkipReason::NoActiveOrigins,
-        )));
+        return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::NoActiveOrigins));
     }
 
     let archive_mirror = Mirror::new(
@@ -1079,24 +1068,24 @@ async fn resolve_origin_packages_archive_root(
         };
         match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
             Ok(ReduceOutcome::Reduced) => {}
-            Ok(ReduceOutcome::Exhausted) => return Ok(GroupResolution::Exhausted),
+            Ok(ReduceOutcome::Exhausted) => return GroupResolution::Exhausted,
             Ok(ReduceOutcome::FetchFailed(status)) => {
                 debug!(
                     "Failed to fetch the archive-root Packages index for `{root}` ({status}); continuing with fallback index sources for mirror {mirror}"
                 );
-                return Ok(GroupResolution::Ran(GroupOutcome::FetchFailed(status)));
+                return GroupResolution::Ran(GroupOutcome::FetchFailed(status));
             }
             Err(err) => {
                 error!(
                     "Failed to reduce the archive-root Packages index for `{root}`; continuing with the mirror's remaining index sources:  {}",
                     ErrorReport(&err)
                 );
-                return Ok(GroupResolution::Ran(GroupOutcome::ParseError));
+                return GroupResolution::Ran(GroupOutcome::ParseError);
             }
         }
     }
 
-    Ok(GroupResolution::Ran(GroupOutcome::Complete))
+    GroupResolution::Ran(GroupOutcome::Complete)
 }
 
 /// Flat root-segment source resolver (`FlatPackages { RootSegment }`): a flat
@@ -1117,7 +1106,7 @@ async fn resolve_flat_root_segment(
     prefix: &str,
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
-) -> Result<GroupResolution, ProxyCacheError> {
+) -> GroupResolution {
     let &ReconcileCtx {
         policy: _,
         self_origins: _,
@@ -1131,7 +1120,7 @@ async fn resolve_flat_root_segment(
     // Skip the DB gate + fetch when there is nothing to reconcile (see the
     // hybrid resolver's guard for the debug-assert rationale).
     if cached_files.is_empty() {
-        return Ok(GroupResolution::Skipped);
+        return GroupResolution::Skipped;
     }
 
     match appstate
@@ -1141,11 +1130,9 @@ async fn resolve_flat_root_segment(
     {
         Ok(true) => {}
         Ok(false) => {
-            return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
-                SkipReason::NoRow {
-                    seg: seg.to_owned(),
-                },
-            )));
+            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::NoRow {
+                seg: seg.to_owned(),
+            }));
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
@@ -1153,30 +1140,28 @@ async fn resolve_flat_root_segment(
                 "Failed to check the mirror row of flat-repo root `{seg}`; continuing with the mirror's remaining index sources:  {}",
                 ErrorReport(&err)
             );
-            return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
-                SkipReason::DbError,
-            )));
+            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
         }
     }
 
     let plan = flat_root_fetch_plan(mirror, seg, prefix);
     match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
-        Ok(ReduceOutcome::Reduced) => Ok(GroupResolution::Ran(GroupOutcome::Complete)),
+        Ok(ReduceOutcome::Reduced) => GroupResolution::Ran(GroupOutcome::Complete),
         Ok(ReduceOutcome::Exhausted) => {
             debug!(
                 "Flat mirror {mirror}: fully reconciled against flat-repo root `{seg}`; skipped co-located probe"
             );
-            Ok(GroupResolution::Exhausted)
+            GroupResolution::Exhausted
         }
         Ok(ReduceOutcome::FetchFailed(status)) => {
-            Ok(GroupResolution::Ran(GroupOutcome::FetchFailed(status)))
+            GroupResolution::Ran(GroupOutcome::FetchFailed(status))
         }
         Err(err) => {
             error!(
                 "Failed to reduce the flat-root Packages index `{seg}` for mirror {mirror}; falling back to time-based retention:  {}",
                 ErrorReport(&err)
             );
-            Ok(GroupResolution::Ran(GroupOutcome::ParseError))
+            GroupResolution::Ran(GroupOutcome::ParseError)
         }
     }
 }
@@ -1190,7 +1175,7 @@ async fn resolve_flat_colocated(
     ctx: &ReconcileCtx<'_>,
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
-) -> Result<GroupResolution, ProxyCacheError> {
+) -> GroupResolution {
     let &ReconcileCtx {
         policy: _,
         self_origins: _,
@@ -1204,7 +1189,7 @@ async fn resolve_flat_colocated(
     // Skip the co-located fetch when there is nothing to reconcile (see the
     // hybrid resolver's guard for the debug-assert rationale).
     if cached_files.is_empty() {
-        return Ok(GroupResolution::Skipped);
+        return GroupResolution::Skipped;
     }
 
     let plan = FetchPlan {
@@ -1221,22 +1206,22 @@ async fn resolve_flat_colocated(
         keymap: KeyMapper::Relpath,
     };
     match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
-        Ok(ReduceOutcome::Reduced) => Ok(GroupResolution::Ran(GroupOutcome::Complete)),
+        Ok(ReduceOutcome::Reduced) => GroupResolution::Ran(GroupOutcome::Complete),
         Ok(ReduceOutcome::Exhausted) => {
             debug!(
                 "All cached flat deb files for mirror {mirror} are referenced by the Packages index"
             );
-            Ok(GroupResolution::Exhausted)
+            GroupResolution::Exhausted
         }
         Ok(ReduceOutcome::FetchFailed(status)) => {
-            Ok(GroupResolution::Ran(GroupOutcome::FetchFailed(status)))
+            GroupResolution::Ran(GroupOutcome::FetchFailed(status))
         }
         Err(err) => {
             error!(
                 "Failed to reduce the co-located flat Packages index for mirror {mirror}; falling back to time-based retention:  {}",
                 ErrorReport(&err)
             );
-            Ok(GroupResolution::Ran(GroupOutcome::ParseError))
+            GroupResolution::Ran(GroupOutcome::ParseError)
         }
     }
 }
@@ -1253,7 +1238,7 @@ async fn resolve_origin_packages_self(
     ctx: &ReconcileCtx<'_>,
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
-) -> Result<GroupResolution, ProxyCacheError> {
+) -> GroupResolution {
     let &ReconcileCtx {
         policy,
         self_origins,
@@ -1273,9 +1258,7 @@ async fn resolve_origin_packages_self(
         // cannot tell which cached debs are still referenced. Hand the tail a
         // `DbError`, which `decide_sweep` turns into a bail -- treating it as
         // "no origins" would grace-sweep files we never got to check.
-        return Ok(GroupResolution::Ran(GroupOutcome::NotApplicable(
-            SkipReason::DbError,
-        )));
+        return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
     };
 
     trace!("Origins ({}): {origins:?}", origins.len());
@@ -1332,7 +1315,7 @@ async fn resolve_origin_packages_self(
     // when there are no debs to reconcile (which would otherwise stall on an
     // absent upstream).
     if cached_files.is_empty() || active_origins.is_empty() {
-        return Ok(GroupResolution::Skipped);
+        return GroupResolution::Skipped;
     }
 
     // One fetch-buffer-reduce plan per active origin, built as its turn comes:
@@ -1360,7 +1343,7 @@ async fn resolve_origin_packages_self(
                 debug!(
                     "All cached deb files for mirror {mirror} are referenced by the Packages index"
                 );
-                return Ok(GroupResolution::Exhausted);
+                return GroupResolution::Exhausted;
             }
             // A missing Packages file leaves us unable to complete the
             // reference set; deleting now risks wiping files referenced only by
@@ -1372,7 +1355,7 @@ async fn resolve_origin_packages_self(
                     "Failed to fetch the Packages index for host {} path {} ({status}); skipping cleanup for mirror {mirror}",
                     origin.host, origin.mirror_path
                 );
-                return Ok(GroupResolution::Ran(GroupOutcome::FetchFailed(status)));
+                return GroupResolution::Ran(GroupOutcome::FetchFailed(status));
             }
             // A reduce parse error (malformed/decompression-bomb index, local
             // read failure) leaves the reference set incomplete just like a
@@ -1382,7 +1365,7 @@ async fn resolve_origin_packages_self(
                     "Failed to reduce the Packages index for mirror {mirror}; skipping cleanup for this mirror:  {}",
                     ErrorReport(&err)
                 );
-                return Ok(GroupResolution::Ran(GroupOutcome::ParseError));
+                return GroupResolution::Ran(GroupOutcome::ParseError);
             }
         }
     }
@@ -1390,7 +1373,7 @@ async fn resolve_origin_packages_self(
     // Every active origin's index reduced; leftovers are genuinely
     // unreferenced. `decide_sweep(ReferencedOrBail, [Complete])` returns
     // `Grace`, so the tail reaps them on the short grace span.
-    Ok(GroupResolution::Ran(GroupOutcome::Complete))
+    GroupResolution::Ran(GroupOutcome::Complete)
 }
 
 /// Per-facet reconcile-sweep completion summary for the `Grace` action —

@@ -1,10 +1,7 @@
 use std::fmt::Display;
 
 #[cfg(feature = "hyper")]
-use crate::{
-    ClientInfo, ContentLength, channel_body::ChannelBodyError, deb_mirror::Mirror,
-    rate_checker::InsufficientRate,
-};
+use crate::{ClientInfo, ContentLength, deb_mirror::Mirror, rate_checker::InsufficientRate};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorDownloadRate {
@@ -47,6 +44,12 @@ fn fmt_client_download_rate(
     error.fmt_with_context(f, format_args!(" for client {client}"))
 }
 
+/// Error type of the hyper response bodies (`ProxyCacheBody`).  Every variant
+/// is a way a streamed body can fail *after* the response headers went out;
+/// errors raised before that point use the scoped enums of their own module.
+/// Hyper-less builds only ever build infallible bodies, so the enum is empty
+/// there.
+///
 /// The wrapped transport errors render through [`ErrorReport`] inside
 /// `Display` and are deliberately **not** exposed via `source()`.  Log sites
 /// report this type through [`ErrorReport`] too, which walks `source()`, so
@@ -57,13 +60,12 @@ fn fmt_client_download_rate(
 /// impls below rather than `#[from]`, which would imply `#[source]`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProxyCacheError {
+    #[cfg(feature = "hyper")]
     #[error("{}", ErrorReport(.0))]
     Io(std::io::Error),
     #[cfg(feature = "hyper")]
     #[error("{}", ErrorReport(.0))]
     Hyper(hyper::Error),
-    #[error("{}", ErrorReport(.0))]
-    Sqlx(sqlx::Error),
     #[cfg(feature = "hyper")]
     #[error(fmt = fmt_client_download_rate)]
     ClientDownloadRate {
@@ -73,8 +75,6 @@ pub(crate) enum ProxyCacheError {
     #[cfg(feature = "hyper")]
     #[error(fmt = fmt_mirror_download_rate)]
     MirrorDownloadRate(MirrorDownloadRate),
-    #[error("{}", ErrorReport(.0))]
-    Memfd(memfd::Error),
     #[cfg(feature = "hyper")]
     #[error(
         "Upstream sent {received} bytes, exceeding the announced Content-Length of {announced}"
@@ -85,34 +85,7 @@ pub(crate) enum ProxyCacheError {
     },
 }
 
-impl From<std::io::Error> for ProxyCacheError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
 #[cfg(feature = "hyper")]
-impl From<hyper::Error> for ProxyCacheError {
-    fn from(value: hyper::Error) -> Self {
-        Self::Hyper(value)
-    }
-}
-
-impl From<sqlx::Error> for ProxyCacheError {
-    fn from(value: sqlx::Error) -> Self {
-        Self::Sqlx(value)
-    }
-}
-
-#[cfg(feature = "hyper")]
-impl From<ChannelBodyError> for ProxyCacheError {
-    fn from(value: ChannelBodyError) -> Self {
-        match value {
-            ChannelBodyError::MirrorDownloadRate(mdr) => Self::MirrorDownloadRate(mdr),
-        }
-    }
-}
-
 impl From<std::io::Error> for Box<ProxyCacheError> {
     fn from(value: std::io::Error) -> Self {
         Self::new(ProxyCacheError::Io(value))
@@ -216,6 +189,7 @@ mod tests {
     /// exposing it here too would both duplicate it in reports and flip that
     /// classification -- which is why the `From` impls are hand-written rather
     /// than `#[from]`.
+    #[cfg(feature = "hyper")]
     #[test]
     fn proxy_cache_error_has_no_source() {
         use std::error::Error as _;
