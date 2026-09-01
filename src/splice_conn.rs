@@ -2327,6 +2327,69 @@ enum DeliveryResult {
     Failure(u64),
 }
 
+/// Which of the three independent I/O parties a body-transfer failure came
+/// from.
+///
+/// `splice_proxy_body{,_tls}` drive an upstream socket, a client socket and a
+/// cache file (plus the internal splice pipes) in one loop.  They used to
+/// collapse every failure into a bare `io::Error`, which the caller then
+/// labelled `AfterHeaderClient` wholesale -- so an upstream stall was logged
+/// as "client response delivery failed ... upstream read timed out".  Every
+/// throw site now names its side so the outer arm can attribute it correctly.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BodyFailureSide {
+    /// Reading from (or rate-checking) the upstream connection.
+    Upstream,
+    /// Writing to the client socket.
+    Client,
+    /// A cached-file syscall (`pwrite`, or the `splice` into the cache fd).
+    /// Kept distinct from `Proxy` so only genuine cached-file failures bump
+    /// `CACHE_IO_FAILURE`, whose documented scope is cached-file syscalls.
+    Cache,
+    /// Another proxy-side resource: the internal splice pipes, or the fd
+    /// duplication behind the demoted file-serve task.
+    Proxy,
+}
+
+/// An `io::Error` out of `splice_proxy_body{,_tls}` tagged with the side of
+/// the proxy that produced it.  Construct via [`BodyTransferError::upstream`]
+/// / [`BodyTransferError::client`] / [`BodyTransferError::proxy`] so the
+/// tagging stays greppable at every throw site.
+pub(crate) struct BodyTransferError {
+    side: BodyFailureSide,
+    err: std::io::Error,
+}
+
+impl BodyTransferError {
+    fn upstream(err: std::io::Error) -> Self {
+        Self {
+            side: BodyFailureSide::Upstream,
+            err,
+        }
+    }
+
+    fn client(err: std::io::Error) -> Self {
+        Self {
+            side: BodyFailureSide::Client,
+            err,
+        }
+    }
+
+    fn cache(err: std::io::Error) -> Self {
+        Self {
+            side: BodyFailureSide::Cache,
+            err,
+        }
+    }
+
+    fn proxy(err: std::io::Error) -> Self {
+        Self {
+            side: BodyFailureSide::Proxy,
+            err,
+        }
+    }
+}
+
 /// The caller must `.await` the join handle after the download barrier has
 /// been consumed (so the spawned task can observe a terminal
 /// `ActiveDownloadStatus` -- `Verifying` while integrity hashing is in
@@ -2358,7 +2421,7 @@ async fn splice_proxy_body(
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
     #[cfg(feature = "ktls")] upstream_is_ktls: bool,
-) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64)> {
+) -> Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64), BodyTransferError> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
     // accounting cleanly — see the `ClientStatus::Demoted` branch below.
@@ -2371,8 +2434,10 @@ async fn splice_proxy_body(
     // this body fn is skipped when the entire response fits in the
     // body_prefix / kTLS extra-body and we still need to count it.
 
-    let (upstream_pipe_sender, mut upstream_pipe_receiver) = create_pipe()?;
-    let (cache_pipe_sender, cache_pipe_receiver) = create_pipe()?;
+    let (upstream_pipe_sender, mut upstream_pipe_receiver) =
+        create_pipe().map_err(BodyTransferError::proxy)?;
+    let (cache_pipe_sender, cache_pipe_receiver) =
+        create_pipe().map_err(BodyTransferError::proxy)?;
 
     let config = global_config();
 
@@ -2409,7 +2474,10 @@ async fn splice_proxy_body(
     let client_range_end = range_filter.skip + range_filter.send;
 
     while remaining > 0 {
-        dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
+        dbarrier = dbarrier
+            .check_upstream_rate(rate_checker.as_ref())
+            .await
+            .map_err(BodyTransferError::upstream)?;
 
         static_assert!(PIPE_BUFFER_SIZE > 0 && (PIPE_BUFFER_SIZE as u64) < usize::MAX as u64);
         #[expect(
@@ -2438,12 +2506,12 @@ async fn splice_proxy_body(
             let _: Never = match res {
                 Ok(0) => {
                     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    return Err(std::io::Error::new(
+                    return Err(BodyTransferError::upstream(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
                         format!(
                             "splice proxy: upstream closed prematurely (remaining={remaining}, chunk_size={chunk_size})"
                         ),
-                    ));
+                    )));
                 }
                 Ok(n) => break n,
                 Err(nix::errno::Errno::EINTR) => continue,
@@ -2460,8 +2528,8 @@ async fn splice_proxy_body(
                             &mut rate_checker,
                             RateCheckDirection::Upstream,
                             config.http_timeout,
-                        ) => r?,
-                        w = upstream_pipe_sender.writable() => w?,
+                        ) => r.map_err(BodyTransferError::upstream)?,
+                        w = upstream_pipe_sender.writable() => w.map_err(BodyTransferError::proxy)?,
                     }
                     continue;
                 }
@@ -2488,7 +2556,10 @@ async fn splice_proxy_body(
                             cache_path.display(),
                             ErrorReport(&drain_err)
                         );
-                        return Err(errno_to_io_error(err, "splice failed on kTLS record"));
+                        return Err(BodyTransferError::upstream(errno_to_io_error(
+                            err,
+                            "splice failed on kTLS record",
+                        )));
                     }
                     debug!("splice proxy: drained mid-stream kTLS control record(s), retrying");
                     continue;
@@ -2502,16 +2573,16 @@ async fn splice_proxy_body(
                 // immediately instead of burning the drain budget.
                 #[cfg(feature = "ktls")]
                 Err(err @ nix::errno::Errno::EKEYEXPIRED) if upstream_is_ktls => {
-                    return Err(errno_to_io_error(
+                    return Err(BodyTransferError::upstream(errno_to_io_error(
                         err,
                         "upstream sent TLS KeyUpdate (kernel paused RX awaiting rekey); \
                          kernel TLS cannot rekey",
-                    ));
+                    )));
                 }
                 // Budget spent: the same errno now falls through to the
                 // generic arm, which surfaces as a plain "splice failed:
-                // Invalid argument" attributed to client delivery. Say that
-                // the kTLS drain budget is what ran out.
+                // Invalid argument". Say that the kTLS drain budget is what
+                // ran out.
                 #[cfg(feature = "ktls")]
                 Err(
                     err @ (nix::errno::Errno::EINVAL
@@ -2523,9 +2594,17 @@ async fn splice_proxy_body(
                         cache_path.display(),
                         ErrorReport(&err)
                     );
-                    return Err(errno_to_io_error(err, "splice failed after kTLS drains"));
+                    return Err(BodyTransferError::upstream(errno_to_io_error(
+                        err,
+                        "splice failed after kTLS drains",
+                    )));
                 }
-                Err(err) => return Err(errno_to_io_error(err, "splice failed")),
+                Err(err) => {
+                    return Err(BodyTransferError::upstream(errno_to_io_error(
+                        err,
+                        "splice failed",
+                    )));
+                }
             };
         };
 
@@ -2550,7 +2629,9 @@ async fn splice_proxy_body(
             || chunk_start >= client_range_end
         {
             // Chunk is entirely outside client range, or client is gone/demoted — cache only
-            splice_pipe_to_file(&upstream_pipe_receiver, cache_file, got, &mut file_offset).await?;
+            splice_pipe_to_file(&upstream_pipe_receiver, cache_file, got, &mut file_offset)
+                .await
+                .map_err(BodyTransferError::cache)?;
             dbarrier.ping_batched(got as u64);
         } else if chunk_start >= client_skip && chunk_end <= client_range_end {
             // Chunk is entirely inside client range — normal tee
@@ -2578,7 +2659,10 @@ async fn splice_proxy_body(
                 // Slow upstream is the most common reason the client RC trips;
                 // surface that root cause via the existing MirrorDownloadRate
                 // abort before spinning up a doomed demoted file-serve task.
-                dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
+                dbarrier = dbarrier
+                    .check_upstream_rate(rate_checker.as_ref())
+                    .await
+                    .map_err(BodyTransferError::upstream)?;
 
                 // Upstream is healthy — client really is the bottleneck.
                 #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
@@ -2596,18 +2680,23 @@ async fn splice_proxy_body(
                 // `async_sendfile_unfinished` creates its own `ClientDownload`
                 // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
                 drop(counter.take());
-                demoted_handle = Some(spawn_file_serve_task(
-                    client,
-                    cache_path,
-                    demote_pos,
-                    demote_remaining,
-                    &dbarrier,
-                )?);
+                demoted_handle = Some(
+                    spawn_file_serve_task(
+                        client,
+                        cache_path,
+                        demote_pos,
+                        demote_remaining,
+                        &dbarrier,
+                    )
+                    .map_err(BodyTransferError::proxy)?,
+                );
                 client_status = ClientStatus::Demoted;
             }
         } else {
             // Boundary chunk — read into userspace, slice for client, pwrite for cache
-            let mut buf = read_pipe_to_buf(&mut upstream_pipe_receiver, got).await?;
+            let mut buf = read_pipe_to_buf(&mut upstream_pipe_receiver, got)
+                .await
+                .map_err(BodyTransferError::proxy)?;
 
             debug_assert!(
                 matches!(client_status, ClientStatus::Active),
@@ -2621,7 +2710,9 @@ async fn splice_proxy_body(
             // Write full chunk to cache via pwrite first, so concurrent clients
             // see progress without being gated on the first client's send speed.
             let buf_len = buf.len();
-            pwrite_buf_to_file(cache_file, &mut buf, buf_len, file_offset).await?;
+            pwrite_buf_to_file(cache_file, &mut buf, buf_len, file_offset)
+                .await
+                .map_err(BodyTransferError::cache)?;
 
             #[expect(
                 clippy::cast_possible_wrap,
@@ -2680,7 +2771,7 @@ async fn splice_proxy_body(
                         );
                         client_status = ClientStatus::Disconnected;
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => return Err(BodyTransferError::client(err)),
                 }
             }
         }
@@ -2820,7 +2911,7 @@ async fn splice_proxy_body_tls(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-) -> std::io::Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64)> {
+) -> Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64), BodyTransferError> {
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
     // accounting cleanly — see the `ClientStatus::Demoted` branch below.
@@ -2869,7 +2960,10 @@ async fn splice_proxy_body_tls(
     tokio::pin!(tick);
 
     while remaining > 0 {
-        dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
+        dbarrier = dbarrier
+            .check_upstream_rate(rate_checker.as_ref())
+            .await
+            .map_err(BodyTransferError::upstream)?;
 
         // Step 1: async read from TLS stream into userspace buffer
         // The outer http_timeout ensures a fully stalled connection is killed even if
@@ -2895,7 +2989,7 @@ async fn splice_proxy_body_tls(
                     // tick fires, so no read progress is ever cancelled.
                     result = &mut read_fut => match result {
                         Ok(n) => break n,
-                        Err(err) => return Err(err),
+                        Err(err) => return Err(BodyTransferError::upstream(err)),
                     },
                     () = &mut tick, if rate_checker.is_some() => {
                         let rc = rate_checker
@@ -2903,30 +2997,32 @@ async fn splice_proxy_body_tls(
                             .expect("guarded by rate_checker.is_some()");
                         rc.add(0);
                         if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                            return Err(dbarrier.abort_with_rate_timeout(rate).await);
+                            return Err(BodyTransferError::upstream(
+                                dbarrier.abort_with_rate_timeout(rate).await,
+                            ));
                         }
                         tick.as_mut()
                             .reset(tokio::time::Instant::now() + RATE_TICK_PERIOD);
                     }
                     () = &mut outer => {
                         metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                        return Err(std::io::Error::new(
+                        return Err(BodyTransferError::upstream(std::io::Error::new(
                             ErrorKind::TimedOut,
                             format!(
                                 "upstream TLS read timed out after {}",
                                 HumanFmt::Time(config.http_timeout)
                             ),
-                        ));
+                        )));
                     }
                 }
             }
         };
         if got == 0 {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            return Err(std::io::Error::new(
+            return Err(BodyTransferError::upstream(std::io::Error::new(
                 ErrorKind::UnexpectedEof,
                 "splice proxy: TLS upstream closed prematurely",
-            ));
+            )));
         }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
@@ -2944,7 +3040,9 @@ async fn splice_proxy_body_tls(
         // Write the full chunk to cache via pwrite first, so concurrent
         // clients see progress without being gated on this client's send
         // speed.
-        pwrite_buf_to_file(cache_file, &mut read_buf, got, file_offset).await?;
+        pwrite_buf_to_file(cache_file, &mut read_buf, got, file_offset)
+            .await
+            .map_err(BodyTransferError::cache)?;
 
         #[expect(
             clippy::cast_possible_wrap,
@@ -2973,7 +3071,8 @@ async fn splice_proxy_body_tls(
                 &mut client_remaining,
                 range_filter.send,
             )
-            .await?;
+            .await
+            .map_err(BodyTransferError::client)?;
 
             if let ClientStatus::DemoteRequested {
                 client_file_pos: demote_pos,
@@ -2983,7 +3082,10 @@ async fn splice_proxy_body_tls(
                 // Slow upstream is the most common reason the client RC trips;
                 // surface that root cause via the existing MirrorDownloadRate
                 // abort before spinning up a doomed demoted file-serve task.
-                dbarrier = dbarrier.check_upstream_rate(rate_checker.as_ref()).await?;
+                dbarrier = dbarrier
+                    .check_upstream_rate(rate_checker.as_ref())
+                    .await
+                    .map_err(BodyTransferError::upstream)?;
 
                 // Upstream is healthy — client really is the bottleneck.
                 #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
@@ -3001,13 +3103,16 @@ async fn splice_proxy_body_tls(
                 // `async_sendfile_unfinished` creates its own `ClientDownload`
                 // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
                 drop(counter.take());
-                demoted_handle = Some(spawn_file_serve_task(
-                    client,
-                    cache_path,
-                    demote_pos,
-                    demote_remaining,
-                    &dbarrier,
-                )?);
+                demoted_handle = Some(
+                    spawn_file_serve_task(
+                        client,
+                        cache_path,
+                        demote_pos,
+                        demote_remaining,
+                        &dbarrier,
+                    )
+                    .map_err(BodyTransferError::proxy)?,
+                );
                 client_status = ClientStatus::Demoted;
             }
         }
@@ -3307,7 +3412,7 @@ async fn tee_and_splice(
     client_rate_checker: &mut Option<RateChecker>,
     client_file_pos: &mut u64,
     client_remaining: &mut u64,
-) -> std::io::Result<ClientStatus> {
+) -> Result<ClientStatus, BodyTransferError> {
     let (cache_file, file_offset) = target;
     let mut status = client_status;
     let mut remaining = got;
@@ -3331,10 +3436,10 @@ async fn tee_and_splice(
 
                 let _: Never = match res {
                     Ok(0) => {
-                        return Err(std::io::Error::new(
+                        return Err(BodyTransferError::proxy(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
                             "splice proxy: tee returned 0",
-                        ));
+                        )));
                     }
                     Ok(n) => break n,
                     Err(nix::errno::Errno::EINTR) => continue,
@@ -3343,17 +3448,24 @@ async fn tee_and_splice(
                         clear_pipe_readable_cache(upstream_pipe_rx);
                         clear_pipe_writable_cache(cache_pipe_tx);
                         tokio::select! {
-                            r = upstream_pipe_rx.readable() => r?,
-                            w = cache_pipe_tx.writable() => w?,
+                            r = upstream_pipe_rx.readable() => r.map_err(BodyTransferError::proxy)?,
+                            w = cache_pipe_tx.writable() => w.map_err(BodyTransferError::proxy)?,
                         }
                         continue;
                     }
-                    Err(err) => return Err(errno_to_io_error(err, "tee failed")),
+                    Err(err) => {
+                        return Err(BodyTransferError::proxy(errno_to_io_error(
+                            err,
+                            "tee failed",
+                        )));
+                    }
                 };
             };
 
             // Step 3: splice pipe_B → cache file first (fast, local disk I/O)
-            splice_pipe_to_file(cache_pipe_rx, cache_file, teed, file_offset).await?;
+            splice_pipe_to_file(cache_pipe_rx, cache_file, teed, file_offset)
+                .await
+                .map_err(BodyTransferError::cache)?;
 
             // Notify concurrent clients that new data is on disk
             dbarrier.ping_batched(teed as u64);
@@ -3400,7 +3512,9 @@ async fn tee_and_splice(
                             client_sent_percent,
                         );
                         status = ClientStatus::Disconnected;
-                        drain_pipe(upstream_pipe_rx, teed_remaining).await?;
+                        drain_pipe(upstream_pipe_rx, teed_remaining)
+                            .await
+                            .map_err(BodyTransferError::proxy)?;
                         break;
                     }
                     Ok(n) => {
@@ -3423,7 +3537,9 @@ async fn tee_and_splice(
                                 // just sent to the client), so it is exactly the count of teed
                                 // bytes still sitting in pipe_A that need to be drained before
                                 // we can stop servicing the client.
-                                drain_pipe(upstream_pipe_rx, teed_remaining).await?;
+                                drain_pipe(upstream_pipe_rx, teed_remaining)
+                                    .await
+                                    .map_err(BodyTransferError::proxy)?;
 
                                 status = ClientStatus::DemoteRequested {
                                     client_file_pos: *client_file_pos,
@@ -3446,12 +3562,17 @@ async fn tee_and_splice(
                                 client_rate_checker,
                                 RateCheckDirection::Client,
                                 global_config().http_timeout,
-                            ) => w?,
-                            r = upstream_pipe_rx.readable() => r?,
+                            ) => w.map_err(BodyTransferError::client)?,
+                            r = upstream_pipe_rx.readable() => r.map_err(BodyTransferError::proxy)?,
                         }
                         continue;
                     }
-                    Err(err) => return Err(errno_to_io_error(err, "splice failed")),
+                    Err(err) => {
+                        return Err(BodyTransferError::client(errno_to_io_error(
+                            err,
+                            "splice failed",
+                        )));
+                    }
                 };
             }
 
@@ -3460,7 +3581,9 @@ async fn tee_and_splice(
                 .expect("splice should not return more than requested");
         } else {
             // Client is gone or demoted — splice pipe_A directly to cache (no tee needed)
-            splice_pipe_to_file(upstream_pipe_rx, cache_file, remaining, file_offset).await?;
+            splice_pipe_to_file(upstream_pipe_rx, cache_file, remaining, file_offset)
+                .await
+                .map_err(BodyTransferError::cache)?;
             dbarrier.ping_batched(remaining as u64);
             remaining = 0;
         }
@@ -6226,9 +6349,40 @@ async fn splice_proxy_drive(
             // undelivered bytes. `upstream_guard` (still armed here) poisons
             // the connection on the early return so PoolGuard::drop discards it
             // rather than re-pooling it -- the next checkout would otherwise log
-            // "pooled connection to ... has unexpected data; discarding it and
-            // connecting fresh".
-            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "splice body transfer"))?;
+            // "pooled connection to ... has unexpected data; connecting fresh".
+            //
+            // The body helpers tag which party broke, so the outer arm can
+            // attribute the failure instead of blaming the client for an
+            // upstream stall. Cache- and proxy-side failures are logged here
+            // (the on-disk path is in scope) and reported as `AfterHeaderIo`,
+            // whose contract is exactly "inner site logs, outer arm silent".
+            .map_err(|BodyTransferError { side, err }| match side {
+                BodyFailureSide::Upstream => {
+                    SpliceProxyError::AfterHeaderUpstream(err, "splice body transfer")
+                }
+                BodyFailureSide::Client => {
+                    SpliceProxyError::AfterHeaderClient(err, "splice body transfer")
+                }
+                BodyFailureSide::Cache => {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "splice proxy: failed to write the cache file `{}` in splice body transfer; aborting the transfer and closing the connection:  {}",
+                        temppath.display(),
+                        ErrorReport(&err)
+                    );
+                    SpliceProxyError::AfterHeaderIo
+                }
+                BodyFailureSide::Proxy => {
+                    // Splice pipes / fd duplication -- not a cached-file
+                    // syscall, so `CACHE_IO_FAILURE` stays out of it.
+                    error!(
+                        "splice proxy: proxy-side I/O failure in splice body transfer for `{}`; aborting the transfer and closing the connection:  {}",
+                        temppath.display(),
+                        ErrorReport(&err)
+                    );
+                    SpliceProxyError::AfterHeaderIo
+                }
+            })?;
         dbarrier = returned_dbarrier;
         // The splice body block ran: the upstream-rate and client-rate windows
         // both end here. The demoted-client case reassigns `t_client_done`
@@ -7977,6 +8131,17 @@ pub(crate) enum SpliceProxyError {
     /// broke.  Logged at the outer arm with `is_peer_disconnect`-based
     /// severity (INFO for peer disconnects, WARN otherwise).
     AfterHeaderClient(std::io::Error, &'static str),
+    /// Upstream-side I/O failure after response headers were written: the
+    /// mirror stalled, hung up, or fell below `min_download_rate` mid-body.
+    /// The caller must close the connection without emitting a new HTTP
+    /// status -- the client has already received a 200/206 header.  Carries
+    /// the same short code-location tag as `AfterHeaderClient`.  Logged at
+    /// the outer arm at WARN: unlike a client hang-up there is no benign
+    /// case, and the throw sites already bumped their dedicated counter
+    /// (`HTTP_TIMEOUT_UPSTREAM_READ`, `RATE_LIMIT_UPSTREAM`,
+    /// `UPSTREAM_PROTOCOL_VIOLATION`), so the line is counter-backed and
+    /// bounded to one per connection.
+    AfterHeaderUpstream(std::io::Error, &'static str),
     /// Cache-side I/O failure after response headers were written
     /// (tempfile write, rename, partial-file reopen, etc.).  The caller
     /// must close the connection.  Unlike `AfterHeaderClient`, the log

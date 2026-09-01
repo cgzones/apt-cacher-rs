@@ -1144,6 +1144,19 @@ async fn try_sendfile_request(
                     }
                     ZeroCopyResult::AfterHeaderError
                 }
+                // Not reachable today -- `splice_simple_proxy` relays the body
+                // itself rather than going through `splice_proxy_body{,_tls}`,
+                // the only producers of this variant. Kept correct rather than
+                // `unreachable!()` so wiring the split into the passthrough
+                // relay is a one-line change, not a panic in production.
+                Err(SpliceProxyError::AfterHeaderUpstream(err, location)) => {
+                    warn!(
+                        "simple proxy: upstream failed in {location} for {uri_path} from host {}; closing the connection:  {}",
+                        mirror.format_authority(),
+                        ErrorReport(&err)
+                    );
+                    ZeroCopyResult::AfterHeaderError
+                }
                 Err(SpliceProxyError::AfterHeaderIo) => ZeroCopyResult::AfterHeaderError,
                 Err(SpliceProxyError::Cache) => ZeroCopyResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1453,6 +1466,25 @@ async fn try_sendfile_request(
                         ErrorReport(&err)
                     );
                 }
+                ZeroCopyResult::AfterHeaderError
+            }
+            Err(SpliceProxyError::AfterHeaderUpstream(err, location)) => {
+                // Upstream-side failure mid-body: a stall (`http_timeout`), a
+                // `min_download_rate` breach, or a premature close. Unlike the
+                // client split above there is no benign peer-hung-up case to
+                // demote -- every variant means this mirror failed to deliver a
+                // body it had already promised, and the operator wants to see
+                // which mirror. Bounded to one line per connection and backed by
+                // `HTTP_TIMEOUT_UPSTREAM_READ` / `RATE_LIMIT_UPSTREAM` /
+                // `UPSTREAM_PROTOCOL_VIOLATION`, so it takes the same
+                // once-gating exemption as the delivery split.
+                warn!(
+                    "splice proxy: upstream failed in {location} for {} from mirror {}{}; closing the connection:  {}",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    aliased,
+                    ErrorReport(&err)
+                );
                 ZeroCopyResult::AfterHeaderError
             }
             Err(SpliceProxyError::AfterHeaderIo) => ZeroCopyResult::AfterHeaderError,
