@@ -76,6 +76,8 @@ mod task_cache_scan;
 mod task_setup;
 #[cfg(feature = "splice")]
 mod tcp_cork_guard;
+#[cfg(test)]
+mod test_support;
 mod tunnel_limiter;
 mod uncacheables;
 mod upstream_retry;

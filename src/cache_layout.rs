@@ -869,14 +869,13 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-
     use super::*;
     use crate::ClientInfo;
     use crate::deb_mirror::{FlatKind, ResourceFile};
+    use crate::test_support::local_client;
 
     fn fake_client() -> ClientInfo {
-        ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        local_client()
     }
 
     #[test]

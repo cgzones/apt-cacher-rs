@@ -180,6 +180,7 @@ mod tests {
     use crate::cache_layout::CacheLayout;
     use crate::config::ClientHost;
     use crate::deb_mirror::{Mirror, MirrorKind};
+    use crate::test_support::structured_mirror;
 
     const BASE_SECS: u64 = 30;
     const CAP_SECS: u64 = 3600;
@@ -192,12 +193,7 @@ mod tests {
     }
 
     fn test_mirror() -> Mirror {
-        Mirror::new(
-            ClientHost::new("deb.debian.org".to_string()).expect("valid host"),
-            None,
-            String::new(),
-            MirrorKind::Structured,
-        )
+        structured_mirror("deb.debian.org", "")
     }
 
     fn throttle() -> VerifyThrottle {

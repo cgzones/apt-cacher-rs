@@ -387,13 +387,12 @@ fn decide_request(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-
     use super::*;
     use crate::ClientInfo;
+    use crate::test_support::local_client;
 
     fn fake_client() -> ClientInfo {
-        ClientInfo::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        local_client()
     }
 
     fn fake_host() -> ClientHost {

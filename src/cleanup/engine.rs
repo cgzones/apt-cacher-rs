@@ -1399,6 +1399,7 @@ fn log_reconcile_removed(facet: ReconcileFacet, mirror: &Mirror, swept: &SweepRe
 mod tests {
     use super::*;
     use crate::config::ClientHost;
+    use crate::test_support::structured_mirror;
 
     #[test]
     fn flat_root_fetch_plan_keys_metadata_by_owner_mirror() {
@@ -1481,7 +1482,6 @@ mod tests {
     //     these tests DB-free while still gating the keep/remove verdicts.
 
     use hashbrown::HashSet;
-    use std::num::NonZero;
 
     use crate::deb_mirror::MirrorKind;
     use crate::index_parser::hex_encode;
@@ -1489,12 +1489,7 @@ mod tests {
     const DAY: u64 = 24 * 60 * 60;
 
     fn byhash_test_mirror() -> Mirror {
-        Mirror::new(
-            ClientHost::new("deb.example.org".to_owned()).expect("valid host"),
-            None::<NonZero<u16>>,
-            "debian".to_owned(),
-            MirrorKind::Structured,
-        )
+        structured_mirror("deb.example.org", "debian")
     }
 
     /// `cache_metadata::store()` (reached via `invalidate_metadata_for` on

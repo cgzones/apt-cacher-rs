@@ -370,6 +370,7 @@ mod tests {
     use crate::cache_layout::CacheLayout;
     use crate::config::ClientHost;
     use crate::deb_mirror::{Mirror, MirrorKind};
+    use crate::test_support::structured_mirror;
 
     #[test]
     fn age_reference_time_returns_live_timestamp() {
@@ -383,12 +384,7 @@ mod tests {
     }
 
     fn test_mirror() -> Mirror {
-        Mirror::new(
-            ClientHost::new("deb.example.org".to_owned()).expect("valid host"),
-            None,
-            "debian".to_owned(),
-            MirrorKind::Structured,
-        )
+        structured_mirror("deb.example.org", "debian")
     }
 
     #[tokio::test]

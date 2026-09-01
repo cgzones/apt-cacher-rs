@@ -469,16 +469,11 @@ impl ActiveDownloads {
 mod tests {
     use super::*;
     use crate::cache_layout::CacheLayout;
-    use crate::config::ClientHost;
-    use crate::deb_mirror::{Mirror, MirrorKind};
+    use crate::deb_mirror::Mirror;
+    use crate::test_support::structured_mirror;
 
     fn test_mirror() -> Mirror {
-        Mirror::new(
-            ClientHost::new("deb.debian.org".to_string()).expect("valid host"),
-            None,
-            String::new(),
-            MirrorKind::Structured,
-        )
+        structured_mirror("deb.debian.org", "")
     }
 
     #[test]
