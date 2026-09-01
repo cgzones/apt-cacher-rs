@@ -63,8 +63,8 @@ use crate::{
     uncacheables::record_uncacheable,
     upstream_retry,
     utils::{
-        self, TempPath, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
-        tokio_tempfile, touch_volatile_mtime,
+        self, CacheAccessFailure, TempPath, hint_sequential_read, is_peer_disconnect,
+        regular_file_metadata, tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
     },
     warn_on_content_type_mismatch, warn_once, warn_once_or_debug, warn_once_or_info,
     web_interface::serve_web_interface,
@@ -798,23 +798,9 @@ async fn serve_unfinished_file(
 ) -> Response<ProxyCacheBody> {
     let config = global_config();
 
-    let md = match file.metadata().await {
-        Ok(data) if data.file_type().is_file() => data,
-        Ok(_) => {
-            metrics::CACHE_NON_REGULAR.increment();
-            error!(
-                "Cache file `{}` is not a regular file; refusing to serve and returning 500",
-                file_path.display()
-            );
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
-        }
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to get metadata of file `{}`; returning 500:  {}",
-                file_path.display(),
-                ErrorReport(&err)
-            );
+    let md = match regular_file_metadata(&file, &file_path).await {
+        Ok(data) => data,
+        Err(CacheAccessFailure) => {
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
@@ -1085,23 +1071,9 @@ async fn serve_cached_file(
             );
             m
         }
-        None => match file.metadata().await {
-            Ok(m) if m.file_type().is_file() => m,
-            Ok(_) => {
-                metrics::CACHE_NON_REGULAR.increment();
-                error!(
-                    "Cache file `{}` is not a regular file; refusing to serve and returning 500",
-                    file_path.display()
-                );
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
-            }
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to get metadata of cached file `{}`; returning 500:  {}",
-                    file_path.display(),
-                    ErrorReport(&err)
-                );
+        None => match regular_file_metadata(&file, &file_path).await {
+            Ok(m) => m,
+            Err(CacheAccessFailure) => {
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
             }
         },
@@ -1691,23 +1663,9 @@ async fn serve_volatile_file(
         "serve_volatile_file() assumes volatile flavor"
     );
 
-    let mdata = match file.metadata().await {
-        Ok(data) if data.file_type().is_file() => data,
-        Ok(_) => {
-            metrics::CACHE_NON_REGULAR.increment();
-            error!(
-                "Cache file `{}` is not a regular file; refusing to serve and returning 500",
-                file_path.display()
-            );
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
-        }
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to get metadata of file `{}`; returning 500:  {}",
-                file_path.display(),
-                ErrorReport(&err)
-            );
+    let mdata = match regular_file_metadata(&file, &file_path).await {
+        Ok(data) => data,
+        Err(CacheAccessFailure) => {
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };

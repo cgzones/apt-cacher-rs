@@ -43,6 +43,43 @@ macro_rules! static_assert {
         const _: () = assert!($cond, $msg);
     };
 }
+/// Marker for a cache-file access that failed and was already logged, with
+/// the matching `CACHE_IO_FAILURE` / `CACHE_NON_REGULAR` bump. Callers only
+/// map it to their transport's 500 - never log it a second time.
+#[derive(Debug)]
+pub(crate) struct CacheAccessFailure;
+
+/// `fstat` an open cache file and require a regular file.
+///
+/// The single owner of the "stat failed -> `CACHE_IO_FAILURE`, non-regular ->
+/// `CACHE_NON_REGULAR`" policy for files about to be served: every serve path
+/// (hyper, sendfile, splice) goes through here so no path can silently skip
+/// the anomaly accounting.
+pub(crate) async fn regular_file_metadata(
+    file: &tokio::fs::File,
+    path: &Path,
+) -> Result<std::fs::Metadata, CacheAccessFailure> {
+    match file.metadata().await {
+        Ok(md) if md.file_type().is_file() => Ok(md),
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            error!(
+                "Cache file `{}` is not a regular file; refusing to serve it",
+                path.display()
+            );
+            Err(CacheAccessFailure)
+        }
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to get metadata of cache file `{}`; refusing to serve it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            Err(CacheAccessFailure)
+        }
+    }
+}
 
 /// Returns `true` when `err` indicates the peer terminated the connection
 /// (by reset, abort, half-close, or EOF). Used to demote routine "client

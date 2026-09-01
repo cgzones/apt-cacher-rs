@@ -24,6 +24,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::cache_layout;
 use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_quota::QuotaExceeded;
 use crate::config::ClientHost;
@@ -64,8 +65,8 @@ use crate::sendfile_conn::{
 };
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils::{
-    self, hint_sequential_read, is_peer_disconnect, tokio_nofollow_options,
-    tokio_tempfile, touch_volatile_mtime,
+    self, CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
+    tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
 };
 use crate::xattr_helpers;
 use crate::{
@@ -82,7 +83,6 @@ use crate::{
 use crate::{KTLS_BLOCKED, SchemeKey, SchemeKeyRef};
 #[cfg(not(feature = "hyper"))]
 use crate::{ProxyCacheBody, VOLATILE_CACHE_MAX_AGE, error::UpstreamFetchError, full_body};
-use crate::cache_layout;
 
 // On Linux, EAGAIN and EWOULDBLOCK share the same numeric value, so matching
 // one variant is equivalent to matching both. The nix crate models EWOULDBLOCK
@@ -4851,7 +4851,6 @@ async fn splice_proxy_drive(
         return Ok(());
     }
 
-
     // Check for a partial download file to resume (permanent files only).
     // Opens the file upfront (if it exists and is non-empty) to get size + mtime
     // from the same file descriptor, avoiding TOCTOU races between metadata() and open().
@@ -4904,23 +4903,9 @@ async fn splice_proxy_drive(
             }
         };
         if let Some(file) = file {
-            let mdata = match file.metadata().await {
-                Ok(m) if m.file_type().is_file() => m,
-                Ok(_) => {
-                    metrics::CACHE_NON_REGULAR.increment();
-                    error!(
-                        "splice proxy: cache file `{}` is not a regular file; refusing to serve and returning 500",
-                        cache_path.display()
-                    );
-                    return Err(SpliceProxyError::Cache);
-                }
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to get metadata for volatile cached file `{}`; returning 500:  {}",
-                        cache_path.display(),
-                        ErrorReport(&err)
-                    );
+            let mdata = match regular_file_metadata(&file, &cache_path).await {
+                Ok(m) => m,
+                Err(CacheAccessFailure) => {
                     return Err(SpliceProxyError::Cache);
                 }
             };
@@ -6759,23 +6744,9 @@ async fn serve_cached_cleanup_file(
     cache_path: &Path,
     req: &http::Request<http_body_util::Empty<()>>,
 ) -> Option<http::Response<ProxyCacheBody>> {
-    let mdata = match file.metadata().await {
-        Ok(data) if data.file_type().is_file() => data,
-        Ok(_) => {
-            metrics::CACHE_NON_REGULAR.increment();
-            error!(
-                "splice cleanup: cache file `{}` is not a regular file; refusing to serve and returning 500",
-                cache_path.display()
-            );
-            return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
-        }
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice cleanup: failed to get metadata of cached file `{}`; returning 500:  {}",
-                cache_path.display(),
-                ErrorReport(&err)
-            );
+    let mdata = match regular_file_metadata(&file, cache_path).await {
+        Ok(data) => data,
+        Err(CacheAccessFailure) => {
             return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
         }
     };

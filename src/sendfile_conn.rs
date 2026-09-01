@@ -45,7 +45,10 @@ use crate::{
     rate_log,
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
     static_assert, swrite, tunnel_limiter,
-    utils::{hint_sequential_read, is_peer_disconnect, tokio_nofollow_options},
+    utils::{
+        CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
+        tokio_nofollow_options,
+    },
     warn_once, warn_once_or_debug, warn_once_or_info,
     web_interface::{WebResponse, serve_web_interface},
 };
@@ -1278,8 +1281,8 @@ async fn try_sendfile_request(
         // upstream. Keep the metadata for the serve path so it doesn't
         // fstat a second time.
         if conn_details.cached_flavor == CachedFlavor::Volatile {
-            match file.metadata().await {
-                Ok(md) if md.file_type().is_file() => {
+            match regular_file_metadata(&file, &cache_path).await {
+                Ok(md) => {
                     let last_modified = md
                         .modified()
                         .expect("Platform should support modification timestamps via setup check");
@@ -1307,24 +1310,7 @@ async fn try_sendfile_request(
                     metrics::VOLATILE_HIT.increment();
                     break 'cache_lookup Some((file, Some(md)));
                 }
-                Ok(_) => {
-                    metrics::CACHE_NON_REGULAR.increment();
-                    error!(
-                        "Cache file `{}` is not a regular file; refusing to serve and returning 500",
-                        cache_path.display()
-                    );
-                    return ZeroCopyResult::Invalid {
-                        status: StatusCode::INTERNAL_SERVER_ERROR,
-                        msg: "Cache Access Failure",
-                    };
-                }
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to get metadata of cached file `{}` for client {client}; returning 500:  {}",
-                        cache_path.display(),
-                        ErrorReport(&err)
-                    );
+                Err(CacheAccessFailure) => {
                     return ZeroCopyResult::Invalid {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
                         msg: "Cache Access Failure",
@@ -1675,27 +1661,9 @@ pub(crate) async fn serve_file_via_sendfile(
     let mdata = if let Some(m) = prefetched_mdata {
         m
     } else {
-        match file.metadata().await {
-            Ok(m) if m.file_type().is_file() => m,
-            Ok(_) => {
-                metrics::CACHE_NON_REGULAR.increment();
-                error!(
-                    "Cache file `{}` is not a regular file; refusing to serve and returning 500",
-                    file_path.display()
-                );
-                return SendfileResult::Invalid {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    msg: "Cache Access Failure",
-                };
-            }
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to get metadata of cached file `{}` for client {}; returning 500:  {}",
-                    file_path.display(),
-                    conn_details.client,
-                    ErrorReport(&err)
-                );
+        match regular_file_metadata(&file, file_path).await {
+            Ok(m) => m,
+            Err(CacheAccessFailure) => {
                 return SendfileResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     msg: "Cache Access Failure",
@@ -2848,27 +2816,9 @@ async fn serve_unfinished_sendfile(
         return ZeroCopyResult::NotApplicable("unknown content length for in-progress download");
     };
 
-    let metadata = match file.metadata().await {
-        Ok(m) if m.file_type().is_file() => m,
-        Ok(_) => {
-            metrics::CACHE_NON_REGULAR.increment();
-            error!(
-                "Cache file `{}` is not a regular file; refusing to serve and returning 500",
-                file_path.display()
-            );
-            return ZeroCopyResult::Invalid {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                msg: "Cache Access Failure",
-            };
-        }
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to get metadata of downloading file `{}` for joining client {}; returning 500:  {}",
-                file_path.display(),
-                conn_details.client,
-                ErrorReport(&err)
-            );
+    let metadata = match regular_file_metadata(&file, &file_path).await {
+        Ok(m) => m,
+        Err(CacheAccessFailure) => {
             return ZeroCopyResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",
