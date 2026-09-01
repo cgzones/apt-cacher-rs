@@ -25,11 +25,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::{HashMap, hash_map::Entry};
+use http::StatusCode;
+use tracing::{error, info};
 
 use crate::ContentLength;
-use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef};
+use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef, ConnectionDetails};
 use crate::cache_metadata::UpstreamMetadata;
-use crate::error::MirrorDownloadRate;
+use crate::error::{ErrorReport, MirrorDownloadRate};
+use crate::utils::tokio_nofollow_options;
 use crate::{global_config, metrics};
 
 #[derive(Debug)]
@@ -74,11 +77,207 @@ pub(crate) enum ActiveDownloadStatus {
         path: PathBuf,
         meta: Option<Arc<UpstreamMetadata>>,
     },
-    #[cfg_attr(
-        not(feature = "hyper"),
-        expect(unused, reason = "not read in splice backend")
-    )]
     Aborted(AbortReason),
+}
+
+/// A late joiner's view of an in-flight download once it has left `Init`,
+/// with the file already open. Produced by [`await_serveable`].
+pub(crate) enum Serveable {
+    /// The writer is still streaming: serve from the growing partial file,
+    /// tailing `rx` for progress pings (see `DownloadBarrier::ping`).
+    InProgress {
+        file: tokio::fs::File,
+        path: PathBuf,
+        content_length: ContentLength,
+        rx: tokio::sync::watch::Receiver<()>,
+        meta: Arc<UpstreamMetadata>,
+    },
+    /// Every byte is on disk (`Verifying` or `Finished`): serve `file` as a
+    /// complete cached copy. `meta` is `None` only for a `Finished` entry
+    /// produced by `InitBarrier::finished` (see `ActiveDownloadStatus`).
+    Complete {
+        file: tokio::fs::File,
+        path: PathBuf,
+        meta: Option<Arc<UpstreamMetadata>>,
+    },
+}
+
+/// Why a late joiner could not be served. Every variant was already logged
+/// (and metered where applicable) by [`await_serveable`]; callers only map
+/// it to their transport's response via [`Self::response_parts`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum JoinFailure {
+    /// The writer aborted; `rate_timeout` when it gave up on a stalled
+    /// mirror (`min_download_rate`), which is the client's 504.
+    Aborted { rate_timeout: bool },
+    /// Still `Init` after the writer signalled - a logic error.
+    StateCorrupted,
+    /// Opening the file failed (`CACHE_IO_FAILURE` bumped).
+    CacheAccess,
+}
+
+impl JoinFailure {
+    /// The canonical status + body both backends answer with.
+    #[must_use]
+    pub(crate) fn response_parts(self) -> (StatusCode, &'static str) {
+        match self {
+            Self::Aborted { rate_timeout: true } => {
+                (StatusCode::GATEWAY_TIMEOUT, "Upstream Download Timeout")
+            }
+            Self::Aborted {
+                rate_timeout: false,
+            } => (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted"),
+            Self::StateCorrupted => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Download State Corrupted",
+            ),
+            Self::CacheAccess => (StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure"),
+        }
+    }
+}
+
+/// Wait for an in-flight download to leave `Init`, then open the file a late
+/// joiner serves from. The one implementation of the late-joiner state
+/// machine shared by the hyper and sendfile backends.
+///
+/// `Download` opens the partial under the status read lock: the writer can
+/// only move the file after flipping to `Verifying`, which needs the write
+/// lock, so the path cannot go stale mid-open. `Verifying` and `Finished`
+/// open after releasing the lock; a `Verifying` open that loses the race
+/// with the rename (`ENOENT`) re-reads the status and picks up `Finished`
+/// with the new path.
+pub(crate) async fn await_serveable(
+    status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    conn_details: &ConnectionDetails,
+) -> Result<Serveable, JoinFailure> {
+    fn aliased(conn_details: &ConnectionDetails) -> String {
+        conn_details
+            .aliased_host
+            .map_or_else(String::new, |alias| format!(" aliased to host {alias}"))
+    }
+
+    async fn open(
+        what: &str,
+        path: &std::path::Path,
+        conn_details: &ConnectionDetails,
+    ) -> std::io::Result<tokio::fs::File> {
+        tokio_nofollow_options()
+            .read(true)
+            .open(path)
+            .await
+            .inspect_err(|err| {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to open {what} file `{}` for joining client {}; returning 500:  {}",
+                    path.display(),
+                    conn_details.client,
+                    ErrorReport(err)
+                );
+            })
+    }
+
+    let mut init_waited = false;
+
+    loop {
+        let st = status.read().await;
+
+        match &*st {
+            ActiveDownloadStatus::Init(init_rx) => {
+                let mut init_rx = init_rx.clone();
+                drop(st);
+
+                debug_assert!(
+                    !init_waited,
+                    "state should change once a ping is received or the downloading task dropped the sender"
+                );
+                if init_waited {
+                    error!(
+                        "Download state still Init after waiting for download of {} from mirror {}{}; returning 500",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        aliased(conn_details)
+                    );
+                    return Err(JoinFailure::StateCorrupted);
+                }
+
+                // Either the state changed manually by the downloading task,
+                // or the downloading task just dropped the sender.
+                if let Err(_err @ tokio::sync::watch::error::RecvError { .. }) =
+                    init_rx.changed().await
+                {}
+                init_waited = true;
+            }
+            ActiveDownloadStatus::Download {
+                path,
+                content_length,
+                rx,
+                meta,
+            } => {
+                let Ok(file) = open("downloading", path, conn_details).await else {
+                    return Err(JoinFailure::CacheAccess);
+                };
+                let serveable = Serveable::InProgress {
+                    file,
+                    path: path.clone(),
+                    content_length: *content_length,
+                    rx: rx.clone(),
+                    meta: Arc::clone(meta),
+                };
+                drop(st);
+                return Ok(serveable);
+            }
+            ActiveDownloadStatus::Verifying {
+                path,
+                content_length: _,
+                meta,
+            } => {
+                let path = path.clone();
+                let meta = Some(Arc::clone(meta));
+                drop(st);
+                let file = match tokio_nofollow_options().read(true).open(&path).await {
+                    Ok(f) => f,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // Lost the rename race; re-read status.
+                        continue;
+                    }
+                    Err(err) => {
+                        metrics::CACHE_IO_FAILURE.increment();
+                        error!(
+                            "Failed to open verifying file `{}` for joining client {}; returning 500:  {}",
+                            path.display(),
+                            conn_details.client,
+                            ErrorReport(&err)
+                        );
+                        return Err(JoinFailure::CacheAccess);
+                    }
+                };
+                return Ok(Serveable::Complete { file, path, meta });
+            }
+            ActiveDownloadStatus::Finished { path, meta } => {
+                let path = path.clone();
+                let meta = meta.clone();
+                drop(st);
+                let Ok(file) = open("finished", &path, conn_details).await else {
+                    return Err(JoinFailure::CacheAccess);
+                };
+                return Ok(Serveable::Complete { file, path, meta });
+            }
+            ActiveDownloadStatus::Aborted(reason) => {
+                let rate_timeout = matches!(reason, AbortReason::MirrorDownloadRate(_));
+                drop(st);
+                let failure = JoinFailure::Aborted { rate_timeout };
+                info!(
+                    "Download of {} from mirror {}{} was aborted; returning {} to joining client {}",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    aliased(conn_details),
+                    failure.response_parts().0.as_u16(),
+                    conn_details.client
+                );
+                return Err(failure);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

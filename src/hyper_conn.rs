@@ -30,7 +30,9 @@ use crate::mmap_body::MmapBody;
 use crate::{
     APP_NAME, APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, ProxyCacheBody,
     Scheme, VOLATILE_CACHE_MAX_AGE, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
-    active_downloads::{AbortReason, ActiveDownloadStatus, InsertOutcome},
+    active_downloads::{
+        AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
+    },
     cache_conditional::CacheInfo,
     cache_layout::{self, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
     cache_metadata::{self, UpstreamMetadata},
@@ -1457,177 +1459,30 @@ async fn serve_downloading_file(
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     prefetched_upstream_metadata: Option<&UpstreamMetadata>,
 ) -> Response<ProxyCacheBody> {
-    let mut init_waited = false;
-
-    loop {
-        let st = status.read().await;
-
-        match &*st {
-            ActiveDownloadStatus::Aborted(err) => {
-                let (status_code, msg) = match err {
-                    AbortReason::MirrorDownloadRate(_) => {
-                        (StatusCode::GATEWAY_TIMEOUT, "Upstream Download Timeout")
-                    }
-                    AbortReason::AlreadyLoggedJustFail => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted")
-                    }
-                };
-                drop(st);
-                drop(status);
-                return quick_response(status_code, msg);
-            }
-            ActiveDownloadStatus::Init(init_rx) => {
-                let mut init_rx = init_rx.clone();
-                drop(st);
-
-                debug_assert!(
-                    !init_waited,
-                    "state should change once a ping is received or the downloading task dropped the sender"
-                );
-                if init_waited {
-                    error!(
-                        "Download state still Init after waiting for download of {} from mirror {}; returning 500",
-                        conn_details.debname, conn_details.mirror
-                    );
-                    return quick_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Download State Corrupted",
-                    );
-                }
-
-                // Either the state changed manually by the downloading task,
-                // or the downloading task just dropped the sender.
-                if let Err(_err @ tokio::sync::watch::error::RecvError { .. }) =
-                    init_rx.changed().await
-                {}
-                init_waited = true;
-            }
-            ActiveDownloadStatus::Finished { path, meta } => {
-                let path_clone = path.clone();
-                let prefetched_upstream_metadata = if let Some(meta) = prefetched_upstream_metadata
-                {
-                    Some(UpstreamMetadataView::Borrowed(meta))
-                } else {
-                    meta.as_ref()
-                        .map(|meta| UpstreamMetadataView::Arc(Arc::clone(meta)))
-                };
-                drop(st);
-                drop(status);
-                let file = match tokio_nofollow_options().read(true).open(&path_clone).await {
-                    Ok(f) => f,
-                    Err(err) => {
-                        metrics::CACHE_IO_FAILURE.increment();
-                        error!(
-                            "Failed to open downloaded file `{}`; returning 500:  {}",
-                            path_clone.display(),
-                            ErrorReport(&err)
-                        );
-                        return quick_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Cache Access Failure",
-                        );
-                    }
-                };
-
-                return serve_cached_file(
-                    conn_details,
-                    &req,
-                    file,
-                    path_clone,
-                    prefetched_upstream_metadata.as_deref(),
-                    None,
-                )
-                .await;
-            }
-            ActiveDownloadStatus::Verifying {
-                path,
-                content_length: _,
-                meta,
-            } => {
-                // Writer has finished writing all bytes; the file is being
-                // hashed and will be renamed to its dest path. Open the
-                // partial path now — the inode stays valid across the
-                // upcoming rename. On the rare ENOENT race (open after the
-                // rename completes but before the status flip lands), re-loop
-                // and pick up the Finished state with the new path.
-                let path_clone = path.clone();
-                let prefetched_upstream_metadata = if let Some(meta) = prefetched_upstream_metadata
-                {
-                    Some(UpstreamMetadataView::Borrowed(meta))
-                } else {
-                    Some(UpstreamMetadataView::Arc(Arc::clone(meta)))
-                };
-                drop(st);
-                let file = match tokio_nofollow_options().read(true).open(&path_clone).await {
-                    Ok(f) => f,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        // Lost the rename race; re-read status.
-                        continue;
-                    }
-                    Err(err) => {
-                        metrics::CACHE_IO_FAILURE.increment();
-                        error!(
-                            "Failed to open verifying file `{}`; returning 500:  {}",
-                            path_clone.display(),
-                            ErrorReport(&err)
-                        );
-                        return quick_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Cache Access Failure",
-                        );
-                    }
-                };
-                drop(status);
-
-                return serve_cached_file(
-                    conn_details,
-                    &req,
-                    file,
-                    path_clone,
-                    prefetched_upstream_metadata.as_deref(),
-                    None,
-                )
-                .await;
-            }
-            ActiveDownloadStatus::Download {
-                path,
-                content_length,
-                rx: receiver,
-                meta,
-            } => {
-                // Cannot use mmap(2) since the file is not yet completely written
-                let file = match tokio_nofollow_options().read(true).open(&path).await {
-                    Ok(f) => f,
-                    Err(err) => {
-                        metrics::CACHE_IO_FAILURE.increment();
-                        error!(
-                            "Failed to open downloading file `{}`; returning 500:  {}",
-                            path.display(),
-                            ErrorReport(&err)
-                        );
-                        return quick_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Cache Access Failure",
-                        );
-                    }
-                };
-                let path_clone = path.clone();
-                let content_length_copy = *content_length;
-                let receiver_clone = receiver.clone();
-                let upstream_metadata = Arc::clone(meta);
-                drop(st);
-
-                return serve_unfinished_file(
-                    conn_details,
-                    file,
-                    path_clone,
-                    status,
-                    content_length_copy,
-                    receiver_clone,
-                    &upstream_metadata,
-                )
-                .await;
-            }
+    match await_serveable(&status, &conn_details).await {
+        Ok(Serveable::InProgress {
+            file,
+            path,
+            content_length,
+            rx,
+            meta,
+        }) => {
+            serve_unfinished_file(conn_details, file, path, status, content_length, rx, &meta).await
+        }
+        Ok(Serveable::Complete { file, path, meta }) => {
+            drop(status);
+            // A caller-supplied snapshot (the stale-volatile revalidation
+            // path) wins over what the status carried.
+            let meta = match (prefetched_upstream_metadata, meta) {
+                (Some(meta), _) => Some(UpstreamMetadataView::Borrowed(meta)),
+                (None, meta) => meta.map(UpstreamMetadataView::Arc),
+            };
+            serve_cached_file(conn_details, &req, file, path, meta.as_deref(), None).await
+        }
+        Err(failure) => {
+            drop(status);
+            let (status_code, msg) = failure.response_parts();
+            quick_response(status_code, msg)
         }
     }
 }

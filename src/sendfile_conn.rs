@@ -23,7 +23,7 @@ use crate::hyper_conn::handle_hyper_connection;
 use crate::splice_conn::SpliceProxyError;
 use crate::{
     APP_NAME, APP_VIA, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
-    active_downloads::ActiveDownloadStatus,
+    active_downloads::{ActiveDownloadStatus, Serveable, await_serveable},
     cache_conditional::CacheInfo,
     cache_layout::{CachedFlavor, ConnectionDetails},
     cache_metadata::{self},
@@ -2598,171 +2598,36 @@ async fn serve_unfinished_sendfile(
     conn_action: ConnectionAction,
     headers: RangeRequestHeaders<'_>,
 ) -> ZeroCopyResult {
-    // Wait for the download to leave the Init state and learn the file path,
-    // content length, notification receiver, and the upstream metadata
-    // captured on the status (so we don't need to xattr-read the temp file
-    // for ETag / Last-Modified during the conditional-request decision).
-    let (file, file_path, total_size, receiver, status_meta) = {
-        let mut init_waited = false;
-        loop {
-            let st = dl_status.read().await;
-            let _: Never = match &*st {
-                ActiveDownloadStatus::Init(init_rx) => {
-                    let mut init_rx = init_rx.clone();
-                    drop(st);
-                    debug_assert!(
-                        !init_waited,
-                        "state should change once a ping is received or the downloading task dropped the sender"
-                    );
-                    if init_waited {
-                        error!(
-                            "Download state still Init after waiting for download of {} from mirror {}{aliased}; returning 500",
-                            conn_details.debname, conn_details.mirror
-                        );
-                        return ZeroCopyResult::Invalid {
-                            status: StatusCode::INTERNAL_SERVER_ERROR,
-                            msg: "Download State Corrupted",
-                        };
-                    }
-                    if let Err(_err @ tokio::sync::watch::error::RecvError { .. }) =
-                        init_rx.changed().await
-                    {}
-                    init_waited = true;
-
-                    continue;
-                }
-                ActiveDownloadStatus::Download {
-                    path,
-                    content_length,
-                    rx,
-                    meta,
-                } => {
-                    let file = match tokio_nofollow_options().read(true).open(path).await {
-                        Ok(f) => f,
-                        Err(err) => {
-                            metrics::CACHE_IO_FAILURE.increment();
-                            error!(
-                                "Failed to open downloading file `{}` for joining client {}; returning 500:  {}",
-                                path.display(),
-                                conn_details.client,
-                                ErrorReport(&err)
-                            );
-                            return ZeroCopyResult::Invalid {
-                                status: StatusCode::INTERNAL_SERVER_ERROR,
-                                msg: "Cache Access Failure",
-                            };
-                        }
-                    };
-                    let r = (
-                        file,
-                        path.clone(),
-                        *content_length,
-                        rx.clone(),
-                        Arc::clone(meta),
-                    );
-                    drop(st);
-                    break r;
-                }
-                ActiveDownloadStatus::Finished { path, meta } => {
-                    let finished_path = path.clone();
-                    let prefetched = meta.clone();
-                    drop(st);
-
-                    let file = match tokio_nofollow_options()
-                        .read(true)
-                        .open(&finished_path)
-                        .await
-                    {
-                        Ok(f) => f,
-                        Err(err) => {
-                            metrics::CACHE_IO_FAILURE.increment();
-                            error!(
-                                "Failed to open finished file `{}` for joining client {}; returning 500:  {}",
-                                finished_path.display(),
-                                conn_details.client,
-                                ErrorReport(&err)
-                            );
-                            return ZeroCopyResult::Invalid {
-                                status: StatusCode::INTERNAL_SERVER_ERROR,
-                                msg: "Cache Access Failure",
-                            };
-                        }
-                    };
-
-                    return serve_file_via_sendfile(
-                        stream,
-                        conn_details,
-                        aliased,
-                        (file, None, &finished_path),
-                        (conn_version, conn_action),
-                        headers,
-                        prefetched.as_deref(),
-                    )
-                    .await
-                    .into();
-                }
-                ActiveDownloadStatus::Verifying {
-                    path,
-                    content_length: _,
-                    meta,
-                } => {
-                    // All bytes are on disk; the writer is hashing and about
-                    // to rename. Open the partial path now — the inode stays
-                    // valid across the upcoming rename. On the rare ENOENT
-                    // race (open after the rename completes but before the
-                    // status flip lands), re-loop and pick up Finished.
-                    let verifying_path = path.clone();
-                    let prefetched = Arc::clone(meta);
-                    drop(st);
-
-                    let file = match tokio_nofollow_options()
-                        .read(true)
-                        .open(&verifying_path)
-                        .await
-                    {
-                        Ok(f) => f,
-                        Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                        Err(err) => {
-                            metrics::CACHE_IO_FAILURE.increment();
-                            error!(
-                                "Failed to open verifying file `{}` for joining client {}; returning 500:  {}",
-                                verifying_path.display(),
-                                conn_details.client,
-                                ErrorReport(&err)
-                            );
-                            return ZeroCopyResult::Invalid {
-                                status: StatusCode::INTERNAL_SERVER_ERROR,
-                                msg: "Cache Access Failure",
-                            };
-                        }
-                    };
-
-                    return serve_file_via_sendfile(
-                        stream,
-                        conn_details,
-                        aliased,
-                        (file, None, &verifying_path),
-                        (conn_version, conn_action),
-                        headers,
-                        Some(&prefetched),
-                    )
-                    .await
-                    .into();
-                }
-                ActiveDownloadStatus::Aborted(_) => {
-                    drop(st);
-                    info!(
-                        "Download of {} from mirror {}{aliased} was aborted; returning 500 to joining client {}",
-                        conn_details.debname, conn_details.mirror, conn_details.client
-                    );
-                    return ZeroCopyResult::Invalid {
-                        status: StatusCode::INTERNAL_SERVER_ERROR,
-                        msg: "Download Aborted",
-                    };
-                }
-            };
-        }
-    };
+    // Wait for the download to leave the Init state; a complete copy
+    // (Verifying/Finished) is served like any cached file, an in-progress
+    // one below via the partial file plus the progress receiver.
+    let (file, file_path, total_size, receiver, status_meta) =
+        match await_serveable(&dl_status, conn_details).await {
+            Ok(Serveable::InProgress {
+                file,
+                path,
+                content_length,
+                rx,
+                meta,
+            }) => (file, path, content_length, rx, meta),
+            Ok(Serveable::Complete { file, path, meta }) => {
+                return serve_file_via_sendfile(
+                    stream,
+                    conn_details,
+                    aliased,
+                    (file, None, &path),
+                    (conn_version, conn_action),
+                    headers,
+                    meta.as_deref(),
+                )
+                .await
+                .into();
+            }
+            Err(failure) => {
+                let (status, msg) = failure.response_parts();
+                return ZeroCopyResult::Invalid { status, msg };
+            }
+        };
 
     // We need an exact content length to write a Content-Length header.
     #[cfg_attr(
