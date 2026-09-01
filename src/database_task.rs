@@ -13,21 +13,34 @@ use crate::{
     metrics,
 };
 
-pub(crate) struct DbCmdDelivery {
-    pub(crate) mirror: Mirror,
-    pub(crate) debname: String,
-    pub(crate) size: u64,
-    pub(crate) elapsed: StdDuration,
-    pub(crate) partial: bool,
-    pub(crate) client_ip: IpAddr,
+/// Which per-transfer table a [`DbCmdTransfer`] is recorded in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TransferKind {
+    /// A body shipped to a client (`deliveries`); `partial` marks a 206.
+    Delivery { partial: bool },
+    /// A body fetched from upstream and committed to the cache (`downloads`).
+    Download,
 }
 
-pub(crate) struct DbCmdDownload {
+impl TransferKind {
+    /// Log noun for the record.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Delivery { partial: _ } => "delivery",
+            Self::Download => "download",
+        }
+    }
+}
+
+/// One completed transfer, delivery or download; the two tables share every
+/// column but `partial`.
+pub(crate) struct DbCmdTransfer {
     pub(crate) mirror: Mirror,
     pub(crate) debname: String,
     pub(crate) size: u64,
     pub(crate) elapsed: StdDuration,
     pub(crate) client_ip: IpAddr,
+    pub(crate) kind: TransferKind,
 }
 
 pub(crate) struct DbCmdOrigin {
@@ -39,8 +52,7 @@ pub(crate) struct DbCmdPing {
 }
 
 pub(crate) enum DatabaseCommand {
-    Delivery(DbCmdDelivery),
-    Download(DbCmdDownload),
+    Transfer(DbCmdTransfer),
     Origin(DbCmdOrigin),
     Ping(DbCmdPing),
 }
@@ -207,11 +219,12 @@ async fn stage(
     now: i64,
 ) {
     match cmd {
-        DatabaseCommand::Delivery(c) => {
+        DatabaseCommand::Transfer(c) => {
+            let noun = c.kind.noun();
             let Some((size, duration)) = convert_size_duration(c.size, c.elapsed) else {
                 metrics::DB_OPERATION_FAILED.increment();
                 error!(
-                    "Delivery size/duration conversion overflowed for {} from mirror {}; dropping the delivery record",
+                    "Transfer size/duration conversion overflowed for {} from mirror {}; dropping the {noun} record",
                     c.debname, c.mirror
                 );
                 return;
@@ -221,7 +234,7 @@ async fn stage(
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
-                        "Failed to resolve the mirror id for a delivery of {debname} from mirror {mirror}; dropping the delivery record:  {}",
+                        "Failed to resolve the mirror id for a {noun} of {debname} from mirror {mirror}; dropping the {noun} record:  {}",
                         ErrorReport(&err),
                         debname = c.debname,
                         mirror = c.mirror
@@ -229,44 +242,24 @@ async fn stage(
                     return;
                 }
             };
-            buf.deliveries.push(DeliveryRow {
-                mirror_id,
-                debname: c.debname,
-                size,
-                duration,
-                partial: u8::from(c.partial),
-                client_ip: ip_to_octets(c.client_ip),
-            });
-        }
-        DatabaseCommand::Download(c) => {
-            let Some((size, duration)) = convert_size_duration(c.size, c.elapsed) else {
-                metrics::DB_OPERATION_FAILED.increment();
-                error!(
-                    "Download size/duration conversion overflowed for {} from mirror {}; dropping the download record",
-                    c.debname, c.mirror
-                );
-                return;
-            };
-            let mirror_id = match resolve_mirror_id(db, cache, &c.mirror, now).await {
-                Ok(id) => id,
-                Err(err) => {
-                    metrics::DB_OPERATION_FAILED.increment();
-                    error!(
-                        "Failed to resolve the mirror id for a download of {debname} from mirror {mirror}; dropping the download record:  {}",
-                        ErrorReport(&err),
-                        debname = c.debname,
-                        mirror = c.mirror
-                    );
-                    return;
-                }
-            };
-            buf.downloads.push(DownloadRow {
-                mirror_id,
-                debname: c.debname,
-                size,
-                duration,
-                client_ip: ip_to_octets(c.client_ip),
-            });
+            let client_ip = ip_to_octets(c.client_ip);
+            match c.kind {
+                TransferKind::Delivery { partial } => buf.deliveries.push(DeliveryRow {
+                    mirror_id,
+                    debname: c.debname,
+                    size,
+                    duration,
+                    partial: u8::from(partial),
+                    client_ip,
+                }),
+                TransferKind::Download => buf.downloads.push(DownloadRow {
+                    mirror_id,
+                    debname: c.debname,
+                    size,
+                    duration,
+                    client_ip,
+                }),
+            }
         }
         DatabaseCommand::Origin(c) => {
             let mirror_id = match resolve_mirror_id(db, cache, &c.origin.mirror, now).await {

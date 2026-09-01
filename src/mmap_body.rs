@@ -7,7 +7,7 @@ use tracing::info;
 use crate::{
     cache_layout::{CachedFlavor, ConnectionDetails},
     client_counter,
-    database_task::{DatabaseCommand, DbCmdDelivery, send_db_command_nonblocking},
+    database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command_nonblocking},
     humanfmt::HumanFmt,
     metrics,
     precise_instant::PreciseInstant,
@@ -80,12 +80,12 @@ impl Drop for MmapBody {
                 rate_log::client_segment(size, elapsed),
             );
 
-            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
                 mirror: cd.mirror,
                 debname: cd.debname,
                 size,
                 elapsed,
-                partial,
+                kind: TransferKind::Delivery { partial },
                 client_ip: cd.client.ip(),
             });
             send_db_command_nonblocking(cmd);

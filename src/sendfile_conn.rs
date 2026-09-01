@@ -30,7 +30,7 @@ use crate::{
     client_counter,
     connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
-    database_task::{DatabaseCommand, DbCmdDelivery, send_db_command},
+    database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
     error::{ErrorReport, errno_to_io_error},
     global_config,
     http_helpers::{
@@ -1742,12 +1742,14 @@ pub(crate) async fn serve_file_via_sendfile(
                 HumanFmt::Time(in_time),
                 rate_log::client_segment(transferred, elapsed),
             );
-            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
                 mirror: conn_details.mirror.clone(),
                 debname: conn_details.debname.clone(),
                 size: content_length,
                 elapsed,
-                partial: content_range.is_some(),
+                kind: TransferKind::Delivery {
+                    partial: content_range.is_some(),
+                },
                 client_ip: conn_details.client.ip(),
             });
             send_db_command(cmd).await;
@@ -2897,12 +2899,14 @@ async fn serve_unfinished_sendfile(
                 HumanFmt::Time(in_time),
                 rate_log::client_segment(transferred, elapsed),
             );
-            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
                 mirror: conn_details.mirror.clone(),
                 debname: conn_details.debname.clone(),
                 size: content_length,
                 elapsed,
-                partial: content_range.is_some(),
+                kind: TransferKind::Delivery {
+                    partial: content_range.is_some(),
+                },
                 client_ip: conn_details.client.ip(),
             });
             send_db_command(cmd).await;

@@ -40,7 +40,7 @@ use crate::{
     connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
     database_task::{
-        DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
+        DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command,
         send_db_command_nonblocking,
     },
     deb_mirror::Origin,
@@ -476,12 +476,12 @@ impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
                 HumanFmt::Time(in_time),
                 rate_log::client_segment(size, duration),
             );
-            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
                 mirror: cd.mirror,
                 debname: cd.debname,
                 size,
                 elapsed: duration,
-                partial,
+                kind: TransferKind::Delivery { partial },
                 client_ip: cd.client.ip(),
             });
             send_db_command_nonblocking(cmd);
@@ -956,12 +956,12 @@ async fn serve_unfinished_file(
                 HumanFmt::Time(in_time),
                 rate_log::client_segment(bytes, elapsed),
             );
-            let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
                 mirror: conn_details.mirror,
                 debname: conn_details.debname,
                 size: bytes,
                 elapsed,
-                partial: false,
+                kind: TransferKind::Delivery { partial: false },
                 client_ip: conn_details.client.ip(),
             });
             send_db_command(cmd).await;
@@ -1980,12 +1980,13 @@ async fn download_file(
         },
     );
 
-    let cmd = DatabaseCommand::Download(DbCmdDownload {
+    let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
         mirror: conn_details.mirror.clone(),
         debname: conn_details.debname.clone(),
         size: total_bytes,
         elapsed,
         client_ip: conn_details.client.ip(),
+        kind: TransferKind::Download,
     });
     send_db_command(cmd).await;
 }

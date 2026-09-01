@@ -29,7 +29,7 @@ use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
 use crate::cache_quota::QuotaExceeded;
 use crate::config::ClientHost;
 use crate::database_task::{
-    DatabaseCommand, DbCmdDelivery, DbCmdDownload, DbCmdOrigin, send_db_command,
+    DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command,
 };
 use crate::deb_mirror::{Mirror, MirrorKind, Origin};
 use crate::error::{ErrorReport, errno_to_io_error};
@@ -6288,12 +6288,13 @@ async fn splice_proxy_drive(
 
     if cache_committed {
         // Record download in database (mirrors download_file() in hyper_conn.rs).
-        let cmd = DatabaseCommand::Download(DbCmdDownload {
+        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
             mirror: conn_details.mirror.clone(),
             debname: conn_details.debname.clone(),
             size: total_content_length.get(),
             elapsed,
             client_ip: conn_details.client.ip(),
+            kind: TransferKind::Download,
         });
         send_db_command(cmd).await;
 
@@ -6410,12 +6411,14 @@ async fn splice_proxy_drive(
     metrics::SERVED_TOTAL.increment();
 
     if cache_committed {
-        let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
             mirror: conn_details.mirror.clone(),
             debname: conn_details.debname.clone(),
             size: total_content_length.get(),
             elapsed,
-            partial: is_partial,
+            kind: TransferKind::Delivery {
+                partial: is_partial,
+            },
             client_ip: conn_details.client.ip(),
         });
         send_db_command(cmd).await;
@@ -7386,12 +7389,13 @@ async fn handle_volatile_buffered_download(
 
     if cache_committed {
         // Record download in database (mirrors download_file() in hyper_conn.rs).
-        let cmd = DatabaseCommand::Download(DbCmdDownload {
+        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
             mirror: conn_details.mirror.clone(),
             debname: conn_details.debname.clone(),
             size: total_content_length.get(),
             elapsed,
             client_ip: conn_details.client.ip(),
+            kind: TransferKind::Download,
         });
         send_db_command(cmd).await;
 
@@ -7526,12 +7530,14 @@ async fn handle_volatile_buffered_download(
         );
 
         // Record delivery in database.
-        let cmd = DatabaseCommand::Delivery(DbCmdDelivery {
+        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
             mirror: conn_details.mirror.clone(),
             debname: conn_details.debname.clone(),
             size: total_content_length.get(),
             elapsed,
-            partial: is_partial,
+            kind: TransferKind::Delivery {
+                partial: is_partial,
+            },
             client_ip: conn_details.client.ip(),
         });
         send_db_command(cmd).await;
