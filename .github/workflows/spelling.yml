@@ -48,4 +48,4 @@ jobs:
       # Picks up _typos.toml automatically.  Complements codespell: the two
       # carry different dictionaries and disagree on what is a typo.
       - name: Run typos
-        uses: crate-ci/typos@v1.49.0
+        uses: crate-ci/typos@v1.50.0
