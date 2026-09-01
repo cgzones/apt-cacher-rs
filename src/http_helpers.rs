@@ -1,12 +1,13 @@
-use std::io::ErrorKind;
+use std::{borrow::Cow, io::ErrorKind};
 
 use http::{HeaderName, StatusCode};
 use tokio::net::TcpStream;
-use tracing::trace;
 
 use crate::{
-    APP_NAME, APP_VIA, Never, global_config, http_range::format_http_date, humanfmt::HumanFmt,
+    Never, global_config,
+    humanfmt::HumanFmt,
     metrics,
+    response_head::{ResponseHead, ResponseKind, WireBody, retry_after_secs},
 };
 
 /// Represents the action to take after sending a response.
@@ -123,24 +124,16 @@ pub(crate) async fn write_304_response(
     age: u32,
     etag: Option<&str>,
 ) -> std::io::Result<()> {
-    let date = format_http_date();
-
-    let response = format!(
-        "{conn_version} 304 Not Modified\r\n\
-         Date: {date}\r\n\
-         Via: {APP_VIA}\r\n\
-         Connection: {conn_action}\r\n\
-         Last-Modified: {last_modified_str}\r\n\
-         Content-Length: 0\r\n\
-         {etag_header}\
-         Accept-Ranges: bytes\r\n\
-         Age: {age}\r\n\
-         \r\n",
-        etag_header = OptHeader("ETag", etag),
-    );
-    trace!("Outgoing 304 response:\n{response}");
-    metrics::record_client_status(StatusCode::NOT_MODIFIED);
-    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
+    let head = ResponseHead {
+        content_length: Some(0),
+        accept_ranges: true,
+        last_modified: Some(last_modified_str),
+        etag,
+        age: Some(age),
+        ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
+    };
+    head.write_to(stream, conn_version, conn_action, WireBody::None)
+        .await
 }
 
 /// Write a 416 Range Not Satisfiable response to the stream.
@@ -152,21 +145,16 @@ pub(crate) async fn write_416_response(
     conn_action: ConnectionAction,
     file_size: u64,
 ) -> std::io::Result<()> {
-    let date = format_http_date();
-
-    let response = format!(
-        "{conn_version} 416 Range Not Satisfiable\r\n\
-        Date: {date}\r\n\
-        Via: {APP_VIA}\r\n\
-        Connection: {conn_action}\r\n\
-        Content-Length: 0\r\n\
-        Content-Range: bytes */{file_size}\r\n\
-        Accept-Ranges: bytes\r\n\
-        \r\n"
-    );
-    trace!("Outgoing 416 response:\n{response}");
-    metrics::record_client_status(StatusCode::RANGE_NOT_SATISFIABLE);
-    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
+    // A `Success` head, unlike hyper's 416 (which carries `Server:`) — a
+    // wire-visible backend difference kept as-is.
+    let head = ResponseHead {
+        content_length: Some(0),
+        accept_ranges: true,
+        content_range: Some(ResponseHead::unsatisfied_range(file_size)),
+        ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Success)
+    };
+    head.write_to(stream, conn_version, conn_action, WireBody::None)
+        .await
 }
 
 /// Write an error response to the stream.
@@ -180,36 +168,14 @@ pub(crate) async fn write_invalid_response(
     msg: &'static str,
     retry_after: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
-    let date = format_http_date();
-    let content_length = msg.len();
-
-    let extra_headers = if status == StatusCode::METHOD_NOT_ALLOWED {
-        "Allow: GET\r\n"
-    } else {
-        ""
+    let head = ResponseHead {
+        content_length: Some(msg.len() as u64),
+        accept_ranges: true,
+        retry_after: retry_after.map(retry_after_secs),
+        ..ResponseHead::error(status)
     };
-
-    let retry_after_secs = retry_after
-        .map(|remaining| u32::try_from(remaining.as_secs().saturating_add(1)).unwrap_or(u32::MAX));
-
-    let response = format!(
-        "{conn_version} {status}\r\n\
-         Server: {APP_NAME}\r\n\
-         Via: {APP_VIA}\r\n\
-         Date: {date}\r\n\
-         Connection: {conn_action}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {content_length}\r\n\
-         Accept-Ranges: bytes\r\n\
-         {extra_headers}\
-         {retry_after_header}\
-         \r\n\
-         {msg}",
-        retry_after_header = OptHeader("Retry-After", retry_after_secs),
-    );
-    trace!("Outgoing error response:\n{response}");
-    metrics::record_client_status(status);
-    write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
+    head.write_to(stream, conn_version, conn_action, WireBody::Inline(msg))
+        .await
 }
 
 pub(crate) struct ResponseHeaders<'a> {
@@ -217,54 +183,44 @@ pub(crate) struct ResponseHeaders<'a> {
     pub(crate) status: StatusCode,
     pub(crate) conn_action: ConnectionAction,
     pub(crate) content_length: u64,
-    pub(crate) content_type: &'a str,
+    pub(crate) content_type: &'static str,
     pub(crate) last_modified_str: &'a str,
     pub(crate) age: u32,
     pub(crate) content_range: Option<&'a str>,
     pub(crate) etag: Option<&'a str>,
 }
 
-/// Write HTTP response headers for a file response.
+/// Write HTTP response headers for a file response whose body follows via
+/// `sendfile(2)`/`splice(2)`.
 ///
 /// Times out after the configured HTTP timeout.
 pub(crate) async fn write_response_headers(
     stream: &TcpStream,
     headers: ResponseHeaders<'_>,
 ) -> std::io::Result<()> {
-    let date = format_http_date();
-
-    let response = format!(
-        "{conn_version} {status}\r\n\
-         Date: {date}\r\n\
-         Via: {APP_VIA}\r\n\
-         Connection: {conn_action}\r\n\
-         Content-Length: {content_length}\r\n\
-         Content-Type: {content_type}\r\n\
-         {content_range_header}\
-         Last-Modified: {last_modified_str}\r\n\
-         {etag_header}\
-         Accept-Ranges: bytes\r\n\
-         Age: {age}\r\n\
-         \r\n",
-        conn_version = headers.conn_version,
-        status = headers.status,
-        conn_action = headers.conn_action,
-        content_length = headers.content_length,
-        content_type = headers.content_type,
-        last_modified_str = headers.last_modified_str,
-        age = headers.age,
-        content_range_header = OptHeader("Content-Range", headers.content_range),
-        etag_header = OptHeader("ETag", headers.etag),
-    );
-
-    trace!("Outgoing file response headers:\n{response}");
-    metrics::record_client_status(headers.status);
-    if headers.content_length == 0 {
-        // No body bytes will follow to flush a MSG_MORE-held segment.
-        write_all_to_stream(stream, response.as_bytes(), WritePhase::Header).await
-    } else {
-        write_all_to_stream_msg_more(stream, response.as_bytes()).await
-    }
+    let ResponseHeaders {
+        conn_version,
+        status,
+        conn_action,
+        content_length,
+        content_type,
+        last_modified_str,
+        age,
+        content_range,
+        etag,
+    } = headers;
+    let head = ResponseHead {
+        content_length: Some(content_length),
+        content_type: Some(content_type),
+        accept_ranges: true,
+        last_modified: Some(last_modified_str),
+        etag,
+        age: Some(age),
+        content_range: content_range.map(Cow::Borrowed),
+        ..ResponseHead::bare(status, ResponseKind::Success)
+    };
+    head.write_to(stream, conn_version, conn_action, WireBody::Follows)
+        .await
 }
 
 /// Like [`write_all_to_stream`] with `WritePhase::Header`, but issues the
@@ -276,7 +232,10 @@ pub(crate) async fn write_response_headers(
 /// Only correct when body bytes follow immediately on the same socket and
 /// the body write does *not* carry the flag (sendfile(2) does not), so the
 /// body tail flushes without an uncork.
-async fn write_all_to_stream_msg_more(stream: &TcpStream, mut data: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_all_to_stream_msg_more(
+    stream: &TcpStream,
+    mut data: &[u8],
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     use nix::sys::socket::{MsgFlags, send};

@@ -42,7 +42,7 @@ use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
 #[cfg(feature = "splice")]
 use crate::splice_conn::SpliceProxyError;
 use crate::{
-    APP_NAME, APP_VIA, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
+    APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
     active_downloads::{ActiveDownloadStatus, Serveable, await_serveable},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
@@ -69,6 +69,7 @@ use crate::{
         ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
         dispatch_request, preflight_method, preflight_target,
     },
+    response_head::{ResponseHead, WireBody},
     static_assert, swrite, tunnel_limiter,
     utils::{
         CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
@@ -554,10 +555,10 @@ async fn serve_webui(
 
 /// Format and write a [`WebResponse`] onto the raw stream.
 ///
-/// Mirrors the layout used by [`crate::http_helpers::write_response_headers`]:
-/// a single `format!` builds the entire status-line + headers block with named
-/// substitutions, so the wire bytes are easy to read alongside the hyper-side
-/// `WebResponse::into_hyper_response` constructor.
+/// Deliberately not a `ResponseHead`: web-interface responses are
+/// origin-server responses (no `Via:`), so a single `format!` builds the
+/// status-line + headers block with named substitutions, mirroring the
+/// hyper-side `WebResponse::into_hyper_response` constructor.
 async fn write_webui_response(
     stream: &TcpStream,
     conn_version: ConnectionVersion,
@@ -858,18 +859,17 @@ async fn run_connect_tunnel(
     }
 
     // Upstream is connected: send `200 Connection Established` so the client may
-    // begin its TLS handshake. Header set mirrors the hyper backend's CONNECT
-    // response (RFC 9110 §7.6.3 requires `Via:` on proxy-generated responses).
-    let established = format!(
-        "{conn_version} 200 Connection Established\r\n\
-         Server: {APP_NAME}\r\n\
-         Via: {APP_VIA}\r\n\
-         Date: {}\r\n\
-         \r\n",
-        format_http_date()
-    );
-    metrics::record_client_status(StatusCode::OK);
-    if let Err(err) = write_all_to_stream(&stream, established.as_bytes(), WritePhase::Header).await
+    // begin its TLS handshake. The head is the same `TunnelEstablished` shape
+    // the hyper backend renders for its CONNECT response; a tunnel head
+    // carries no `Connection:` header, so the action passed is not rendered.
+    if let Err(err) = ResponseHead::tunnel_established()
+        .write_to(
+            &stream,
+            conn_version,
+            ConnectionAction::Close,
+            WireBody::None,
+        )
+        .await
     {
         if is_peer_disconnect(&err) {
             info!(

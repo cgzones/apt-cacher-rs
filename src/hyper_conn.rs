@@ -10,17 +10,16 @@
 //! here.
 
 use std::{
-    convert::Infallible, error::Error as _, num::NonZero, os::unix::fs::MetadataExt as _,
-    path::Path, path::PathBuf, sync::Arc,
+    borrow::Cow, convert::Infallible, error::Error as _, num::NonZero,
+    os::unix::fs::MetadataExt as _, path::Path, path::PathBuf, sync::Arc,
 };
 
 use futures_util::TryStreamExt as _;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
     header::{
-        ACCEPT, ACCEPT_RANGES, AGE, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, DATE, ETAG, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED,
-        LOCATION, RANGE, RETRY_AFTER, SERVER, USER_AGENT, VIA,
+        ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ETAG, HOST, IF_MODIFIED_SINCE,
+        IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT, VIA,
     },
     uri::Authority,
 };
@@ -37,8 +36,8 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(feature = "mmap")]
 use crate::mmap_body::MmapBody;
 use crate::{
-    APP_NAME, APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, ProxyCacheBody,
-    Scheme, VOLATILE_CACHE_MAX_AGE,
+    APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, ProxyCacheBody, Scheme,
+    VOLATILE_CACHE_MAX_AGE,
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
         AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
@@ -60,7 +59,7 @@ use crate::{
     guards::{DownloadBarrier, InitBarrier},
     http_etag::{is_valid_etag, write_etag},
     http_last_modified::write_last_modified,
-    http_range::{HttpDate, format_http_date},
+    http_range::HttpDate,
     humanfmt::HumanFmt,
     metrics,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
@@ -73,6 +72,7 @@ use crate::{
         ClientAcls, DispatchOutcome, RequestKind, RequestTarget, dispatch_request,
         preflight_method, preflight_target,
     },
+    response_head::{ResponseHead, ResponseKind, retry_after_secs},
     scheme_cache, static_assert, tunnel_limiter,
     upstream_head::{
         DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead, plan_download,
@@ -675,34 +675,23 @@ async fn serve_unfinished_file(
         }
     });
 
-    let mut response_builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(DATE, &*format_http_date())
-        .header(VIA, APP_VIA)
-        .header(CONNECTION, "keep-alive")
-        .header(CONTENT_TYPE, content_type)
-        .header(ACCEPT_RANGES, "bytes")
-        .header(
-            LAST_MODIFIED,
-            HeaderValue::try_from(&*last_modified_str).expect("Http datetime is valid"),
-        )
-        .header(AGE, HeaderValue::from(age));
-
-    if let Some(etag) = file_etag {
-        response_builder = response_builder.header(
-            ETAG,
-            HeaderValue::try_from(&*etag).expect("ETag is validated before passing"),
-        );
-    }
-
-    if let ContentLength::Exact(size) = content_length {
-        response_builder = response_builder.header(CONTENT_LENGTH, HeaderValue::from(size.get()));
-    }
+    let head = ResponseHead {
+        content_length: match content_length {
+            ContentLength::Exact(size) => Some(size.get()),
+            ContentLength::Unknown(_) => None,
+        },
+        content_type: Some(content_type),
+        accept_ranges: true,
+        last_modified: Some(&last_modified_str),
+        etag: file_etag.as_deref(),
+        age: Some(age),
+        ..ResponseHead::bare(StatusCode::OK, ResponseKind::Success)
+    };
 
     metrics::REQUESTS_CHANNEL.increment();
     let body = rated_client_body(ChannelBody::new(rx, content_length), client);
 
-    let response = response_builder.body(body).expect("HTTP response is valid");
+    let response = head.into_hyper(body);
 
     trace!("Outgoing response: {response:?}");
 
@@ -781,45 +770,27 @@ async fn serve_cached_file(
                 conn_details.debname, conn_details.mirror, aliased, conn_details.client
             );
 
-            let mut builder = Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(DATE, &*format_http_date())
-                .header(VIA, APP_VIA)
-                .header(CONNECTION, "keep-alive")
-                .header(
-                    LAST_MODIFIED,
-                    HeaderValue::try_from(&*cache_info.last_modified_str)
-                        .expect("HTTP date is valid"),
-                )
-                .header(AGE, HeaderValue::from(cache_info.age));
-
-            if let Some(etag) = cache_info.file_etag.as_deref() {
-                builder = builder.header(
-                    ETAG,
-                    HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
-                );
-            }
-
-            let response = builder.body(empty_body()).expect("HTTP response is valid");
+            let head = ResponseHead {
+                last_modified: Some(&cache_info.last_modified_str),
+                etag: cache_info.file_etag.as_deref(),
+                age: Some(cache_info.age),
+                ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
+            };
+            let response = head.into_hyper(empty_body());
 
             trace!("Outgoing response: {response:?}");
 
             return response;
         }
         ServePlan::NotSatisfiable => {
-            return Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(SERVER, APP_NAME)
-                .header(VIA, APP_VIA)
-                .header(DATE, &*format_http_date())
-                .header(CONNECTION, "keep-alive")
-                .header(
-                    CONTENT_RANGE,
-                    HeaderValue::try_from(format!("bytes */{file_size}"))
-                        .expect("content range is valid"),
-                )
-                .body(empty_body())
-                .expect("HTTP response is valid");
+            // Unlike the sendfile writer, hyper's 416 is an `Error` head
+            // (carries `Server:`) — a wire-visible backend difference kept
+            // as-is.
+            let head = ResponseHead {
+                content_range: Some(ResponseHead::unsatisfied_range(file_size)),
+                ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
+            };
+            return head.into_hyper(empty_body());
         }
     };
 
@@ -959,35 +930,18 @@ fn serve_cached_file_response(
      *  "x-timer":                "S1705782486.334221,VS0,VE1"
      */
 
-    let mut response_builder = Response::builder()
-        .status(http_status)
-        .header(DATE, &*format_http_date())
-        .header(VIA, APP_VIA)
-        .header(CONNECTION, "keep-alive")
-        .header(CONTENT_LENGTH, HeaderValue::from(content_length))
-        .header(CONTENT_TYPE, content_type)
-        .header(
-            LAST_MODIFIED,
-            HeaderValue::try_from(&*cache_info.last_modified_str).expect("date string is valid"),
-        )
-        .header(ACCEPT_RANGES, "bytes")
-        .header(AGE, HeaderValue::from(cache_info.age));
+    let head = ResponseHead {
+        content_length: Some(content_length),
+        content_type: Some(content_type),
+        accept_ranges: true,
+        last_modified: Some(&cache_info.last_modified_str),
+        etag: cache_info.file_etag.as_deref(),
+        age: Some(cache_info.age),
+        content_range: content_range.map(Cow::Owned),
+        ..ResponseHead::bare(http_status, ResponseKind::Success)
+    };
 
-    if let Some(ct) = content_range {
-        response_builder = response_builder.header(
-            CONTENT_RANGE,
-            HeaderValue::try_from(ct).expect("content range string is valid"),
-        );
-    }
-
-    if let Some(etag) = cache_info.file_etag.as_deref() {
-        response_builder = response_builder.header(
-            ETAG,
-            HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
-        );
-    }
-
-    let response = response_builder.body(body).expect("HTTP response is valid");
+    let response = head.into_hyper(body);
 
     trace!("Outgoing response of cached file: {response:?}");
 
@@ -1647,7 +1601,7 @@ async fn serve_new_file(
         }
     };
 
-    let mut req_uri = std::borrow::Cow::Borrowed(req.uri());
+    let mut req_uri = Cow::Borrowed(req.uri());
 
     // Cleanup probes bypass the throttle: they run once per 24h cycle and a
     // 503 would hard-fail the index-fetch cascade; their commit outcome
@@ -1663,18 +1617,11 @@ async fn serve_new_file(
             HumanFmt::Time(throttled.remaining)
         );
         metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-        let secs =
-            u32::try_from(throttled.remaining.as_secs().saturating_add(1)).unwrap_or(u32::MAX);
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header(SERVER, APP_NAME)
-            .header(VIA, APP_VIA)
-            .header(DATE, &*format_http_date())
-            .header(CONNECTION, "keep-alive")
-            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-            .header(RETRY_AFTER, HeaderValue::from(secs))
-            .body(full_body("Recently failed checksum verification"))
-            .expect("Response is valid");
+        let head = ResponseHead {
+            retry_after: Some(retry_after_secs(throttled.remaining)),
+            ..ResponseHead::error(StatusCode::SERVICE_UNAVAILABLE)
+        };
+        return head.into_hyper(full_body("Recently failed checksum verification"));
     }
 
     let prefetched_upstream_metadata = match &cfstate {
@@ -1768,7 +1715,7 @@ async fn serve_new_file(
             // the URI we're actually sending the request to.
             let redirected_host = host_header_from_uri(moved_auth);
 
-            req_uri = std::borrow::Cow::Owned(moved_uri);
+            req_uri = Cow::Owned(moved_uri);
 
             let redirected_request = build_fwd_request(
                 &req_uri,
@@ -2269,22 +2216,16 @@ async fn serve_new_file(
                     config.experimental_parallel_hack_retryafter
                 );
 
-                let mut response_builder = Response::builder()
-                    .status(config.experimental_parallel_hack_statuscode)
-                    .header(DATE, &*format_http_date())
-                    .header(VIA, APP_VIA)
-                    .header(CONNECTION, "keep-alive");
+                let head = ResponseHead {
+                    retry_after: (config.experimental_parallel_hack_retryafter != 0)
+                        .then_some(u32::from(config.experimental_parallel_hack_retryafter)),
+                    ..ResponseHead::bare(
+                        config.experimental_parallel_hack_statuscode,
+                        ResponseKind::Success,
+                    )
+                };
 
-                if config.experimental_parallel_hack_retryafter != 0 {
-                    response_builder = response_builder.header(
-                        RETRY_AFTER,
-                        HeaderValue::from(config.experimental_parallel_hack_retryafter),
-                    );
-                }
-
-                let response = response_builder
-                    .body(empty_body())
-                    .expect("Response is valid");
+                let response = head.into_hyper(empty_body());
 
                 trace!("Outgoing parallel download hack response: {response:?}");
 
@@ -2518,12 +2459,7 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
         }
     });
 
-    let response = Response::builder()
-        .header(SERVER, APP_NAME)
-        .header(VIA, APP_VIA)
-        .header(DATE, &*format_http_date())
-        .body(empty_body())
-        .expect("HTTP response is valid");
+    let response = ResponseHead::tunnel_established().into_hyper(empty_body());
 
     trace!("Outgoing response: {response:?}");
 

@@ -65,6 +65,7 @@ mod rate_checked_body;
 mod rate_checker;
 mod rate_log;
 mod request_dispatch;
+mod response_head;
 mod ringbuffer;
 mod scheme_cache;
 #[cfg(feature = "ktls")]
@@ -111,15 +112,14 @@ use clap::Parser;
 use hashbrown::HashMap;
 use http::Response;
 #[cfg(feature = "hyper")]
-use http::{
-    StatusCode,
-    header::{ALLOW, CONNECTION, CONTENT_TYPE, DATE, SERVER, VIA},
-};
+use http::StatusCode;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use pin_project::pin_project;
 #[cfg(all(feature = "mmap", feature = "hyper"))]
 use rate_checked_body::{MaybeRated, RateCheckedBodyErr};
+#[cfg(feature = "hyper")]
+use response_head::ResponseHead;
 use time::format_description::well_known::Rfc2822;
 use tokio::runtime::Builder;
 use tracing::{debug, error, info, trace, warn};
@@ -288,19 +288,7 @@ fn quick_response<T: Into<bytes::Bytes>>(
     status: StatusCode,
     message: T,
 ) -> Response<ProxyCacheBody> {
-    let mut builder = Response::builder()
-        .status(status)
-        .header(SERVER, APP_NAME)
-        .header(VIA, APP_VIA)
-        .header(DATE, &*http_range::format_http_date())
-        .header(CONNECTION, "keep-alive")
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8");
-
-    if status == StatusCode::METHOD_NOT_ALLOWED {
-        builder = builder.header(ALLOW, "GET");
-    }
-
-    builder.body(full_body(message)).expect("Response is valid")
+    ResponseHead::error(status).into_hyper(full_body(message))
 }
 
 /// Box `Full<Bytes>` into [`ProxyCacheBody::Boxed`] for
