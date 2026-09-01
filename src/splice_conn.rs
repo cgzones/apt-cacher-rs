@@ -418,13 +418,6 @@ impl PoolGuard {
     fn unset_poolable(&mut self) {
         self.poolable = false;
     }
-
-    /// Replace the inner connection (e.g., after a retry with a fresh connection).
-    /// The old connection is dropped without being returned to the pool.
-    fn replace(&mut self, conn: UpstreamConn, poolable: bool) {
-        self.conn = Some(conn);
-        self.poolable = poolable;
-    }
 }
 
 impl std::ops::Deref for PoolGuard {
@@ -497,6 +490,45 @@ impl std::ops::DerefMut for UnconsumedBodyGuard<'_> {
     fn deref_mut(&mut self) -> &mut PoolGuard {
         self.upstream
     }
+}
+
+/// One upstream request/response in flight: the pool-guarded connection the
+/// response arrived on, its parsed head, and the bytes read alongside it
+/// (`header_buf[header_end..]` is the body prefix). Built only by
+/// [`standard_upstream_connect`] and the kTLS `Ready` arm of
+/// [`acquire_upstream`], and replaced wholesale by the reconnect helpers
+/// ([`follow_redirect`], [`discard_partial_and_retry`]), so every field always
+/// describes the same connection.
+struct UpstreamExchange {
+    conn: PoolGuard,
+    response: UpstreamResponse,
+    header_buf: BytesMut,
+    header_end: usize,
+    /// Log suffix naming the connection flavour (TLS-ness, pool reuse).
+    tls_label: &'static str,
+}
+
+/// Outcome of [`acquire_upstream`].
+#[cfg_attr(
+    feature = "ktls",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Exchange is the overwhelmingly common variant; boxing it would cost an allocation per download"
+    )
+)]
+enum UpstreamAcquire {
+    /// Response head in hand on a live connection.
+    Exchange(UpstreamExchange),
+    /// The kTLS attempt's 200 has no usable Content-Length and the planner
+    /// refused it (already logged and counted, upstream status recorded). No
+    /// connection is left: the caller answers 502 with `reason.body()`.
+    #[cfg(feature = "ktls")]
+    KtlsReject(RejectReason),
+    /// The kTLS attempt got a 304 for a volatile file whose cached copy lives
+    /// at this path (upstream status recorded). No connection is left: the
+    /// caller serves the cached file.
+    #[cfg(feature = "ktls")]
+    KtlsNotModified(PathBuf),
 }
 
 impl UpstreamConn {
@@ -3985,17 +4017,7 @@ async fn standard_upstream_connect(
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
     scheme_override: Option<Scheme>,
-) -> Result<
-    (
-        UpstreamConn,
-        UpstreamResponse,
-        BytesMut,
-        usize,
-        &'static str,
-        bool, // poolable
-    ),
-    SpliceProxyError,
-> {
+) -> Result<UpstreamExchange, SpliceProxyError> {
     // Resolve the scheme decision ONCE per connect: it drives the pool-lookup
     // key, the HTTPS-upgrade accounting, and the connect itself. A per-request
     // redirect forcing the scheme carries no decision, and so does none of the
@@ -4035,7 +4057,13 @@ async fn standard_upstream_connect(
                         };
                         let poolable = !resp.connection_close;
                         metrics::POOL_REUSED.increment();
-                        return Ok((pooled, resp, hdr_buf, hdr_end, label, poolable));
+                        return Ok(UpstreamExchange {
+                            conn: PoolGuard::new(pooled, mirror.host().to_string(), port, poolable),
+                            response: resp,
+                            header_buf: hdr_buf,
+                            header_end: hdr_end,
+                            tls_label: label,
+                        });
                     }
                     Err(err) => {
                         metrics::POOL_MISS_FAILED.increment();
@@ -4161,35 +4189,35 @@ async fn standard_upstream_connect(
 
     let label = if is_tls { " (TLS)" } else { "" };
     let poolable = !resp.connection_close;
-    Ok((up, resp, hdr_buf, hdr_end, label, poolable))
+    let port = mirror_port(mirror, is_tls);
+    Ok(UpstreamExchange {
+        conn: PoolGuard::new(up, mirror.host().to_string(), port, poolable),
+        response: resp,
+        header_buf: hdr_buf,
+        header_end: hdr_end,
+        tls_label: label,
+    })
 }
 
 /// Follow a 3xx redirect if the Location target is valid and allowed.
 ///
-/// On success, replaces the upstream connection, response, header buffer, and TLS label
-/// with those from the redirected request, and returns `Some(redirected_path)`.
-/// If the redirect is not followable (invalid URI, disallowed host), logs and returns `None`
-/// so the caller falls through to the non-200 forwarding path.
+/// On success, replaces `exchange` (connection, response, header buffer and
+/// TLS label) with the redirected request's exchange, and returns
+/// `Some(redirected_path)`. If the redirect is not followable (invalid URI,
+/// disallowed host), logs and returns `None` so the caller falls through to the
+/// non-200 forwarding path.
 ///
 /// Times out after the configured HTTP timeout.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors splice_proxy_drive's mutable state"
-)]
 async fn follow_redirect(
-    upstream_resp: &mut UpstreamResponse,
-    upstream: &mut PoolGuard,
-    header_buf: &mut BytesMut,
-    header_end: &mut usize,
-    tls_label: &mut &'static str,
+    exchange: &mut UpstreamExchange,
     conn_details: &ConnectionDetails,
     original_path: &str,
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
 ) -> Result<Option<String>, SpliceProxyError> {
-    let status = upstream_resp.status_code;
-    let Some(location) = upstream_resp.location.as_deref() else {
+    let status = exchange.response.status_code;
+    let Some(location) = exchange.response.location.as_deref() else {
         // Every other reject branch below logs; without this one a broken
         // upstream's 3xx is forwarded to the client with nothing cached and
         // no explanation anywhere.
@@ -4259,7 +4287,7 @@ async fn follow_redirect(
             80
         }
     });
-    let original_port_effective = mirror_port(&conn_details.mirror, upstream.is_tls());
+    let original_port_effective = mirror_port(&conn_details.mirror, exchange.conn.is_tls());
     if moved_host == conn_details.mirror.host()
         && moved_port_effective == original_port_effective
         && moved_path == original_path
@@ -4276,8 +4304,8 @@ async fn follow_redirect(
     );
 
     // Mark as non-poolable so the old connection is discarded (not returned to
-    // pool) when we reassign *upstream below.
-    upstream.unset_poolable();
+    // pool) when we reassign `*exchange` below.
+    exchange.conn.unset_poolable();
 
     let moved_port = moved_uri.port_u16().and_then(NonZero::new);
     // Redirect Mirror: used only for upstream dispatch/formatting; never persisted.
@@ -4290,7 +4318,7 @@ async fn follow_redirect(
     let redirect_authority = redirect_mirror.format_authority();
     let redirect_path = moved_path;
 
-    let (up, resp, hdr_buf, hdr_end_new, label, poolable) = standard_upstream_connect(
+    *exchange = standard_upstream_connect(
         &redirect_mirror,
         &redirect_authority,
         redirect_path,
@@ -4311,12 +4339,6 @@ async fn follow_redirect(
             conn_details.mirror
         );
     })?;
-    let port = mirror_port(&redirect_mirror, up.is_tls());
-    *upstream = PoolGuard::new(up, moved_host.to_owned(), port, poolable);
-    *upstream_resp = resp;
-    *header_buf = hdr_buf;
-    *header_end = hdr_end_new;
-    *tls_label = label;
 
     Ok(Some(redirect_path.to_owned()))
 }
@@ -4784,58 +4806,214 @@ fn warn_upstream_reject(reason: RejectReason, conn_details: &ConnectionDetails, 
 ///
 /// Shared by the 416 and invalid-Content-Range recovery paths
 /// (`ResumeAnomaly::needs_refetch`).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "called from exactly 1 site in splice_proxy_drive"
-)]
 async fn discard_partial_and_retry(
     partial: &mut utils::PartialDownload,
     mirror: &Mirror,
     host_authority: &str,
     upstream_path: &str,
-    tls_label: &mut &'static str,
-    upstream: &mut PoolGuard,
-    upstream_resp: &mut UpstreamResponse,
-    header_buf: &mut BytesMut,
-    header_end: &mut usize,
+    exchange: &mut UpstreamExchange,
     conn_details: &ConnectionDetails,
 ) -> Result<(), SpliceProxyError> {
     partial.discard_resume().await;
-    upstream.unset_poolable();
-    let (up, resp, hdr_buf, hdr_end, label, pool) =
+    exchange.conn.unset_poolable();
+    *exchange =
         standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
             .await?;
-    *tls_label = label;
-    upstream.replace(up, pool);
-    *upstream_resp = resp;
-    *header_buf = hdr_buf;
-    *header_end = hdr_end;
     // The fresh connect above does not follow redirects; the caller's top-level
     // redirect handling already ran on the original (now-discarded) response, so
     // follow one redirect here if the retry also lands on a 3xx (the retry is
     // always a fresh full request: resume_offset=0, no If-Range/volatile cond).
     if matches!(
-        upstream_resp.status_code,
+        exchange.response.status_code,
         StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
     ) {
-        follow_redirect(
-            upstream_resp,
-            upstream,
-            header_buf,
-            header_end,
-            tls_label,
-            conn_details,
-            upstream_path,
-            0,
-            None,
-            None,
-        )
-        .await?;
+        follow_redirect(exchange, conn_details, upstream_path, 0, None, None).await?;
     }
     Ok(())
+}
+
+/// Acquire the upstream exchange for a cache-miss download.
+///
+/// Under `ktls` the unbuffered kTLS attempt runs first (connect + handshake +
+/// request + response headers in one shot with guaranteed record alignment)
+/// and falls back to [`standard_upstream_connect`] on any failure or on a
+/// response it cannot splice -- except for the two responses resolvable from
+/// the already-buffered head alone (a planner-rejected 200, a 304 with a
+/// cached copy), which come back as their own [`UpstreamAcquire`] variants so
+/// no reconnect is spent on them. Without `ktls` this is
+/// `standard_upstream_connect`.
+///
+/// Times out after the configured HTTP timeout.
+async fn acquire_upstream(
+    conn_details: &ConnectionDetails,
+    host_authority: &str,
+    upstream_path: &str,
+    resume_offset: u64,
+    resume_if_range: Option<&str>,
+    volatile_cond: Option<&VolatileCondHeaders>,
+    #[cfg(feature = "ktls")] volatile_cache_path: &mut Option<PathBuf>,
+) -> Result<UpstreamAcquire, SpliceProxyError> {
+    let mirror = &conn_details.mirror;
+
+    #[cfg(feature = "ktls")]
+    {
+        let unbuffered_result = try_unbuffered_ktls_connect(
+            mirror,
+            host_authority,
+            upstream_path,
+            resume_offset,
+            resume_if_range,
+            volatile_cond,
+        )
+        .await;
+
+        // Handle kTLS ResponseNotSpliceable early for cases we can fully resolve
+        // from the already-buffered data (304 -> serve cache, 200-without-CL non-volatile
+        // -> 502). Everything else falls through to the standard path, which reconnects
+        // to deliver a complete response rather than forwarding a potentially truncated
+        // body from the one-shot kTLS attempt.
+        if let KtlsResult::ResponseNotSpliceable { ref response, .. } = unbuffered_result {
+            cache_scheme(mirror, Scheme::Https);
+            if response.status_code == 200 {
+                // A 200 the kTLS path could not splice has no usable
+                // Content-Length (absent, chunked or zero).  The planner refuses
+                // what it would refuse on the standard path too (permanent files,
+                // `Content-Length: 0`) without a reconnect; a volatile file falls
+                // through to the standard path for a buffered download, whose
+                // reconnect bumps `record_upstream_status` itself.
+                match plan_fresh_download::<PathBuf>(
+                    &response.head(),
+                    conn_details.cached_flavor,
+                    None,
+                    global_config().max_object_size,
+                ) {
+                    DownloadPlan::Reject(reason) => {
+                        reason.record_metrics();
+                        warn_upstream_reject(reason, conn_details, " (from kTLS attempt)");
+                        // Honoring the kTLS-parsed response: record its status before
+                        // the caller emits our own 502 to the client. (The standard
+                        // path is not reconnected for, so no other site will record
+                        // this 200.)
+                        metrics::record_upstream_status(response.status_code);
+                        return Ok(UpstreamAcquire::KtlsReject(reason));
+                    }
+                    DownloadPlan::NotModified(_)
+                    | DownloadPlan::Passthrough
+                    | DownloadPlan::Download { .. } => {
+                        debug!(
+                            "splice proxy: volatile file without Content-Length (from kTLS attempt), \
+                             falling back to standard path for buffered download"
+                        );
+                    }
+                }
+            }
+            // During resume, 206 and 416 need the standard buffered path
+            if resume_offset > 0 && (response.status_code == 206 || response.status_code == 416) {
+                debug!(
+                    "splice proxy: kTLS got {} during resume, falling back to standard path",
+                    response.status_code
+                );
+                // Fall through to standard_upstream_connect via the ResponseNotSpliceable arm below
+            } else if response.status_code == 304
+                && let Some(cache_path) = volatile_cache_path.take()
+            {
+                // 304 from kTLS for volatile resource -- the caller serves the cached
+                // file directly rather than reconnecting on the standard path just to
+                // get the same 304.
+                debug!(
+                    "splice proxy: kTLS upstream returned 304 for {} from mirror {}, serving cached file",
+                    conn_details.debname, conn_details.mirror
+                );
+
+                // Honoring the kTLS-parsed 304: record its upstream status here
+                // since no standard-path reconnect will run for this response.
+                metrics::record_upstream_status(response.status_code);
+
+                return Ok(UpstreamAcquire::KtlsNotModified(cache_path));
+            } else {
+                // Non-200 / no-Content-Length response from the kTLS attempt.
+                // We cannot safely forward just the buffered bytes: the body may be
+                // longer than what rustls already decrypted, and the kTLS connection
+                // has been consumed for a single request -- there is no userspace read
+                // loop to pull the remainder. Falling through to the standard path
+                // reconnects and re-fetches, which delivers a complete response to
+                // the client. One extra request is cheaper than a truncated reply.
+                debug!(
+                    "splice proxy: upstream returned {} (from kTLS attempt), reconnecting via standard path",
+                    response.status_code
+                );
+                // Fall through to the `ResponseNotSpliceable { .. }` match arm below,
+                // which leads to standard_upstream_connect().
+            }
+        }
+
+        match unbuffered_result {
+            KtlsResult::Ready(tcp, state) => {
+                // The kTLS fast path is outside HTTPS_UPGRADE_* accounting (see
+                // metrics.rs); both sides of the identity are skipped together.
+                cache_scheme(mirror, Scheme::Https);
+                // kTLS connections must NOT be pooled: the socket has kernel TLS
+                // RX configured for this specific session's keys and sequence
+                // numbers. Reusing it for a new request would layer a new TLS
+                // handshake on top of the kTLS socket, corrupting the stream.
+                // Future optimization: kTLS sockets could be pooled as a separate
+                // "kTLS-ready" type that writes plaintext (kernel encrypts via TX)
+                // and splices responses (kernel decrypts via RX), skipping the TLS
+                // handshake entirely. This requires a distinct pool entry type,
+                // control-message draining between requests, and key-update handling.
+                let poolable = false;
+                let port = mirror_port(mirror, true);
+                // Honoring the kTLS-parsed response: record its upstream status
+                // here since no standard-path reconnect will run for this flow.
+                metrics::record_upstream_status(state.response.status_code);
+                let KtlsReadyState {
+                    response,
+                    header_buf,
+                    header_end,
+                } = state;
+                return Ok(UpstreamAcquire::Exchange(UpstreamExchange {
+                    conn: PoolGuard::new(
+                        UpstreamConn::Tcp(tcp),
+                        mirror.host().to_string(),
+                        port,
+                        poolable,
+                    ),
+                    response,
+                    header_buf,
+                    header_end,
+                    tls_label: KTLS_TLS_LABEL,
+                }));
+            }
+            KtlsResult::ResponseNotSpliceable { response: _ } => {
+                // Normally handled above, but during resume 206/416 fall through here
+                // to use the standard buffered path for proper resume handling.
+                // A full reconnect, not a reuse of the kTLS socket: that socket is
+                // already dropped and would be unsound to reuse (KtlsResult contract).
+            }
+            KtlsResult::Failed { tls_succeeded } => {
+                // Cache HTTPS scheme if TLS handshake succeeded, avoiding double-HTTPS
+                // in auto mode
+                if tls_succeeded {
+                    cache_scheme(mirror, Scheme::Https);
+                }
+            }
+        }
+    }
+
+    standard_upstream_connect(
+        mirror,
+        host_authority,
+        upstream_path,
+        resume_offset,
+        resume_if_range,
+        volatile_cond,
+        None,
+    )
+    .await
+    .map(UpstreamAcquire::Exchange)
 }
 
 /// Splice-based proxy: connects to upstream (HTTP or HTTPS), transfers the response body
@@ -5097,91 +5275,42 @@ async fn splice_proxy_drive(
     }
 
     // --- Prepare upstream connection ---
-    // Try unbuffered kTLS first (handles connect + handshake + request + response
-    // headers in one shot with guaranteed record alignment). Falls back to the
-    // standard buffered path on any failure.
-    #[cfg(feature = "ktls")]
-    let unbuffered_result = try_unbuffered_ktls_connect(
-        mirror,
+    #[cfg_attr(
+        not(feature = "ktls"),
+        expect(
+            clippy::infallible_destructuring_match,
+            reason = "the kTLS-only variants make the match refutable in ktls builds"
+        )
+    )]
+    let mut exchange = match acquire_upstream(
+        conn_details,
         &host_authority,
         upstream_path,
         resume_offset,
         resume_if_range.as_deref(),
         volatile_cond.as_ref(),
+        #[cfg(feature = "ktls")]
+        &mut volatile_cache_path,
     )
-    .await;
-
-    // Handle kTLS ResponseNotSpliceable early for cases we can fully resolve
-    // from the already-buffered data (304 → serve cache, 200-without-CL non-volatile
-    // → 502). Everything else falls through to the standard path, which reconnects
-    // to deliver a complete response rather than forwarding a potentially truncated
-    // body from the one-shot kTLS attempt.
-    #[cfg(feature = "ktls")]
-    if let KtlsResult::ResponseNotSpliceable { ref response, .. } = unbuffered_result {
-        cache_scheme(mirror, Scheme::Https);
-        if response.status_code == 200 {
-            // A 200 the kTLS path could not splice has no usable
-            // Content-Length (absent, chunked or zero).  The planner refuses
-            // what it would refuse on the standard path too (permanent files,
-            // `Content-Length: 0`) without a reconnect; a volatile file falls
-            // through to the standard path for a buffered download, whose
-            // reconnect bumps `record_upstream_status` itself.
-            match plan_fresh_download::<PathBuf>(
-                &response.head(),
-                conn_details.cached_flavor,
+    .await?
+    {
+        UpstreamAcquire::Exchange(exchange) => exchange,
+        #[cfg(feature = "ktls")]
+        UpstreamAcquire::KtlsReject(reason) => {
+            write_invalid_response(
+                client_stream,
+                conn_version,
+                conn_action,
+                StatusCode::BAD_GATEWAY,
+                reason.body(),
                 None,
-                global_config().max_object_size,
-            ) {
-                DownloadPlan::Reject(reason) => {
-                    reason.record_metrics();
-                    warn_upstream_reject(reason, conn_details, " (from kTLS attempt)");
-                    // Honoring the kTLS-parsed response: record its status before
-                    // emitting our own 502 to the client. (The standard path is not
-                    // reconnected for, so no other site will record this 200.)
-                    metrics::record_upstream_status(response.status_code);
-                    write_invalid_response(
-                        client_stream,
-                        conn_version,
-                        conn_action,
-                        StatusCode::BAD_GATEWAY,
-                        reason.body(),
-                        None,
-                    )
-                    .await
-                    .map_err(|err| SpliceProxyError::Client(err, "kTLS upstream reject 502"))?;
-                    return Ok(());
-                }
-                DownloadPlan::NotModified(_)
-                | DownloadPlan::Passthrough
-                | DownloadPlan::Download { .. } => {
-                    debug!(
-                        "splice proxy: volatile file without Content-Length (from kTLS attempt), \
-                         falling back to standard path for buffered download"
-                    );
-                }
-            }
+            )
+            .await
+            .map_err(|err| SpliceProxyError::Client(err, "kTLS upstream reject 502"))?;
+            return Ok(());
         }
-        // During resume, 206 and 416 need the standard buffered path
-        if resume_offset > 0 && (response.status_code == 206 || response.status_code == 416) {
-            debug!(
-                "splice proxy: kTLS got {} during resume, falling back to standard path",
-                response.status_code
-            );
-            // Fall through to standard_upstream_connect via the ResponseNotSpliceable arm below
-        } else if response.status_code == 304
-            && let Some(cache_path) = volatile_cache_path
-        {
-            // 304 from kTLS for volatile resource — serve the cached file directly
-            // rather than reconnecting on the standard path just to get the same 304.
-            debug!(
-                "splice proxy: kTLS upstream returned 304 for {} from mirror {}, serving cached file",
-                conn_details.debname, conn_details.mirror
-            );
-
-            // Honoring the kTLS-parsed 304: record its upstream status here
-            // since no standard-path reconnect will run for this response.
-            metrics::record_upstream_status(response.status_code);
-
+        #[cfg(feature = "ktls")]
+        UpstreamAcquire::KtlsNotModified(cache_path) => {
             return serve_volatile_304_via_sendfile(
                 client_stream,
                 conn_details,
@@ -5193,125 +5322,7 @@ async fn splice_proxy_drive(
                 "kTLS post-304 invalid response",
             )
             .await;
-        } else {
-            // Non-200 / no-Content-Length response from the kTLS attempt.
-            // We cannot safely forward just the buffered bytes: the body may be
-            // longer than what rustls already decrypted, and the kTLS connection
-            // has been consumed for a single request — there is no userspace read
-            // loop to pull the remainder. Falling through to the standard path
-            // reconnects and re-fetches, which delivers a complete response to
-            // the client. One extra request is cheaper than a truncated reply.
-            debug!(
-                "splice proxy: upstream returned {} (from kTLS attempt), reconnecting via standard path",
-                response.status_code
-            );
-            // Fall through to the `ResponseNotSpliceable { .. }` match arm below,
-            // which calls standard_upstream_connect().
         }
-    }
-
-    let pool_host = mirror.host().to_string();
-
-    #[cfg(feature = "ktls")]
-    let (mut upstream, mut upstream_resp, mut header_buf, mut header_end, mut tls_label) =
-        match unbuffered_result {
-            KtlsResult::Ready(tcp, state) => {
-                // The kTLS fast path is outside HTTPS_UPGRADE_* accounting (see
-                // metrics.rs); both sides of the identity are skipped together.
-                cache_scheme(mirror, Scheme::Https);
-                // kTLS connections must NOT be pooled: the socket has kernel TLS
-                // RX configured for this specific session's keys and sequence
-                // numbers. Reusing it for a new request would layer a new TLS
-                // handshake on top of the kTLS socket, corrupting the stream.
-                // Future optimization: kTLS sockets could be pooled as a separate
-                // "kTLS-ready" type that writes plaintext (kernel encrypts via TX)
-                // and splices responses (kernel decrypts via RX), skipping the TLS
-                // handshake entirely. This requires a distinct pool entry type,
-                // control-message draining between requests, and key-update handling.
-                let poolable = false;
-                let port = mirror_port(mirror, true);
-                // Honoring the kTLS-parsed response: record its upstream status
-                // here since no standard-path reconnect will run for this flow.
-                metrics::record_upstream_status(state.response.status_code);
-                (
-                    PoolGuard::new(UpstreamConn::Tcp(tcp), pool_host, port, poolable),
-                    state.response,
-                    state.header_buf,
-                    state.header_end,
-                    KTLS_TLS_LABEL,
-                )
-            }
-            KtlsResult::ResponseNotSpliceable { .. } => {
-                // Normally handled above, but during resume 206/416 fall through here
-                // to use the standard buffered path for proper resume handling.
-                // A full reconnect, not a reuse of the kTLS socket: that socket is
-                // already dropped and would be unsound to reuse (KtlsResult contract).
-                let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
-                    mirror,
-                    &host_authority,
-                    upstream_path,
-                    resume_offset,
-                    resume_if_range.as_deref(),
-                    volatile_cond.as_ref(),
-                    None,
-                )
-                .await?;
-                let port = mirror_port(mirror, up.is_tls());
-                (
-                    PoolGuard::new(up, pool_host, port, poolable),
-                    resp,
-                    hdr_buf,
-                    hdr_end,
-                    label,
-                )
-            }
-            KtlsResult::Failed { tls_succeeded } => {
-                // Cache HTTPS scheme if TLS handshake succeeded, avoiding double-HTTPS
-                // in auto mode
-                if tls_succeeded {
-                    cache_scheme(mirror, Scheme::Https);
-                }
-                let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
-                    mirror,
-                    &host_authority,
-                    upstream_path,
-                    resume_offset,
-                    resume_if_range.as_deref(),
-                    volatile_cond.as_ref(),
-                    None,
-                )
-                .await?;
-                let port = mirror_port(mirror, up.is_tls());
-                (
-                    PoolGuard::new(up, pool_host, port, poolable),
-                    resp,
-                    hdr_buf,
-                    hdr_end,
-                    label,
-                )
-            }
-        };
-
-    #[cfg(not(feature = "ktls"))]
-    let (mut upstream, mut upstream_resp, mut header_buf, mut header_end, mut tls_label) = {
-        let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
-            mirror,
-            &host_authority,
-            upstream_path,
-            resume_offset,
-            resume_if_range.as_deref(),
-            volatile_cond.as_ref(),
-            None,
-        )
-        .await?;
-        let port = mirror_port(mirror, up.is_tls());
-        (
-            PoolGuard::new(up, pool_host, port, poolable),
-            resp,
-            hdr_buf,
-            hdr_end,
-            label,
-        )
     };
 
     // Handle 3xx redirects (301/302/307/308): follow if the target host is allowed.
@@ -5320,18 +5331,14 @@ async fn splice_proxy_drive(
     // (possibly redirected) response, mirroring hyper_conn.rs which follows the
     // redirect before its NOT_MODIFIED check.
     let redirected_path_owned = if matches!(
-        upstream_resp.status_code,
+        exchange.response.status_code,
         StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
             | StatusCode::TEMPORARY_REDIRECT
             | StatusCode::PERMANENT_REDIRECT
     ) {
         follow_redirect(
-            &mut upstream_resp,
-            &mut upstream,
-            &mut header_buf,
-            &mut header_end,
-            &mut tls_label,
+            &mut exchange,
             conn_details,
             upstream_path,
             resume_offset,
@@ -5344,7 +5351,7 @@ async fn splice_proxy_drive(
     };
     let upstream_path = redirected_path_owned.as_deref().unwrap_or(upstream_path);
 
-    upstream_resp.discard_invalid_validators(conn_details);
+    exchange.response.discard_invalid_validators(conn_details);
 
     // Volatile stale-but-present revalidation that returned a fresh body
     // (200 or 206): counterpart to the 304 / UPTODATE case in
@@ -5352,14 +5359,14 @@ async fn splice_proxy_drive(
     // `volatile_cache_path` as None and is intentionally not split into
     // UPTODATE/OUTOFDATE.
     if volatile_cache_path.is_some()
-        && (upstream_resp.status_code == 200 || upstream_resp.status_code == 206)
+        && (exchange.response.status_code == 200 || exchange.response.status_code == 206)
         && !conn_details.client.is_cleanup_synthetic()
     {
         metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
     }
 
     let plan = match plan_download(
-        &upstream_resp.head(),
+        &exchange.response.head(),
         ResumeState::new(resume_offset, resume_expected_total),
         conn_details.cached_flavor,
         volatile_cache_path,
@@ -5390,11 +5397,7 @@ async fn splice_proxy_drive(
                     mirror,
                     &host_authority,
                     upstream_path,
-                    &mut tls_label,
-                    &mut upstream,
-                    &mut upstream_resp,
-                    &mut header_buf,
-                    &mut header_end,
+                    &mut exchange,
                     conn_details,
                 )
                 .await?;
@@ -5403,13 +5406,23 @@ async fn splice_proxy_drive(
             }
             // A resume never revalidates: there is no cached copy to serve.
             plan_fresh_download(
-                &upstream_resp.head(),
+                &exchange.response.head(),
                 conn_details.cached_flavor,
                 None,
                 global_config().max_object_size,
             )
         }
     };
+
+    // No reconnect helper runs past this point, so the exchange is final:
+    // split it into the locals the rest of the download uses.
+    let UpstreamExchange {
+        conn: mut upstream,
+        response: upstream_resp,
+        header_buf,
+        header_end,
+        tls_label,
+    } = exchange;
 
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified(cache_path) => {
@@ -6642,16 +6655,14 @@ async fn cleanup_upstream_fetch(
         .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_owned()));
     let upstream_path = upstream_path_buf.as_deref().unwrap_or(upstream_uri);
     let host_authority = mirror.format_authority();
-    let (up, resp, hdr_buf, hdr_end, _label, poolable) = match standard_upstream_connect(
-        mirror,
-        &host_authority,
-        upstream_path,
-        0,
-        None,
-        None,
-        None,
-    )
-    .await
+    let UpstreamExchange {
+        conn: mut upstream,
+        response: resp,
+        header_buf: hdr_buf,
+        header_end: hdr_end,
+        tls_label: _,
+    } = match standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
+        .await
     {
         Ok(v) => v,
         Err(_err) => {
@@ -6668,8 +6679,6 @@ async fn cleanup_upstream_fetch(
     };
 
     let status = resp.status_code;
-    let port = mirror_port(mirror, up.is_tls());
-    let mut upstream = PoolGuard::new(up, mirror.host().to_string(), port, poolable);
     let body_prefix = &hdr_buf[hdr_end..];
 
     if status != StatusCode::OK {
@@ -7560,20 +7569,21 @@ pub(crate) async fn splice_simple_proxy(
     // invisible to the counter.
     let _client_count = client_counter::ClientDownload::new();
 
-    let (up, resp, hdr_buf, hdr_end, _label, poolable) =
-        standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
-            .await?;
+    let UpstreamExchange {
+        conn: mut upstream,
+        response: resp,
+        header_buf: hdr_buf,
+        header_end: hdr_end,
+        tls_label: _,
+    } = standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
+        .await?;
 
     let t_req_sent = resp.request_sent_at.unwrap_or_else(PreciseInstant::now);
-
-    let port = mirror_port(mirror, up.is_tls());
 
     debug!(
         "simple proxy: upstream returned {} for {upstream_path} from {host_authority}",
         resp.status_code
     );
-
-    let mut upstream = PoolGuard::new(up, mirror.host().to_string(), port, poolable);
 
     // Rewrite response headers: adjust HTTP version and Connection header
     // to match the client's protocol version and keep-alive strategy.
