@@ -11,7 +11,7 @@ const XATTR_LAST_MODIFIED: &str = "user.apt_cacher_rs.last_modified";
 /// (and the RFC 2822 superset); broadening that parser is a behaviour
 /// change, out of scope here.
 #[must_use]
-fn is_valid_http_date(s: &str) -> bool {
+pub(crate) fn is_valid_http_date(s: &str) -> bool {
     HttpDate::parse(s).is_some()
 }
 

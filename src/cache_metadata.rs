@@ -74,8 +74,8 @@ use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::{
     cache_layout::{CacheEntryKey, CacheEntryKeyRef},
-    http_etag::try_read_etag,
-    http_last_modified::try_read_last_modified,
+    http_etag::{is_valid_etag, try_read_etag},
+    http_last_modified::{is_valid_http_date, try_read_last_modified},
     http_range::HttpDate,
     warn_once, warn_once_or_info,
 };
@@ -108,6 +108,45 @@ impl UpstreamMetadata {
             last_modified,
         }
     }
+}
+
+/// A malformed upstream validator discarded by [`check_upstream_validators`],
+/// carrying the offending value for the caller's warn line.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InvalidValidator<'a> {
+    /// `ETag` not well-formed per RFC 9110 §8.8.3.
+    ETag(&'a str),
+    /// `Last-Modified` not an IMF-fixdate HTTP-date (RFC 9110 §5.6.7).
+    LastModified(&'a str),
+}
+
+/// Validate the raw upstream `ETag`/`Last-Modified` header values once per
+/// upstream response, before either reaches a client response header, an
+/// `If-Range` comparison or an xattr.  Malformed values come back as `None`.
+///
+/// Both backends route through here so the accepted set is identical;
+/// `on_invalid` receives each discarded value so the caller emits its
+/// backend's warn line.
+pub(crate) fn check_upstream_validators(
+    etag: Option<String>,
+    last_modified: Option<String>,
+    mut on_invalid: impl FnMut(InvalidValidator<'_>),
+) -> (Option<String>, Option<String>) {
+    let etag = etag.filter(|etag| {
+        let valid = is_valid_etag(etag);
+        if !valid {
+            on_invalid(InvalidValidator::ETag(etag));
+        }
+        valid
+    });
+    let last_modified = last_modified.filter(|lm| {
+        let valid = is_valid_http_date(lm);
+        if !valid {
+            on_invalid(InvalidValidator::LastModified(lm));
+        }
+        valid
+    });
+    (etag, last_modified)
 }
 
 /// Process-local cache mapping `(mirror, debname, layout)` to the most
@@ -468,5 +507,71 @@ mod tests {
     fn from_upstream_drops_malformed_last_modified() {
         let m = UpstreamMetadata::from_upstream(None, Some("not a date".into()));
         assert!(m.last_modified.is_none());
+    }
+
+    #[test]
+    fn check_upstream_validators_keeps_well_formed_values() {
+        let mut rejected = Vec::new();
+        let (etag, lm) = check_upstream_validators(
+            Some("W/\"abc\"".into()),
+            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
+            |invalid| rejected.push(format!("{invalid:?}")),
+        );
+        assert_eq!(etag.as_deref(), Some("W/\"abc\""));
+        assert_eq!(lm.as_deref(), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn check_upstream_validators_passes_absent_values_silently() {
+        let mut calls = 0;
+        let (etag, lm) = check_upstream_validators(None, None, |_invalid| calls += 1);
+        assert_eq!(etag, None);
+        assert_eq!(lm, None);
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn check_upstream_validators_discards_malformed_etag() {
+        let mut rejected = Vec::new();
+        let (etag, lm) = check_upstream_validators(
+            Some("not-an-etag".into()),
+            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
+            |invalid| rejected.push(format!("{invalid:?}")),
+        );
+        assert_eq!(etag, None);
+        assert_eq!(lm.as_deref(), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert_eq!(rejected, vec!["ETag(\"not-an-etag\")".to_owned()]);
+    }
+
+    #[test]
+    fn check_upstream_validators_discards_malformed_last_modified() {
+        let mut rejected = Vec::new();
+        let (etag, lm) = check_upstream_validators(
+            Some("\"abc\"".into()),
+            Some("not a date".into()),
+            |invalid| rejected.push(format!("{invalid:?}")),
+        );
+        assert_eq!(etag.as_deref(), Some("\"abc\""));
+        assert_eq!(lm, None);
+        assert_eq!(rejected, vec!["LastModified(\"not a date\")".to_owned()]);
+    }
+
+    #[test]
+    fn check_upstream_validators_reports_both_malformed_values() {
+        let mut rejected = Vec::new();
+        let (etag, lm) =
+            check_upstream_validators(Some("bad".into()), Some("worse".into()), |invalid| {
+                rejected.push(format!("{invalid:?}"))
+            });
+        assert_eq!(etag, None);
+        assert_eq!(lm, None);
+        assert_eq!(
+            rejected,
+            vec![
+                "ETag(\"bad\")".to_owned(),
+                "LastModified(\"worse\")".to_owned()
+            ]
+        );
     }
 }

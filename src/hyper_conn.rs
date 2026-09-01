@@ -44,7 +44,7 @@ use crate::{
     },
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{self, CacheMiss, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
-    cache_metadata::{self, UpstreamMetadata},
+    cache_metadata::{self, InvalidValidator, UpstreamMetadata, check_upstream_validators},
     cache_quota::QuotaExceeded,
     channel_body::ChannelBody,
     client_counter,
@@ -57,7 +57,7 @@ use crate::{
     error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
     full_body, global_cache_quota, global_config, global_verify_throttle,
     guards::{DownloadBarrier, InitBarrier},
-    http_etag::{is_valid_etag, write_etag},
+    http_etag::write_etag,
     http_last_modified::write_last_modified,
     http_range::HttpDate,
     humanfmt::HumanFmt,
@@ -2002,41 +2002,32 @@ async fn serve_new_file(
         }
     };
 
-    let upstream_etag: Option<String> = fwd_response
-        .headers()
-        .get(ETAG)
-        .and_then(|hv| hv.to_str().ok())
-        .filter(|etag| {
-            if is_valid_etag(etag) {
-                true
-            } else {
-                warn_once_or_info!(
-                    "Upstream mirror {} sent an invalid ETag `{etag}` for {}; discarding it",
-                    conn_details.mirror,
-                    conn_details.debname
-                );
-                false
-            }
-        })
-        .map(String::from);
-
-    let upstream_last_modified: Option<String> = fwd_response
-        .headers()
-        .get(LAST_MODIFIED)
-        .and_then(|hv| hv.to_str().ok())
-        .filter(|lm| {
-            if HttpDate::parse(lm).is_some() {
-                true
-            } else {
-                warn_once_or_info!(
-                    "Upstream mirror {} sent an invalid Last-Modified `{lm}` for {}; discarding it",
-                    conn_details.mirror,
-                    conn_details.debname
-                );
-                false
-            }
-        })
-        .map(String::from);
+    // Wording mirrors `splice_conn.rs::UpstreamResponse::discard_invalid_validators`
+    // modulo the subsystem prefix (`docs/logging.md`, cross-backend parity).
+    let (upstream_etag, upstream_last_modified) = check_upstream_validators(
+        fwd_response
+            .headers()
+            .get(ETAG)
+            .and_then(|hv| hv.to_str().ok())
+            .map(String::from),
+        fwd_response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|hv| hv.to_str().ok())
+            .map(String::from),
+        |invalid| match invalid {
+            InvalidValidator::ETag(etag) => warn_once_or_info!(
+                "Upstream mirror {} sent an invalid ETag `{etag}` for {}; discarding it",
+                conn_details.mirror,
+                conn_details.debname
+            ),
+            InvalidValidator::LastModified(lm) => warn_once_or_info!(
+                "Upstream mirror {} sent an invalid Last-Modified `{lm}` for {}; discarding it",
+                conn_details.mirror,
+                conn_details.debname
+            ),
+        },
+    );
 
     let upstream_content_type: Option<&str> = fwd_response
         .headers()

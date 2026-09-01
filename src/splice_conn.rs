@@ -35,7 +35,7 @@ use crate::database_task::{
 use crate::deb_mirror::{Mirror, MirrorKind, Origin};
 use crate::error::{ErrorReport, errno_to_io_error};
 use crate::guards::{DownloadBarrier, InitBarrier};
-use crate::http_etag::{is_valid_etag, write_etag};
+use crate::http_etag::write_etag;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, WritePhase, find_header, write_416_response,
     write_all_to_stream, write_invalid_response,
@@ -79,8 +79,9 @@ use crate::{
     APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, Scheme,
     VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
     active_downloads::{ActiveDownloadStatus, OriginateOutcome},
-    cache_metadata, client_counter, content_type_for_cached_file, global_cache_quota,
-    global_config, global_verify_throttle, metrics,
+    cache_metadata::{self, InvalidValidator},
+    client_counter, content_type_for_cached_file, global_cache_quota, global_config,
+    global_verify_throttle, metrics,
     permitted_host_cache::is_host_allowed_cached,
     scheme_cache, static_assert, upstream_retry, warn_on_content_type_mismatch, warn_once,
     warn_once_or_debug, warn_once_or_info,
@@ -2334,6 +2335,32 @@ impl UpstreamResponse {
             content_range: self.content_range.as_deref().and_then(parse_content_range),
         }
     }
+
+    /// Discard malformed `ETag`/`Last-Modified` values before they reach a
+    /// client response header, an `If-Range` comparison or an xattr.
+    ///
+    /// Wording mirrors `hyper_conn.rs::serve_new_file` modulo the subsystem
+    /// prefix (`docs/logging.md`, cross-backend parity).
+    fn discard_invalid_validators(&mut self, conn_details: &ConnectionDetails) {
+        let (etag, last_modified) = cache_metadata::check_upstream_validators(
+            self.etag.take(),
+            self.last_modified.take(),
+            |invalid| match invalid {
+                InvalidValidator::ETag(etag) => warn_once_or_info!(
+                    "splice proxy: upstream mirror {} sent an invalid ETag `{etag}` for {}; discarding it",
+                    conn_details.mirror,
+                    conn_details.debname
+                ),
+                InvalidValidator::LastModified(lm) => warn_once_or_info!(
+                    "splice proxy: upstream mirror {} sent an invalid Last-Modified `{lm}` for {}; discarding it",
+                    conn_details.mirror,
+                    conn_details.debname
+                ),
+            },
+        );
+        self.etag = etag;
+        self.last_modified = last_modified;
+    }
 }
 
 /// Parse upstream HTTP response headers.
@@ -2390,20 +2417,11 @@ fn parse_upstream_response(
 
     let content_type = find_header(headers, &CONTENT_TYPE).map(String::from);
 
+    // Raw values: `UpstreamResponse::discard_invalid_validators` filters them
+    // once the driver knows which file they belong to.
     let last_modified = find_header(headers, &LAST_MODIFIED).map(String::from);
 
-    let etag = find_header(headers, &ETAG)
-        .filter(|etag| {
-            if is_valid_etag(etag) {
-                true
-            } else {
-                warn_once_or_info!(
-                    "Upstream mirror {host_authority} sent an invalid ETag `{etag}`; discarding it"
-                );
-                false
-            }
-        })
-        .map(String::from);
+    let etag = find_header(headers, &ETAG).map(String::from);
 
     let content_range = find_header(headers, &CONTENT_RANGE).map(String::from);
 
@@ -5339,6 +5357,8 @@ async fn splice_proxy_drive(
     };
     let upstream_path = redirected_path_owned.as_deref().unwrap_or(upstream_path);
 
+    upstream_resp.discard_invalid_validators(conn_details);
+
     // Volatile stale-but-present revalidation that returned a fresh body
     // (200 or 206): counterpart to the 304 / UPTODATE case in
     // `serve_volatile_304_via_sendfile`. The volatile-not-found path leaves
@@ -8056,14 +8076,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_upstream_response_invalid_etag_ignored() {
+    fn test_parse_upstream_response_keeps_raw_validators() {
+        // The parser forwards validators verbatim; `discard_invalid_validators`
+        // filters them once the driver knows the file they belong to.
         let headers = b"HTTP/1.1 200 OK\r\n\
                         Content-Length: 100\r\n\
                         ETag: not-a-valid-etag\r\n\
+                        Last-Modified: not a date\r\n\
                         \r\n";
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
-        assert_eq!(resp.etag, None);
+        assert_eq!(resp.etag.as_deref(), Some("not-a-valid-etag"));
+        assert_eq!(resp.last_modified.as_deref(), Some("not a date"));
     }
 
     #[test]
