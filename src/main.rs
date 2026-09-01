@@ -83,6 +83,8 @@ mod tcp_cork_guard;
 mod test_support;
 mod tunnel_limiter;
 mod uncacheables;
+#[cfg(feature = "hyper")]
+mod upstream_head;
 mod upstream_retry;
 mod utils;
 mod verify_throttle;
@@ -427,7 +429,7 @@ pub(crate) struct AppState {
     pub(crate) active_downloads: active_downloads::ActiveDownloads,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContentLength {
     /// An exact size
     Exact(NonZero<u64>),

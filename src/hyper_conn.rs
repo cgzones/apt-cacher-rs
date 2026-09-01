@@ -27,7 +27,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::mmap_body::MmapBody;
 use crate::{
     APP_NAME, APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, ProxyCacheBody,
-    Scheme, VOLATILE_CACHE_MAX_AGE, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
+    Scheme, VOLATILE_CACHE_MAX_AGE,
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
         AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
@@ -48,9 +48,9 @@ use crate::{
     guards::{DownloadBarrier, InitBarrier},
     http_etag::{is_valid_etag, write_etag},
     http_last_modified::write_last_modified,
-    http_range::{self, HttpDate, format_http_date},
+    http_range::{HttpDate, format_http_date},
     humanfmt::HumanFmt,
-    limits, metrics,
+    metrics,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
     quick_response,
@@ -63,6 +63,10 @@ use crate::{
     },
     scheme_cache, static_assert, tunnel_limiter,
     uncacheables::record_uncacheable,
+    upstream_head::{
+        DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead, plan_download,
+        plan_fresh_download,
+    },
     upstream_retry,
     utils::{
         self, CacheAccessFailure, TempPath, hint_sequential_read, is_peer_disconnect,
@@ -1646,34 +1650,32 @@ async fn serve_new_file(
     // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
     // `partial.discard_resume()` is used only when a stale partial must be
     // discarded (200 fallback from unsupported Range, 416, invalid Content-Range).
-    let (mut resume_offset, mut resume_expected_total, resume_if_range, mut partial) =
-        if conn_details.cached_flavor == CachedFlavor::Permanent
-            && matches!(cfstate, CacheFileStat::New)
+    let (resume_offset, resume_expected_total, resume_if_range, mut partial) = if conn_details
+        .cached_flavor
+        == CachedFlavor::Permanent
+        && matches!(cfstate, CacheFileStat::New)
+    {
+        match utils::prepare_partial_resume(
+            &ibarrier,
+            &conn_details.debname,
+            &conn_details.mirror,
+            "",
+        )
+        .await
         {
-            match utils::prepare_partial_resume(
-                &ibarrier,
-                &conn_details.debname,
-                &conn_details.mirror,
-                "",
-            )
-            .await
-            {
-                Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
-                Err((err, guard)) if err.kind() == std::io::ErrorKind::NotFound => {
-                    (0, None, None, utils::PartialDownload::Fresh(guard))
-                }
-                Err((_err, guard)) => {
-                    // Error already logged in `open_partial_file()`.
-                    drop(guard);
-                    return quick_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Cache Access Failure",
-                    );
-                }
+            Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
+            Err((err, guard)) if err.kind() == std::io::ErrorKind::NotFound => {
+                (0, None, None, utils::PartialDownload::Fresh(guard))
             }
-        } else {
-            (0, None, None, utils::PartialDownload::Volatile)
-        };
+            Err((_err, guard)) => {
+                // Error already logged in `open_partial_file()`.
+                drop(guard);
+                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            }
+        }
+    } else {
+        (0, None, None, utils::PartialDownload::Volatile)
+    };
 
     let fwd_request = build_fwd_request(
         &req_uri,
@@ -1754,22 +1756,103 @@ async fn serve_new_file(
         }
     }
 
-    if let CacheFileStat::Volatile {
-        mut file,
-        file_path,
-        local_modification_time: _,
-        prev_size: _,
-    } = cfstate
-    {
-        if fwd_response.status() == StatusCode::NOT_MODIFIED {
-            // Skip the counter for cleanup-synthetic probes: they bypass
-            // sendfile and never bump VOLATILE_REFETCHED in the default build,
-            // so counting their 304s here would let the subset run ahead of
-            // the parent.
+    // `cfstate` was only needed by reference for the conditional headers of
+    // the requests above; a retry below is an unconditional fresh fetch.
+    let cached = match cfstate {
+        CacheFileStat::Volatile {
+            file,
+            file_path,
+            local_modification_time: _,
+            prev_size: _,
+        } => Some((file, file_path)),
+        CacheFileStat::New => None,
+    };
+
+    let mut head = UpstreamHead::from_response(&fwd_response);
+
+    if let Some((_, file_path)) = &cached {
+        // Only count "out of date" when upstream actually returned fresh
+        // content (mirrors the splice path's non-200/non-206 passthrough in
+        // `splice_proxy_drive`); a 4xx/5xx revalidation is not a fresh body.
+        // Cleanup-synthetic probes bypass the parent counter (they bypass
+        // sendfile and never bump VOLATILE_REFETCHED in the default build),
+        // so counting them here would let the subset run ahead of the parent;
+        // the UPTODATE site below excludes them for the same reason.
+        if (head.status == StatusCode::OK || head.status == StatusCode::PARTIAL_CONTENT)
+            && !conn_details.client.is_cleanup_synthetic()
+        {
+            metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
+        }
+        if head.status != StatusCode::NOT_MODIFIED {
+            debug!(
+                "File `{}` did not revalidate (status={})",
+                file_path.display(),
+                head.status
+            );
+        }
+    }
+
+    let plan = match plan_download(
+        &head,
+        ResumeState::new(resume_offset, resume_expected_total),
+        conn_details.cached_flavor,
+        cached,
+        config.max_object_size,
+    ) {
+        Ok(plan) => plan,
+        Err(anomaly) => {
+            match anomaly {
+                ResumeAnomaly::RangeIgnored => info!(
+                    "Server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
+                    conn_details.debname, conn_details.mirror
+                ),
+                ResumeAnomaly::RangeNotSatisfiable => warn_once_or_info!(
+                    "Server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    HumanFmt::Size(resume_offset)
+                ),
+                ResumeAnomaly::ContentRangeMismatch => warn_once_or_info!(
+                    "Invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+            }
+            partial.discard_resume().await;
+
+            if anomaly.needs_refetch() {
+                // Deliberately pass CacheFileStat::New here: the partial file
+                // has been discarded, so from the upstream's perspective this
+                // is a fresh unconditional fetch (no If-Modified-Since, no
+                // If-None-Match, no Range).
+                let retry_request =
+                    build_fwd_request(&req_uri, host, &CacheFileStat::New, volatile_etag, 0, None);
+
+                upstream_request_sent = PreciseInstant::now();
+                fwd_response = match request_with_retry(&appstate.https_client, retry_request).await
+                {
+                    Ok((r, _parts)) => r,
+                    Err(err) => return upstream_error_response(&err),
+                };
+                head = UpstreamHead::from_response(&fwd_response);
+            }
+
+            // A resume never revalidates: there is no cached copy to serve.
+            plan_fresh_download(
+                &head,
+                conn_details.cached_flavor,
+                None,
+                config.max_object_size,
+            )
+        }
+    };
+
+    let (total_content_length, body_content_length, resume_offset) = match plan {
+        DownloadPlan::NotModified((file, file_path)) => {
             if !conn_details.client.is_cleanup_synthetic() {
                 metrics::VOLATILE_REFETCHED_UPTODATE.increment();
             }
-            file = touch_volatile_mtime(file, &file_path).await;
+            let file = touch_volatile_mtime(file, &file_path).await;
 
             ibarrier.finished(file_path.clone()).await;
 
@@ -1783,217 +1866,7 @@ async fn serve_new_file(
             )
             .await;
         }
-
-        // Only count "out of date" when upstream actually returned fresh
-        // content (mirrors the splice path's non-200/non-206 passthrough in
-        // `splice_proxy_drive`); a 4xx/5xx revalidation is not a fresh body.
-        // Cleanup-synthetic probes bypass the parent counter and are excluded
-        // for the same reason as the UPTODATE site above.
-        let status = fwd_response.status();
-        if (status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT)
-            && !conn_details.client.is_cleanup_synthetic()
-        {
-            metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
-        }
-        debug!(
-            "File `{}` did not revalidate (status={})",
-            file_path.display(),
-            fwd_response.status()
-        );
-    }
-
-    // Handle resume: if we sent Range and got 200 (server ignores Range) or 416
-    // (partial is stale), discard partial and start fresh.
-    let needs_retry = if resume_offset > 0 && fwd_response.status() == StatusCode::OK {
-        info!(
-            "Server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
-            conn_details.debname, conn_details.mirror
-        );
-        partial.discard_resume().await;
-        resume_offset = 0;
-        resume_expected_total = None;
-        false
-    } else if resume_offset > 0 && fwd_response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-        warn_once_or_info!(
-            "Server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
-            conn_details.debname,
-            conn_details.mirror,
-            HumanFmt::Size(resume_offset)
-        );
-        partial.discard_resume().await;
-        resume_offset = 0;
-        resume_expected_total = None;
-        true
-    } else if resume_offset > 0 && fwd_response.status() == StatusCode::PARTIAL_CONTENT {
-        // Validate Content-Range before proceeding: if the server returned 206 but the
-        // Content-Range doesn't match our resume offset or the total size changed
-        // (e.g. file replaced upstream with a different size), discard the stale
-        // partial and retry fresh — same pattern as 416 handling.
-        // Only accept a 206 that delivers the full remainder (start == resume_offset
-        // AND end == total - 1). Otherwise `body_content_length` computed from
-        // `total - resume_offset` would not match the bytes on the wire and the
-        // writer would hang or truncate.
-        let content_range_valid = fwd_response
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|hv| hv.to_str().ok())
-            .and_then(http_range::parse_content_range)
-            .is_some_and(|(start, end, total)| {
-                start == resume_offset
-                    && end.checked_add(1) == Some(total)
-                    && resume_expected_total.is_none_or(|expected| expected == total)
-            });
-
-        if content_range_valid {
-            false
-        } else {
-            warn_once_or_info!(
-                "Invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
-                conn_details.debname,
-                conn_details.mirror
-            );
-            partial.discard_resume().await;
-            resume_offset = 0;
-            resume_expected_total = None;
-            true
-        }
-    } else {
-        false
-    };
-
-    if needs_retry {
-        // Deliberately pass CacheFileStat::New here rather than the original
-        // `cfstate` binding: at this point the partial file has been discarded
-        // (and any prior cached data is being superseded), so from the
-        // upstream's perspective this is a fresh unconditional fetch — no
-        // If-Modified-Since, no If-None-Match, no Range.
-        let retry_request =
-            build_fwd_request(&req_uri, host, &CacheFileStat::New, volatile_etag, 0, None);
-
-        upstream_request_sent = PreciseInstant::now();
-        fwd_response = match request_with_retry(&appstate.https_client, retry_request).await {
-            Ok((r, _parts)) => r,
-            Err(err) => return upstream_error_response(&err),
-        };
-    }
-
-    // Reject unsolicited 206: upstream returned partial content for a request
-    // without Range. Treating it as a fresh 200 would write the partial bytes
-    // into the cache at offset 0 and mark the file complete at the partial
-    // length - a cache-poisoning vector.
-    if resume_offset == 0 && fwd_response.status() == StatusCode::PARTIAL_CONTENT {
-        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        metrics::UPSTREAM_UNSOLICITED_206.increment();
-        warn_once_or_info!(
-            "Upstream returned 206 Partial Content without a Range request for {} from mirror {}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        );
-        return quick_response(StatusCode::BAD_GATEWAY, "Unsolicited 206");
-    }
-
-    // Parse total file size and body content length for resume vs fresh downloads
-    let (total_content_length, body_content_length) = if resume_offset > 0
-        && fwd_response.status() == StatusCode::PARTIAL_CONTENT
-    {
-        // Parse Content-Range header for 206 responses
-        let content_range = fwd_response
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|hv| hv.to_str().ok())
-            .and_then(http_range::parse_content_range);
-
-        match content_range {
-            Some((start, end, total))
-                if start == resume_offset
-                    && end.checked_add(1) == Some(total)
-                    && resume_expected_total.is_none_or(|expected| expected == total) =>
-            {
-                let remaining = end - start + 1;
-                // Cross-check declared Content-Length (if present) matches the range span.
-                if let Some(cl) = fwd_response
-                    .headers()
-                    .get(CONTENT_LENGTH)
-                    .and_then(|hv| hv.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    && cl != remaining
-                {
-                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    warn_once_or_info!(
-                        "Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}; returning 502",
-                        conn_details.debname,
-                        conn_details.mirror
-                    );
-                    return quick_response(StatusCode::BAD_GATEWAY, "Inconsistent Content-Range");
-                }
-                let Some(total_nz) = NonZero::new(total) else {
-                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    warn_once_or_info!(
-                        "Content-Range total is zero for {} from mirror {}; returning 502",
-                        conn_details.debname,
-                        conn_details.mirror
-                    );
-                    return quick_response(StatusCode::BAD_GATEWAY, "Invalid Content-Range");
-                };
-
-                if !limits::content_length_within_cap(
-                    total_nz.get(),
-                    global_config().max_object_size,
-                ) {
-                    metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
-                    warn_once_or_info!(
-                        "Upstream 206 declares total size {} for file {} from mirror {}, exceeding `max_object_size`; returning 502",
-                        HumanFmt::Size(total_nz.get()),
-                        conn_details.debname,
-                        conn_details.mirror
-                    );
-                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream resource too large");
-                }
-
-                let Some(remaining_nz) = NonZero::new(remaining) else {
-                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    // File is already complete — guard drops and cleans up partial
-                    warn_once_or_info!(
-                        "Partial file is already complete for {} from mirror {}; returning 502",
-                        conn_details.debname,
-                        conn_details.mirror
-                    );
-                    return quick_response(StatusCode::BAD_GATEWAY, "No remaining bytes");
-                };
-                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-                let remaining_percent = remaining as f32 / total as f32 * 100.0;
-                info!(
-                    "Resuming download of {} from mirror {} at {} ({} ({:.1}%) remaining of {} total)",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    HumanFmt::Size(resume_offset),
-                    HumanFmt::Size(remaining),
-                    remaining_percent,
-                    HumanFmt::Size(total)
-                );
-                (
-                    ContentLength::Exact(total_nz),
-                    ContentLength::Exact(remaining_nz),
-                )
-            }
-            // Content-Range mismatch or missing: should be handled by the
-            // pre-check above (which discards partial and retries fresh).
-            // Defensive fallback in case of unexpected state.
-            _ => {
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn_once_or_info!(
-                    "Unexpected Content-Range state for the 206 response of {} from mirror {}; returning 502",
-                    conn_details.debname,
-                    conn_details.mirror
-                );
-                return quick_response(StatusCode::BAD_GATEWAY, "Unexpected Content-Range");
-            }
-        }
-    } else {
-        // Fresh download (including after fallback from failed resume)
-        resume_offset = 0;
-
-        if fwd_response.status() != StatusCode::OK {
+        DownloadPlan::Passthrough => {
             // Demote routine 4xx for cleanup-synthetic clients to DEBUG:
             // `try_fetch_packages_file` deliberately walks `.xz → .gz → raw`,
             // and on S3-hosted flat repos every miss surfaces as 403 (not
@@ -2051,45 +1924,65 @@ async fn serve_new_file(
 
             return response;
         }
-
-        let cl = match fwd_response.headers().get(CONTENT_LENGTH).and_then(|hv| {
-            hv.to_str()
-                .ok()
-                .and_then(|ct| ct.parse::<NonZero<u64>>().ok())
-        }) {
-            Some(size) => {
-                if !limits::content_length_within_cap(size.get(), global_config().max_object_size) {
-                    metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
-                    warn_once_or_info!(
-                        "Upstream declared Content-Length {} for file {} from mirror {}, exceeding `max_object_size`; returning 502",
-                        HumanFmt::Size(size.get()),
-                        conn_details.debname,
-                        conn_details.mirror
-                    );
-                    return quick_response(StatusCode::BAD_GATEWAY, "Upstream resource too large");
-                }
-                ContentLength::Exact(size)
-            }
-            None if conn_details.cached_flavor == CachedFlavor::Volatile => {
-                ContentLength::Unknown(VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER)
-            }
-            None => {
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn_once_or_info!(
-                    "Failed to extract Content-Length header for file {} from mirror {}; returning 502",
+        DownloadPlan::Reject(reason) => {
+            reason.record_metrics();
+            match reason {
+                RejectReason::Unsolicited206 => warn_once_or_info!(
+                    "Upstream returned 206 Partial Content without a Range request for {} from mirror {}; returning 502",
                     conn_details.debname,
                     conn_details.mirror
-                );
-                return quick_response(
-                    StatusCode::BAD_GATEWAY,
-                    "Upstream resource has no content length",
+                ),
+                RejectReason::InconsistentContentRange {
+                    content_length,
+                    span,
+                } => warn_once_or_info!(
+                    "Content-Length {content_length} disagrees with Content-Range span {span} for {} from mirror {}; returning 502",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+                RejectReason::Oversize { total } => warn_once_or_info!(
+                    "Upstream declared total size {} for file {} from mirror {}, exceeding `max_object_size`; returning 502",
+                    HumanFmt::Size(total),
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+                RejectReason::NoContentLength => warn_once_or_info!(
+                    "Upstream sent no usable Content-Length for file {} from mirror {}; returning 502",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+                RejectReason::ZeroContentLength => warn_once_or_info!(
+                    "Upstream declared Content-Length 0 for file {} from mirror {}; returning 502",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+            }
+            return quick_response(StatusCode::BAD_GATEWAY, reason.body());
+        }
+        DownloadPlan::Download {
+            total,
+            body,
+            resume_offset,
+        } => {
+            if resume_offset > 0
+                && let (ContentLength::Exact(total_nz), ContentLength::Exact(remaining_nz)) =
+                    (total, body)
+            {
+                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+                let remaining_percent = remaining_nz.get() as f32 / total_nz.get() as f32 * 100.0;
+                info!(
+                    "Resuming download of {} from mirror {} at {} ({} ({:.1}%) remaining of {} total)",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    HumanFmt::Size(resume_offset),
+                    HumanFmt::Size(remaining_nz.get()),
+                    remaining_percent,
+                    HumanFmt::Size(total_nz.get())
                 );
             }
-        };
-        (cl, cl)
+            (total, body, resume_offset)
+        }
     };
-    // mark immutable
-    let resume_offset = resume_offset;
 
     debug_assert!(
         match (total_content_length, body_content_length) {
