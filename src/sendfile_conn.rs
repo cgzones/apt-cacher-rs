@@ -24,7 +24,7 @@ use crate::{
     active_downloads::ActiveDownloadStatus,
     cache_conditional::CacheInfo,
     cache_layout::{CachedFlavor, ConnectionDetails},
-    cache_metadata::{self, CacheMetadataKeyRef},
+    cache_metadata::{self},
     client_counter,
     connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
@@ -1209,11 +1209,7 @@ async fn try_sendfile_request(
     // as the lookup; on `NotApplicable` we fall back to hyper, whose
     // `insert()` may count this client a second time (rare, only when
     // upstream omits Content-Length).
-    if let Some(dl_status) = appstate.active_downloads.attach(
-        &conn_details.mirror,
-        &conn_details.debname,
-        conn_details.layout,
-    ) {
+    if let Some(dl_status) = appstate.active_downloads.attach(conn_details.key()) {
         let result = serve_unfinished_sendfile(
             stream,
             &conn_details,
@@ -1677,11 +1673,7 @@ pub(crate) async fn serve_file_via_sendfile(
     let cache_info = if let Some(meta) = prefetched_upstream_metadata {
         CacheInfo::with_meta(&mdata, meta)
     } else {
-        let key = CacheMetadataKeyRef::new(
-            &conn_details.mirror,
-            &conn_details.debname,
-            conn_details.layout,
-        );
+        let key = conn_details.key();
         CacheInfo::resolve(&file, file_path, &mdata, &key)
     };
 

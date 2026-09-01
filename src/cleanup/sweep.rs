@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 use hashbrown::HashMap;
 use tracing::{debug, error, warn};
 
-use crate::cache_layout::CacheLayout;
+use crate::cache_layout::{CacheEntryKeyRef, CacheLayout};
 use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
@@ -34,9 +34,7 @@ use super::engine::SpanClass;
 /// restart.
 pub(super) fn invalidate_metadata_for(path: &Path, mirror: &Mirror, layout: CacheLayout) {
     if let Some(debname) = path.file_name().and_then(|n| n.to_str()) {
-        cache_metadata::store().invalidate(&cache_metadata::CacheMetadataKeyRef::new(
-            mirror, debname, layout,
-        ));
+        cache_metadata::store().invalidate(&CacheEntryKeyRef::new(mirror, debname, layout));
     }
 }
 

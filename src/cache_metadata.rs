@@ -73,8 +73,11 @@ use std::{hash::Hash, path::Path, sync::Arc};
 use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::{
-    cache_layout::CacheLayout, deb_mirror::Mirror, http_etag::try_read_etag,
-    http_last_modified::try_read_last_modified, http_range::HttpDate, warn_once, warn_once_or_info,
+    cache_layout::{CacheEntryKey, CacheEntryKeyRef},
+    http_etag::try_read_etag,
+    http_last_modified::try_read_last_modified,
+    http_range::HttpDate,
+    warn_once, warn_once_or_info,
 };
 
 /// Upstream-supplied metadata for a single cached file.  Used both as the
@@ -107,87 +110,11 @@ impl UpstreamMetadata {
     }
 }
 
-/// Cache key.  Mirrors the keying used by `active_downloads.rs` so the
-/// in-flight and post-flight stores look up the same logical resource;
-/// see that module's `ActiveDownloadKey` doc for the rationale behind
-/// keeping both [`Mirror::kind`] (coarse structured-vs-flat) and
-/// `layout` (fine-grained subtree) in the key.  Disambiguation between
-/// flat-pool `.deb`s nested under different sub-directories
-/// (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is implicit in
-/// [`Mirror::path`], since the URL path becomes the mirror path
-/// verbatim under the host-anchored flat layout.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct CacheMetadataKey {
-    pub(crate) mirror: Mirror,
-    pub(crate) debname: String,
-    pub(crate) layout: CacheLayout,
-}
-
-impl CacheMetadataKey {
-    #[must_use]
-    pub(crate) fn new(mirror: Mirror, debname: String, layout: CacheLayout) -> Self {
-        Self {
-            mirror,
-            debname,
-            layout,
-        }
-    }
-}
-
-/// Borrow-only counterpart to [`CacheMetadataKey`].  Used as a lookup key
-/// on the hot-path `resolve` to avoid cloning `Mirror` and `debname` on
-/// every cache hit; mirrors the `ActiveDownloadKeyRef` pattern in
-/// `active_downloads.rs`.
-#[derive(Hash)]
-pub(crate) struct CacheMetadataKeyRef<'a> {
-    pub(crate) mirror: &'a Mirror,
-    pub(crate) debname: &'a str,
-    pub(crate) layout: CacheLayout,
-}
-
-impl<'a> CacheMetadataKeyRef<'a> {
-    #[must_use]
-    pub(crate) fn new(mirror: &'a Mirror, debname: &'a str, layout: CacheLayout) -> Self {
-        Self {
-            mirror,
-            debname,
-            layout,
-        }
-    }
-
-    /// Materialise an owned [`CacheMetadataKey`] (used on the cold-path
-    /// insert when a resolve misses).
-    #[must_use]
-    fn to_owned(&self) -> CacheMetadataKey {
-        CacheMetadataKey {
-            mirror: self.mirror.clone(),
-            debname: self.debname.to_owned(),
-            layout: self.layout,
-        }
-    }
-}
-
-impl Equivalent<CacheMetadataKey> for CacheMetadataKeyRef<'_> {
-    fn equivalent(&self, key: &CacheMetadataKey) -> bool {
-        let &Self {
-            mirror,
-            debname,
-            layout,
-        } = self;
-        let CacheMetadataKey {
-            mirror: kmirror,
-            debname: kdebname,
-            layout: klayout,
-        } = key;
-        mirror == kmirror && debname == kdebname && layout == *klayout
-    }
-}
-
 /// Process-local cache mapping `(mirror, debname, layout)` to the most
 /// recently observed upstream metadata for the file.  Lookups return an
 /// [`Arc`] so readers drop the map lock before inspecting fields.
 pub(crate) struct CacheMetadataStore {
-    map: parking_lot::RwLock<HashMap<CacheMetadataKey, Arc<UpstreamMetadata>>>,
+    map: parking_lot::RwLock<HashMap<CacheEntryKey, Arc<UpstreamMetadata>>>,
 }
 
 /// Soft cap on cached entries, bounding memory for caches holding very
@@ -230,8 +157,8 @@ impl CacheMetadataStore {
     /// lookups address the same inode the caller is serving from.
     ///
     /// The hot-path lookup is zero-clone — readers pass a
-    /// [`CacheMetadataKeyRef`] that borrows the caller's `Mirror` and
-    /// `debname`, and we only materialise an owned [`CacheMetadataKey`]
+    /// [`CacheEntryKeyRef`] that borrows the caller's `Mirror` and
+    /// `debname`, and we only materialise an owned [`CacheEntryKey`]
     /// on the cold cache-miss insert.  The `block_in_place` round-trip
     /// happens only on miss; subsequent hits return an [`Arc`] clone with
     /// no syscalls.
@@ -242,7 +169,7 @@ impl CacheMetadataStore {
         path: &Path,
     ) -> Arc<UpstreamMetadata>
     where
-        K: Hash + Equivalent<CacheMetadataKey> + ?Sized,
+        K: Hash + Equivalent<CacheEntryKey> + ?Sized,
         Self: ResolveOwn<K>,
     {
         if let Some(entry) = self.map.read().get(key) {
@@ -335,7 +262,7 @@ impl CacheMetadataStore {
     /// [`Self::resolve`] reads xattrs after releasing its read lock and
     /// would otherwise clobber the published value with the stale xattr
     /// read).
-    pub(crate) fn set(&self, key: CacheMetadataKey, meta: Arc<UpstreamMetadata>) {
+    pub(crate) fn set(&self, key: CacheEntryKey, meta: Arc<UpstreamMetadata>) {
         let mut map = self.map.write();
         if map.len() >= CACHE_METADATA_MAX_ENTRIES && !map.contains_key(&key) {
             log_metadata_cache_cleared();
@@ -351,7 +278,7 @@ impl CacheMetadataStore {
     /// clone `Mirror` and `debname` to invalidate.
     pub(crate) fn invalidate<K>(&self, key: &K)
     where
-        K: Hash + Equivalent<CacheMetadataKey> + ?Sized,
+        K: Hash + Equivalent<CacheEntryKey> + ?Sized,
     {
         self.map.write().remove(key);
     }
@@ -364,24 +291,24 @@ impl CacheMetadataStore {
 }
 
 /// Helper trait used by [`CacheMetadataStore::resolve`] to materialise an
-/// owned [`CacheMetadataKey`] on the cold cache-miss insert.  Implemented
-/// for both the borrowed [`CacheMetadataKeyRef`] (hot-path callers) and
-/// the owned [`CacheMetadataKey`] (test/cold callers).
+/// owned [`CacheEntryKey`] on the cold cache-miss insert.  Implemented
+/// for both the borrowed [`CacheEntryKeyRef`] (hot-path callers) and
+/// the owned [`CacheEntryKey`] (test/cold callers).
 pub(crate) trait ResolveOwn<K: ?Sized> {
-    fn own(key: &K) -> CacheMetadataKey;
+    fn own(key: &K) -> CacheEntryKey;
 }
 
-impl ResolveOwn<CacheMetadataKey> for CacheMetadataStore {
+impl ResolveOwn<CacheEntryKey> for CacheMetadataStore {
     #[inline]
-    fn own(key: &CacheMetadataKey) -> CacheMetadataKey {
+    fn own(key: &CacheEntryKey) -> CacheEntryKey {
         key.clone()
     }
 }
 
-impl ResolveOwn<CacheMetadataKeyRef<'_>> for CacheMetadataStore {
+impl ResolveOwn<CacheEntryKeyRef<'_>> for CacheMetadataStore {
     #[inline]
-    fn own(key: &CacheMetadataKeyRef<'_>) -> CacheMetadataKey {
-        key.to_owned()
+    fn own(key: &CacheEntryKeyRef<'_>) -> CacheEntryKey {
+        (*key).to_owned()
     }
 }
 
@@ -422,22 +349,23 @@ mod tests {
     use tokio::fs::File;
 
     use super::*;
+    use crate::cache_layout::CacheLayout;
     use crate::deb_mirror::{Mirror, MirrorKind};
     use crate::http_etag::write_etag;
     use crate::http_last_modified::write_last_modified;
 
-    fn fixture_key() -> CacheMetadataKey {
+    fn fixture_key() -> CacheEntryKey {
         use crate::config::ClientHost;
-        CacheMetadataKey::new(
-            Mirror::new(
+        CacheEntryKey {
+            mirror: Mirror::new(
                 ClientHost::new(String::from("example.test")).unwrap(),
                 std::num::NonZero::new(80),
                 "/debian".into(),
                 MirrorKind::Structured,
             ),
-            "test.deb".into(),
-            CacheLayout::StructuredPool,
-        )
+            debname: "test.deb".into(),
+            layout: CacheLayout::StructuredPool,
+        }
     }
 
     async fn fixture_file() -> (tempfile::TempDir, File, PathBuf) {

@@ -1081,11 +1081,7 @@ async fn serve_cached_file(
 
     let file_size = mdata.len();
 
-    let cache_key = cache_metadata::CacheMetadataKeyRef::new(
-        &conn_details.mirror,
-        &conn_details.debname,
-        conn_details.layout,
-    );
+    let cache_key = conn_details.key();
 
     // Caller pre-resolves on the stale-volatile revalidation path;
     // otherwise fall back to the post-flight cache (lazy-loads xattr on miss).
@@ -1717,11 +1713,7 @@ async fn serve_volatile_file(
         metrics::VOLATILE_REFETCHED.increment();
     }
 
-    match appstate.active_downloads.insert(
-        &conn_details.mirror,
-        &conn_details.debname,
-        conn_details.layout,
-    ) {
+    match appstate.active_downloads.insert(conn_details.key()) {
         InsertOutcome::Joined { status } => {
             debug!(
                 "Serving file {} already in cache / download from mirror {} for client {}...",
@@ -2223,11 +2215,7 @@ async fn serve_new_file(
     // 503 would hard-fail the index-fetch cascade; their commit outcome
     // still records/clears throttle state.
     if !conn_details.client.is_cleanup_synthetic()
-        && let Some(throttled) = global_verify_throttle().check(
-            &conn_details.mirror,
-            &conn_details.debname,
-            conn_details.layout,
-        )
+        && let Some(throttled) = global_verify_throttle().check(conn_details.key())
     {
         warn_once_or_info!(
             "Rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
@@ -2258,11 +2246,7 @@ async fn serve_new_file(
             local_modification_time: _,
             prev_size: _,
         } => {
-            let key = cache_metadata::CacheMetadataKeyRef::new(
-                &conn_details.mirror,
-                &conn_details.debname,
-                conn_details.layout,
-            );
+            let key = conn_details.key();
 
             Some(cache_metadata::store().resolve(&key, file, file_path))
         }
@@ -3113,11 +3097,7 @@ pub(crate) async fn process_cache_request(
                 }
             }
 
-            match appstate.active_downloads.insert(
-                &conn_details.mirror,
-                &conn_details.debname,
-                conn_details.layout,
-            ) {
+            match appstate.active_downloads.insert(conn_details.key()) {
                 InsertOutcome::Originator { init_tx, status } => {
                     trace!(
                         "File {} not found, serving new version...",

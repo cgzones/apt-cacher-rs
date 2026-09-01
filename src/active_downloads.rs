@@ -24,64 +24,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use hashbrown::{Equivalent, HashMap, hash_map::Entry};
+use hashbrown::{HashMap, hash_map::Entry};
 
 use crate::ContentLength;
-use crate::cache_layout::CacheLayout;
+use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef};
 use crate::cache_metadata::UpstreamMetadata;
-use crate::deb_mirror::Mirror;
 use crate::error::MirrorDownloadRate;
 use crate::{global_config, metrics};
-
-/// Layout-aware key for in-flight downloads.  Two discriminators are
-/// part of the key:
-///
-/// - [`Mirror`]'s own `kind` field separates the structured and flat
-///   mirror identities for the same `(host, port, path)` tuple — the
-///   coarse "which subtree does this row live in" axis.
-/// - `layout` carries the finer-grained on-disk shape within a subtree
-///   (e.g. `StructuredPool` vs `Dists` vs `DistsByHash` all share the
-///   same structured-`Mirror::kind`).  This is the value the cache
-///   pipeline already threads through `ConnectionDetails`, so reusing
-///   it here keeps the key uniform across the structured/flat split.
-///
-/// The two are redundant on the structured-vs-flat axis but not
-/// overall, and dropping the `layout` field would lose the structured-
-/// subtree distinctions.
-///
-/// Disambiguation between flat-pool `.deb`s living in different
-/// sub-directories (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is
-/// implicit in [`Mirror::path`], since the URL path becomes the mirror
-/// path verbatim under the host-anchored flat layout.
-#[derive(Debug, Eq, Hash, PartialEq)]
-struct ActiveDownloadKey {
-    mirror: Mirror,
-    debname: String,
-    layout: CacheLayout,
-}
-
-#[derive(Hash)]
-struct ActiveDownloadKeyRef<'a> {
-    mirror: &'a Mirror,
-    debname: &'a str,
-    layout: CacheLayout,
-}
-
-impl Equivalent<ActiveDownloadKey> for ActiveDownloadKeyRef<'_> {
-    fn equivalent(&self, key: &ActiveDownloadKey) -> bool {
-        let &Self {
-            mirror,
-            debname,
-            layout,
-        } = self;
-        let ActiveDownloadKey {
-            mirror: kmirror,
-            debname: kdebname,
-            layout: klayout,
-        } = key;
-        mirror == kmirror && debname == kdebname && layout == *klayout
-    }
-}
 
 #[derive(Debug)]
 pub(crate) enum AbortReason {
@@ -143,7 +92,7 @@ struct ActiveDownloadEntry {
 
 #[derive(Clone)]
 pub(crate) struct ActiveDownloads {
-    inner: Arc<parking_lot::RwLock<HashMap<ActiveDownloadKey, ActiveDownloadEntry>>>,
+    inner: Arc<parking_lot::RwLock<HashMap<CacheEntryKey, ActiveDownloadEntry>>>,
 }
 
 impl std::fmt::Debug for ActiveDownloads {
@@ -284,19 +233,12 @@ impl ActiveDownloads {
     /// `UPSTREAM_DOWNLOAD_REJECTED_CAP` global metrics.
     fn lookup_or_insert(
         &self,
-        mirror: &Mirror,
-        debname: &str,
-        layout: CacheLayout,
+        keyref: CacheEntryKeyRef<'_>,
         max_upstream_downloads: Option<NonZero<usize>>,
     ) -> LookupResult {
         // First pass with the borrowed key: joining an in-flight download
         // allocates nothing (no owned key, no channel, no status Arc).
         {
-            let keyref = ActiveDownloadKeyRef {
-                mirror,
-                debname,
-                layout,
-            };
             let mut guard = self.inner.write();
             if let Some(entry) = guard.get_mut(&keyref) {
                 entry.late_joiners += 1;
@@ -313,11 +255,7 @@ impl ActiveDownloads {
             }
         }
 
-        let key = ActiveDownloadKey {
-            mirror: mirror.to_owned(),
-            debname: debname.to_owned(),
-            layout,
-        };
+        let key = keyref.to_owned();
 
         // Pre-allocate channel + status outside the write lock so the
         // critical section stays as short as possible.
@@ -388,14 +326,9 @@ impl ActiveDownloads {
     /// origination — the caller answers with the canonical 503.
     #[cfg(feature = "hyper")]
     #[must_use]
-    pub(crate) fn insert(
-        &self,
-        mirror: &Mirror,
-        debname: &str,
-        layout: CacheLayout,
-    ) -> InsertOutcome {
+    pub(crate) fn insert(&self, key: CacheEntryKeyRef<'_>) -> InsertOutcome {
         let max = global_config().max_upstream_downloads;
-        match self.lookup_or_insert(mirror, debname, layout, max) {
+        match self.lookup_or_insert(key, max) {
             LookupResult::Originator { init_tx, status } => {
                 InsertOutcome::Originator { init_tx, status }
             }
@@ -414,14 +347,9 @@ impl ActiveDownloads {
     /// answers with the canonical 503.
     #[cfg(feature = "splice")]
     #[must_use]
-    pub(crate) fn originate(
-        &self,
-        mirror: &Mirror,
-        debname: &str,
-        layout: CacheLayout,
-    ) -> OriginateOutcome {
+    pub(crate) fn originate(&self, key: CacheEntryKeyRef<'_>) -> OriginateOutcome {
         let max = global_config().max_upstream_downloads;
-        match self.lookup_or_insert(mirror, debname, layout, max) {
+        match self.lookup_or_insert(key, max) {
             LookupResult::Originator { init_tx, status } => {
                 OriginateOutcome::Originator { init_tx, status }
             }
@@ -430,13 +358,8 @@ impl ActiveDownloads {
         }
     }
 
-    pub(crate) fn remove(&self, mirror: &Mirror, debname: &str, layout: CacheLayout) {
+    pub(crate) fn remove(&self, key: CacheEntryKeyRef<'_>) {
         let max = global_config().max_upstream_downloads;
-        let key = ActiveDownloadKeyRef {
-            mirror,
-            debname,
-            layout,
-        };
         let mut guard = self.inner.write();
         let was_present = guard.remove(&key);
         // Sample the post-remove length AND clear the cap-transition latch
@@ -471,16 +394,8 @@ impl ActiveDownloads {
     #[must_use]
     pub(crate) fn attach(
         &self,
-        mirror: &Mirror,
-        debname: &str,
-        layout: CacheLayout,
+        key: CacheEntryKeyRef<'_>,
     ) -> Option<Arc<tokio::sync::RwLock<ActiveDownloadStatus>>> {
-        let key = ActiveDownloadKeyRef {
-            mirror,
-            debname,
-            layout,
-        };
-
         // Fast path under the shared lock: this runs on every cacheable
         // sendfile request and almost always misses (nothing in flight for
         // the key), so don't pay the exclusive lock for a pure lookup.
@@ -570,7 +485,10 @@ mod tests {
     fn lookup_or_insert_originator_on_empty() {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
-        let result = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        let result = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+            None,
+        );
         assert!(matches!(result, LookupResult::Originator { .. }));
     }
 
@@ -579,10 +497,16 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         // First call: originator.
-        let first = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        let first = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+            None,
+        );
         assert!(matches!(first, LookupResult::Originator { .. }));
         // Second call on the same key: late joiner.
-        let second = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        let second = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+            None,
+        );
         assert!(matches!(second, LookupResult::LateJoiner { .. }));
     }
 
@@ -592,17 +516,19 @@ mod tests {
         let mirror = test_mirror();
         // 1 originator + 3 late joiners. After 4 calls total, the
         // entry's late_joiners field should equal 3.
-        let _orig = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+        let _orig = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+            None,
+        );
         for _ in 0..3 {
-            let _join = ad.lookup_or_insert(&mirror, "foo.deb", CacheLayout::StructuredPool, None);
+            let _join = ad.lookup_or_insert(
+                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+                None,
+            );
         }
         // Read back via the inner lock (test-only access is fine).
         // Use a short-lived scope so the read guard is released promptly.
-        let key = ActiveDownloadKeyRef {
-            mirror: &mirror,
-            debname: "foo.deb",
-            layout: CacheLayout::StructuredPool,
-        };
+        let key = CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool);
         let late_joiners = ad
             .inner
             .read()
@@ -617,9 +543,15 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(1).expect("nonzero");
-        let first = ad.lookup_or_insert(&mirror, "a.deb", CacheLayout::StructuredPool, Some(max));
+        let first = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(first, LookupResult::Originator { .. }));
-        let second = ad.lookup_or_insert(&mirror, "b.deb", CacheLayout::StructuredPool, Some(max));
+        let second = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(second, LookupResult::AtCapacity { max: m } if m == max));
         // The refused origination must not have registered anything.
         assert_eq!(ad.len(), 1, "rejected origination must not insert");
@@ -630,11 +562,17 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(1).expect("nonzero");
-        let first = ad.lookup_or_insert(&mirror, "a.deb", CacheLayout::StructuredPool, Some(max));
+        let first = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(first, LookupResult::Originator { .. }));
         // Same key at cap: joins the in-flight download, no new upstream
         // connection — exempt from the cap.
-        let join = ad.lookup_or_insert(&mirror, "a.deb", CacheLayout::StructuredPool, Some(max));
+        let join = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(join, LookupResult::LateJoiner { .. }));
     }
 
@@ -643,11 +581,20 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(2).expect("nonzero");
-        let first = ad.lookup_or_insert(&mirror, "a.deb", CacheLayout::StructuredPool, Some(max));
+        let first = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(first, LookupResult::Originator { .. }));
-        let second = ad.lookup_or_insert(&mirror, "b.deb", CacheLayout::StructuredPool, Some(max));
+        let second = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(second, LookupResult::Originator { .. }));
-        let third = ad.lookup_or_insert(&mirror, "c.deb", CacheLayout::StructuredPool, Some(max));
+        let third = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "c.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(third, LookupResult::AtCapacity { max: _ }));
     }
 
@@ -656,17 +603,19 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(1).expect("nonzero");
-        let first = ad.lookup_or_insert(&mirror, "a.deb", CacheLayout::StructuredPool, Some(max));
+        let first = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(first, LookupResult::Originator { .. }));
         // Remove via the inner map directly: `remove()` reads
         // `global_config()`, which is unavailable in unit tests.
-        let key = ActiveDownloadKeyRef {
-            mirror: &mirror,
-            debname: "a.deb",
-            layout: CacheLayout::StructuredPool,
-        };
+        let key = CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool);
         assert!(ad.inner.write().remove(&key).is_some());
-        let second = ad.lookup_or_insert(&mirror, "b.deb", CacheLayout::StructuredPool, Some(max));
+        let second = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
         assert!(matches!(second, LookupResult::Originator { .. }));
     }
 
@@ -675,7 +624,10 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         for name in ["a.deb", "b.deb", "c.deb", "d.deb"] {
-            let result = ad.lookup_or_insert(&mirror, name, CacheLayout::StructuredPool, None);
+            let result = ad.lookup_or_insert(
+                CacheEntryKeyRef::new(&mirror, name, CacheLayout::StructuredPool),
+                None,
+            );
             assert!(matches!(result, LookupResult::Originator { .. }));
         }
     }

@@ -10,9 +10,11 @@
 #[cfg(feature = "sendfile")]
 use std::path::Path;
 
-use crate::cache_metadata::UpstreamMetadata;
 #[cfg(feature = "sendfile")]
-use crate::cache_metadata::{self, CacheMetadataKeyRef};
+use crate::cache_layout::CacheEntryKeyRef;
+#[cfg(feature = "sendfile")]
+use crate::cache_metadata;
+use crate::cache_metadata::UpstreamMetadata;
 use crate::http_etag::if_none_match;
 use crate::http_range::{HttpDate, cache_file_http_date, compute_age};
 
@@ -36,7 +38,7 @@ impl CacheInfo {
         file: &tokio::fs::File,
         file_path: &Path,
         metadata: &std::fs::Metadata,
-        key: &CacheMetadataKeyRef<'_>,
+        key: &CacheEntryKeyRef<'_>,
     ) -> Self {
         let resolved = cache_metadata::store().resolve(key, file, file_path);
         Self::with_meta(metadata, &resolved)

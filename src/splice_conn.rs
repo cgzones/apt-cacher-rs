@@ -4685,11 +4685,7 @@ pub(crate) async fn splice_proxy(
     // an alternate success — the caller retries as a sendfile late joiner
     // instead of falling all the way back to hyper. No late-joiner double
     // count, since `attach()` and `insert()` are mutually exclusive paths.
-    let (init_tx, status) = match appstate.active_downloads.originate(
-        &conn_details.mirror,
-        &conn_details.debname,
-        conn_details.layout,
-    ) {
+    let (init_tx, status) = match appstate.active_downloads.originate(conn_details.key()) {
         OriginateOutcome::Originator { init_tx, status } => (init_tx, status),
         OriginateOutcome::Concurrent { status } => {
             return Ok(SpliceProxyOutcome::Concurrent { status });
@@ -4824,11 +4820,7 @@ async fn splice_proxy_drive(
     // still records/clears throttle state. (Only the hyper gate is reachable
     // by cleanup today; kept here for parallel-path symmetry.)
     if !conn_details.client.is_cleanup_synthetic()
-        && let Some(throttled) = global_verify_throttle().check(
-            &conn_details.mirror,
-            &conn_details.debname,
-            conn_details.layout,
-        )
+        && let Some(throttled) = global_verify_throttle().check(conn_details.key())
     {
         warn_once_or_info!(
             "splice proxy: rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
@@ -4917,11 +4909,7 @@ async fn splice_proxy_drive(
                 .modified()
                 .expect("Platform should support modification timestamps via setup check");
             let if_modified_since = HttpDate::from(mtime).format();
-            let key = cache_metadata::CacheMetadataKeyRef::new(
-                &conn_details.mirror,
-                &conn_details.debname,
-                conn_details.layout,
-            );
+            let key = conn_details.key();
             let if_none_match = cache_metadata::store()
                 .resolve(&key, &file, &cache_path)
                 .etag

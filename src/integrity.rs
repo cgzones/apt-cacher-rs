@@ -242,7 +242,7 @@ struct RegistryScope {
 
 /// Borrowed lookup key paired with `RegistryScope` via
 /// `hashbrown::Equivalent`, so `lookup` does not allocate per call. Mirrors
-/// the pattern in `active_downloads.rs` (`ActiveDownloadKeyRef`).
+/// the pattern of `cache_layout::CacheEntryKeyRef`.
 #[derive(Hash)]
 struct RegistryScopeRef<'a> {
     host: &'a str,

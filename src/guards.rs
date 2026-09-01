@@ -5,8 +5,8 @@ use tracing::{error, info, warn};
 use crate::{
     ContentLength,
     active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads},
-    cache_layout::{CacheLayout, ConnectionDetails, ResourceKind},
-    cache_metadata::{self, CacheMetadataKey, UpstreamMetadata},
+    cache_layout::{CacheEntryKey, CacheEntryKeyRef, CacheLayout, ConnectionDetails, ResourceKind},
+    cache_metadata::{self, UpstreamMetadata},
     cache_quota::QuotaReservation,
     config::CacheHost,
     deb_mirror::Mirror,
@@ -26,15 +26,13 @@ use crate::{
 struct InitBarrierData<'a> {
     status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: &'a ActiveDownloads,
-    mirror: &'a Mirror,
+    key: CacheEntryKeyRef<'a>,
     /// When the request was resolved against an alias mapping, the on-disk
     /// host directory is the alias' main host (not `mirror.host()`).  Kept
     /// here so that `partial_path_for_barrier` lays the `.partial` next to
     /// the eventual rename target produced by
     /// `ConnectionDetails::cache_dir_path`, which also uses this host.
     aliased_host: Option<&'static CacheHost>,
-    debname: &'a str,
-    layout: CacheLayout,
     resource_kind: ResourceKind,
     /// The raw client request URI path (pre-normalisation, pre-redirect),
     /// carried through to `RenameBarrier::commit`'s `RenamePlan`.
@@ -63,10 +61,8 @@ impl<'a> InitBarrier<'a> {
             data: Some(InitBarrierData {
                 status,
                 active_downloads,
-                mirror: &conn_details.mirror,
+                key: conn_details.key(),
                 aliased_host: conn_details.aliased_host,
-                debname: &conn_details.debname,
-                layout: conn_details.layout,
                 resource_kind: conn_details.resource_kind,
                 raw_uri_path,
                 _tx: tx,
@@ -83,8 +79,7 @@ impl<'a> InitBarrier<'a> {
         let data = self.data.take().expect("every sink consumes the instance");
 
         *data.status.write().await = ActiveDownloadStatus::Finished { path, meta: None };
-        data.active_downloads
-            .remove(data.mirror, data.debname, data.layout);
+        data.active_downloads.remove(data.key);
     }
 
     pub(crate) async fn download(
@@ -109,9 +104,7 @@ impl<'a> InitBarrier<'a> {
             data: Some(DownloadBarrierData {
                 status: Arc::clone(data.status),
                 active_downloads: data.active_downloads.clone(),
-                mirror: data.mirror.clone(),
-                debname: data.debname.to_owned(),
-                layout: data.layout,
+                key: data.key.to_owned(),
                 resource_kind: data.resource_kind,
                 raw_uri_path: data.raw_uri_path.to_owned(),
                 tx,
@@ -127,6 +120,7 @@ impl<'a> InitBarrier<'a> {
         self.data
             .as_ref()
             .expect("every sink consumes the instance")
+            .key
             .mirror
     }
 
@@ -135,6 +129,7 @@ impl<'a> InitBarrier<'a> {
         self.data
             .as_ref()
             .expect("every sink consumes the instance")
+            .key
             .debname
     }
 
@@ -143,6 +138,7 @@ impl<'a> InitBarrier<'a> {
         self.data
             .as_ref()
             .expect("every sink consumes the instance")
+            .key
             .layout
     }
 
@@ -166,8 +162,7 @@ impl Drop for InitBarrier<'_> {
                 *data.status.blocking_write() =
                     ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
                 metrics::DOWNLOADS_ABORTED.increment();
-                data.active_downloads
-                    .remove(data.mirror, data.debname, data.layout);
+                data.active_downloads.remove(data.key);
             });
         }
     }
@@ -176,9 +171,7 @@ impl Drop for InitBarrier<'_> {
 struct DownloadBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: ActiveDownloads,
-    mirror: Mirror,
-    debname: String,
-    layout: CacheLayout,
+    key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
     tx: tokio::sync::watch::Sender<()>,
@@ -237,8 +230,7 @@ impl DownloadBarrier {
 
         *data.status.write().await = ActiveDownloadStatus::Aborted(reason);
         metrics::DOWNLOADS_ABORTED.increment();
-        data.active_downloads
-            .remove(&data.mirror, &data.debname, data.layout);
+        data.active_downloads.remove(data.key.as_ref());
     }
 
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
@@ -283,7 +275,7 @@ impl DownloadBarrier {
                 | ActiveDownloadStatus::Aborted(_)) => {
                     error!(
                         "Download barrier begin_rename reached with non-Download status for {} from mirror {}; leaving the status untouched: {other:?}",
-                        data.debname, data.mirror
+                        data.key.debname, data.key.mirror
                     );
                     other
                 }
@@ -295,9 +287,7 @@ impl DownloadBarrier {
             data: Some(RenameBarrierData {
                 status: data.status,
                 active_downloads: data.active_downloads,
-                mirror: data.mirror,
-                debname: data.debname,
-                layout: data.layout,
+                key: data.key,
                 resource_kind: data.resource_kind,
                 raw_uri_path: data.raw_uri_path,
                 quota_reservation: data.quota_reservation,
@@ -362,13 +352,13 @@ impl DownloadBarrier {
             .expect("every sink consumes the instance");
         let io_err = download_rate_err.to_timeout_io_error(format_args!(
             " for mirror {} downloading file {}",
-            data.mirror, data.debname,
+            data.key.mirror, data.key.debname,
         ));
         #[cfg(feature = "hyper")]
         let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {
             download_rate_err,
-            mirror: data.mirror.clone(),
-            debname: data.debname.clone(),
+            mirror: data.key.mirror.clone(),
+            debname: data.key.debname.clone(),
         });
         #[cfg(not(feature = "hyper"))]
         let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {});
@@ -384,8 +374,7 @@ impl Drop for DownloadBarrier {
                 *data.status.blocking_write() =
                     ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
                 metrics::DOWNLOADS_ABORTED.increment();
-                data.active_downloads
-                    .remove(&data.mirror, &data.debname, data.layout);
+                data.active_downloads.remove(data.key.as_ref());
             });
         }
     }
@@ -394,9 +383,7 @@ impl Drop for DownloadBarrier {
 struct RenameBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: ActiveDownloads,
-    mirror: Mirror,
-    debname: String,
-    layout: CacheLayout,
+    key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
     quota_reservation: Option<QuotaReservation>,
@@ -473,9 +460,9 @@ impl RenameBarrier {
                 dest_path,
                 bytes_received,
                 resource_kind: data.resource_kind,
-                debname: data.debname.clone(),
-                host: data.mirror.host().to_string(),
-                mirror_path: data.mirror.path().to_owned(),
+                debname: data.key.debname.clone(),
+                host: data.key.mirror.host().to_string(),
+                mirror_path: data.key.mirror.path().to_owned(),
                 raw_uri_path: data.raw_uri_path.clone(),
             }
         };
@@ -496,15 +483,13 @@ impl RenameBarrier {
                     .data
                     .as_ref()
                     .expect("every sink consumes the instance");
-                if let Some((window, failures)) = global_verify_throttle().record_failure(
-                    &data.mirror,
-                    &data.debname,
-                    data.layout,
-                ) {
+                if let Some((window, failures)) =
+                    global_verify_throttle().record_failure(data.key.as_ref())
+                {
                     info!(
                         "Throttling downloads of {} from mirror {} for {} after checksum verification failure (consecutive failures: {failures})",
-                        data.debname,
-                        data.mirror,
+                        data.key.debname,
+                        data.key.mirror,
                         HumanFmt::Time(window),
                     );
                 }
@@ -540,7 +525,7 @@ impl RenameBarrier {
                 | ActiveDownloadStatus::Aborted(_) => {
                     error!(
                         "RenameBarrier::commit reached with non-Verifying status for {} from mirror {}; finishing the download without publishing cache metadata: {:?}",
-                        data.debname, data.mirror, *lock
+                        data.key.debname, data.key.mirror, *lock
                     );
                     None
                 }
@@ -553,14 +538,10 @@ impl RenameBarrier {
         };
 
         if let Some(meta) = meta_for_status {
-            cache_metadata::store().set(
-                CacheMetadataKey::new(data.mirror.clone(), data.debname.clone(), data.layout),
-                meta,
-            );
+            cache_metadata::store().set(data.key.clone(), meta);
         }
-        global_verify_throttle().record_success(&data.mirror, &data.debname, data.layout);
-        data.active_downloads
-            .remove(&data.mirror, &data.debname, data.layout);
+        global_verify_throttle().record_success(data.key.as_ref());
+        data.active_downloads.remove(data.key.as_ref());
 
         Ok(())
     }
@@ -576,8 +557,7 @@ impl Drop for RenameBarrier {
                 *data.status.blocking_write() =
                     ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
                 metrics::DOWNLOADS_ABORTED.increment();
-                data.active_downloads
-                    .remove(&data.mirror, &data.debname, data.layout);
+                data.active_downloads.remove(data.key.as_ref());
             });
         }
     }

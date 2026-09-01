@@ -54,6 +54,7 @@ use std::{
     string::FromUtf8Error,
 };
 
+use hashbrown::Equivalent;
 use tracing::trace;
 
 use crate::{
@@ -224,6 +225,102 @@ impl CacheLayout {
     }
 }
 
+/// Identity of one cache entry across every per-entry store
+/// (`active_downloads`, `cache_metadata`, `verify_throttle`) and the
+/// download barrier chain: the in-flight and post-flight views of a resource
+/// must agree on what "the same file" is, so they all key on this one type.
+///
+/// Both [`Mirror::kind`] (inside `mirror`) and `layout` are part of the key:
+///
+/// - `Mirror::kind` distinguishes structured vs flat mirror identities for
+///   the same `(host, port, path)` tuple - the coarse "which subtree does
+///   this entry live in" axis.
+/// - `layout` carries the finer-grained on-disk shape within a subtree (e.g.
+///   `StructuredPool` vs `Dists` vs `DistsByHash` all share the same
+///   structured `Mirror::kind`). This is the value the cache pipeline already
+///   threads through [`ConnectionDetails`], so reusing it keeps the key
+///   uniform across the structured/flat split.
+///
+/// The two are redundant on the structured-vs-flat axis but not overall;
+/// dropping `layout` would lose the structured-subtree distinctions.
+/// Disambiguation between flat-pool `.deb`s living in different
+/// sub-directories (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is implicit
+/// in [`Mirror::path`], since the URL path becomes the mirror path verbatim
+/// under the host-anchored flat layout.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CacheEntryKey {
+    pub(crate) mirror: Mirror,
+    pub(crate) debname: String,
+    pub(crate) layout: CacheLayout,
+}
+
+impl CacheEntryKey {
+    #[must_use]
+    pub(crate) fn as_ref(&self) -> CacheEntryKeyRef<'_> {
+        let Self {
+            mirror,
+            debname,
+            layout,
+        } = self;
+        CacheEntryKeyRef {
+            mirror,
+            debname,
+            layout: *layout,
+        }
+    }
+}
+
+/// Borrow-only counterpart to [`CacheEntryKey`], paired with it via
+/// [`hashbrown::Equivalent`] so hot-path lookups never clone `Mirror` or
+/// `debname`; only a cold-path insert materialises the owned form.
+#[derive(Clone, Copy, Debug, Hash)]
+pub(crate) struct CacheEntryKeyRef<'a> {
+    pub(crate) mirror: &'a Mirror,
+    pub(crate) debname: &'a str,
+    pub(crate) layout: CacheLayout,
+}
+
+impl<'a> CacheEntryKeyRef<'a> {
+    #[must_use]
+    pub(crate) fn new(mirror: &'a Mirror, debname: &'a str, layout: CacheLayout) -> Self {
+        Self {
+            mirror,
+            debname,
+            layout,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn to_owned(self) -> CacheEntryKey {
+        let Self {
+            mirror,
+            debname,
+            layout,
+        } = self;
+        CacheEntryKey {
+            mirror: mirror.clone(),
+            debname: debname.to_owned(),
+            layout,
+        }
+    }
+}
+
+impl Equivalent<CacheEntryKey> for CacheEntryKeyRef<'_> {
+    fn equivalent(&self, key: &CacheEntryKey) -> bool {
+        let &Self {
+            mirror,
+            debname,
+            layout,
+        } = self;
+        let CacheEntryKey {
+            mirror: kmirror,
+            debname: kdebname,
+            layout: klayout,
+        } = key;
+        mirror == kmirror && debname == kdebname && layout == *klayout
+    }
+}
+
 /// Per-request state carried across the cache pipeline.  Owns enough of the
 /// classified resource to assemble the on-disk path via
 /// [`Self::cache_dir_path`].
@@ -242,6 +339,12 @@ pub(crate) struct ConnectionDetails {
 }
 
 impl ConnectionDetails {
+    /// The entry identity every per-entry store keys on.
+    #[must_use]
+    pub(crate) fn key(&self) -> CacheEntryKeyRef<'_> {
+        CacheEntryKeyRef::new(&self.mirror, &self.debname, self.layout)
+    }
+
     /// Build the absolute directory path holding this request's cached file.
     /// The full file path is `<this>/<debname>`; the leaf is appended by the
     /// caller.
