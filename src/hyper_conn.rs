@@ -57,7 +57,10 @@ use crate::{
     rate_checked_body::{MaybeRated, RateCheckedBodyErr},
     rate_checker::RateCheckDirection,
     rate_log,
-    request_dispatch::{DispatchOutcome, dispatch_request},
+    request_dispatch::{
+        ClientAcls, DispatchOutcome, RequestKind, RequestTarget, dispatch_request,
+        preflight_method, preflight_target,
+    },
     scheme_cache, static_assert, tunnel_limiter,
     uncacheables::record_uncacheable,
     upstream_retry,
@@ -2626,22 +2629,10 @@ pub(crate) async fn process_cache_request(
 }
 
 #[must_use]
+/// Answer a `CONNECT` whose client already passed the proxy-client ACL in
+/// `preflight_method`.
 fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<ProxyCacheBody> {
     let config = global_config();
-
-    {
-        let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
-        let client_ip = client.ip();
-        if !allowed_proxy_clients.is_empty()
-            && !allowed_proxy_clients
-                .iter()
-                .any(|ac| ac.contains(&client_ip))
-        {
-            warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
-            metrics::AUTHZ_REJECTED_CLIENT.increment();
-            return quick_response(StatusCode::FORBIDDEN, "Unauthorized client");
-        }
-    }
 
     /*
      * Received an HTTP request like:
@@ -2761,76 +2752,37 @@ async fn pre_process_client_request(
 
     metrics::REQUESTS_TOTAL.increment();
 
-    let config = global_config();
+    let acls = ClientAcls::from(global_config());
 
-    match req.method() {
-        &Method::CONNECT => return connect_response(client, req),
-        &Method::GET => {}
-        m => {
-            warn_once_or_info!(
-                "Unsupported request method `{m}` from client {client}; returning 405"
-            );
-            return quick_response(StatusCode::METHOD_NOT_ALLOWED, "Method not supported");
+    match preflight_method(req.method().as_str(), &client, &acls) {
+        Ok(RequestKind::Connect) => return connect_response(client, req),
+        Ok(RequestKind::Get) => {}
+        Err(reason) => {
+            let (status, msg) = reason.response_parts();
+            return quick_response(status, msg);
         }
     }
 
-    // Proxy GET requests always use http://, HTTPS goes through CONNECT.
-    // Reject any other scheme (e.g. ftp://, file://).
-    if let Some(scheme) = req.uri().scheme()
-        && *scheme != http::uri::Scheme::HTTP
-    {
-        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}; returning 400");
-        return quick_response(StatusCode::BAD_REQUEST, "Unsupported URI scheme");
-    }
-
-    let requested_host = if let Some(h) = req.uri().authority().map(Authority::host) {
-        h.to_owned()
-    } else {
-        // RFC 7230 §5.4: A server MUST respond with a 400 status code to any
-        // HTTP/1.1 request that lacks a Host header field.
-        // HTTP/1.0 did not require Host, so only enforce for 1.1+.
-        if req.version() == http::Version::HTTP_11 && !req.headers().contains_key(HOST) {
-            return quick_response(StatusCode::BAD_REQUEST, "Missing Host header");
+    let (requested_host, requested_port) = match preflight_target(
+        req.uri(),
+        req.version() == http::Version::HTTP_11,
+        || req.headers().contains_key(HOST),
+        &client,
+        &acls,
+    ) {
+        Ok(RequestTarget::Proxy { host, port }) => (host, port),
+        Ok(RequestTarget::WebUi) => {
+            return serve_web_interface(req.uri(), &appstate)
+                .await
+                .into_hyper_response();
         }
-
-        {
-            let allowed_webif_clients = config
-                .allowed_webif_clients
-                .as_ref()
-                .unwrap_or(&config.allowed_proxy_clients);
-            let client_ip = client.ip();
-            if !allowed_webif_clients.is_empty()
-                && !allowed_webif_clients
-                    .iter()
-                    .any(|ac| ac.contains(&client_ip))
-            {
-                warn_once_or_info!(
-                    "Unauthorized web-interface access by client {client}; returning 403"
-                );
-                metrics::AUTHZ_REJECTED_WEBUI.increment();
-                return quick_response(StatusCode::FORBIDDEN, "Unauthorized client");
-            }
+        Err(reason) => {
+            let (status, msg) = reason.response_parts();
+            return quick_response(status, msg);
         }
-
-        return serve_web_interface(req.uri(), &appstate)
-            .await
-            .into_hyper_response();
     };
 
-    let requested_port = match req.uri().port_u16() {
-        Some(port) => {
-            let Some(port) = NonZero::new(port) else {
-                warn_once_or_info!(
-                    "Unsupported request port 0 from client {client}; returning 400"
-                );
-                return quick_response(StatusCode::BAD_REQUEST, "Invalid port");
-            };
-            Some(port)
-        }
-        None => None,
-    };
-
-    let requested_host = match authorize_cache_access(&client, &requested_host) {
+    let requested_host = match authorize_cache_access(&client, requested_host) {
         Ok(rh) => rh,
         Err((status, msg)) => return quick_response(status, msg),
     };

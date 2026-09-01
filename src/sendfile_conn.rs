@@ -45,7 +45,10 @@ use crate::{
     permitted_host_cache::authorize_cache_access,
     precise_instant::PreciseInstant,
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
-    request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
+    request_dispatch::{
+        ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
+        dispatch_request, preflight_method, preflight_target,
+    },
     static_assert, swrite, tunnel_limiter,
     utils::{
         CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
@@ -472,6 +475,7 @@ async fn graceful_close(stream: &TcpStream) {
 
 /// Serve a local web-interface request directly from the sendfile path.
 ///
+/// The web-interface ACL has already been enforced by `preflight_target`.
 /// The hyper-based handler exists in `web_interface::serve_web_interface`; this
 /// wrapper invokes it and serializes the resulting `WebResponse`
 /// onto the raw `TcpStream` with handwritten headers, so webui responses look
@@ -484,26 +488,6 @@ async fn serve_webui(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
 ) -> ZeroCopyResult {
-    let cfg = global_config();
-    let allowed_webif_clients = cfg
-        .allowed_webif_clients
-        .as_ref()
-        .unwrap_or(&cfg.allowed_proxy_clients);
-    let client_ip = client.ip();
-    if !allowed_webif_clients.is_empty()
-        && !allowed_webif_clients
-            .iter()
-            .any(|ac| ac.contains(&client_ip))
-    {
-        warn_once_or_info!("Unauthorized web-interface access by client {client}; returning 403");
-        metrics::AUTHZ_REJECTED_WEBUI.increment();
-        return ZeroCopyResult::Rejection {
-            status: StatusCode::FORBIDDEN,
-            conn_action,
-            msg: "Unauthorized client",
-        };
-    }
-
     let response = serve_web_interface(uri, appstate).await;
 
     if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
@@ -566,6 +550,40 @@ async fn write_webui_response(
     write_all_to_stream(stream, &response.body, WritePhase::Body).await
 }
 
+/// Map a shared pre-flight/dispatch rejection onto the sendfile result type.
+///
+/// Diff-request and web-interface ACL rejections keep the connection alive
+/// (per the request's own `Connection` semantics); the CONNECT ACL rejection
+/// closes it; every other 4xx closes to defend against header smuggling.
+/// `conn_action` is a closure because `compute_conn_action` logs a warning
+/// for requests carrying a body, which the closing variants never did.
+#[must_use]
+fn reject_result(
+    reason: RejectReason,
+    conn_action: impl FnOnce() -> ConnectionAction,
+) -> ZeroCopyResult {
+    let (status, msg) = reason.response_parts();
+    match reason {
+        RejectReason::DiffRequest | RejectReason::UnauthorizedWebUi => ZeroCopyResult::Rejection {
+            status,
+            conn_action: conn_action(),
+            msg,
+        },
+        RejectReason::UnauthorizedClient => ZeroCopyResult::Rejection {
+            status,
+            conn_action: ConnectionAction::Close,
+            msg,
+        },
+        RejectReason::BadEncoding
+        | RejectReason::InvalidValue
+        | RejectReason::UnsafePath
+        | RejectReason::UnsupportedMethod
+        | RejectReason::UnsupportedScheme
+        | RejectReason::MissingHost
+        | RejectReason::InvalidPort => ZeroCopyResult::Invalid { status, msg },
+    }
+}
+
 /// Compute the connection action based on the request headers.
 #[must_use]
 fn compute_conn_action(
@@ -617,29 +635,11 @@ fn compute_conn_action(
 /// loop owns the stream and drives [`run_connect_tunnel`] on the returned
 /// [`ZeroCopyResult::Tunnel`].
 ///
-/// The proxy-client ACL (`allowed_proxy_clients`) is enforced here: the GET
-/// path enforces it via `authorize_cache_access`, which CONNECT never reaches.
-/// This mirrors the hyper backend, which checks the same ACL before tunnel
-/// validation.
+/// The proxy-client ACL (`allowed_proxy_clients`) has already been enforced
+/// by `preflight_method`, which both backends run before reaching here.
 #[must_use]
 fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
     let config = global_config();
-
-    let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
-    let client_ip = client.ip();
-    if !allowed_proxy_clients.is_empty()
-        && !allowed_proxy_clients
-            .iter()
-            .any(|ac| ac.contains(&client_ip))
-    {
-        warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
-        metrics::AUTHZ_REJECTED_CLIENT.increment();
-        return ZeroCopyResult::Rejection {
-            status: StatusCode::FORBIDDEN,
-            conn_action: ConnectionAction::Close,
-            msg: "Unauthorized client",
-        };
-    }
 
     // A CONNECT request target is authority-form ("host:port"); parse it into a
     // URI so the shared validator sees the same `authority()` the hyper backend
@@ -968,19 +968,16 @@ async fn try_sendfile_request(
 
     trace!("Parsed client request:\n{req:?}");
 
+    let acls = ClientAcls::from(global_config());
+
     // Only handle GET requests via sendfile
-    match req.method.expect("complete header parsed") {
-        "GET" => {}
-        "CONNECT" => return handle_connect(client, req.path.expect("complete header parsed")),
-        m => {
-            warn_once_or_info!(
-                "Unsupported request method `{}` from client {client}; returning 405",
-                m.escape_debug(),
-            );
-            return ZeroCopyResult::Invalid {
-                status: StatusCode::METHOD_NOT_ALLOWED,
-                msg: "Method not supported",
-            };
+    match preflight_method(req.method.expect("complete header parsed"), &client, &acls) {
+        Ok(RequestKind::Get) => {}
+        Ok(RequestKind::Connect) => {
+            return handle_connect(client, req.path.expect("complete header parsed"));
+        }
+        Err(reason) => {
+            return reject_result(reason, || compute_conn_action(&req, *conn_version, &client));
         }
     }
 
@@ -1002,51 +999,26 @@ async fn try_sendfile_request(
         }
     };
 
-    // Proxy GET requests always use http://, HTTPS goes through CONNECT.
-    // Reject any other scheme (e.g. ftp://, file://).
-    if let Some(scheme) = uri.scheme()
-        && *scheme != http::uri::Scheme::HTTP
-    {
-        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}; returning 400");
-        return ZeroCopyResult::Invalid {
-            status: StatusCode::BAD_REQUEST,
-            msg: "Unsupported URI scheme",
-        };
-    }
-
-    let Some(authority) = uri.authority() else {
-        // RFC 9112 §3.2: A server MUST respond with a 400 (Bad Request) status code to any
-        // HTTP/1.1 request message that lacks a Host header field.
-        if *conn_version == ConnectionVersion::Http11 && find_header(req.headers, &HOST).is_none() {
-            debug!("Missing Host header from HTTP/1.1 request from client {client}");
-            return ZeroCopyResult::Invalid {
-                status: StatusCode::BAD_REQUEST,
-                msg: "Missing Host header",
-            };
+    let (requested_host, requested_port) = match preflight_target(
+        &uri,
+        *conn_version == ConnectionVersion::Http11,
+        || find_header(req.headers, &HOST).is_some(),
+        &client,
+        &acls,
+    ) {
+        Ok(RequestTarget::Proxy { host, port }) => (host, port),
+        Ok(RequestTarget::WebUi) => {
+            let conn_action = compute_conn_action(&req, *conn_version, &client);
+            return serve_webui(stream, &uri, appstate, &client, *conn_version, conn_action).await;
         }
-        // No authority means it's a direct request to the local web interface.
-        let conn_action = compute_conn_action(&req, *conn_version, &client);
-        return serve_webui(stream, &uri, appstate, &client, *conn_version, conn_action).await;
+        Err(reason) => {
+            return reject_result(reason, || compute_conn_action(&req, *conn_version, &client));
+        }
     };
 
-    let requested_host = match authorize_cache_access(&client, authority.host()) {
+    let requested_host = match authorize_cache_access(&client, requested_host) {
         Ok(rh) => rh,
         Err((status, msg)) => return ZeroCopyResult::Invalid { status, msg },
-    };
-    let requested_port = match authority.port_u16() {
-        Some(port) => {
-            let Some(port) = NonZero::new(port) else {
-                warn_once_or_info!(
-                    "Unsupported request port 0 from client {client}; returning 400"
-                );
-                return ZeroCopyResult::Invalid {
-                    status: StatusCode::BAD_REQUEST,
-                    msg: "Invalid port",
-                };
-            };
-            Some(port)
-        }
-        None => None,
     };
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
@@ -1058,21 +1030,7 @@ async fn try_sendfile_request(
     let uri_path = uri.path();
     let plan = match dispatch_request(uri_path, requested_host, requested_port, &client).await {
         DispatchOutcome::Cache(plan) => plan,
-        DispatchOutcome::Reject(reason) => {
-            let (status, msg) = reason.response_parts();
-            // Diff-request rejections keep the connection alive; the other
-            // 4xx variants close to defend against header smuggling.
-            return match reason {
-                RejectReason::DiffRequest => ZeroCopyResult::Rejection {
-                    status,
-                    conn_action,
-                    msg,
-                },
-                RejectReason::BadEncoding
-                | RejectReason::InvalidValue
-                | RejectReason::UnsafePath => ZeroCopyResult::Invalid { status, msg },
-            };
-        }
+        DispatchOutcome::Reject(reason) => return reject_result(reason, || conn_action),
         #[cfg(feature = "splice")]
         DispatchOutcome::Passthrough {
             reason:

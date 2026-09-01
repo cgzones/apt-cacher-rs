@@ -3,8 +3,9 @@
 //! Both the hyper and sendfile/splice backends call
 //! [`validate_connect_target`] so their tunnel policy (enable flag, authority
 //! bound, port ACL, mirror ACL) — and the metrics/log side effects — stay
-//! identical. The per-request proxy-client ACL is *not* handled here; each
-//! backend enforces `allowed_proxy_clients` on its own.
+//! identical. The per-request proxy-client ACL is *not* handled here; both
+//! backends enforce `allowed_proxy_clients` for `CONNECT` in
+//! `request_dispatch::preflight_method` before reaching this validator.
 
 use core::num::NonZero;
 

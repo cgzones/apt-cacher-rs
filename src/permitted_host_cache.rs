@@ -3,7 +3,10 @@ use std::sync::LazyLock;
 use hashbrown::HashMap;
 use http::StatusCode;
 
-use crate::{ClientInfo, config::ClientHost, global_config, metrics, warn_once_or_info};
+use crate::{
+    ClientInfo, config::ClientHost, global_config, metrics, request_dispatch::client_permitted,
+    warn_once_or_info,
+};
 
 #[must_use]
 fn is_host_allowed(requested_host: &str) -> bool {
@@ -80,13 +83,7 @@ pub(crate) fn authorize_cache_access(
 ) -> Result<ClientHost, (StatusCode, &'static str)> {
     let config = global_config();
 
-    let allowed_proxy_clients = config.allowed_proxy_clients.as_slice();
-    let client_ip = client.ip();
-    if !allowed_proxy_clients.is_empty()
-        && !allowed_proxy_clients
-            .iter()
-            .any(|ac| ac.contains(&client_ip))
-    {
+    if !client_permitted(&config.allowed_proxy_clients, client) {
         warn_once_or_info!(
             "Unauthorized proxy client {client}: not permitted by `allowed_proxy_clients`; rejecting with 403"
         );

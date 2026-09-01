@@ -1,5 +1,16 @@
-//! Unified URI dispatch entry point shared by the hyper backend in
-//! `hyper_conn.rs` and the sendfile backend in `sendfile_conn.rs`.
+//! Unified request pre-flight and URI dispatch entry point shared by the
+//! hyper backend in `hyper_conn.rs` and the sendfile backend in
+//! `sendfile_conn.rs`.
+//!
+//! The pre-flight ([`preflight_method`] + [`preflight_target`]) is the
+//! backend-independent part of "is this a request we serve at all": method
+//! gate, proxy-client ACL for `CONNECT`, URI scheme gate, the HTTP/1.1
+//! `Host` requirement, the web-interface ACL and the port sanity check.  Both
+//! functions are pure over their parameters (no `global_config()`); the
+//! backends feed them the already-parsed request line and map the shared
+//! [`RejectReason`] onto their response type.  The host allowlist stays in
+//! `permitted_host_cache::authorize_cache_access`, which the backends call on
+//! the returned [`RequestTarget::Proxy`] host.
 //!
 //! Owns the request-classification pipeline that previously appeared inline
 //! in both dispatchers:
@@ -29,13 +40,13 @@
 
 use std::{cell::LazyCell, num::NonZero};
 
-use http::StatusCode;
-use tracing::trace;
+use http::{StatusCode, uri::Uri};
+use tracing::{debug, trace};
 
 use crate::{
     ClientInfo,
     cache_layout::{self, CacheLayout, CachedFlavor, ClassifyError, ResourceKind},
-    config::{Alias, CacheHost, ClientHost, resolve_alias},
+    config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
     database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
         Mirror, Origin, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path,
@@ -63,12 +74,30 @@ pub(crate) struct CachePlan {
     _private: (),
 }
 
-/// Reason the dispatcher refused a request with a fixed 4xx response.
+/// Reason the pre-flight or the dispatcher refused a request with a fixed
+/// 4xx response.
 ///
 /// Backends call [`Self::response_parts`] to materialise the `(status, body)`
-/// pair; logging and metric bumping have already been done by the dispatcher.
-#[derive(Clone, Copy, Debug)]
+/// pair - the single status/body table for every shared rejection; logging
+/// and metric bumping have already been done by the function that returned
+/// the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RejectReason {
+    /// Request method other than `GET` or `CONNECT`.
+    UnsupportedMethod,
+    /// A `CONNECT` from a client outside `allowed_proxy_clients`.  (A `GET`
+    /// from such a client is refused by `authorize_cache_access` instead.)
+    UnauthorizedClient,
+    /// Absolute-form `GET` with a scheme other than `http` (HTTPS goes
+    /// through `CONNECT`).
+    UnsupportedScheme,
+    /// HTTP/1.1 origin-form request without a `Host` header (RFC 9112 §3.2).
+    MissingHost,
+    /// Origin-form (web-interface) request from a client outside
+    /// `allowed_webif_clients`.
+    UnauthorizedWebUi,
+    /// Absolute-form `GET` naming port 0.
+    InvalidPort,
     /// URL-decoding a request field produced invalid UTF-8.
     BadEncoding,
     /// A decoded field failed its allowlist validator
@@ -88,6 +117,13 @@ impl RejectReason {
     #[must_use]
     pub(crate) const fn response_parts(self) -> (StatusCode, &'static str) {
         match self {
+            Self::UnsupportedMethod => (StatusCode::METHOD_NOT_ALLOWED, "Method not supported"),
+            Self::UnauthorizedClient | Self::UnauthorizedWebUi => {
+                (StatusCode::FORBIDDEN, "Unauthorized client")
+            }
+            Self::UnsupportedScheme => (StatusCode::BAD_REQUEST, "Unsupported URI scheme"),
+            Self::MissingHost => (StatusCode::BAD_REQUEST, "Missing Host header"),
+            Self::InvalidPort => (StatusCode::BAD_REQUEST, "Invalid port"),
             Self::BadEncoding => (StatusCode::BAD_REQUEST, "Unsupported URL encoding"),
             Self::InvalidValue | Self::UnsafePath => {
                 (StatusCode::BAD_REQUEST, "Unsupported request")
@@ -95,6 +131,158 @@ impl RejectReason {
             Self::DiffRequest => (StatusCode::GONE, "Diff requests are not supported"),
         }
     }
+}
+
+/// The client allowlists the pre-flight consults, borrowed from [`Config`].
+///
+/// A view rather than `&Config` so unit tests can build one from slices
+/// without parsing a TOML document.  `webif_clients` already has the
+/// "inherit `allowed_proxy_clients`" fallback applied.
+pub(crate) struct ClientAcls<'a> {
+    pub(crate) proxy_clients: &'a [IpNetOrAddr],
+    pub(crate) webif_clients: &'a [IpNetOrAddr],
+}
+
+impl<'a> From<&'a Config> for ClientAcls<'a> {
+    fn from(config: &'a Config) -> Self {
+        Self {
+            proxy_clients: &config.allowed_proxy_clients,
+            webif_clients: config
+                .allowed_webif_clients
+                .as_deref()
+                .unwrap_or(&config.allowed_proxy_clients),
+        }
+    }
+}
+
+/// Whether `client` passes `acl`.  An empty list permits everyone.
+#[must_use]
+pub(crate) fn client_permitted(acl: &[IpNetOrAddr], client: &ClientInfo) -> bool {
+    if acl.is_empty() {
+        return true;
+    }
+    let client_ip = client.ip();
+    acl.iter().any(|ac| ac.contains(&client_ip))
+}
+
+/// What an accepted request method asks the proxy to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestKind {
+    /// A `GET`; continue with [`preflight_target`].
+    Get,
+    /// A `CONNECT` from a client permitted by `allowed_proxy_clients`.  The
+    /// backend parses the authority-form target and hands it to
+    /// `connect_tunnel::validate_connect_target`.
+    Connect,
+}
+
+/// Method gate shared by both backends: `GET` and `CONNECT` are the only
+/// methods served, and `CONNECT` additionally passes the proxy-client ACL
+/// here (the `GET` path enforces it inside `authorize_cache_access`).
+///
+/// Logs and bumps metrics for every rejection; the caller only maps the
+/// [`RejectReason`] onto its response type.
+pub(crate) fn preflight_method(
+    method: &str,
+    client: &ClientInfo,
+    acls: &ClientAcls<'_>,
+) -> Result<RequestKind, RejectReason> {
+    match method {
+        "GET" => Ok(RequestKind::Get),
+        "CONNECT" => {
+            if !client_permitted(acls.proxy_clients, client) {
+                warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
+                metrics::AUTHZ_REJECTED_CLIENT.increment();
+                return Err(RejectReason::UnauthorizedClient);
+            }
+            Ok(RequestKind::Connect)
+        }
+        m => {
+            warn_once_or_info!(
+                "Unsupported request method `{}` from client {client}; returning 405",
+                m.escape_debug(),
+            );
+            Err(RejectReason::UnsupportedMethod)
+        }
+    }
+}
+
+/// Where an accepted `GET` is headed.
+#[derive(Debug)]
+pub(crate) enum RequestTarget<'a> {
+    /// Origin-form request (no authority): the local web interface.  The
+    /// web-interface ACL has passed.
+    WebUi,
+    /// Absolute-form request to a mirror.  `host` is the raw authority host,
+    /// still to be validated by `permitted_host_cache::authorize_cache_access`
+    /// (which also enforces `allowed_proxy_clients`); `port` is `None` for
+    /// the default port.
+    Proxy {
+        host: &'a str,
+        port: Option<NonZero<u16>>,
+    },
+}
+
+/// Target gate shared by both backends for a `GET`: scheme check, the
+/// HTTP/1.1 `Host` requirement and web-interface ACL for origin-form
+/// requests, and the port sanity check for absolute-form ones.
+///
+/// `has_host_header` is only consulted for HTTP/1.1 origin-form requests,
+/// so the sendfile backend's linear header scan is skipped on the proxy
+/// path.  Logs and bumps metrics for every rejection.
+pub(crate) fn preflight_target<'a>(
+    uri: &'a Uri,
+    is_http11: bool,
+    has_host_header: impl FnOnce() -> bool,
+    client: &ClientInfo,
+    acls: &ClientAcls<'_>,
+) -> Result<RequestTarget<'a>, RejectReason> {
+    // Proxy GET requests always use http://, HTTPS goes through CONNECT.
+    // Reject any other scheme (e.g. ftp://, file://).
+    if let Some(scheme) = uri.scheme()
+        && *scheme != http::uri::Scheme::HTTP
+    {
+        warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}; returning 400");
+        return Err(RejectReason::UnsupportedScheme);
+    }
+
+    let Some(authority) = uri.authority() else {
+        // RFC 9112 §3.2: A server MUST respond with a 400 (Bad Request) status
+        // code to any HTTP/1.1 request message that lacks a Host header field.
+        // HTTP/1.0 did not require Host, so only enforce for 1.1.
+        if is_http11 && !has_host_header() {
+            debug!("Missing Host header from HTTP/1.1 request from client {client}");
+            return Err(RejectReason::MissingHost);
+        }
+
+        // No authority means it's a direct request to the local web interface.
+        if !client_permitted(acls.webif_clients, client) {
+            warn_once_or_info!(
+                "Unauthorized web-interface access by client {client}; returning 403"
+            );
+            metrics::AUTHZ_REJECTED_WEBUI.increment();
+            return Err(RejectReason::UnauthorizedWebUi);
+        }
+        return Ok(RequestTarget::WebUi);
+    };
+
+    let port = match authority.port_u16() {
+        Some(port) => {
+            let Some(port) = NonZero::new(port) else {
+                warn_once_or_info!(
+                    "Unsupported request port 0 from client {client}; returning 400"
+                );
+                return Err(RejectReason::InvalidPort);
+            };
+            Some(port)
+        }
+        None => None,
+    };
+
+    Ok(RequestTarget::Proxy {
+        host: authority.host(),
+        port,
+    })
 }
 
 /// Why the cache pipeline declined and the request must be forwarded
@@ -387,12 +575,185 @@ fn decide_request(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
     use crate::ClientInfo;
     use crate::test_support::local_client;
 
     fn fake_client() -> ClientInfo {
         local_client()
+    }
+
+    const OPEN_ACLS: ClientAcls<'static> = ClientAcls {
+        proxy_clients: &[],
+        webif_clients: &[],
+    };
+
+    /// ACLs that admit only a host the loopback test client is not.
+    const OTHER_HOST_ACLS: ClientAcls<'static> = ClientAcls {
+        proxy_clients: &[IpNetOrAddr::Addr(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 99, 99,
+        )))],
+        webif_clients: &[IpNetOrAddr::Addr(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 99, 99,
+        )))],
+    };
+
+    #[test]
+    fn preflight_method_accepts_get_and_connect() {
+        assert_eq!(
+            preflight_method("GET", &fake_client(), &OPEN_ACLS),
+            Ok(RequestKind::Get)
+        );
+        assert_eq!(
+            preflight_method("CONNECT", &fake_client(), &OPEN_ACLS),
+            Ok(RequestKind::Connect)
+        );
+        // The proxy-client ACL only gates CONNECT here; GET is checked later
+        // by authorize_cache_access.
+        assert_eq!(
+            preflight_method("GET", &fake_client(), &OTHER_HOST_ACLS),
+            Ok(RequestKind::Get)
+        );
+    }
+
+    #[test]
+    fn preflight_method_rejects_other_methods() {
+        for m in ["POST", "PUT", "HEAD", "get"] {
+            assert_eq!(
+                preflight_method(m, &fake_client(), &OPEN_ACLS),
+                Err(RejectReason::UnsupportedMethod),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_method_rejects_connect_from_unlisted_client() {
+        assert_eq!(
+            preflight_method("CONNECT", &fake_client(), &OTHER_HOST_ACLS),
+            Err(RejectReason::UnauthorizedClient)
+        );
+    }
+
+    #[test]
+    fn preflight_target_rejects_non_http_scheme() {
+        let uri: Uri = "ftp://deb.example.com/debian/dists/sid/Release"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            preflight_target(&uri, true, || true, &fake_client(), &OPEN_ACLS).unwrap_err(),
+            RejectReason::UnsupportedScheme
+        );
+    }
+
+    #[test]
+    fn preflight_target_origin_form_requires_host_on_http11_only() {
+        let uri: Uri = "/".parse().unwrap();
+        assert_eq!(
+            preflight_target(&uri, true, || false, &fake_client(), &OPEN_ACLS).unwrap_err(),
+            RejectReason::MissingHost
+        );
+        assert!(matches!(
+            preflight_target(&uri, true, || true, &fake_client(), &OPEN_ACLS),
+            Ok(RequestTarget::WebUi)
+        ));
+        assert!(matches!(
+            preflight_target(&uri, false, || false, &fake_client(), &OPEN_ACLS),
+            Ok(RequestTarget::WebUi)
+        ));
+    }
+
+    #[test]
+    fn preflight_target_origin_form_enforces_webif_acl() {
+        let uri: Uri = "/".parse().unwrap();
+        assert_eq!(
+            preflight_target(&uri, true, || true, &fake_client(), &OTHER_HOST_ACLS).unwrap_err(),
+            RejectReason::UnauthorizedWebUi
+        );
+        // The proxy-client ACL is not consulted for the web interface once a
+        // dedicated webif list is given.
+        let webif_only = ClientAcls {
+            proxy_clients: OTHER_HOST_ACLS.proxy_clients,
+            webif_clients: &[],
+        };
+        assert!(matches!(
+            preflight_target(&uri, true, || true, &fake_client(), &webif_only),
+            Ok(RequestTarget::WebUi)
+        ));
+    }
+
+    #[test]
+    fn preflight_target_absolute_form_yields_host_and_port() {
+        let client = fake_client();
+        let uri: Uri = "http://deb.example.com/debian/dists/sid/Release"
+            .parse()
+            .unwrap();
+        let Ok(RequestTarget::Proxy { host, port }) =
+            preflight_target(&uri, true, || false, &client, &OPEN_ACLS)
+        else {
+            unreachable!("expected Proxy target")
+        };
+        assert_eq!(host, "deb.example.com");
+        assert_eq!(port, None);
+
+        let uri: Uri = "http://deb.example.com:8080/debian/dists/sid/Release"
+            .parse()
+            .unwrap();
+        let Ok(RequestTarget::Proxy { host, port }) =
+            preflight_target(&uri, true, || false, &client, &OPEN_ACLS)
+        else {
+            unreachable!("expected Proxy target")
+        };
+        assert_eq!(host, "deb.example.com");
+        assert_eq!(port, NonZero::new(8080));
+
+        // Absolute-form requests need no Host header even on HTTP/1.1, and
+        // the ACLs are left to authorize_cache_access.
+        assert!(matches!(
+            preflight_target(&uri, true, || false, &client, &OTHER_HOST_ACLS),
+            Ok(RequestTarget::Proxy { .. })
+        ));
+    }
+
+    #[test]
+    fn preflight_target_rejects_port_zero() {
+        let uri: Uri = "http://deb.example.com:0/debian/dists/sid/Release"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            preflight_target(&uri, true, || false, &fake_client(), &OPEN_ACLS).unwrap_err(),
+            RejectReason::InvalidPort
+        );
+    }
+
+    #[test]
+    fn preflight_reject_reasons_map_to_fixed_responses() {
+        assert_eq!(
+            RejectReason::UnsupportedMethod.response_parts(),
+            (StatusCode::METHOD_NOT_ALLOWED, "Method not supported")
+        );
+        assert_eq!(
+            RejectReason::UnauthorizedClient.response_parts(),
+            (StatusCode::FORBIDDEN, "Unauthorized client")
+        );
+        assert_eq!(
+            RejectReason::UnauthorizedWebUi.response_parts(),
+            (StatusCode::FORBIDDEN, "Unauthorized client")
+        );
+        assert_eq!(
+            RejectReason::UnsupportedScheme.response_parts(),
+            (StatusCode::BAD_REQUEST, "Unsupported URI scheme")
+        );
+        assert_eq!(
+            RejectReason::MissingHost.response_parts(),
+            (StatusCode::BAD_REQUEST, "Missing Host header")
+        );
+        assert_eq!(
+            RejectReason::InvalidPort.response_parts(),
+            (StatusCode::BAD_REQUEST, "Invalid port")
+        );
     }
 
     fn fake_host() -> ClientHost {
