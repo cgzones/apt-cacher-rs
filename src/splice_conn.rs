@@ -2681,6 +2681,300 @@ impl BodyTransferError {
 /// flight, then `Finished` once `RenameBarrier::commit` flips the variant).
 type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
 
+/// Per-body bookkeeping shared by the two body loops.
+///
+/// [`splice_proxy_body`] (zero-copy splice/tee) and [`splice_proxy_body_tls`]
+/// (userspace `read_buf` + `pwrite`) differ only in how they pull a chunk
+/// from upstream and how they hand it to the cache file and the client.
+/// Everything around that -- the client-download accounting, the two rate
+/// checkers, the upstream-rate gate, the byte cursors, the client state
+/// machine and the demotion hand-off -- lives here so it exists once.
+struct BodyTransfer<'a> {
+    /// Dropped at the demotion transition so the spawned
+    /// `serve_remaining_from_file` task's own `ClientDownload` (in
+    /// `async_sendfile_unfinished`) takes over the accounting cleanly; see
+    /// [`Self::maybe_demote`]. `Option` because it is taken exactly once.
+    counter: Option<client_counter::ClientDownload>,
+    /// `None` only after [`Self::check_upstream_rate`] consumed it into
+    /// `Aborted(MirrorDownloadRate)` on the error path, where the whole
+    /// transfer is dropped next.
+    dbarrier: Option<DownloadBarrier>,
+    rate_checker: Option<RateChecker>,
+    client_rate_checker: Option<RateChecker>,
+    /// Body bytes still to be pulled from upstream.
+    remaining: u64,
+    /// Cache-file offset of the next byte to write.
+    file_offset: i64,
+    client_status: ClientStatus,
+    /// Body bytes pulled from upstream so far (the next chunk starts here).
+    bytes_done: u64,
+    /// Absolute cache-file offset of the next byte the client expects.
+    /// Maintained together with `client_remaining` across the tee, boundary
+    /// and userspace delivery paths so that on demotion the file-serve task
+    /// gets the exact resume point and length regardless of resume offset,
+    /// body-prefix advance, or 206 range filtering.
+    client_file_pos: u64,
+    /// Bytes still owed to the client.
+    client_remaining: u64,
+    demoted_handle: Option<DemotedClientHandle>,
+    range_filter: &'a SpliceRangeFilter,
+    cache_path: &'a Path,
+    client: &'a TcpStream,
+}
+
+/// What a body loop hands back to `splice_proxy_drive`.
+struct BodyOutcome {
+    /// Returned for the rename step.
+    dbarrier: DownloadBarrier,
+    /// Set when the client was demoted to a file-serve task; the caller
+    /// awaits it after consuming `dbarrier`.
+    demoted_handle: Option<DemotedClientHandle>,
+    /// The client went away mid-body (as opposed to being demoted).
+    client_disconnected: bool,
+    /// Bytes this loop delivered to the client.
+    client_bytes: u64,
+}
+
+impl<'a> BodyTransfer<'a> {
+    fn new(
+        client: &'a TcpStream,
+        dbarrier: DownloadBarrier,
+        range_filter: &'a SpliceRangeFilter,
+        cache_path: &'a Path,
+        content_length: u64,
+        file_start_offset: i64,
+    ) -> Self {
+        // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
+        // response-headers emission (next to `record_client_status`), since
+        // the body loops are skipped when the entire response fits in the
+        // body prefix and we still need to count it.
+        let counter = Some(client_counter::ClientDownload::new());
+
+        let config = global_config();
+        let rate_checker = config
+            .min_download_rate
+            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+        let client_rate_checker = config
+            .min_download_rate
+            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+
+        Self {
+            counter,
+            dbarrier: Some(dbarrier),
+            rate_checker,
+            client_rate_checker,
+            remaining: content_length,
+            file_offset: file_start_offset,
+            client_status: ClientStatus::Active,
+            bytes_done: 0,
+            client_file_pos: u64::try_from(file_start_offset)
+                .expect("file_start_offset is non-negative by construction")
+                + range_filter.skip,
+            client_remaining: range_filter.send,
+            demoted_handle: None,
+            range_filter,
+            cache_path,
+            client,
+        }
+    }
+
+    fn barrier(&mut self) -> &mut DownloadBarrier {
+        self.dbarrier
+            .as_mut()
+            .expect("the barrier is only taken on the upstream-rate abort path")
+    }
+
+    /// Hand the barrier out for a consuming abort (the TLS read step's rate
+    /// tick); the transfer is dropped right after.
+    fn take_barrier(&mut self) -> DownloadBarrier {
+        self.dbarrier
+            .take()
+            .expect("the barrier is only taken on the upstream-rate abort path")
+    }
+
+    /// Upstream-rate gate: at the top of every iteration, and again before
+    /// accepting a demotion (see [`Self::maybe_demote`]). On failure the
+    /// barrier is consumed into `Aborted(MirrorDownloadRate)`.
+    async fn check_upstream_rate(&mut self) -> Result<(), BodyTransferError> {
+        let dbarrier = self.take_barrier();
+        self.dbarrier = Some(
+            dbarrier
+                .check_upstream_rate(self.rate_checker.as_ref())
+                .await
+                .map_err(BodyTransferError::upstream)?,
+        );
+        Ok(())
+    }
+
+    /// Account a chunk just pulled from upstream and return the body-offset
+    /// range it covers.
+    ///
+    /// The upstream RC is fed up-front (the bytes have already arrived) so
+    /// any `check_fail` later in this iteration -- in particular the
+    /// `DemoteRequested` adjudication in [`Self::maybe_demote`] -- sees the
+    /// freshest window. Without this the upstream RC would still be one
+    /// chunk behind the client RC at the moment a slow upstream causes the
+    /// client check to trip.
+    fn note_chunk(&mut self, got: usize) -> Range<u64> {
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
+        if let Some(ref mut rate_checker) = self.rate_checker {
+            rate_checker.add(got);
+        }
+        let start = self.bytes_done;
+        let end = start + got as u64;
+        self.bytes_done = end;
+        self.remaining = self
+            .remaining
+            .checked_sub(got as u64)
+            .expect("upstream should not deliver more than requested");
+        start..end
+    }
+
+    /// `pwrite` a userspace chunk to the cache file at the current offset
+    /// and notify concurrent clients. Always done before the client send so
+    /// late joiners are not gated on this client's send speed.
+    async fn write_cache_chunk(
+        &mut self,
+        cache_file: &tokio::fs::File,
+        buf: &mut Vec<u8>,
+        got: usize,
+    ) -> Result<(), BodyTransferError> {
+        pwrite_buf_to_file(cache_file, buf, got, self.file_offset)
+            .await
+            .map_err(BodyTransferError::cache)?;
+        self.file_offset +=
+            i64::try_from(got).expect("a chunk is bounded by its read buffer, which fits in i64");
+        self.barrier().ping_batched(got as u64);
+        Ok(())
+    }
+
+    /// Splice `count` bytes from `rx` into the cache file at the current
+    /// offset and notify concurrent clients.
+    async fn splice_cache_chunk(
+        &mut self,
+        rx: &pipe::Receiver,
+        cache_file: &tokio::fs::File,
+        count: usize,
+    ) -> Result<(), BodyTransferError> {
+        splice_pipe_to_file(rx, cache_file, count, &mut self.file_offset)
+            .await
+            .map_err(BodyTransferError::cache)?;
+        self.barrier().ping_batched(count as u64);
+        Ok(())
+    }
+
+    /// Record bytes just delivered to the client.
+    fn note_client_bytes(&mut self, sent: usize) {
+        metrics::BYTES_SERVED_SPLICE.increment_by(sent as u64);
+        self.client_file_pos += sent as u64;
+        self.client_remaining = self
+            .client_remaining
+            .checked_sub(sent as u64)
+            .expect("client_remaining tracks bytes still owed to the client");
+    }
+
+    /// The client RC tripped after progress: the cache already has the
+    /// bytes, so hand off to [`Self::maybe_demote`] for adjudication.
+    fn request_demote(&mut self) {
+        self.client_status = ClientStatus::DemoteRequested {
+            client_file_pos: self.client_file_pos,
+            client_remaining: self.client_remaining,
+        };
+    }
+
+    /// The client hung up mid-body: count it, log it once, and carry on
+    /// cache-only so late joiners still complete.
+    fn client_disconnected(&mut self) {
+        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+        let client_total = self.range_filter.send;
+        let client_sent = client_total - self.client_remaining;
+        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+        let client_sent_percent = 100.0 * client_sent as f32 / client_total as f32;
+        info!(
+            "splice proxy: client disconnected after {} out of {} ({:.1}%), continuing cache-only",
+            HumanFmt::Size(client_sent),
+            HumanFmt::Size(client_total),
+            client_sent_percent,
+        );
+        self.client_status = ClientStatus::Disconnected;
+    }
+
+    /// Adjudicate a `DemoteRequested` client: no-op in every other state.
+    ///
+    /// Slow upstream is the most common reason the client RC trips, so the
+    /// upstream rate is checked first and its `MirrorDownloadRate` abort
+    /// surfaces the root cause instead of spinning up a doomed demoted
+    /// file-serve task. Only when the upstream is healthy is the client
+    /// really the bottleneck: accounting is handed to the spawned task (its
+    /// `async_sendfile_unfinished` creates its own `ClientDownload`, so net
+    /// `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition).
+    async fn maybe_demote(&mut self) -> Result<(), BodyTransferError> {
+        let ClientStatus::DemoteRequested {
+            client_file_pos: demote_pos,
+            client_remaining: demote_remaining,
+        } = self.client_status
+        else {
+            return Ok(());
+        };
+
+        self.check_upstream_rate().await?;
+
+        let client_total = self.range_filter.send;
+        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+        let demote_remaining_percent = 100.0 * demote_remaining as f32 / client_total as f32;
+        info!(
+            "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%)",
+            self.cache_path.display(),
+            HumanFmt::Size(demote_pos),
+            HumanFmt::Size(demote_remaining),
+            HumanFmt::Size(client_total),
+            demote_remaining_percent,
+        );
+        drop(self.counter.take());
+        self.demoted_handle = Some(
+            spawn_file_serve_task(
+                self.client,
+                self.cache_path,
+                demote_pos,
+                demote_remaining,
+                self.barrier(),
+            )
+            .map_err(BodyTransferError::proxy)?,
+        );
+        self.client_status = ClientStatus::Demoted;
+        Ok(())
+    }
+
+    fn finish(self) -> BodyOutcome {
+        let Self {
+            counter: _counter,
+            dbarrier,
+            rate_checker: _,
+            client_rate_checker: _,
+            remaining,
+            file_offset: _,
+            client_status,
+            bytes_done: _,
+            client_file_pos: _,
+            client_remaining,
+            demoted_handle,
+            range_filter,
+            cache_path: _,
+            client: _,
+        } = self;
+        debug_assert_eq!(
+            remaining, 0,
+            "the body loop runs until the body is exhausted"
+        );
+        BodyOutcome {
+            dbarrier: dbarrier.expect("the barrier is only taken on the upstream-rate abort path"),
+            demoted_handle,
+            client_disconnected: matches!(client_status, ClientStatus::Disconnected),
+            client_bytes: range_filter.send - client_remaining,
+        }
+    }
+}
+
 /// Splice data from upstream TCP socket to client socket, with zero-copy tee to a cache file.
 ///
 /// Data flow (all in kernel space, zero userspace copies):
@@ -2702,24 +2996,21 @@ async fn splice_proxy_body(
     cache_file: &tokio::fs::File,
     content_length: u64,
     file_start_offset: i64,
-    mut dbarrier: DownloadBarrier,
+    dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-) -> Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64), BodyTransferError> {
+) -> Result<BodyOutcome, BodyTransferError> {
     #[cfg(feature = "ktls")]
     let upstream_is_ktls = upstream.ktls;
     let upstream = upstream.tcp;
-    // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
-    // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
-    // accounting cleanly — see the `ClientStatus::Demoted` branch below.
-    // `Option` is required because the borrow checker can't prove the demotion
-    // branch fires at most once per call when it's nested in the loop below.
-    let mut counter = Some(client_counter::ClientDownload::new());
-
-    // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
-    // response-headers emission (next to `record_client_status`), since
-    // this body fn is skipped when the entire response fits in the
-    // body_prefix / kTLS extra-body and we still need to count it.
+    let mut xfer = BodyTransfer::new(
+        client,
+        dbarrier,
+        range_filter,
+        cache_path,
+        content_length,
+        file_start_offset,
+    );
 
     let (upstream_pipe_sender, mut upstream_pipe_receiver) =
         create_pipe().map_err(BodyTransferError::proxy)?;
@@ -2728,14 +3019,6 @@ async fn splice_proxy_body(
 
     let config = global_config();
 
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-
-    let mut client_rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-
     // Budget for draining kTLS control records that arrive mid-stream (e.g. a
     // late NewSessionTicket) — see the drain-retry arm in the splice loop.
     // Multiple bursts over a long download are plausible; each drain consumes
@@ -2743,35 +3026,18 @@ async fn splice_proxy_body(
     #[cfg(feature = "ktls")]
     let mut ktls_drain_retries: u32 = 8;
 
-    let mut remaining = content_length;
-    let mut file_offset: i64 = file_start_offset;
-    let mut client_status = ClientStatus::Active;
-    let mut bytes_done: u64 = 0;
-    // Absolute cache-file offset of the next byte the client expects, and the
-    // count of bytes still owed to it. Maintained across both the
-    // `tee_and_splice` and boundary-chunk paths so that on demotion we can
-    // hand sendfile the exact resume point and length regardless of resume
-    // offset, body-prefix advance, or 206 range filtering.
-    let mut client_file_pos: u64 = u64::try_from(file_start_offset)
-        .expect("file_start_offset is non-negative by construction")
-        + range_filter.skip;
-    let mut client_remaining: u64 = range_filter.send;
-    let mut demoted_handle: Option<DemotedClientHandle> = None;
     let client_skip = range_filter.skip;
     let client_range_end = range_filter.skip + range_filter.send;
 
-    while remaining > 0 {
-        dbarrier = dbarrier
-            .check_upstream_rate(rate_checker.as_ref())
-            .await
-            .map_err(BodyTransferError::upstream)?;
+    while xfer.remaining > 0 {
+        xfer.check_upstream_rate().await?;
 
         static_assert!(PIPE_BUFFER_SIZE > 0 && (PIPE_BUFFER_SIZE as u64) < usize::MAX as u64);
         #[expect(
             clippy::cast_possible_truncation,
             reason = "PIPE_BUFFER_SIZE is checked to be < usize::MAX above"
         )]
-        let chunk_size = std::cmp::min(remaining, PIPE_BUFFER_SIZE as u64) as usize;
+        let chunk_size = std::cmp::min(xfer.remaining, PIPE_BUFFER_SIZE as u64) as usize;
 
         // Step 1: splice upstream → pipe_A
         // Both fds are non-blocking; splice() never waits on I/O and reads
@@ -2796,7 +3062,8 @@ async fn splice_proxy_body(
                     return Err(BodyTransferError::upstream(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
                         format!(
-                            "splice proxy: upstream closed prematurely (remaining={remaining}, chunk_size={chunk_size})"
+                            "splice proxy: upstream closed prematurely (remaining={}, chunk_size={chunk_size})",
+                            xfer.remaining
                         ),
                     )));
                 }
@@ -2812,7 +3079,7 @@ async fn splice_proxy_body(
                     tokio::select! {
                         r = wait_readable_rated(
                             upstream,
-                            &mut rate_checker,
+                            &mut xfer.rate_checker,
                             RateCheckDirection::Upstream,
                             config.http_timeout,
                         ) => r.map_err(BodyTransferError::upstream)?,
@@ -2895,90 +3162,28 @@ async fn splice_proxy_body(
             };
         };
 
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
-
-        // Feed the upstream RC up-front (the bytes have already arrived) so
-        // any subsequent `check_fail` in this iteration — in particular the
-        // `DemoteRequested → check_upstream_rate` adjudication below — sees
-        // the freshest window. Without this the upstream RC would still be
-        // one chunk behind the client RC at the moment a slow upstream
-        // causes the client check inside `tee_and_splice` to trip.
-        if let Some(ref mut rate_checker) = rate_checker {
-            rate_checker.add(got);
-        }
-
         // Determine how this chunk overlaps with the client range.
-        let chunk_start = bytes_done;
-        let chunk_end = bytes_done + got as u64;
+        let chunk = xfer.note_chunk(got);
 
-        if !matches!(client_status, ClientStatus::Active)
-            || chunk_end <= client_skip
-            || chunk_start >= client_range_end
+        if !matches!(xfer.client_status, ClientStatus::Active)
+            || chunk.end <= client_skip
+            || chunk.start >= client_range_end
         {
             // Chunk is entirely outside client range, or client is gone/demoted — cache only
-            splice_pipe_to_file(&upstream_pipe_receiver, cache_file, got, &mut file_offset)
-                .await
-                .map_err(BodyTransferError::cache)?;
-            dbarrier.ping_batched(got as u64);
-        } else if chunk_start >= client_skip && chunk_end <= client_range_end {
+            xfer.splice_cache_chunk(&upstream_pipe_receiver, cache_file, got)
+                .await?;
+        } else if chunk.start >= client_skip && chunk.end <= client_range_end {
             // Chunk is entirely inside client range — normal tee
-            client_status = tee_and_splice(
+            tee_and_splice(
+                &mut xfer,
                 &upstream_pipe_receiver,
                 &cache_pipe_receiver,
                 &cache_pipe_sender,
-                client,
-                (cache_file, &mut file_offset),
-                range_filter.send,
+                cache_file,
                 got,
-                client_status,
-                &mut dbarrier,
-                &mut client_rate_checker,
-                &mut client_file_pos,
-                &mut client_remaining,
             )
             .await?;
-
-            if let ClientStatus::DemoteRequested {
-                client_file_pos: demote_pos,
-                client_remaining: demote_remaining,
-            } = client_status
-            {
-                // Slow upstream is the most common reason the client RC trips;
-                // surface that root cause via the existing MirrorDownloadRate
-                // abort before spinning up a doomed demoted file-serve task.
-                dbarrier = dbarrier
-                    .check_upstream_rate(rate_checker.as_ref())
-                    .await
-                    .map_err(BodyTransferError::upstream)?;
-
-                // Upstream is healthy — client really is the bottleneck.
-                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-                let demote_remaining_percent =
-                    100.0 * demote_remaining as f32 / range_filter.send as f32;
-                info!(
-                    "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%)",
-                    cache_path.display(),
-                    HumanFmt::Size(demote_pos),
-                    HumanFmt::Size(demote_remaining),
-                    HumanFmt::Size(range_filter.send),
-                    demote_remaining_percent,
-                );
-                // Hand accounting off to the spawned demoted-serve task — its
-                // `async_sendfile_unfinished` creates its own `ClientDownload`
-                // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
-                drop(counter.take());
-                demoted_handle = Some(
-                    spawn_file_serve_task(
-                        client,
-                        cache_path,
-                        demote_pos,
-                        demote_remaining,
-                        &dbarrier,
-                    )
-                    .map_err(BodyTransferError::proxy)?,
-                );
-                client_status = ClientStatus::Demoted;
-            }
+            xfer.maybe_demote().await?;
         } else {
             // Boundary chunk — read into userspace, slice for client, pwrite for cache
             let mut buf = read_pipe_to_buf(&mut upstream_pipe_receiver, got)
@@ -2986,52 +3191,32 @@ async fn splice_proxy_body(
                 .map_err(BodyTransferError::proxy)?;
 
             debug_assert!(
-                matches!(client_status, ClientStatus::Active),
+                matches!(xfer.client_status, ClientStatus::Active),
                 "outer condition excludes non-active"
             );
             debug_assert!(
-                client_range_end > chunk_start,
+                client_range_end > chunk.start,
                 "boundary chunk must overlap client range"
             );
+            debug_assert_eq!(buf.len(), got, "read_pipe_to_buf reads exactly `got` bytes");
 
             // Write full chunk to cache via pwrite first, so concurrent clients
             // see progress without being gated on the first client's send speed.
-            let buf_len = buf.len();
-            pwrite_buf_to_file(cache_file, &mut buf, buf_len, file_offset)
-                .await
-                .map_err(BodyTransferError::cache)?;
-
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "got is bounded by PIPE_BUFFER_SIZE which fits in i64"
-            )]
-            {
-                file_offset += got as i64;
-            }
-
-            // Notify concurrent clients of progress
-            dbarrier.ping_batched(got as u64);
+            xfer.write_cache_chunk(cache_file, &mut buf, got).await?;
 
             // Then send to client (may be slow)
-            let client_slice = range_slice(&buf, chunk_start, range_filter.skip, range_filter.send);
+            let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
                 match write_all_to_stream_rated(
                     client,
                     client_slice,
-                    &mut client_rate_checker,
+                    &mut xfer.client_rate_checker,
                     RateCheckDirection::Client,
                     config.http_timeout,
                 )
                 .await
                 {
-                    Ok(()) => {
-                        let sent = client_slice.len() as u64;
-                        metrics::BYTES_SERVED_SPLICE.increment_by(sent);
-                        client_file_pos += sent;
-                        client_remaining = client_remaining
-                            .checked_sub(sent)
-                            .expect("client_remaining tracks bytes still owed to the client");
-                    }
+                    Ok(()) => xfer.note_client_bytes(client_slice.len()),
                     // Rate-stall / HTTP per-op timeout on the client write:
                     // the proxy gave up on this client but the upstream
                     // download must continue so the cache is populated for
@@ -3046,38 +3231,16 @@ async fn splice_proxy_body(
                                 .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
                             ErrorReport(&err)
                         );
-                        client_status = ClientStatus::Disconnected;
+                        xfer.client_status = ClientStatus::Disconnected;
                     }
-                    Err(err) if is_peer_disconnect(&err) => {
-                        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                        info!(
-                            "splice proxy: client {} disconnected during boundary chunk",
-                            client
-                                .peer_addr()
-                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string())
-                        );
-                        client_status = ClientStatus::Disconnected;
-                    }
+                    Err(err) if is_peer_disconnect(&err) => xfer.client_disconnected(),
                     Err(err) => return Err(BodyTransferError::client(err)),
                 }
             }
         }
-
-        bytes_done = chunk_end;
-
-        remaining = remaining
-            .checked_sub(got as u64)
-            .expect("splice should not return more than requested");
     }
 
-    let client_disconnected = matches!(client_status, ClientStatus::Disconnected);
-    let client_bytes_written = range_filter.send - client_remaining;
-    Ok((
-        dbarrier,
-        demoted_handle,
-        client_disconnected,
-        client_bytes_written,
-    ))
+    Ok(xfer.finish())
 }
 
 /// Writes the entire buffer to the cache file via pwrite at the specified offset.
@@ -3195,47 +3358,25 @@ async fn splice_proxy_body_tls(
     cache_file: &tokio::fs::File,
     content_length: u64,
     file_start_offset: i64,
-    mut dbarrier: DownloadBarrier,
+    dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-) -> Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64), BodyTransferError> {
-    // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
-    // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
-    // accounting cleanly — see the `ClientStatus::Demoted` branch below.
-    // `Option` is required because the borrow checker can't prove the demotion
-    // branch fires at most once per call when it's nested in the loop below.
-    let mut counter = Some(client_counter::ClientDownload::new());
-
-    // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
-    // response-headers emission (next to `record_client_status`), since
-    // this body fn is skipped when the entire response fits in the
-    // body_prefix / kTLS extra-body and we still need to count it.
+) -> Result<BodyOutcome, BodyTransferError> {
+    let mut xfer = BodyTransfer::new(
+        client,
+        dbarrier,
+        range_filter,
+        cache_path,
+        content_length,
+        file_start_offset,
+    );
 
     let config = global_config();
 
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-
-    let mut client_rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-
-    let mut remaining = content_length;
-    let mut file_offset: i64 = file_start_offset;
     // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
     // writes into the spare capacity via `BufMut` so the buffer never has
     // to be zero-initialized before being overwritten by upstream data.
     let mut read_buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
-    let mut client_status = ClientStatus::Active;
-    let mut bytes_done: u64 = 0;
-    // See `splice_proxy_body` for the rationale on tracking absolute client
-    // position and remaining bytes here.
-    let mut client_file_pos: u64 = u64::try_from(file_start_offset)
-        .expect("file_start_offset is non-negative by construction")
-        + range_filter.skip;
-    let mut client_remaining: u64 = range_filter.send;
-    let mut demoted_handle: Option<DemotedClientHandle> = None;
 
     // One pinned re-armable sleep per body for the http_timeout deadline
     // and one for the 1 s rate-check tick — the previous version built two
@@ -3246,11 +3387,8 @@ async fn splice_proxy_body_tls(
     let tick = tokio::time::sleep(RATE_TICK_PERIOD);
     tokio::pin!(tick);
 
-    while remaining > 0 {
-        dbarrier = dbarrier
-            .check_upstream_rate(rate_checker.as_ref())
-            .await
-            .map_err(BodyTransferError::upstream)?;
+    while xfer.remaining > 0 {
+        xfer.check_upstream_rate().await?;
 
         // Step 1: async read from TLS stream into userspace buffer
         // The outer http_timeout ensures a fully stalled connection is killed even if
@@ -3261,7 +3399,7 @@ async fn splice_proxy_body_tls(
             "buffer capacity should remain constant"
         );
         read_buf.clear();
-        let to_read = std::cmp::min(remaining, TLS_READ_BUF_SIZE as u64);
+        let to_read = std::cmp::min(xfer.remaining, TLS_READ_BUF_SIZE as u64);
         outer
             .as_mut()
             .reset(tokio::time::Instant::now() + config.http_timeout);
@@ -3278,14 +3416,15 @@ async fn splice_proxy_body_tls(
                         Ok(n) => break n,
                         Err(err) => return Err(BodyTransferError::upstream(err)),
                     },
-                    () = &mut tick, if rate_checker.is_some() => {
-                        let rc = rate_checker
+                    () = &mut tick, if xfer.rate_checker.is_some() => {
+                        let rc = xfer
+                            .rate_checker
                             .as_mut()
                             .expect("guarded by rate_checker.is_some()");
                         rc.add(0);
                         if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
                             return Err(BodyTransferError::upstream(
-                                dbarrier.abort_with_rate_timeout(rate).await,
+                                xfer.take_barrier().abort_with_rate_timeout(rate).await,
                             ));
                         }
                         tick.as_mut()
@@ -3312,113 +3451,31 @@ async fn splice_proxy_body_tls(
             )));
         }
 
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
-
-        // See `splice_proxy_body` for the rationale on feeding the upstream
-        // RC up-front rather than at the end of the iteration.
-        if let Some(ref mut rate_checker) = rate_checker {
-            rate_checker.add(got);
-        }
-
         // Determine how this chunk overlaps with the client range.
-        let chunk_start = bytes_done;
-        let chunk_end = bytes_done + got as u64;
+        let chunk = xfer.note_chunk(got);
 
         // Write the full chunk to cache via pwrite first, so concurrent
         // clients see progress without being gated on this client's send
         // speed.
-        pwrite_buf_to_file(cache_file, &mut read_buf, got, file_offset)
-            .await
-            .map_err(BodyTransferError::cache)?;
-
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "got is bounded by TLS_READ_BUF_SIZE which fits in i64"
-        )]
-        {
-            file_offset += got as i64;
-        }
-
-        // Notify concurrent clients of progress
-        dbarrier.ping_batched(got as u64);
+        xfer.write_cache_chunk(cache_file, &mut read_buf, got)
+            .await?;
 
         // Then send the overlap with the client range (may be slow)
         let client_slice = range_slice(
             &read_buf[..got],
-            chunk_start,
+            chunk.start,
             range_filter.skip,
             range_filter.send,
         );
-        if matches!(client_status, ClientStatus::Active) && !client_slice.is_empty() {
-            client_status = write_client_or_demote(
-                client,
-                client_slice,
-                &mut client_rate_checker,
-                &mut client_file_pos,
-                &mut client_remaining,
-                range_filter.send,
-            )
-            .await
-            .map_err(BodyTransferError::client)?;
-
-            if let ClientStatus::DemoteRequested {
-                client_file_pos: demote_pos,
-                client_remaining: demote_remaining,
-            } = client_status
-            {
-                // Slow upstream is the most common reason the client RC trips;
-                // surface that root cause via the existing MirrorDownloadRate
-                // abort before spinning up a doomed demoted file-serve task.
-                dbarrier = dbarrier
-                    .check_upstream_rate(rate_checker.as_ref())
-                    .await
-                    .map_err(BodyTransferError::upstream)?;
-
-                // Upstream is healthy — client really is the bottleneck.
-                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-                let demote_remaining_percent =
-                    100.0 * demote_remaining as f32 / range_filter.send as f32;
-                info!(
-                    "splice proxy: demoting slow client to file-serve of `{}` at cache offset {} with {} remaining out of {} ({:.1}%)",
-                    cache_path.display(),
-                    HumanFmt::Size(demote_pos),
-                    HumanFmt::Size(demote_remaining),
-                    HumanFmt::Size(range_filter.send),
-                    demote_remaining_percent,
-                );
-                // Hand accounting off to the spawned demoted-serve task — its
-                // `async_sendfile_unfinished` creates its own `ClientDownload`
-                // so net `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition.
-                drop(counter.take());
-                demoted_handle = Some(
-                    spawn_file_serve_task(
-                        client,
-                        cache_path,
-                        demote_pos,
-                        demote_remaining,
-                        &dbarrier,
-                    )
-                    .map_err(BodyTransferError::proxy)?,
-                );
-                client_status = ClientStatus::Demoted;
-            }
+        if matches!(xfer.client_status, ClientStatus::Active) && !client_slice.is_empty() {
+            write_client_or_demote(&mut xfer, client_slice)
+                .await
+                .map_err(BodyTransferError::client)?;
+            xfer.maybe_demote().await?;
         }
-
-        bytes_done = chunk_end;
-
-        remaining = remaining
-            .checked_sub(got as u64)
-            .expect("read(2) should not return more than requested");
     }
 
-    let client_disconnected = matches!(client_status, ClientStatus::Disconnected);
-    let client_bytes_written = range_filter.send - client_remaining;
-    Ok((
-        dbarrier,
-        demoted_handle,
-        client_disconnected,
-        client_bytes_written,
-    ))
+    Ok(xfer.finish())
 }
 
 /// Write `slice` to the client with rate checking, translating client
@@ -3427,35 +3484,15 @@ async fn splice_proxy_body_tls(
 /// not abort the download (late joiners depend on it).
 ///
 /// Mirrors the `tee_and_splice` client-splice semantics: a client
-/// rate-check trip after progress returns `DemoteRequested` (the caller
-/// adjudicates the actual demote), a peer disconnect returns
-/// `Disconnected` (bumping `CLIENT_DISCONNECTED_MID_BODY`), and a rated
-/// wait timeout abandons the client (`Disconnected`, no metric — the
+/// rate-check trip after progress leaves `DemoteRequested` (the caller
+/// adjudicates via [`BodyTransfer::maybe_demote`]), a peer disconnect
+/// leaves `Disconnected` (bumping `CLIENT_DISCONNECTED_MID_BODY`), and a
+/// rated wait timeout abandons the client (`Disconnected`, no metric — the
 /// timeout counters were already bumped at rejection) so the download
 /// continues cache-only. Only unexpected I/O errors are returned as
 /// `Err`.
-async fn write_client_or_demote(
-    client: &TcpStream,
-    slice: &[u8],
-    client_rate_checker: &mut Option<RateChecker>,
-    client_file_pos: &mut u64,
-    client_remaining: &mut u64,
-    client_total: u64,
-) -> std::io::Result<ClientStatus> {
-    let disconnected = |client_remaining: u64| {
-        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-        let client_sent = client_total - client_remaining;
-        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-        let client_sent_percent = 100.0 * client_sent as f32 / client_total as f32;
-        info!(
-            "splice proxy: client disconnected after {} out of {} ({:.1}%), continuing cache-only",
-            HumanFmt::Size(client_sent),
-            HumanFmt::Size(client_total),
-            client_sent_percent,
-        );
-        ClientStatus::Disconnected
-    };
-
+async fn write_client_or_demote(xfer: &mut BodyTransfer<'_>, slice: &[u8]) -> std::io::Result<()> {
+    let client = xfer.client;
     let mut written = 0;
     while written < slice.len() {
         // `try_write` clears tokio's cached writability itself on
@@ -3463,28 +3500,22 @@ async fn write_client_or_demote(
         match client.try_write(&slice[written..]) {
             Ok(n) => {
                 written += n;
-                *client_file_pos += n as u64;
-                *client_remaining = client_remaining
-                    .checked_sub(n as u64)
-                    .expect("client_remaining tracks bytes still owed to the client");
-                metrics::BYTES_SERVED_SPLICE.increment_by(n as u64);
-                if let Some(rc) = client_rate_checker {
+                xfer.note_client_bytes(n);
+                if let Some(rc) = &mut xfer.client_rate_checker {
                     rc.add(n);
                     if rc.check_fail(RateCheckDirection::Client).is_some() {
                         // Client RC tripped — the cache already has the
                         // bytes, hand off to the caller for demote
                         // adjudication.
-                        return Ok(ClientStatus::DemoteRequested {
-                            client_file_pos: *client_file_pos,
-                            client_remaining: *client_remaining,
-                        });
+                        xfer.request_demote();
+                        return Ok(());
                     }
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 match wait_writable_rated(
                     client,
-                    client_rate_checker,
+                    &mut xfer.client_rate_checker,
                     RateCheckDirection::Client,
                     global_config().http_timeout,
                 )
@@ -3503,22 +3534,25 @@ async fn write_client_or_demote(
                                 .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
                             ErrorReport(&err)
                         );
-                        return Ok(ClientStatus::Disconnected);
+                        xfer.client_status = ClientStatus::Disconnected;
+                        return Ok(());
                     }
                     Err(err) if is_peer_disconnect(&err) => {
-                        return Ok(disconnected(*client_remaining));
+                        xfer.client_disconnected();
+                        return Ok(());
                     }
                     Err(err) => return Err(err),
                 }
             }
             Err(err) if is_peer_disconnect(&err) => {
-                return Ok(disconnected(*client_remaining));
+                xfer.client_disconnected();
+                return Ok(());
             }
             Err(err) => return Err(err),
         }
     }
 
-    Ok(ClientStatus::Active)
+    Ok(())
 }
 
 /// Duplicate the client socket fd and spawn a task that serves remaining bytes
@@ -3681,31 +3715,23 @@ enum ClientStatus {
 /// write to the cache file so concurrent hyper clients can still complete.
 ///
 /// If the client send rate drops below the configured minimum, remaining bytes are
-/// drained and `ClientStatus::DemoteRequested` is returned so the caller can
-/// either promote it to `ClientStatus::Demoted` (spawn a file-serve task) or
-/// abort the splice with an upstream-rate timeout when the upstream is the
-/// actual bottleneck.
-#[expect(clippy::too_many_arguments, reason = "function has only 2 callers")]
+/// drained and the client is left in `ClientStatus::DemoteRequested` so the
+/// caller ([`BodyTransfer::maybe_demote`]) can either promote it to
+/// `ClientStatus::Demoted` (spawn a file-serve task) or abort the splice with
+/// an upstream-rate timeout when the upstream is the actual bottleneck.
 async fn tee_and_splice(
+    xfer: &mut BodyTransfer<'_>,
     upstream_pipe_rx: &pipe::Receiver,
     cache_pipe_rx: &pipe::Receiver,
     cache_pipe_tx: &pipe::Sender,
-    client: &TcpStream,
-    target: (&tokio::fs::File, &mut i64),
-    client_total: u64,
+    cache_file: &tokio::fs::File,
     got: usize,
-    client_status: ClientStatus,
-    dbarrier: &mut DownloadBarrier,
-    client_rate_checker: &mut Option<RateChecker>,
-    client_file_pos: &mut u64,
-    client_remaining: &mut u64,
-) -> Result<ClientStatus, BodyTransferError> {
-    let (cache_file, file_offset) = target;
-    let mut status = client_status;
+) -> Result<(), BodyTransferError> {
+    let client = xfer.client;
     let mut remaining = got;
 
     while remaining > 0 {
-        if matches!(status, ClientStatus::Active) {
+        if matches!(xfer.client_status, ClientStatus::Active) {
             // Tee pipe_A → pipe_B, then splice pipe_B → cache, then splice pipe_A → client.
             // Cache is written first so concurrent clients see progress immediately
             // without being gated on a potentially slow first client.
@@ -3749,13 +3775,10 @@ async fn tee_and_splice(
                 };
             };
 
-            // Step 3: splice pipe_B → cache file first (fast, local disk I/O)
-            splice_pipe_to_file(cache_pipe_rx, cache_file, teed, file_offset)
-                .await
-                .map_err(BodyTransferError::cache)?;
-
-            // Notify concurrent clients that new data is on disk
-            dbarrier.ping_batched(teed as u64);
+            // Step 3: splice pipe_B → cache file first (fast, local disk I/O),
+            // notifying concurrent clients that new data is on disk.
+            xfer.splice_cache_chunk(cache_pipe_rx, cache_file, teed)
+                .await?;
 
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
             // pipe_A always has data on entry (just filled by tee), so try the
@@ -3766,7 +3789,7 @@ async fn tee_and_splice(
             // win the `select!` race and cancel them mid-flight.
             // Tracks how many of the just-teed bytes are still sitting in
             // `pipe_A` waiting to be spliced to the client. Distinct from the
-            // outer `client_remaining` parameter (response-level total).
+            // transfer's `client_remaining` (response-level total).
             let mut teed_remaining = teed;
             while teed_remaining > 0 {
                 let result = splice(
@@ -3788,17 +3811,7 @@ async fn tee_and_splice(
                     ) => {
                         // Client disconnected — drain the remaining teed bytes from pipe_A
                         // by splicing them to /dev/null (discard)
-                        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                        let client_sent = client_total - *client_remaining;
-                        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-                        let client_sent_percent = 100.0 * client_sent as f32 / client_total as f32;
-                        info!(
-                            "splice proxy: client disconnected after {} out of {} ({:.1}%), continuing cache-only",
-                            HumanFmt::Size(client_sent),
-                            HumanFmt::Size(client_total),
-                            client_sent_percent,
-                        );
-                        status = ClientStatus::Disconnected;
+                        xfer.client_disconnected();
                         drain_pipe(upstream_pipe_rx, teed_remaining)
                             .await
                             .map_err(BodyTransferError::proxy)?;
@@ -3806,12 +3819,8 @@ async fn tee_and_splice(
                     }
                     Ok(n) => {
                         teed_remaining -= n;
-                        *client_file_pos += n as u64;
-                        *client_remaining = client_remaining
-                            .checked_sub(n as u64)
-                            .expect("client_remaining tracks bytes still owed to the client");
-                        metrics::BYTES_SERVED_SPLICE.increment_by(n as u64);
-                        if let Some(rc) = client_rate_checker {
+                        xfer.note_client_bytes(n);
+                        if let Some(rc) = &mut xfer.client_rate_checker {
                             rc.add(n);
                             if rc.check_fail(RateCheckDirection::Client).is_some() {
                                 // Client RC tripped — drain remaining teed bytes
@@ -3828,10 +3837,7 @@ async fn tee_and_splice(
                                     .await
                                     .map_err(BodyTransferError::proxy)?;
 
-                                status = ClientStatus::DemoteRequested {
-                                    client_file_pos: *client_file_pos,
-                                    client_remaining: *client_remaining,
-                                };
+                                xfer.request_demote();
                                 break;
                             }
                         }
@@ -3846,7 +3852,7 @@ async fn tee_and_splice(
                         tokio::select! {
                             w = wait_writable_rated(
                                 client,
-                                client_rate_checker,
+                                &mut xfer.client_rate_checker,
                                 RateCheckDirection::Client,
                                 global_config().http_timeout,
                             ) => w.map_err(BodyTransferError::client)?,
@@ -3868,15 +3874,13 @@ async fn tee_and_splice(
                 .expect("splice should not return more than requested");
         } else {
             // Client is gone or demoted — splice pipe_A directly to cache (no tee needed)
-            splice_pipe_to_file(upstream_pipe_rx, cache_file, remaining, file_offset)
-                .await
-                .map_err(BodyTransferError::cache)?;
-            dbarrier.ping_batched(remaining as u64);
+            xfer.splice_cache_chunk(upstream_pipe_rx, cache_file, remaining)
+                .await?;
             remaining = 0;
         }
     }
 
-    Ok(status)
+    Ok(())
 }
 
 /// Read exactly `count` bytes from a pipe into a Vec (for boundary chunks
@@ -6275,8 +6279,12 @@ async fn splice_proxy_drive(
         // rename step; on a structured rate-timeout it's already consumed into
         // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
         // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
-        let (returned_dbarrier, demoted_handle, body_client_disconnected, body_client_bytes) =
-            if let Some(zero_copy_upstream) = upstream_guard.zero_copy() {
+        let BodyOutcome {
+            dbarrier: returned_dbarrier,
+            demoted_handle,
+            client_disconnected: body_client_disconnected,
+            client_bytes: body_client_bytes,
+        } = if let Some(zero_copy_upstream) = upstream_guard.zero_copy() {
                 // Zero-copy path for TCP (plain or kTLS)
                 splice_proxy_body(
                     zero_copy_upstream,
