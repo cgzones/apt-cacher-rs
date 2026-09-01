@@ -2063,9 +2063,9 @@ async fn download_file(
 #[must_use]
 /// Parse a redirect response's `Location` into a URI.
 ///
-/// The two *other* reasons a redirect is not followed (unsupported scheme,
-/// host not permitted) each log at the call site; a `Location` that does not
-/// parse -- or is missing entirely -- would otherwise leave nothing but a
+/// The other reasons a redirect is not followed (relative target, unsupported
+/// scheme, host not permitted) each log at the call site; a `Location` that
+/// does not parse -- or is missing entirely -- would otherwise leave nothing but a
 /// bare "failed with code 302" further down. `source` and `what` only name
 /// the mirror and resource for the log line.
 fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) -> Option<Uri> {
@@ -2430,6 +2430,11 @@ async fn serve_new_file(
             trace!("Forwarded redirected response: {redirected_response:?}");
 
             fwd_response = redirected_response;
+        } else if moved_uri.scheme().is_none() {
+            // A relative Location (`/pool/...`) is legal per RFC 9110, but this
+            // backend only follows absolute targets. Reported before the scheme
+            // branch below, which would otherwise call it an unsupported scheme.
+            debug!("Moved URI `{moved_uri}` is relative; not following the redirect");
         } else if moved_uri.scheme().is_none_or(|scheme| {
             *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
         }) {
@@ -3580,6 +3585,19 @@ async fn pre_process_client_request(
             trace!("Outgoing response: {response:?}");
 
             return response;
+        } else if moved_uri.scheme().is_none() {
+            // A relative Location (`/pool/...`) is legal per RFC 9110, but this
+            // backend only follows absolute targets. Reported before the scheme
+            // branch below, which would otherwise call it an unsupported scheme.
+            debug!("Moved URI `{moved_uri}` is relative; not following the redirect");
+        } else if moved_uri.scheme().is_none_or(|scheme| {
+            *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
+        }) {
+            debug!("Scheme of moved URI `{moved_uri}` not supported");
+        } else if let Some(moved_host) = moved_uri.host() {
+            debug!("Host `{moved_host}` of moved URI not permitted");
+        } else {
+            debug!("Moved URI has no host; not following the redirect");
         }
     }
 
