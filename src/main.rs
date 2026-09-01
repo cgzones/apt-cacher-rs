@@ -863,6 +863,9 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     let output_thread_names = output_log_level >= tracing::level_filters::LevelFilter::DEBUG;
     let stderr_is_tty = std::io::stderr().is_terminal();
 
+    // The `non_blocking` `WorkerGuard` flushes the file appender on drop, so
+    // it must outlive every log call: keep it bound here in `main()`, never
+    // in a shorter scope.
     let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = match output_log_file {
         config::LogDestination::Console => {
             let base = tracing_subscriber::fmt::layer()

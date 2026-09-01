@@ -6,6 +6,11 @@
 //! memoized for one second with single-flight semantics so probe spam
 //! cannot amplify disk writes or DB-channel traffic (see
 //! `cached_health_report`).
+//!
+//! `utils::filesystem_space` is the single `statvfs(3)` entry for both the
+//! disk-space and inode checks (`inodes: None` means a filesystem without
+//! an inode limit, not "none left"). Probing runs even without
+//! `min_disk_free`: inode exhaustion is invisible to that setting.
 
 use std::num::NonZero;
 use std::path::Path;
@@ -183,7 +188,10 @@ fn check_inodes_free(inodes: Option<InodeSpace>) -> CheckResult {
     }
 }
 
-/// Returns the operator-facing detail when either floor is breached, `None` otherwise.
+/// Returns the operator-facing detail when either inode floor
+/// ([`MIN_FREE_INODES`], [`MIN_FREE_INODE_FRACTION`]) is breached, `None`
+/// otherwise. The floors live here only: `main_loop`'s startup warn calls
+/// this too, so both verdicts always agree.
 #[must_use]
 pub(crate) fn low_inodes_detail(inodes: Option<InodeSpace>) -> Option<String> {
     let inodes = inodes?;

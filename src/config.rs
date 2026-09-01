@@ -1,3 +1,19 @@
+//! Daemon configuration: TOML parsing, defaults, CLI overrides and
+//! `validate()`.
+//!
+//! Adding an option: a `DEFAULT_*` const + a `default_*` fn + the serde
+//! field + a `validate()` warning when it has no effect (feature-gated
+//! branches mirror `mmap_threshold`) + a commented entry in
+//! `debian/apt-cacher-rs.conf`. The man page and README document CLI flags
+//! only.
+//!
+//! A CLI flag that *overrides* a config field instead: a `Cli` field in
+//! `main.rs` + a `Config::new` parameter applied on top of the parsed TOML
+//! **before** `validate()` + man page + README, and no
+//! `debian/apt-cacher-rs.conf` entry. Fallible flag values parse via
+//! `FromStr<Err = String>` on a type in this module (see `BindOverride`);
+//! infallible ones via `From<String>` (see `LogDestination`).
+
 use std::{
     borrow::Cow,
     cmp::Ordering,

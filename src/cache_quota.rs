@@ -26,7 +26,11 @@ impl CacheQuota {
     /// Atomically check quota and reserve space for a download.
     ///
     /// `content_length.upper()` is the maximum size we might write.
-    /// `prev_file_size` is the size of an existing file being replaced (subtracted from the delta).
+    /// `prev_file_size` is the size of an existing file being replaced
+    /// (subtracted from the delta). It must be the real on-disk size when a
+    /// download overwrites an entry (e.g. a stale-volatile re-fetch): passing
+    /// 0 silently over-counts the quota, which only surfaces later as a
+    /// `Repaired cache size discrepancy` warn from cleanup.
     pub(crate) fn try_acquire(
         &self,
         content_length: ContentLength,
