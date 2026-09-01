@@ -51,7 +51,9 @@ use crate::ktls;
 use crate::ktls::UlpAttachError;
 #[cfg(feature = "ktls")]
 use crate::ktls_handshake::{discard_incoming, encode_tls_data, grow_incoming};
-use crate::limits::{self, MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
+#[cfg(not(feature = "hyper"))]
+use crate::limits;
+use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::rate_log;
@@ -64,6 +66,10 @@ use crate::sendfile_conn::{
     write_all_to_stream_rated,
 };
 use crate::tcp_cork_guard::CorkGuard;
+use crate::upstream_head::{
+    DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead, plan_download,
+    plan_fresh_download,
+};
 use crate::utils::{
     self, CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
     tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
@@ -2316,6 +2322,16 @@ impl UpstreamResponse {
         match self.framing {
             BodyFraming::ContentLength(n) => Some(n),
             BodyFraming::Chunked | BodyFraming::CloseDelimited => None,
+        }
+    }
+
+    /// The backend-neutral projection consumed by
+    /// `upstream_head::plan_download`.
+    fn head(&self) -> UpstreamHead {
+        UpstreamHead {
+            status: self.status_code,
+            content_length: self.content_length(),
+            content_range: self.content_range.as_deref().and_then(parse_content_range),
         }
     }
 }
@@ -4720,20 +4736,58 @@ async fn forward_upstream_chunked_body(
     }
 }
 
+/// Log an upstream response the planner rejected (`DownloadPlan::Reject`).
+///
+/// `origin` tags the kTLS one-shot attempt (`" (from kTLS attempt)"`) or is
+/// empty.  Wording mirrors `hyper_conn.rs::serve_new_file` modulo the
+/// subsystem prefix (`docs/logging.md`, cross-backend parity).
+fn warn_upstream_reject(reason: RejectReason, conn_details: &ConnectionDetails, origin: &str) {
+    match reason {
+        RejectReason::Unsolicited206 => warn_once_or_info!(
+            "splice proxy: upstream returned 206 Partial Content without a Range request for {} from mirror {}{origin}; returning 502",
+            conn_details.debname,
+            conn_details.mirror
+        ),
+        RejectReason::InconsistentContentRange {
+            content_length,
+            span,
+        } => warn_once_or_info!(
+            "splice proxy: Content-Length {content_length} disagrees with Content-Range span {span} for {} from mirror {}{origin}; returning 502",
+            conn_details.debname,
+            conn_details.mirror
+        ),
+        RejectReason::Oversize { total } => warn_once_or_info!(
+            "splice proxy: upstream declared total size {} for file {} from mirror {}{origin}, exceeding `max_object_size`; returning 502",
+            HumanFmt::Size(total),
+            conn_details.debname,
+            conn_details.mirror
+        ),
+        RejectReason::NoContentLength => warn_once_or_info!(
+            "splice proxy: upstream sent no usable Content-Length for file {} from mirror {}{origin}; returning 502",
+            conn_details.debname,
+            conn_details.mirror
+        ),
+        RejectReason::ZeroContentLength => warn_once_or_info!(
+            "splice proxy: upstream declared Content-Length 0 for file {} from mirror {}{origin}; returning 502",
+            conn_details.debname,
+            conn_details.mirror
+        ),
+    }
+}
+
 /// Discard a stale partial download file and retry the upstream request from scratch.
 ///
-/// Shared by the 416 and invalid-Content-Range recovery paths.
+/// Shared by the 416 and invalid-Content-Range recovery paths
+/// (`ResumeAnomaly::needs_refetch`).
 #[expect(
     clippy::too_many_arguments,
-    reason = "called from exactly 2 sites in splice_proxy_drive"
+    reason = "called from exactly 1 site in splice_proxy_drive"
 )]
 async fn discard_partial_and_retry(
     partial: &mut utils::PartialDownload,
     mirror: &Mirror,
     host_authority: &str,
     upstream_path: &str,
-    resume_offset: &mut u64,
-    resume_expected_total: &mut Option<u64>,
     tls_label: &mut &'static str,
     upstream: &mut PoolGuard,
     upstream_resp: &mut UpstreamResponse,
@@ -4742,8 +4796,6 @@ async fn discard_partial_and_retry(
     conn_details: &ConnectionDetails,
 ) -> Result<(), SpliceProxyError> {
     partial.discard_resume().await;
-    *resume_offset = 0;
-    *resume_expected_total = None;
     upstream.unset_poolable();
     let (up, resp, hdr_buf, hdr_end, label, pool) =
         standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
@@ -4966,7 +5018,7 @@ async fn splice_proxy_drive(
     // The guard uses keep_on_drop: true so the partial file survives on fallback
     // (e.g., concurrent download → hyper path picks it up for resume).
     // Explicit guard.remove() is used only when a stale partial must be discarded.
-    let (mut resume_offset, mut resume_expected_total, resume_if_range, mut partial) =
+    let (resume_offset, resume_expected_total, resume_if_range, mut partial) =
         if conn_details.cached_flavor == CachedFlavor::Permanent {
             match utils::prepare_partial_resume(
                 &ibarrier,
@@ -5063,36 +5115,45 @@ async fn splice_proxy_drive(
     if let KtlsResult::ResponseNotSpliceable { ref response, .. } = unbuffered_result {
         cache_scheme(mirror, Scheme::Https);
         if response.status_code == 200 {
-            if conn_details.cached_flavor == CachedFlavor::Volatile {
-                // Volatile files without Content-Length: fall through to standard
-                // path for buffered download (same as 206/416 fall-through below).
-                // The standard reconnect will bump `record_upstream_status` itself.
-                debug!(
-                    "splice proxy: volatile file without Content-Length (from kTLS attempt), \
-                     falling back to standard path for buffered download"
-                );
-            } else {
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn_once_or_info!(
-                    "splice proxy: upstream {} sent no usable Content-Length for {} (from kTLS attempt); returning 502",
-                    conn_details.mirror,
-                    conn_details.debname
-                );
-                // Honoring the kTLS-parsed response: record its status before
-                // emitting our own 502 to the client. (The standard path is not
-                // reconnected for, so no other site will record this 200.)
-                metrics::record_upstream_status(response.status_code);
-                write_invalid_response(
-                    client_stream,
-                    conn_version,
-                    conn_action,
-                    StatusCode::BAD_GATEWAY,
-                    "no Content-Length",
-                    None,
-                )
-                .await
-                .map_err(|err| SpliceProxyError::Client(err, "kTLS no-CL 502"))?;
-                return Ok(());
+            // A 200 the kTLS path could not splice has no usable
+            // Content-Length (absent, chunked or zero).  The planner refuses
+            // what it would refuse on the standard path too (permanent files,
+            // `Content-Length: 0`) without a reconnect; a volatile file falls
+            // through to the standard path for a buffered download, whose
+            // reconnect bumps `record_upstream_status` itself.
+            match plan_fresh_download::<PathBuf>(
+                &response.head(),
+                conn_details.cached_flavor,
+                None,
+                global_config().max_object_size,
+            ) {
+                DownloadPlan::Reject(reason) => {
+                    reason.record_metrics();
+                    warn_upstream_reject(reason, conn_details, " (from kTLS attempt)");
+                    // Honoring the kTLS-parsed response: record its status before
+                    // emitting our own 502 to the client. (The standard path is not
+                    // reconnected for, so no other site will record this 200.)
+                    metrics::record_upstream_status(response.status_code);
+                    write_invalid_response(
+                        client_stream,
+                        conn_version,
+                        conn_action,
+                        StatusCode::BAD_GATEWAY,
+                        reason.body(),
+                        None,
+                    )
+                    .await
+                    .map_err(|err| SpliceProxyError::Client(err, "kTLS upstream reject 502"))?;
+                    return Ok(());
+                }
+                DownloadPlan::NotModified(_)
+                | DownloadPlan::Passthrough
+                | DownloadPlan::Download { .. } => {
+                    debug!(
+                        "splice proxy: volatile file without Content-Length (from kTLS attempt), \
+                         falling back to standard path for buffered download"
+                    );
+                }
             }
         }
         // During resume, 206 and 416 need the standard buffered path
@@ -5278,395 +5339,215 @@ async fn splice_proxy_drive(
     };
     let upstream_path = redirected_path_owned.as_deref().unwrap_or(upstream_path);
 
-    // Handle resume: if we sent Range and got 200 (server ignores Range), discard partial
-    if resume_offset > 0 && upstream_resp.status_code == 200 {
-        info!(
-            "splice proxy: server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
-            conn_details.debname, conn_details.mirror
-        );
-        partial.discard_resume().await;
-        resume_offset = 0;
-        resume_expected_total = None;
-    }
-
-    // Handle resume: if we got 416 (stale partial), discard and retry without Range
-    if resume_offset > 0 && upstream_resp.status_code == 416 {
-        warn_once_or_info!(
-            "splice proxy: server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
-            conn_details.debname,
-            conn_details.mirror,
-            HumanFmt::Size(resume_offset)
-        );
-        discard_partial_and_retry(
-            &mut partial,
-            mirror,
-            &host_authority,
-            upstream_path,
-            &mut resume_offset,
-            &mut resume_expected_total,
-            &mut tls_label,
-            &mut upstream,
-            &mut upstream_resp,
-            &mut header_buf,
-            &mut header_end,
-            conn_details,
-        )
-        .await?;
-    }
-
-    // Handle 304 Not Modified for volatile resources: upstream confirms the cached copy
-    // is still current. Update the file's mtime to reset the freshness window, then
-    // serve the cached file via sendfile.
-    if upstream_resp.status_code == 304
-        && let Some(cache_path) = volatile_cache_path
-    {
-        debug!(
-            "splice proxy: upstream returned 304 for {} from mirror {}, serving cached file",
-            conn_details.debname, conn_details.mirror
-        );
-
-        // Pool the upstream connection back (304 has no body).
-        if upstream_resp.connection_close {
-            upstream.unset_poolable();
-        }
-        drop(upstream);
-
-        return serve_volatile_304_via_sendfile(
-            client_stream,
-            conn_details,
-            &cache_path,
-            conn_version,
-            conn_action,
-            client_range,
-            ibarrier,
-            "post-304 invalid response",
-        )
-        .await;
-    }
-
-    // Forward non-200/non-206 responses directly to the client instead of falling back
-    // to hyper (which would open a redundant second connection).
-    if upstream_resp.status_code != 200 && upstream_resp.status_code != 206 {
-        debug!(
-            "splice proxy: upstream returned {}, forwarding directly",
-            upstream_resp.status_code
-        );
-
-        metrics::REQUESTS_PASSTHROUGH.increment();
-        metrics::record_client_status(upstream_resp.status_code);
-
-        // Rewrite the response headers before forwarding: strip hop-by-hop
-        // headers, emit a single `Connection:` matching our keep-alive
-        // decision, drop `Content-Length` when chunked, and append `Via:`.
-        // Nothing has been written to the client yet, so a malformed-header
-        // error can safely bail to a 502 via the outer arm.
-        let passthrough_headers = match rewrite_simple_proxy_headers(
-            &header_buf[..header_end],
-            conn_version,
-            conn_action,
-            upstream_resp.status_code,
-        ) {
-            Ok(s) => s,
-            Err(err) => {
-                warn_once_or_info!(
-                    "splice proxy: failed to rewrite passthrough headers for {} from mirror {}; returning 502:  {}",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    ErrorReport(&err)
-                );
-                upstream.unset_poolable();
-                return Err(SpliceProxyError::Upstream);
-            }
-        };
-        write_all_to_stream(
-            client_stream,
-            passthrough_headers.as_bytes(),
-            WritePhase::Header,
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client(err, "passthrough headers"))?;
-
-        // Forward the body that arrived with the headers plus the rest,
-        // framed per the upstream's (precedence-resolved) framing.
-        let body_prefix = &header_buf[header_end..];
-        upstream_resp
-            .framing
-            .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
-            .await
-            .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "passthrough body"))?;
-
-        // InitBarrier fires on return, which is correct: nothing was cached
-        // PoolGuard::drop handles returning the connection to pool if poolable
-        metrics::SERVED_PASSTHROUGH.increment();
-        metrics::SERVED_TOTAL.increment();
-        return Ok(());
-    }
-
     // Volatile stale-but-present revalidation that returned a fresh body
-    // (200 or 206) — counterpart to the 304 / UPTODATE case above. The
-    // volatile-not-found path leaves `volatile_cache_path` as None and is
-    // intentionally not split into UPTODATE/OUTOFDATE.
-    if volatile_cache_path.is_some() && !conn_details.client.is_cleanup_synthetic() {
+    // (200 or 206): counterpart to the 304 / UPTODATE case in
+    // `serve_volatile_304_via_sendfile`. The volatile-not-found path leaves
+    // `volatile_cache_path` as None and is intentionally not split into
+    // UPTODATE/OUTOFDATE.
+    if volatile_cache_path.is_some()
+        && (upstream_resp.status_code == 200 || upstream_resp.status_code == 206)
+        && !conn_details.client.is_cleanup_synthetic()
+    {
         metrics::VOLATILE_REFETCHED_OUTOFDATE.increment();
     }
 
-    // Handle resume: if we got 206 but Content-Range is invalid/mismatched,
-    // discard partial and retry fresh — same pattern as 416 handling above.
-    // Only accept a 206 that delivers the full remainder (start == resume_offset
-    // AND end + 1 == total) and whose total matches the size we expected; anything
-    // else means the file changed upstream or the server is misbehaving, so the
-    // stored bytes can't safely be appended to.
-    if resume_offset > 0 && upstream_resp.status_code == 206 {
-        let content_range_valid = upstream_resp
-            .content_range
-            .as_deref()
-            .and_then(parse_content_range)
-            .is_some_and(|(start, end, total)| {
-                start == resume_offset
-                    && end.checked_add(1) == Some(total)
-                    && resume_expected_total.is_none_or(|expected| expected == total)
-            });
-
-        if !content_range_valid {
-            warn_once_or_info!(
-                "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
-                conn_details.debname,
-                conn_details.mirror
-            );
-            discard_partial_and_retry(
-                &mut partial,
-                mirror,
-                &host_authority,
-                upstream_path,
-                &mut resume_offset,
-                &mut resume_expected_total,
-                &mut tls_label,
-                &mut upstream,
-                &mut upstream_resp,
-                &mut header_buf,
-                &mut header_end,
-                conn_details,
-            )
-            .await?;
-        }
-    }
-
-    // Reject unsolicited 206: upstream returned partial content for a request
-    // without Range. See parallel reject in hyper_conn.rs (hyper path).
-    if resume_offset == 0 && upstream_resp.status_code == 206 {
-        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        metrics::UPSTREAM_UNSOLICITED_206.increment();
-        warn_once_or_info!(
-            "splice proxy: upstream returned 206 Partial Content without a Range request for {} from mirror {}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        );
-        upstream.unset_poolable();
-        write_invalid_response(
-            client_stream,
-            conn_version,
-            conn_action,
-            StatusCode::BAD_GATEWAY,
-            "Unsolicited 206",
-            None,
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client(err, "unsolicited 206 502"))?;
-        return Ok(());
-    }
-
-    // Determine total file size and body size for resume vs fresh downloads
-    let (total_file_size, body_content_length) = if resume_offset > 0
-        && upstream_resp.status_code == 206
-    {
-        let content_range = upstream_resp
-            .content_range
-            .as_deref()
-            .and_then(parse_content_range);
-
-        match content_range {
-            Some((start, end, total))
-                if start == resume_offset
-                    && end.checked_add(1) == Some(total)
-                    && resume_expected_total.is_none_or(|expected| expected == total) =>
-            {
-                let remaining = end - start + 1;
-                // Cross-check declared Content-Length (if present) matches the range span.
-                if let Some(cl) = upstream_resp.content_length()
-                    && cl != remaining
-                {
-                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    warn_once_or_info!(
-                        "splice proxy: Content-Length {cl} disagrees with Content-Range span {remaining} for {} from mirror {}; returning 502",
-                        conn_details.debname,
-                        conn_details.mirror
-                    );
-                    upstream.unset_poolable();
-                    write_invalid_response(
-                        client_stream,
-                        conn_version,
-                        conn_action,
-                        StatusCode::BAD_GATEWAY,
-                        "Inconsistent Content-Range",
-                        None,
-                    )
-                    .await
-                    .map_err(|err| {
-                        SpliceProxyError::Client(err, "inconsistent Content-Range 502")
-                    })?;
-                    return Ok(());
-                }
-                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-                let remaining_percent = remaining as f32 / total as f32 * 100.0;
-                info!(
-                    "splice proxy: resuming download of {} from mirror {} at {} ({} ({:.1}%) remaining of {} total)",
+    let plan = match plan_download(
+        &upstream_resp.head(),
+        ResumeState::new(resume_offset, resume_expected_total),
+        conn_details.cached_flavor,
+        volatile_cache_path,
+        global_config().max_object_size,
+    ) {
+        Ok(plan) => plan,
+        Err(anomaly) => {
+            match anomaly {
+                ResumeAnomaly::RangeIgnored => info!(
+                    "splice proxy: server returned 200 instead of 206 for resume of {} from mirror {}, starting fresh",
+                    conn_details.debname, conn_details.mirror
+                ),
+                ResumeAnomaly::RangeNotSatisfiable => warn_once_or_info!(
+                    "splice proxy: server returned 416 for resume of {} from mirror {} (partial {}); discarding the stale partial and retrying fresh",
                     conn_details.debname,
                     conn_details.mirror,
-                    HumanFmt::Size(resume_offset),
-                    HumanFmt::Size(remaining),
-                    remaining_percent,
-                    HumanFmt::Size(total)
-                );
-                (total, remaining)
-            }
-            _ => {
-                // Content-Range mismatch or missing: should be handled by the
-                // pre-check above (which discards partial and retries fresh).
-                // Defensive fallback in case of unexpected state.
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn_once_or_info!(
-                    "splice proxy: unexpected Content-Range state {:?} for the 206 response of {} from mirror {}; returning 502",
-                    upstream_resp.content_range,
+                    HumanFmt::Size(resume_offset)
+                ),
+                ResumeAnomaly::ContentRangeMismatch => warn_once_or_info!(
+                    "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
                     conn_details.debname,
                     conn_details.mirror
-                );
-                upstream.unset_poolable();
-                write_invalid_response(
-                    client_stream,
-                    conn_version,
-                    conn_action,
-                    StatusCode::BAD_GATEWAY,
-                    "unexpected Content-Range",
-                    None,
-                )
-                .await
-                .map_err(|err| SpliceProxyError::Client(err, "unexpected Content-Range 502"))?;
-                return Ok(());
+                ),
             }
-        }
-    } else {
-        // Fresh download
-        resume_offset = 0;
-        // Length-delimited bodies are spliced; chunked / close-delimited fall
-        // back to the buffered path (volatile) or are refused (non-volatile).
-        let Some(cl) = upstream_resp.content_length() else {
-            if conn_details.cached_flavor == CachedFlavor::Volatile {
-                return handle_volatile_buffered_download(
+            if anomaly.needs_refetch() {
+                discard_partial_and_retry(
+                    &mut partial,
+                    mirror,
+                    &host_authority,
+                    upstream_path,
+                    &mut tls_label,
                     &mut upstream,
-                    client_stream,
-                    conn_version,
-                    conn_action,
+                    &mut upstream_resp,
+                    &mut header_buf,
+                    &mut header_end,
                     conn_details,
-                    original_uri_path,
-                    &upstream_resp,
-                    &header_buf,
-                    header_end,
-                    ibarrier,
-                    client_range,
-                    tls_label,
                 )
-                .await;
+                .await?;
+            } else {
+                partial.discard_resume().await;
             }
-            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            warn_once_or_info!(
-                "splice proxy: no Content-Length for file {} from mirror {}; returning 502",
-                conn_details.debname,
-                conn_details.mirror
+            // A resume never revalidates: there is no cached copy to serve.
+            plan_fresh_download(
+                &upstream_resp.head(),
+                conn_details.cached_flavor,
+                None,
+                global_config().max_object_size,
+            )
+        }
+    };
+
+    let (total_content_length, body_content_length, resume_offset) = match plan {
+        DownloadPlan::NotModified(cache_path) => {
+            // Upstream confirms the cached copy is still current: refresh the
+            // freshness window and serve the cached file via sendfile.
+            debug!(
+                "splice proxy: upstream returned 304 for {} from mirror {}, serving cached file",
+                conn_details.debname, conn_details.mirror
             );
-            // Body framing unknown — any bytes in header_buf tail or on the
-            // socket cannot be safely skipped, so don't return the connection
-            // to the pool.
+
+            // Pool the upstream connection back (304 has no body).
+            if upstream_resp.connection_close {
+                upstream.unset_poolable();
+            }
+            drop(upstream);
+
+            return serve_volatile_304_via_sendfile(
+                client_stream,
+                conn_details,
+                &cache_path,
+                conn_version,
+                conn_action,
+                client_range,
+                ibarrier,
+                "post-304 invalid response",
+            )
+            .await;
+        }
+        DownloadPlan::Passthrough => {
+            // Forward non-200/non-206 responses directly to the client instead
+            // of falling back to hyper (which would open a redundant second
+            // connection).
+            debug!(
+                "splice proxy: upstream returned {}, forwarding directly",
+                upstream_resp.status_code
+            );
+
+            metrics::REQUESTS_PASSTHROUGH.increment();
+            metrics::record_client_status(upstream_resp.status_code);
+
+            // Rewrite the response headers before forwarding: strip hop-by-hop
+            // headers, emit a single `Connection:` matching our keep-alive
+            // decision, drop `Content-Length` when chunked, and append `Via:`.
+            // Nothing has been written to the client yet, so a malformed-header
+            // error can safely bail to a 502 via the outer arm.
+            let passthrough_headers = match rewrite_simple_proxy_headers(
+                &header_buf[..header_end],
+                conn_version,
+                conn_action,
+                upstream_resp.status_code,
+            ) {
+                Ok(s) => s,
+                Err(err) => {
+                    warn_once_or_info!(
+                        "splice proxy: failed to rewrite passthrough headers for {} from mirror {}; returning 502:  {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        ErrorReport(&err)
+                    );
+                    upstream.unset_poolable();
+                    return Err(SpliceProxyError::Upstream);
+                }
+            };
+            write_all_to_stream(
+                client_stream,
+                passthrough_headers.as_bytes(),
+                WritePhase::Header,
+            )
+            .await
+            .map_err(|err| SpliceProxyError::Client(err, "passthrough headers"))?;
+
+            // Forward the body that arrived with the headers plus the rest,
+            // framed per the upstream's (precedence-resolved) framing.
+            let body_prefix = &header_buf[header_end..];
+            upstream_resp
+                .framing
+                .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
+                .await
+                .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "passthrough body"))?;
+
+            // InitBarrier fires on return, which is correct: nothing was cached
+            // PoolGuard::drop handles returning the connection to pool if poolable
+            metrics::SERVED_PASSTHROUGH.increment();
+            metrics::SERVED_TOTAL.increment();
+            return Ok(());
+        }
+        DownloadPlan::Reject(reason) => {
+            reason.record_metrics();
+            warn_upstream_reject(reason, conn_details, "");
+            // Protocol-violating or unusable response: body bytes in the
+            // header_buf tail or on the socket cannot be safely skipped, so
+            // don't return the connection to the pool.
             upstream.unset_poolable();
             write_invalid_response(
                 client_stream,
                 conn_version,
                 conn_action,
                 StatusCode::BAD_GATEWAY,
-                "no Content-Length",
+                reason.body(),
                 None,
             )
             .await
-            .map_err(|err| SpliceProxyError::Client(err, "no-CL 502"))?;
+            .map_err(|err| SpliceProxyError::Client(err, "upstream reject 502"))?;
             return Ok(());
-        };
-        (cl, cl)
-    };
-    let resume_offset = resume_offset; // mark immutable
-
-    let Some(total_content_length) = NonZero::new(total_file_size) else {
-        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        warn_once_or_info!(
-            "splice proxy: zero total file size for file {} from mirror {}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        );
-        // Protocol-violating response — don't trust the connection's framing.
-        upstream.unset_poolable();
-        write_invalid_response(
-            client_stream,
-            conn_version,
-            conn_action,
-            StatusCode::BAD_GATEWAY,
-            "zero total file size",
-            None,
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client(err, "zero total-size 502"))?;
-        return Ok(());
-    };
-    if !limits::content_length_within_cap(
-        total_content_length.get(),
-        global_config().max_object_size,
-    ) {
-        metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
-        warn_once_or_info!(
-            "splice proxy: upstream object size {} for file {} from mirror {} exceeds `max_object_size`; returning 502",
-            HumanFmt::Size(total_content_length.get()),
-            conn_details.debname,
-            conn_details.mirror
-        );
-        upstream.unset_poolable();
-        write_invalid_response(
-            client_stream,
-            conn_version,
-            conn_action,
-            StatusCode::BAD_GATEWAY,
-            "upstream resource too large",
-            None,
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client(err, "oversize 502"))?;
-        return Ok(());
-    }
-    let Some(body_content_length) = NonZero::new(body_content_length) else {
-        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        warn_once_or_info!(
-            "splice proxy: zero body content length for file {} from mirror {}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        );
-        upstream.unset_poolable();
-        write_invalid_response(
-            client_stream,
-            conn_version,
-            conn_action,
-            StatusCode::BAD_GATEWAY,
-            "zero body Content-Length",
-            None,
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client(err, "zero body-CL 502"))?;
-        return Ok(());
+        }
+        DownloadPlan::Download {
+            total: ContentLength::Exact(total),
+            body: ContentLength::Exact(body),
+            resume_offset,
+        } => {
+            if resume_offset > 0 {
+                #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
+                let remaining_percent = body.get() as f32 / total.get() as f32 * 100.0;
+                info!(
+                    "splice proxy: resuming download of {} from mirror {} at {} ({} ({:.1}%) remaining of {} total)",
+                    conn_details.debname,
+                    conn_details.mirror,
+                    HumanFmt::Size(resume_offset),
+                    HumanFmt::Size(body.get()),
+                    remaining_percent,
+                    HumanFmt::Size(total.get())
+                );
+            }
+            (total, body, resume_offset)
+        }
+        // A volatile file without a usable Content-Length (chunked or
+        // close-delimited): length-delimited bodies are spliced, anything
+        // else is buffered.
+        DownloadPlan::Download { .. } => {
+            return handle_volatile_buffered_download(
+                &mut upstream,
+                client_stream,
+                conn_version,
+                conn_action,
+                conn_details,
+                original_uri_path,
+                &upstream_resp,
+                &header_buf,
+                header_end,
+                ibarrier,
+                client_range,
+                tls_label,
+            )
+            .await;
+        }
     };
 
     // Committed to splicing a length-delimited body: keep the upstream out of

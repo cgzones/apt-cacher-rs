@@ -2495,10 +2495,6 @@ async fn serve_unfinished_sendfile(
         };
 
     // We need an exact content length to write a Content-Length header.
-    #[cfg_attr(
-        not(feature = "hyper"),
-        expect(irrefutable_let_patterns, reason = "only one variant")
-    )]
     let ContentLength::Exact(exact_size) = total_size else {
         warn_once_or_debug!(
             "Unknown content length for in-progress download of {} from mirror {}{aliased}; not serving the joining client via sendfile",

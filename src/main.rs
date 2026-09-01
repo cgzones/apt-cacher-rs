@@ -83,7 +83,6 @@ mod tcp_cork_guard;
 mod test_support;
 mod tunnel_limiter;
 mod uncacheables;
-#[cfg(feature = "hyper")]
 mod upstream_head;
 mod upstream_retry;
 mod utils;
@@ -433,7 +432,6 @@ pub(crate) struct AppState {
 pub(crate) enum ContentLength {
     /// An exact size
     Exact(NonZero<u64>),
-    #[cfg(feature = "hyper")]
     /// A limit for an unknown size
     Unknown(NonZero<u64>),
 }
@@ -442,9 +440,7 @@ impl ContentLength {
     #[must_use]
     const fn upper(self) -> NonZero<u64> {
         match self {
-            Self::Exact(s) => s,
-            #[cfg(feature = "hyper")]
-            Self::Unknown(s) => s,
+            Self::Exact(s) | Self::Unknown(s) => s,
         }
     }
 }
@@ -453,7 +449,6 @@ impl Display for ContentLength {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exact(size) => write!(f, "exact {size} bytes"),
-            #[cfg(feature = "hyper")]
             Self::Unknown(limit) => write!(f, "up to {limit} bytes"),
         }
     }
