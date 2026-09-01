@@ -303,6 +303,18 @@ pub(crate) enum PassthroughReason {
     FlatBlocked,
 }
 
+impl PassthroughReason {
+    /// Short human-readable name for log lines.
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unrecognized => "unrecognized resource path",
+            Self::NonDebPool => "unsupported pool filename",
+            Self::FlatBlocked => "flat host blocked by structured collision",
+        }
+    }
+}
+
 /// Dispatcher verdict.  Backends own response-type construction; this
 /// module owns logging, metric bumping, the deferred `Origin` DB write and
 /// `record_uncacheable`, so the two backends stay structurally in sync.
@@ -319,17 +331,8 @@ pub(crate) enum DispatchOutcome {
     /// backends can build an upstream `Mirror` or emit per-request log lines
     /// without re-deriving it.
     Passthrough {
-        // The hyper backend only needs `requested_host` to continue its
-        // uncached forwarding flow (it ignores `reason` via `reason: _`); the
-        // sendfile backend (`sendfile_conn.rs`) reads `reason` to name the
-        // `NotApplicable` handoff to hyper.  Under feature configurations
-        // that exclude sendfile (e.g. `--no-default-features --features
-        // tls_hyper`), the field is genuinely unread - silence the dead-code
-        // lint there.
-        #[cfg_attr(
-            not(feature = "sendfile"),
-            expect(dead_code, reason = "consumed only by sendfile_conn dispatch")
-        )]
+        // Named in the "Proxying (without caching)" line by both backends
+        // and in sendfile's `NotApplicable` handoff.
         reason: PassthroughReason,
         requested_host: ClientHost,
         // Consumed by both backends: `splice_simple_proxy` (`splice_conn.rs`,
@@ -551,13 +554,9 @@ fn decide_request(
     // before parsing, so we don't repeat it here.)
 
     if is_unsafe_proxy_path(uri_path) {
-        let passthrough_label = match passthrough_reason {
-            PassthroughReason::Unrecognized => "unrecognized",
-            PassthroughReason::NonDebPool => "non-deb pool",
-            PassthroughReason::FlatBlocked => "flat-blocked",
-        };
         warn_once_or_info!(
-            "Rejecting unsafe passthrough path {uri_path} ({passthrough_label}) for client {client} with 400"
+            "Rejecting unsafe passthrough path {uri_path} ({}) for client {client} with 400",
+            passthrough_reason.label()
         );
         metrics::UNSAFE_PATH_REJECTED.increment();
         return Decision::Reject(RejectReason::UnsafePath);

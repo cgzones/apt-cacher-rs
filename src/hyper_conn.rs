@@ -69,8 +69,8 @@ use crate::{
     rate_checker::RateCheckDirection,
     rate_log,
     request_dispatch::{
-        ClientAcls, DispatchOutcome, RequestKind, RequestTarget, dispatch_request,
-        preflight_method, preflight_target,
+        ClientAcls, DispatchOutcome, PassthroughReason, RequestKind, RequestTarget,
+        dispatch_request, preflight_method, preflight_target,
     },
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
     scheme_cache, static_assert, tunnel_limiter,
@@ -2506,6 +2506,7 @@ pub(crate) enum HandoffPlan {
     /// the dispatcher.  Hyper forwards the request uncached.
     #[cfg(not(feature = "splice"))]
     Passthrough {
+        reason: PassthroughReason,
         requested_host: ClientHost,
         requested_port: Option<NonZero<u16>>,
         request_received_at: PreciseInstant,
@@ -2554,7 +2555,12 @@ async fn pre_process_client_request(
 ) -> Response<ProxyCacheBody> {
     trace!("Incoming request: {req:?}");
 
-    let passthrough: Option<(ClientHost, Option<NonZero<u16>>, PreciseInstant)> = match handoff {
+    let passthrough: Option<(
+        PassthroughReason,
+        ClientHost,
+        Option<NonZero<u16>>,
+        PreciseInstant,
+    )> = match handoff {
         #[cfg(not(feature = "splice"))]
         Some(HandoffPlan::CacheMiss {
             conn_details,
@@ -2577,87 +2583,97 @@ async fn pre_process_client_request(
         }
         #[cfg(not(feature = "splice"))]
         Some(HandoffPlan::Passthrough {
+            reason,
             requested_host,
             requested_port,
             request_received_at,
-        }) => Some((requested_host, requested_port, request_received_at)),
+        }) => Some((reason, requested_host, requested_port, request_received_at)),
         None => None,
     };
 
-    let (req, requested_host, requested_port, passthrough_request_received_at) = match passthrough {
-        Some((requested_host, requested_port, request_received_at)) => (
-            strip_request_body(client, req),
-            requested_host,
-            requested_port,
-            request_received_at,
-        ),
-        None => {
-            metrics::REQUESTS_TOTAL.increment();
+    let (req, passthrough_reason, requested_host, requested_port, passthrough_request_received_at) =
+        match passthrough {
+            Some((reason, requested_host, requested_port, request_received_at)) => (
+                strip_request_body(client, req),
+                reason,
+                requested_host,
+                requested_port,
+                request_received_at,
+            ),
+            None => {
+                metrics::REQUESTS_TOTAL.increment();
 
-            let acls = ClientAcls::from(global_config());
+                let acls = ClientAcls::from(global_config());
 
-            match preflight_method(req.method().as_str(), &client, &acls) {
-                Ok(RequestKind::Connect) => return connect_response(client, req),
-                Ok(RequestKind::Get) => {}
-                Err(reason) => {
-                    let (status, msg) = reason.response_parts();
-                    return quick_response(status, msg);
+                match preflight_method(req.method().as_str(), &client, &acls) {
+                    Ok(RequestKind::Connect) => return connect_response(client, req),
+                    Ok(RequestKind::Get) => {}
+                    Err(reason) => {
+                        let (status, msg) = reason.response_parts();
+                        return quick_response(status, msg);
+                    }
+                }
+
+                let (requested_host, requested_port) = match preflight_target(
+                    req.uri(),
+                    req.version() == http::Version::HTTP_11,
+                    || req.headers().contains_key(HOST),
+                    &client,
+                    &acls,
+                ) {
+                    Ok(RequestTarget::Proxy { host, port }) => (host, port),
+                    Ok(RequestTarget::WebUi) => {
+                        return serve_web_interface(req.uri(), &appstate)
+                            .await
+                            .into_hyper_response();
+                    }
+                    Err(reason) => {
+                        let (status, msg) = reason.response_parts();
+                        return quick_response(status, msg);
+                    }
+                };
+
+                let requested_host = match authorize_cache_access(&client, requested_host) {
+                    Ok(rh) => rh,
+                    Err((status, msg)) => return quick_response(status, msg),
+                };
+
+                let req = strip_request_body(client, req);
+
+                match dispatch_request(req.uri().path(), requested_host, requested_port, &client)
+                    .await
+                {
+                    DispatchOutcome::Cache(plan) => {
+                        let conn_details = ConnectionDetails {
+                            client,
+                            request_received_at: plan.request_received_at,
+                            mirror: plan.mirror,
+                            aliased_host: plan.aliased_host,
+                            debname: plan.debname,
+                            cached_flavor: plan.cached_flavor,
+                            layout: plan.layout,
+                            resource_kind: plan.resource_kind,
+                        };
+                        return process_cache_request(conn_details, req, appstate).await;
+                    }
+                    DispatchOutcome::Reject(reason) => {
+                        let (status, msg) = reason.response_parts();
+                        return quick_response(status, msg);
+                    }
+                    DispatchOutcome::Passthrough {
+                        reason,
+                        requested_host,
+                        request_received_at,
+                    } => (
+                        req,
+                        reason,
+                        requested_host,
+                        requested_port,
+                        request_received_at,
+                    ),
                 }
             }
-
-            let (requested_host, requested_port) = match preflight_target(
-                req.uri(),
-                req.version() == http::Version::HTTP_11,
-                || req.headers().contains_key(HOST),
-                &client,
-                &acls,
-            ) {
-                Ok(RequestTarget::Proxy { host, port }) => (host, port),
-                Ok(RequestTarget::WebUi) => {
-                    return serve_web_interface(req.uri(), &appstate)
-                        .await
-                        .into_hyper_response();
-                }
-                Err(reason) => {
-                    let (status, msg) = reason.response_parts();
-                    return quick_response(status, msg);
-                }
-            };
-
-            let requested_host = match authorize_cache_access(&client, requested_host) {
-                Ok(rh) => rh,
-                Err((status, msg)) => return quick_response(status, msg),
-            };
-
-            let req = strip_request_body(client, req);
-
-            match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await
-            {
-                DispatchOutcome::Cache(plan) => {
-                    let conn_details = ConnectionDetails {
-                        client,
-                        request_received_at: plan.request_received_at,
-                        mirror: plan.mirror,
-                        aliased_host: plan.aliased_host,
-                        debname: plan.debname,
-                        cached_flavor: plan.cached_flavor,
-                        layout: plan.layout,
-                        resource_kind: plan.resource_kind,
-                    };
-                    return process_cache_request(conn_details, req, appstate).await;
-                }
-                DispatchOutcome::Reject(reason) => {
-                    let (status, msg) = reason.response_parts();
-                    return quick_response(status, msg);
-                }
-                DispatchOutcome::Passthrough {
-                    reason: _,
-                    requested_host,
-                    request_received_at,
-                } => (req, requested_host, requested_port, request_received_at),
-            }
-        }
-    };
+        };
 
     assert_eq!(req.method(), Method::GET, "Filtered at function start");
 
@@ -2666,8 +2682,9 @@ async fn pre_process_client_request(
     //
 
     warn_once_or_info!(
-        "Proxying (without caching) request {} for client {client}",
-        req.uri()
+        "Proxying (without caching) request {} for client {client} ({})",
+        req.uri(),
+        passthrough_reason.label()
     );
 
     let (mut parts, _body) = req.into_parts();

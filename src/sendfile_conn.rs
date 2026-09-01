@@ -68,8 +68,8 @@ use crate::{
     precise_instant::PreciseInstant,
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
     request_dispatch::{
-        ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
-        dispatch_request, preflight_method, preflight_target,
+        ClientAcls, DispatchOutcome, RejectReason, RequestKind, RequestTarget, dispatch_request,
+        preflight_method, preflight_target,
     },
     response_head::{ResponseHead, WireBody},
     static_assert, swrite, tunnel_limiter,
@@ -1078,10 +1078,7 @@ async fn try_sendfile_request(
         DispatchOutcome::Reject(reason) => return reject_result(reason, || conn_action),
         #[cfg(feature = "splice")]
         DispatchOutcome::Passthrough {
-            reason:
-                PassthroughReason::Unrecognized
-                | PassthroughReason::NonDebPool
-                | PassthroughReason::FlatBlocked,
+            reason,
             requested_host,
             request_received_at,
         } => {
@@ -1089,6 +1086,11 @@ async fn try_sendfile_request(
                 deb_mirror::{Mirror, MirrorKind},
                 splice_conn::splice_simple_proxy,
             };
+
+            warn_once_or_info!(
+                "Proxying (without caching) request {uri} for client {client} ({})",
+                reason.label()
+            );
 
             // Simple-proxy path: this Mirror is used only for upstream
             // dispatch/formatting and is never persisted; kind is arbitrary.
@@ -1126,14 +1128,10 @@ async fn try_sendfile_request(
         } => {
             // Without splice this backend has no uncached forwarder; hyper
             // continues from the dispatch verdict.
-            let reason = match reason {
-                PassthroughReason::NonDebPool => "unsupported pool filename",
-                PassthroughReason::FlatBlocked => "flat host blocked by structured collision",
-                PassthroughReason::Unrecognized => "unrecognized resource path",
-            };
             return ZeroCopyResult::NotApplicable {
-                reason,
+                reason: reason.label(),
                 plan: HandoffPlan::Passthrough {
+                    reason,
                     requested_host,
                     requested_port,
                     request_received_at,
