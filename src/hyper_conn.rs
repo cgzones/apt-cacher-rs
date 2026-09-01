@@ -1,9 +1,8 @@
 use std::{
     convert::Infallible, error::Error as _, num::NonZero, os::unix::fs::MetadataExt as _,
-    path::Path, path::PathBuf, pin::Pin, sync::Arc, task::Poll::Pending, task::Poll::Ready,
+    path::Path, path::PathBuf, sync::Arc,
 };
 
-use bytes::Buf as _;
 use futures_util::TryStreamExt as _;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
@@ -14,13 +13,12 @@ use http::{
     },
     uri::Authority,
 };
-use http_body::{Body, Frame, SizeHint};
-use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
+use http_body::{Body, Frame};
+use http_body_util::{BodyExt as _, Empty, StreamBody, combinators::BoxBody};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::tokio::TokioIo};
 #[cfg(feature = "mmap")]
 use memmap2::{Advice, MmapOptions};
-use pin_project::{pin_project, pinned_drop};
 use rand::distr::{Bernoulli, Distribution as _};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tracing::{debug, error, info, trace, warn};
@@ -30,6 +28,7 @@ use crate::mmap_body::MmapBody;
 use crate::{
     APP_NAME, APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, ProxyCacheBody,
     Scheme, VOLATILE_CACHE_MAX_AGE, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER,
+    accounted_body::{AccountedBody, Subject},
     active_downloads::{
         AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
     },
@@ -37,15 +36,13 @@ use crate::{
     cache_layout::{self, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
     cache_metadata::{self, UpstreamMetadata},
     cache_quota::QuotaExceeded,
-    channel_body::{ChannelBody, ChannelBodyError},
+    channel_body::ChannelBody,
     client_counter,
     connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
-    database_task::{
-        DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command,
-        send_db_command_nonblocking,
-    },
+    database_task::{DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::Origin,
+    delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
     full_body, global_cache_quota, global_config, global_verify_throttle,
     guards::{DownloadBarrier, InitBarrier},
@@ -362,329 +359,28 @@ fn upstream_error_response(err: &hyper_util::client::legacy::Error) -> Response<
     response
 }
 
-/* Adopted from http_body_util::StreamBody */
-#[pin_project(PinnedDrop)]
-struct DeliveryStreamBody<S, E> {
-    #[pin]
-    stream: S,
-    start: PreciseInstant,
-    size: u64,
-    partial: bool,
-    transferred_bytes: u64,
-    conn_details: Option<ConnectionDetails>,
-    /// Stringified error and peer-disconnect flag captured from the last stream error.
-    error: Option<(String, bool)>,
-    peer_disconnect_check: fn(&E) -> bool,
-    _counter: client_counter::ClientDownload,
-}
-
-impl<S, E> DeliveryStreamBody<S, E> {
-    #[must_use]
-    fn new(
-        stream: S,
-        size: u64,
-        partial: bool,
-        conn_details: ConnectionDetails,
-        peer_disconnect_check: fn(&E) -> bool,
-    ) -> Self {
-        metrics::REQUESTS_COPY.increment();
-        Self {
-            stream,
-            start: PreciseInstant::now(),
-            size,
-            partial,
-            transferred_bytes: 0,
-            conn_details: Some(conn_details),
-            error: None,
-            peer_disconnect_check,
-            _counter: client_counter::ClientDownload::new(),
-        }
-    }
-}
-
-impl<S, D, E: ToString> Body for DeliveryStreamBody<S, E>
+/// Wrap a client-facing body in the configured client-rate check and box it
+/// into [`ProxyCacheBody`], mapping a rate timeout to
+/// `ProxyCacheError::ClientDownloadRate` for `client`.
+fn rated_client_body<B>(body: B, client: ClientInfo) -> ProxyCacheBody
 where
-    S: futures_util::Stream<Item = Result<Frame<D>, E>>,
-    D: bytes::Buf,
+    B: Body<Data = bytes::Bytes> + Send + Sync + 'static,
+    B::Error: Into<Box<ProxyCacheError>>,
 {
-    type Data = D;
-    type Error = E;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.as_mut().project().stream.poll_next(cx) {
-            Ready(Some(result)) => {
-                match &result {
-                    Ok(frame) => {
-                        if let Some(data) = frame.data_ref() {
-                            *self.project().transferred_bytes += data.remaining() as u64;
-                        }
-                    }
-                    Err(err) => {
-                        let proj = self.project();
-                        let is_disconnect = (proj.peer_disconnect_check)(err);
-                        *proj.error = Some((err.to_string(), is_disconnect));
-                    }
-                }
-                Ready(Some(result))
-            }
-            Pending => Pending,
-            Ready(None) => Ready(None),
+    let config = global_config();
+    let rated = MaybeRated::new(
+        body,
+        config.min_download_rate,
+        config.rate_check_timeframe,
+        RateCheckDirection::Client,
+    )
+    .map_err(move |err| match *err {
+        RateCheckedBodyErr::RateTimeout(error) => {
+            Box::new(ProxyCacheError::ClientDownloadRate { error, client })
         }
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        match self.size.checked_sub(self.transferred_bytes) {
-            Some(val) => SizeHint::with_exact(val),
-            None => SizeHint::default(),
-        }
-    }
-}
-
-#[pinned_drop]
-impl<S, E> PinnedDrop for DeliveryStreamBody<S, E> {
-    fn drop(self: Pin<&mut Self>) {
-        let size = self.size;
-        let partial = self.partial;
-        let duration = self.start.elapsed();
-        let transferred_bytes = self.transferred_bytes;
-        metrics::BYTES_SERVED_COPY.increment_by(transferred_bytes);
-        let project = self.project();
-        let cd = project.conn_details.take().expect("Option is set in new()");
-        let error = project.error.take();
-        // Logging is synchronous and the DB enqueue has a sync fast path —
-        // no per-request task spawn needed here.
-        let aliased = match cd.aliased_host {
-            Some(alias) => format!(" aliased to host {alias}"),
-            None => String::new(),
-        };
-        let in_time = cd.request_received_at.elapsed();
-        let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
-            "volatile "
-        } else {
-            ""
-        };
-        if transferred_bytes == size {
-            metrics::SERVED_COPY.increment();
-            metrics::SERVED_TOTAL.increment();
-            info!(
-                "Served cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({})",
-                cd.debname,
-                cd.mirror,
-                aliased,
-                cd.client,
-                HumanFmt::Time(in_time),
-                rate_log::client_segment(size, duration),
-            );
-            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-                mirror: cd.mirror,
-                debname: cd.debname,
-                size,
-                elapsed: duration,
-                kind: TransferKind::Delivery { partial },
-                client_ip: cd.client.ip(),
-            });
-            send_db_command_nonblocking(cmd);
-        } else {
-            let segment = rate_log::client_disconnect_segment(transferred_bytes, duration);
-            let (reason, peer_disconnect) =
-                error.unwrap_or_else(|| (String::from("unknown reason"), false));
-            if peer_disconnect {
-                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                info!(
-                    "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({segment}):  {reason}",
-                    cd.debname,
-                    cd.mirror,
-                    aliased,
-                    cd.client,
-                    HumanFmt::Time(in_time),
-                );
-            } else {
-                warn!(
-                    "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via stream ({segment}):  {reason}",
-                    cd.debname,
-                    cd.mirror,
-                    aliased,
-                    cd.client,
-                    HumanFmt::Time(in_time),
-                );
-            }
-        }
-    }
-}
-
-/// Body wrapper for the hyper simple-proxy path: counts data bytes into
-/// [`metrics::BYTES_SERVED_PASSTHROUGH`] at poll time (hyper's body model
-/// exposes no post-write hook). Splice/sendfile count post-write directly.
-///
-/// On Drop, bumps `SERVED_PASSTHROUGH` + `SERVED_TOTAL` iff the inner body
-/// reached clean end-of-stream (`poll_frame` returned `Ready(None)`) without
-/// ever surfacing an error — so aborted clients and errored deliveries do
-/// not increment the served counter.  Also logs a per-request rate summary
-/// (total in-time, upstream rate, client rate).
-#[pin_project(PinnedDrop)]
-struct PassthroughBody<B: Body> {
-    #[pin]
-    inner: B,
-    end_of_stream: bool,
-    // Sticky: set once `poll_frame` has yielded any `Err`, vetoing the
-    // Drop-time `SERVED_*` credit even if a later poll reaches `Ready(None)`.
-    errored: bool,
-    transferred: u64,
-    start: PreciseInstant,
-    request_received_at: PreciseInstant,
-    request_sent: PreciseInstant,
-    host: String,
-    path: String,
-    client: ClientInfo,
-}
-
-impl<B: Body> PassthroughBody<B> {
-    fn new(
-        inner: B,
-        request_received_at: PreciseInstant,
-        request_sent: PreciseInstant,
-        host: String,
-        path: String,
-        client: ClientInfo,
-    ) -> Self {
-        Self {
-            inner,
-            end_of_stream: false,
-            errored: false,
-            transferred: 0,
-            start: PreciseInstant::now(),
-            request_received_at,
-            request_sent,
-            host,
-            path,
-            client,
-        }
-    }
-}
-
-impl<B> Body for PassthroughBody<B>
-where
-    B: Body,
-{
-    type Data = B::Data;
-    type Error = B::Error;
-
-    #[inline]
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.project();
-        let result = this.inner.poll_frame(cx);
-        match &result {
-            Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    let n = data.remaining() as u64;
-                    metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n);
-                    *this.transferred += n;
-                }
-            }
-            Ready(None) => {
-                *this.end_of_stream = true;
-            }
-            Ready(Some(Err(_))) => {
-                *this.errored = true;
-            }
-            Pending => {}
-        }
-        result
-    }
-
-    #[inline]
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-
-    #[inline]
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-}
-
-#[pinned_drop]
-impl<B: Body> PinnedDrop for PassthroughBody<B> {
-    fn drop(self: Pin<&mut Self>) {
-        let transferred = self.transferred;
-        let client_window = self.start.elapsed();
-        let in_time = self.request_received_at.elapsed();
-        let upstream_window = self.request_sent.elapsed();
-        let end_of_stream = self.end_of_stream;
-        let errored = self.errored;
-        let this = self.project();
-        let host = std::mem::take(this.host);
-        let path = std::mem::take(this.path);
-        let client = *this.client;
-        if end_of_stream && !errored {
-            metrics::SERVED_PASSTHROUGH.increment();
-            metrics::SERVED_TOTAL.increment();
-            info!(
-                "simple proxy: passed through {path} from host {host} for client {client} in {} ({}, {})",
-                HumanFmt::Time(in_time),
-                rate_log::upstream_segment(transferred, upstream_window),
-                rate_log::client_segment(transferred, client_window),
-            );
-        } else {
-            info!(
-                "simple proxy: aborted passthrough of {path} from host {host} for client {client} in {} ({})",
-                HumanFmt::Time(in_time),
-                rate_log::client_disconnect_segment(transferred, client_window),
-            );
-        }
-    }
-}
-
-/// Body wrapper that holds a [`client_counter::ClientDownload`] for the lifetime
-/// of the body so paths without their own counter (passthrough, upstream
-/// error-body relay) still register in `ACTIVE_CLIENT_DOWNLOADS`. Forwards
-/// `Body` methods unchanged.
-#[pin_project]
-struct ClientCountedBody<B: Body> {
-    #[pin]
-    inner: B,
-    _counter: client_counter::ClientDownload,
-}
-
-impl<B: Body> ClientCountedBody<B> {
-    fn new(inner: B) -> Self {
-        Self {
-            inner,
-            _counter: client_counter::ClientDownload::new(),
-        }
-    }
-}
-
-impl<B> Body for ClientCountedBody<B>
-where
-    B: Body,
-{
-    type Data = B::Data;
-    type Error = B::Error;
-
-    #[inline]
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.project().inner.poll_frame(cx)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-
-    #[inline]
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
+        RateCheckedBodyErr::Inner(ierr) => ierr.into(),
+    });
+    ProxyCacheBody::Boxed(BoxBody::new(rated))
 }
 
 #[cfg(feature = "mmap")]
@@ -761,7 +457,16 @@ fn serve_cached_file_mmap(
 
     let client = conn_details.client;
 
-    let memory_body = MmapBody::new(memory_map, content_length, partial, conn_details);
+    let memory_body = AccountedBody::new(
+        MmapBody::new(memory_map, content_length),
+        Subject::Cached {
+            conn_details,
+            mechanism: Mechanism::Mmap,
+            size: content_length as u64,
+            partial,
+        },
+        |never| match *never {},
+    );
 
     let config = global_config();
 
@@ -817,6 +522,7 @@ async fn serve_unfinished_file(
     let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
+    let client = conn_details.client;
     tokio::task::spawn(async move {
         let start = PreciseInstant::now();
         debug!(
@@ -930,43 +636,18 @@ async fn serve_unfinished_file(
         drop(counter);
 
         let elapsed = start.elapsed();
-        let in_time = conn_details.request_received_at.elapsed();
-        let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
-            "volatile "
-        } else {
-            ""
+        let outcome = ServeOutcome {
+            size: bytes,
+            transferred: bytes,
+            complete: !client_disconnected,
+            partial: false,
+            elapsed,
+            abort: None,
         };
-        let aliased = match conn_details.aliased_host {
-            Some(alias) => format!(" aliased to host {alias}"),
-            None => String::new(),
-        };
-        if client_disconnected {
-            info!(
-                "Aborted serving downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via channel ({})",
-                conn_details.debname,
-                conn_details.mirror,
-                conn_details.client,
-                HumanFmt::Time(in_time),
-                rate_log::client_disconnect_segment(bytes, elapsed),
-            );
-        } else {
-            info!(
-                "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via channel ({})",
-                conn_details.debname,
-                conn_details.mirror,
-                conn_details.client,
-                HumanFmt::Time(in_time),
-                rate_log::client_segment(bytes, elapsed),
-            );
-            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-                mirror: conn_details.mirror,
-                debname: conn_details.debname,
-                size: bytes,
-                elapsed,
-                kind: TransferKind::Delivery { partial: false },
-                client_ip: conn_details.client.ip(),
-            });
-            send_db_command(cmd).await;
+        if let Some(cmd) =
+            finish_cached_serve(&conn_details, Mechanism::Channel, Role::LateJoiner, outcome)
+        {
+            send_db_command(DatabaseCommand::Transfer(cmd)).await;
         }
     });
 
@@ -995,36 +676,7 @@ async fn serve_unfinished_file(
     }
 
     metrics::REQUESTS_CHANNEL.increment();
-    let channel_body = ChannelBody::new(rx, content_length);
-
-    let rated = MaybeRated::new(
-        channel_body,
-        config.min_download_rate,
-        config.rate_check_timeframe,
-        RateCheckDirection::Client,
-    );
-
-    let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| {
-        let new_err = match *err {
-            RateCheckedBodyErr::RateTimeout(error) => ProxyCacheError::ClientDownloadRate {
-                error,
-                client: conn_details.client,
-            },
-            RateCheckedBodyErr::Inner(ierr) => match *ierr {
-                ChannelBodyError::MirrorDownloadRate(rate) => {
-                    ProxyCacheError::MirrorDownloadRate(rate)
-                }
-                ChannelBodyError::ContentTooLarge {
-                    announced,
-                    received,
-                } => ProxyCacheError::ContentTooLarge {
-                    announced,
-                    received,
-                },
-            },
-        };
-        Box::new(new_err)
-    })));
+    let body = rated_client_body(ChannelBody::new(rx, content_length), client);
 
     let response = response_builder.body(body).expect("HTTP response is valid");
 
@@ -1342,28 +994,18 @@ async fn serve_cached_file_buf(
         config.buffer_size,
     );
 
-    let delivery_body = DeliveryStreamBody::new(
-        reader_stream.map_ok(Frame::data),
-        content_length,
-        partial,
-        conn_details,
+    let delivery_body = AccountedBody::new(
+        StreamBody::new(reader_stream.map_ok(Frame::data)),
+        Subject::Cached {
+            conn_details,
+            mechanism: Mechanism::Stream,
+            size: content_length,
+            partial,
+        },
         is_peer_disconnect,
     );
 
-    let rated = MaybeRated::new(
-        delivery_body,
-        config.min_download_rate,
-        config.rate_check_timeframe,
-        RateCheckDirection::Client,
-    )
-    .map_err(move |err| match *err {
-        RateCheckedBodyErr::RateTimeout(error) => {
-            Box::new(ProxyCacheError::ClientDownloadRate { error, client })
-        }
-        RateCheckedBodyErr::Inner(ierr) => ierr.into(),
-    });
-
-    let body = ProxyCacheBody::Boxed(BoxBody::new(rated));
+    let body = rated_client_body(delivery_body, client);
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(
@@ -2500,32 +2142,20 @@ async fn serve_new_file(
 
             let (parts, body) = fwd_response.into_parts();
 
-            metrics::REQUESTS_PASSTHROUGH.increment();
-            let counted = ClientCountedBody::new(PassthroughBody::new(
-                body,
-                conn_details.request_received_at,
-                upstream_request_sent,
-                conn_details.mirror.format_authority().to_string(),
-                req_uri.path().to_owned(),
-                conn_details.client,
-            ));
-
-            let rated = MaybeRated::new(
-                counted,
-                config.min_download_rate,
-                config.rate_check_timeframe,
-                RateCheckDirection::Client,
-            );
-
-            let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
-                RateCheckedBodyErr::RateTimeout(error) => {
-                    Box::new(ProxyCacheError::ClientDownloadRate {
-                        error,
+            let body = rated_client_body(
+                AccountedBody::new(
+                    body,
+                    Subject::Passthrough {
+                        host: conn_details.mirror.format_authority().to_string(),
+                        path: req_uri.path().to_owned(),
                         client: conn_details.client,
-                    })
-                }
-                RateCheckedBodyErr::Inner(ierr) => ierr.into(),
-            })));
+                        request_received_at: conn_details.request_received_at,
+                        request_sent: upstream_request_sent,
+                    },
+                    |_| false,
+                ),
+                conn_details.client,
+            );
 
             let mut response = Response::from_parts(parts, body);
             response
@@ -3328,29 +2958,20 @@ async fn pre_process_client_request(
 
             let (parts, body) = redirected_response.into_parts();
 
-            metrics::REQUESTS_PASSTHROUGH.increment();
-            let counted = ClientCountedBody::new(PassthroughBody::new(
-                body,
-                passthrough_request_received_at,
-                redirected_request_sent,
-                requested_host.to_string(),
-                request_path.clone(),
+            let body = rated_client_body(
+                AccountedBody::new(
+                    body,
+                    Subject::Passthrough {
+                        host: requested_host.to_string(),
+                        path: request_path.clone(),
+                        client,
+                        request_received_at: passthrough_request_received_at,
+                        request_sent: redirected_request_sent,
+                    },
+                    |_| false,
+                ),
                 client,
-            ));
-
-            let rated = MaybeRated::new(
-                counted,
-                config.min_download_rate,
-                config.rate_check_timeframe,
-                RateCheckDirection::Client,
             );
-
-            let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
-                RateCheckedBodyErr::RateTimeout(error) => {
-                    Box::new(ProxyCacheError::ClientDownloadRate { error, client })
-                }
-                RateCheckedBodyErr::Inner(ierr) => ierr.into(),
-            })));
 
             let mut response = Response::from_parts(parts, body);
             response
@@ -3378,29 +2999,20 @@ async fn pre_process_client_request(
 
     let (parts, body) = fwd_response.into_parts();
 
-    metrics::REQUESTS_PASSTHROUGH.increment();
-    let counted = ClientCountedBody::new(PassthroughBody::new(
-        body,
-        passthrough_request_received_at,
-        fwd_request_sent,
-        requested_host.to_string(),
-        request_path,
+    let body = rated_client_body(
+        AccountedBody::new(
+            body,
+            Subject::Passthrough {
+                host: requested_host.to_string(),
+                path: request_path,
+                client,
+                request_received_at: passthrough_request_received_at,
+                request_sent: fwd_request_sent,
+            },
+            |_| false,
+        ),
         client,
-    ));
-
-    let rated = MaybeRated::new(
-        counted,
-        config.min_download_rate,
-        config.rate_check_timeframe,
-        RateCheckDirection::Client,
     );
-
-    let body = ProxyCacheBody::Boxed(BoxBody::new(rated.map_err(move |err| match *err {
-        RateCheckedBodyErr::RateTimeout(error) => {
-            Box::new(ProxyCacheError::ClientDownloadRate { error, client })
-        }
-        RateCheckedBodyErr::Inner(ierr) => ierr.into(),
-    })));
 
     let mut response = Response::from_parts(parts, body);
 

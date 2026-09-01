@@ -30,7 +30,8 @@ use crate::{
     client_counter,
     connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
-    database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
+    database_task::{DatabaseCommand, send_db_command},
+    delivery::{AbortCause, Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{ErrorReport, errno_to_io_error},
     global_config,
     http_helpers::{
@@ -44,7 +45,6 @@ use crate::{
     permitted_host_cache::authorize_cache_access,
     precise_instant::PreciseInstant,
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
-    rate_log,
     request_dispatch::{DispatchOutcome, PassthroughReason, RejectReason, dispatch_request},
     static_assert, swrite, tunnel_limiter,
     utils::{
@@ -1723,63 +1723,36 @@ pub(crate) async fn serve_file_via_sendfile(
     metrics::REQUESTS_SENDFILE.increment();
     let transfer_result = async_sendfile(stream, &file, content_start, content_length).await;
 
-    let in_time = conn_details.request_received_at.elapsed();
-    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
-        "volatile "
-    } else {
-        ""
+    let elapsed = start.elapsed();
+    let (complete, transferred, failure) = match &transfer_result {
+        Ok(transferred) => (true, *transferred, None),
+        Err((transferred, err)) => (
+            false,
+            *transferred,
+            Some((ErrorReport(err), is_peer_disconnect(err))),
+        ),
     };
-    match transfer_result {
-        Ok(transferred) => {
-            metrics::SERVED_SENDFILE.increment();
-            metrics::SERVED_TOTAL.increment();
-            let elapsed = start.elapsed();
-            info!(
-                "Served cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({})",
-                conn_details.debname,
-                conn_details.mirror,
-                conn_details.client,
-                HumanFmt::Time(in_time),
-                rate_log::client_segment(transferred, elapsed),
-            );
-            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-                mirror: conn_details.mirror.clone(),
-                debname: conn_details.debname.clone(),
-                size: content_length,
-                elapsed,
-                kind: TransferKind::Delivery {
-                    partial: content_range.is_some(),
-                },
-                client_ip: conn_details.client.ip(),
-            });
-            send_db_command(cmd).await;
-            SendfileResult::Served(conn_action)
-        }
-        Err((transferred, err)) => {
-            let elapsed = start.elapsed();
-            let segment = rate_log::client_disconnect_segment(transferred, elapsed);
-            if is_peer_disconnect(&err) {
-                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                info!(
-                    "Aborted serving cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    conn_details.client,
-                    HumanFmt::Time(in_time),
-                    ErrorReport(&err),
-                );
-            } else {
-                warn!(
-                    "Aborted serving cached {volatile}file {} from mirror {}{aliased} for client {} in {} via sendfile ({segment}):  {}",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    conn_details.client,
-                    HumanFmt::Time(in_time),
-                    ErrorReport(&err),
-                );
-            }
-            SendfileResult::AfterHeaderError
-        }
+    let outcome = ServeOutcome {
+        size: content_length,
+        transferred,
+        complete,
+        partial: content_range.is_some(),
+        elapsed,
+        abort: failure
+            .as_ref()
+            .map(|(reason, peer_disconnect)| AbortCause {
+                reason,
+                peer_disconnect: *peer_disconnect,
+            }),
+    };
+    if let Some(cmd) = finish_cached_serve(conn_details, Mechanism::Sendfile, Role::Cached, outcome)
+    {
+        send_db_command(DatabaseCommand::Transfer(cmd)).await;
+    }
+    if complete {
+        SendfileResult::Served(conn_action)
+    } else {
+        SendfileResult::AfterHeaderError
     }
 }
 
@@ -2745,63 +2718,37 @@ async fn serve_unfinished_sendfile(
     )
     .await;
 
-    let in_time = conn_details.request_received_at.elapsed();
-    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
-        "volatile "
-    } else {
-        ""
+    let elapsed = start.elapsed();
+    let (complete, transferred, failure) = match &transfer_result {
+        Ok(transferred) => (true, *transferred, None),
+        Err((transferred, err)) => (
+            false,
+            *transferred,
+            Some((ErrorReport(err), is_peer_disconnect(err))),
+        ),
     };
-    match transfer_result {
-        Ok(transferred) => {
-            metrics::SERVED_SENDFILE.increment();
-            metrics::SERVED_TOTAL.increment();
-            let elapsed = start.elapsed();
-            info!(
-                "Served downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({})",
-                conn_details.debname,
-                conn_details.mirror,
-                conn_details.client,
-                HumanFmt::Time(in_time),
-                rate_log::client_segment(transferred, elapsed),
-            );
-            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-                mirror: conn_details.mirror.clone(),
-                debname: conn_details.debname.clone(),
-                size: content_length,
-                elapsed,
-                kind: TransferKind::Delivery {
-                    partial: content_range.is_some(),
-                },
-                client_ip: conn_details.client.ip(),
-            });
-            send_db_command(cmd).await;
-            ZeroCopyResult::Served(conn_action)
-        }
-        Err((transferred, err)) => {
-            let elapsed = start.elapsed();
-            let segment = rate_log::client_disconnect_segment(transferred, elapsed);
-            if is_peer_disconnect(&err) {
-                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                info!(
-                    "Aborted serving downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    conn_details.client,
-                    HumanFmt::Time(in_time),
-                    ErrorReport(&err),
-                );
-            } else {
-                warn!(
-                    "Aborted serving downloading {volatile}file {} from mirror {}{aliased} for joining client {} in {} via sendfile ({segment}):  {}",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    conn_details.client,
-                    HumanFmt::Time(in_time),
-                    ErrorReport(&err),
-                );
-            }
-            ZeroCopyResult::AfterHeaderError
-        }
+    let outcome = ServeOutcome {
+        size: content_length,
+        transferred,
+        complete,
+        partial: content_range.is_some(),
+        elapsed,
+        abort: failure
+            .as_ref()
+            .map(|(reason, peer_disconnect)| AbortCause {
+                reason,
+                peer_disconnect: *peer_disconnect,
+            }),
+    };
+    if let Some(cmd) =
+        finish_cached_serve(conn_details, Mechanism::Sendfile, Role::LateJoiner, outcome)
+    {
+        send_db_command(DatabaseCommand::Transfer(cmd)).await;
+    }
+    if complete {
+        ZeroCopyResult::Served(conn_action)
+    } else {
+        ZeroCopyResult::AfterHeaderError
     }
 }
 

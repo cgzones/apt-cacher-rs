@@ -2,103 +2,25 @@ use std::{convert::Infallible, pin::Pin, sync::Arc, task::Poll::Ready};
 
 use http_body::{Body, Frame, SizeHint};
 use memmap2::Mmap;
-use tracing::info;
-
-use crate::{
-    cache_layout::{CachedFlavor, ConnectionDetails},
-    client_counter,
-    database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command_nonblocking},
-    humanfmt::HumanFmt,
-    metrics,
-    precise_instant::PreciseInstant,
-    rate_log,
-};
 
 const MMAP_FRAME_SIZE: usize = 2 * 1024 * 1024; // 2MiB
 
+/// A `Body` over a memory-mapped cache file, yielding zero-copy
+/// [`MmapData`] frames. Delivery accounting (bytes, `SERVED_*`, the
+/// completion log, the DB row) is the wrapping `AccountedBody`'s job.
 pub(crate) struct MmapBody {
     mapping: Arc<Mmap>,
     position: usize,
     length: usize,
-    partial: bool,
-    start: PreciseInstant,
-    conn_details: Option<ConnectionDetails>,
-    _counter: client_counter::ClientDownload,
 }
 
 impl MmapBody {
     #[must_use]
-    pub(crate) fn new(
-        mapping: Mmap,
-        length: usize,
-        partial: bool,
-        conn_details: ConnectionDetails,
-    ) -> Self {
-        metrics::REQUESTS_MMAP.increment();
+    pub(crate) fn new(mapping: Mmap, length: usize) -> Self {
         Self {
             mapping: Arc::new(mapping),
             position: 0,
             length,
-            partial,
-            start: PreciseInstant::now(),
-            conn_details: Some(conn_details),
-            _counter: client_counter::ClientDownload::new(),
-        }
-    }
-}
-
-impl Drop for MmapBody {
-    fn drop(&mut self) {
-        let size = self.length as u64;
-        let partial = self.partial;
-        let elapsed = self.start.elapsed();
-        let transferred_bytes = self.position as u64;
-        metrics::BYTES_SERVED_MMAP.increment_by(transferred_bytes);
-        let cd = self.conn_details.take().expect("set in new()");
-        // Logging is synchronous and the DB enqueue has a sync fast path —
-        // no per-request task spawn needed here.
-        let aliased = match cd.aliased_host {
-            Some(alias) => format!(" aliased to host {alias}"),
-            None => String::new(),
-        };
-        let in_time = cd.request_received_at.elapsed();
-        let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
-            "volatile "
-        } else {
-            ""
-        };
-        if transferred_bytes == size {
-            metrics::SERVED_MMAP.increment();
-            metrics::SERVED_TOTAL.increment();
-            info!(
-                "Served cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({})",
-                cd.debname,
-                cd.mirror,
-                aliased,
-                cd.client,
-                HumanFmt::Time(in_time),
-                rate_log::client_segment(size, elapsed),
-            );
-
-            let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-                mirror: cd.mirror,
-                debname: cd.debname,
-                size,
-                elapsed,
-                kind: TransferKind::Delivery { partial },
-                client_ip: cd.client.ip(),
-            });
-            send_db_command_nonblocking(cmd);
-        } else {
-            let segment = rate_log::client_disconnect_segment(transferred_bytes, elapsed);
-            info!(
-                "Aborted serving cached {volatile}file {} from mirror {}{} for client {} in {} via mmap ({segment})",
-                cd.debname,
-                cd.mirror,
-                aliased,
-                cd.client,
-                HumanFmt::Time(in_time),
-            );
         }
     }
 }

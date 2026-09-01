@@ -1,6 +1,8 @@
 use std::fmt::Display;
 
 #[cfg(feature = "hyper")]
+use crate::channel_body::ChannelBodyError;
+#[cfg(feature = "hyper")]
 use crate::{ClientInfo, ContentLength, deb_mirror::Mirror, rate_checker::InsufficientRate};
 
 #[derive(Clone, Debug)]
@@ -96,6 +98,22 @@ impl From<std::io::Error> for Box<ProxyCacheError> {
 impl From<hyper::Error> for Box<ProxyCacheError> {
     fn from(value: hyper::Error) -> Self {
         Self::new(ProxyCacheError::Hyper(value))
+    }
+}
+
+#[cfg(feature = "hyper")]
+impl From<Box<ChannelBodyError>> for Box<ProxyCacheError> {
+    fn from(value: Box<ChannelBodyError>) -> Self {
+        Self::new(match *value {
+            ChannelBodyError::MirrorDownloadRate(rate) => ProxyCacheError::MirrorDownloadRate(rate),
+            ChannelBodyError::ContentTooLarge {
+                announced,
+                received,
+            } => ProxyCacheError::ContentTooLarge {
+                announced,
+                received,
+            },
+        })
     }
 }
 

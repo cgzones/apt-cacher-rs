@@ -16,6 +16,8 @@ compile_error!("Feature \"tls_hyper\" and \"tls_rustls\" are mutually exclusive.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "hyper")]
+mod accounted_body;
 mod active_downloads;
 mod cache_conditional;
 mod cache_layout;
@@ -30,6 +32,7 @@ mod connect_tunnel;
 mod database;
 mod database_task;
 mod deb_mirror;
+mod delivery;
 mod error;
 mod flat_blocklist;
 mod guards;
@@ -317,7 +320,10 @@ pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
 )]
 enum ProxyCacheBody {
     #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap(#[pin] MaybeRated<mmap_body::MmapBody>, ClientInfo),
+    Mmap(
+        #[pin] MaybeRated<accounted_body::AccountedBody<mmap_body::MmapBody>>,
+        ClientInfo,
+    ),
     Boxed(#[pin] BoxBody<bytes::Bytes, Box<error::ProxyCacheError>>),
 }
 
