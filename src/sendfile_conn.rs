@@ -1,4 +1,10 @@
-use std::{io::ErrorKind, num::NonZero, os::fd::AsFd as _, path::Path, sync::Arc};
+use std::{
+    io::ErrorKind,
+    num::NonZero,
+    os::{fd::AsFd as _, unix::fs::MetadataExt as _},
+    path::Path,
+    sync::Arc,
+};
 #[cfg(feature = "hyper")]
 use std::{
     pin::Pin,
@@ -18,14 +24,14 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "hyper")]
-use crate::hyper_conn::handle_hyper_connection;
+use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
 #[cfg(feature = "splice")]
 use crate::splice_conn::SpliceProxyError;
 use crate::{
     APP_NAME, APP_VIA, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
     active_downloads::{ActiveDownloadStatus, Serveable, await_serveable},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{CachedFlavor, ConnectionDetails},
+    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
     cache_metadata::{self},
     client_counter,
     connect_tunnel::{ConnectReject, validate_connect_target},
@@ -77,12 +83,31 @@ const INITIAL_HEADER_SIZE: usize = 2048;
 const MAX_HEADERS: usize = 100;
 
 /// Represents the result of a sendfile operation.
+// Only the `CacheMiss` handoff plan (carrying the stale copy) pushes the
+// variant-size gap over clippy's threshold.
+#[cfg_attr(
+    all(feature = "hyper", not(feature = "splice")),
+    expect(
+        clippy::large_enum_variant,
+        reason = "transient value: returned by try_sendfile_request and matched once by the \
+                  connection loop, never stored or collected; boxing the handoff plan would \
+                  add a heap alloc per default-build cache miss"
+    )
+)]
 pub(crate) enum ZeroCopyResult {
     /// Request was served via sendfile
     Served(ConnectionAction),
 
-    /// Request is not applicable for sendfile, fall back to hyper
-    NotApplicable(&'static str),
+    /// Request is not applicable for sendfile, fall back to hyper for this
+    /// and every later request on the connection.  `plan` carries the work
+    /// already done (pre-flight, dispatch, cache lookup / late-joiner
+    /// attach) so hyper resumes the pipeline instead of restarting it; see
+    /// `hyper_conn::HandoffPlan`.  Without hyper the request is refused.
+    NotApplicable {
+        reason: &'static str,
+        #[cfg(feature = "hyper")]
+        plan: HandoffPlan,
+    },
 
     /// Request is invalid, reject and close the connection
     Invalid {
@@ -210,15 +235,11 @@ pub(crate) async fn handle_sendfile_connection(
         let result =
             try_sendfile_request(&buf, &stream, client, &appstate, &mut conn_version).await;
 
-        // NotApplicable is excluded from the count only because hyper
-        // re-dispatches (and itself counts) the request in hyper builds; the
-        // splice-only arm below answers it directly with a 503 — which
-        // records a client status — so count it here to keep
-        // REQUESTS_TOTAL >= CLIENT_STATUS_* (same invariant as the
-        // parse-error path above).
-        if cfg!(not(feature = "hyper")) || !matches!(result, ZeroCopyResult::NotApplicable(_)) {
-            metrics::REQUESTS_TOTAL.increment();
-        }
+        // Proxy entry for every request this backend parsed, including the
+        // ones handed to hyper (which skips its own bump for a handoff), so
+        // REQUESTS_TOTAL >= CLIENT_STATUS_* holds as on the parse-error path
+        // above.
+        metrics::REQUESTS_TOTAL.increment();
 
         // Parse the request and try to handle it with sendfile
         #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
@@ -232,10 +253,16 @@ pub(crate) async fn handle_sendfile_connection(
                 // Request served via sendfile; close the connection as requested
                 return;
             }
-            ZeroCopyResult::NotApplicable(reason) => {
+            ZeroCopyResult::NotApplicable {
+                reason,
+                #[cfg(feature = "hyper")]
+                plan,
+            } => {
                 #[cfg(feature = "hyper")]
                 {
-                    // Fall back to hyper for this and all subsequent requests
+                    // Fall back to hyper for this and all subsequent requests.
+                    // `buf` starts with the request `plan` describes; any
+                    // pipelined successors behind it are hyper's to parse.
                     debug!(
                         "Falling back to hyper for client {client} on request #{req_num} due to: {reason} ({} bytes buffered)",
                         buf.len()
@@ -243,7 +270,7 @@ pub(crate) async fn handle_sendfile_connection(
 
                     let stream = MaybePrependedStream::new(buf, stream);
 
-                    return handle_hyper_connection(stream, client, appstate).await;
+                    return handle_hyper_connection(stream, client, appstate, Some(plan)).await;
                 }
                 #[cfg(not(feature = "hyper"))]
                 {
@@ -1023,10 +1050,12 @@ async fn try_sendfile_request(
 
     let conn_action = compute_conn_action(&req, *conn_version, &client);
 
-    // Unified dispatch shared with main.rs: diff-reject -> normalize -> parse
-    // -> classify -> flat-blocklist -> deferred-Origin-DB -> unsafe-path gate.
-    // Logging, metric bumping, and deferred Origin DB writes happen inside
-    // `dispatch_request`; this match only maps outcomes to ZeroCopyResult.
+    // Unified dispatch shared with hyper_conn.rs: diff-reject -> normalize
+    // -> parse -> classify -> flat-blocklist -> deferred-Origin-DB ->
+    // unsafe-path gate.  Logging, metric bumping, the deferred Origin DB
+    // write and `record_uncacheable` happen inside `dispatch_request`, which
+    // runs once per request: a handoff carries its outcome to hyper.  This
+    // match only maps outcomes to ZeroCopyResult.
     let uri_path = uri.path();
     let plan = match dispatch_request(uri_path, requested_host, requested_port, &client).await {
         DispatchOutcome::Cache(plan) => plan,
@@ -1043,12 +1072,7 @@ async fn try_sendfile_request(
             use crate::{
                 deb_mirror::{Mirror, MirrorKind},
                 splice_conn::splice_simple_proxy,
-                uncacheables::record_uncacheable,
             };
-
-            // Splice serves this request directly; hyper won't re-enter the
-            // dispatcher, so record here.
-            record_uncacheable(&requested_host, uri_path);
 
             // Simple-proxy path: this Mirror is used only for upstream
             // dispatch/formatting and is never persisted; kind is arbitrary.
@@ -1080,22 +1104,26 @@ async fn try_sendfile_request(
         }
         #[cfg(not(feature = "splice"))]
         DispatchOutcome::Passthrough {
-            reason: PassthroughReason::NonDebPool,
-            requested_host: _,
-            request_received_at: _,
-        } => return ZeroCopyResult::NotApplicable("unsupported pool filename"),
-        #[cfg(not(feature = "splice"))]
-        DispatchOutcome::Passthrough {
-            reason: PassthroughReason::FlatBlocked,
-            requested_host: _,
-            request_received_at: _,
-        } => return ZeroCopyResult::NotApplicable("flat host blocked by structured collision"),
-        #[cfg(not(feature = "splice"))]
-        DispatchOutcome::Passthrough {
-            reason: PassthroughReason::Unrecognized,
-            requested_host: _,
-            request_received_at: _,
-        } => return ZeroCopyResult::NotApplicable("unrecognized resource path"),
+            reason,
+            requested_host,
+            request_received_at,
+        } => {
+            // Without splice this backend has no uncached forwarder; hyper
+            // continues from the dispatch verdict.
+            let reason = match reason {
+                PassthroughReason::NonDebPool => "unsupported pool filename",
+                PassthroughReason::FlatBlocked => "flat host blocked by structured collision",
+                PassthroughReason::Unrecognized => "unrecognized resource path",
+            };
+            return ZeroCopyResult::NotApplicable {
+                reason,
+                plan: HandoffPlan::Passthrough {
+                    requested_host,
+                    requested_port,
+                    request_received_at,
+                },
+            };
+        }
     };
 
     let aliased = match plan.aliased_host {
@@ -1114,16 +1142,26 @@ async fn try_sendfile_request(
         resource_kind: plan.resource_kind,
     };
 
-    // Check if the file is currently being downloaded — if so, serve it via
-    // sendfile from the growing partial file instead of falling back to hyper.
-    // `attach()` atomically records the late joiner under the same write lock
-    // as the lookup; on `NotApplicable` we fall back to hyper, whose
-    // `insert()` may count this client a second time (rare, only when
-    // upstream omits Content-Length).
+    // Check if the file is currently being downloaded - if so, serve it via
+    // sendfile from the growing partial file.  `attach()` atomically records
+    // the late joiner under the same write lock as the lookup; should the
+    // response turn out unframeable here (no Content-Length), the attached
+    // status travels to hyper in the `NotApplicable` plan, so the joiner is
+    // never registered twice.
     if let Some(dl_status) = appstate.active_downloads.attach(conn_details.key()) {
-        let result = serve_unfinished_sendfile(
+        // Coalesced permanent late-joiners count as `CACHE_MISSES`: the file
+        // was not yet fully on disk so we would have fetched upstream if not
+        // for the in-flight originator. `LATE_JOINERS_TOTAL` is the subset of
+        // misses that attached; `attach()` already bumped that counter. The
+        // volatile case is accounted for via `VOLATILE_REFETCHED` by the
+        // originator.
+        if conn_details.cached_flavor == CachedFlavor::Permanent {
+            metrics::CACHE_MISSES.increment();
+        }
+
+        return serve_unfinished_sendfile(
             stream,
-            &conn_details,
+            conn_details,
             &aliased,
             dl_status,
             *conn_version,
@@ -1131,43 +1169,21 @@ async fn try_sendfile_request(
             RangeRequestHeaders::extract(req.headers),
         )
         .await;
-
-        // Coalesced permanent late-joiners count as `CACHE_MISSES`: the file
-        // was not yet fully on disk so we would have fetched upstream if not
-        // for the in-flight originator. `LATE_JOINERS_TOTAL` is the subset of
-        // misses that attached. `attach()` already bumped that counter.
-        // `NotApplicable` falls back to hyper, which bumps `CACHE_MISSES`
-        // itself on its own miss path; the volatile case is accounted for via
-        // `VOLATILE_REFETCHED` by the originator.
-        if !matches!(result, ZeroCopyResult::NotApplicable(_))
-            && conn_details.cached_flavor == CachedFlavor::Permanent
-        {
-            metrics::CACHE_MISSES.increment();
-        }
-
-        return result;
     }
 
     let cache_path = conn_details.cache_file_path();
 
-    // Refetch/miss accounting split: with splice, the request is served here
-    // without ever reaching hyper, so this function bumps the counters.
-    // Without splice, every miss/stale outcome below ends in `NotApplicable`
-    // and hyper re-dispatches the request through its own accounting —
-    // bumping here too would double-count.
-    #[cfg(feature = "splice")]
-    let mut cache_miss_was_volatile_notfound = false;
+    // This is the lookup site for every request that gets here, so the
+    // hit/miss/refetch counters are bumped exactly here - whether the miss is
+    // then fetched by splice below or handed to hyper, which enters its
+    // pipeline past its own lookup (`HandoffPlan::CacheMiss`).
 
     // Try to open the cached file; for volatile resources, treat stale files as cache misses.
     let cached_file = 'cache_lookup: {
         let file = match tokio_nofollow_options().read(true).open(&cache_path).await {
             Ok(f) => f,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                #[cfg(feature = "splice")]
-                if conn_details.cached_flavor == CachedFlavor::Volatile {
-                    cache_miss_was_volatile_notfound = true;
-                }
-                break 'cache_lookup None;
+                break 'cache_lookup Err(CacheMiss::NotFound);
             }
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
@@ -1195,9 +1211,11 @@ async fn try_sendfile_request(
                         .expect("Platform should support modification timestamps via setup check");
                     if let Ok(elapsed) = last_modified.elapsed() {
                         if elapsed >= VOLATILE_CACHE_MAX_AGE {
-                            #[cfg(feature = "splice")]
-                            metrics::VOLATILE_REFETCHED.increment();
-                            break 'cache_lookup None;
+                            break 'cache_lookup Err(CacheMiss::StaleVolatile {
+                                file,
+                                modified: last_modified,
+                                size: md.size(),
+                            });
                         }
 
                         debug!(
@@ -1215,7 +1233,7 @@ async fn try_sendfile_request(
                         );
                     }
                     metrics::VOLATILE_HIT.increment();
-                    break 'cache_lookup Some((file, Some(md)));
+                    break 'cache_lookup Ok((file, Some(md)));
                 }
                 Err(CacheAccessFailure) => {
                     return ZeroCopyResult::Invalid {
@@ -1226,46 +1244,50 @@ async fn try_sendfile_request(
             }
         }
 
-        Some((file, None))
+        Ok((file, None))
     };
 
-    if let Some((file, mdata)) = cached_file {
-        // CACHE_HITS only counts permanent-file hits; fresh volatile hits
-        // were already bumped as VOLATILE_HIT in the cache_lookup block.
-        if conn_details.cached_flavor == CachedFlavor::Permanent {
-            metrics::CACHE_HITS.increment();
+    let miss = match cached_file {
+        Ok((file, mdata)) => {
+            // CACHE_HITS only counts permanent-file hits; fresh volatile hits
+            // were already bumped as VOLATILE_HIT in the cache_lookup block.
+            if conn_details.cached_flavor == CachedFlavor::Permanent {
+                metrics::CACHE_HITS.increment();
+            }
+
+            return serve_file_via_sendfile(
+                stream,
+                &conn_details,
+                &aliased,
+                (file, mdata, &cache_path),
+                (*conn_version, conn_action),
+                RangeRequestHeaders::extract(req.headers),
+                None,
+            )
+            .await
+            .into();
         }
+        Err(miss) => miss,
+    };
 
-        return serve_file_via_sendfile(
-            stream,
-            &conn_details,
-            &aliased,
-            (file, mdata, &cache_path),
-            (*conn_version, conn_action),
-            RangeRequestHeaders::extract(req.headers),
-            None,
-        )
-        .await
-        .into();
-    }
-
-    // Cache miss or stale volatile file — try splice proxy, then hyper fallback.
-    // The stale-volatile case has already bumped VOLATILE_REFETCHED above; bump
-    // it for the volatile-not-found case too. Permanent-not-found is a real
-    // cache miss. Splice-only: without splice the `NotApplicable` fallthrough
-    // below hands the request to hyper, which owns the accounting.
-    #[cfg(feature = "splice")]
-    if cache_miss_was_volatile_notfound {
-        metrics::VOLATILE_REFETCHED.increment();
-    } else if conn_details.cached_flavor == CachedFlavor::Permanent {
-        metrics::CACHE_MISSES.increment();
+    // Cache miss or stale volatile file: a permanent file not found is a real
+    // cache miss; a volatile file not found or stale is a refetch.
+    match &miss {
+        CacheMiss::NotFound => match conn_details.cached_flavor {
+            CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
+            CachedFlavor::Volatile => metrics::VOLATILE_REFETCHED.increment(),
+        },
+        CacheMiss::StaleVolatile { .. } => metrics::VOLATILE_REFETCHED.increment(),
     }
 
     #[cfg(feature = "splice")]
     {
         use crate::splice_conn::{SpliceProxyOutcome, splice_proxy};
 
-        match splice_proxy(
+        // Splice fetches on its own path and re-opens a stale copy itself.
+        drop(miss);
+
+        let outcome = splice_proxy(
             stream,
             *conn_version,
             conn_action,
@@ -1274,8 +1296,8 @@ async fn try_sendfile_request(
             appstate,
             RangeRequestHeaders::extract(req.headers),
         )
-        .await
-        {
+        .await;
+        match outcome {
             Ok(SpliceProxyOutcome::Served) => ZeroCopyResult::Served(conn_action),
             Ok(SpliceProxyOutcome::Concurrent { status: dl_status }) => {
                 // Race-loser path: another connection registered the
@@ -1283,14 +1305,14 @@ async fn try_sendfile_request(
                 // nothing) and `splice_proxy`'s `originate()`. The
                 // existing download's status was handed back by
                 // `originate()` and is held alive by the Arc, so we can
-                // serve from the partial via sendfile directly — no
+                // serve from the partial via sendfile directly - no
                 // re-attach, no race-of-races fall-back. `CACHE_MISSES`
                 // (permanent) or `VOLATILE_REFETCHED` (volatile) was bumped
                 // above when the cache lookup found no usable file;
                 // `LATE_JOINERS_TOTAL` was bumped inside `originate()`.
                 serve_unfinished_sendfile(
                     stream,
-                    &conn_details,
+                    conn_details,
                     &aliased,
                     dl_status,
                     *conn_version,
@@ -1325,7 +1347,20 @@ async fn try_sendfile_request(
     }
 
     #[cfg(not(feature = "splice"))]
-    ZeroCopyResult::NotApplicable("file not found in cache")
+    {
+        let reason = match miss {
+            CacheMiss::NotFound => "file not found in cache",
+            CacheMiss::StaleVolatile { .. } => "stale volatile file in cache",
+        };
+        ZeroCopyResult::NotApplicable {
+            reason,
+            plan: HandoffPlan::CacheMiss {
+                conn_details,
+                cache_path,
+                miss,
+            },
+        }
+    }
 }
 
 /// The single outer arm for [`SpliceProxyError`]: maps every variant to its
@@ -2454,9 +2489,13 @@ pub(crate) async fn async_sendfile_unfinished(
 
 /// Serve a file that is currently being downloaded by another task, using
 /// sendfile(2) for zero-copy delivery to the joining client.
+///
+/// Takes `conn_details` by value because an in-flight download without a
+/// known `Content-Length` cannot be framed here and is handed to hyper
+/// together with the attached `dl_status` (`HandoffPlan::JoinDownload`).
 async fn serve_unfinished_sendfile(
     stream: &TcpStream,
-    conn_details: &ConnectionDetails,
+    conn_details: ConnectionDetails,
     aliased: &str,
     dl_status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     conn_version: ConnectionVersion,
@@ -2467,7 +2506,7 @@ async fn serve_unfinished_sendfile(
     // (Verifying/Finished) is served like any cached file, an in-progress
     // one below via the partial file plus the progress receiver.
     let (file, file_path, total_size, receiver, status_meta) =
-        match await_serveable(&dl_status, conn_details).await {
+        match await_serveable(&dl_status, &conn_details).await {
             Ok(Serveable::InProgress {
                 file,
                 path,
@@ -2478,7 +2517,7 @@ async fn serve_unfinished_sendfile(
             Ok(Serveable::Complete { file, path, meta }) => {
                 return serve_file_via_sendfile(
                     stream,
-                    conn_details,
+                    &conn_details,
                     aliased,
                     (file, None, &path),
                     (conn_version, conn_action),
@@ -2501,7 +2540,14 @@ async fn serve_unfinished_sendfile(
             conn_details.debname,
             conn_details.mirror,
         );
-        return ZeroCopyResult::NotApplicable("unknown content length for in-progress download");
+        return ZeroCopyResult::NotApplicable {
+            reason: "unknown content length for in-progress download",
+            #[cfg(feature = "hyper")]
+            plan: HandoffPlan::JoinDownload {
+                conn_details,
+                status: dl_status,
+            },
+        };
     };
 
     let metadata = match regular_file_metadata(&file, &file_path).await {
@@ -2630,9 +2676,12 @@ async fn serve_unfinished_sendfile(
                 peer_disconnect: *peer_disconnect,
             }),
     };
-    if let Some(cmd) =
-        finish_cached_serve(conn_details, Mechanism::Sendfile, Role::LateJoiner, outcome)
-    {
+    if let Some(cmd) = finish_cached_serve(
+        &conn_details,
+        Mechanism::Sendfile,
+        Role::LateJoiner,
+        outcome,
+    ) {
         send_db_command(DatabaseCommand::Transfer(cmd)).await;
     }
     if complete {

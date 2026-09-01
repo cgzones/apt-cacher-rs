@@ -33,11 +33,12 @@ use crate::{
         AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
     },
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{self, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
+    cache_layout::{self, CacheMiss, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
     cache_metadata::{self, UpstreamMetadata},
     cache_quota::QuotaExceeded,
     channel_body::ChannelBody,
     client_counter,
+    config::ClientHost,
     connect_tunnel::{ConnectReject, validate_connect_target},
     content_type_for_cached_file,
     database_task::{DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command},
@@ -62,7 +63,6 @@ use crate::{
         preflight_method, preflight_target,
     },
     scheme_cache, static_assert, tunnel_limiter,
-    uncacheables::record_uncacheable,
     upstream_head::{
         DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead, plan_download,
         plan_fresh_download,
@@ -1067,14 +1067,9 @@ async fn serve_volatile_file(
                 HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
             );
 
-            // Hyper owns hit/refetch accounting for every request it
-            // processes: in sendfile builds requests only get here when
-            // sendfile did NOT account them — either re-dispatched after a
-            // `NotApplicable` handoff (sendfile's bumps are splice-only) or
-            // arriving on an already-handed-off keep-alive connection that
-            // bypasses sendfile entirely. Cleanup-synthetic probes
-            // (task_cleanup's `.xz → .gz → raw` walk) would inflate the
-            // user-facing counter — exclude them.
+            // Lookup-site accounting (see `process_cache_request`).
+            // Cleanup-synthetic probes (task_cleanup's `.xz -> .gz -> raw`
+            // walk) would inflate the user-facing counter - exclude them.
             if !conn_details.client.is_cleanup_synthetic() {
                 metrics::VOLATILE_HIT.increment();
             }
@@ -1088,40 +1083,85 @@ async fn serve_volatile_file(
         );
     }
 
-    // Hyper owns the parent refetch bump for every stale-volatile request it
-    // processes (see the VOLATILE_HIT comment above: sendfile's bumps are
-    // splice-only, and handed-off keep-alive connections bypass sendfile).
-    // This dominates the VOLATILE_REFETCHED_* subset bumps in
-    // `serve_new_file`. Cleanup-synthetic probes are operator bookkeeping,
-    // not user traffic — exclude them so the dashboard ratio reflects real
-    // client behavior only.
+    // Lookup-site parent refetch bump; dominates the VOLATILE_REFETCHED_*
+    // subset bumps in `serve_new_file`. Cleanup-synthetic probes are
+    // operator bookkeeping, not user traffic - exclude them so the
+    // dashboard ratio reflects real client behavior only.
     if !conn_details.client.is_cleanup_synthetic() {
         metrics::VOLATILE_REFETCHED.increment();
     }
 
+    serve_cache_miss(
+        conn_details,
+        req,
+        file_path,
+        CacheMiss::StaleVolatile {
+            file,
+            modified: modified_system_time,
+            size: mdata.size(),
+        },
+        appstate,
+    )
+    .await
+}
+
+/// Fetch (or join the in-flight fetch of) a resource whose cache lookup
+/// produced `miss`.
+///
+/// Hit/miss/refetch accounting is the lookup site's job and has already
+/// happened - in [`process_cache_request`] / [`serve_volatile_file`] for
+/// requests hyper looked up itself, in `sendfile_conn::try_sendfile_request`
+/// for a `HandoffPlan::CacheMiss` - so nothing is bumped here.
+async fn serve_cache_miss(
+    conn_details: ConnectionDetails,
+    req: Request<Empty<()>>,
+    cache_path: PathBuf,
+    miss: CacheMiss,
+    appstate: AppState,
+) -> Response<ProxyCacheBody> {
     match appstate.active_downloads.insert(conn_details.key()) {
-        InsertOutcome::Joined { status } => {
-            debug!(
-                "Serving file {} already in cache / download from mirror {} for client {}...",
-                conn_details.debname, conn_details.mirror, conn_details.client
-            );
-            serve_downloading_file(conn_details, req, status, None).await
-        }
         InsertOutcome::Originator { init_tx, status } => {
-            serve_new_file(
-                conn_details,
-                status,
-                init_tx,
-                req,
-                CacheFileStat::Volatile {
+            let cfstate = match miss {
+                CacheMiss::NotFound => {
+                    trace!(
+                        "File {} not found, serving new version...",
+                        cache_path.display()
+                    );
+                    CacheFileStat::New
+                }
+                CacheMiss::StaleVolatile {
                     file,
-                    file_path,
-                    local_modification_time: HttpDate::from(modified_system_time),
-                    prev_size: mdata.size(),
+                    modified,
+                    size,
+                } => CacheFileStat::Volatile {
+                    file,
+                    file_path: cache_path,
+                    local_modification_time: HttpDate::from(modified),
+                    prev_size: size,
                 },
-                appstate,
-            )
-            .await
+            };
+            serve_new_file(conn_details, status, init_tx, req, cfstate, appstate).await
+        }
+        InsertOutcome::Joined { status } => {
+            match miss {
+                CacheMiss::NotFound => {
+                    trace!(
+                        "File {} not found, serving in-download version...",
+                        cache_path.display()
+                    );
+                    debug!(
+                        "Serving file {} already in download from mirror {} for client {}...",
+                        conn_details.debname, conn_details.mirror, conn_details.client
+                    );
+                }
+                CacheMiss::StaleVolatile { .. } => {
+                    debug!(
+                        "Serving file {} already in cache / download from mirror {} for client {}...",
+                        conn_details.debname, conn_details.mirror, conn_details.client
+                    );
+                }
+            }
+            serve_downloading_file(conn_details, req, status, None).await
         }
         InsertOutcome::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
     }
@@ -2308,6 +2348,14 @@ async fn tunnel(
     Ok(())
 }
 
+/// Cache lookup plus hit/miss accounting for a request hyper classified
+/// itself (or cleanup's synthetic index fetches), then serve or fetch.
+///
+/// This is the lookup site: `CACHE_HITS` / `CACHE_MISSES` /
+/// `VOLATILE_REFETCHED` (and `VOLATILE_HIT` in [`serve_volatile_file`]) are
+/// bumped exactly where the lookup decides.  Requests the sendfile backend
+/// already looked up never come here - their `HandoffPlan::CacheMiss`
+/// enters [`serve_cache_miss`] directly, so no bump can repeat.
 #[must_use]
 pub(crate) async fn process_cache_request(
     conn_details: ConnectionDetails,
@@ -2319,10 +2367,7 @@ pub(crate) async fn process_cache_request(
     match tokio_nofollow_options().read(true).open(&cache_path).await {
         Ok(file) => {
             // CACHE_HITS only counts permanent-file hits; volatile hits live
-            // in VOLATILE_HIT / VOLATILE_REFETCHED. Unconditional: in
-            // sendfile builds only unaccounted requests reach hyper
-            // (handed-off keep-alive connections bypass sendfile; sendfile
-            // serves its own hits without hyper).
+            // in VOLATILE_HIT / VOLATILE_REFETCHED.
             if conn_details.cached_flavor == CachedFlavor::Permanent {
                 metrics::CACHE_HITS.increment();
             }
@@ -2345,15 +2390,11 @@ pub(crate) async fn process_cache_request(
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // Unconditional miss accounting: in sendfile builds only
-            // unaccounted requests reach hyper (sendfile's bumps are
-            // splice-only, and handed-off keep-alive connections bypass
-            // sendfile entirely).
             match conn_details.cached_flavor {
                 CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
                 CachedFlavor::Volatile => {
                     // Cleanup-synthetic probes are operator bookkeeping, not
-                    // user traffic — exclude them so the dashboard ratio
+                    // user traffic - exclude them so the dashboard ratio
                     // reflects real client behavior only.
                     if !conn_details.client.is_cleanup_synthetic() {
                         metrics::VOLATILE_REFETCHED.increment();
@@ -2361,35 +2402,7 @@ pub(crate) async fn process_cache_request(
                 }
             }
 
-            match appstate.active_downloads.insert(conn_details.key()) {
-                InsertOutcome::Originator { init_tx, status } => {
-                    trace!(
-                        "File {} not found, serving new version...",
-                        cache_path.display()
-                    );
-                    serve_new_file(
-                        conn_details,
-                        status,
-                        init_tx,
-                        req,
-                        CacheFileStat::New,
-                        appstate,
-                    )
-                    .await
-                }
-                InsertOutcome::Joined { status } => {
-                    trace!(
-                        "File {} not found, serving in-download version...",
-                        cache_path.display()
-                    );
-                    debug!(
-                        "Serving file {} already in download from mirror {} for client {}...",
-                        conn_details.debname, conn_details.mirror, conn_details.client
-                    );
-                    serve_downloading_file(conn_details, req, status, None).await
-                }
-                InsertOutcome::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
-            }
+            serve_cache_miss(conn_details, req, cache_path, CacheMiss::NotFound, appstate).await
         }
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -2506,62 +2519,75 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
     response
 }
 
+/// Work the sendfile backend already did for the first request hyper parses
+/// on a handed-off connection (`sendfile_conn::handle_sendfile_connection`).
+///
+/// Sendfile parses the request, runs the shared pre-flight,
+/// `authorize_cache_access` and `dispatch_request`, and - for a `Cache`
+/// outcome - the cache lookup or late-joiner attach, before deciding it
+/// cannot answer the request itself.  The plan carries those results so
+/// [`pre_process_client_request`] enters the pipeline exactly where sendfile
+/// left it: pre-flight and dispatch run once per request, the deferred
+/// `Origin` write and `record_uncacheable` fire once, and every
+/// hit/miss/refetch bump belongs to the one lookup that ran.
+///
+/// Pairing invariant: the bytes prepended to hyper's stream are exactly the
+/// request sendfile parsed (plus any pipelined successors it has not looked
+/// at), and hyper invokes the service once per parsed request in stream
+/// order, so the plan pairs with the *first* service invocation and only
+/// that one - see [`handle_hyper_connection`].
+///
+/// With `splice` the sendfile backend fetches misses and forwards
+/// passthroughs itself, so only [`Self::JoinDownload`] exists there.
+#[cfg_attr(
+    not(feature = "sendfile"),
+    expect(dead_code, reason = "constructed only by the sendfile backend")
+)]
+#[derive(Debug)]
+pub(crate) enum HandoffPlan {
+    /// Dispatch routed through the cache pipeline and sendfile's lookup found
+    /// nothing it could serve.  Hit/miss accounting is done; hyper only
+    /// fetches (or joins the in-flight fetch).
+    #[cfg(not(feature = "splice"))]
+    CacheMiss {
+        conn_details: ConnectionDetails,
+        cache_path: PathBuf,
+        miss: CacheMiss,
+    },
+    /// Dispatch routed through the cache pipeline and sendfile attached to a
+    /// download already in flight, but cannot frame the response itself
+    /// (upstream sent no `Content-Length`).  Late-joiner and miss accounting
+    /// are done; hyper streams the in-flight download.
+    JoinDownload {
+        conn_details: ConnectionDetails,
+        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    },
+    /// Dispatch declined to cache; `record_uncacheable` already ran inside
+    /// the dispatcher.  Hyper forwards the request uncached.
+    #[cfg(not(feature = "splice"))]
+    Passthrough {
+        requested_host: ClientHost,
+        requested_port: Option<NonZero<u16>>,
+        request_received_at: PreciseInstant,
+    },
+}
+
 #[inline]
 async fn pre_process_client_request_wrapper(
     client: ClientInfo,
     req: Request<Incoming>,
     appstate: AppState,
+    handoff: Option<HandoffPlan>,
 ) -> Result<Response<ProxyCacheBody>, Infallible> {
-    let response = pre_process_client_request(client, req, appstate).await;
+    let response = pre_process_client_request(client, req, appstate, handoff).await;
     metrics::record_client_status(response.status());
     Ok(response)
 }
 
+/// Drop the request body (never forwarded) so the rest of the pipeline
+/// handles a bodiless `Request<Empty<()>>`.
 #[must_use]
-async fn pre_process_client_request(
-    client: ClientInfo,
-    req: Request<Incoming>,
-    appstate: AppState,
-) -> Response<ProxyCacheBody> {
-    trace!("Incoming request: {req:?}");
-
-    metrics::REQUESTS_TOTAL.increment();
-
-    let acls = ClientAcls::from(global_config());
-
-    match preflight_method(req.method().as_str(), &client, &acls) {
-        Ok(RequestKind::Connect) => return connect_response(client, req),
-        Ok(RequestKind::Get) => {}
-        Err(reason) => {
-            let (status, msg) = reason.response_parts();
-            return quick_response(status, msg);
-        }
-    }
-
-    let (requested_host, requested_port) = match preflight_target(
-        req.uri(),
-        req.version() == http::Version::HTTP_11,
-        || req.headers().contains_key(HOST),
-        &client,
-        &acls,
-    ) {
-        Ok(RequestTarget::Proxy { host, port }) => (host, port),
-        Ok(RequestTarget::WebUi) => {
-            return serve_web_interface(req.uri(), &appstate)
-                .await
-                .into_hyper_response();
-        }
-        Err(reason) => {
-            let (status, msg) = reason.response_parts();
-            return quick_response(status, msg);
-        }
-    };
-
-    let requested_host = match authorize_cache_access(&client, requested_host) {
-        Ok(rh) => rh,
-        Err((status, msg)) => return quick_response(status, msg),
-    };
-
+fn strip_request_body(client: ClientInfo, req: Request<Incoming>) -> Request<Empty<()>> {
     if req.body().size_hint().exact() != Some(0) {
         // Also fires for unknown-length bodies, whose lower bound can be 0.
         warn_once_or_info!(
@@ -2572,33 +2598,126 @@ async fn pre_process_client_request(
         );
     }
     let (parts, _body) = req.into_parts();
-    let req = Request::from_parts(parts, Empty::new());
+    Request::from_parts(parts, Empty::new())
+}
 
-    let (requested_host, passthrough_request_received_at) =
-        match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await {
-            DispatchOutcome::Cache(plan) => {
-                let conn_details = ConnectionDetails {
-                    client,
-                    request_received_at: plan.request_received_at,
-                    mirror: plan.mirror,
-                    aliased_host: plan.aliased_host,
-                    debname: plan.debname,
-                    cached_flavor: plan.cached_flavor,
-                    layout: plan.layout,
-                    resource_kind: plan.resource_kind,
-                };
-                return process_cache_request(conn_details, req, appstate).await;
+/// Entry point for every request hyper serves.  With a [`HandoffPlan`] the
+/// request was already pre-flighted and dispatched by the sendfile backend
+/// (which also bumped `REQUESTS_TOTAL` for it); without one this is the
+/// proxy entry and everything runs here.
+#[must_use]
+async fn pre_process_client_request(
+    client: ClientInfo,
+    req: Request<Incoming>,
+    appstate: AppState,
+    handoff: Option<HandoffPlan>,
+) -> Response<ProxyCacheBody> {
+    trace!("Incoming request: {req:?}");
+
+    let passthrough: Option<(ClientHost, Option<NonZero<u16>>, PreciseInstant)> = match handoff {
+        #[cfg(not(feature = "splice"))]
+        Some(HandoffPlan::CacheMiss {
+            conn_details,
+            cache_path,
+            miss,
+        }) => {
+            let req = strip_request_body(client, req);
+            return serve_cache_miss(conn_details, req, cache_path, miss, appstate).await;
+        }
+        Some(HandoffPlan::JoinDownload {
+            conn_details,
+            status,
+        }) => {
+            let req = strip_request_body(client, req);
+            debug!(
+                "Serving file {} already in download from mirror {} for client {}...",
+                conn_details.debname, conn_details.mirror, conn_details.client
+            );
+            return serve_downloading_file(conn_details, req, status, None).await;
+        }
+        #[cfg(not(feature = "splice"))]
+        Some(HandoffPlan::Passthrough {
+            requested_host,
+            requested_port,
+            request_received_at,
+        }) => Some((requested_host, requested_port, request_received_at)),
+        None => None,
+    };
+
+    let (req, requested_host, requested_port, passthrough_request_received_at) = match passthrough {
+        Some((requested_host, requested_port, request_received_at)) => (
+            strip_request_body(client, req),
+            requested_host,
+            requested_port,
+            request_received_at,
+        ),
+        None => {
+            metrics::REQUESTS_TOTAL.increment();
+
+            let acls = ClientAcls::from(global_config());
+
+            match preflight_method(req.method().as_str(), &client, &acls) {
+                Ok(RequestKind::Connect) => return connect_response(client, req),
+                Ok(RequestKind::Get) => {}
+                Err(reason) => {
+                    let (status, msg) = reason.response_parts();
+                    return quick_response(status, msg);
+                }
             }
-            DispatchOutcome::Reject(reason) => {
-                let (status, msg) = reason.response_parts();
-                return quick_response(status, msg);
+
+            let (requested_host, requested_port) = match preflight_target(
+                req.uri(),
+                req.version() == http::Version::HTTP_11,
+                || req.headers().contains_key(HOST),
+                &client,
+                &acls,
+            ) {
+                Ok(RequestTarget::Proxy { host, port }) => (host, port),
+                Ok(RequestTarget::WebUi) => {
+                    return serve_web_interface(req.uri(), &appstate)
+                        .await
+                        .into_hyper_response();
+                }
+                Err(reason) => {
+                    let (status, msg) = reason.response_parts();
+                    return quick_response(status, msg);
+                }
+            };
+
+            let requested_host = match authorize_cache_access(&client, requested_host) {
+                Ok(rh) => rh,
+                Err((status, msg)) => return quick_response(status, msg),
+            };
+
+            let req = strip_request_body(client, req);
+
+            match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await
+            {
+                DispatchOutcome::Cache(plan) => {
+                    let conn_details = ConnectionDetails {
+                        client,
+                        request_received_at: plan.request_received_at,
+                        mirror: plan.mirror,
+                        aliased_host: plan.aliased_host,
+                        debname: plan.debname,
+                        cached_flavor: plan.cached_flavor,
+                        layout: plan.layout,
+                        resource_kind: plan.resource_kind,
+                    };
+                    return process_cache_request(conn_details, req, appstate).await;
+                }
+                DispatchOutcome::Reject(reason) => {
+                    let (status, msg) = reason.response_parts();
+                    return quick_response(status, msg);
+                }
+                DispatchOutcome::Passthrough {
+                    reason: _,
+                    requested_host,
+                    request_received_at,
+                } => (req, requested_host, requested_port, request_received_at),
             }
-            DispatchOutcome::Passthrough {
-                reason: _,
-                requested_host,
-                request_received_at,
-            } => (requested_host, request_received_at),
-        };
+        }
+    };
 
     assert_eq!(req.method(), Method::GET, "Filtered at function start");
 
@@ -2610,8 +2729,6 @@ async fn pre_process_client_request(
         "Proxying (without caching) request {} for client {client}",
         req.uri()
     );
-
-    record_uncacheable(&requested_host, req.uri().path());
 
     let (mut parts, _body) = req.into_parts();
     parts
@@ -2765,8 +2882,18 @@ fn host_header_from_uri(auth: &Authority) -> HeaderValue {
     HeaderValue::try_from(value).expect("host value is valid")
 }
 
-pub(crate) async fn handle_hyper_connection<T>(stream: T, client: ClientInfo, appstate: AppState)
-where
+/// Serve every request on `stream` through hyper.
+///
+/// `handoff` is `Some` when the sendfile backend hands over a connection
+/// whose first request it already parsed and dispatched: the plan applies to
+/// the first request hyper's service sees and to nothing after it (later
+/// keep-alive requests on the connection run the full pipeline here).
+pub(crate) async fn handle_hyper_connection<T>(
+    stream: T,
+    client: ClientInfo,
+    appstate: AppState,
+    handoff: Option<HandoffPlan>,
+) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     #[must_use]
@@ -2794,13 +2921,27 @@ where
         }
     }
 
+    // The plan pairs with the first service invocation only: the stream's
+    // prepended bytes are exactly the request sendfile parsed (with any
+    // pipelined successors behind it), hyper invokes the service once per
+    // parsed request in stream order, and a request hyper cannot parse ends
+    // the connection with hyper's own 400 rather than skipping to the next
+    // one - so the first invocation is that request, and `take()` makes
+    // every later invocation run the full pipeline.
+    let handoff = parking_lot::Mutex::new(handoff);
+
     if let Err(err) = http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(global_config().client_idle_timeout)
         .serve_connection(
             TokioIo::new(stream),
             service_fn(move |req| {
-                pre_process_client_request_wrapper(client, req, appstate.clone())
+                pre_process_client_request_wrapper(
+                    client,
+                    req,
+                    appstate.clone(),
+                    handoff.lock().take(),
+                )
             }),
         )
         .with_upgrades()

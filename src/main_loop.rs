@@ -557,7 +557,7 @@ pub(crate) async fn main_loop(
             sendfile_conn::handle_sendfile_connection(stream, client, appstate).await;
 
             #[cfg(not(feature = "sendfile"))]
-            handle_hyper_connection(stream, client, appstate).await;
+            handle_hyper_connection(stream, client, appstate, None).await;
 
             debug!(
                 "Closed connection to client {client} after {}",

@@ -321,6 +321,38 @@ impl Equivalent<CacheEntryKey> for CacheEntryKeyRef<'_> {
     }
 }
 
+/// Verdict of a cache-file lookup that found nothing serveable for a
+/// [`ConnectionDetails`], produced by whichever backend ran the lookup and
+/// consumed by the backend that fetches.
+///
+/// Hit/miss/refetch accounting belongs to the lookup site: the producer bumps
+/// `CACHE_MISSES` / `VOLATILE_REFETCHED` when it builds one of these, so a
+/// consumer must never bump them again.  The stale copy travels with the
+/// verdict so the fetcher can revalidate against it without a second
+/// open/stat.
+#[derive(Debug)]
+// Only the hyper backend revalidates from the carried copy; the splice
+// backend re-opens the file on its own path, so in a splice-only build the
+// verdict is built and dropped unread.
+#[cfg_attr(
+    not(feature = "hyper"),
+    expect(dead_code, reason = "consumed only by hyper_conn::serve_cache_miss")
+)]
+pub(crate) enum CacheMiss {
+    /// No cache file on disk.
+    NotFound,
+    /// A volatile copy exists but is older than `VOLATILE_CACHE_MAX_AGE`
+    /// (or its mtime is in the future); revalidate it upstream.
+    StaleVolatile {
+        file: tokio::fs::File,
+        /// The copy's mtime, the `If-Modified-Since` value for revalidation.
+        modified: std::time::SystemTime,
+        /// The copy's on-disk size, for the quota reservation
+        /// (`cache_quota.rs`: `prev_file_size`).
+        size: u64,
+    },
+}
+
 /// Per-request state carried across the cache pipeline.  Owns enough of the
 /// classified resource to assemble the on-disk path via
 /// [`Self::cache_dir_path`].

@@ -25,14 +25,12 @@
 //!   7. unsafe-proxy-path gate     - traversal/control bytes in passthrough
 //!
 //! Backends translate the returned [`DispatchOutcome`] into their response
-//! type.  All logging, metric bumping, and deferred `Origin` DB writes happen
-//! here, so the two parallel paths cannot drift apart.  `record_uncacheable`
-//! is *not* called here - it is intentionally deferred to each backend's
-//! terminal passthrough step (hyper's simple-proxy block; the sendfile splice
-//! path).  Sendfile's `NotApplicable` handoff causes hyper to re-enter this
-//! dispatcher for the same request, so recording inside the dispatcher would
-//! double-count; recording at the terminal step yields exactly-once
-//! semantics.
+//! type.  All logging, metric bumping, the deferred `Origin` DB write and
+//! `record_uncacheable` happen here, so the two parallel paths cannot drift
+//! apart.  [`dispatch_request`] runs exactly once per client request: the
+//! sendfile backend's `NotApplicable` handoff carries its outcome to hyper
+//! (`hyper_conn::HandoffPlan`) instead of letting hyper re-dispatch, so every
+//! side-effect in here is exactly-once by construction.
 //!
 //! [`classify_request`]: crate::cache_layout::classify_request
 //! [`normalize_uri_path`]: crate::deb_mirror::normalize_uri_path
@@ -55,6 +53,7 @@ use crate::{
     error::ErrorReport,
     flat_blocklist, global_config, info_once, metrics,
     precise_instant::PreciseInstant,
+    uncacheables::record_uncacheable,
     warn_once_or_debug, warn_once_or_info,
 };
 
@@ -286,8 +285,9 @@ pub(crate) fn preflight_target<'a>(
 }
 
 /// Why the cache pipeline declined and the request must be forwarded
-/// uncached.  Backends use this to pick between hyper's simple proxy,
-/// `splice_simple_proxy`, and the `NotApplicable` handoff back to hyper.
+/// uncached.  The sendfile backend uses this to name the reason in its
+/// `NotApplicable` handoff to hyper; hyper's simple proxy and
+/// `splice_simple_proxy` forward regardless of the reason.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PassthroughReason {
     /// The parser did not recognise a known archive shape.
@@ -304,10 +304,8 @@ pub(crate) enum PassthroughReason {
 }
 
 /// Dispatcher verdict.  Backends own response-type construction; this
-/// module owns logging, metric bumping, and deferred `Origin` DB writes, so
-/// the two backends stay structurally in sync.  `record_uncacheable` is
-/// *not* called here - see the module docs for why it is deferred to each
-/// backend's terminal forwarding step.
+/// module owns logging, metric bumping, the deferred `Origin` DB write and
+/// `record_uncacheable`, so the two backends stay structurally in sync.
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
     /// Route through the cache pipeline using `plan` as the
@@ -316,19 +314,18 @@ pub(crate) enum DispatchOutcome {
     /// Refuse with a fixed 4xx response.  Logging and metric bumping
     /// already done.
     Reject(RejectReason),
-    /// Forward to upstream uncached.  Logging and metric bumping already
-    /// done; the caller is responsible for `record_uncacheable` at its
-    /// terminal forwarding step.  `requested_host` is returned so backends
-    /// can build an upstream `Mirror` or emit per-request log lines without
-    /// re-deriving it.
+    /// Forward to upstream uncached.  Logging, metric bumping and
+    /// `record_uncacheable` already done.  `requested_host` is returned so
+    /// backends can build an upstream `Mirror` or emit per-request log lines
+    /// without re-deriving it.
     Passthrough {
         // The hyper backend only needs `requested_host` to continue its
         // uncached forwarding flow (it ignores `reason` via `reason: _`); the
-        // sendfile backend (`sendfile_conn.rs`) inspects `reason` to choose
-        // between `splice_simple_proxy` and a `NotApplicable` handoff back to
-        // hyper.  Under feature configurations that exclude sendfile
-        // (e.g. `--no-default-features --features tls_hyper`), the field is
-        // genuinely unread - silence the dead-code lint there.
+        // sendfile backend (`sendfile_conn.rs`) reads `reason` to name the
+        // `NotApplicable` handoff to hyper.  Under feature configurations
+        // that exclude sendfile (e.g. `--no-default-features --features
+        // tls_hyper`), the field is genuinely unread - silence the dead-code
+        // lint there.
         #[cfg_attr(
             not(feature = "sendfile"),
             expect(dead_code, reason = "consumed only by sendfile_conn dispatch")
@@ -414,11 +411,18 @@ pub(crate) async fn dispatch_request(
             reason,
             requested_host,
             request_received_at,
-        } => DispatchOutcome::Passthrough {
-            reason,
-            requested_host,
-            request_received_at,
-        },
+        } => {
+            // Exactly-once: the dispatcher runs once per request (see the
+            // module docs), so the uncacheables ring buffer and its
+            // `UNCACHEABLE` counter are fed here rather than at each
+            // backend's forwarding step.
+            record_uncacheable(&requested_host, uri_path);
+            DispatchOutcome::Passthrough {
+                reason,
+                requested_host,
+                request_received_at,
+            }
+        }
     }
 }
 
@@ -559,13 +563,9 @@ fn decide_request(
         return Decision::Reject(RejectReason::UnsafePath);
     }
 
-    // `record_uncacheable` is intentionally NOT called here.  The sendfile
-    // backend hands `NonDebPool` / `FlatBlocked` / non-splice `Unrecognized`
-    // back to hyper via `ZeroCopyResult::NotApplicable`, which causes hyper
-    // to re-enter this dispatcher for the same request.  Recording at the
-    // backend's terminal forwarding step (hyper's simple-proxy block; the
-    // sendfile splice path) instead of inside the dispatcher gives an
-    // exactly-once guarantee.
+    // `record_uncacheable` happens in the async wrapper (`dispatch_request`)
+    // alongside the other global side-effects, keeping this function pure
+    // for the unit tests.
     Decision::Passthrough {
         reason: passthrough_reason,
         requested_host,

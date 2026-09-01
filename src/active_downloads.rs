@@ -583,12 +583,10 @@ impl ActiveDownloads {
     /// under a write lock. Returns `None` if no download is in flight for
     /// this key.
     ///
-    /// The sendfile path may still encounter a `NotApplicable` from
-    /// `serve_unfinished_sendfile` and fall back to hyper, where `insert()`
-    /// will count the late joiner a second time. That overcount is rare
-    /// (only fires when upstream omits Content-Length) and uncorrelated with
-    /// the silent undercount this design replaces — the trade was made
-    /// deliberately on review.
+    /// When `serve_unfinished_sendfile` cannot frame the response (upstream
+    /// omitted Content-Length) the returned status travels to hyper inside
+    /// `HandoffPlan::JoinDownload`, so the joiner is never re-registered via
+    /// `insert()`.
     #[cfg(feature = "sendfile")]
     #[must_use]
     pub(crate) fn attach(

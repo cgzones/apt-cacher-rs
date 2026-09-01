@@ -379,9 +379,8 @@ pub(crate) struct DownloadRow {
 
 /// Pre-converted SQL-ready row for an `origins` upsert.
 ///
-/// `PartialEq` supports batch-level dedup in the DB task: on default-build
-/// cache misses the sendfile->hyper handoff dispatches the same request
-/// twice, enqueueing two identical origin upserts.
+/// `PartialEq` supports batch-level dedup in the DB task: every Packages
+/// request for an origin enqueues the same upsert.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OriginRow {
     pub(crate) mirror_id: i64,

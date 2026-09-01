@@ -280,10 +280,11 @@ async fn stage(
                 component: c.origin.component,
                 architecture: c.origin.architecture,
             };
-            // Dedup within the batch: the sendfile->hyper handoff dispatches
-            // a cache-missed Packages request twice, producing two identical
-            // upserts back-to-back. Batches are <= flush size (256), and
-            // origin rows are a small fraction, so a linear scan is fine.
+            // Dedup within the batch: every Packages request for an origin
+            // enqueues the same upsert, so a fleet refreshing one suite
+            // produces runs of identical rows. Batches are <= flush size
+            // (256), and origin rows are a small fraction, so a linear scan
+            // is fine.
             if !buf.origins.contains(&row) {
                 buf.origins.push(row);
             }
