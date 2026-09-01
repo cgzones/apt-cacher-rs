@@ -1,6 +1,7 @@
 use std::{
     io::ErrorKind,
     num::{NonZero, Saturating},
+    ops::Range,
     os::fd::{AsFd as _, AsRawFd as _, BorrowedFd},
     path::{Path, PathBuf},
     pin::Pin,
@@ -4605,14 +4606,11 @@ async fn forward_upstream_body_until_eof(
     Ok(total)
 }
 
-/// State for the chunked transfer-encoding decoder.
-///
-/// Tracks position within the chunked framing so we can detect the terminating
-/// `0\r\n\r\n` while forwarding all raw bytes transparently to the client.
+/// Framing position of a [`ChunkDecoder`].
 enum ChunkedState {
     /// Accumulating the hex chunk-size line (up to `\r\n`).
     ReadingSize,
-    /// Forwarding chunk data bytes; `remaining` counts undecoded payload bytes.
+    /// Inside chunk data; `remaining` counts undecoded payload bytes.
     ReadingData { remaining: usize },
     /// Expecting the `\r\n` trailer after chunk data.
     ReadingTrailer { seen_cr: bool },
@@ -4623,17 +4621,258 @@ enum ChunkedState {
     Done { remaining: u8 },
 }
 
+/// Why [`ChunkDecoder::feed`] stopped early.
+#[derive(Debug)]
+enum ChunkDecodeError {
+    /// The declared payload total crossed the decoder's cap. The decoder
+    /// does not log this: the two I/O wrappers word the line differently
+    /// (relayed body vs volatile body) and each keeps its own
+    /// `warn_once_or_info!` gate.
+    SizeCap { max_bytes: usize },
+    /// A framing violation; `UPSTREAM_PROTOCOL_VIOLATION` has been bumped.
+    Framing(std::io::Error),
+}
+
+/// What one [`ChunkDecoder::feed`] call took from its input.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Consumed {
+    /// Raw bytes (framing and payload) consumed from the input. Equals the
+    /// input length unless `done` is set: then the decoder stopped right
+    /// after the closing CRLF and left everything past it untouched.
+    raw: usize,
+    /// The terminating `0\r\n\r\n` has been fully consumed.
+    done: bool,
+}
+
+impl Consumed {
+    /// Reject input past the terminator. Well-behaved upstreams send no
+    /// bytes after the closing `\r\n`; anything there is a framing
+    /// violation (smuggling attempt, buggy upstream) that must neither be
+    /// relayed nor left in the socket buffer to poison the next checkout,
+    /// so callers must mark the upstream non-poolable on this error.
+    ///
+    /// Kept out of [`ChunkDecoder::feed`] so the streaming relay can first
+    /// forward the validated `[..raw]` prefix (the terminator included) and
+    /// only then fail the connection.
+    fn ensure_no_trailing_bytes(self, data_len: usize) -> std::io::Result<()> {
+        let Self { raw, done } = self;
+        if done && raw < data_len {
+            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "chunked encoding: trailing bytes after 0-length chunk",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Incremental decoder for the chunked transfer coding (RFC 9112 section 7.1).
+///
+/// The single framing implementation behind both the streaming relay
+/// [`forward_upstream_chunked_body`] (which forwards the raw encoding
+/// unchanged and only needs to know where the body ends) and the buffered
+/// reader [`read_dechunk_body_to_vec`] (which collects the decoded payload).
+/// Chunk extensions after `;` are ignored; trailer fields between `0\r\n`
+/// and the final `\r\n` are rejected as a framing sanity check rather than
+/// skipped, to catch truncation and smuggling. The declared payload total is
+/// checked against `max_bytes` at every chunk-size line.
+struct ChunkDecoder {
+    state: ChunkedState,
+    size_buf: Vec<u8>,
+    /// Sum of the declared chunk sizes seen so far.
+    total: Saturating<usize>,
+    max_bytes: usize,
+}
+
+impl ChunkDecoder {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            state: ChunkedState::ReadingSize,
+            size_buf: Vec::with_capacity(32),
+            total: Saturating(0),
+            max_bytes,
+        }
+    }
+
+    /// Run the state machine over `data`, reporting every payload byte range
+    /// (relative to `data`) through `on_payload`.
+    ///
+    /// Stops right after the closing CRLF of the terminator (see
+    /// [`Consumed::raw`]) so the caller can detect bytes past it; otherwise
+    /// consumes all of `data`. On error the input position is lost and the
+    /// upstream connection state is indeterminate.
+    fn feed(
+        &mut self,
+        data: &[u8],
+        mut on_payload: impl FnMut(Range<usize>),
+    ) -> Result<Consumed, ChunkDecodeError> {
+        fn framing_violation(msg: &'static str) -> ChunkDecodeError {
+            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+            ChunkDecodeError::Framing(std::io::Error::new(ErrorKind::InvalidData, msg))
+        }
+
+        let mut i = 0usize;
+        while i < data.len() {
+            match self.state {
+                ChunkedState::ReadingSize => {
+                    let b = data[i];
+                    i += 1;
+                    self.size_buf.push(b);
+                    if b == b'\n'
+                        && self.size_buf.len() >= 2
+                        && self.size_buf[self.size_buf.len() - 2] == b'\r'
+                    {
+                        // Parse the hex chunk size; ignore optional chunk
+                        // extensions after ';'.
+                        let line = &self.size_buf[..self.size_buf.len() - 2];
+                        let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
+                        let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_err| {
+                            framing_violation("chunked encoding: invalid chunk-size line")
+                        })?;
+                        let chunk_size =
+                            usize::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
+                                framing_violation("chunked encoding: invalid chunk-size hex")
+                            })?;
+                        self.size_buf.clear();
+                        if chunk_size == 0 {
+                            // Terminal chunk; still need to consume the
+                            // closing \r\n that ends the (empty) trailer
+                            // section.
+                            self.state = ChunkedState::Done { remaining: 2 };
+                        } else {
+                            self.total += chunk_size;
+                            if self.total > Saturating(self.max_bytes) {
+                                return Err(ChunkDecodeError::SizeCap {
+                                    max_bytes: self.max_bytes,
+                                });
+                            }
+                            self.state = ChunkedState::ReadingData {
+                                remaining: chunk_size,
+                            };
+                        }
+                    } else if self.size_buf.len() > 64 {
+                        // Guard against absurdly long size lines.
+                        return Err(framing_violation(
+                            "chunked encoding: chunk-size line too long",
+                        ));
+                    }
+                }
+                ChunkedState::ReadingData { ref mut remaining } => {
+                    let taken = (data.len() - i).min(*remaining);
+                    on_payload(i..i + taken);
+                    *remaining -= taken;
+                    i += taken;
+                    if *remaining == 0 {
+                        self.state = ChunkedState::ReadingTrailer { seen_cr: false };
+                    }
+                }
+                ChunkedState::ReadingTrailer { ref mut seen_cr } => {
+                    let b = data[i];
+                    i += 1;
+                    if !*seen_cr && b == b'\r' {
+                        *seen_cr = true;
+                    } else if *seen_cr && b == b'\n' {
+                        self.state = ChunkedState::ReadingSize;
+                    } else {
+                        return Err(framing_violation(
+                            "chunked encoding: expected CRLF after chunk data",
+                        ));
+                    }
+                }
+                ChunkedState::Done { ref mut remaining } => {
+                    // Validate the closing \r\n after the 0-length chunk.
+                    while i < data.len() && *remaining > 0 {
+                        let b = data[i];
+                        i += 1;
+                        let expected = if *remaining == 2 { b'\r' } else { b'\n' };
+                        if b != expected {
+                            return Err(framing_violation(
+                                "chunked encoding: expected \\r\\n after 0-length chunk \
+                                 (trailer sections are not supported)",
+                            ));
+                        }
+                        *remaining -= 1;
+                    }
+                    if *remaining == 0 {
+                        // Stop here: leave any trailing bytes unconsumed so
+                        // the caller can detect them.
+                        return Ok(Consumed { raw: i, done: true });
+                    }
+                }
+            }
+        }
+        Ok(Consumed {
+            raw: i,
+            done: matches!(self.state, ChunkedState::Done { remaining: 0 }),
+        })
+    }
+}
+
+/// One buffer's worth of [`forward_upstream_chunked_body`]: validate the
+/// framing, then forward the validated raw bytes to the client. Returns
+/// `true` once the terminator has been consumed.
+///
+/// Framing is validated before anything is forwarded, so the client never
+/// receives bytes past a detected framing error: on invalid framing the
+/// caller's error-return path closes the client connection, and without the
+/// pre-check the client would first receive the corrupt bytes and only then
+/// see the connection drop. When the terminator is consumed only the
+/// validated prefix `data[..raw]` goes out; bytes past the closing `\r\n`
+/// are rejected afterwards by [`Consumed::ensure_no_trailing_bytes`].
+async fn forward_chunked_buf(
+    decoder: &mut ChunkDecoder,
+    data: &[u8],
+    client: &TcpStream,
+    client_rate_checker: &mut Option<RateChecker>,
+    client_total: &mut u64,
+    http_timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let consumed = match decoder.feed(data, |_payload| {}) {
+        Ok(consumed) => consumed,
+        Err(ChunkDecodeError::SizeCap { max_bytes }) => {
+            warn_once_or_info!(
+                "splice proxy: chunked response body exceeded {} byte cap; truncating the relayed body",
+                max_bytes
+            );
+            return Err(std::io::Error::other(
+                "chunked response body exceeded size cap",
+            ));
+        }
+        Err(ChunkDecodeError::Framing(err)) => return Err(err),
+    };
+    let forward_slice = &data[..consumed.raw];
+    if !forward_slice.is_empty() {
+        write_all_to_stream_rated(
+            client,
+            forward_slice,
+            client_rate_checker,
+            RateCheckDirection::Client,
+            http_timeout,
+        )
+        .await
+        .map_err(|e| {
+            std::io::Error::new(e.kind(), format!("chunked forward: client write:  {e}"))
+        })?;
+        metrics::BYTES_SERVED_PASSTHROUGH.increment_by(forward_slice.len() as u64);
+        *client_total += forward_slice.len() as u64;
+    }
+    consumed.ensure_no_trailing_bytes(data.len())?;
+    Ok(consumed.done)
+}
+
 /// Forward a chunked transfer-encoded body from upstream to client.
 ///
 /// All raw bytes (chunk-size lines, data, CRLFs) are forwarded unchanged.
-/// The state machine only tracks framing to detect the terminating zero-length
-/// chunk, so the connection can be reused afterwards.
+/// The [`ChunkDecoder`] only tracks framing to detect the terminating
+/// zero-length chunk, so the connection can be reused afterwards.
 ///
 /// On success the closing `\r\n` after the `0\r\n` terminator has been fully
 /// consumed from the upstream socket buffer, so the connection can be safely
-/// returned to the pool (mirrors the buffered variant
-/// [`read_dechunk_body_to_vec`]). On error the connection state is
-/// indeterminate -- callers must mark the upstream non-poolable.
+/// returned to the pool (the buffered variant [`read_dechunk_body_to_vec`]
+/// shares the decoder and therefore the terminator policy). On error the
+/// connection state is indeterminate -- callers must mark the upstream
+/// non-poolable.
 async fn forward_upstream_chunked_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
@@ -4648,189 +4887,21 @@ async fn forward_upstream_chunked_body(
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
 
-    let mut state = ChunkedState::ReadingSize;
-    let mut size_buf = Vec::<u8>::with_capacity(32);
-    let mut total = Saturating(0);
+    let mut decoder = ChunkDecoder::new(max_bytes);
     // Tracks raw bytes (framing + data) written to the client.
     let mut client_total: u64 = 0;
 
-    // Process a slice of bytes through the state machine, forwarding them to the
-    // client.  Returns `true` when the terminal chunk has been fully consumed.
-    //
-    // We define this as a macro instead of a closure/function because it needs
-    // mutable access to several locals (`state`, `size_buf`, `total`) while also
-    // performing async writes.
-    macro_rules! process_buf {
-        ($data:expr) => {{
-            let data: &[u8] = $data;
-            // Validate framing before forwarding, so we never send bytes past a
-            // detected framing error. On invalid framing the client connection
-            // is closed by the error-return path in the caller; without this
-            // pre-check the client would first receive the corrupt bytes and
-            // only then see the connection drop.
-            let mut i = 0usize;
-            let mut done = false;
-            while i < data.len() && !done {
-                match state {
-                    ChunkedState::ReadingSize => {
-                        while i < data.len() {
-                            let b = data[i];
-                            i += 1;
-                            size_buf.push(b);
-                            if b == b'\n' && size_buf.len() >= 2 && size_buf[size_buf.len() - 2] == b'\r' {
-                                // Parse hex chunk size (ignore optional chunk extensions after ';')
-                                let line = &size_buf[..size_buf.len() - 2]; // strip \r\n
-                                let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
-                                let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_| {
-                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                    std::io::Error::new(
-                                        ErrorKind::InvalidData,
-                                        "chunked encoding: invalid chunk-size line",
-                                    )
-                                })?;
-                                let chunk_size = usize::from_str_radix(hex_str.trim(), 16).map_err(|_| {
-                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                    std::io::Error::new(
-                                        ErrorKind::InvalidData,
-                                        "chunked encoding: invalid chunk-size hex",
-                                    )
-                                })?;
-                                size_buf.clear();
-                                if chunk_size == 0 {
-                                    // Terminal chunk — still need to consume
-                                    // the closing \r\n (empty trailer section).
-                                    state = ChunkedState::Done { remaining: 2 };
-                                } else {
-                                    total += chunk_size;
-                                    if total > Saturating(max_bytes) {
-                                        warn_once_or_info!(
-                                            "splice proxy: chunked response body exceeded {} byte cap; truncating the relayed body",
-                                            max_bytes
-                                        );
-                                        return Err(std::io::Error::other(
-                                            "chunked response body exceeded size cap",
-                                        ));
-                                    }
-                                    state = ChunkedState::ReadingData { remaining: chunk_size };
-                                }
-                                break;
-                            }
-                            // Guard against absurdly long size lines
-                            if size_buf.len() > 64 {
-                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                return Err(std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "chunked encoding: chunk-size line too long",
-                                ));
-                            }
-                        }
-                    }
-                    ChunkedState::ReadingData { ref mut remaining } => {
-                        let avail = data.len() - i;
-                        let consume = std::cmp::min(*remaining, avail);
-                        *remaining -= consume;
-                        i += consume;
-                        if *remaining == 0 {
-                            state = ChunkedState::ReadingTrailer { seen_cr: false };
-                        }
-                    }
-                    ChunkedState::ReadingTrailer { ref mut seen_cr } => {
-                        while i < data.len() {
-                            let b = data[i];
-                            i += 1;
-                            if !*seen_cr {
-                                if b == b'\r' {
-                                    *seen_cr = true;
-                                } else {
-                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                    return Err(std::io::Error::new(
-                                        ErrorKind::InvalidData,
-                                        "chunked encoding: expected CR after chunk data",
-                                    ));
-                                }
-                            } else {
-                                if b == b'\n' {
-                                    state = ChunkedState::ReadingSize;
-                                } else {
-                                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                    return Err(std::io::Error::new(
-                                        ErrorKind::InvalidData,
-                                        "chunked encoding: expected LF after chunk data CR",
-                                    ));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    ChunkedState::Done { ref mut remaining } => {
-                        // Validate the closing \r\n after the 0-length chunk.
-                        // Trailer sections (header fields between `0\r\n` and
-                        // the final `\r\n`) are not forwarded by this proxy;
-                        // we reject them as a framing sanity check to catch
-                        // truncation / smuggling rather than silently skipping.
-                        while i < data.len() && *remaining > 0 {
-                            let b = data[i];
-                            i += 1;
-                            let expected = if *remaining == 2 { b'\r' } else { b'\n' };
-                            if b != expected {
-                                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                                return Err(std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    "chunked encoding: expected \\r\\n after 0-length chunk \
-                                     (trailer sections are not supported)",
-                                ));
-                            }
-                            *remaining -= 1;
-                        }
-                        if *remaining == 0 {
-                            done = true;
-                        }
-                    }
-                }
-            }
-            // Framing validated -- forward the raw bytes to the client unchanged.
-            // When the terminal chunk has been consumed we forward only the
-            // validated prefix `&data[..i]`; any bytes past the closing \r\n
-            // are a framing violation (smuggling attempt, buggy upstream) and
-            // must NOT be relayed to the client. Mirrors the buffered variant
-            // `read_dechunk_body_to_vec`, which treats trailing-after-Done as
-            // a poison-connection error.
-            let forward_slice: &[u8] = if done { &data[..i] } else { data };
-            if !forward_slice.is_empty() {
-                write_all_to_stream_rated(
-                    client,
-                    forward_slice,
-                    &mut client_rate_checker,
-                    RateCheckDirection::Client,
-                    config.http_timeout,
-                )
-                .await
-                .map_err(|e| {
-                    std::io::Error::new(e.kind(), format!("chunked forward: client write:  {e}"))
-                })?;
-                metrics::BYTES_SERVED_PASSTHROUGH.increment_by(forward_slice.len() as u64);
-                client_total += forward_slice.len() as u64;
-            }
-            if done && i < data.len() {
-                // Defence in depth: well-behaved upstreams send no bytes past
-                // the closing `\r\n`. Surface this as a framing violation and
-                // drop the client connection. Callers must mark the upstream
-                // non-poolable on any error returned from this function
-                // (stray bytes in the kernel socket buffer would poison the
-                // next checkout) -- matches the buffered counterpart
-                // `read_dechunk_body_to_vec`.
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "chunked encoding: trailing bytes after 0-length chunk",
-                ));
-            }
-            done
-        }};
-    }
-
     // Bootstrap: process bytes that arrived with the response headers.
-    if process_buf!(body_prefix) {
+    if forward_chunked_buf(
+        &mut decoder,
+        body_prefix,
+        client,
+        &mut client_rate_checker,
+        &mut client_total,
+        config.http_timeout,
+    )
+    .await?
+    {
         return Ok(client_total);
     }
 
@@ -4867,7 +4938,16 @@ async fn forward_upstream_chunked_body(
             }
         }
 
-        if process_buf!(&buf[..n]) {
+        if forward_chunked_buf(
+            &mut decoder,
+            &buf[..n],
+            client,
+            &mut client_rate_checker,
+            &mut client_total,
+            config.http_timeout,
+        )
+        .await?
+        {
             return Ok(client_total);
         }
     }
@@ -6824,163 +6904,14 @@ async fn cleanup_upstream_fetch(
     }
 }
 
-/// State machine for the buffered chunked-body decoder.
-///
-/// Mirrors [`ChunkedState`] used by the streaming variant
-/// [`forward_upstream_chunked_body`]; the `Done { remaining }` variant counts
-/// the still-unseen bytes of the closing `\r\n` after the `0\r\n` terminator,
-/// so the upstream socket buffer is left empty and the connection can be
-/// safely returned to the pool. Trailer header fields between `0\r\n` and the
-/// final `\r\n` are rejected (same policy as the streaming variant).
-enum BufferedDechunkState {
-    /// Accumulating the hex chunk-size line (up to `\r\n`).
-    ReadingSize,
-    /// Reading chunk data bytes; `remaining` counts undecoded payload bytes.
-    ReadingData { remaining: usize },
-    /// Expecting the `\r\n` trailer after chunk data.
-    ReadingTrailer { seen_cr: bool },
-    /// The final `0\r\n` chunk has been received; still expecting the
-    /// closing `\r\n` that terminates the (empty) trailer section.
-    /// `remaining` is the count of still-unseen bytes of that final CRLF
-    /// (starts at 2, decrements to 0 when fully consumed).
-    Done { remaining: u8 },
-}
-
-/// Pure step of [`read_dechunk_body_to_vec`]: process one buffer of upstream
-/// bytes through the state machine, appending decoded payload to `body`.
-///
-/// Returns the number of bytes consumed from `data`. When the terminal chunk
-/// and its closing CRLF have been fully consumed, `state` transitions to
-/// `Done { remaining: 0 }` and the function stops processing further bytes
-/// (so callers can detect trailing/leftover bytes if needed).
-///
-/// Factored out so the framing logic is unit-testable without setting up
-/// `RUNTIMEDETAILS` (the I/O wrapper depends on `global_config()`).
-fn buffered_dechunk_step(
-    state: &mut BufferedDechunkState,
-    size_buf: &mut Vec<u8>,
-    body: &mut Vec<u8>,
-    data: &[u8],
-    max_bytes: usize,
-) -> std::io::Result<usize> {
-    let mut i = 0usize;
-    while i < data.len() {
-        match state {
-            BufferedDechunkState::ReadingSize => {
-                let b = data[i];
-                i += 1;
-                size_buf.push(b);
-                if b == b'\n' && size_buf.len() >= 2 && size_buf[size_buf.len() - 2] == b'\r' {
-                    let line = &size_buf[..size_buf.len() - 2];
-                    let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
-                    let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_err| {
-                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                        std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "chunked encoding: invalid chunk-size line",
-                        )
-                    })?;
-                    let chunk_size = usize::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
-                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                        std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "chunked encoding: invalid chunk-size hex",
-                        )
-                    })?;
-                    size_buf.clear();
-                    if chunk_size == 0 {
-                        // Terminal chunk -- still need to consume the closing
-                        // \r\n that ends the (empty) trailer section.
-                        *state = BufferedDechunkState::Done { remaining: 2 };
-                    } else {
-                        if body
-                            .len()
-                            .checked_add(chunk_size)
-                            .is_none_or(|sum| sum > max_bytes)
-                        {
-                            warn_once_or_info!(
-                                "splice proxy: chunked volatile body exceeded {max_bytes} byte cap; aborting the download"
-                            );
-                            return Err(std::io::Error::other(
-                                "chunked volatile body exceeded size cap",
-                            ));
-                        }
-                        *state = BufferedDechunkState::ReadingData {
-                            remaining: chunk_size,
-                        };
-                    }
-                } else if size_buf.len() > 64 {
-                    // Guard against absurdly long size lines (matches the
-                    // streaming variant's 64-byte cap).
-                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    return Err(std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        "chunked encoding: chunk-size line too long",
-                    ));
-                }
-            }
-            BufferedDechunkState::ReadingData { remaining } => {
-                let avail = data.len() - i;
-                let taken = avail.min(*remaining);
-                body.extend_from_slice(&data[i..i + taken]);
-                *remaining -= taken;
-                i += taken;
-                if *remaining == 0 {
-                    *state = BufferedDechunkState::ReadingTrailer { seen_cr: false };
-                }
-            }
-            BufferedDechunkState::ReadingTrailer { seen_cr } => {
-                let b = data[i];
-                i += 1;
-                if !*seen_cr && b == b'\r' {
-                    *seen_cr = true;
-                } else if *seen_cr && b == b'\n' {
-                    *state = BufferedDechunkState::ReadingSize;
-                } else {
-                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    return Err(std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        "chunked encoding: expected CRLF after chunk data",
-                    ));
-                }
-            }
-            BufferedDechunkState::Done { remaining } => {
-                // Validate the closing \r\n after the 0-length chunk. Trailer
-                // header fields between `0\r\n` and the final `\r\n` are not
-                // supported (matches the streaming variant) -- reject as a
-                // framing sanity check rather than silently skipping.
-                while i < data.len() && *remaining > 0 {
-                    let b = data[i];
-                    i += 1;
-                    let expected = if *remaining == 2 { b'\r' } else { b'\n' };
-                    if b != expected {
-                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                        return Err(std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "chunked encoding: expected \\r\\n after 0-length chunk \
-                             (trailer sections are not supported)",
-                        ));
-                    }
-                    *remaining -= 1;
-                }
-                if *remaining == 0 {
-                    // Stop processing -- leave any trailing bytes in `data`
-                    // unconsumed so the caller can detect framing surprises.
-                    return Ok(i);
-                }
-            }
-        }
-    }
-    Ok(i)
-}
-
 /// Dechunk a chunked-encoded body from upstream into a `Vec<u8>`, up to `max_bytes`
 /// of decoded payload.
 ///
 /// On success the closing `\r\n` after the `0\r\n` terminator has been fully
 /// consumed from the upstream socket buffer, so the connection can be safely
-/// returned to the pool (mirrors the streaming variant
-/// [`forward_upstream_chunked_body`]). On error the connection state is
+/// returned to the pool (the streaming variant
+/// [`forward_upstream_chunked_body`] shares the [`ChunkDecoder`] and
+/// therefore the terminator policy). On error the connection state is
 /// indeterminate -- callers must mark the upstream non-poolable.
 async fn read_dechunk_body_to_vec(
     upstream: &mut UpstreamConn,
@@ -6992,8 +6923,7 @@ async fn read_dechunk_body_to_vec(
     let mut rate_checker = config
         .min_download_rate
         .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-    let mut state = BufferedDechunkState::ReadingSize;
-    let mut size_buf = Vec::with_capacity(32);
+    let mut decoder = ChunkDecoder::new(max_bytes);
     let mut read_buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
 
     // Process the prefix first, then read from upstream.
@@ -7039,23 +6969,21 @@ async fn read_dechunk_body_to_vec(
             pending
         };
 
-        let consumed =
-            buffered_dechunk_step(&mut state, &mut size_buf, &mut body, data, max_bytes)?;
-
-        if matches!(state, BufferedDechunkState::Done { remaining: 0 }) {
-            if consumed < data.len() {
-                // Defence in depth: well-behaved upstreams send no bytes
-                // past the closing `\r\n`. If trailing bytes are present
-                // we treat the connection as poisoned and bail. Callers
-                // must mark the upstream non-poolable on any error
-                // returned from this function (stray bytes in the kernel
-                // socket buffer would poison the next checkout).
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "chunked encoding: trailing bytes after 0-length chunk",
+        let consumed = match decoder.feed(data, |payload| body.extend_from_slice(&data[payload])) {
+            Ok(consumed) => consumed,
+            Err(ChunkDecodeError::SizeCap { max_bytes }) => {
+                warn_once_or_info!(
+                    "splice proxy: chunked volatile body exceeded {max_bytes} byte cap; aborting the download"
+                );
+                return Err(std::io::Error::other(
+                    "chunked volatile body exceeded size cap",
                 ));
             }
+            Err(ChunkDecodeError::Framing(err)) => return Err(err),
+        };
+
+        if consumed.done {
+            consumed.ensure_no_trailing_bytes(data.len())?;
             break;
         }
     }
@@ -8519,19 +8447,36 @@ mod tests {
         let _rx = drain_handle.await.expect("drain task completes");
     }
 
-    // Drive `buffered_dechunk_step` to completion over a single input buffer,
-    // returning the decoded body and the count of bytes consumed.
-    fn dechunk_once(input: &[u8], max_bytes: usize) -> std::io::Result<(Vec<u8>, usize)> {
-        let mut state = BufferedDechunkState::ReadingSize;
-        let mut size_buf = Vec::with_capacity(32);
+    // Feed one buffer through a decoder, collecting the reported payload
+    // ranges as bytes (what the buffered reader appends) alongside the
+    // consumption report (what the streaming relay forwards `[..raw]` of).
+    fn feed_collect(
+        decoder: &mut ChunkDecoder,
+        input: &[u8],
+    ) -> Result<(Vec<u8>, Consumed), ChunkDecodeError> {
         let mut body = Vec::new();
-        let consumed =
-            buffered_dechunk_step(&mut state, &mut size_buf, &mut body, input, max_bytes)?;
+        let consumed = decoder.feed(input, |payload| body.extend_from_slice(&input[payload]))?;
         Ok((body, consumed))
     }
 
+    // Drive a fresh decoder over a single input buffer.
+    fn dechunk_once(
+        input: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, Consumed), ChunkDecodeError> {
+        let mut decoder = ChunkDecoder::new(max_bytes);
+        feed_collect(&mut decoder, input)
+    }
+
+    fn assert_framing_error(err: &ChunkDecodeError) {
+        assert!(
+            matches!(err, ChunkDecodeError::Framing(io_err) if io_err.kind() == ErrorKind::InvalidData),
+            "expected an InvalidData framing error, got {err:?}",
+        );
+    }
+
     #[test]
-    fn test_buffered_dechunk_consumes_closing_crlf() {
+    fn test_chunk_decoder_consumes_closing_crlf() {
         // Well-formed chunked body: one 5-byte chunk "hello", then terminator.
         // The decoder must consume every byte (including the final \r\n) so
         // the upstream socket buffer is left empty and the connection can be
@@ -8541,13 +8486,16 @@ mod tests {
         assert_eq!(body, b"hello");
         assert_eq!(
             consumed,
-            input.len(),
+            Consumed {
+                raw: input.len(),
+                done: true
+            },
             "decoder must consume every byte of the chunked frame, including the closing CRLF",
         );
     }
 
     #[test]
-    fn test_buffered_dechunk_empty_body() {
+    fn test_chunk_decoder_empty_body() {
         // `0\r\n\r\n` -- a body that is purely the terminal chunk. Must
         // consume all 5 bytes and produce an empty body.
         let input: &[u8] = b"0\r\n\r\n";
@@ -8556,92 +8504,264 @@ mod tests {
             body.is_empty(),
             "empty chunked body should decode to no bytes"
         );
-        assert_eq!(consumed, input.len());
+        assert_eq!(consumed, Consumed { raw: 5, done: true });
     }
 
     #[test]
-    fn test_buffered_dechunk_multi_chunk() {
+    fn test_chunk_decoder_multi_chunk() {
         // Two data chunks then terminator.
         let input: &[u8] = b"3\r\nfoo\r\n4\r\nbarz\r\n0\r\n\r\n";
         let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
         assert_eq!(body, b"foobarz");
-        assert_eq!(consumed, input.len());
+        assert_eq!(
+            consumed,
+            Consumed {
+                raw: input.len(),
+                done: true
+            }
+        );
     }
 
     #[test]
-    fn test_buffered_dechunk_rejects_trailer_fields() {
+    fn test_chunk_decoder_rejects_trailer_fields() {
         // Trailer fields between `0\r\n` and the final `\r\n` are not
-        // supported (matches the streaming variant's policy). A header
-        // line starting with `X` after `0\r\n` must be rejected because
-        // the byte after `0\r\n` is expected to be `\r`.
+        // supported. A header line starting with `X` after `0\r\n` must be
+        // rejected because the byte after `0\r\n` is expected to be `\r`.
         let input: &[u8] = b"0\r\nX-Trailer: foo\r\n\r\n";
         let err = dechunk_once(input, 1024).expect_err("trailer fields must be rejected");
-        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_framing_error(&err);
     }
 
     #[test]
-    fn test_buffered_dechunk_rejects_garbage_after_zero_chunk() {
+    fn test_chunk_decoder_rejects_garbage_after_zero_chunk() {
         // The bytes following `0\r\n` must be exactly `\r\n`. Garbage in
         // place of the CR triggers a framing error rather than silently
         // succeeding (the pre-fix decoder did the latter, leaving the
         // garbage in the upstream socket buffer).
         let input: &[u8] = b"0\r\nXY";
         let err = dechunk_once(input, 1024).expect_err("garbage after 0-chunk must be rejected");
-        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_framing_error(&err);
     }
 
     #[test]
-    fn test_buffered_dechunk_split_closing_crlf() {
+    fn test_chunk_decoder_split_closing_crlf() {
         // The closing `\r\n` arrives in two separate buffers (the `\r` in
         // one read, the `\n` in the next). Verifies `Done { remaining }`
         // correctly counts down across buffer boundaries.
-        let mut state = BufferedDechunkState::ReadingSize;
-        let mut size_buf = Vec::with_capacity(32);
-        let mut body = Vec::new();
+        let mut decoder = ChunkDecoder::new(1024);
 
         // First buffer: data chunk + terminal `0\r\n` + the `\r` of the
         // closing CRLF (1 byte short of the full terminator).
         let part1: &[u8] = b"5\r\nhello\r\n0\r\n\r";
-        let c1 = buffered_dechunk_step(&mut state, &mut size_buf, &mut body, part1, 1024)
-            .expect("part1 decode");
-        assert_eq!(c1, part1.len());
-        assert!(
-            matches!(state, BufferedDechunkState::Done { remaining: 1 }),
+        let (body1, c1) = feed_collect(&mut decoder, part1).expect("part1 decode");
+        assert_eq!(body1, b"hello");
+        assert_eq!(
+            c1,
+            Consumed {
+                raw: part1.len(),
+                done: false
+            },
             "after part1 the decoder must still be waiting for one more byte (the LF)",
         );
+        assert!(matches!(decoder.state, ChunkedState::Done { remaining: 1 }));
 
         // Second buffer: just the `\n` that finishes the closing CRLF.
         let part2: &[u8] = b"\n";
-        let c2 = buffered_dechunk_step(&mut state, &mut size_buf, &mut body, part2, 1024)
-            .expect("part2 decode");
-        assert_eq!(c2, 1);
-        assert!(matches!(state, BufferedDechunkState::Done { remaining: 0 }));
-        assert_eq!(body, b"hello");
+        let (body2, c2) = feed_collect(&mut decoder, part2).expect("part2 decode");
+        assert!(body2.is_empty());
+        assert_eq!(c2, Consumed { raw: 1, done: true });
     }
 
     #[test]
-    fn test_buffered_dechunk_stops_at_done_leaves_trailing_bytes() {
+    fn test_chunk_decoder_stops_at_done_leaves_trailing_bytes() {
         // After fully consuming `0\r\n\r\n` the decoder must stop and
         // leave any trailing bytes in the input unconsumed -- the I/O
-        // wrapper turns that into a framing-violation error so a
-        // misbehaving upstream cannot poison the connection pool.
+        // wrappers turn that into a framing-violation error (via
+        // `Consumed::ensure_no_trailing_bytes`) so a misbehaving upstream
+        // cannot poison the connection pool. The streaming relay relies on
+        // `raw` stopping there to forward only the validated prefix.
         let input: &[u8] = b"0\r\n\r\nGARBAGE";
         let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
         assert_eq!(body, [] as [u8; 0]);
         assert_eq!(
-            consumed, 5,
+            consumed,
+            Consumed { raw: 5, done: true },
             "decoder must stop right after the closing CRLF, not swallow trailing bytes",
+        );
+        let err = consumed
+            .ensure_no_trailing_bytes(input.len())
+            .expect_err("trailing bytes after the terminator must be rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        // A frame that ends exactly at the terminator passes the check.
+        consumed
+            .ensure_no_trailing_bytes(5)
+            .expect("no trailing bytes when the input ends at the terminator");
+        // An unfinished frame never trips it, whatever the input length.
+        Consumed {
+            raw: 3,
+            done: false,
+        }
+        .ensure_no_trailing_bytes(3)
+        .expect("unfinished frames are not checked for trailing bytes");
+    }
+
+    #[test]
+    fn test_chunk_decoder_chunk_extensions_ignored() {
+        // RFC 9112 allows chunk extensions after `;` on the chunk-size
+        // line; they must be parsed and ignored.
+        let input: &[u8] = b"5;ext=foo\r\nhello\r\n0;final\r\n\r\n";
+        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
+        assert_eq!(body, b"hello");
+        assert_eq!(
+            consumed,
+            Consumed {
+                raw: input.len(),
+                done: true
+            }
         );
     }
 
     #[test]
-    fn test_buffered_dechunk_chunk_extensions_ignored() {
-        // RFC 9112 allows chunk extensions after `;` on the chunk-size
-        // line; they must be parsed and ignored, matching the streaming
-        // variant.
-        let input: &[u8] = b"5;ext=foo\r\nhello\r\n0;final\r\n\r\n";
-        let (body, consumed) = dechunk_once(input, 1024).expect("decode succeeds");
-        assert_eq!(body, b"hello");
-        assert_eq!(consumed, input.len());
+    fn test_chunk_decoder_size_line_split_across_reads() {
+        // The chunk-size line arrives one byte per read, including a split
+        // between its `\r` and `\n`; `size_buf` accumulates across feeds.
+        let mut decoder = ChunkDecoder::new(1024);
+        let mut body = Vec::new();
+        for part in [&b"a"[..], b";", b"x", b"\r", b"\n"] {
+            let (payload, consumed) = feed_collect(&mut decoder, part).expect("size line piece");
+            assert!(payload.is_empty());
+            assert_eq!(
+                consumed,
+                Consumed {
+                    raw: 1,
+                    done: false
+                }
+            );
+            body.extend_from_slice(&payload);
+        }
+        assert!(matches!(
+            decoder.state,
+            ChunkedState::ReadingData { remaining: 10 }
+        ));
+        let (payload, consumed) =
+            feed_collect(&mut decoder, b"0123456789\r\n0\r\n\r\n").expect("rest of the frame");
+        body.extend_from_slice(&payload);
+        assert_eq!(body, b"0123456789");
+        assert_eq!(
+            consumed,
+            Consumed {
+                raw: 17,
+                done: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_chunk_decoder_chunk_data_split_across_reads() {
+        // Chunk data and the CRLF after it straddle read boundaries; every
+        // feed that does not finish the frame must consume its whole input
+        // (the streaming relay forwards `[..raw]` and relies on that), and
+        // the payload ranges must add up to exactly the chunk data.
+        let mut decoder = ChunkDecoder::new(1024);
+        let mut body = Vec::new();
+        let parts: [&[u8]; 6] = [
+            b"6\r\nab",
+            b"cd",
+            b"ef\r",
+            b"\n3\r\nx",
+            b"yz\r\n0\r",
+            b"\n\r\n",
+        ];
+        for (idx, part) in parts.iter().enumerate() {
+            let (payload, consumed) = feed_collect(&mut decoder, part).expect("piece decodes");
+            body.extend_from_slice(&payload);
+            let last = idx + 1 == parts.len();
+            assert_eq!(
+                consumed,
+                Consumed {
+                    raw: part.len(),
+                    done: last
+                },
+                "piece {idx} must be consumed whole",
+            );
+        }
+        assert_eq!(body, b"abcdefxyz");
+    }
+
+    #[test]
+    fn test_chunk_decoder_payload_ranges_are_input_relative() {
+        // The ranges handed to `on_payload` index into the fed buffer, one
+        // per chunk (or chunk fragment), covering the data bytes only.
+        let mut decoder = ChunkDecoder::new(1024);
+        let input: &[u8] = b"2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n";
+        let mut ranges = Vec::new();
+        let consumed = decoder
+            .feed(input, |payload| ranges.push(payload))
+            .expect("decode succeeds");
+        assert_eq!(ranges, [3..5, 10..13]);
+        assert_eq!(
+            consumed,
+            Consumed {
+                raw: input.len(),
+                done: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_chunk_decoder_rejects_bad_byte_after_chunk_data() {
+        // The CRLF after chunk data is mandatory; a chunk whose declared
+        // size undercounts its data trips the check on the first extra byte.
+        let input: &[u8] = b"2\r\nabc\r\n0\r\n\r\n";
+        let err = dechunk_once(input, 1024).expect_err("missing CRLF after data must be rejected");
+        assert_framing_error(&err);
+        // Likewise a lone CR followed by something other than LF.
+        let input: &[u8] = b"2\r\nab\rX0\r\n\r\n";
+        let err = dechunk_once(input, 1024).expect_err("CR without LF must be rejected");
+        assert_framing_error(&err);
+    }
+
+    #[test]
+    fn test_chunk_decoder_rejects_invalid_size_line() {
+        // Non-hex size digits and a non-UTF-8 size line are both framing
+        // errors; an overlong size line is cut off at 64 bytes without
+        // waiting for its CRLF.
+        let err = dechunk_once(b"zz\r\n", 1024).expect_err("non-hex size must be rejected");
+        assert_framing_error(&err);
+        let err = dechunk_once(b"\xff\r\n", 1024).expect_err("non-UTF-8 size must be rejected");
+        assert_framing_error(&err);
+        let long_line = [b'1'; 65];
+        let err = dechunk_once(&long_line, 1024).expect_err("overlong size line must be rejected");
+        assert_framing_error(&err);
+        // 64 bytes without a CRLF are still tolerated (the cap is `> 64`).
+        let (body, consumed) =
+            dechunk_once(&long_line[..64], 1024).expect("64-byte size line still pending");
+        assert!(body.is_empty());
+        assert_eq!(
+            consumed,
+            Consumed {
+                raw: 64,
+                done: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_chunk_decoder_size_cap() {
+        // The cap applies to the declared payload total at each size line:
+        // a frame whose chunks sum to exactly `max_bytes` passes, one byte
+        // more is refused before any of that chunk's data is consumed, and
+        // the error is distinct from a framing violation so the I/O
+        // wrappers can word their own log line.
+        let input: &[u8] = b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n";
+        let (body, consumed) = dechunk_once(input, 6).expect("exactly at the cap is fine");
+        assert_eq!(body, b"foobar");
+        assert!(consumed.done);
+
+        let err = dechunk_once(input, 5).expect_err("one byte over the cap must be refused");
+        assert!(
+            matches!(err, ChunkDecodeError::SizeCap { max_bytes: 5 }),
+            "expected SizeCap, got {err:?}",
+        );
     }
 }
