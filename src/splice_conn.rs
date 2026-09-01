@@ -157,12 +157,6 @@ const VOLATILE_BODY_MAX: usize = 1024 * 1024;
 #[cfg(feature = "ktls")]
 const KTLS_BLOCK_DURATION: coarsetime::Duration = coarsetime::Duration::from_secs(600);
 
-/// `tls_label` value for a kTLS-offloaded upstream connection. Doubles as the
-/// kTLS marker at body-transfer time: every reconnect helper updates
-/// `tls_label`, so it always describes the *current* upstream connection.
-#[cfg(feature = "ktls")]
-const KTLS_TLS_LABEL: &str = " (kTLS)";
-
 /// Monotonic time (coarsetime ticks) of the last opportunistic GC of `KTLS_BLOCKED`
 /// from the read path. Used to rate-limit GC sweeps to at most once per
 /// `KTLS_BLOCK_DURATION` on cache misses.
@@ -205,7 +199,7 @@ fn block_ktls_host(key: &SchemeKeyRef<'_>) {
 }
 
 // ---------------------------------------------------------------------------
-// UpstreamConn: TCP or TLS wrapper
+// UpstreamConn: TCP, TLS or kTLS wrapper
 // ---------------------------------------------------------------------------
 
 #[cfg_attr(
@@ -219,6 +213,63 @@ fn block_ktls_host(key: &SchemeKeyRef<'_>) {
 enum UpstreamConn {
     Tcp(#[pin] TcpStream),
     Tls(#[pin] TlsStream),
+    /// TLS with kernel RX offload configured for one session: the socket
+    /// yields plaintext, but only for the request already on the wire.
+    /// `PoolGuard::drop` never returns this variant to the pool.
+    #[cfg(feature = "ktls")]
+    Ktls(#[pin] TcpStream),
+}
+
+/// How an [`UpstreamConn`] is encrypted. Derived from the variant on demand,
+/// never cached, so it cannot drift from the socket it describes.
+#[derive(Clone, Copy)]
+enum TlsMode {
+    /// Plain TCP.
+    Plain,
+    /// TLS terminated in userspace by [`TlsStream`].
+    Userspace,
+    /// TLS with kernel RX offload: the socket hands plaintext to `splice(2)`.
+    #[cfg(feature = "ktls")]
+    Kernel,
+}
+
+/// An upstream socket whose receive queue holds plaintext the kernel can
+/// `splice(2)` straight into a pipe: plain TCP, or TLS with kernel RX
+/// offload. Obtained via [`UpstreamConn::zero_copy`]; userspace TLS never
+/// yields one.
+#[derive(Clone, Copy)]
+struct ZeroCopyUpstream<'a> {
+    tcp: &'a TcpStream,
+    /// Whether kTLS RX is configured on `tcp`, i.e. whether TLS control
+    /// records can surface as `splice(2)` errors mid-stream.
+    #[cfg(feature = "ktls")]
+    ktls: bool,
+}
+
+/// Log suffix naming an exchange's connection flavour -- [`TlsMode`] plus
+/// pool reuse -- as in `" (TLS, reused)"`; empty for a fresh plain connection.
+#[derive(Clone, Copy)]
+struct ConnLabel {
+    mode: TlsMode,
+    reused: bool,
+}
+
+impl std::fmt::Display for ConnLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { mode, reused } = *self;
+        let mode = match mode {
+            TlsMode::Plain => None,
+            TlsMode::Userspace => Some("TLS"),
+            #[cfg(feature = "ktls")]
+            TlsMode::Kernel => Some("kTLS"),
+        };
+        match (mode, reused) {
+            (None, false) => Ok(()),
+            (None, true) => f.write_str(" (reused)"),
+            (Some(mode), false) => write!(f, " ({mode})"),
+            (Some(mode), true) => write!(f, " ({mode}, reused)"),
+        }
+    }
 }
 
 /// Userspace-TLS upstream stream of the selected TLS backend. The one `cfg`
@@ -238,6 +289,8 @@ impl AsyncRead for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_read(cx, buf),
             UpstreamConnProj::Tls(s) => s.poll_read(cx, buf),
+            #[cfg(feature = "ktls")]
+            UpstreamConnProj::Ktls(s) => s.poll_read(cx, buf),
         }
     }
 }
@@ -252,6 +305,8 @@ impl AsyncWrite for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_write(cx, buf),
             UpstreamConnProj::Tls(s) => s.poll_write(cx, buf),
+            #[cfg(feature = "ktls")]
+            UpstreamConnProj::Ktls(s) => s.poll_write(cx, buf),
         }
     }
 
@@ -260,6 +315,8 @@ impl AsyncWrite for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_flush(cx),
             UpstreamConnProj::Tls(s) => s.poll_flush(cx),
+            #[cfg(feature = "ktls")]
+            UpstreamConnProj::Ktls(s) => s.poll_flush(cx),
         }
     }
 
@@ -268,26 +325,45 @@ impl AsyncWrite for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_shutdown(cx),
             UpstreamConnProj::Tls(s) => s.poll_shutdown(cx),
+            #[cfg(feature = "ktls")]
+            UpstreamConnProj::Ktls(s) => s.poll_shutdown(cx),
         }
     }
 }
 
 impl UpstreamConn {
+    /// How this connection is encrypted.
     #[must_use]
-    const fn is_tls(&self) -> bool {
+    const fn tls_mode(&self) -> TlsMode {
         match self {
-            Self::Tcp(_) => false,
-            Self::Tls(_) => true,
+            Self::Tcp(_) => TlsMode::Plain,
+            Self::Tls(_) => TlsMode::Userspace,
+            #[cfg(feature = "ktls")]
+            Self::Ktls(_) => TlsMode::Kernel,
         }
     }
 
-    /// For the TCP variant, get a reference to the inner `TcpStream`.
-    /// Returns `None` for TLS connections.
+    /// Whether the connection is encrypted at all (userspace or kernel TLS):
+    /// decides the upstream port and the pool key.
     #[must_use]
-    const fn as_tcp(&self) -> Option<&TcpStream> {
+    const fn is_tls(&self) -> bool {
+        !matches!(self.tls_mode(), TlsMode::Plain)
+    }
+
+    /// The socket to `splice(2)` the response body from, when the kernel
+    /// hands out plaintext (plain TCP, or kTLS with RX offload). `None` for
+    /// userspace TLS, whose plaintext only ever exists in this process.
+    #[must_use]
+    const fn zero_copy(&self) -> Option<ZeroCopyUpstream<'_>> {
         match self {
-            Self::Tcp(s) => Some(s),
+            Self::Tcp(tcp) => Some(ZeroCopyUpstream {
+                tcp,
+                #[cfg(feature = "ktls")]
+                ktls: false,
+            }),
             Self::Tls(_) => None,
+            #[cfg(feature = "ktls")]
+            Self::Ktls(tcp) => Some(ZeroCopyUpstream { tcp, ktls: true }),
         }
     }
 }
@@ -440,7 +516,22 @@ impl Drop for PoolGuard {
         {
             // Derive from the connection itself rather than caching it in a
             // field that could drift from `conn`'s actual scheme.
-            pool_return(&self.host, self.port, conn.is_tls(), conn);
+            let is_tls = match conn.tls_mode() {
+                TlsMode::Plain => false,
+                TlsMode::Userspace => true,
+                // kTLS connections must NOT be pooled: the socket has kernel TLS
+                // RX configured for this specific session's keys and sequence
+                // numbers. Reusing it for a new request would layer a new TLS
+                // handshake on top of the kTLS socket, corrupting the stream.
+                // Future optimization: kTLS sockets could be pooled as a separate
+                // "kTLS-ready" type that writes plaintext (kernel encrypts via TX)
+                // and splices responses (kernel decrypts via RX), skipping the TLS
+                // handshake entirely. This requires a distinct pool entry type,
+                // control-message draining between requests, and key-update handling.
+                #[cfg(feature = "ktls")]
+                TlsMode::Kernel => return,
+            };
+            pool_return(&self.host, self.port, is_tls, conn);
         }
     }
 }
@@ -504,8 +595,26 @@ struct UpstreamExchange {
     response: UpstreamResponse,
     header_buf: BytesMut,
     header_end: usize,
-    /// Log suffix naming the connection flavour (TLS-ness, pool reuse).
-    tls_label: &'static str,
+    /// Whether `conn` came out of the pool rather than a fresh connect.
+    reused: bool,
+}
+
+impl UpstreamExchange {
+    /// Log suffix naming this exchange's connection flavour.
+    #[must_use]
+    fn label(&self) -> ConnLabel {
+        let Self {
+            conn,
+            response: _,
+            header_buf: _,
+            header_end: _,
+            reused,
+        } = self;
+        ConnLabel {
+            mode: conn.tls_mode(),
+            reused: *reused,
+        }
+    }
 }
 
 /// Outcome of [`acquire_upstream`].
@@ -585,6 +694,10 @@ impl UpstreamConn {
         match self {
             Self::Tcp(tcp) => tcp_peek_alive(tcp.as_raw_fd(), host, port),
             Self::Tls(tls) => tls_peek_alive(tls, host, port),
+            // Never pooled (`PoolGuard::drop`), so never checked; the kernel
+            // session is spent after its one request anyway.
+            #[cfg(feature = "ktls")]
+            Self::Ktls(_) => false,
         }
     }
 }
@@ -964,8 +1077,9 @@ enum KtlsError {
 /// arms below re-enter `standard_upstream_connect` rather than reusing.
 #[cfg(feature = "ktls")]
 enum KtlsResult {
-    /// kTLS fully set up — ready for zero-copy splice. Carries a fresh,
-    /// non-poolable socket (see the socket contract above).
+    /// kTLS fully set up — ready for zero-copy splice. Carries a fresh
+    /// socket that becomes `UpstreamConn::Ktls`, which `PoolGuard::drop`
+    /// never pools (see the socket contract above).
     Ready(TcpStream, KtlsReadyState),
     /// TLS+HTTP succeeded but response is not splice-eligible (non-200, no CL).
     /// Carries only the parsed response so the caller can choose to serve cached
@@ -2582,7 +2696,7 @@ type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
 /// the pool.
 #[expect(clippy::too_many_arguments, reason = "called from a single site")]
 async fn splice_proxy_body(
-    upstream: &TcpStream,
+    upstream: ZeroCopyUpstream<'_>,
     client: &TcpStream,
     cache_file: &tokio::fs::File,
     content_length: u64,
@@ -2590,8 +2704,10 @@ async fn splice_proxy_body(
     mut dbarrier: DownloadBarrier,
     range_filter: &SpliceRangeFilter,
     cache_path: &Path,
-    #[cfg(feature = "ktls")] upstream_is_ktls: bool,
 ) -> Result<(DownloadBarrier, Option<DemotedClientHandle>, bool, u64), BodyTransferError> {
+    #[cfg(feature = "ktls")]
+    let upstream_is_ktls = upstream.ktls;
+    let upstream = upstream.tcp;
     // Dropped at the demotion transition so the spawned `serve_remaining_from_file`
     // task's own `ClientDownload` (in `async_sendfile_unfinished`) takes over the
     // accounting cleanly — see the `ClientStatus::Demoted` branch below.
@@ -4050,11 +4166,6 @@ async fn standard_upstream_connect(
                 .await
                 {
                     Ok((resp, hdr_buf, hdr_end)) => {
-                        let label = if is_tls {
-                            " (TLS, reused)"
-                        } else {
-                            " (reused)"
-                        };
                         let poolable = !resp.connection_close;
                         metrics::POOL_REUSED.increment();
                         return Ok(UpstreamExchange {
@@ -4062,7 +4173,7 @@ async fn standard_upstream_connect(
                             response: resp,
                             header_buf: hdr_buf,
                             header_end: hdr_end,
-                            tls_label: label,
+                            reused: true,
                         });
                     }
                     Err(err) => {
@@ -4187,7 +4298,6 @@ async fn standard_upstream_connect(
         SpliceProxyError::Upstream
     })?;
 
-    let label = if is_tls { " (TLS)" } else { "" };
     let poolable = !resp.connection_close;
     let port = mirror_port(mirror, is_tls);
     Ok(UpstreamExchange {
@@ -4195,7 +4305,7 @@ async fn standard_upstream_connect(
         response: resp,
         header_buf: hdr_buf,
         header_end: hdr_end,
-        tls_label: label,
+        reused: false,
     })
 }
 
@@ -4955,16 +5065,9 @@ async fn acquire_upstream(
                 // The kTLS fast path is outside HTTPS_UPGRADE_* accounting (see
                 // metrics.rs); both sides of the identity are skipped together.
                 cache_scheme(mirror, Scheme::Https);
-                // kTLS connections must NOT be pooled: the socket has kernel TLS
-                // RX configured for this specific session's keys and sequence
-                // numbers. Reusing it for a new request would layer a new TLS
-                // handshake on top of the kTLS socket, corrupting the stream.
-                // Future optimization: kTLS sockets could be pooled as a separate
-                // "kTLS-ready" type that writes plaintext (kernel encrypts via TX)
-                // and splices responses (kernel decrypts via RX), skipping the TLS
-                // handshake entirely. This requires a distinct pool entry type,
-                // control-message draining between requests, and key-update handling.
-                let poolable = false;
+                // Wrapped as `UpstreamConn::Ktls`, which `PoolGuard::drop`
+                // never returns to the pool (the rationale lives there); the
+                // keep-alive bit is recorded like on the standard path.
                 let port = mirror_port(mirror, true);
                 // Honoring the kTLS-parsed response: record its upstream status
                 // here since no standard-path reconnect will run for this flow.
@@ -4974,9 +5077,10 @@ async fn acquire_upstream(
                     header_buf,
                     header_end,
                 } = state;
+                let poolable = !response.connection_close;
                 return Ok(UpstreamAcquire::Exchange(UpstreamExchange {
                     conn: PoolGuard::new(
-                        UpstreamConn::Tcp(tcp),
+                        UpstreamConn::Ktls(tcp),
                         mirror.host().to_string(),
                         port,
                         poolable,
@@ -4984,7 +5088,7 @@ async fn acquire_upstream(
                     response,
                     header_buf,
                     header_end,
-                    tls_label: KTLS_TLS_LABEL,
+                    reused: false,
                 }));
             }
             KtlsResult::ResponseNotSpliceable { response: _ } => {
@@ -5416,12 +5520,13 @@ async fn splice_proxy_drive(
 
     // No reconnect helper runs past this point, so the exchange is final:
     // split it into the locals the rest of the download uses.
+    let conn_label = exchange.label();
     let UpstreamExchange {
         conn: mut upstream,
         response: upstream_resp,
         header_buf,
         header_end,
-        tls_label,
+        reused: _,
     } = exchange;
 
     let (total_content_length, body_content_length, resume_offset) = match plan {
@@ -5564,7 +5669,7 @@ async fn splice_proxy_drive(
                 header_end,
                 ibarrier,
                 client_range,
-                tls_label,
+                conn_label,
             )
             .await;
         }
@@ -5839,7 +5944,7 @@ async fn splice_proxy_drive(
         let resume_percent = resume_offset as f32 / total_content_length.get() as f32 * 100.0;
 
         debug!(
-            "splice proxy{tls_label}: resuming and serving {} from mirror {} for client {} at byte {} ({:.1}%)...",
+            "splice proxy{conn_label}: resuming and serving {} from mirror {} for client {} at byte {} ({:.1}%)...",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client,
@@ -5848,7 +5953,7 @@ async fn splice_proxy_drive(
         );
     } else {
         debug!(
-            "splice proxy{tls_label}: downloading and serving {} from mirror {} for client {}...",
+            "splice proxy{conn_label}: downloading and serving {} from mirror {} for client {}...",
             conn_details.debname, conn_details.mirror, conn_details.client
         );
     }
@@ -6090,18 +6195,11 @@ async fn splice_proxy_drive(
         // rename step; on a structured rate-timeout it's already consumed into
         // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
         // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
-        // Whether the upstream socket has kTLS RX configured: tls_label is
-        // maintained by every reconnect helper, so it describes the current
-        // connection (and a kTLS attempt only yields Ready for 200 responses,
-        // so no reconnect path fires after it).
-        #[cfg(feature = "ktls")]
-        let upstream_is_ktls = tls_label == KTLS_TLS_LABEL;
-
         let (returned_dbarrier, demoted_handle, body_client_disconnected, body_client_bytes) =
-            if let Some(tcp_upstream) = upstream_guard.as_tcp() {
+            if let Some(zero_copy_upstream) = upstream_guard.zero_copy() {
                 // Zero-copy path for TCP (plain or kTLS)
                 splice_proxy_body(
-                    tcp_upstream,
+                    zero_copy_upstream,
                     client_stream,
                     &tempfile,
                     splice_count,
@@ -6109,8 +6207,6 @@ async fn splice_proxy_drive(
                     dbarrier,
                     &range_filter,
                     &temppath,
-                    #[cfg(feature = "ktls")]
-                    upstream_is_ktls,
                 )
                 .await
             } else {
@@ -6317,7 +6413,7 @@ async fn splice_proxy_drive(
             )
         };
         info!(
-            "{} {volatile}file {} from mirror {} for client {} in {} via splice{tls_label} ({upstream}, {client}){}",
+            "{} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({upstream}, {client}){}",
             if client_succeeded {
                 "Served and cached"
             } else {
@@ -6660,7 +6756,7 @@ async fn cleanup_upstream_fetch(
         response: resp,
         header_buf: hdr_buf,
         header_end: hdr_end,
-        tls_label: _,
+        reused: _,
     } = match standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
         .await
     {
@@ -6989,7 +7085,7 @@ async fn handle_volatile_buffered_download(
     header_end: usize,
     ibarrier: InitBarrier<'_>,
     client_range: RangeRequestHeaders<'_>,
-    tls_label: &str,
+    conn_label: ConnLabel,
 ) -> Result<(), SpliceProxyError> {
     let max_bytes: usize = VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER
         .get()
@@ -7053,7 +7149,7 @@ async fn handle_volatile_buffered_download(
     };
 
     debug!(
-        "splice proxy{tls_label}: buffered volatile download of {} from mirror {} for client {} ({} bytes)...",
+        "splice proxy{conn_label}: buffered volatile download of {} from mirror {} for client {} ({} bytes)...",
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
 
@@ -7401,7 +7497,7 @@ async fn handle_volatile_buffered_download(
             ""
         };
         info!(
-            "Served and cached {volatile}file {} from mirror {} for client {} in {} via splice{tls_label} ({}, {})",
+            "Served and cached {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({}, {})",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client,
@@ -7574,7 +7670,7 @@ pub(crate) async fn splice_simple_proxy(
         response: resp,
         header_buf: hdr_buf,
         header_end: hdr_end,
-        tls_label: _,
+        reused: _,
     } = standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
         .await?;
 
@@ -7723,6 +7819,17 @@ mod tests {
     use nix::fcntl::{FcntlArg, fcntl};
 
     use super::*;
+
+    #[test]
+    fn conn_label_renders_the_log_suffixes() {
+        let label = |mode, reused| ConnLabel { mode, reused }.to_string();
+        assert_eq!(label(TlsMode::Plain, false), "");
+        assert_eq!(label(TlsMode::Plain, true), " (reused)");
+        assert_eq!(label(TlsMode::Userspace, false), " (TLS)");
+        assert_eq!(label(TlsMode::Userspace, true), " (TLS, reused)");
+        #[cfg(feature = "ktls")]
+        assert_eq!(label(TlsMode::Kernel, false), " (kTLS)");
+    }
 
     #[test]
     fn classify_tls_error_marks_deterministic_kinds_permanent() {
