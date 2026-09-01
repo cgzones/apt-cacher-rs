@@ -401,9 +401,11 @@ impl RenameBarrier {
     ///
     /// Verification is delegated to `integrity::verify_and_rename`; this is the
     /// **only** way to finish a `RenameBarrier`, so no download backend can
-    /// commit a download without it. On any `CommitError` the barrier is
-    /// dropped (its `Drop` runs the abort / signal-waiters path, exactly as a
-    /// failed rename does today) and the error is returned to the caller.
+    /// commit a download without it. On any `CommitError` the entry is
+    /// retired right here (status `Aborted`, active-downloads entry removed)
+    /// *before* a checksum mismatch arms the re-download throttle, and the
+    /// error is returned to the caller; `Drop` stays the safety net for a
+    /// cancelled future.
     ///
     /// Lock ordering: `verify_and_rename` runs *before* the status write lock
     /// is acquired, so late-joiner readers (`status.read().await`) can proceed
@@ -476,26 +478,42 @@ impl RenameBarrier {
                     ErrorReport(io_err)
                 );
             }
+            // Retire the entry before arming the throttle. Leaving that to
+            // `Drop` (which runs only after the `TempPath` parameter is
+            // dropped and a blocking write lock is won) opened a window in
+            // which the throttle was already armed and logged while the
+            // entry was still joinable in `Verifying` state, so a request
+            // arriving in it was served the mismatching partial as a
+            // finished file (or, once `Aborted`, got a 500) instead of the
+            // throttle's 503. With the entry gone first, such a request
+            // originates anew and hits the pre-upstream throttle gate; the
+            // residual removed-but-unarmed window costs at most one
+            // redundant upstream fetch, never wrong bytes.
+            // `Discarded` (not `AlreadyLoggedJustFail`): every byte is on
+            // disk, so readers that already hold the file drain it instead
+            // of truncating the body they were promised.
+            let data = self.data.take().expect("every sink consumes the instance");
+            *data.status.write().await = ActiveDownloadStatus::Aborted(AbortReason::Discarded);
+            metrics::DOWNLOADS_ABORTED.increment();
+            data.active_downloads.remove(data.key.as_ref());
             // Arm the re-download throttle only on a genuine content
             // mismatch; VerifyIo/Rename are transient local problems.
-            if matches!(err, CommitError::ChecksumMismatch) {
-                let data = self
-                    .data
-                    .as_ref()
-                    .expect("every sink consumes the instance");
-                if let Some((window, failures)) =
+            if matches!(err, CommitError::ChecksumMismatch)
+                && let Some((window, failures)) =
                     global_verify_throttle().record_failure(data.key.as_ref())
-                {
-                    info!(
-                        "Throttling downloads of {} from mirror {} for {} after checksum verification failure (consecutive failures: {failures})",
-                        data.key.debname,
-                        data.key.mirror,
-                        HumanFmt::Time(window),
-                    );
-                }
+            {
+                // Integration tests use this line as the "throttle is
+                // observable" sync point: it must stay after the entry
+                // removal above.
+                info!(
+                    "Throttling downloads of {} from mirror {} for {} after checksum verification failure (consecutive failures: {failures})",
+                    data.key.debname,
+                    data.key.mirror,
+                    HumanFmt::Time(window),
+                );
             }
-            // `self.data` is still held: Drop runs the abort path; the
-            // `TempPath` guard removes the temp file.
+            // `data` (and its quota reservation) drops here; the `TempPath`
+            // guard decides the temp file's fate.
             return Err(err);
         }
 

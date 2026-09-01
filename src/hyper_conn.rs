@@ -611,31 +611,30 @@ async fn serve_unfinished_file(
                     // Verifying: writer has written all bytes and is hashing on
                     // a blocking thread. The open file handle stays valid
                     // across the upcoming rename, so drain like Finished.
+                    // Discarded: same complete file, verdict was negative;
+                    // the handle is still ours to drain.
                     ActiveDownloadStatus::Finished { .. }
-                    | ActiveDownloadStatus::Verifying { .. } => {
+                    | ActiveDownloadStatus::Verifying { .. }
+                    | ActiveDownloadStatus::Aborted(AbortReason::Discarded) => {
                         drop(st);
                         finished = true;
                         continue;
                     }
-                    ActiveDownloadStatus::Aborted(ref err) => {
-                        match err {
-                            AbortReason::MirrorDownloadRate(mdr) => {
-                                let mdr = (*mdr).clone();
-                                drop(st);
-                                if tx.send(Err(mdr)).await.is_err() {
-                                    // receiver gone, nothing to recover
-                                }
-                            }
-                            AbortReason::AlreadyLoggedJustFail => {
-                                drop(st);
-                                // Reason already logged
-                                debug!(
-                                    "Download of file `{}` aborted, cancelling stream",
-                                    file_path.display()
-                                );
-                            }
+                    ActiveDownloadStatus::Aborted(AbortReason::MirrorDownloadRate(ref mdr)) => {
+                        let mdr = mdr.clone();
+                        drop(st);
+                        if tx.send(Err(mdr)).await.is_err() {
+                            // receiver gone, nothing to recover
                         }
-
+                        return;
+                    }
+                    ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail) => {
+                        drop(st);
+                        // Reason already logged
+                        debug!(
+                            "Download of file `{}` aborted, cancelling stream",
+                            file_path.display()
+                        );
                         return;
                     }
                     ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {

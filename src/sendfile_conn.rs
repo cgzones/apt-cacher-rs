@@ -43,7 +43,7 @@ use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
 use crate::splice_conn::SpliceProxyError;
 use crate::{
     APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
-    active_downloads::{ActiveDownloadStatus, Serveable, await_serveable},
+    active_downloads::{AbortReason, ActiveDownloadStatus, Serveable, await_serveable},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
     cache_metadata::{self},
@@ -2410,12 +2410,15 @@ pub(crate) async fn async_sendfile_unfinished(
                     let st = status.read().await;
                     match *st {
                         ActiveDownloadStatus::Finished { .. }
-                        | ActiveDownloadStatus::Verifying { .. } => {
+                        | ActiveDownloadStatus::Verifying { .. }
+                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded) => {
                             drop(st);
                             finished = true;
                             continue;
                         }
-                        ActiveDownloadStatus::Aborted(_) => {
+                        ActiveDownloadStatus::Aborted(
+                            AbortReason::MirrorDownloadRate(_) | AbortReason::AlreadyLoggedJustFail,
+                        ) => {
                             drop(st);
                             let transferred = content_length - remaining;
                             return Err((
@@ -2462,8 +2465,11 @@ pub(crate) async fn async_sendfile_unfinished(
                     let st = status.read().await;
                     match *st {
                         ActiveDownloadStatus::Finished { .. }
-                        | ActiveDownloadStatus::Verifying { .. } => (true, false),
-                        ActiveDownloadStatus::Aborted(_) => (false, true),
+                        | ActiveDownloadStatus::Verifying { .. }
+                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded) => (true, false),
+                        ActiveDownloadStatus::Aborted(
+                            AbortReason::MirrorDownloadRate(_) | AbortReason::AlreadyLoggedJustFail,
+                        ) => (false, true),
                         ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
                             (false, false)
                         }

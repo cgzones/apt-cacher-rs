@@ -37,8 +37,20 @@ use crate::{global_config, metrics};
 
 #[derive(Debug)]
 pub(crate) enum AbortReason {
+    /// The writer gave up on a stalled mirror (`min_download_rate`); the
+    /// file on disk is incomplete.
     MirrorDownloadRate(MirrorDownloadRate),
+    /// The writer failed for an already-logged reason before all bytes
+    /// were on disk (or its future was cancelled); the file is incomplete.
     AlreadyLoggedJustFail,
+    /// Every upstream byte was written, but `RenameBarrier::commit`
+    /// discarded the download (checksum mismatch, verify I/O or rename
+    /// failure). Readers holding an open handle drain it exactly like
+    /// `Verifying` (the clients attached before the verdict get the bytes
+    /// they were promised; apt verifies them itself), while anyone still
+    /// looking for the file fails like the other abort reasons — the temp
+    /// file may already be unlinked.
+    Discarded,
 }
 
 #[derive(Debug)]
