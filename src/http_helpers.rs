@@ -124,9 +124,11 @@ pub(crate) async fn write_304_response(
     age: u32,
     etag: Option<&str>,
 ) -> std::io::Result<()> {
+    // No `Content-Length`: RFC 9110 section 8.6 allows it on a 304 only when
+    // it equals the 200 representation's length, which `0` never does.
+    // `Accept-Ranges` is advertised on the representation-bearing responses
+    // only, matching hyper's 304.
     let head = ResponseHead {
-        content_length: Some(0),
-        accept_ranges: true,
         last_modified: Some(last_modified_str),
         etag,
         age: Some(age),
@@ -145,13 +147,13 @@ pub(crate) async fn write_416_response(
     conn_action: ConnectionAction,
     file_size: u64,
 ) -> std::io::Result<()> {
-    // A `Success` head, unlike hyper's 416 (which carries `Server:`) — a
-    // wire-visible backend difference kept as-is.
+    // An `Error` head like hyper's 416 (proxy-generated rejection, carries
+    // `Server:`). `Content-Length: 0` frames the empty body for keep-alive;
+    // hyper emits the same automatically for its empty body.
     let head = ResponseHead {
         content_length: Some(0),
-        accept_ranges: true,
         content_range: Some(ResponseHead::unsatisfied_range(file_size)),
-        ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Success)
+        ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
     };
     head.write_to(stream, conn_version, conn_action, WireBody::None)
         .await
@@ -170,7 +172,6 @@ pub(crate) async fn write_invalid_response(
 ) -> std::io::Result<()> {
     let head = ResponseHead {
         content_length: Some(msg.len() as u64),
-        accept_ranges: true,
         retry_after: retry_after.map(retry_after_secs),
         ..ResponseHead::error(status)
     };

@@ -572,12 +572,16 @@ mod tests {
             let wire = render(&ResponseHead {
                 content_length: Some(0),
                 content_range: Some(ResponseHead::unsatisfied_range(1234)),
-                ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Success)
+                ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
             });
             let lines = header_lines(&wire);
             assert!(lines.contains(&"Content-Range: bytes */1234"), "{wire}");
             assert!(lines.contains(&"Content-Length: 0"), "{wire}");
-            assert!(!has_header(&lines, "Server"), "{wire}");
+            assert!(
+                lines.contains(&format!("Server: {APP_NAME}").as_str()),
+                "{wire}"
+            );
+            assert!(!has_header(&lines, "Content-Type"), "{wire}");
         }
 
         #[test]

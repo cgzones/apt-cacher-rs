@@ -782,9 +782,6 @@ async fn serve_cached_file(
             return response;
         }
         ServePlan::NotSatisfiable => {
-            // Unlike the sendfile writer, hyper's 416 is an `Error` head
-            // (carries `Server:`) — a wire-visible backend difference kept
-            // as-is.
             let head = ResponseHead {
                 content_range: Some(ResponseHead::unsatisfied_range(file_size)),
                 ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
