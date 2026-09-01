@@ -3946,20 +3946,26 @@ async fn follow_redirect(
         );
         return Ok(None);
     };
-    let Some(redirect_scheme) = moved_uri.scheme().and_then(Scheme::from_uri_scheme) else {
-        debug!("splice proxy: {status} redirect to non-HTTP scheme `{moved_uri}`, not following");
-        return Ok(None);
-    };
-    let Some(moved_host) = moved_uri.host() else {
+    if moved_uri.scheme().is_none() {
         // A relative Location (`/pool/...`) is legal per RFC 9110 and common
         // on redirectors, but this backend only follows absolute targets, so
-        // the resource is forwarded uncached on every request.
+        // the resource is forwarded uncached on every request. Checked before
+        // the scheme branch below, which would otherwise report a relative
+        // target as a non-HTTP scheme.
         warn_once_or_info!(
             "splice proxy: upstream {} sent {status} for {} with relative Location `{}`; not following the redirect and not caching the response",
             conn_details.mirror,
             conn_details.debname,
             location.escape_debug()
         );
+        return Ok(None);
+    }
+    let Some(redirect_scheme) = moved_uri.scheme().and_then(Scheme::from_uri_scheme) else {
+        debug!("splice proxy: {status} redirect to non-HTTP scheme `{moved_uri}`, not following");
+        return Ok(None);
+    };
+    let Some(moved_host) = moved_uri.host() else {
+        debug!("splice proxy: {status} redirect target `{moved_uri}` has no host, not following");
         return Ok(None);
     };
     if !is_host_allowed_cached(moved_host) {
