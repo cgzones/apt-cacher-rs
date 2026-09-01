@@ -888,9 +888,12 @@ async fn tls_connect(
 #[cfg(feature = "ktls")]
 struct KtlsReadyState {
     response: UpstreamResponse,
+    /// Response head plus every body byte already decrypted in userspace
+    /// (bytes past the header terminator and the plaintext drained from
+    /// buffered TLS records before RX offload took over). `header_buf[header_end..]`
+    /// is therefore the body prefix, exactly as on the standard path.
     header_buf: BytesMut,
     header_end: usize,
-    extra_body: Vec<u8>,
 }
 
 /// Errors from unbuffered kTLS request, distinguishing failure stages.
@@ -1998,11 +2001,14 @@ async fn unbuffered_ktls_request(
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(downloaded_body as u64);
     }
 
+    // Hand the drained plaintext to the drive as part of the body prefix so
+    // the kTLS and standard paths share one pre-loop write.
+    header_buf.extend_from_slice(&extra_body);
+
     Ok(KtlsReadyState {
         response,
         header_buf,
         header_end,
-        extra_body,
     })
 }
 
@@ -5030,94 +5036,84 @@ async fn splice_proxy_drive(
     let pool_host = mirror.host().to_string();
 
     #[cfg(feature = "ktls")]
-    let (
-        mut upstream,
-        mut upstream_resp,
-        mut header_buf,
-        mut header_end,
-        ktls_extra_body,
-        mut tls_label,
-    ) = match unbuffered_result {
-        KtlsResult::Ready(tcp, state) => {
-            // The kTLS fast path is outside HTTPS_UPGRADE_* accounting (see
-            // metrics.rs); both sides of the identity are skipped together.
-            cache_scheme(mirror, Scheme::Https);
-            // kTLS connections must NOT be pooled: the socket has kernel TLS
-            // RX configured for this specific session's keys and sequence
-            // numbers. Reusing it for a new request would layer a new TLS
-            // handshake on top of the kTLS socket, corrupting the stream.
-            // Future optimization: kTLS sockets could be pooled as a separate
-            // "kTLS-ready" type that writes plaintext (kernel encrypts via TX)
-            // and splices responses (kernel decrypts via RX), skipping the TLS
-            // handshake entirely. This requires a distinct pool entry type,
-            // control-message draining between requests, and key-update handling.
-            let poolable = false;
-            let splice_extra = state.extra_body;
-            let port = mirror_port(mirror, true);
-            // Honoring the kTLS-parsed response: record its upstream status
-            // here since no standard-path reconnect will run for this flow.
-            metrics::record_upstream_status(state.response.status_code);
-            (
-                PoolGuard::new(UpstreamConn::Tcp(tcp), pool_host, port, poolable),
-                state.response,
-                state.header_buf,
-                state.header_end,
-                splice_extra,
-                KTLS_TLS_LABEL,
-            )
-        }
-        KtlsResult::ResponseNotSpliceable { .. } => {
-            // Normally handled above, but during resume 206/416 fall through here
-            // to use the standard buffered path for proper resume handling.
-            // A full reconnect, not a reuse of the kTLS socket: that socket is
-            // already dropped and would be unsound to reuse (KtlsResult contract).
-            let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
-                mirror,
-                &host_authority,
-                upstream_path,
-                resume_offset,
-                resume_if_range.as_deref(),
-                volatile_cond.as_ref(),
-                None,
-            )
-            .await?;
-            let port = mirror_port(mirror, up.is_tls());
-            (
-                PoolGuard::new(up, pool_host, port, poolable),
-                resp,
-                hdr_buf,
-                hdr_end,
-                Vec::new(),
-                label,
-            )
-        }
-        KtlsResult::Failed { tls_succeeded } => {
-            // Cache HTTPS scheme if TLS handshake succeeded, avoiding double-HTTPS
-            // in auto mode
-            if tls_succeeded {
+    let (mut upstream, mut upstream_resp, mut header_buf, mut header_end, mut tls_label) =
+        match unbuffered_result {
+            KtlsResult::Ready(tcp, state) => {
+                // The kTLS fast path is outside HTTPS_UPGRADE_* accounting (see
+                // metrics.rs); both sides of the identity are skipped together.
                 cache_scheme(mirror, Scheme::Https);
+                // kTLS connections must NOT be pooled: the socket has kernel TLS
+                // RX configured for this specific session's keys and sequence
+                // numbers. Reusing it for a new request would layer a new TLS
+                // handshake on top of the kTLS socket, corrupting the stream.
+                // Future optimization: kTLS sockets could be pooled as a separate
+                // "kTLS-ready" type that writes plaintext (kernel encrypts via TX)
+                // and splices responses (kernel decrypts via RX), skipping the TLS
+                // handshake entirely. This requires a distinct pool entry type,
+                // control-message draining between requests, and key-update handling.
+                let poolable = false;
+                let port = mirror_port(mirror, true);
+                // Honoring the kTLS-parsed response: record its upstream status
+                // here since no standard-path reconnect will run for this flow.
+                metrics::record_upstream_status(state.response.status_code);
+                (
+                    PoolGuard::new(UpstreamConn::Tcp(tcp), pool_host, port, poolable),
+                    state.response,
+                    state.header_buf,
+                    state.header_end,
+                    KTLS_TLS_LABEL,
+                )
             }
-            let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
-                mirror,
-                &host_authority,
-                upstream_path,
-                resume_offset,
-                resume_if_range.as_deref(),
-                volatile_cond.as_ref(),
-                None,
-            )
-            .await?;
-            let port = mirror_port(mirror, up.is_tls());
-            (
-                PoolGuard::new(up, pool_host, port, poolable),
-                resp,
-                hdr_buf,
-                hdr_end,
-                Vec::new(),
-                label,
-            )
-        }
-    };
+            KtlsResult::ResponseNotSpliceable { .. } => {
+                // Normally handled above, but during resume 206/416 fall through here
+                // to use the standard buffered path for proper resume handling.
+                // A full reconnect, not a reuse of the kTLS socket: that socket is
+                // already dropped and would be unsound to reuse (KtlsResult contract).
+                let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
+                    mirror,
+                    &host_authority,
+                    upstream_path,
+                    resume_offset,
+                    resume_if_range.as_deref(),
+                    volatile_cond.as_ref(),
+                    None,
+                )
+                .await?;
+                let port = mirror_port(mirror, up.is_tls());
+                (
+                    PoolGuard::new(up, pool_host, port, poolable),
+                    resp,
+                    hdr_buf,
+                    hdr_end,
+                    label,
+                )
+            }
+            KtlsResult::Failed { tls_succeeded } => {
+                // Cache HTTPS scheme if TLS handshake succeeded, avoiding double-HTTPS
+                // in auto mode
+                if tls_succeeded {
+                    cache_scheme(mirror, Scheme::Https);
+                }
+                let (up, resp, hdr_buf, hdr_end, label, poolable) = standard_upstream_connect(
+                    mirror,
+                    &host_authority,
+                    upstream_path,
+                    resume_offset,
+                    resume_if_range.as_deref(),
+                    volatile_cond.as_ref(),
+                    None,
+                )
+                .await?;
+                let port = mirror_port(mirror, up.is_tls());
+                (
+                    PoolGuard::new(up, pool_host, port, poolable),
+                    resp,
+                    hdr_buf,
+                    hdr_end,
+                    label,
+                )
+            }
+        };
 
     #[cfg(not(feature = "ktls"))]
     let (mut upstream, mut upstream_resp, mut header_buf, mut header_end, mut tls_label) = {
@@ -5854,11 +5850,7 @@ async fn splice_proxy_drive(
 
     let body_prefix = &header_buf[header_end..];
 
-    #[cfg_attr(
-        not(feature = "ktls"),
-        expect(unused_mut, reason = "kTLS needs to adjust for extra body")
-    )]
-    let Some(mut splice_count) = body_content_length
+    let Some(splice_count) = body_content_length
         .get()
         .checked_sub(body_prefix.len() as u64)
     else {
@@ -5884,34 +5876,6 @@ async fn splice_proxy_drive(
         .map_err(|err| SpliceProxyError::Client(err, "body-CL mismatch 502"))?;
         return Ok(());
     };
-
-    #[cfg(feature = "ktls")]
-    {
-        let extra_len = ktls_extra_body.len() as u64;
-
-        splice_count = if let Some(sc) = splice_count.checked_sub(extra_len) {
-            sc
-        } else {
-            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            error!(
-                "splice proxy: kTLS extra body ({extra_len} bytes) exceeds remaining \
-                 body content length ({splice_count} bytes) for {} from mirror {}; returning 502",
-                conn_details.debname, conn_details.mirror
-            );
-            // `upstream_guard` poisons the connection on drop.
-            write_invalid_response(
-                client_stream,
-                conn_version,
-                conn_action,
-                StatusCode::BAD_GATEWAY,
-                "body Content-Length mismatch",
-                None,
-            )
-            .await
-            .map_err(|err| SpliceProxyError::Client(err, "kTLS extra-body mismatch 502"))?;
-            return Ok(());
-        };
-    }
 
     let start = PreciseInstant::now();
 
@@ -6052,22 +6016,21 @@ async fn splice_proxy_drive(
         }
     }
 
-    // Track file cursor for range-filtering pre-loop buffers.
-    #[cfg_attr(
-        not(feature = "ktls"),
-        expect(unused_mut, reason = "kTLS needs to adjust for included body")
-    )]
-    let mut pre_loop_file_pos: u64 = resume_offset;
+    // File cursor for range-filtering the pre-loop buffer.
+    let pre_loop_file_pos: u64 = resume_offset;
 
     // Latches if a pre-loop client write fails.  We swallow the error to
-    // keep caching the buffered prefix/extra-body, but if the splice loop
+    // keep caching the buffered prefix, but if the splice loop
     // never runs (entire body is in the prefix; `splice_count == 0`) we
     // need to close the connection at the end so the handler does not
     // keep-alive a socket whose write side just broke and so we do not
     // claim success after sending fewer bytes than `Content-Length`.
     let mut prefix_client_failed = false;
 
-    // If upstream sent body data in the same read as headers, write it directly.
+    // If upstream sent body data in the same read as headers (or, on the kTLS
+    // path, decrypted it in userspace before RX offload), write it directly.
+    // When the upstream is fast enough that the entire body lands inside the
+    // kTLS handshake drain, the prefix holds the full file.
     if !body_prefix.is_empty() {
         // Cache write first: the bytes are already in our hands, so the cache
         // file is the source of truth that other clients read from.  Only
@@ -6146,94 +6109,6 @@ async fn splice_proxy_drive(
             }
         }
 
-        #[cfg(feature = "ktls")]
-        {
-            pre_loop_file_pos += body_prefix.len() as u64;
-        }
-
-        // Notify concurrent clients of progress
-        dbarrier.ping();
-    }
-
-    // Write any kTLS-drained buffered plaintext to client + cache
-    #[cfg(feature = "ktls")]
-    if !ktls_extra_body.is_empty() {
-        // Same ordering as the body_prefix branch above: persist to the cache
-        // first, then attempt the (potentially failing) client write.  When
-        // the upstream sends fast enough that the entire body lands inside
-        // the kTLS handshake drain, ktls_extra_body holds the full file —
-        // dropping it on a disconnected client would lose everything.
-        // Flush for the same deferred-write-error reason as the body_prefix
-        // branch above.
-        let write_res = match tempfile.write_all(&ktls_extra_body).await {
-            Ok(()) => tempfile.flush().await,
-            Err(err) => Err(err),
-        };
-        write_res.map_err(|err| {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to write kTLS extra body to cache file `{}`; aborting the download and closing the connection:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            );
-            SpliceProxyError::AfterHeaderIo
-        })?;
-
-        let client_slice = range_slice(
-            &ktls_extra_body,
-            pre_loop_file_pos,
-            client_range_start,
-            client_range_len,
-        );
-        if !client_slice.is_empty() {
-            let config = global_config();
-            let mut prefix_rc = config
-                .min_download_rate
-                .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-            if let Err(err) = write_all_to_stream_rated(
-                client_stream,
-                client_slice,
-                &mut prefix_rc,
-                RateCheckDirection::Client,
-                config.http_timeout,
-            )
-            .await
-            {
-                // See the body-prefix site above: `TimedOut` covers both the
-                // rate-check failure and the `http_timeout` write stall, and
-                // neither must escalate to `warn`.
-                if err.kind() == ErrorKind::TimedOut || is_peer_disconnect(&err) {
-                    info!(
-                        "splice proxy: failed to write kTLS extra body to client {} for {} from mirror {}; continuing cache-only:  {}",
-                        conn_details.client,
-                        conn_details.debname,
-                        conn_details.mirror,
-                        ErrorReport(&err)
-                    );
-                } else {
-                    warn!(
-                        "splice proxy: failed to write kTLS extra body to client {} for {} from mirror {}; continuing cache-only:  {}",
-                        conn_details.client,
-                        conn_details.debname,
-                        conn_details.mirror,
-                        ErrorReport(&err)
-                    );
-                }
-                prefix_client_failed = true;
-            } else {
-                metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
-                client_bytes_sent += client_slice.len() as u64;
-            }
-        }
-
-        #[expect(
-            unused_assignments,
-            reason = "tracks file position for range filtering; last assignment before splice loop"
-        )]
-        {
-            pre_loop_file_pos += ktls_extra_body.len() as u64;
-        }
-
         // Notify concurrent clients of progress
         dbarrier.ping();
     }
@@ -6241,7 +6116,7 @@ async fn splice_proxy_drive(
     // Uncork before entering the splice loop, which uses SPLICE_F_MORE for coalescing
     drop(cork);
 
-    // Client-rate-window end after the prefix / kTLS-extra-body writes; covers
+    // Client-rate-window end after the prefix write; covers
     // the case where the splice loop never runs (whole body in the prefix).
     // Reassigned after the splice body block and the demoted file-serve task.
     let mut t_client_done = PreciseInstant::now();
