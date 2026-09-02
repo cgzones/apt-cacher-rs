@@ -1,5 +1,6 @@
 use std::ffi::OsString;
-use std::io;
+use std::fmt;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -17,6 +18,7 @@ use crate::{
     error::ErrorReport,
     humanfmt::HumanFmt,
     metrics,
+    utils::Logged,
 };
 
 use http::{StatusCode, header::CONTENT_LENGTH};
@@ -27,8 +29,8 @@ use crate::cleanup::model::{
     ReconcileUnit, SkipReason, SourceGroup, SweepAction, SweepReason, decide_sweep,
 };
 use crate::cleanup::packages::{
-    DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, body_is_incomplete,
-    packages_body_to_memfd, reduce_file_list, try_fetch_packages_file,
+    DebnameKind, FetchFailure, KeyMapper, PackagesLayout, ReduceContext, ReduceError,
+    body_is_incomplete, packages_body_to_memfd, reduce_file_list, try_fetch_packages_file,
 };
 use crate::cleanup::partials::cleanup_tmp_dir;
 use crate::cleanup::refs::{
@@ -59,6 +61,17 @@ pub(super) enum SpanClass {
     /// swept past the by-hash backstop.
     ByHashUncovered,
 }
+
+/// A cleanup unit abandoned on a cache-directory failure.
+///
+/// The failure was logged - with its path, verb and consequence - and counted
+/// (`CACHE_IO_FAILURE`) where it happened: the walker's one directory-failure
+/// line (`cache_walk::WalkContext::dir_failure`, `DirFailure::Abort`).  The
+/// carried [`Logged`] is the proof, so every arm this passes through
+/// (`run_reconcile_unit`, `run_byhash_unit`, `run_mirror_units`) maps it
+/// silently; there is exactly one line per abandoned unit.
+#[derive(Debug)]
+pub(super) struct CleanupUnitError(pub(super) Logged);
 
 pub(super) struct CleanupDone {
     pub(super) mirror: Mirror,
@@ -161,8 +174,9 @@ pub(super) enum ReduceOutcome {
 /// header arrived but the download aborted mid-stream, leaving fewer bytes than
 /// the announced `Content-Length`) all yield `Ok(ReduceOutcome::FetchFailed(_))`
 /// so the caller can bail the mirror conservatively. Only a *reduce parse error*
-/// (decompression bomb, malformed index, local read failure) propagates as
-/// `Err`; every caller now treats that conservatively too.
+/// (decompression bomb, malformed or zero-byte compressed index, local read
+/// failure) propagates as `Err`, unlogged - [`map_reduce`] logs it once with
+/// the resolver's consequence; every caller treats it conservatively too.
 pub(super) async fn reduce_against(
     plan: &FetchPlan<'_>,
     root: &Path,
@@ -170,7 +184,7 @@ pub(super) async fn reduce_against(
     tally: &mut UnitStats,
     appstate: &AppState,
     config: &Config,
-) -> Result<ReduceOutcome, io::Error> {
+) -> Result<ReduceOutcome, ReduceError> {
     let (mut response, pkgfmt) = match try_fetch_packages_file(
         &plan.mirror,
         &plan.base_uri,
@@ -264,9 +278,9 @@ pub(super) fn flat_root_fetch_plan<'a>(
 }
 
 /// Run every `unit` of one mirror in order, folding their [`UnitStats`] into a
-/// single per-mirror [`CleanupDone`]. A unit's hard error is logged
-/// (`"Failed to run a cleanup unit for mirror ..."`) and does NOT abort the
-/// remaining units for that mirror.
+/// single per-mirror [`CleanupDone`]. An abandoned unit ([`CleanupUnitError`],
+/// already logged where it failed) does NOT abort the remaining units for
+/// that mirror.
 pub(super) async fn run_mirror_units(
     entry: MirrorEntry,
     units: Vec<CleanupUnit>,
@@ -309,10 +323,9 @@ pub(super) async fn run_mirror_units(
                 bytes_removed += unit_stats.bytes_removed;
                 removed_unreferenced += unit_stats.removed_unreferenced;
             }
-            Err(err) => {
-                error!(
-                    "Failed to run a cleanup unit for mirror {mirror}; skipping it and continuing with the mirror's remaining units:  {}",
-                    ErrorReport(&err)
+            Err(CleanupUnitError(_logged @ Logged { .. })) => {
+                debug!(
+                    "Abandoned a cleanup unit for mirror {mirror}; continuing with the mirror's remaining units"
                 );
             }
         }
@@ -409,7 +422,7 @@ enum GroupResolution {
 /// exactly the inputs that shape carries, so there is no facet -> layout table
 /// to drift from the roots the classifier built and no policy-shape guard to
 /// fall through.
-async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, io::Error> {
+async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, CleanupUnitError> {
     match unit {
         CleanupUnit::Reconcile(unit) => run_reconcile_unit(unit, ctx).await,
         CleanupUnit::ByHash(unit) => run_byhash_unit(unit, ctx).await,
@@ -508,7 +521,10 @@ struct ByHashOutcome {
 ///
 /// `byhash_dir_present` is probed up front so an absent tree (the common case
 /// for a mirror without by-hash) skips the origins query and Release reads.
-async fn run_byhash_unit(unit: &ByHashUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, io::Error> {
+async fn run_byhash_unit(
+    unit: &ByHashUnit,
+    ctx: &MirrorCtx<'_>,
+) -> Result<UnitStats, CleanupUnitError> {
     let mirror = ctx.mirror;
     let layout = unit.layout;
 
@@ -593,7 +609,7 @@ async fn sweep_byhash_dir(
     now: SystemTime,
     mirror: &Mirror,
     layout: CacheLayout,
-) -> Result<ByHashOutcome, io::Error> {
+) -> Result<ByHashOutcome, CleanupUnitError> {
     let mut candidates: HashMap<OsString, SpanClass> = HashMap::new();
     let mut anomaly_removed = 0u64;
     let mut referenced_kept = 0u64;
@@ -640,7 +656,7 @@ async fn sweep_byhash_dir(
 
     match walker.finish() {
         WalkOutcome::Complete | WalkOutcome::RootMissing => {}
-        WalkOutcome::Aborted(err) => return Err(err),
+        WalkOutcome::Aborted { logged, err: _ } => return Err(CleanupUnitError(logged)),
     }
 
     let survivors = candidates.len() as u64;
@@ -680,7 +696,7 @@ async fn sweep_byhash_dir(
 async fn run_reconcile_unit(
     unit: &ReconcileUnit,
     mirror_ctx: &MirrorCtx<'_>,
-) -> Result<UnitStats, io::Error> {
+) -> Result<UnitStats, CleanupUnitError> {
     let layout = unit.facet.cache_layout();
     let policy = unit.policy;
     let &MirrorCtx {
@@ -692,15 +708,8 @@ async fn run_reconcile_unit(
         now,
     } = mirror_ctx;
 
-    let mut cached_files = scan_candidates(&unit.tree, &entry.path)
-        .await
-        .inspect_err(|err| {
-            error!(
-                "Failed to list the cached files in `{}`; abandoning this cleanup unit:  {}",
-                unit.tree.root.display(),
-                ErrorReport(err)
-            );
-        })?;
+    // An unreadable directory was logged by the walker; the unit is abandoned.
+    let mut cached_files = scan_candidates(&unit.tree, &entry.path).await?;
 
     trace!("Cached files ({}): {cached_files:?}", cached_files.len());
 
@@ -928,6 +937,108 @@ fn keymapper_for(spec: &KeymapSpec) -> KeyMapper<'_> {
     }
 }
 
+/// The `mirrors_v2` row gate shared by the two resolvers whose referencing
+/// index belongs to *another* row (the archive root, the flat-repo root):
+/// cleanup never mints a row, so the group runs only when that row exists.
+/// `Ok(())` proceeds; `Err` is the group's resolution (`NoRow`, or `DbError`
+/// after the one error line naming `noun`).
+async fn gate_on_row(
+    ctx: &ReconcileCtx<'_>,
+    seg: &str,
+    noun: &'static str,
+) -> Result<(), GroupResolution> {
+    match ctx
+        .appstate
+        .database
+        .mirror_exists(ctx.mirror.host(), ctx.mirror.port(), seg)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(GroupResolution::Ran(GroupOutcome::NotApplicable(
+            SkipReason::NoRow {
+                seg: seg.to_owned(),
+            },
+        ))),
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!(
+                "Failed to check the mirror row of {noun} `{seg}`; continuing with the mirror's remaining index sources:  {}",
+                ErrorReport(&err)
+            );
+            Err(GroupResolution::Ran(GroupOutcome::NotApplicable(
+                SkipReason::DbError,
+            )))
+        }
+    }
+}
+
+/// The fetch-buffer-reduce plan for one active origin's `dists/.../Packages*`
+/// index, shared by the two origin-driven resolvers.  `fetch_mirror` is the
+/// row the index is fetched through (the mirror itself, or its archive
+/// root); `owner_mirror` is where the candidate debs live and keys their
+/// `cache_metadata` invalidation, so it is the reconciled mirror in both.
+fn origin_fetch_plan<'a>(
+    fetch_mirror: &Mirror,
+    owner_mirror: &Mirror,
+    origin: &OriginEntry,
+    cache_layout: CacheLayout,
+    keymap: KeyMapper<'a>,
+) -> FetchPlan<'a> {
+    FetchPlan {
+        mirror: fetch_mirror.clone(),
+        owner_mirror: owner_mirror.clone(),
+        base_uri: origin.uri(),
+        layout: PackagesLayout::Dists,
+        cache_layout,
+        debname: DebnameKind::OriginScoped {
+            distribution: origin.distribution.clone(),
+            component: origin.component.clone(),
+            architecture: origin.architecture.clone(),
+        },
+        keymap,
+    }
+}
+
+/// The one mapping of a [`reduce_against`] outcome onto a group's
+/// resolution, shared by every resolver: `Continue` means the index reduced
+/// and the resolver carries on (its next origin, or `Complete`); `Break`
+/// carries the group's resolution.  An emptied candidate map short-circuits
+/// as `Exhausted`; a fetch failure is handed to `on_fetch_failed` for the
+/// resolver's own diagnostic (the structured-pool bail warn, the hybrid
+/// debug line, or nothing where the tail's age-fallback warn reports the
+/// status) before resolving to `FetchFailed`; a reduce error is logged here,
+/// once, as `Failed to reduce {index} for mirror {mirror}; {consequence}:
+/// {cause}` - the cause ([`ReduceError`]) is unlogged until this point -
+/// and resolves to `ParseError`.
+fn map_reduce(
+    result: Result<ReduceOutcome, ReduceError>,
+    mirror: &Mirror,
+    index: fmt::Arguments<'_>,
+    parse_consequence: &'static str,
+    on_fetch_failed: impl FnOnce(&FetchFailure),
+) -> ControlFlow<GroupResolution> {
+    match result {
+        Ok(ReduceOutcome::Reduced) => ControlFlow::Continue(()),
+        Ok(ReduceOutcome::Exhausted) => {
+            debug!(
+                "Every cached deb file of mirror {mirror} is referenced by {index}; skipping the remaining index sources and the sweep"
+            );
+            ControlFlow::Break(GroupResolution::Exhausted)
+        }
+        Ok(ReduceOutcome::FetchFailed(failure)) => {
+            on_fetch_failed(&failure);
+            ControlFlow::Break(GroupResolution::Ran(GroupOutcome::FetchFailed(failure)))
+        }
+        Err(err) => {
+            error!(
+                "Failed to reduce {index} for mirror {mirror}; {parse_consequence}:  {}",
+                ErrorReport(&err)
+            );
+            ControlFlow::Break(GroupResolution::Ran(GroupOutcome::ParseError))
+        }
+    }
+}
+
 /// Hybrid flat-pool source resolver (`OriginPackages { ArchiveRoot }`, issue
 /// #162, e.g. Gitea/Forgejo `.../pool/<dist>/<comp>`): a faithful port of the
 /// deleted `try_strict_flat_pool_cleanup`. The referencing `Packages` index
@@ -969,25 +1080,8 @@ async fn resolve_origin_packages_archive_root(
         return GroupResolution::Skipped;
     }
 
-    match appstate
-        .database
-        .mirror_exists(mirror.host(), mirror.port(), root)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::NoRow {
-                seg: root.to_owned(),
-            }));
-        }
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!(
-                "Failed to check the mirror row of archive root `{root}`; continuing with the mirror's remaining index sources:  {}",
-                ErrorReport(&err)
-            );
-            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
-        }
+    if let Err(resolution) = gate_on_row(ctx, root, "archive root").await {
+        return resolution;
     }
 
     let origins = match appstate
@@ -1024,37 +1118,28 @@ async fn resolve_origin_packages_archive_root(
     );
 
     for origin in &active_origins {
-        let plan = FetchPlan {
-            mirror: archive_mirror.clone(),
-            // The debs live under the original flat sub-path `mirror`, not the
-            // archive root, so metadata invalidation must key by `mirror`.
-            owner_mirror: mirror.clone(),
-            base_uri: origin.uri(),
-            layout: PackagesLayout::Dists,
+        // The debs live under the original flat sub-path `mirror`, not the
+        // archive root, so metadata invalidation must key by `mirror`.
+        let plan = origin_fetch_plan(
+            &archive_mirror,
+            mirror,
+            origin,
             cache_layout,
-            debname: DebnameKind::OriginScoped {
-                distribution: origin.distribution.clone(),
-                component: origin.component.clone(),
-                architecture: origin.architecture.clone(),
-            },
-            keymap: keymapper_for(keymap),
-        };
-        match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
-            Ok(ReduceOutcome::Reduced) => {}
-            Ok(ReduceOutcome::Exhausted) => return GroupResolution::Exhausted,
-            Ok(ReduceOutcome::FetchFailed(status)) => {
+            keymapper_for(keymap),
+        );
+        let step = map_reduce(
+            reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+            mirror,
+            format_args!("the archive-root Packages index `{root}`"),
+            "continuing with the mirror's remaining index sources",
+            |status| {
                 debug!(
                     "Failed to fetch the archive-root Packages index for `{root}` ({status}); continuing with fallback index sources for mirror {mirror}"
                 );
-                return GroupResolution::Ran(GroupOutcome::FetchFailed(status));
-            }
-            Err(err) => {
-                error!(
-                    "Failed to reduce the archive-root Packages index for `{root}`; continuing with the mirror's remaining index sources:  {}",
-                    ErrorReport(&err)
-                );
-                return GroupResolution::Ran(GroupOutcome::ParseError);
-            }
+            },
+        );
+        if let ControlFlow::Break(resolution) = step {
+            return resolution;
         }
     }
 
@@ -1096,46 +1181,22 @@ async fn resolve_flat_root_segment(
         return GroupResolution::Skipped;
     }
 
-    match appstate
-        .database
-        .mirror_exists(mirror.host(), mirror.port(), seg)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::NoRow {
-                seg: seg.to_owned(),
-            }));
-        }
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!(
-                "Failed to check the mirror row of flat-repo root `{seg}`; continuing with the mirror's remaining index sources:  {}",
-                ErrorReport(&err)
-            );
-            return GroupResolution::Ran(GroupOutcome::NotApplicable(SkipReason::DbError));
-        }
+    if let Err(resolution) = gate_on_row(ctx, seg, "flat-repo root").await {
+        return resolution;
     }
 
     let plan = flat_root_fetch_plan(mirror, seg, prefix);
-    match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
-        Ok(ReduceOutcome::Reduced) => GroupResolution::Ran(GroupOutcome::Complete),
-        Ok(ReduceOutcome::Exhausted) => {
-            debug!(
-                "Flat mirror {mirror}: fully reconciled against flat-repo root `{seg}`; skipped co-located probe"
-            );
-            GroupResolution::Exhausted
-        }
-        Ok(ReduceOutcome::FetchFailed(status)) => {
-            GroupResolution::Ran(GroupOutcome::FetchFailed(status))
-        }
-        Err(err) => {
-            error!(
-                "Failed to reduce the flat-root Packages index `{seg}` for mirror {mirror}; falling back to time-based retention:  {}",
-                ErrorReport(&err)
-            );
-            GroupResolution::Ran(GroupOutcome::ParseError)
-        }
+    // A fetch failure is silent here: the tail's age-fallback warn reports
+    // the root status next to the co-located one.
+    match map_reduce(
+        reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+        mirror,
+        format_args!("the flat-root Packages index `{seg}`"),
+        "falling back to time-based retention",
+        |_status| {},
+    ) {
+        ControlFlow::Continue(()) => GroupResolution::Ran(GroupOutcome::Complete),
+        ControlFlow::Break(resolution) => resolution,
     }
 }
 
@@ -1178,24 +1239,17 @@ async fn resolve_flat_colocated(
         debname: DebnameKind::Flat,
         keymap: KeyMapper::Relpath,
     };
-    match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
-        Ok(ReduceOutcome::Reduced) => GroupResolution::Ran(GroupOutcome::Complete),
-        Ok(ReduceOutcome::Exhausted) => {
-            debug!(
-                "All cached flat deb files for mirror {mirror} are referenced by the Packages index"
-            );
-            GroupResolution::Exhausted
-        }
-        Ok(ReduceOutcome::FetchFailed(status)) => {
-            GroupResolution::Ran(GroupOutcome::FetchFailed(status))
-        }
-        Err(err) => {
-            error!(
-                "Failed to reduce the co-located flat Packages index for mirror {mirror}; falling back to time-based retention:  {}",
-                ErrorReport(&err)
-            );
-            GroupResolution::Ran(GroupOutcome::ParseError)
-        }
+    // A fetch failure is silent here: the tail's age-fallback warn reports
+    // the co-located status.
+    match map_reduce(
+        reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+        mirror,
+        format_args!("the co-located flat Packages index"),
+        "falling back to time-based retention",
+        |_status| {},
+    ) {
+        ControlFlow::Continue(()) => GroupResolution::Ran(GroupOutcome::Complete),
+        ControlFlow::Break(resolution) => resolution,
     }
 }
 
@@ -1297,49 +1351,34 @@ async fn resolve_origin_packages_self(
     // because the structured pool flattens `Filename:` relpaths to basename;
     // `layout: Dists` is where the referencing `Packages` index lives.
     for origin in active_origins {
-        let plan = FetchPlan {
-            mirror: mirror.clone(),
-            owner_mirror: mirror.clone(),
-            base_uri: origin.uri(),
-            layout: PackagesLayout::Dists,
-            cache_layout: CacheLayout::StructuredPool,
-            debname: DebnameKind::OriginScoped {
-                distribution: origin.distribution.clone(),
-                component: origin.component.clone(),
-                architecture: origin.architecture.clone(),
-            },
-            keymap: KeyMapper::Basename,
-        };
-        match reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await {
-            Ok(ReduceOutcome::Reduced) => {}
-            Ok(ReduceOutcome::Exhausted) => {
-                debug!(
-                    "All cached deb files for mirror {mirror} are referenced by the Packages index"
-                );
-                return GroupResolution::Exhausted;
-            }
-            // A missing Packages file leaves us unable to complete the
-            // reference set; deleting now risks wiping files referenced only by
-            // this origin (typical when a distribution goes EOL upstream). Warn
-            // here (host/path/status in hand) and hand the tail a `FetchFailed`
-            // so `decide_sweep` returns `Bail` — no sweep this cycle.
-            Ok(ReduceOutcome::FetchFailed(status)) => {
+        let plan = origin_fetch_plan(
+            mirror,
+            mirror,
+            origin,
+            CacheLayout::StructuredPool,
+            KeyMapper::Basename,
+        );
+        // A missing Packages file leaves us unable to complete the reference
+        // set; deleting now risks wiping files referenced only by this origin
+        // (typical when a distribution goes EOL upstream). Warn here
+        // (host/path/status in hand) and hand the tail a `FetchFailed` so
+        // `decide_sweep` returns `Bail` - no sweep this cycle. A reduce error
+        // (malformed/decompression-bomb index, local read failure) leaves the
+        // reference set incomplete just like a fetch miss, so it bails too.
+        let step = map_reduce(
+            reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+            mirror,
+            format_args!("the Packages index"),
+            "skipping cleanup for this mirror",
+            |status| {
                 warn!(
                     "Failed to fetch the Packages index for host {} path {} ({status}); skipping cleanup for mirror {mirror}",
                     origin.host, origin.mirror_path
                 );
-                return GroupResolution::Ran(GroupOutcome::FetchFailed(status));
-            }
-            // A reduce parse error (malformed/decompression-bomb index, local
-            // read failure) leaves the reference set incomplete just like a
-            // fetch miss -- hand the tail a `ParseError` so it bails.
-            Err(err) => {
-                error!(
-                    "Failed to reduce the Packages index for mirror {mirror}; skipping cleanup for this mirror:  {}",
-                    ErrorReport(&err)
-                );
-                return GroupResolution::Ran(GroupOutcome::ParseError);
-            }
+            },
+        );
+        if let ControlFlow::Break(resolution) = step {
+            return resolution;
         }
     }
 

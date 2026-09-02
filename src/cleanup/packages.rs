@@ -274,6 +274,34 @@ async fn process_stanza(
     }
 }
 
+/// Why a fetched `Packages` index could not be reduced against the candidate
+/// set.  Carries the cause only: the resolver receiving it decides the
+/// consequence (bail the mirror, continue with the next index source, fall
+/// back to age-based retention) and logs the one line, with this rendered
+/// through `ErrorReport` after it.  `filename` is the synthetic memfd name
+/// (`DebnameKind::memfd_name`), which identifies the origin's index.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ReduceError {
+    /// A gzip/xz index of zero bytes is malformed (both formats need at least
+    /// a header), never "no stanzas" - only a raw index may be empty.
+    #[error("compressed Packages index `{filename}` is zero bytes")]
+    ZeroSizeCompressed { filename: String },
+    #[error("failed to stat Packages index `{filename}` for the decompression-ratio guard")]
+    Stat {
+        filename: String,
+        #[source]
+        source: io::Error,
+    },
+    /// Decode/read failure, including the decompressed-size and line caps
+    /// and a decompression bomb.
+    #[error("failed to read Packages index `{filename}` (may exceed the size or line limit)")]
+    Read {
+        filename: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
 /// Stream a (possibly compressed) Debian `Packages` file stanza by stanza,
 /// reducing the candidate `file_list` by basename and verifying matched
 /// cache files against the stanza's `SHA256:`/`SHA512:` digest.
@@ -282,8 +310,9 @@ async fn process_stanza(
 /// or malformed file bails the mirror this cycle rather than reconciling against
 /// a partial reference set (which would grace-sweep still-referenced debs). That
 /// is the deliberate difference from `integrity::ingest_packages_file`, which
-/// shares the decode ladder via [`packages_reader`] but degrades to a
-/// less-populated registry instead.
+/// shares the decode ladder via [`packages_reader`] and the stanza loop via
+/// [`StanzaStream`] but degrades to a less-populated registry instead.  The
+/// `Err` is the cause alone; the resolver logs it with its consequence.
 pub(super) async fn reduce_file_list(
     compression: PackagesCompression,
     file: tokio::fs::File,
@@ -291,21 +320,15 @@ pub(super) async fn reduce_file_list(
     file_list: &mut HashMap<OsString, SpanClass>,
     ctx: &mut ReduceContext<'_>,
     config: &Config,
-) -> Result<(), io::Error> {
+) -> Result<(), ReduceError> {
     debug_assert!(!file_list.is_empty(), "avoid unnecessary work");
 
     let buffer_size = config.buffer_size;
 
-    let mdata = match file.metadata().await {
-        Ok(m) => m,
-        Err(err) => {
-            error!(
-                "Failed to stat Packages file `{filename}` for the decompression-ratio guard; skipping this mirror's reconcile this cycle:  {}",
-                ErrorReport(&err)
-            );
-            return Err(err);
-        }
-    };
+    let mdata = file.metadata().await.map_err(|source| ReduceError::Stat {
+        filename: filename.to_owned(),
+        source,
+    })?;
 
     let Some(compressed_size) = NonZero::new(mdata.len()) else {
         return match compression {
@@ -319,13 +342,9 @@ pub(super) async fn reduce_file_list(
             // For compressed formats an empty file is malformed:
             // both gzip and xz require at least a header.
             PackagesCompression::Gz | PackagesCompression::Xz => {
-                // `filename` is the synthetic memfd name, so name the mirror:
-                // this bails the mirror's whole reconcile for the cycle.
-                warn!(
-                    "Compressed Packages index `{filename}` for mirror {} is zero bytes; skipping this mirror's reconcile for this cycle (nothing reclaimed)",
-                    ctx.mirror
-                );
-                Err(io::Error::new(io::ErrorKind::InvalidData, "zero size"))
+                Err(ReduceError::ZeroSizeCompressed {
+                    filename: filename.to_owned(),
+                })
             }
         };
     };
@@ -352,12 +371,11 @@ pub(super) async fn reduce_file_list(
                 }
             }
             Ok(None) => return Ok(()),
-            Err(err) => {
-                error!(
-                    "Failed to read Packages file `{filename}` (may exceed the size limit); skipping this mirror's reconcile this cycle:  {}",
-                    ErrorReport(&err)
-                );
-                return Err(err);
+            Err(source) => {
+                return Err(ReduceError::Read {
+                    filename: filename.to_owned(),
+                    source,
+                });
             }
         }
     }

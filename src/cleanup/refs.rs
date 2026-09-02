@@ -169,7 +169,7 @@ pub(super) async fn build_byhash_reference_set(
         // An absent directory has no Release files by definition; an
         // unreadable one was logged by the walker.  Neither is a reason to
         // warn about a Release-less tree.
-        WalkOutcome::RootMissing | WalkOutcome::Aborted(_) => return None,
+        WalkOutcome::RootMissing | WalkOutcome::Aborted { .. } => return None,
     }
 
     // Reference mode reconciles the whole union `by-hash/` tree at once, so an

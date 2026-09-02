@@ -1,13 +1,12 @@
 use std::borrow::Cow;
 use std::ffi::OsString;
-use std::io;
 use std::path::Path;
 
 use hashbrown::HashMap;
 use tracing::{debug, error, trace};
 
 use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker};
-use crate::cleanup::engine::SpanClass;
+use crate::cleanup::engine::{CleanupUnitError, SpanClass};
 use crate::cleanup::model::{TreeSpec, Walk};
 use crate::deb_mirror::{NestedMirrorRelation, is_deb_package, nested_mirror_relation};
 use crate::error::ErrorReport;
@@ -73,8 +72,8 @@ static RECONCILE_WALK: WalkContext = WalkContext {
 /// and nested-mirror boundaries are not entered.  Either way only
 /// `.deb`/`.udeb`/`.ddeb`-named regular files become candidates; every
 /// symlink / FIFO / socket / device met on the way is unlinked, and an
-/// unreadable directory abandons the unit (`Err`) - reconciling against a
-/// partial candidate set would grace-sweep live debs.
+/// unreadable directory abandons the unit (`Err`, logged by the walker) -
+/// reconciling against a partial candidate set would grace-sweep live debs.
 ///
 /// Candidates are keyed by the entry's path *relative to `tree.root`*, which
 /// is what `sweep_candidates` rejoins to reach the file - so it must stay
@@ -82,7 +81,7 @@ static RECONCILE_WALK: WalkContext = WalkContext {
 pub(super) async fn scan_candidates(
     tree: &TreeSpec,
     mirror_path: &str,
-) -> Result<HashMap<OsString, SpanClass>, io::Error> {
+) -> Result<HashMap<OsString, SpanClass>, CleanupUnitError> {
     let mut ret = HashMap::new();
     let mut walker = Walker::new(&tree.root, &RECONCILE_WALK, OnMissing::Tolerate, ());
 
@@ -173,7 +172,7 @@ pub(super) async fn scan_candidates(
 
     match walker.finish() {
         WalkOutcome::Complete | WalkOutcome::RootMissing => Ok(ret),
-        WalkOutcome::Aborted(err) => Err(err),
+        WalkOutcome::Aborted { logged, err: _ } => Err(CleanupUnitError(logged)),
     }
 }
 

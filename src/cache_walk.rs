@@ -43,7 +43,7 @@ use std::{
 use tokio::fs::{DirEntry, ReadDir};
 use tracing::{debug, error, warn};
 
-use crate::{error::ErrorReport, metrics};
+use crate::{error::ErrorReport, metrics, utils::Logged};
 
 /// Wording and failure policy of one walk.  Every field is a fragment of the
 /// walker's fixed sentences; the caller supplies only the *consequence*
@@ -107,9 +107,13 @@ pub(crate) enum WalkOutcome {
     Complete,
     /// The root does not exist and the walk was [`OnMissing::Tolerate`].
     RootMissing,
-    /// A [`DirFailure::Abort`] fired; the error was already logged and
-    /// counted.
-    Aborted(io::Error),
+    /// A [`DirFailure::Abort`] fired.  `logged` proves the failure was
+    /// logged and counted where it happened (the walker's one directory-
+    /// failure line), so a caller maps it silently - cleanup's
+    /// `CleanupUnitError` carries the proof.  `err` is for a caller that has
+    /// to classify the failure or fold it into a typed error of its own
+    /// (`task_cache_scan`), never for a second line.
+    Aborted { logged: Logged, err: io::Error },
 }
 
 /// What an entry is, by `lstat` semantics.
@@ -159,7 +163,7 @@ pub(crate) struct Walker<T> {
     /// [`Walker::next`] call, when the yielded entry is known to be a dir.
     descend: Option<T>,
     root_missing: bool,
-    aborted: Option<io::Error>,
+    aborted: Option<(Logged, io::Error)>,
 }
 
 impl<T: Copy + Send + Sync> Walker<T> {
@@ -253,8 +257,8 @@ impl<T: Copy + Send + Sync> Walker<T> {
     /// caller that cannot abort and does not care whether the root existed.
     #[must_use]
     pub(crate) fn finish(self) -> WalkOutcome {
-        if let Some(err) = self.aborted {
-            WalkOutcome::Aborted(err)
+        if let Some((logged, err)) = self.aborted {
+            WalkOutcome::Aborted { logged, err }
         } else if self.root_missing {
             WalkOutcome::RootMissing
         } else {
@@ -282,18 +286,17 @@ impl<T: Copy + Send + Sync> Walker<T> {
 
     /// The one site logging and counting a directory-level failure.
     fn dir_failed(&mut self, verb: &'static str, path: &Path, err: io::Error) {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
+        let logged = Logged::cache_io_failure(format_args!(
             "Failed to {verb} {} `{}`; {}:  {}",
             self.ctx.what,
             path.display(),
             self.ctx.dir_failure.consequence(),
             ErrorReport(&err)
-        );
+        ));
         self.current = None;
         if let DirFailure::Abort(_) = self.ctx.dir_failure {
             self.pending.clear();
-            self.aborted = Some(err);
+            self.aborted = Some((logged, err));
         }
     }
 }
@@ -628,9 +631,8 @@ mod tests {
         let before = metrics::CACHE_IO_FAILURE.get();
         let (events, outcome) = collect(&absent, &ABORT, OnMissing::Fail, &[]).await;
         assert!(events.is_empty());
-        assert!(matches!(outcome, WalkOutcome::Aborted(_)), "{outcome:?}");
-        let WalkOutcome::Aborted(err) = outcome else {
-            return;
+        let WalkOutcome::Aborted { logged: _, err } = outcome else {
+            unreachable!("expected Aborted, got {outcome:?}")
         };
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(metrics::CACHE_IO_FAILURE.get() > before);
@@ -668,7 +670,10 @@ mod tests {
         assert!(metrics::CACHE_IO_FAILURE.get() > before);
 
         let (events, outcome) = collect(dir.path(), &ABORT, OnMissing::Fail, &["locked"]).await;
-        assert!(matches!(outcome, WalkOutcome::Aborted(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, WalkOutcome::Aborted { .. }),
+            "{outcome:?}"
+        );
         // The root was fully listed before the subdirectory was opened.
         assert_eq!(events.len(), 2);
 

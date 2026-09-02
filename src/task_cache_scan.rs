@@ -248,7 +248,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
 
     match walker.finish() {
         WalkOutcome::Complete | WalkOutcome::RootMissing => Ok(totals),
-        WalkOutcome::Aborted(err) => Err(CacheScanError::Io(err)),
+        WalkOutcome::Aborted { logged: _, err } => Err(CacheScanError::Io(err)),
     }
 }
 
