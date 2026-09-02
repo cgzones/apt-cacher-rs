@@ -324,12 +324,26 @@ pub(crate) struct PartialResume {
 }
 
 impl PartialResume {
-    fn fresh(guard: TempPath) -> Self {
+    /// A permanent file with no partial to resume: the download starts at
+    /// byte 0 on the deterministic partial path `guard` reserves.
+    pub(crate) fn fresh(guard: TempPath) -> Self {
         Self {
             offset: 0,
             expected_total: None,
             if_range: None,
             partial: PartialDownload::Fresh(guard),
+        }
+    }
+
+    /// A volatile file: no partial-file semantics, the download starts at
+    /// byte 0 into a random temp file.
+    #[cfg(feature = "splice")]
+    pub(crate) fn volatile() -> Self {
+        Self {
+            offset: 0,
+            expected_total: None,
+            if_range: None,
+            partial: PartialDownload::Volatile,
         }
     }
 }
