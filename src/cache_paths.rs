@@ -3,7 +3,7 @@
 //! [`CachePaths`] is the only code that joins the layout directory names
 //! (`flat/`, `dists/`, `by-hash/`, `tmp/`) onto a cache root.  The serve
 //! path (`ConnectionDetails::cache_file_path`), the `.partial` placement
-//! (`utils::create_partial_file`), cleanup's unit roots
+//! (`partial_file::create_partial_file`), cleanup's unit roots
 //! (`cleanup::model::classify_mirror`), the startup cache scan
 //! (`task_cache_scan`), the web interface's per-mirror size walk and the
 //! legacy-layout migration probe all derive their paths here, so they cannot

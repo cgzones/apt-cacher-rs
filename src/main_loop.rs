@@ -34,11 +34,11 @@ use crate::{
     database_task::{self, db_loop},
     deb_mirror,
     error::ErrorReport,
-    flat_blocklist, global_config, healthcheck,
+    flat_blocklist, global_config,
+    healthcheck::{self, filesystem_space},
     humanfmt::HumanFmt,
     metrics,
     task_cache_scan::task_cache_scan,
-    utils::filesystem_space,
     warn_once_or_debug,
 };
 #[cfg(feature = "hyper")]

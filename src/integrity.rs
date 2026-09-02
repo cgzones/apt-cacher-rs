@@ -31,8 +31,8 @@ use parking_lot::Mutex;
 use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
+use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
 use crate::limits::{self, LimitedReader, PackagesCompression};
-use crate::utils::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
 use crate::{
     cache_layout::ResourceKind,
     index_parser::{self, HashAlgo, IndexFormat, StanzaStream},

@@ -365,7 +365,7 @@ impl ConnectionDetails {
 
     /// The alias-resolved on-disk identity of this request's mirror: the
     /// alias' `main` host when the request was resolved against an alias
-    /// mapping, else the mirror's own host.  `utils::create_partial_file`
+    /// mapping, else the mirror's own host.  `partial_file::create_partial_file`
     /// resolves the same site through `InitBarrier::site`, so the `.partial`
     /// lands next to its rename target.
     #[must_use]

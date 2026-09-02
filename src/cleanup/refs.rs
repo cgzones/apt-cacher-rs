@@ -9,10 +9,10 @@ use crate::cache_layout::CacheLayout;
 use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker};
 use crate::database::OriginEntry;
 use crate::error::ErrorReport;
+use crate::fs_open::probe_dir;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
 use crate::integrity::read_release_to_string;
 use crate::metrics;
-use crate::utils::probe_dir;
 use crate::warn_once_or_debug;
 
 /// The set of by-hash digests referenced by a mirror's current

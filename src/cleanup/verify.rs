@@ -2,9 +2,9 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use crate::fs_open::nofollow_nonblock_options;
 use crate::index_parser::{HashAlgo, byhash_digest_for_algo, hash_open_file, hex_encode};
 use crate::metrics;
-use crate::utils::nofollow_nonblock_options;
 use crate::xattr_helpers::{self, XattrValue};
 
 /// Xattr recording a successful cleanup digest verification, persisted as

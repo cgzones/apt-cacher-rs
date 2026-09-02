@@ -123,7 +123,7 @@ impl Role {
 /// Why a delivery stopped short, when the transport reported a reason.
 pub(crate) struct AbortCause<'a> {
     pub(crate) reason: &'a dyn Display,
-    /// Classified by the caller (`utils::is_peer_disconnect` or the body's
+    /// Classified by the caller (`error::is_peer_disconnect` or the body's
     /// equivalent): demotes the abort line to INFO and bumps
     /// `CLIENT_DISCONNECTED_MID_BODY`.
     pub(crate) peer_disconnect: bool,

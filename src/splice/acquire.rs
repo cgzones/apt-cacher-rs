@@ -24,11 +24,11 @@ use crate::config::ClientHost;
 use crate::deb_mirror::{Mirror, MirrorKind};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
+use crate::partial_file;
 use crate::scheme_cache::SchemeDecision;
 use crate::upstream_head::RejectReason;
 #[cfg(feature = "ktls")]
 use crate::upstream_head::{DownloadPlan, plan_fresh_download};
-use crate::utils;
 use crate::{
     Scheme, global_config, metrics, permitted_host_cache::is_host_allowed_cached, scheme_cache,
     upstream_retry, warn_once_or_info, warn_once_or_info_logged,
@@ -495,7 +495,7 @@ pub(super) fn warn_upstream_reject(
 /// Shared by the 416 and invalid-Content-Range recovery paths
 /// (`ResumeAnomaly::needs_refetch`).
 pub(super) async fn discard_partial_and_retry(
-    partial: &mut utils::PartialDownload,
+    partial: &mut partial_file::PartialDownload,
     mirror: &Mirror,
     host_authority: &str,
     upstream_path: &str,

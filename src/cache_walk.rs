@@ -43,7 +43,7 @@ use std::{
 use tokio::fs::{DirEntry, ReadDir};
 use tracing::{debug, error, warn};
 
-use crate::{error::ErrorReport, metrics, utils::Logged};
+use crate::{error::ErrorReport, log_once::Logged, metrics};
 
 /// Wording and failure policy of one walk.  Every field is a fragment of the
 /// walker's fixed sentences; the caller supplies only the *consequence*

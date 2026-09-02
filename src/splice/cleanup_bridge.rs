@@ -14,12 +14,12 @@ use tracing::{debug, error};
 use crate::cache_layout::ConnectionDetails;
 use crate::deb_mirror::Mirror;
 use crate::error::ErrorReport;
+use crate::fs_open::{
+    CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
+};
 use crate::humanfmt::HumanFmt;
 use crate::limits;
 use crate::metrics;
-use crate::utils::{
-    CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
-};
 use crate::warn_once_or_info;
 use crate::{
     AppState,

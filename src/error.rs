@@ -59,7 +59,7 @@ fn fmt_client_download_rate(
 /// `Display` and are deliberately **not** exposed via `source()`.  Log sites
 /// report this type through [`ErrorReport`] too, which walks `source()`, so
 /// re-exposing the transport error there would print it twice; and
-/// `hyper_conn::is_io_timed_out_in_chain` walks `source()` looking for a
+/// [`is_io_timed_out_in_chain`] walks `source()` looking for a
 /// `TimedOut` `io::Error`, which re-exposure would silently reclassify.  The
 /// cause therefore has to be part of `Display`.  Hence the hand-written `From`
 /// impls below rather than `#[from]`, which would imply `#[source]`.
@@ -153,6 +153,57 @@ pub(crate) struct UpstreamFetchError {
     pub(crate) reason: String,
 }
 
+/// Returns `true` when `err` indicates the peer terminated the connection
+/// (by reset, abort, half-close, or EOF). Used to demote routine "client
+/// went away" log lines from warn to info, since they are not actionable
+/// for the operator.
+///
+/// `ErrorKind::TimedOut` is deliberately *not* included here: in this
+/// codebase, `TimedOut` `io::Error`s overwhelmingly originate from the
+/// proxy's own decisions — `wait_socket_rated` HTTP per-op timeouts and
+/// `rate_checked_body` rate-stalls — which already bump dedicated
+/// `HTTP_TIMEOUT_*` counters at construction. Folding them into
+/// "peer disconnect" was double-attributing them to
+/// `CLIENT_DISCONNECTED_MID_BODY`. The rare OS-level `ETIMEDOUT`
+/// (TCP keepalive / `TCP_USER_TIMEOUT`) is the only remaining source and
+/// is acceptable to log as a warn-level timeout rather than an
+/// info-level "peer disconnect" — the wording stays accurate either way.
+///
+/// Call sites that want to demote a `TimedOut` to a different severity
+/// (e.g. the header-read idle-timeout debug path, or the splice
+/// boundary-chunk demote-on-stall path) MUST add an explicit
+/// `err.kind() == ErrorKind::TimedOut` branch before this check.
+#[must_use]
+pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    )
+}
+
+/// Whether any error in `err`'s `source()` chain is a `TimedOut` `io::Error`.
+/// Hyper wraps the connector's timeout several layers deep; this is what the
+/// hyper backend's 502/504 split reads.
+#[cfg(feature = "hyper")]
+#[must_use]
+pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::TimedOut
+        {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
 #[cfg(feature = "sendfile")]
 pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> std::io::Error {
     // `Display` prints only the context message; the errno text lives on the
@@ -205,7 +256,7 @@ mod tests {
         );
     }
 
-    /// `hyper_conn::is_io_timed_out_in_chain` walks `source()` for a `TimedOut`
+    /// `is_io_timed_out_in_chain` walks `source()` for a `TimedOut`
     /// `io::Error`. `ProxyCacheError` puts its cause in `Display` instead, so
     /// exposing it here too would both duplicate it in reports and flip that
     /// classification -- which is why the `From` impls are hand-written rather

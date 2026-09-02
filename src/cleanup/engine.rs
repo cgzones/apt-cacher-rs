@@ -18,8 +18,8 @@ use crate::{
     error::ErrorReport,
     humanfmt::HumanFmt,
     limits::RETENTION_TIME,
+    log_once::Logged,
     metrics,
-    utils::Logged,
 };
 
 use http::{StatusCode, header::CONTENT_LENGTH};

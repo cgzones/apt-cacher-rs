@@ -40,6 +40,7 @@ mod deb_mirror;
 mod delivery;
 mod error;
 mod flat_blocklist;
+mod fs_open;
 mod guards;
 mod healthcheck;
 mod http_etag;
@@ -59,10 +60,12 @@ mod ktls_handshake;
 mod limits;
 mod log_once;
 mod logstore;
+mod macros;
 mod main_loop;
 mod metrics;
 #[cfg(all(feature = "mmap", feature = "hyper"))]
 mod mmap_body;
+mod partial_file;
 mod permitted_host_cache;
 mod precise_instant;
 mod proxy_body;
@@ -92,7 +95,6 @@ mod tunnel_limiter;
 mod uncacheables;
 mod upstream_head;
 mod upstream_retry;
-mod utils;
 mod verify_throttle;
 mod web;
 mod xattr_helpers;
@@ -208,7 +210,7 @@ struct ReopenableLogFile {
 
 impl ReopenableLogFile {
     fn new(path: &Path) -> std::io::Result<Self> {
-        let file = utils::nofollow_options()
+        let file = fs_open::nofollow_options()
             .append(true)
             .create(true)
             .open(path)?;
@@ -220,7 +222,7 @@ impl ReopenableLogFile {
     }
 
     fn reopen(&self) -> std::io::Result<()> {
-        let file = utils::nofollow_options()
+        let file = fs_open::nofollow_options()
             .append(true)
             .create(true)
             .open(&self.path)?;

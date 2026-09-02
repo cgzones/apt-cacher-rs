@@ -56,7 +56,10 @@ use crate::{
     content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
     delivery::{AbortCause, Mechanism, Role, ServeOutcome, finish_cached_serve},
-    error::{ErrorReport, errno_to_io_error},
+    error::{ErrorReport, errno_to_io_error, is_peer_disconnect},
+    fs_open::{
+        CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
+    },
     global_config,
     http_helpers::{
         ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header,
@@ -77,10 +80,6 @@ use crate::{
     response_head::{ResponseHead, WireBody},
     static_assert, swrite, tunnel_limiter,
     upstream_head::ContentLength,
-    utils::{
-        CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
-        tokio_nofollow_options,
-    },
     warn_once, warn_once_or_debug, warn_once_or_info,
     web::{WebResponse, serve_web_interface},
 };

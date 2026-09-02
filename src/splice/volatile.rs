@@ -16,11 +16,11 @@ use crate::error::ErrorReport;
 use crate::guards::InitBarrier;
 use crate::http_helpers::write_invalid_response;
 use crate::http_range::{HttpDate, ParsedRange, http_parse_range};
+use crate::partial_file;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::tcp_cork_guard::CorkGuard;
-use crate::utils;
 use crate::{
     client_counter, global_config, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics,
     warn_once, warn_once_or_debug, warn_once_or_info_logged,
@@ -162,7 +162,7 @@ pub(super) async fn handle_volatile_buffered_download(
         client,
         conn_details,
         upstream_resp,
-        utils::PartialDownload::Volatile,
+        partial_file::PartialDownload::Volatile,
         0,
         total_content_length,
         ibarrier,

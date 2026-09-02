@@ -59,13 +59,21 @@ use crate::{
     database_task::{DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::Origin,
     delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
-    error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
+    error::{
+        ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError,
+        is_io_timed_out_in_chain, is_peer_disconnect,
+    },
+    fs_open::{
+        CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
+        touch_volatile_mtime,
+    },
     global_cache_quota, global_config, global_verify_throttle,
     guards::{DownloadBarrier, InitBarrier},
     http_range::HttpDate,
     humanfmt::HumanFmt,
     limits::VOLATILE_CACHE_MAX_AGE,
     metrics,
+    partial_file::{self, TempPath, tokio_tempfile},
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
     proxy_body::{ProxyCacheBody, full_body, quick_response},
@@ -82,12 +90,7 @@ use crate::{
         ContentLength, DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead,
         plan_download, plan_fresh_download,
     },
-    upstream_retry,
-    utils::{
-        self, CacheAccessFailure, TempPath, hint_sequential_read, is_peer_disconnect,
-        regular_file_metadata, tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
-    },
-    warn_once_or_debug, warn_once_or_info,
+    upstream_retry, warn_once_or_debug, warn_once_or_info,
     web::serve_web_interface,
 };
 #[cfg(feature = "tls_rustls")]
@@ -104,20 +107,6 @@ pub(crate) type HttpClient = hyper_util::client::legacy::Client<
 fn empty_body() -> ProxyCacheBody {
     let body = Empty::new().map_err(|never| match never {});
     ProxyCacheBody::Boxed(BoxBody::new(body))
-}
-
-#[must_use]
-fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(e) = cur {
-        if let Some(io) = e.downcast_ref::<std::io::Error>()
-            && io.kind() == std::io::ErrorKind::TimedOut
-        {
-            return true;
-        }
-        cur = e.source();
-    }
-    false
 }
 
 /// On success the request `Parts` are handed back alongside the response —
@@ -1653,7 +1642,7 @@ async fn serve_new_file(
     // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
     // `partial.discard_resume()` is used only when a stale partial must be
     // discarded (200 fallback from unsupported Range, 416, invalid Content-Range).
-    let utils::PartialResume {
+    let partial_file::PartialResume {
         offset: resume_offset,
         expected_total: resume_expected_total,
         if_range: resume_if_range,
@@ -1661,7 +1650,7 @@ async fn serve_new_file(
     } = if conn_details.cached_flavor() == CachedFlavor::Permanent
         && matches!(cfstate, CacheFileStat::New)
     {
-        match utils::prepare_partial_resume(
+        match partial_file::prepare_partial_resume(
             &ibarrier,
             &conn_details.debname,
             &conn_details.mirror,
@@ -1670,8 +1659,10 @@ async fn serve_new_file(
         .await
         {
             Ok(r) => r,
-            Err(utils::PartialOpenError::NotFound(guard)) => utils::PartialResume::fresh(guard),
-            Err(utils::PartialOpenError::Failed {
+            Err(partial_file::PartialOpenError::NotFound(guard)) => {
+                partial_file::PartialResume::fresh(guard)
+            }
+            Err(partial_file::PartialOpenError::Failed {
                 logged: _logged,
                 guard,
             }) => {
@@ -1681,7 +1672,7 @@ async fn serve_new_file(
             }
         }
     } else {
-        utils::PartialResume::volatile()
+        partial_file::PartialResume::volatile()
     };
 
     let fwd_request = build_fwd_request(
@@ -2060,7 +2051,7 @@ async fn serve_new_file(
     // Defuse the guard once we take ownership of the partial path — from here on, the
     // download's own TempPath (keep_on_drop: true) manages the file lifetime.
     let (outfile, outpath) = match partial {
-        utils::PartialDownload::Resumable { mut file, guard } => {
+        partial_file::PartialDownload::Resumable { mut file, guard } => {
             // Resume: use the file already opened during the partial-file check.
             // The file handle has been held open since the check, so no TOCTOU race.
             // Verify the file size matches expectations (should always hold since
@@ -2089,9 +2080,9 @@ async fn serve_new_file(
             }
             (file, guard)
         }
-        utils::PartialDownload::Fresh(guard) => {
+        partial_file::PartialDownload::Fresh(guard) => {
             // Fresh permanent download: create at deterministic partial path
-            match utils::create_partial_file(guard, 0o640).await {
+            match partial_file::create_partial_file(guard, 0o640).await {
                 Ok((f, p)) => (f, p),
                 Err((err, path)) => {
                     metrics::CACHE_IO_FAILURE.increment();
@@ -2107,7 +2098,7 @@ async fn serve_new_file(
                 }
             }
         }
-        utils::PartialDownload::Volatile => {
+        partial_file::PartialDownload::Volatile => {
             // Volatile file: random temp file
             let tmppath = CachePaths::new(&config.cache_directory).scratch_file(filename);
             match tokio_tempfile(&tmppath, 0o640).await {

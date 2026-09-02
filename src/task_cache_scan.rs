@@ -13,9 +13,8 @@ use crate::{
         nested_mirror_relation,
     },
     error::ErrorReport,
-    global_config, healthcheck, metrics, task_setup,
-    utils::probe_dir,
-    warn_once_or_info,
+    fs_open::probe_dir,
+    global_config, healthcheck, metrics, task_setup, warn_once_or_info,
 };
 
 #[derive(Debug, thiserror::Error)]

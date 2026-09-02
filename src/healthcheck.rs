@@ -7,8 +7,9 @@
 //! cannot amplify disk writes or DB-channel traffic (see
 //! `cached_health_report`).
 //!
-//! `utils::filesystem_space` is the single `statvfs(3)` entry for both the
-//! disk-space and inode checks (`inodes: None` means a filesystem without
+//! [`filesystem_space`] is the single `statvfs(3)` entry for both the
+//! disk-space and inode checks (and for the main loop's periodic disk-free
+//! check) (`inodes: None` means a filesystem without
 //! an inode limit, not "none left"). Probing runs even without
 //! `min_disk_free`: inode exhaustion is invisible to that setting.
 
@@ -24,9 +25,8 @@ use crate::{
     cache_quota::CacheQuota,
     database_task::{DatabaseCommand, DbCmdPing, send_db_command},
     error::ErrorReport,
-    global_cache_quota, global_config, swrite,
-    utils::{InodeSpace, filesystem_space, tokio_nofollow_options},
-    warn_once_or_info,
+    fs_open::tokio_nofollow_options,
+    global_cache_quota, global_config, swrite, warn_once_or_debug, warn_once_or_info,
 };
 
 /// Filename of the transient cache-writability probe, created and unlinked
@@ -36,6 +36,78 @@ pub(crate) const PROBE_FILENAME: &str = ".apt-cacher-rs.healthprobe";
 
 /// Upper bound for each individual check.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One `statvfs(3)` snapshot of a filesystem's remaining capacity.
+///
+/// Both figures are what an unprivileged process may still consume. They
+/// fail independently in practice: a cache can be byte-rich and inode-poor
+/// (a mirror of many tiny index files on a small-inode ext4) and then
+/// `ENOSPC` arrives with gigabytes still free.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FsSpace {
+    /// Bytes available to unprivileged processes.
+    pub(crate) free_bytes: u64,
+    /// Inode accounting. `None` when the filesystem reports no inode limit
+    /// at all (btrfs and other dynamically-allocating filesystems report a
+    /// total of 0), which is not the same as "none left".
+    pub(crate) inodes: Option<InodeSpace>,
+}
+
+/// Inode accounting of a filesystem that has a fixed inode table.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InodeSpace {
+    /// Inodes available to unprivileged processes.
+    pub(crate) free: u64,
+    /// Inodes the filesystem was created with.
+    pub(crate) total: NonZero<u64>,
+}
+
+impl InodeSpace {
+    /// Whether fewer than `1/divisor` of all inodes are still available.
+    /// Integer math: no rounding surprises near the boundary.
+    #[must_use]
+    pub(crate) fn free_below_fraction(self, divisor: u64) -> bool {
+        self.free.saturating_mul(divisor) < self.total.get()
+    }
+}
+
+/// Remaining capacity of the filesystem holding `path`, via `statvfs(3)`.
+/// Returns `None` when the blocking task is lost or the probe fails.
+/// Free-byte accounting saturates at `u64::MAX` if the `statvfs` product
+/// does not fit in `u64`. The blocking pool keeps a slow filesystem from
+/// wedging a Tokio worker.
+pub(crate) async fn filesystem_space(path: &Path) -> Option<FsSpace> {
+    let owned = path.to_path_buf();
+    let joined = tokio::task::spawn_blocking(move || nix::sys::statvfs::statvfs(&owned)).await;
+    let result = match joined {
+        Ok(result) => result,
+        Err(err) => {
+            warn_once_or_debug!(
+                "Failed to join the statvfs(3) probe of `{}`; treating the free space as unknown:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            return None;
+        }
+    };
+    let stat = result
+        .inspect_err(|err| {
+            warn_once_or_debug!(
+                "Failed to statvfs(3) the filesystem holding `{}`; treating the free space as unknown:  {}",
+                path.display(),
+                ErrorReport(err)
+            );
+        })
+        .ok()?;
+    let free_bytes = stat.blocks_available().saturating_mul(stat.fragment_size());
+    Some(FsSpace {
+        free_bytes,
+        inodes: NonZero::new(stat.files()).map(|total| InodeSpace {
+            free: stat.files_available(),
+            total,
+        }),
+    })
+}
 
 /// Outcome of a single readiness check.
 #[derive(Clone)]

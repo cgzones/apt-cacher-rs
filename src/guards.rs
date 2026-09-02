@@ -14,8 +14,8 @@ use crate::{
     humanfmt::HumanFmt,
     integrity::{self, CommitError, RenamePlan},
     metrics,
+    partial_file::TempPath,
     upstream_head::ContentLength,
-    utils::TempPath,
 };
 #[cfg(feature = "splice")]
 use crate::{

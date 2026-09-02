@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
 use crate::{
-    cache_paths::CachePaths, error::ErrorReport, global_config, utils::nofollow_options,
+    cache_paths::CachePaths, error::ErrorReport, fs_open::nofollow_options, global_config,
     xattr_helpers::set_xattr_supported,
 };
 

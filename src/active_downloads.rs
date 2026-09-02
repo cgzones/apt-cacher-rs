@@ -31,9 +31,9 @@ use tracing::{error, info};
 use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef, ConnectionDetails};
 use crate::cache_metadata::UpstreamMetadata;
 use crate::error::{ErrorReport, MirrorDownloadRate};
+use crate::fs_open::tokio_nofollow_options;
 use crate::humanfmt::HumanFmt;
 use crate::upstream_head::ContentLength;
-use crate::utils::tokio_nofollow_options;
 use crate::{global_config, global_verify_throttle, metrics, warn_once_or_info};
 
 #[derive(Debug)]

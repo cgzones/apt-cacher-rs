@@ -66,7 +66,10 @@ use crate::database_task::{
     DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command,
 };
 use crate::deb_mirror::Origin;
-use crate::error::ErrorReport;
+use crate::error::{ErrorReport, is_peer_disconnect};
+use crate::fs_open::{
+    CacheAccessFailure, regular_file_metadata, tokio_nofollow_options, touch_volatile_mtime,
+};
 use crate::guards::{DownloadBarrier, InitBarrier};
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, WritePhase, write_416_response,
@@ -74,6 +77,8 @@ use crate::http_helpers::{
 };
 use crate::http_range::{HttpDate, ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
+use crate::log_once::Logged;
+use crate::partial_file::{self, TempPath, tokio_tempfile};
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::rate_log;
@@ -84,10 +89,6 @@ use crate::tcp_cork_guard::CorkGuard;
 use crate::upstream_head::{
     ContentLength, DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, plan_download,
     plan_fresh_download,
-};
-use crate::utils::{
-    self, CacheAccessFailure, Logged, TempPath, is_peer_disconnect, regular_file_metadata,
-    tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
 };
 use crate::{
     AppState,
@@ -466,7 +467,7 @@ async fn prepare_cache_target(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
-    partial: utils::PartialDownload,
+    partial: partial_file::PartialDownload,
     resume_offset: u64,
     total_content_length: NonZero<u64>,
     ibarrier: InitBarrier<'_>,
@@ -555,7 +556,7 @@ async fn prepare_cache_target(
     // Defuse the guard once we take ownership of the partial path — from here on, the
     // download's own TempPath (keep_on_drop: true) manages the file lifetime.
     let (tempfile, temppath) = match partial {
-        utils::PartialDownload::Resumable { mut file, guard } => {
+        partial_file::PartialDownload::Resumable { mut file, guard } => {
             // Resume: use the file already opened during the partial-file check.
             // The file handle has been held open since the check, so no TOCTOU race.
             // Verify the file size matches expectations (should always hold since
@@ -598,16 +599,18 @@ async fn prepare_cache_target(
             }
             (file, guard)
         }
-        utils::PartialDownload::Fresh(guard) => utils::create_partial_file(guard, 0o640)
-            .await
-            .map_err(|(err, path)| {
-                SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
-                    "splice proxy: failed to create partial file `{}`; aborting the download:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                )))
-            })?,
-        utils::PartialDownload::Volatile => {
+        partial_file::PartialDownload::Fresh(guard) => partial_file::create_partial_file(
+            guard, 0o640,
+        )
+        .await
+        .map_err(|(err, path)| {
+            SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
+                "splice proxy: failed to create partial file `{}`; aborting the download:  {}",
+                path.display(),
+                ErrorReport(&err)
+            )))
+        })?,
+        partial_file::PartialDownload::Volatile => {
             let tmppath = CachePaths::global().scratch_file(filename);
             tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
                 SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
@@ -896,11 +899,11 @@ async fn reject_if_verify_throttled(
 async fn open_partial_resume(
     ibarrier: &InitBarrier<'_>,
     conn_details: &ConnectionDetails,
-) -> Result<utils::PartialResume, SpliceProxyError> {
+) -> Result<partial_file::PartialResume, SpliceProxyError> {
     if conn_details.cached_flavor() != CachedFlavor::Permanent {
-        return Ok(utils::PartialResume::volatile());
+        return Ok(partial_file::PartialResume::volatile());
     }
-    match utils::prepare_partial_resume(
+    match partial_file::prepare_partial_resume(
         ibarrier,
         &conn_details.debname,
         &conn_details.mirror,
@@ -909,8 +912,10 @@ async fn open_partial_resume(
     .await
     {
         Ok(resume) => Ok(resume),
-        Err(utils::PartialOpenError::NotFound(guard)) => Ok(utils::PartialResume::fresh(guard)),
-        Err(utils::PartialOpenError::Failed { logged, guard }) => {
+        Err(partial_file::PartialOpenError::NotFound(guard)) => {
+            Ok(partial_file::PartialResume::fresh(guard))
+        }
+        Err(partial_file::PartialOpenError::Failed { logged, guard }) => {
             // Error already logged in `open_partial_file()`.
             drop(guard);
             Err(SpliceProxyError::Cache(logged))
@@ -988,7 +993,7 @@ async fn plan_upstream_response(
     conn_details: &ConnectionDetails,
     host_authority: &str,
     upstream_path: &str,
-    resume: &mut utils::PartialResume,
+    resume: &mut partial_file::PartialResume,
     volatile_cond: Option<&VolatileCondHeaders>,
     volatile_cache_path: Option<PathBuf>,
 ) -> Result<DownloadPlan<PathBuf>, SpliceProxyError> {

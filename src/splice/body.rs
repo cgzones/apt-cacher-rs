@@ -28,17 +28,18 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
-use crate::error::{ErrorReport, errno_to_io_error};
+use crate::error::{ErrorReport, errno_to_io_error, is_peer_disconnect};
+use crate::fs_open::{hint_sequential_read, nofollow_options};
 use crate::guards::DownloadBarrier;
 use crate::humanfmt::HumanFmt;
 #[cfg(feature = "ktls")]
 use crate::ktls;
+use crate::log_once::Logged;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::sendfile_conn::{
     async_sendfile_unfinished, clear_tcp_readable_cache, clear_tcp_writable_cache,
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
-use crate::utils::{self, Logged, hint_sequential_read, is_peer_disconnect};
 #[cfg(feature = "ktls")]
 use crate::warn_once;
 use crate::{
@@ -1145,7 +1146,7 @@ fn spawn_file_serve_task(
     // before a spawned task's open ran (NotFound, truncating this client). This
     // is a short local-file open syscall on the async worker, consistent with
     // the synchronous `dup(2)` above.
-    let std_file = match utils::nofollow_options().read(true).open(&cache_path) {
+    let std_file = match nofollow_options().read(true).open(&cache_path) {
         Ok(f) => f,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
