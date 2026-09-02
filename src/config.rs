@@ -764,6 +764,11 @@ pub(crate) struct Config {
     /// Timeout (in seconds) after which an inbound client connection is closed
     /// while waiting for a complete HTTP request -- covers idle keep-alive
     /// connections and slowloris-style partial header sends.
+    ///
+    /// Also bounds an established https tunnel (`CONNECT`): a tunnel that
+    /// relays no byte in either direction for this long is torn down, so a
+    /// parked tunnel cannot pin two file descriptors and an upstream
+    /// connection indefinitely (see `connect_tunnel`).
     #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) client_idle_timeout: Duration,
 
