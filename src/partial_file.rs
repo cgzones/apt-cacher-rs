@@ -442,11 +442,7 @@ pub(crate) async fn create_partial_file(
     guard: TempPath,
     mode: u32,
 ) -> Result<(tokio::fs::File, TempPath), (tokio::io::Error, PathBuf)> {
-    async fn file_ops(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
+    async fn open(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
         tokio_nofollow_options()
             .create(true)
             .truncate(true)
@@ -455,6 +451,25 @@ pub(crate) async fn create_partial_file(
             .mode(mode)
             .open(path)
             .await
+    }
+
+    async fn file_ops(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
+        // Open first and create the parent only on `ENOENT`: with `O_CREAT`
+        // set, a missing directory is the sole source of that errno here,
+        // and the directory already exists for every download after the
+        // first into a given `tmp/`. `create_dir_all` is a blocking-pool
+        // round trip of its own, so the steady state now costs one hop
+        // rather than two.
+        match open(path, mode).await {
+            Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {}
+            result => return result,
+        }
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        open(path, mode).await
     }
 
     let path = guard.defuse();
