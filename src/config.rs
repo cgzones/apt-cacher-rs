@@ -97,8 +97,13 @@ impl ConfigDomainName {
             return Err(domain);
         }
 
+        // DNS names are case-insensitive: normalise so `DEB.debian.org` and
+        // `deb.debian.org` are one allow-list entry, one cache tree and one
+        // mirror row.
         if let Some(d) = domain.strip_prefix('*') {
-            return Ok(Self(ConfigDomainNameInner::Wildcard(d.to_string())));
+            return Ok(Self(ConfigDomainNameInner::Wildcard(
+                d.to_ascii_lowercase(),
+            )));
         }
 
         if domain.contains(':') {
@@ -112,7 +117,9 @@ impl ConfigDomainName {
             return Ok(Self(ConfigDomainNameInner::Ipv4(addr.to_string(), addr)));
         }
 
-        Ok(Self(ConfigDomainNameInner::Dns(domain)))
+        Ok(Self(ConfigDomainNameInner::Dns(
+            domain.to_ascii_lowercase(),
+        )))
     }
 
     #[must_use]
@@ -188,7 +195,11 @@ impl DomainName {
         // is not a valid IPv4 address, so skip those branches in the
         // validator.
         if is_valid_dns_label_string(&domain) {
-            Ok(Self(DomainNameInner::Dns(domain.into())))
+            // DNS names are case-insensitive: one cache tree, mirror row and
+            // registry scope per host, whatever case the client typed.
+            Ok(Self(DomainNameInner::Dns(
+                domain.to_ascii_lowercase().into(),
+            )))
         } else {
             Err(domain)
         }
@@ -2176,6 +2187,19 @@ mod test {
             main: cah(main),
             aliases,
         }
+    }
+
+    #[test]
+    fn domain_names_are_case_insensitive() {
+        // DNS is case-insensitive; a mixed-case request host must map onto
+        // the same cache tree, mirror row and allow-list entry.
+        let host = DomainName::new("DEB.Debian.ORG".to_owned()).expect("valid");
+        assert_eq!(host.as_str(), "deb.debian.org");
+        let exact = ConfigDomainName::new("Deb.debian.org".to_owned()).expect("valid");
+        assert!(exact.permits("deb.debian.org"));
+        assert_eq!(exact.as_str(), Some("deb.debian.org"));
+        let wildcard = ConfigDomainName::new("*.Debian.ORG".to_owned()).expect("valid");
+        assert!(wildcard.permits("deb.debian.org"));
     }
 
     #[test]
