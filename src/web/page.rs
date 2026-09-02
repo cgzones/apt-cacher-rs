@@ -308,7 +308,7 @@ h3 { color: var(--h-fg); margin-bottom: 6px; border-bottom: 2px solid var(--h-ac
 .tablewrap { overflow-x: auto; max-width: 100%; }
 table { width: 100%; border-collapse: collapse; margin-top: 6px; }
 table td, table th { font-variant-numeric: tabular-nums; }
-dl.details { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+dl.details { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
              width: 100%; margin-top: 6px; }
 dl.details > div { display: flex; flex-direction: column; padding: 4px 10px;
                    border-left: 3px solid transparent; }
@@ -325,6 +325,9 @@ footer hr { border: none; border-top: 1px solid var(--nav-border); margin-bottom
 p { margin: 4px 0; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 h4.mini { font-size: 0.85em; margin: 4px 0; }
+h4.group { font-size: 0.85em; color: var(--h-fg); margin: 12px 0 2px;
+           border-bottom: 1px solid var(--section-border); padding-bottom: 3px; }
+h4.group:first-of-type { margin-top: 4px; }
 pre.log { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.85em;
           max-height: 80vh; overflow-y: auto; }
 

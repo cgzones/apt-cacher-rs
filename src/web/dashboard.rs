@@ -20,7 +20,6 @@ use crate::{
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
-    database_task::DB_TASK_QUEUE_SENDER,
     error::ErrorReport,
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
@@ -33,7 +32,7 @@ use crate::{
 use super::{
     fmt::{
         CacheHitRatio, Colorize, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp, HtmlEscape,
-        MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Utc, WarnNonzero, Window, YesNo,
+        MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Utc, Window, YesNo,
         as_size,
     },
     metrics_page::build_metrics_html,
@@ -212,11 +211,6 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     };
 
     let active_mirror_downloads = appstate.active_downloads.len();
-    let database_tx = DB_TASK_QUEUE_SENDER
-        .get()
-        .expect("Sender initialized in main_loop()");
-    let db_channel_max = database_tx.max_capacity();
-    let db_channel_in_flight = db_channel_max.saturating_sub(database_tx.capacity());
     let memory_stats = memory_stats::memory_stats();
 
     let https_mode = match rd.config.https_upgrade_mode {
@@ -237,8 +231,6 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         memory_stats,
         database_size,
         active_mirror_downloads,
-        db_channel_in_flight,
-        db_channel_max,
     );
 
     let configuration_html = build_configuration_html(rd, https_mode);
@@ -280,14 +272,8 @@ fn build_daemon_status_html(
     memory_stats: Option<memory_stats::MemoryStats>,
     database_size: Option<u64>,
     active_mirror_downloads: usize,
-    db_channel_in_flight: usize,
-    db_channel_max: usize,
 ) -> String {
     let start = Utc::from_offset(rd.start_time);
-
-    let depth_class = RatioClass::new(db_channel_in_flight as u64, db_channel_max as u64);
-    let peak = metrics::DB_QUEUE_DEPTH_PEAK.get();
-    let peak_class = RatioClass::new(peak, db_channel_max as u64);
 
     let logstore = LOGSTORE.get().expect("initialized in main()");
     let log_entries = logstore.entries().len();
@@ -362,46 +348,6 @@ fn build_daemon_status_html(
         ),
     );
     t.row("Active HTTPS Tunnels", active_tunnels());
-    t.row(
-        "DB Command Queue (current / max, peak, sent, full-waits, full-transitions, dropped)",
-        format_args!(
-            "{} / {db_channel_max}, peak {}, sent {}, full-waits {}, full-transitions {}, dropped {}",
-            Colorize {
-                inner: db_channel_in_flight,
-                class: depth_class,
-            },
-            Colorize {
-                inner: peak,
-                class: peak_class,
-            },
-            metrics::DB_COMMANDS_SENT.get(),
-            WarnNonzero(metrics::DB_QUEUE_FULL_WAITS.get()),
-            WarnNonzero(metrics::DB_QUEUE_FULL_TRANSITIONS.get()),
-            WarnNonzero(metrics::DB_COMMANDS_DROPPED_SHUTDOWN.get()),
-        ),
-    );
-    t.row_tip(
-        "DB Batch Flushes (by size / by time / on shutdown, peak size)",
-        "Batch flush trigger counts and the peak number of commands coalesced into a single flush. Under load `by size` should dominate; idle periods favour `by time`.",
-        format_args!(
-            "{} / {} / {}, peak {}",
-            metrics::DB_BATCH_FLUSHES_BY_SIZE.get(),
-            metrics::DB_BATCH_FLUSHES_BY_TIME.get(),
-            metrics::DB_BATCH_FLUSHES_ON_SHUTDOWN.get(),
-            metrics::DB_BATCH_SIZE_PEAK.get(),
-        ),
-    );
-    t.row_tip(
-        "DB Mirror Cache (entries, hits / misses, last_seen flushed)",
-        "Process-local mirror-id cache: current entry count (hydrated at startup, grows on each newly observed mirror; never evicted), hit/miss totals, and the cumulative number of `mirrors_v2.last_seen` rows the periodic task has flushed back to disk.",
-        format_args!(
-            "{}, {} / {}, {}",
-            metrics::DB_MIRROR_CACHE_ENTRIES.get(),
-            metrics::DB_MIRROR_CACHE_HITS.get(),
-            metrics::DB_MIRROR_CACHE_MISSES.get(),
-            metrics::DB_MIRROR_LAST_SEEN_FLUSHED.get(),
-        ),
-    );
     t.row_tip(
         "Metadata Cache Entries",
         "Process-local entries cached from per-file ETag and Last-Modified xattrs. Skips fgetxattr(2) on subsequent conditional-request hits; rebuilt lazily after restart.",
