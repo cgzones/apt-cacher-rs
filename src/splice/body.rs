@@ -1416,7 +1416,31 @@ async fn tee_and_splice(
                                 &mut xfer.client_rate_checker,
                                 RateCheckDirection::Client,
                                 global_config().http_timeout,
-                            ) => w.map_err(BodyTransferError::client)?,
+                            ) => match w {
+                                Ok(()) => {}
+                                // Rate-stall / HTTP per-op timeout on the client
+                                // write: abandon the client but keep the download
+                                // alive for the cache and the late joiners, like
+                                // every sibling delivery site. Propagating here
+                                // would drop the barrier and truncate every
+                                // joiner's body -- a stalled client must not
+                                // abort a shared transfer.
+                                Err(err) if err.kind() == ErrorKind::TimedOut => {
+                                    info!(
+                                        "splice proxy: client {} timed out during zero-copy body; abandoning the client:  {}",
+                                        client
+                                            .peer_addr()
+                                            .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                                        ErrorReport(&err)
+                                    );
+                                    xfer.client_status = ClientStatus::Disconnected;
+                                    drain_pipe(upstream_pipe_rx, teed_remaining)
+                                        .await
+                                        .map_err(BodyTransferError::proxy)?;
+                                    break;
+                                }
+                                Err(err) => return Err(BodyTransferError::client(err)),
+                            },
                             r = upstream_pipe_rx.readable() => r.map_err(BodyTransferError::proxy)?,
                         }
                         continue;
@@ -1516,8 +1540,12 @@ async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
     let devnull = dev_null()?;
     let mut remaining = count;
     while remaining > 0 {
-        rx.readable().await?;
-
+        // Optimistic-then-park: the bytes to drain are already sitting in
+        // the pipe (nothing else feeds it while a chunk is being fanned
+        // out), and the caller may have just cleared tokio's readiness
+        // cache for it. Parking on `readable()` first would then wait for
+        // an edge event no writer will ever produce; splice first and only
+        // park on a genuine EAGAIN.
         let result = splice(
             rx,
             None,
@@ -1547,6 +1575,7 @@ async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
             // ready bit.
             Err(nix::errno::Errno::EAGAIN) => {
                 clear_pipe_readable_cache(rx);
+                rx.readable().await?;
                 continue;
             }
             Err(err) => {
