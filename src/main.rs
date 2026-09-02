@@ -94,6 +94,7 @@ mod tunnel_limiter;
 mod uncacheables;
 mod upstream_head;
 mod upstream_retry;
+mod verified_marker;
 mod verify_throttle;
 mod web;
 mod xattr_helpers;

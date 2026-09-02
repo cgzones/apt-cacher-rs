@@ -37,7 +37,7 @@ use crate::{
     cache_layout::ResourceKind,
     cache_quota::QuotaReservation,
     index_parser::{self, HashAlgo, IndexFormat, StanzaStream},
-    metrics,
+    metrics, verified_marker,
 };
 use crate::{
     global_checksum_registry, global_config, info_once, warn_once_or_debug, warn_once_or_info,
@@ -153,7 +153,7 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
         return VerifyOutcome::Proceed;
     };
 
-    let computed = match hash_file(input.temp_path, algo) {
+    let (computed, hashed_file) = match hash_file(input.temp_path, algo) {
         Ok(c) => c,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -169,6 +169,7 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 
     if computed == expected {
         metrics::CHECKSUM_VERIFIED.increment();
+        stamp_verified(&hashed_file, input.temp_path, algo, &expected);
         VerifyOutcome::Proceed
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
@@ -181,14 +182,42 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 }
 
 /// Open `path` with `O_NOFOLLOW`, hint sequential read, and hash it.
-fn hash_file(path: &Path, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
+/// Returns the digest together with the still-open file so the caller can
+/// stamp the verified marker on the same fd, without a second open.
+fn hash_file(path: &Path, algo: HashAlgo) -> std::io::Result<(Vec<u8>, std::fs::File)> {
     let mut file = nofollow_options().read(true).open(path)?;
     // `u64::MAX`: hashing reads the whole file, and no cheap size is on hand
     // without an extra fstat, so always advise.
     hint_sequential_read(&file, u64::MAX, path);
-    match algo {
-        HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut file),
-        HashAlgo::Sha512 => index_parser::hash_open_file::<sha2::Sha512>(&mut file),
+    let digest = match algo {
+        HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut file)?,
+        HashAlgo::Sha512 => index_parser::hash_open_file::<sha2::Sha512>(&mut file)?,
+    };
+    Ok((digest, file))
+}
+
+/// Stamp the cleanup-verification marker on a temp file whose digest just
+/// matched, so the first cleanup cycle after this download does not re-read
+/// and re-hash it cold from disk.
+///
+/// Stamped before the rename: `rename(2)` keeps the inode and the size is
+/// final, so the marker is valid for the destination path cleanup will read
+/// it from. Unlike `cleanup/verify.rs`, no post-hash inode/size recheck is
+/// needed — the temp file is exclusively owned by this download and no other
+/// writer can reach it. Best-effort: a stat or xattr failure only means the
+/// next cleanup cycle hashes the file, so it is not worth failing a commit.
+fn stamp_verified(file: &std::fs::File, path: &Path, algo: HashAlgo, expected: &[u8]) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match file.metadata() {
+        Ok(meta) => verified_marker::stamp(file, path, meta.ino(), meta.len(), algo, expected),
+        Err(err) => {
+            debug!(
+                "Failed to stat `{}` after hashing; skipping the cleanup verification marker, so the next cleanup cycle re-hashes it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+        }
     }
 }
 
@@ -1531,6 +1560,49 @@ mod tests {
         assert!(reg.lookup("h", "m", "c").is_some());
         assert!(reg.lookup("h", "m", "d").is_some());
         assert!(reg.lookup("h", "m", "e").is_some());
+    }
+
+    #[test]
+    fn verify_temp_file_stamps_the_cleanup_marker_on_a_registry_match() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        use crate::verified_marker::has_valid_marker;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let temp_path = dir.path().join("pkg.deb.part");
+        let payload = b"a small deb body";
+        {
+            let mut f = std::fs::File::create(&temp_path).expect("create");
+            f.write_all(payload).expect("write");
+        }
+        let digest: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(payload).into()
+        };
+
+        let outcome = verify_temp_file(&VerifyInput {
+            verify_enabled: true,
+            kind: VerifyKind::Registry {
+                digest: Some(digest),
+            },
+            temp_path: &temp_path,
+        });
+        assert!(matches!(outcome, VerifyOutcome::Proceed));
+
+        let file = std::fs::File::open(&temp_path).expect("reopen");
+        let meta = file.metadata().expect("metadata");
+        assert!(
+            has_valid_marker(
+                &file,
+                &temp_path,
+                meta.ino(),
+                meta.len(),
+                HashAlgo::Sha256,
+                &digest,
+            ),
+            "commit must leave a marker cleanup accepts, or the first cleanup pass re-hashes every fresh download"
+        );
     }
 
     #[test]
