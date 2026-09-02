@@ -1,18 +1,26 @@
 //! Pure-Rust XZ streaming decompressor.
 //!
-//! Wraps `lzma_rust2::XzReader` (a synchronous `std::io::Read` adapter) in a
-//! tokio blocking task feeding a `tokio::io::duplex` pipe, so callers can treat
-//! it as any other `AsyncRead`. Replaces `async_compression::tokio::bufread::XzDecoder`
+//! Drives `lzma_rust2::XzStream` (the push-style decoder) in a tokio blocking
+//! task feeding a `tokio::io::duplex` pipe, so callers can treat it as any
+//! other `AsyncRead`. Replaces `async_compression::tokio::bufread::XzDecoder`
 //! to remove the C `liblzma`/`liblzma-sys` dependency.
+//!
+//! `XzStream` rather than the `Read`-adapter `XzReader` because only the
+//! former takes a memory limit: the LZMA2 dictionary size comes verbatim from
+//! the (untrusted) block header and is allocated before any output reaches
+//! the callers' decompression caps.  [`limits::MAX_XZ_DICT_SIZE`] bounds it.
 
 use std::future::Future as _;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use lzma_rust2::{Action, Status, XzStream};
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
 use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
+
+use crate::limits::MAX_XZ_DICT_SIZE;
 
 /// Internal pipe capacity. 64 KiB amortises copy syscalls between the blocking
 /// decoder thread and the async consumer without buffering meaningful amounts
@@ -40,18 +48,16 @@ where
     let (err_tx, err_rx) = oneshot::channel::<io::Result<()>>();
 
     tokio::task::spawn_blocking(move || {
-        let bridge_in = SyncIoBridge::new(reader);
-        // Buffer up to the duplex capacity: io::copy alone crosses the
-        // bridge in 8 KiB chunks, each a block_on round-trip between the
-        // blocking thread and the runtime — the BufWriter cuts those
-        // handoffs 8x. The explicit flush surfaces write errors before the
-        // result send (BufWriter's Drop swallows them).
+        let mut bridge_in = SyncIoBridge::new(reader);
+        // Buffer up to the duplex capacity: writing straight through would
+        // cross the bridge in small pieces, each a block_on round-trip
+        // between the blocking thread and the runtime — the BufWriter cuts
+        // those handoffs. The explicit flush surfaces write errors before
+        // the result send (BufWriter's Drop swallows them).
         let mut bridge_out =
             io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
-        let mut decoder =
-            lzma_rust2::XzReader::new(bridge_in, /* allow_multiple_streams = */ true);
-        let result =
-            io::copy(&mut decoder, &mut bridge_out).and_then(|_| io::Write::flush(&mut bridge_out));
+        let result = decode_stream(&mut bridge_in, &mut bridge_out)
+            .and_then(|()| io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
         // EOF on `inner` before polling `tail`. Without this, the consumer can
         // observe Pending on the oneshot while the duplex still has an open
@@ -67,6 +73,50 @@ where
     XzDecoderStream {
         inner: read_half,
         tail: Some(err_rx),
+    }
+}
+
+/// The decoder's memory limit in KiB: the dictionary cap plus the fixed
+/// per-stream overhead `lzma_rust2` adds on top (a few dozen KiB; one MiB of
+/// slack keeps a `-9` index decodable without tracking the crate's exact
+/// formula).
+fn xz_mem_limit_kb() -> u32 {
+    let dict_kib = MAX_XZ_DICT_SIZE.get() / 1024 + 1024;
+    u32::try_from(dict_kib).expect("64 MiB in KiB fits u32")
+}
+
+/// Pump `input` through a memory-limited `XzStream` into `output` until the
+/// stream ends.  Multi-stream xz files are accepted (matches the `xz` CLI
+/// default and what `async_compression`'s `XzDecoder` did before).
+fn decode_stream(input: &mut impl io::Read, output: &mut impl io::Write) -> io::Result<()> {
+    let mut stream =
+        XzStream::new_mem_limit(/* allow_multiple_streams = */ true, xz_mem_limit_kb());
+    let mut in_buf = vec![0u8; PIPE_CAPACITY];
+    let mut out_buf = vec![0u8; PIPE_CAPACITY];
+    let mut in_len = 0;
+    let mut in_pos = 0;
+    let mut eof = false;
+
+    loop {
+        if in_pos == in_len && !eof {
+            in_len = input.read(&mut in_buf)?;
+            in_pos = 0;
+            eof = in_len == 0;
+        }
+        let action = if eof { Action::Finish } else { Action::Run };
+        let step = stream.process(&in_buf[in_pos..in_len], &mut out_buf, action)?;
+        in_pos += step.bytes_consumed;
+        output.write_all(&out_buf[..step.bytes_produced])?;
+        match step.status {
+            Status::StreamEnd => return Ok(()),
+            Status::Ok => {}
+        }
+        if eof && step.bytes_consumed == 0 && step.bytes_produced == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "xz stream ended without a stream footer",
+            ));
+        }
     }
 }
 
@@ -134,6 +184,49 @@ mod tests {
             .await
             .expect("decode should succeed");
         assert_eq!(&out, b"hello world\n");
+    }
+
+    /// A valid stream header and block header whose LZMA2 property byte
+    /// (0x1e) declares a 128 MiB dictionary, followed by nothing.  Only the
+    /// head matters: the decoder must refuse the dictionary before it
+    /// allocates anything.
+    const BIG_DICT_XZ: &[u8] = &[
+        0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x02, 0x00, 0x21,
+        0x01, 0x1e, 0x00, 0x00, 0x00, 0x9b, 0x07, 0x51, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+
+    /// `printf 'hello world\n' | xz -9 -c --check=crc32`: property byte
+    /// 0x1c, the 64 MiB dictionary at the cap.  Must still decode.
+    const HELLO_XZ_9: &[u8] = &[
+        0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x04, 0xc0, 0x10,
+        0x0c, 0x21, 0x01, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb2, 0x20,
+        0x76, 0x3f, 0x01, 0x00, 0x0b, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c,
+        0x64, 0x0a, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x00, 0x01, 0x28, 0x0c, 0xaa, 0x57, 0x6d, 0x74,
+        0x90, 0x42, 0x99, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x59, 0x5a,
+    ];
+
+    #[tokio::test]
+    async fn dictionary_at_the_cap_still_decodes() {
+        let mut decoder = xz_decoder(Cursor::new(HELLO_XZ_9));
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .await
+            .expect("a 64 MiB dictionary is within the cap");
+        assert_eq!(&out, b"hello world\n");
+    }
+
+    #[tokio::test]
+    async fn oversized_dictionary_is_refused_before_allocation() {
+        let mut decoder = xz_decoder(Cursor::new(BIG_DICT_XZ));
+        let mut out = Vec::new();
+        let err = decoder
+            .read_to_end(&mut out)
+            .await
+            .expect_err("a dictionary above the cap must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
+        assert!(out.is_empty(), "nothing must be decoded");
     }
 
     #[tokio::test]

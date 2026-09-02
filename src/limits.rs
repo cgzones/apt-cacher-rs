@@ -52,6 +52,14 @@ pub(crate) const MAX_RELEASE_SIZE: NonZero<u64> = nonzero!(8 * 1024 * 1024);
 /// Maximum decompressed-to-compressed ratio tolerated for a `Packages` file.
 pub(crate) const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 
+/// Largest LZMA2 dictionary an `.xz` index may declare, 64 MiB (`xz -9`;
+/// Debian's archive tooling uses `-6`, 8 MiB).  The decoder allocates and
+/// zero-fills the dictionary from the block header *before* the output
+/// caps above see a single byte, so a hostile ~200-byte `Packages.xz` could
+/// otherwise commit up to 4 GiB per concurrent ingest.  Enforced through
+/// `lzma_rust2::XzStream::new_mem_limit` in `xz_stream`.
+pub(crate) const MAX_XZ_DICT_SIZE: NonZero<u64> = nonzero!(64 * 1024 * 1024);
+
 /// Maximum length (bytes) of a single line read from upstream metadata.
 pub(crate) const MAX_METADATA_LINE_LEN: usize = 8 * 1024;
 
