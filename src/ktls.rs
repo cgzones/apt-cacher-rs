@@ -40,7 +40,7 @@ use rustls::ConnectionTrafficSecrets;
 use rustls::crypto::cipher::NONCE_LEN;
 use tracing::{debug, info, warn};
 
-use crate::error::{ErrorReport, errno_to_io_error};
+use crate::error::{ErrorReport, Transience, errno_to_io_error};
 use crate::{Never, static_assert, warn_once, warn_once_or_debug};
 
 /// Overwrite every byte of a mutable POD value with zeros via `explicit_bzero`,
@@ -499,7 +499,7 @@ pub(crate) fn is_available() -> bool {
 /// according to the matrix built by [`is_available`]'s probe.
 ///
 /// The gate in `splice/ktls_path.rs` calls this before `setup_rx` so an unsupported
-/// combo fails fast (deterministic `KtlsSetupFailed`) instead of wasting a full
+/// combo fails fast (deterministic `KtlsSetupFailed`, `Transience::Permanent`) instead of wasting a full
 /// upstream request. An unknown version/cipher returns `false`. If the matrix
 /// isn't published yet (not AVAILABLE), or was never populated (mask 0 —
 /// should not happen once AVAILABLE), this returns `true` and lets `setup_rx`
@@ -788,11 +788,14 @@ pub(crate) enum UlpAttachError {
     /// been flipped to unavailable by [`attach_ulp`], so this fires at most
     /// once per process.
     Unavailable(io::Error),
-    /// `ENOTCONN` — the socket left `TCP_ESTABLISHED` between `connect(2)`
-    /// and the attach (peer FIN/RST raced the connect). Transient.
-    Transient(io::Error),
-    /// Any other errno. Persistent (per-host block only).
-    Persistent(io::Error),
+    /// The attach failed for this socket only. `Transient`: `ENOTCONN`, the
+    /// socket left `TCP_ESTABLISHED` between `connect(2)` and the attach
+    /// (peer FIN/RST raced the connect). `Permanent`: any other errno
+    /// (per-host block only).
+    Failed {
+        transience: Transience,
+        err: io::Error,
+    },
 }
 
 /// Attach the TLS Upper Layer Protocol to the socket.
@@ -831,10 +834,13 @@ pub(crate) fn attach_ulp<F: AsFd>(fd: &F) -> Result<(), UlpAttachError> {
                     // process-wide; latch unavailable rather than block per host.
                     latch_unavailable();
                     UlpAttachError::Unavailable(err)
-                } else if errno == nix::errno::Errno::ENOTCONN {
-                    UlpAttachError::Transient(err)
                 } else {
-                    UlpAttachError::Persistent(err)
+                    let transience = if errno == nix::errno::Errno::ENOTCONN {
+                        Transience::Transient
+                    } else {
+                        Transience::Permanent
+                    };
+                    UlpAttachError::Failed { transience, err }
                 },
             )
         }

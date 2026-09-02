@@ -22,7 +22,7 @@ use tracing::debug;
 use crate::cache_layout::ConnectionDetails;
 use crate::config::ClientHost;
 use crate::deb_mirror::{Mirror, MirrorKind};
-use crate::error::ErrorReport;
+use crate::error::{ErrorReport, Transience};
 use crate::humanfmt::HumanFmt;
 use crate::partial_file;
 use crate::scheme_cache::SchemeDecision;
@@ -39,9 +39,7 @@ use super::http::{UpstreamResponse, send_and_read_headers};
 use super::ktls_path::{KtlsReadyState, KtlsResult, try_unbuffered_ktls_connect};
 #[cfg(feature = "ktls")]
 use super::upstream::UpstreamConn;
-use super::upstream::{
-    ConnLabel, ConnectRetry, PoolGuard, connect_upstream, mirror_port, pool_checkout,
-};
+use super::upstream::{ConnLabel, PoolGuard, connect_upstream, mirror_port, pool_checkout};
 use super::{SpliceProxyError, UpstreamFailure, VolatileCondHeaders};
 
 /// One upstream request/response in flight: the pool-guarded connection the
@@ -210,7 +208,7 @@ pub(super) async fn standard_upstream_connect(
         // A permanent failure repeats identically on every retry, so it skips
         // the budget and drops straight into the terminal branch below --
         // sparing 10 pointless TCP connects and TLS handshakes.
-        let permanent = err.retry == ConnectRetry::Permanent;
+        let permanent = err.transience == Transience::Permanent;
         let next = if permanent {
             None
         } else {

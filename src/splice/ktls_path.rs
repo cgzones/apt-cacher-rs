@@ -22,7 +22,7 @@ use tokio::{io::AsyncReadExt as _, net::TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::deb_mirror::Mirror;
-use crate::error::ErrorReport;
+use crate::error::{ErrorReport, Transience};
 use crate::http_helpers::{ConnectionAction, WritePhase, write_all_to_stream};
 use crate::humanfmt::HumanFmt;
 use crate::ktls;
@@ -121,18 +121,39 @@ enum KtlsError {
     /// failure has nothing to do with kTLS. The caller falls back to the
     /// standard path without blocking kTLS for this host.
     UpstreamProtocolError(std::io::Error),
-    /// kTLS setup failed for a reason that would repeat deterministically on
-    /// a retry (unsupported cipher or TLS version, `TLS_RX` setsockopt
-    /// failure, pathological peer state machines, internal invariant
-    /// violations). ULP attach failures are handled earlier, at the
+    /// kTLS setup failed. `Transience::Permanent`: a reason that would
+    /// repeat deterministically on a retry (unsupported cipher or TLS
+    /// version, `TLS_RX` setsockopt failure, pathological peer state
+    /// machines, internal invariant violations); blocks kTLS for the full
+    /// `KTLS_BLOCK_DURATION`. `Transience::Transient`: a plausibly transient
+    /// reason (network-flavored errors -- read/write failures, EOF,
+    /// truncation -- errors triggered by peer-supplied TLS data, drain
+    /// races); upstream flakiness says nothing about kTLS capability, so no
+    /// block. ULP attach failures are handled earlier, at the
     /// attach-after-connect site in `try_unbuffered_ktls_connect`, and never
-    /// reach this variant. Blocks kTLS for the full `KTLS_BLOCK_DURATION`.
-    KtlsSetupFailed(std::io::Error),
-    /// kTLS setup failed for a plausibly transient reason: network-flavored
-    /// errors (read/write failures, EOF, truncation), errors triggered by
-    /// peer-supplied TLS data, drain races. Upstream flakiness says nothing
-    /// about kTLS capability — do not block further kTLS connections.
-    KtlsSetupFailedTransient(std::io::Error),
+    /// reach this variant.
+    KtlsSetupFailed {
+        transience: Transience,
+        err: std::io::Error,
+    },
+}
+
+impl KtlsError {
+    /// [`KtlsError::KtlsSetupFailed`] with `Transience::Permanent`.
+    fn setup_permanent(err: std::io::Error) -> Self {
+        Self::KtlsSetupFailed {
+            transience: Transience::Permanent,
+            err,
+        }
+    }
+
+    /// [`KtlsError::KtlsSetupFailed`] with `Transience::Transient`.
+    fn setup_transient(err: std::io::Error) -> Self {
+        Self::KtlsSetupFailed {
+            transience: Transience::Transient,
+            err,
+        }
+    }
 }
 
 /// Result of attempting an unbuffered kTLS connection.
@@ -319,7 +340,10 @@ pub(super) async fn try_unbuffered_ktls_connect(
                     tls_succeeded: false,
                 }
             }
-            UlpAttachError::Transient(err) => {
+            UlpAttachError::Failed {
+                transience: Transience::Transient,
+                err,
+            } => {
                 metrics::KTLS_FALLBACK_TRANSIENT.increment();
                 info!(
                     "kTLS: ULP attach for {} raced connection close (no block):  {}",
@@ -330,7 +354,10 @@ pub(super) async fn try_unbuffered_ktls_connect(
                     tls_succeeded: false,
                 }
             }
-            UlpAttachError::Persistent(err) => {
+            UlpAttachError::Failed {
+                transience: Transience::Permanent,
+                err,
+            } => {
                 metrics::KTLS_FALLBACK_PERMANENT.increment();
                 warn!(
                     "kTLS: failed to attach the TLS ULP for {}; blocking kTLS for this host for {}:  {}",
@@ -412,7 +439,10 @@ pub(super) async fn try_unbuffered_ktls_connect(
                 tls_succeeded: true,
             }
         }
-        Ok(Err(KtlsError::KtlsSetupFailed(err))) => {
+        Ok(Err(KtlsError::KtlsSetupFailed {
+            transience: Transience::Permanent,
+            err,
+        })) => {
             metrics::KTLS_FALLBACK_PERMANENT.increment();
             warn!(
                 "kTLS: failed to set up kernel TLS for {}; blocking kTLS for this host for {}:  {}",
@@ -425,7 +455,10 @@ pub(super) async fn try_unbuffered_ktls_connect(
                 tls_succeeded: true,
             }
         }
-        Ok(Err(KtlsError::KtlsSetupFailedTransient(err))) => {
+        Ok(Err(KtlsError::KtlsSetupFailed {
+            transience: Transience::Transient,
+            err,
+        })) => {
             metrics::KTLS_FALLBACK_TRANSIENT.increment();
             info!(
                 "kTLS: failed to set up kernel TLS for {} (transient, not blocking kTLS for this host):  {}",
@@ -619,7 +652,7 @@ impl<'a> KtlsHandshake<'a> {
 
             post_handshake_rounds += 1;
             if post_handshake_rounds > MAX_POST_HANDSHAKE_ROUNDS {
-                return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                return Err(KtlsError::setup_permanent(std::io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
                         "kTLS: post-handshake state machine did not reach WriteTraffic \
@@ -634,7 +667,7 @@ impl<'a> KtlsHandshake<'a> {
             let discard = status.discard;
             // Triggered by peer-supplied TLS data — transient, no host block.
             let state = status.state.map_err(|err| {
-                KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
+                KtlsError::setup_transient(std::io::Error::other(format!(
                     "TLS post-handshake error:  {err}"
                 )))
             })?;
@@ -651,7 +684,7 @@ impl<'a> KtlsHandshake<'a> {
                 ConnectionState::TransmitTlsData(ttd) => {
                     transmit_tls_data(ttd, self.tcp, &self.outgoing, &mut self.outgoing_used)
                         .await
-                        .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                        .map_err(KtlsError::setup_transient)?;
                     discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                 }
                 ConnectionState::WriteTraffic(mut wt) => {
@@ -671,7 +704,7 @@ impl<'a> KtlsHandshake<'a> {
                         "un-transmitted TLS bytes pending at WriteTraffic"
                     );
                     if self.outgoing_used != 0 {
-                        return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                        return Err(KtlsError::setup_permanent(std::io::Error::new(
                             ErrorKind::InvalidData,
                             format!(
                                 "kTLS: {} un-transmitted TLS bytes pending at \
@@ -697,7 +730,7 @@ impl<'a> KtlsHandshake<'a> {
                                 self.outgoing.resize(isz.required_size, 0);
                             }
                             Err(err) => {
-                                return Err(KtlsError::KtlsSetupFailed(std::io::Error::other(
+                                return Err(KtlsError::setup_permanent(std::io::Error::other(
                                     format!("TLS encrypt error:  {err}"),
                                 )));
                             }
@@ -707,7 +740,7 @@ impl<'a> KtlsHandshake<'a> {
                     discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                     write_all_to_stream(self.tcp, &self.outgoing[..enc_len], WritePhase::Header)
                         .await
-                        .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                        .map_err(KtlsError::setup_transient)?;
                     return Ok(PreciseInstant::now());
                 }
                 ConnectionState::BlockedHandshake => {
@@ -715,14 +748,14 @@ impl<'a> KtlsHandshake<'a> {
                     // Read from network to avoid spinning through the iteration limit.
                     discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                     grow_incoming(&mut self.incoming, self.incoming_used, "post-handshake")
-                        .map_err(KtlsError::KtlsSetupFailed)?;
+                        .map_err(KtlsError::setup_permanent)?;
                     let n = self
                         .tcp
                         .read(&mut self.incoming[self.incoming_used..])
                         .await
-                        .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                        .map_err(KtlsError::setup_transient)?;
                     if n == 0 {
-                        return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
+                        return Err(KtlsError::setup_transient(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
                             "server closed during post-handshake processing",
                         )));
@@ -782,7 +815,7 @@ impl<'a> KtlsHandshake<'a> {
 
             header_read_rounds = header_read_rounds.saturating_add(1);
             if header_read_rounds > MAX_PHASE3_ROUNDS {
-                return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                return Err(KtlsError::setup_permanent(std::io::Error::new(
                     ErrorKind::TimedOut,
                     format!(
                         "Phase 3 header-read loop exceeded {MAX_PHASE3_ROUNDS} iterations without completion"
@@ -801,7 +834,7 @@ impl<'a> KtlsHandshake<'a> {
                 let discard = status.discard;
                 // Triggered by peer-supplied TLS data — transient, no host block.
                 let state = status.state.map_err(|err| {
-                    KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
+                    KtlsError::setup_transient(std::io::Error::other(format!(
                         "TLS read error:  {err}"
                     )))
                 })?;
@@ -812,7 +845,7 @@ impl<'a> KtlsHandshake<'a> {
                         let mut total_discard = discard;
                         while let Some(result) = rt.next_record() {
                             let AppDataRecord { payload, discard } = result.map_err(|err| {
-                                KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
+                                KtlsError::setup_transient(std::io::Error::other(format!(
                                     "TLS record error:  {err}"
                                 )))
                             })?;
@@ -847,7 +880,7 @@ impl<'a> KtlsHandshake<'a> {
                                 header_buf.len(),
                                 MAX_UPSTREAM_HEADER_SIZE
                             );
-                            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                            return Err(KtlsError::setup_permanent(std::io::Error::new(
                                 ErrorKind::InvalidData,
                                 "upstream response headers too large",
                             )));
@@ -865,7 +898,7 @@ impl<'a> KtlsHandshake<'a> {
                     ConnectionState::TransmitTlsData(ttd) => {
                         transmit_tls_data(ttd, self.tcp, &self.outgoing, &mut self.outgoing_used)
                             .await
-                            .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                            .map_err(KtlsError::setup_transient)?;
                         discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                     }
                     ConnectionState::BlockedHandshake | ConnectionState::WriteTraffic(_) => {
@@ -896,14 +929,14 @@ impl<'a> KtlsHandshake<'a> {
             }
             if need_more_data {
                 grow_incoming(&mut self.incoming, self.incoming_used, "header read")
-                    .map_err(KtlsError::KtlsSetupFailed)?;
+                    .map_err(KtlsError::setup_permanent)?;
                 let n = self
                     .tcp
                     .read(&mut self.incoming[self.incoming_used..])
                     .await
-                    .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                    .map_err(KtlsError::setup_transient)?;
                 if n == 0 {
-                    return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
+                    return Err(KtlsError::setup_transient(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
                         "server closed before sending complete response headers",
                     )));
@@ -934,7 +967,7 @@ impl<'a> KtlsHandshake<'a> {
                 .process_tls_records(&mut self.incoming[..self.incoming_used]);
             // Triggered by peer-supplied TLS data — transient, no host block.
             let state = state.map_err(|err| {
-                KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
+                KtlsError::setup_transient(std::io::Error::other(format!(
                     "TLS drain error:  {err}"
                 )))
             })?;
@@ -944,7 +977,7 @@ impl<'a> KtlsHandshake<'a> {
                     let mut total_discard = discard;
                     while let Some(result) = rt.next_record() {
                         let AppDataRecord { payload, discard } = result.map_err(|err| {
-                            KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
+                            KtlsError::setup_transient(std::io::Error::new(
                                 ErrorKind::InvalidData,
                                 format!("TLS record error:  {err}"),
                             ))
@@ -968,7 +1001,7 @@ impl<'a> KtlsHandshake<'a> {
                 ConnectionState::TransmitTlsData(ttd) => {
                     transmit_tls_data(ttd, self.tcp, &self.outgoing, &mut self.outgoing_used)
                         .await
-                        .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                        .map_err(KtlsError::setup_transient)?;
                     discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                 }
                 ConnectionState::PeerClosed
@@ -1036,7 +1069,7 @@ impl<'a> KtlsHandshake<'a> {
             let mut drain_stop_reason = "";
             'drain: while self.incoming_used > 0 {
                 grow_incoming(&mut self.incoming, self.incoming_used, "drain")
-                    .map_err(KtlsError::KtlsSetupFailed)?;
+                    .map_err(KtlsError::setup_permanent)?;
 
                 // Bound this read to the end of the current record so it never pulls
                 // the following partial record in — that is what would keep us
@@ -1085,13 +1118,11 @@ impl<'a> KtlsHandshake<'a> {
 
                 self.drain_buffered_records(extra_body).await?;
                 if extra_body.len() > MAX_KTLS_EXTRA_BODY {
-                    return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::other(
-                        format!(
-                            "kTLS: buffered {} bytes of decrypted body without reaching \
+                    return Err(KtlsError::setup_transient(std::io::Error::other(format!(
+                        "kTLS: buffered {} bytes of decrypted body without reaching \
                              TLS record alignment; falling back to the streaming path",
-                            extra_body.len()
-                        ),
-                    )));
+                        extra_body.len()
+                    ))));
                 }
                 if self.incoming_used == 0 {
                     break 'drain;
@@ -1101,7 +1132,7 @@ impl<'a> KtlsHandshake<'a> {
             if self.incoming_used > 0 {
                 // Upstream truncation (EOF/reset/stall mid-record) — transient,
                 // no host block.
-                return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
+                return Err(KtlsError::setup_transient(std::io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
                         "kTLS: {} bytes remain in buffer after drain \
@@ -1145,7 +1176,7 @@ impl<'a> KtlsHandshake<'a> {
             "incoming buffer must be fully drained before kTLS secret extraction"
         );
         if incoming_used != 0 {
-            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+            return Err(KtlsError::setup_permanent(std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!(
                     "kTLS: incoming buffer has {incoming_used} unprocessed bytes \
@@ -1155,7 +1186,7 @@ impl<'a> KtlsHandshake<'a> {
         }
 
         let (secrets, kernel_conn) = conn.dangerous_into_kernel_connection().map_err(|err| {
-            KtlsError::KtlsSetupFailed(std::io::Error::other(format!(
+            KtlsError::setup_permanent(std::io::Error::other(format!(
                 "kTLS secret extraction:  {err}"
             )))
         })?;
@@ -1171,11 +1202,11 @@ impl<'a> KtlsHandshake<'a> {
 
         // Gate on the kernel's probed TLS_RX support matrix before touching the
         // socket: an unsupported cipher/version would fail the setup_rx
-        // setsockopt deterministically, so reject up front as KtlsSetupFailed
+        // setsockopt deterministically, so reject up front as permanent
         // (the caller's 600s host block is correct for a deterministic failure)
         // rather than discover it after a full upstream request per host.
         if !ktls::rx_supported(version, rx_secrets) {
-            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+            return Err(KtlsError::setup_permanent(std::io::Error::new(
                 ErrorKind::Unsupported,
                 format!(
                     "kTLS: {secret_name} with {version:?} not supported by this kernel's TLS_RX"
@@ -1194,7 +1225,7 @@ impl<'a> KtlsHandshake<'a> {
         // for another request (see the comment at the KtlsResult::Ready arm),
         // and configuring TX would add a failure surface (some kernels may
         // reject TX for ciphers they accept for RX) for no gain.
-        ktls::setup_rx(&*tcp, rx_seq, rx_secrets, version).map_err(KtlsError::KtlsSetupFailed)?;
+        ktls::setup_rx(&*tcp, rx_seq, rx_secrets, version).map_err(KtlsError::setup_permanent)?;
         drop(rx);
 
         // drain_control_messages can fail for transient reasons (e.g. EAGAIN
@@ -1203,7 +1234,7 @@ impl<'a> KtlsHandshake<'a> {
         // polled the socket here, so the "no data ready" case is the expected
         // outcome and is not an error — pass `MaybeIdle`.
         ktls::drain_control_messages(tcp.as_fd(), ktls::DrainExpect::MaybeIdle)
-            .map_err(KtlsError::KtlsSetupFailedTransient)?;
+            .map_err(KtlsError::setup_transient)?;
 
         Ok(KtlsRxOffload {
             version,
@@ -1240,12 +1271,12 @@ async fn unbuffered_ktls_request(
     );
 
     // TLS handshake succeeded. From here on, classification follows one
-    // principle: KtlsSetupFailed (600s host block) is reserved for failures
+    // principle: a permanent KtlsSetupFailed (600s host block) is reserved for failures
     // that would repeat deterministically on a retry — pathological peer
     // state machines (round caps), oversized headers/buffers, internal
     // invariant violations, and kernel setup_rx rejection. Network-flavored
     // failures (read/write errors, EOF, truncation) and errors triggered by
-    // peer-supplied TLS data map to KtlsSetupFailedTransient: upstream
+    // peer-supplied TLS data map to a transient KtlsSetupFailed: upstream
     // flakiness says nothing about this host's kTLS capability and must not
     // disable kTLS for 600s. Routing outcomes keep their own variants:
     // ResponseNotSpliceable (non-200/no-CL), UpstreamProtocolError

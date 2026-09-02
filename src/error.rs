@@ -153,6 +153,21 @@ pub(crate) struct UpstreamFetchError {
     pub(crate) reason: String,
 }
 
+/// Whether a failed operation is worth retrying: the one classification the
+/// upstream connect, the kTLS ULP attach and the kTLS setup all carry next
+/// to their `io::Error`. `Permanent` means the failure is a deterministic
+/// function of its inputs (a rejected certificate, an unsupported cipher)
+/// and a retry re-runs it identically; `Transient` means a transport
+/// hiccup that may clear. Each carrier decides what a permanent failure
+/// costs (skipping the retry budget, blocking kTLS for the host); this type
+/// only records the verdict.
+#[cfg(feature = "splice")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transience {
+    Transient,
+    Permanent,
+}
+
 /// Returns `true` when `err` indicates the peer terminated the connection
 /// (by reset, abort, half-close, or EOF). Used to demote routine "client
 /// went away" log lines from warn to info, since they are not actionable

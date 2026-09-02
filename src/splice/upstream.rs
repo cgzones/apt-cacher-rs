@@ -3,7 +3,7 @@
 //! [`ConnLabel`] log rendering, the per-host idle pool behind [`PoolGuard`]
 //! and [`UnconsumedBodyGuard`], the TCP/TLS connect helpers
 //! ([`connect_upstream`], [`tcp_connect`], `tls_connect`) and the
-//! [`ConnectError`]/[`ConnectRetry`] classification consumed by the retry
+//! [`ConnectError`]/[`Transience`] classification consumed by the retry
 //! loop in `acquire`. Also hosts the process-wide `TLS_CLIENT_CONFIG` that
 //! `main.rs` initialises.
 //!
@@ -29,7 +29,7 @@ use tokio::{
 use tracing::debug;
 
 use crate::deb_mirror::Mirror;
-use crate::error::ErrorReport;
+use crate::error::{ErrorReport, Transience};
 use crate::humanfmt::HumanFmt;
 use crate::{Scheme, global_config, metrics, warn_once_or_debug, warn_once_or_info};
 
@@ -498,35 +498,25 @@ impl UpstreamConn {
 /// succeed. Retrying a deterministic failure costs a full TCP connect plus a
 /// full TLS handshake per attempt and buys nothing.
 pub(super) struct ConnectError {
-    pub(super) retry: ConnectRetry,
+    pub(super) transience: Transience,
     pub(super) err: std::io::Error,
 }
 
 impl ConnectError {
+    /// Pair an already-classified failure with the error it was derived from.
+    fn new(transience: Transience, err: std::io::Error) -> Self {
+        Self { transience, err }
+    }
+
     /// DNS/TCP failure, timeout, or a network error mid-handshake -- retry may help.
     fn transient(err: std::io::Error) -> Self {
-        ConnectRetry::Transient.attach(err)
+        Self::new(Transience::Transient, err)
     }
 
     /// Deterministic for this (host, scheme): unparsable server name, certificate
     /// rejection. Retrying re-runs the same handshake and fails identically.
     fn permanent(err: std::io::Error) -> Self {
-        ConnectRetry::Permanent.attach(err)
-    }
-}
-
-/// The retry disposition of a connect failure -- the pure half of
-/// [`ConnectError`], split out so [`classify_tls_error`] stays unit-testable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ConnectRetry {
-    Transient,
-    Permanent,
-}
-
-impl ConnectRetry {
-    /// Pair the disposition with the error it was derived from.
-    fn attach(self, err: std::io::Error) -> ConnectError {
-        ConnectError { retry: self, err }
+        Self::new(Transience::Permanent, err)
     }
 }
 
@@ -539,12 +529,13 @@ impl ConnectRetry {
 /// may be a transport hiccup.
 ///
 /// Pass the kind of the *original* error, before it is wrapped: a wrapper
-/// reports its own kind and keeps the cause behind `source()`.
-const fn classify_tls_error(kind: ErrorKind) -> ConnectRetry {
+/// reports its own kind and keeps the cause behind `source()`. Split out of
+/// [`ConnectError`] so it stays unit-testable.
+const fn classify_tls_error(kind: ErrorKind) -> Transience {
     if matches!(kind, ErrorKind::InvalidData | ErrorKind::InvalidInput) {
-        ConnectRetry::Permanent
+        Transience::Permanent
     } else {
-        ConnectRetry::Transient
+        Transience::Transient
     }
 }
 
@@ -718,10 +709,13 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
             // Classify before wrapping: the wrapper keeps the cause on
             // `source()`, and only the original kind tells a certificate
             // rejection (`InvalidData`) from a transport error.
-            classify_tls_error(err.kind()).attach(std::io::Error::new(
-                err.kind(),
-                format!("failed to complete TLS handshake:  {err}"),
-            ))
+            ConnectError::new(
+                classify_tls_error(err.kind()),
+                std::io::Error::new(
+                    err.kind(),
+                    format!("failed to complete TLS handshake:  {err}"),
+                ),
+            )
         })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
@@ -759,7 +753,7 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
             // and lands on `ErrorKind::Other`. Classify conservatively (i.e.
             // transient, keep retrying) rather than guess from the message.
             let err = std::io::Error::other(err);
-            classify_tls_error(err.kind()).attach(err)
+            ConnectError::new(classify_tls_error(err.kind()), err)
         })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
@@ -793,12 +787,12 @@ mod tests {
         // unparsable server name as InvalidInput; both repeat identically.
         assert_eq!(
             classify_tls_error(ErrorKind::InvalidData),
-            ConnectRetry::Permanent,
+            Transience::Permanent,
             "certificate rejection must not be retried"
         );
         assert_eq!(
             classify_tls_error(ErrorKind::InvalidInput),
-            ConnectRetry::Permanent,
+            Transience::Permanent,
             "server-name parse failure must not be retried"
         );
     }
@@ -812,7 +806,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_tls_error(kind),
-                ConnectRetry::Transient,
+                Transience::Transient,
                 "{kind:?} may succeed on retry"
             );
         }
