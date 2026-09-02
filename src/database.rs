@@ -18,10 +18,10 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     cache_paths::MirrorSite,
     client_info::CLEANUP_CLIENT_ADDR,
-    config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
+    config::{Alias, ClientHost, DomainName},
     deb_mirror::{Mirror, MirrorKind},
     error::ErrorReport,
-    flat_blocklist, global_config,
+    flat_blocklist,
     humanfmt::HumanFmt,
     limits::RETENTION_TIME,
     warn_once_or_info,
@@ -43,21 +43,6 @@ fn decode_mirror_kind(kind: i64, path: &str) -> MirrorKind {
             path.escape_debug()
         );
         MirrorKind::Structured
-    }
-}
-
-/// Resolve `host` through the configured aliases and return a reference to the
-/// alias-resolved [`CacheHost`] (the `main` host under which files are actually
-/// stored on disk).  Falls back to `host.as_cache_host()` when no alias matches.
-///
-/// Centralises the identical
-/// `match resolve_alias(...) { Some(c) => c, None => host.as_cache_host() }`
-/// blocks that appear across `database.rs` and the `cleanup/` submodule.
-#[must_use]
-pub(crate) fn resolved_cache_host<'a>(aliases: &'a [Alias], host: &'a ClientHost) -> &'a CacheHost {
-    match resolve_alias(aliases, host) {
-        Some(c) => c,
-        None => host.as_cache_host(),
     }
 }
 
@@ -110,27 +95,16 @@ impl MirrorEntry {
         self.host.format_authority(self.port())
     }
 
-    /// The alias-resolved on-disk identity of this mirror, for every
-    /// `CachePaths` derivation (`mirror_dir`, `entry_dir`, `tmp_dir`, ...).
-    /// The DB stores the raw client-supplied host, but `ConnectionDetails::site`
-    /// places cached files under the alias' `main` host.  Cleanup / scan code
-    /// must use the same resolution so the paths line up; raw `self.host`
-    /// would point at an empty (or non-existent) sibling directory whenever
-    /// the request arrived via an alias.
+    /// The on-disk identity of this mirror, for every `CachePaths`
+    /// derivation (`mirror_dir`, `entry_dir`, `tmp_dir`, ...).  Rows store
+    /// the canonical (alias-resolved) host -- `decide_request` resolves
+    /// aliases before any row is minted and `merge_alias_rows` folds legacy
+    /// alias rows at startup -- so this is the same projection as
+    /// `ConnectionDetails::site`.
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
-        self.site_with_aliases(&global_config().aliases)
-    }
-
-    /// Pure sibling of [`Self::site`] taking the alias table explicitly
-    /// instead of reaching for `global_config()`. `global_config()` panics
-    /// outside a running daemon, so a pure caller that already carries its
-    /// own `&Config` (e.g. `cleanup::model::classify_mirror`) uses this to
-    /// stay unit-testable without a `main()`-initialized global.
-    #[must_use]
-    pub(crate) fn site_with_aliases<'a>(&'a self, aliases: &'a [Alias]) -> MirrorSite<'a> {
         MirrorSite {
-            host: resolved_cache_host(aliases, &self.host),
+            host: self.host.as_cache_host(),
             port: self.port(),
             path: &self.path,
         }
@@ -213,12 +187,12 @@ impl MirrorStatEntry {
         }
     }
 
-    /// The alias-resolved on-disk identity of this mirror; same resolution
-    /// as [`MirrorEntry::site`].
+    /// The on-disk identity of this mirror; the same projection as
+    /// [`MirrorEntry::site`] (rows are canonical).
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
         MirrorSite {
-            host: resolved_cache_host(&global_config().aliases, &self.host),
+            host: self.host.as_cache_host(),
             port: self.port(),
             path: &self.path,
         }
@@ -418,12 +392,9 @@ async fn upsert_mirror_get_id(
     // by the blocklist.  `record_mirror`'s `path_collides_with_flat_layout`
     // check is the cheap pre-filter; the HashSet insert is idempotent.
     if MirrorKind::from_db_int(row.kind) == Some(MirrorKind::Structured) {
-        // Resolve the requested host through configured aliases so the
-        // blocklist key matches the on-disk host directory built by
-        // `ConnectionDetails::cache_dir_path` (`aliased_host.unwrap_or(...)`).
-        let resolved_host: &CacheHost =
-            resolved_cache_host(&global_config().aliases, mirror.host());
-        flat_blocklist::record_mirror(resolved_host, mirror.port(), mirror.path());
+        // `mirror` is canonical (alias-resolved at dispatch), so its host is
+        // the on-disk host directory the blocklist keys on.
+        flat_blocklist::record_mirror(mirror.host().as_cache_host(), mirror.port(), mirror.path());
     }
     Ok((row.id, row.was_inserted))
 }
@@ -1194,6 +1165,94 @@ impl Database {
         Ok(())
     }
 
+    /// Fold mirror rows written under a configured alias host into the row of
+    /// the alias' main host: origins, downloads and deliveries are re-pointed
+    /// (an origin the main row already has is dropped), and an alias row with
+    /// no main counterpart is simply renamed.  Rows are canonical from
+    /// `decide_request` on; this runs at startup for rows an earlier version
+    /// wrote, and after an alias is added to the configuration.  Without it
+    /// two rows would each reconcile the one shared tree against only their
+    /// own indices and grace-sweep each other's debs.  Returns the number of
+    /// rows folded or renamed.
+    pub(crate) async fn merge_alias_rows(&self, aliases: &[Alias]) -> Result<usize, Error> {
+        let mut merged = 0usize;
+        let mut tx = self.conn.begin().await?;
+
+        for group in aliases {
+            let main_host = group.main.to_client_host();
+            for alias in &group.aliases {
+                let alias_rows = query!(
+                    r"SELECT id, port, path FROM mirrors_v2 WHERE host = ?;",
+                    alias
+                )
+                .fetch_all(&mut *tx)
+                .await?;
+                for alias_row in alias_rows {
+                    let main_row = query!(
+                        r"SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?;",
+                        main_host,
+                        alias_row.port,
+                        alias_row.path
+                    )
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    match main_row {
+                        None => {
+                            query!(
+                                r"UPDATE mirrors_v2 SET host = ? WHERE id = ?;",
+                                main_host,
+                                alias_row.id
+                            )
+                            .execute(&mut *tx)
+                            .await?;
+                            info!(
+                                "Renamed mirror row {alias}/{} to alias main host {main_host}",
+                                alias_row.path
+                            );
+                        }
+                        Some(main_row) => {
+                            query!(
+                                r"UPDATE OR IGNORE origins SET mirror_id = ? WHERE mirror_id = ?;",
+                                main_row.id,
+                                alias_row.id
+                            )
+                            .execute(&mut *tx)
+                            .await?;
+                            query!(r"DELETE FROM origins WHERE mirror_id = ?;", alias_row.id)
+                                .execute(&mut *tx)
+                                .await?;
+                            query!(
+                                r"UPDATE downloads SET mirror_id = ? WHERE mirror_id = ?;",
+                                main_row.id,
+                                alias_row.id
+                            )
+                            .execute(&mut *tx)
+                            .await?;
+                            query!(
+                                r"UPDATE deliveries SET mirror_id = ? WHERE mirror_id = ?;",
+                                main_row.id,
+                                alias_row.id
+                            )
+                            .execute(&mut *tx)
+                            .await?;
+                            query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", alias_row.id)
+                                .execute(&mut *tx)
+                                .await?;
+                            info!(
+                                "Merged mirror row {alias}/{} into alias main host {main_host}",
+                                alias_row.path
+                            );
+                        }
+                    }
+                    merged += 1;
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(merged)
+    }
+
     /// Drop `origins` rows last seen before `cutoff` (seconds since the
     /// epoch): an origin no client asked for within the retention window
     /// would otherwise cost a `Packages` fetch cascade on every cleanup run
@@ -1355,6 +1414,86 @@ mod retention_tests {
         let left = db.get_origins().await.expect("get origins");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].mirror_path, "fresh");
+    }
+
+    async fn insert_mirror_host(db: &Database, host: &str, path: &str) -> i64 {
+        let row = query(
+            "INSERT INTO mirrors_v2 (host, port, path, kind) VALUES (?, 0, ?, 0) RETURNING id",
+        )
+        .bind(host)
+        .bind(path)
+        .fetch_one(&db.conn)
+        .await
+        .expect("insert mirror");
+        sqlx::Row::get(&row, 0)
+    }
+
+    fn origin(mirror_id: i64, distribution: &str) -> OriginRow {
+        OriginRow {
+            mirror_id,
+            distribution: distribution.to_owned(),
+            component: "main".to_owned(),
+            architecture: "amd64".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_alias_rows_folds_alias_rows_into_the_main_row() {
+        use crate::config::Alias;
+        let (_dir, db) = temp_db().await;
+        let main_id = insert_mirror_host(&db, "deb.example.org", "debian").await;
+        let alias_id = insert_mirror_host(&db, "ftp.example.org", "debian").await;
+        // An alias row with no main counterpart is renamed, not merged.
+        let lone_alias_id = insert_mirror_host(&db, "ftp.example.org", "ubuntu").await;
+        db.batch_upsert_origins(&[
+            origin(main_id, "sid"),
+            origin(alias_id, "sid"),
+            origin(alias_id, "bookworm"),
+            origin(lone_alias_id, "noble"),
+        ])
+        .await
+        .expect("upsert origins");
+
+        let aliases = [Alias {
+            main: ClientHost::new("deb.example.org".to_owned())
+                .expect("host")
+                .into_cache_host(),
+            aliases: vec![ClientHost::new("ftp.example.org".to_owned()).expect("host")],
+        }];
+        let merged = db.merge_alias_rows(&aliases).await.expect("merge");
+        assert_eq!(merged, 2);
+
+        let mut mirrors: Vec<(String, String)> = db
+            .get_mirrors()
+            .await
+            .expect("mirrors")
+            .into_iter()
+            .map(|m| (m.host.to_string(), m.path))
+            .collect();
+        mirrors.sort();
+        assert_eq!(
+            mirrors,
+            vec![
+                ("deb.example.org".to_owned(), "debian".to_owned()),
+                ("deb.example.org".to_owned(), "ubuntu".to_owned()),
+            ]
+        );
+        let mut dists: Vec<(String, String)> = db
+            .get_origins()
+            .await
+            .expect("origins")
+            .into_iter()
+            .map(|o| (o.mirror_path, o.distribution))
+            .collect();
+        dists.sort();
+        assert_eq!(
+            dists,
+            vec![
+                ("debian".to_owned(), "bookworm".to_owned()),
+                ("debian".to_owned(), "sid".to_owned()),
+                ("ubuntu".to_owned(), "noble".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]

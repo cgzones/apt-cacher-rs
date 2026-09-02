@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE mirrors_v2 SET host = ? WHERE id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "be7603869fa4783b9f9915c51041c3b118dfd24c27c5ef81de566ac8d95ed245"
+}

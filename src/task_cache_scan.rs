@@ -130,7 +130,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
     let mut mirrors_by_dir: HashMap<String, HostBucket<'_>> = HashMap::with_capacity(mirrors.len());
     let mut paths_by_host_dir: HashMap<String, Vec<&str>> = HashMap::with_capacity(mirrors.len());
     for mirror in &mirrors {
-        let site = mirror.site_with_aliases(&config.aliases);
+        let site = mirror.site();
         let dir_name = site.host.format_cache_dir(site.port).into_owned();
         paths_by_host_dir
             .entry(dir_name.clone())
@@ -219,7 +219,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
         );
         for mirror in &bucket.mirrors {
             let nested = derive_nested_paths(&mirror.path, host_paths);
-            let mirror_dir = paths.mirror_dir(mirror.site_with_aliases(&config.aliases));
+            let mirror_dir = paths.mirror_dir(mirror.site());
             totals += scan_mirror_dir(&mirror_dir, mirror, &nested).await;
         }
 

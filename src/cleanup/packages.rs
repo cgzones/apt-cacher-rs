@@ -514,7 +514,7 @@ pub(super) async fn try_fetch_packages_file(
             client: ClientInfo::new_cleanup(),
             request_received_at: PreciseInstant::now(),
             mirror: mirror.clone(),
-            aliased_host: None,
+            upstream_host: mirror.host().clone(),
             debname: debname.cache_name(pkgfmt),
             resource_kind,
             origin_fields: None,

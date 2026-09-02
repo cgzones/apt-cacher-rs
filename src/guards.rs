@@ -8,7 +8,6 @@ use crate::{
     cache_metadata::{self, UpstreamMetadata},
     cache_paths::MirrorSite,
     cache_quota::QuotaReservation,
-    config::CacheHost,
     error::ErrorReport,
     global_verify_throttle,
     humanfmt::HumanFmt,
@@ -27,12 +26,6 @@ struct InitBarrierData<'a> {
     status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: &'a ActiveDownloads,
     key: CacheEntryKeyRef<'a>,
-    /// When the request was resolved against an alias mapping, the on-disk
-    /// host directory is the alias' main host (not `mirror.host()`).  Kept
-    /// here so that [`InitBarrier::site`] resolves the same site as
-    /// `ConnectionDetails::site` and `partial_path_for_barrier` lays the
-    /// `.partial` next to the eventual rename target.
-    aliased_host: Option<&'static CacheHost>,
     resource_kind: ResourceKind,
     /// The raw client request URI path (pre-normalisation, pre-redirect),
     /// carried through to `RenameBarrier::commit`'s `RenamePlan`.
@@ -62,7 +55,6 @@ impl<'a> InitBarrier<'a> {
                 status,
                 active_downloads,
                 key: conn_details.key(),
-                aliased_host: conn_details.aliased_host,
                 resource_kind: conn_details.resource_kind,
                 raw_uri_path,
                 _tx: tx,
@@ -144,13 +136,11 @@ impl<'a> InitBarrier<'a> {
             .data
             .as_ref()
             .expect("every sink consumes the instance");
+        // `key.mirror` is the canonical (alias-resolved) mirror, so this is
+        // the same projection as `ConnectionDetails::site`.
         let mirror = data.key.mirror;
-        let host = match data.aliased_host {
-            Some(cache) => cache,
-            None => mirror.host().as_cache_host(),
-        };
         MirrorSite {
-            host,
+            host: mirror.host().as_cache_host(),
             port: mirror.port(),
             path: mirror.path(),
         }

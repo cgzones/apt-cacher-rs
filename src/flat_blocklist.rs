@@ -43,9 +43,8 @@ use tracing::warn;
 
 use crate::{
     cache_paths::{SUBDIR_FLAT, SUBDIR_FLAT_PREFIX},
-    config::{CacheHost, resolve_alias},
+    config::CacheHost,
     database::Database,
-    global_config,
 };
 
 type Port = NonZero<u16>;
@@ -96,20 +95,14 @@ pub(crate) fn path_collides_with_flat_layout(path: &str) -> bool {
 pub(crate) async fn init(database: &Database) -> Result<(), sqlx::Error> {
     let collision_rows = database.load_flat_collision_mirrors().await?;
 
-    let aliases = global_config().aliases.as_slice();
     let mut set = HashSet::with_capacity(collision_rows.len());
     for entry in collision_rows {
         let port = entry.port();
         let path = entry.path.as_str();
-        // Key the blocklist on the alias-resolved host (the same identity
-        // `ConnectionDetails::cache_dir_path` uses for the on-disk host
-        // directory), so a structured mirror registered via one alias also
-        // blocks flat requests arriving via sibling aliases of the same
-        // main host.
-        let resolved: CacheHost = match resolve_alias(aliases, &entry.host) {
-            Some(c) => c.clone(),
-            None => entry.host.into_cache_host(),
-        };
+        // Rows are canonical (alias-resolved at dispatch; legacy rows folded
+        // by `merge_alias_rows` before this runs), so the row host *is* the
+        // on-disk host directory the blocklist keys on.
+        let resolved = entry.host.into_cache_host();
 
         warn!(
             "Structured mirror at {ha}/{path} collides with the host-level flat layout (found at startup); flat caching disabled for host {ha} (structured wins)",

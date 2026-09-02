@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id FROM mirrors_v2 WHERE host = ? AND port = ? AND path = ?;",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mirrors_v2",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f01a518c046a51bb0979cdf78c682644967577ab8d9e4304c7e94733ea3e61cb"
+}

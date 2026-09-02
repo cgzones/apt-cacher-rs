@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deliveries SET mirror_id = ? WHERE mirror_id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "a78447ba74f1425965b3c58474f7211e9281e979d1da880f7641da735325fc9e"
+}

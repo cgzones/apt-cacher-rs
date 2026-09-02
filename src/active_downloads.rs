@@ -183,9 +183,7 @@ pub(crate) async fn await_serveable(
     conn_details: &ConnectionDetails,
 ) -> Result<Serveable, JoinFailure> {
     fn aliased(conn_details: &ConnectionDetails) -> String {
-        conn_details
-            .aliased_host
-            .map_or_else(String::new, |alias| format!(" aliased to host {alias}"))
+        conn_details.alias_suffix()
     }
 
     async fn open(

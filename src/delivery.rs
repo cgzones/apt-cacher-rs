@@ -167,9 +167,7 @@ pub(crate) fn finish_cached_serve(
     } = outcome;
     let (what, who) = role.words();
     let via = mechanism.via();
-    let aliased = cd
-        .aliased_host
-        .map_or_else(String::new, |alias| format!(" aliased to host {alias}"));
+    let aliased = cd.alias_suffix();
     let in_time = cd.request_received_at.elapsed();
     let volatile = if cd.cached_flavor() == CachedFlavor::Volatile {
         "volatile "

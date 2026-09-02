@@ -60,7 +60,7 @@ use tracing::trace;
 use crate::{
     cache_paths::{CachePaths, MirrorSite},
     client_info::ClientInfo,
-    config::CacheHost,
+    config::ClientHost,
     database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
         FlatKind, Mirror, MirrorKind, Origin, ResourceFile, is_deb_package, is_flat_deb_filename,
@@ -337,8 +337,15 @@ pub(crate) struct ConnectionDetails {
     /// Monotonic instant the client request was parsed - origin of the
     /// `in <time>` total-proxy-time figure in download/serve logs.
     pub(crate) request_received_at: PreciseInstant,
+    /// The canonical mirror: alias-resolved once in
+    /// `request_dispatch::decide_request`, so the active-downloads key, the
+    /// on-disk site, the DB rows and the logs all name the alias' main host.
     pub(crate) mirror: Mirror,
-    pub(crate) aliased_host: Option<&'static CacheHost>,
+    /// The host the client named, which is where the upstream fetch goes
+    /// (an alias is a real mirror serving the same content; the alias
+    /// mapping only unifies the cache identity).  Equal to `mirror.host()`
+    /// unless an alias matched.
+    pub(crate) upstream_host: ClientHost,
     pub(crate) debname: String,
     /// The classified kind; [`Self::cached_flavor`] and [`Self::layout`] are
     /// derived from it rather than stored, so the three cannot disagree.
@@ -392,21 +399,47 @@ impl ConnectionDetails {
         CacheEntryKeyRef::new(&self.mirror, &self.debname, self.layout())
     }
 
-    /// The alias-resolved on-disk identity of this request's mirror: the
-    /// alias' `main` host when the request was resolved against an alias
-    /// mapping, else the mirror's own host.  `partial_file::create_partial_file`
-    /// resolves the same site through `InitBarrier::site`, so the `.partial`
-    /// lands next to its rename target.
+    /// The on-disk identity of this request's mirror.  `mirror` is already
+    /// canonical, so this is a plain projection; `InitBarrier::site` derives
+    /// the same site, so the `.partial` lands next to its rename target.
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
-        let host = match self.aliased_host {
-            Some(cache) => cache,
-            None => self.mirror.host().as_cache_host(),
-        };
         MirrorSite {
-            host,
+            host: self.mirror.host().as_cache_host(),
             port: self.mirror.port(),
             path: self.mirror.path(),
+        }
+    }
+
+    /// The `host[:port]` authority of the upstream the fetch dials: the
+    /// host the client named, on the mirror's port.
+    #[must_use]
+    pub(crate) fn upstream_authority(&self) -> Cow<'_, str> {
+        self.upstream_host.format_authority(self.mirror.port())
+    }
+
+    /// The mirror to dial for an upstream fetch: the canonical mirror with
+    /// the client-named host swapped in.  Only for upstream dispatch and
+    /// formatting; never persisted or used as a key.
+    #[cfg(feature = "splice")]
+    #[must_use]
+    pub(crate) fn upstream_mirror(&self) -> Mirror {
+        Mirror::new(
+            self.upstream_host.clone(),
+            self.mirror.port(),
+            self.mirror.path().to_owned(),
+            self.mirror.kind(),
+        )
+    }
+
+    /// Log suffix naming the alias the client used, empty when the request
+    /// named the canonical host itself.
+    #[must_use]
+    pub(crate) fn alias_suffix(&self) -> String {
+        if &self.upstream_host == self.mirror.host() {
+            String::new()
+        } else {
+            format!(" via alias host {}", self.upstream_host)
         }
     }
 

@@ -355,18 +355,23 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
 //
 // Two semantically distinct flavours of host string exist in this codebase:
 //
-// * [`ClientHost`] — the host the client put on the wire (post-validation).
-//   Used verbatim for the upstream TCP/TLS connect, the outgoing `Host:`
-//   header, the DB primary key on `mirrors_v2`, and origin lookups.
+// * [`ClientHost`] — a validated wire-side host name: what the client put
+//   on the wire (`ConnectionDetails::upstream_host`, used for the upstream
+//   TCP/TLS connect and the outgoing `Host:` header), and the host of a
+//   canonical `Mirror` (the alias' main host, or the client host when no
+//   alias matched) that keys the active-downloads registry, the
+//   `mirrors_v2` rows and the origins.
 // * [`CacheHost`]  — the alias-resolved on-disk identity.  Used for the
 //   per-host cache directory, the flat-collision blocklist, and the
 //   cleanup/scan filesystem traversal.
 //
-// Both wrap a validated [`DomainName`] and carry the same byte content when
-// no alias maps the client name.  Keeping them as distinct types prevents
-// callers from accidentally handing a resolved name to a function that
-// expects a raw one (and vice versa) — the invariant used to rest on
-// careful variable naming alone.
+// Alias resolution happens exactly once, in `request_dispatch::decide_request`;
+// every consumer downstream sees the canonical `Mirror`.  Both wrap a
+// validated [`DomainName`] and carry the same byte content when no alias
+// maps the client name.  Keeping them as distinct types prevents callers
+// from accidentally handing a resolved name to a function that expects a
+// raw one (and vice versa) — the invariant used to rest on careful variable
+// naming alone.
 //
 // `#[repr(transparent)]` on both wrappers guarantees they share the
 // layout of the inner [`DomainName`].  [`ClientHost::as_cache_host`]
@@ -440,6 +445,15 @@ impl ClientHost {
         // `DomainName`, so `&ClientHost` and `&CacheHost` share an
         // identical in-memory layout.
         unsafe { &*std::ptr::from_ref(self).cast::<CacheHost>() }
+    }
+}
+
+impl CacheHost {
+    /// The same name as a wire-side [`ClientHost`]: the identity a
+    /// canonical `Mirror` carries after alias resolution.
+    #[must_use]
+    pub(crate) fn to_client_host(&self) -> ClientHost {
+        ClientHost(self.0.clone())
     }
 }
 

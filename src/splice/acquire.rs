@@ -397,8 +397,9 @@ pub(super) async fn follow_redirect(
             80
         }
     });
-    let original_port_effective = mirror_port(&conn_details.mirror, exchange.conn.is_tls());
-    if moved_host == conn_details.mirror.host()
+    let dial_mirror = conn_details.upstream_mirror();
+    let original_port_effective = mirror_port(&dial_mirror, exchange.conn.is_tls());
+    if moved_host == dial_mirror.host()
         && moved_port_effective == original_port_effective
         && moved_path == original_path
     {
@@ -569,7 +570,10 @@ pub(super) async fn acquire_upstream(
     volatile_cond: Option<&VolatileCondHeaders>,
     #[cfg(feature = "ktls")] volatile_cache_path: &mut Option<PathBuf>,
 ) -> Result<UpstreamAcquire, SpliceProxyError> {
-    let mirror = &conn_details.mirror;
+    // Dial the host the client named; `conn_details.mirror` is the
+    // canonical cache identity, which may be an alias' main host.
+    let dial_mirror = conn_details.upstream_mirror();
+    let mirror = &dial_mirror;
 
     #[cfg(feature = "ktls")]
     {

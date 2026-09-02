@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE downloads SET mirror_id = ? WHERE mirror_id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "5bcfca526ba3c0b1c8e4f4b6f95aa888e63d28494b7ceaca8717492868434e34"
+}

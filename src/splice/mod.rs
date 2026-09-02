@@ -1027,16 +1027,17 @@ async fn plan_upstream_response(
     // After a redirect every further upstream exchange -- including the
     // discard-and-retry below -- talks to the redirect target, not to the
     // original mirror with the redirected path.
-    let (upstream_mirror, host_authority, upstream_path) = redirect.as_ref().map_or(
-        (&conn_details.mirror, host_authority, upstream_path),
-        |target| {
-            (
-                &target.mirror,
-                target.authority.as_str(),
-                target.path.as_str(),
-            )
-        },
-    );
+    let dial_mirror = conn_details.upstream_mirror();
+    let (upstream_mirror, host_authority, upstream_path) =
+        redirect
+            .as_ref()
+            .map_or((&dial_mirror, host_authority, upstream_path), |target| {
+                (
+                    &target.mirror,
+                    target.authority.as_str(),
+                    target.path.as_str(),
+                )
+            });
 
     exchange.response.discard_invalid_validators(conn_details);
 
@@ -1589,7 +1590,9 @@ async fn splice_proxy_drive(
     init_tx: tokio::sync::watch::Sender<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
-    let host_authority = conn_details.mirror.format_authority();
+    // The dial target: the host the client named (an alias is a real
+    // mirror), never the canonical mirror the caches key on.
+    let host_authority = conn_details.upstream_authority();
     // Capture the original (pre-redirect) client request path. A 301 redirect
     // in `plan_upstream_response` shadows `upstream_path` to the redirected
     // URL; the Origin row (`commit_and_record`) and

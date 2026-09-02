@@ -442,7 +442,7 @@ fn decide_request(
     requested_host: ClientHost,
     requested_port: Option<NonZero<u16>>,
     client: &ClientInfo,
-    aliases: &'static [Alias],
+    aliases: &[Alias],
     reject_pdiff_requests: bool,
     is_flat_blocked: impl FnOnce(&CacheHost, Option<NonZero<u16>>) -> bool,
     request_received_at: PreciseInstant,
@@ -491,8 +491,13 @@ fn decide_request(
                     );
                     PassthroughReason::FlatBlocked
                 } else {
+                    // Resolve the alias exactly once: the `Mirror` every
+                    // store keys on names the alias' main host, while the
+                    // upstream fetch still dials the host the client named.
+                    let canonical_host = aliased_host
+                        .map_or_else(|| requested_host.clone(), CacheHost::to_client_host);
                     let mirror = Mirror::new(
-                        requested_host,
+                        canonical_host,
                         requested_port,
                         class.mirror_path,
                         layout.mirror_kind(),
@@ -503,7 +508,7 @@ fn decide_request(
                             client: *client,
                             request_received_at,
                             mirror,
-                            aliased_host,
+                            upstream_host: requested_host,
                             debname: class.debname,
                             resource_kind: class.resource_kind,
                             origin_fields: class.origin_fields.map(Box::new),
@@ -795,6 +800,36 @@ mod tests {
         assert_eq!(origin.distribution, "sid");
         assert_eq!(origin.component, "main");
         assert_eq!(origin.architecture, "binary-amd64");
+    }
+
+    #[test]
+    fn cache_outcome_resolves_alias_once_and_keeps_the_upstream_host() {
+        use crate::config::Alias;
+        let main = ClientHost::new("deb.debian.org".to_owned()).expect("valid host");
+        let alias = ClientHost::new("ftp.ca.debian.org".to_owned()).expect("valid host");
+        let aliases = [Alias {
+            main: main.clone().into_cache_host(),
+            aliases: vec![alias.clone()],
+        }];
+        let decision = decide_request(
+            "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb",
+            alias.clone(),
+            None,
+            &fake_client(),
+            &aliases,
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        let Decision::Cache { conn_details } = decision else {
+            unreachable!("expected Cache outcome")
+        };
+        // The identity every store keys on is the alias' main host ...
+        assert_eq!(conn_details.mirror.host(), &main);
+        assert_eq!(conn_details.site().host, main.as_cache_host());
+        // ... while the dial still goes to the mirror the client named.
+        assert_eq!(conn_details.upstream_host, alias);
+        assert_eq!(conn_details.upstream_authority(), "ftp.ca.debian.org");
     }
 
     #[test]

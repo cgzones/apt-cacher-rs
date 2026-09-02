@@ -724,10 +724,7 @@ async fn serve_cached_file(
     prefetched_upstream_metadata: Option<&UpstreamMetadata>,
     prefetched_local_metadata: Option<std::fs::Metadata>,
 ) -> Response<ProxyCacheBody> {
-    let aliased = match conn_details.aliased_host {
-        Some(alias) => format!(" aliased to host {alias}"),
-        None => String::new(),
-    };
+    let aliased = conn_details.alias_suffix();
 
     let mdata = match prefetched_local_metadata {
         Some(m) => {
@@ -1322,9 +1319,9 @@ async fn download_file(
             match tokio::fs::try_exists(&dest_file_path).await {
                 Ok(true) => {
                     warn!(
-                        "Target file `{}` already exists; overwriting (aliased={})",
+                        "Target file `{}` already exists; overwriting{}",
                         dest_file_path.display(),
-                        conn_details.aliased_host.is_some()
+                        conn_details.alias_suffix()
                     );
                 }
                 Ok(false) => {}
@@ -1592,8 +1589,10 @@ async fn serve_new_file(
             }
         }
     }
-    // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers
-    let host = HeaderValue::from_str(&conn_details.mirror.format_authority())
+    // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers.
+    // The upstream authority, not the canonical mirror: an aliased request
+    // dials the host the client named.
+    let host = HeaderValue::from_str(&conn_details.upstream_authority())
         .expect("connection host should be valid");
     let host = &host;
 

@@ -108,7 +108,7 @@ const MAX_HEADERS: usize = 100;
 // Only the `CacheMiss` handoff plan (carrying the stale copy) pushes the
 // variant-size gap over clippy's threshold.
 #[cfg_attr(
-    all(feature = "hyper", not(feature = "splice")),
+    feature = "hyper",
     expect(
         clippy::large_enum_variant,
         reason = "transient value: returned by try_sendfile_request and matched once by the \
@@ -1123,10 +1123,7 @@ async fn try_sendfile_request(
             }
         };
 
-    let aliased = match conn_details.aliased_host {
-        Some(alias) => format!(" aliased to host {alias}"),
-        None => String::new(),
-    };
+    let aliased = conn_details.alias_suffix();
 
     // Check if the file is currently being downloaded - if so, serve it via
     // sendfile from the growing partial file.  `attach()` atomically records

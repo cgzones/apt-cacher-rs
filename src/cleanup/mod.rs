@@ -27,7 +27,7 @@ use crate::{
     AppState,
     cache_paths::CachePaths,
     config::{CacheHost, Config},
-    database::{Database, resolved_cache_host},
+    database::Database,
     deb_mirror::{Mirror, derive_nested_paths},
     error::ErrorReport,
     global_cache_quota, global_config,
@@ -75,7 +75,7 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
     let paths = CachePaths::new(&config.cache_directory);
     let mut gone = Vec::new();
     for orphan in orphans {
-        let site = orphan.entry.site_with_aliases(&config.aliases);
+        let site = orphan.entry.site();
         let has_tree =
             paths.mirror_dir(site).exists() || paths.flat_root(site.host, site.port).exists();
         if !has_tree {
@@ -227,22 +227,14 @@ async fn task_cleanup_impl(appstate: &AppState) {
 
     // Group mirror paths by (cache_host, port) and sort each group once so
     // each mirror's nested-paths derivation is O(k) over its host's siblings
-    // instead of O(n) over every mirror.  Keying on the alias-resolved
-    // `CacheHost` (the same identity `MirrorEntry::site_with_aliases` hands
-    // `CachePaths` to build on-disk paths) matches the cleanup layout: two DB rows whose raw `ClientHost` differs but resolves to
-    // the same `main` host share `<cache>/<main_host>/…` on disk, so they
-    // must share a nesting bucket — otherwise a parent's flat-cleanup could
-    // recurse into and age-evict files owned by a sibling alias's mirror.
-    // Stored as borrows into `mirrors` and the global aliases table.
-    let aliases = config.aliases.as_slice();
-    // Resolve each mirror's (alias-main cache host, port) key once; the alias
-    // table scan in `resolved_cache_host` is otherwise repeated in both the
-    // grouping pass and the nested-paths pass below.
+    // instead of O(n) over every mirror.  Rows are canonical (alias-resolved
+    // at dispatch, legacy rows folded at startup), so the row host *is* the
+    // `<cache>/<host>/…` tree the nesting bucket must follow.
     let host_keys: Vec<(&CacheHost, u16)> = mirrors
         .iter()
         .map(|entry| {
             (
-                resolved_cache_host(aliases, &entry.host),
+                entry.host.as_cache_host(),
                 entry.port().map_or(0, std::num::NonZero::get),
             )
         })

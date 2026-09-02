@@ -137,6 +137,23 @@ pub(crate) async fn main_loop(
         })
         .map_err(MainLoopError::Database)?;
 
+    // Fold mirror rows an earlier version wrote under an alias host into
+    // their main row before anything reads them: the startup scan, the
+    // flat blocklist and cleanup all key on the canonical host now.
+    match database.merge_alias_rows(&config.aliases).await {
+        Ok(0) => {}
+        Ok(merged) => {
+            info!("Folded {merged} mirror rows written under alias hosts into their main rows");
+        }
+        Err(err) => {
+            error!(
+                "Failed to fold alias mirror rows into their main rows; aborting startup:  {}",
+                ErrorReport(&err)
+            );
+            return Err(MainLoopError::Database(err));
+        }
+    }
+
     // Seed the per-host flat-layout collision blocklist from any
     // pre-existing structured mirrors whose `mirror_path` starts with
     // `flat/` (or equals `flat`).  Those hosts get flat caching disabled
@@ -217,7 +234,7 @@ pub(crate) async fn main_loop(
     // a misconfigured alias change could otherwise wipe live cache.
     let paths = CachePaths::new(&config.cache_directory);
     for mirror in &mirrors {
-        let legacy_flat = paths.legacy_flat_dir(mirror.site_with_aliases(&config.aliases));
+        let legacy_flat = paths.legacy_flat_dir(mirror.site());
         match tokio::fs::symlink_metadata(&legacy_flat).await {
             Ok(md) if md.file_type().is_dir() => {
                 warn!(

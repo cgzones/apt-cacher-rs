@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE OR IGNORE origins SET mirror_id = ? WHERE mirror_id = ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "87490f90b6d63c9c9ae23a9f918ba15ce515b20f835482287e6428a95c2e7430"
+}

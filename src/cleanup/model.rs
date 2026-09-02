@@ -460,13 +460,12 @@ pub(super) fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
 /// [`ReconcileFacet::FlatTree`] unit's walk boundaries.
 ///
 /// Every unit root is a [`CachePaths::entry_dir`] / [`CachePaths::tmp_dir`]
-/// of the mirror's alias-resolved site - the same derivation the serve path
-/// writes through (`ConnectionDetails::cache_file_path`), so a layout whose
-/// on-disk position moved cannot leave cleanup scanning the old one (finding
-/// nothing, reaping nothing, and saying nothing).  Both are computed from
-/// `config` (`entry.site_with_aliases(&config.aliases)`) rather than
-/// `global_config()`, which panics outside a running daemon: this function
-/// must stay callable from a plain unit test.
+/// of the mirror's site - the same derivation the serve path writes through
+/// (`ConnectionDetails::cache_file_path`), so a layout whose on-disk position
+/// moved cannot leave cleanup scanning the old one (finding nothing, reaping
+/// nothing, and saying nothing).  Paths are computed from `config` rather
+/// than `global_config()`, which panics outside a running daemon: this
+/// function must stay callable from a plain unit test.
 pub(super) fn classify_mirror(
     entry: &MirrorEntry,
     nested: Vec<String>,
@@ -475,7 +474,7 @@ pub(super) fn classify_mirror(
     let is_flat = entry.kind() == MirrorKind::Flat;
 
     let paths = CachePaths::new(&config.cache_directory);
-    let site = entry.site_with_aliases(&config.aliases);
+    let site = entry.site();
 
     let byhash_backstop = Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get());
 
@@ -845,7 +844,7 @@ mod tests {
     // classify_mirror
 
     use crate::cache_paths::MirrorSite;
-    use crate::config::{Alias, ClientHost};
+    use crate::config::ClientHost;
 
     fn test_entry(host: &str, path: &str, kind: MirrorKind) -> MirrorEntry {
         MirrorEntry::new_for_test(
@@ -971,19 +970,12 @@ mod tests {
     }
 
     #[test]
-    fn unit_roots_are_the_serve_path_entry_dirs_of_the_aliased_site() {
+    fn unit_roots_are_the_serve_path_entry_dirs_of_the_site() {
         // Every root cleanup scans is `CachePaths::entry_dir`/`tmp_dir` of
-        // the same `MirrorSite` the serve path writes through - including
-        // the alias resolution: the row names the alias host, the tree lives
-        // under the alias' main host.
-        let entry = test_entry("mirror.alias.org", "debian", MirrorKind::Structured);
-        let mut config = test_config("/cache");
-        config.aliases = vec![Alias {
-            main: ClientHost::new("deb.debian.org".to_owned())
-                .expect("valid host")
-                .into_cache_host(),
-            aliases: vec![ClientHost::new("mirror.alias.org".to_owned()).expect("valid host")],
-        }];
+        // the same `MirrorSite` the serve path writes through. Rows are
+        // canonical (the alias' main host) by the time cleanup reads them.
+        let entry = test_entry("deb.debian.org", "debian", MirrorKind::Structured);
+        let config = test_config("/cache");
         let paths = CachePaths::new(&config.cache_directory);
         let main = ClientHost::new("deb.debian.org".to_owned())
             .expect("valid host")
