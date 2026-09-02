@@ -173,6 +173,48 @@ impl Display for Meter {
     }
 }
 
+/// How recently a mirror, origin or client was last seen.
+///
+/// The one place the staleness thresholds live: [`FmtLastSeenHealth`] paints
+/// the badge from it and [`Freshness::row_class`] paints the row's left rule,
+/// so the two cannot disagree about what "aging" means.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum Freshness {
+    /// No timestamp recorded.
+    Unknown,
+    Fresh,
+    /// Not seen in over a week.
+    Aging(i64),
+    /// Not seen in over a month.
+    Stale(i64),
+}
+
+impl Freshness {
+    pub(super) const fn of(last_seen: i64, now_epoch: i64) -> Self {
+        if last_seen <= 0 {
+            return Self::Unknown;
+        }
+        let age_days = now_epoch.saturating_sub(last_seen) / (24 * 60 * 60);
+        if age_days > 30 {
+            Self::Stale(age_days)
+        } else if age_days > 7 {
+            Self::Aging(age_days)
+        } else {
+            Self::Fresh
+        }
+    }
+
+    /// The `class` attribute for a row in this state, empty when the row
+    /// needs no marker. A rule on every fresh row would mark nothing.
+    pub(super) const fn row_class(self) -> &'static str {
+        match self {
+            Self::Unknown | Self::Fresh => "",
+            Self::Aging(_) => " class=\"row-aging\"",
+            Self::Stale(_) => " class=\"row-stale\"",
+        }
+    }
+}
+
 /// Combines a "last seen" timestamp with a staleness badge ("aging"/"stale").
 pub(super) struct FmtLastSeenHealth {
     pub(super) last_seen: i64,
@@ -181,22 +223,16 @@ pub(super) struct FmtLastSeenHealth {
 impl Display for FmtLastSeenHealth {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(&FmtTimestamp(self.last_seen), f)?;
-        if self.last_seen <= 0 {
-            return Ok(());
-        }
-        let age_days = self.now_epoch.saturating_sub(self.last_seen) / (24 * 60 * 60);
-        if age_days > 30 {
-            write!(
+        match Freshness::of(self.last_seen, self.now_epoch) {
+            Freshness::Unknown | Freshness::Fresh => Ok(()),
+            Freshness::Aging(days) => write!(
                 f,
-                " <span class=\"alert\" title=\"Stale: not seen in {age_days} days\">stale</span>"
-            )
-        } else if age_days > 7 {
-            write!(
+                " <span class=\"warn\" title=\"Aging: not seen in {days} days\">aging</span>"
+            ),
+            Freshness::Stale(days) => write!(
                 f,
-                " <span class=\"warn\" title=\"Aging: not seen in {age_days} days\">aging</span>"
-            )
-        } else {
-            Ok(())
+                " <span class=\"alert\" title=\"Stale: not seen in {days} days\">stale</span>"
+            ),
         }
     }
 }

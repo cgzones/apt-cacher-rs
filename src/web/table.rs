@@ -43,6 +43,13 @@ impl Table {
         self.out.push_str("<tr>");
     }
 
+    /// Start a row carrying a state class, which the stylesheet paints as a
+    /// rule down the row's leading edge. `attr` is a whole ` class="..."`
+    /// fragment (see `fmt::Freshness::row_class`), empty for no marker.
+    pub(super) fn start_row_marked(&mut self, attr: &'static str) {
+        swrite!(self.out, "<tr{attr}>");
+    }
+
     /// Cell contents longer than this get a `title` attribute repeating the
     /// full value. The stylesheet truncates cells at 220px, which is roughly
     /// 30 characters at the table font size; the lower bound errs towards
@@ -78,11 +85,18 @@ impl Table {
     }
 }
 
-/// Append a row of cells, each formatted via `format_args!`.
+/// Append a row of cells, each formatted via `format_args!`. The `marked`
+/// form carries a state class on the `<tr>`.
 macro_rules! tr {
     ($table:expr, $($cell:expr),* $(,)?) => {{
         let t = &mut $table;
         t.start_row();
+        $( t.cell(format_args!("{}", $cell)); )*
+        t.end_row();
+    }};
+    (marked $attr:expr, $table:expr, $($cell:expr),* $(,)?) => {{
+        let t = &mut $table;
+        t.start_row_marked($attr);
         $( t.cell(format_args!("{}", $cell)); )*
         t.end_row();
     }};
@@ -136,6 +150,28 @@ impl DetailsList {
 /// Append a `<div class="section">` wrapping a titled HTML body.
 pub(super) fn write_section(out: &mut String, title: &'static str, body: &str) {
     swrite!(out, "<div class=\"section\"><h2>{title}</h2>{body}</div>");
+}
+
+/// Append a titled `<details>` section around an already-rendered body.
+///
+/// The row-table sections go through [`write_collapsible_section`], which
+/// derives `open` from the row count and needs an empty-state note; this is
+/// for the key/value sections, whose disclosure state is an editorial call
+/// about how much the reader needs them.
+pub(super) fn write_collapsible_details(
+    out: &mut String,
+    title: &'static str,
+    id: &'static str,
+    open: bool,
+    body: &str,
+) {
+    let open_attr = if open { " open" } else { "" };
+    swrite!(
+        out,
+        "<div class=\"section\"><details{open_attr}>\
+         <summary><h2 id=\"{id}\">{title}</h2></summary>\
+         {body}</details></div>"
+    );
 }
 
 /// Append a collapsible `<details>` section. Expanded by default unless empty.

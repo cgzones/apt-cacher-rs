@@ -42,7 +42,10 @@ use super::{
         build_setup_hint_html,
     },
     response::WebResponse,
-    table::{DetailsList, write_collapsible_section, write_section, write_section_error},
+    table::{
+        DetailsList, write_collapsible_details, write_collapsible_section, write_section,
+        write_section_error,
+    },
     tables::{
         DirStats, Section, TopPackagesView, build_client_table, build_mirror_table,
         build_origin_table, build_top_packages_table, build_uncacheable_table,
@@ -66,6 +69,8 @@ struct DashboardData {
     cache_stats_html: String,
     metrics_html: String,
     health_html: String,
+    hero_html: String,
+    healthy: bool,
     /// Whether any mirror has ever been contacted. A dashboard of zeroes on
     /// a fresh install needs the setup hint more than it needs the tables.
     seen_traffic: bool,
@@ -255,7 +260,15 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     );
 
     let metrics_html = build_metrics_html();
-    let health_html = build_health_html(&cached_health_report().await);
+    let health_report = cached_health_report().await;
+    let healthy = health_report.healthy();
+    let health_html = build_health_html(&health_report);
+    let hero_html = build_hero_html(
+        &mirrors,
+        cache_size,
+        rd.config.disk_quota.map(std::num::NonZero::get),
+        healthy,
+    );
 
     DashboardData {
         mirror,
@@ -270,11 +283,97 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         cache_stats_html,
         metrics_html,
         health_html,
+        hero_html,
+        healthy,
         seen_traffic: !mirrors.is_empty(),
         generation_start: start,
         db_elapsed,
         fs_elapsed,
     }
+}
+
+/// The one thing the daemon exists to do, at the top of the page: bytes in
+/// from upstream, bytes out to clients, and the difference it kept. That
+/// difference was previously the third cell of the fourth card, in the same
+/// weight as the mmap threshold.
+/// The share of what clients asked for that never left the cache, as a
+/// parenthesised suffix; nothing at all before anything has been served.
+///
+/// `saved` is the figure the hero prints beside it, not a second derivation
+/// of it: the two have to agree, and a percentage computed from unclamped
+/// totals reads `-8.3%` next to a `0B` headline whenever more has been
+/// fetched than delivered.
+struct SavedShare {
+    saved: u64,
+    delivered: i64,
+}
+
+impl Display for SavedShare {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.delivered <= 0 {
+            return Ok(());
+        }
+        write!(
+            f,
+            " ({})",
+            Pct {
+                num: i64::try_from(self.saved).unwrap_or(i64::MAX),
+                den: self.delivered,
+            }
+        )
+    }
+}
+
+fn build_hero_html(
+    mirrors: &[MirrorStatEntry],
+    cache_size: u64,
+    quota: Option<u64>,
+    healthy: bool,
+) -> String {
+    let downloaded_raw: i64 = mirrors.iter().map(|m| m.total_download_size).sum();
+    let delivered_raw: i64 = mirrors.iter().map(|m| m.total_delivery_size).sum();
+    let downloaded = as_size(downloaded_raw);
+    let delivered = as_size(delivered_raw);
+    // Floors at zero. A mirror can have fetched more than it has delivered
+    // (bodies still in flight, clients gone mid-download), and "-4.2GB of
+    // bandwidth saved" is not a thing the cache can have done.
+    let saved = delivered.saturating_sub(downloaded);
+
+    let mut html = String::with_capacity(1024);
+    swrite!(
+        html,
+        "<div class=\"hero\">\
+         <div class=\"flow\">\
+         <span><span class=\"k\">fetched upstream</span><span class=\"v\">{}</span></span>\
+         <span class=\"arrow\">\u{2192}</span>\
+         <span><span class=\"k\">served to clients</span><span class=\"v\">{}</span></span>\
+         </div>\
+         <div class=\"saved\"><span class=\"k\">bandwidth saved{}</span>\
+         <span class=\"big\">{}</span></div>",
+        HumanFmt::Size(downloaded),
+        HumanFmt::Size(delivered),
+        // Suppressed until something has been served: "(N/A)" beside a 0B
+        // figure is the first thing a new install reads.
+        SavedShare {
+            saved,
+            delivered: delivered_raw,
+        },
+        HumanFmt::Size(saved),
+    );
+
+    let (state_class, state_text) = if healthy {
+        ("ok", "healthy")
+    } else {
+        ("bad", "unhealthy")
+    };
+    swrite!(
+        html,
+        "<div class=\"right\"><span class=\"k\">cache</span>\
+         <span class=\"v\">{}</span>\
+         <span class=\"state {state_class}\">{state_text}</span></div></div>",
+        DiskUsage { cache_size, quota },
+    );
+    html
 }
 
 /// The five readiness checks the `/healthcheck` endpoint reports, rendered
@@ -550,17 +649,9 @@ fn build_cache_stats_html(
     free_disk_bytes: Option<u64>,
     rd: &RuntimeDetails,
 ) -> String {
-    let total_downloaded: i64 = mirrors.iter().map(|m| m.total_download_size).sum();
-    let total_delivered: i64 = mirrors.iter().map(|m| m.total_delivery_size).sum();
-    let bandwidth_saved = total_delivered.saturating_sub(total_downloaded);
-
     let total_download_count: i64 = mirrors.iter().map(|m| m.download_count).sum();
     let total_delivery_count: i64 = mirrors.iter().map(|m| m.delivery_count).sum();
     let cache_hits = total_delivery_count.saturating_sub(total_download_count);
-
-    let total_downloaded_u = as_size(total_downloaded);
-    let total_delivered_u = as_size(total_delivered);
-    let bandwidth_saved_u = as_size(bandwidth_saved);
 
     let uncacheable_count = get_uncacheables().read().len();
 
@@ -587,17 +678,9 @@ fn build_cache_stats_html(
         }
     };
 
+    // The lifetime fetched/served/saved triple lives in the hero; repeating
+    // it here would be the same three numbers twice on one screen.
     let mut t = DetailsList::new();
-    t.row("Fetched from Upstream", HumanFmt::Size(total_downloaded_u));
-    t.row("Served to Clients", HumanFmt::Size(total_delivered_u));
-    t.row("Bandwidth Saved", HumanFmt::Size(bandwidth_saved_u));
-    t.row(
-        "Bandwidth Savings",
-        Pct {
-            num: bandwidth_saved,
-            den: total_delivered,
-        },
-    );
     t.row(
         "Cache Hit Ratio (persisted)",
         CacheHitRatio {
@@ -670,19 +753,17 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         ));
     }
 
-    write_section(&mut body, "Health", &data.health_html);
-    write_section(&mut body, "Daemon Status", &data.daemon_status_html);
-    write_section(&mut body, "Configuration", &data.configuration_html);
-    write_section(&mut body, "Maintenance", &data.maintenance_html);
-    write_section(&mut body, "Cache Statistics", &data.cache_stats_html);
+    body.push_str(&data.hero_html);
 
-    // Metrics: long & diagnostic; collapsed by default.
-    swrite!(
-        body,
-        "<div class=\"section\"><details>\
-         <summary><h2 id=\"metrics-head\">Metrics</h2></summary>\
-         {}</details></div>",
-        data.metrics_html,
+    // Expanded only when something failed: healthy is already stated in the
+    // hero, and a reader opening this section wants the detail, not five
+    // lines of OK.
+    write_collapsible_details(
+        &mut body,
+        "Health",
+        "health-head",
+        !data.healthy,
+        &data.health_html,
     );
 
     write_collapsible_section(
@@ -747,6 +828,33 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         Some(UNCACHEABLES_MAX.get()),
         "Nothing has been requested that the cache had to pass through untouched.",
         &data.uncacheable.html,
+    );
+
+    // Reference and diagnostics last: read once at setup, or when something
+    // is wrong. Configuration in particular used to sit second, above the
+    // figures anyone actually opens this page for.
+    write_section(&mut body, "Cache Statistics", &data.cache_stats_html);
+    write_section(&mut body, "Daemon Status", &data.daemon_status_html);
+    write_collapsible_details(
+        &mut body,
+        "Maintenance",
+        "maintenance-head",
+        false,
+        &data.maintenance_html,
+    );
+    write_collapsible_details(
+        &mut body,
+        "Configuration",
+        "configuration-head",
+        false,
+        &data.configuration_html,
+    );
+    write_collapsible_details(
+        &mut body,
+        "Metrics",
+        "metrics-head",
+        false,
+        &data.metrics_html,
     );
 
     // Rounded to whole milliseconds so the three figures share a unit;

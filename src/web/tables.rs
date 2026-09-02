@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    fmt::{FmtLastSeenHealth, FmtTimestamp, HtmlEscape, HtmlEscaped, as_size},
+    fmt::{Freshness, FmtLastSeenHealth, FmtTimestamp, HtmlEscape, HtmlEscaped, as_size},
     table::{Table, tr, write_section_error},
 };
 
@@ -334,6 +334,7 @@ pub(super) async fn build_mirror_table(
         let delivered_bytes = as_size(mirror.total_delivery_size);
 
         tr!(
+            marked Freshness::of(mirror.last_seen, now_epoch).row_class(),
             table,
             HtmlEscaped(mirror.uri()),
             FmtLastSeenHealth {
@@ -417,6 +418,7 @@ pub(super) async fn build_origin_table(database: &Database, now_epoch: i64) -> S
 
     for origin in origins {
         tr!(
+            marked Freshness::of(origin.last_seen, now_epoch).row_class(),
             table,
             HtmlEscaped(origin.mirror_uri()),
             HtmlEscape(&origin.distribution),
@@ -469,6 +471,7 @@ pub(super) async fn build_client_table(database: &Database, now_epoch: i64) -> S
         let downloaded = as_size(client.total_downloaded);
         let delivered = as_size(client.total_delivered);
         tr!(
+            marked Freshness::of(client.last_seen, now_epoch).row_class(),
             table,
             client.client_ip,
             FmtLastSeenHealth {
