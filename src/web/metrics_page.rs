@@ -80,7 +80,7 @@ impl Groups {
         build(&mut list);
         swrite!(
             self.out,
-            "<h4 class=\"group\">{title}</h4>{}",
+            "<h3 class=\"group\">{title}</h3>{}",
             list.finish()
         );
     }

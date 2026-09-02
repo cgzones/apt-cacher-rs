@@ -5,7 +5,7 @@
 //! rendering lives in submodules:
 //!
 //! - [`fmt`]: the `Display` newtypes cells are rendered through.
-//! - [`table`]: `Table`/`DetailsTable`, the `tr!` row macro, section wrappers.
+//! - [`table`]: `Table`/`DetailsList`, the `tr!` row macro, section wrappers.
 //! - [`page`]: query options, theme, the `<html>` skeleton and `<nav>`, the
 //!   stylesheet and favicon.
 //! - [`response`]: `WebResponse`, its header table and the hyper body wrapper.

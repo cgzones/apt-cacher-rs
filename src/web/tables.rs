@@ -515,9 +515,9 @@ pub(super) fn build_uncacheable_table() -> Section {
 /// What a Top-Packages table renders besides the package name.
 #[derive(Clone, Copy)]
 pub(super) enum TopPackagesView {
-    /// Columns: Package, Deliveries, Package Size.
+    /// Columns: Package, Deliveries, Size Each.
     ByCount,
-    /// Columns: Package, Total Size, Deliveries, Package Size.
+    /// Columns: Package, Delivered Total, Deliveries, Size Each.
     BySize,
 }
 

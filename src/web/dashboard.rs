@@ -22,7 +22,6 @@ use crate::{
     database::{Database, MirrorStatEntry},
     error::ErrorReport,
     global_cache_quota, global_config,
-    healthcheck::{Check, HealthReport, cached_health_report},
     humanfmt::HumanFmt,
     metrics, swrite,
     tunnel_limiter::active_tunnels,
@@ -67,11 +66,10 @@ struct DashboardData {
     maintenance_html: String,
     cache_stats_html: String,
     metrics_html: String,
-    health_html: String,
     hero_html: String,
-    healthy: bool,
     /// Whether any mirror has ever been contacted. A dashboard of zeroes on
     /// a fresh install needs the setup hint more than it needs the tables.
+    /// A failed mirror query counts as traffic: see `gather_dashboard_data`.
     seen_traffic: bool,
     generation_start: Instant,
     /// Wall-clock time spent on the parallel DB-query block (mirrors,
@@ -259,14 +257,10 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     );
 
     let metrics_html = build_metrics_html();
-    let health_report = cached_health_report().await;
-    let healthy = health_report.healthy();
-    let health_html = build_health_html(&health_report);
     let hero_html = build_hero_html(
         &mirrors,
         cache_size,
         rd.config.disk_quota.map(std::num::NonZero::get),
-        healthy,
     );
 
     DashboardData {
@@ -281,20 +275,29 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         maintenance_html,
         cache_stats_html,
         metrics_html,
-        health_html,
         hero_html,
-        healthy,
-        seen_traffic: !mirrors.is_empty(),
+        seen_traffic,
         generation_start: start,
         db_elapsed,
         fs_elapsed,
     }
 }
 
-/// The one thing the daemon exists to do, at the top of the page: bytes in
-/// from upstream, bytes out to clients, and the difference it kept. That
-/// difference was previously the third cell of the fourth card, in the same
-/// weight as the mmap threshold.
+/// A duration in milliseconds, fixed unit and fixed precision.
+///
+/// The footer's three figures are read against each other, so they have to
+/// share a unit: `HumanFmt::Time` picks one per value and mixes "30.0ms"
+/// with "412us" on one line. Rounding to whole milliseconds first shares the
+/// unit but renders every sub-millisecond figure as "0ns", which is how the
+/// disk timing read on an idle daemon.
+struct Millis(std::time::Duration);
+
+impl Display for Millis {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.2}ms", self.0.as_secs_f64() * 1000.0)
+    }
+}
+
 /// The share of what clients asked for that never left the cache, as a
 /// parenthesised suffix; nothing at all before anything has been served.
 ///
@@ -323,12 +326,11 @@ impl Display for SavedShare {
     }
 }
 
-fn build_hero_html(
-    mirrors: &[MirrorStatEntry],
-    cache_size: u64,
-    quota: Option<u64>,
-    healthy: bool,
-) -> String {
+/// The one thing the daemon exists to do, at the top of the page: bytes in
+/// from upstream, bytes out to clients, and the difference it kept. That
+/// difference was previously the third cell of the fourth card, in the same
+/// weight as the mmap threshold.
+fn build_hero_html(mirrors: &[MirrorStatEntry], cache_size: u64, quota: Option<u64>) -> String {
     let downloaded_raw: i64 = mirrors.iter().map(|m| m.total_download_size).sum();
     let delivered_raw: i64 = mirrors.iter().map(|m| m.total_delivery_size).sum();
     let downloaded = as_size(downloaded_raw);
@@ -360,54 +362,13 @@ fn build_hero_html(
         HumanFmt::Size(saved),
     );
 
-    let (state_class, state_text) = if healthy {
-        ("ok", "healthy")
-    } else {
-        ("bad", "unhealthy")
-    };
     swrite!(
         html,
         "<div class=\"right\"><span class=\"k\">cache</span>\
-         <span class=\"v\">{}</span>\
-         <span class=\"state {state_class}\">{state_text}</span></div></div>",
+         <span class=\"v\">{}</span></div></div>",
         DiskUsage { cache_size, quota },
     );
     html
-}
-
-/// The five readiness checks the `/healthcheck` endpoint reports, rendered
-/// on the page so an operator does not have to fetch JSON to learn whether
-/// the daemon is serving.
-fn build_health_html(report: &HealthReport) -> String {
-    struct CheckCell<'a> {
-        ok: bool,
-        detail: Option<&'a str>,
-    }
-    impl Display for CheckCell<'_> {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            if self.ok {
-                f.write_str("<span class=\"ok\">OK</span>")
-            } else {
-                write!(
-                    f,
-                    "<span class=\"alert\">{}</span>",
-                    HtmlEscape(self.detail.unwrap_or("failed")),
-                )
-            }
-        }
-    }
-
-    let mut t = DetailsList::new();
-    for check in report.checks() {
-        let Check {
-            key: _,
-            label,
-            ok,
-            detail,
-        } = check;
-        t.row(label, CheckCell { ok, detail });
-    }
-    t.finish()
 }
 
 fn build_daemon_status_html(
@@ -754,17 +715,6 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
 
     body.push_str(&data.hero_html);
 
-    // Expanded only when something failed: healthy is already stated in the
-    // hero, and a reader opening this section wants the detail, not five
-    // lines of OK.
-    write_collapsible_details(
-        &mut body,
-        "Health",
-        "health-head",
-        !data.healthy,
-        &data.health_html,
-    );
-
     write_collapsible_section(
         &mut body,
         "Mirrors",
@@ -797,18 +747,26 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         .top_packages_by_count
         .rows
         .max(data.top_packages_by_size.rows);
-    let mut top_packages_body = String::with_capacity(
-        data.top_packages_by_count.html.len() + data.top_packages_by_size.html.len() + 128,
-    );
-    swrite!(
-        top_packages_body,
-        "<div class=\"grid-2\">\
-         <div><h4 class=\"mini\">By Delivery Count</h4>{}</div>\
-         <div><h4 class=\"mini\">By Total Size</h4>{}</div>\
-         </div>",
-        data.top_packages_by_count.html,
-        data.top_packages_by_size.html,
-    );
+    // Left empty when neither half rendered anything, so the section falls
+    // through to its empty note. Emitting the grid unconditionally would
+    // make the note unreachable and leave a fresh install looking at two
+    // bare sub-headings. A section error notice keeps the grid: it is
+    // content, and it must not be swallowed by the note.
+    let mut top_packages_body = String::new();
+    if !data.top_packages_by_count.html.is_empty() || !data.top_packages_by_size.html.is_empty() {
+        top_packages_body.reserve(
+            data.top_packages_by_count.html.len() + data.top_packages_by_size.html.len() + 128,
+        );
+        swrite!(
+            top_packages_body,
+            "<div class=\"grid-2\">\
+             <div><h3 class=\"mini\">By Delivery Count</h3>{}</div>\
+             <div><h3 class=\"mini\">By Total Size</h3>{}</div>\
+             </div>",
+            data.top_packages_by_count.html,
+            data.top_packages_by_size.html,
+        );
+    }
     write_collapsible_section(
         &mut body,
         "Top Packages",
@@ -856,19 +814,12 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &data.metrics_html,
     );
 
-    // Rounded to whole milliseconds so the three figures share a unit;
-    // `HumanFmt::Time` otherwise mixes "30.0ms" with "1.00ms" in one line.
-    let whole_ms = |d: std::time::Duration| {
-        HumanFmt::Time(std::time::Duration::from_millis(
-            u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
-        ))
-    };
     swrite!(
         body,
         "<footer><hr><p>All dates are in UTC. Generated in {} (db {}, disk {}).</p></footer>",
-        whole_ms(data.generation_start.elapsed().into()),
-        whole_ms(data.db_elapsed),
-        whole_ms(data.fs_elapsed),
+        Millis(data.generation_start.elapsed().into()),
+        Millis(data.db_elapsed),
+        Millis(data.fs_elapsed),
     );
 
     build_page(PageTitle("apt-cacher-rs"), body, options)

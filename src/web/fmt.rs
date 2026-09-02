@@ -1,7 +1,7 @@
 //! `Display` newtypes the dashboard renders cells through: UTC timestamps,
 //! HTML escaping, ratio-based colouring and the small value formatters
-//! (sizes, percentages, yes/no). Each writes straight into the `Formatter`,
-//! so a cell never allocates an intermediate `String`.
+//! (sizes, percentages, yes/no). Each writes straight into the `Formatter`
+//! rather than building a `String` of its own.
 
 use std::{
     fmt::{self, Display, Formatter, Write as _},
@@ -128,8 +128,9 @@ impl Display for FmtTimestamp {
     }
 }
 
-/// Renders the age of a `SystemTime` as a duration (e.g. "5d 3h") inside a
-/// `<time>` carrying the absolute instant, or "N/A" when missing.
+/// Renders the age of a `SystemTime` as a duration followed by the absolute
+/// instant in a `<time>` (e.g. `5d 3h ago (<time ...>03 Sep 2026 ...</time>)`),
+/// or "N/A" when missing.
 ///
 /// The age is the useful figure at a glance and the absolute timestamp is
 /// what you need to correlate against a log; every other timestamp on the

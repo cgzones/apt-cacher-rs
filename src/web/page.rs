@@ -371,9 +371,6 @@ h3.group:first-of-type { margin-top: 4px; }
 .hero .right { margin-left: auto; text-align: right; }
 .hero .right .v { display: block; }
 .hero meter.bar { width: 90px; }
-.hero .state { font-weight: 600; }
-.hero .state.ok { color: var(--ok); }
-.hero .state.bad { color: var(--alert); }
 
 details { margin-top: 4px; }
 details > summary { cursor: pointer; list-style: none; }

@@ -1,4 +1,4 @@
-//! HTML table builders: [`Table`] for column tables, [`DetailsTable`] for
+//! HTML table builders: [`Table`] for column tables, [`DetailsList`] for
 //! key/value grids, the [`tr!`] row macro and the `<div class="section">`
 //! wrappers the dashboard page assembles sections with.
 
@@ -9,7 +9,9 @@ use crate::swrite;
 use super::fmt::HtmlEscape;
 
 // ---------------------------------------------------------------------------
-// Table builders — append rows directly via `swrite!`, no per-cell allocation.
+// Table builders — append rows directly via `swrite!`. `Table::cell` needs to
+// inspect a rendered value before emitting it and reuses one scratch buffer
+// for that, so no cell allocates a `String` of its own.
 // ---------------------------------------------------------------------------
 
 pub(super) struct Table {
