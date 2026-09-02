@@ -263,11 +263,61 @@ impl std::io::Write for ReopenableLogFile {
 #[derive(Copy, Clone, Debug)]
 struct UtcTimer;
 
+/// Fixed-size sink for [`UtcTimer`], so rendering a timestamp costs no
+/// allocation: `time`'s `format_into` writes through [`std::io::Write`],
+/// which `String`-returning `format` would satisfy only via a heap buffer
+/// per log record.
+struct StackWriter {
+    buf: [u8; Self::CAPACITY],
+    len: usize,
+}
+
+impl StackWriter {
+    /// An RFC 2822 date is 31 bytes (`Tue, 02 Sep 2026 12:34:56 +0000`);
+    /// the slack absorbs a longer zone abbreviation.
+    const CAPACITY: usize = 64;
+
+    const fn new() -> Self {
+        Self {
+            buf: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.buf[..self.len])
+    }
+}
+
+impl std::io::Write for StackWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Refuse rather than truncate: a short write would let `format_into`
+        // spin, and a truncated timestamp is worse than a dropped one.
+        let room = Self::CAPACITY - self.len;
+        if buf.len() > room {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "formatted timestamp exceeds the stack buffer",
+            ));
+        }
+        self.buf[self.len..self.len + buf.len()].copy_from_slice(buf);
+        self.len += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl tracing_subscriber::fmt::time::FormatTime for UtcTimer {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         let now = time::OffsetDateTime::now_utc();
-        let formatted = now.format(&Rfc2822).map_err(|_err| std::fmt::Error)?;
-        w.write_str(&formatted)
+        let mut formatted = StackWriter::new();
+        if now.format_into(&mut formatted, &Rfc2822).is_err() {
+            return Err(std::fmt::Error);
+        }
+        w.write_str(formatted.as_str().map_err(|_err| std::fmt::Error)?)
     }
 }
 
