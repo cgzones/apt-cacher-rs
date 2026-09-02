@@ -1115,91 +1115,6 @@ async fn transmit_tls_data(
     result
 }
 
-/// Drain all complete TLS records from the incoming buffer, appending decrypted
-/// plaintext to `output`. Handles `EncodeTlsData` and `TransmitTlsData` states
-/// as side-effects (post-handshake messages). Stops when the buffer is empty or
-/// a terminal/blocked state is reached.
-///
-/// Shared drain loop used by Phase 4 of the unbuffered kTLS handshake,
-/// called once after the initial response is parsed and again per iteration
-/// of the post-response read loop until the incoming buffer is empty.
-///
-/// Times out after the configured HTTP timeout.
-#[cfg(feature = "ktls")]
-async fn drain_buffered_records(
-    conn: &mut rustls::client::UnbufferedClientConnection,
-    incoming: &mut SecureVec,
-    incoming_used: &mut usize,
-    outgoing: &mut SecureVec,
-    outgoing_used: &mut usize,
-    tcp: &TcpStream,
-    output: &mut Vec<u8>,
-) -> Result<(), KtlsError> {
-    use rustls::unbuffered::{AppDataRecord, ConnectionState, UnbufferedStatus};
-
-    while *incoming_used > 0 {
-        let UnbufferedStatus { discard, state } =
-            conn.process_tls_records(&mut incoming[..*incoming_used]);
-        // Triggered by peer-supplied TLS data — transient, no host block.
-        let state = state.map_err(|err| {
-            KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
-                "TLS drain error:  {err}"
-            )))
-        })?;
-
-        match state {
-            ConnectionState::ReadTraffic(mut rt) => {
-                let mut total_discard = discard;
-                while let Some(result) = rt.next_record() {
-                    let AppDataRecord { payload, discard } = result.map_err(|err| {
-                        KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            format!("TLS record error:  {err}"),
-                        ))
-                    })?;
-                    total_discard += discard;
-                    output.extend_from_slice(payload);
-                }
-                discard_incoming(incoming, incoming_used, total_discard);
-            }
-            ConnectionState::EncodeTlsData(mut etd) => {
-                // Do NOT reset `outgoing_used` here.  The rustls state
-                // machine may emit several `EncodeTlsData` states in a row
-                // before a single `TransmitTlsData` (e.g. a ClientHello
-                // followed by an early-data finished message), and
-                // `encode_tls_data` appends at `outgoing[*outgoing_used..]`.
-                // Zeroing would silently drop any bytes still waiting to be
-                // written.
-                encode_tls_data(&mut etd, outgoing, outgoing_used);
-                discard_incoming(incoming, incoming_used, discard);
-            }
-            ConnectionState::TransmitTlsData(ttd) => {
-                transmit_tls_data(ttd, tcp, outgoing, outgoing_used)
-                    .await
-                    .map_err(KtlsError::KtlsSetupFailedTransient)?;
-                discard_incoming(incoming, incoming_used, discard);
-            }
-            ConnectionState::PeerClosed
-            | ConnectionState::Closed
-            | ConnectionState::ReadEarlyData(_)
-            | ConnectionState::BlockedHandshake
-            | ConnectionState::WriteTraffic(_) => {
-                discard_incoming(incoming, incoming_used, discard);
-                break;
-            }
-            other => {
-                warn_once!(
-                    "splice proxy: unexpected ConnectionState variant while draining buffered records: {other:?}; stopping the drain"
-                );
-                discard_incoming(incoming, incoming_used, discard);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Additional bytes the next drain read should request so it stops exactly at
 /// the end of the TLS record currently at the front of `incoming` — never
 /// pulling bytes of the *following* record into the buffer.
@@ -1462,51 +1377,200 @@ async fn try_unbuffered_ktls_connect(
     }
 }
 
-/// Drive an unbuffered TLS handshake, send an HTTP request, read response
-/// headers, drain the buffer to record alignment, and set up kTLS RX.
+/// State of the one-shot unbuffered kTLS exchange: the rustls state machine,
+/// the socket it drives, and the two TLS record buffers. `unbuffered_ktls_request`
+/// runs the phase methods in order -- [`handshake`](Self::handshake),
+/// [`send_request`](Self::send_request), [`read_headers`](Self::read_headers),
+/// [`drain_remaining`](Self::drain_remaining), [`extract_secrets`](Self::extract_secrets)
+/// -- and each phase owns the classification of its own failures into
+/// [`KtlsError`] (the principle is spelled out at the call site, between the
+/// handshake and the request send).
 ///
-/// Precondition: `tcp` already has the TLS ULP attached
-/// (`ktls::attach_ulp`). The kernel context is in `TLS_BASE` passthrough
-/// mode until `setup_rx`, so all handshake I/O below behaves as plain TCP.
+/// Security (`ktls.rs`, module doc): both buffers are `SecureVec`s, so the key
+/// material and partially decrypted data they hold are zeroized on drop --
+/// whichever phase fails, and once `extract_secrets` has consumed the state.
+/// The socket arrives with the TLS ULP already attached (`ktls::attach_ulp`);
+/// until `setup_rx` the kernel context is `TLS_BASE` passthrough, so every
+/// read and write below behaves as plain TCP.
 #[cfg(feature = "ktls")]
-async fn unbuffered_ktls_request(
-    tcp: &mut TcpStream,
-    host: &str,
-    host_authority: &str,
-    upstream_path: &str,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
-    volatile_cond: Option<&VolatileCondHeaders>,
-) -> Result<KtlsReadyState, KtlsError> {
-    use rustls::client::UnbufferedClientConnection;
-    use rustls::unbuffered::{AppDataRecord, ConnectionState, EncryptError};
+struct KtlsHandshake<'a> {
+    conn: rustls::client::UnbufferedClientConnection,
+    tcp: &'a mut TcpStream,
+    incoming: SecureVec,
+    incoming_used: usize,
+    outgoing: SecureVec,
+    outgoing_used: usize,
+}
 
-    // --- Build TLS config ---
-    let tls_config = Arc::clone(KTLS_CLIENT_CONFIG.get().expect("initialized in main()"));
+/// What [`KtlsHandshake::extract_secrets`] handed to the kernel, for the
+/// completion log.
+#[cfg(feature = "ktls")]
+struct KtlsRxOffload {
+    version: rustls::ProtocolVersion,
+    secret_name: &'static str,
+    cipher_suite: rustls::SupportedCipherSuite,
+    rx_seq: u64,
+}
 
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|err| KtlsError::TlsFailed(std::io::Error::new(ErrorKind::InvalidInput, err)))?;
+#[cfg(feature = "ktls")]
+impl<'a> KtlsHandshake<'a> {
+    /// Build the rustls state machine for `host` over `tcp`. Nothing has been
+    /// exchanged with the peer yet, so a failure is `TlsFailed`.
+    fn new(tcp: &'a mut TcpStream, host: &str) -> Result<Self, KtlsError> {
+        let tls_config = Arc::clone(KTLS_CLIENT_CONFIG.get().expect("initialized in main()"));
 
-    let mut conn = UnbufferedClientConnection::new(tls_config, server_name).map_err(|err| {
-        KtlsError::TlsFailed(std::io::Error::other(format!("unbuffered TLS new:  {err}")))
-    })?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|err| {
+                KtlsError::TlsFailed(std::io::Error::new(ErrorKind::InvalidInput, err))
+            })?;
 
-    // --- Phase 1 of 5: TLS Handshake ---
-    // Use SecureVec to zeroize TLS record buffers (containing key material and
-    // partially-decrypted data) on drop.
-    let mut incoming = SecureVec::new(32 * 1024);
-    let mut incoming_used = 0usize;
-    let mut outgoing = SecureVec::new(8 * 1024);
-    let mut outgoing_used = 0usize;
+        let conn = rustls::client::UnbufferedClientConnection::new(tls_config, server_name)
+            .map_err(|err| {
+                KtlsError::TlsFailed(std::io::Error::other(format!("unbuffered TLS new:  {err}")))
+            })?;
 
-    // Phase 1 errors are TLS handshake failures — map them accordingly.
-    let handshake_result: std::io::Result<()> = async {
+        Ok(Self {
+            conn,
+            tcp,
+            // Use SecureVec to zeroize TLS record buffers (containing key
+            // material and partially-decrypted data) on drop.
+            incoming: SecureVec::new(32 * 1024),
+            incoming_used: 0,
+            outgoing: SecureVec::new(8 * 1024),
+            outgoing_used: 0,
+        })
+    }
+
+    /// Phase 1 of 5: drive the TLS handshake to completion. Every failure
+    /// here is a TLS handshake failure (`TlsFailed`): the connection cannot
+    /// be reused.
+    async fn handshake(&mut self, host_authority: &str) -> Result<(), KtlsError> {
+        use rustls::unbuffered::ConnectionState;
+
+        let handshake_result: std::io::Result<()> = async {
+            loop {
+                let status = self
+                    .conn
+                    .process_tls_records(&mut self.incoming[..self.incoming_used]);
+                let discard = status.discard;
+                let state = status
+                    .state
+                    .map_err(|err| std::io::Error::other(format!("TLS handshake error:  {err}")))?;
+
+                #[expect(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "all known variants are matched; the @-binding on the terminal arm hides them from the lint"
+                )]
+                match state {
+                    ConnectionState::EncodeTlsData(mut etd) => {
+                        encode_tls_data(&mut etd, &mut self.outgoing, &mut self.outgoing_used);
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    }
+                    ConnectionState::TransmitTlsData(ttd) => {
+                        transmit_tls_data(ttd, self.tcp, &self.outgoing, &mut self.outgoing_used)
+                            .await?;
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    }
+                    ConnectionState::BlockedHandshake => {
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                        // Need more data from the server
+                        grow_incoming(&mut self.incoming, self.incoming_used, "handshake")?;
+                        let n = self.tcp.read(&mut self.incoming[self.incoming_used..]).await?;
+                        if n == 0 {
+                            return Err(std::io::Error::new(
+                                ErrorKind::UnexpectedEof,
+                                "server closed during TLS handshake",
+                            ));
+                        }
+                        self.incoming_used += n;
+                    }
+                    ConnectionState::WriteTraffic(_) => {
+                        // Handshake complete
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                        break;
+                    }
+                    unexpected_state @ (ConnectionState::ReadTraffic(_)
+                    | ConnectionState::PeerClosed
+                    | ConnectionState::Closed
+                    | ConnectionState::ReadEarlyData(_)) => {
+                        warn_once!(
+                            "splice proxy: unexpected terminal ConnectionState during TLS handshake with upstream {host_authority}: {unexpected_state:?}; aborting the kTLS handshake"
+                        );
+                        return Err(std::io::Error::other(
+                            "unexpected state during TLS handshake",
+                        ));
+                    }
+                    other => {
+                        warn_once!(
+                            "splice proxy: unexpected ConnectionState variant during TLS handshake with upstream {host_authority}: {other:?}; aborting the kTLS handshake"
+                        );
+                        return Err(std::io::Error::other(
+                            "unexpected state during TLS handshake",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        handshake_result.map_err(KtlsError::TlsFailed)
+    }
+
+    /// Phase 2 of 5: process any pending records (e.g. NewSessionTickets from
+    /// TLS 1.3), then encrypt and send the HTTP request. Returns the instant
+    /// the encrypted request was transmitted -- the start of the
+    /// upstream-rate window.
+    ///
+    /// Does NOT reset `outgoing_used` on entry. Any bytes still pending from
+    /// Phase 1 are correctly transmitted by the next `TransmitTlsData` arm
+    /// (`encode_tls_data` appends at `outgoing[outgoing_used..]`); the
+    /// `WriteTraffic` arm fail-closes if bytes are still pending by the time
+    /// it runs.
+    async fn send_request(
+        &mut self,
+        host_authority: &str,
+        upstream_path: &str,
+        resume_offset: u64,
+        resume_if_range: Option<&str>,
+        volatile_cond: Option<&VolatileCondHeaders>,
+    ) -> Result<PreciseInstant, KtlsError> {
+        use rustls::unbuffered::{ConnectionState, EncryptError};
+
+        // Guard against a connection stuck in non-WriteTraffic states post-handshake.
+        // TLS 1.3 typically sends 1-2 NewSessionTicket records; a handful of iterations
+        // covers the legitimate case while still catching pathological peers quickly.
+        let mut post_handshake_rounds = 0u32;
+
         loop {
-            let status = conn.process_tls_records(&mut incoming[..incoming_used]);
+            /// Cap on state-machine rounds between handshake-complete and
+            /// first `WriteTraffic`. Bounds record-encode / record-decode iterations
+            /// while rustls processes any trailing post-handshake messages
+            /// (e.g. TLS 1.3 `NewSessionTicket`s).  Each legitimate ticket consumes
+            /// ~2 rounds (decode → discard), so 16 accommodates up to ~8 tickets —
+            /// well beyond what any real server sends.
+            const MAX_POST_HANDSHAKE_ROUNDS: u32 = 16;
+
+            post_handshake_rounds += 1;
+            if post_handshake_rounds > MAX_POST_HANDSHAKE_ROUNDS {
+                return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "kTLS: post-handshake state machine did not reach WriteTraffic \
+                         after {MAX_POST_HANDSHAKE_ROUNDS} iterations"
+                    ),
+                )));
+            }
+
+            let status = self
+                .conn
+                .process_tls_records(&mut self.incoming[..self.incoming_used]);
             let discard = status.discard;
-            let state = status
-                .state
-                .map_err(|err| std::io::Error::other(format!("TLS handshake error:  {err}")))?;
+            // Triggered by peer-supplied TLS data — transient, no host block.
+            let state = status.state.map_err(|err| {
+                KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
+                    "TLS post-handshake error:  {err}"
+                )))
+            })?;
 
             #[expect(
                 clippy::wildcard_enum_match_arm,
@@ -1514,549 +1578,515 @@ async fn unbuffered_ktls_request(
             )]
             match state {
                 ConnectionState::EncodeTlsData(mut etd) => {
-                    encode_tls_data(&mut etd, &mut outgoing, &mut outgoing_used);
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
+                    encode_tls_data(&mut etd, &mut self.outgoing, &mut self.outgoing_used);
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                 }
                 ConnectionState::TransmitTlsData(ttd) => {
-                    transmit_tls_data(ttd, tcp, &outgoing, &mut outgoing_used).await?;
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
+                    transmit_tls_data(ttd, self.tcp, &self.outgoing, &mut self.outgoing_used)
+                        .await
+                        .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                }
+                ConnectionState::WriteTraffic(mut wt) => {
+                    // Ready to send — encrypt and transmit the HTTP request.
+                    // The kTLS socket is one-shot (never pooled), so advertise
+                    // Connection: close and let the upstream release the
+                    // connection promptly instead of holding it idle.
+                    //
+                    // The rustls state machine pairs every EncodeTlsData with a
+                    // TransmitTlsData before yielding WriteTraffic, so no encoded
+                    // bytes should be pending here. wt.encrypt() below writes at
+                    // outgoing[0..] and only outgoing[..enc_len] is transmitted,
+                    // so pending bytes would be silently clobbered. Fail closed
+                    // rather than corrupt the stream if that pairing ever breaks.
+                    debug_assert_eq!(
+                        self.outgoing_used, 0,
+                        "un-transmitted TLS bytes pending at WriteTraffic"
+                    );
+                    if self.outgoing_used != 0 {
+                        return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "kTLS: {} un-transmitted TLS bytes pending at \
+                                 WriteTraffic; request encryption would clobber them",
+                                self.outgoing_used
+                            ),
+                        )));
+                    }
+                    let request = format_http_request(
+                        upstream_path,
+                        host_authority,
+                        resume_offset,
+                        resume_if_range,
+                        volatile_cond,
+                        ConnectionAction::Close,
+                    );
+                    let plaintext = request.as_bytes();
+
+                    let enc_len = loop {
+                        match wt.encrypt(plaintext, &mut self.outgoing) {
+                            Ok(n) => break n,
+                            Err(EncryptError::InsufficientSize(isz)) => {
+                                self.outgoing.resize(isz.required_size, 0);
+                            }
+                            Err(err) => {
+                                return Err(KtlsError::KtlsSetupFailed(std::io::Error::other(
+                                    format!("TLS encrypt error:  {err}"),
+                                )));
+                            }
+                        }
+                    };
+
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    write_all_to_stream(self.tcp, &self.outgoing[..enc_len], WritePhase::Header)
+                        .await
+                        .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                    return Ok(PreciseInstant::now());
                 }
                 ConnectionState::BlockedHandshake => {
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
-                    // Need more data from the server
-                    grow_incoming(&mut incoming, incoming_used, "handshake")?;
-                    let n = tcp.read(&mut incoming[incoming_used..]).await?;
+                    // Post-handshake state machine needs more data (e.g., key update).
+                    // Read from network to avoid spinning through the iteration limit.
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    grow_incoming(&mut self.incoming, self.incoming_used, "post-handshake")
+                        .map_err(KtlsError::KtlsSetupFailed)?;
+                    let n = self
+                        .tcp
+                        .read(&mut self.incoming[self.incoming_used..])
+                        .await
+                        .map_err(KtlsError::KtlsSetupFailedTransient)?;
                     if n == 0 {
-                        return Err(std::io::Error::new(
+                        return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
-                            "server closed during TLS handshake",
-                        ));
+                            "server closed during post-handshake processing",
+                        )));
                     }
-                    incoming_used += n;
-                }
-                ConnectionState::WriteTraffic(_) => {
-                    // Handshake complete
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
-                    break;
+                    self.incoming_used += n;
                 }
                 unexpected_state @ (ConnectionState::ReadTraffic(_)
                 | ConnectionState::PeerClosed
                 | ConnectionState::Closed
                 | ConnectionState::ReadEarlyData(_)) => {
                     warn_once!(
-                        "splice proxy: unexpected terminal ConnectionState during TLS handshake with upstream {host_authority}: {unexpected_state:?}; aborting the kTLS handshake"
+                        "splice proxy: unexpected ConnectionState during post-handshake request send to upstream {host_authority} (peer closed or sent data before request?): {unexpected_state:?}; discarding the buffered TLS records and retrying the send"
                     );
-                    return Err(std::io::Error::other(
-                        "unexpected state during TLS handshake",
-                    ));
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                 }
                 other => {
                     warn_once!(
-                        "splice proxy: unexpected ConnectionState variant during TLS handshake with upstream {host_authority}: {other:?}; aborting the kTLS handshake"
+                        "splice proxy: unexpected ConnectionState variant during post-handshake request to upstream {host_authority}: {other:?}; discarding the buffered TLS records and retrying the send"
                     );
-                    return Err(std::io::Error::other(
-                        "unexpected state during TLS handshake",
-                    ));
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                 }
             }
         }
-        Ok(())
     }
-    .await;
-    handshake_result.map_err(KtlsError::TlsFailed)?;
-    debug!(
-        "kTLS: TLS handshake completed with {host} \
-         (shared ClientSessionMemoryCache enables resumption for subsequent connections)"
-    );
 
-    // TLS handshake succeeded. From here on, classification follows one
-    // principle: KtlsSetupFailed (600s host block) is reserved for failures
-    // that would repeat deterministically on a retry — pathological peer
-    // state machines (round caps), oversized headers/buffers, internal
-    // invariant violations, and kernel setup_rx rejection. Network-flavored
-    // failures (read/write errors, EOF, truncation) and errors triggered by
-    // peer-supplied TLS data map to KtlsSetupFailedTransient: upstream
-    // flakiness says nothing about this host's kTLS capability and must not
-    // disable kTLS for 600s. Routing outcomes keep their own variants:
-    // ResponseNotSpliceable (non-200/no-CL), UpstreamProtocolError
-    // (malformed HTTP, no block).
+    /// Phase 3 of 5: read and decrypt until the response header terminator.
+    /// Returns the head (`header_buf[..header_end]`, truncated at the
+    /// terminator); any decrypted bytes past it go to `extra_body`, so the
+    /// head and the body prefix stay separate until `drain_remaining` has
+    /// appended everything else that was already in flight.
+    async fn read_headers(
+        &mut self,
+        host_authority: &str,
+        extra_body: &mut Vec<u8>,
+    ) -> Result<(BytesMut, usize), KtlsError> {
+        use rustls::unbuffered::{AppDataRecord, ConnectionState};
 
-    // --- Phase 2 of 5: Send HTTP Request ---
-    // Process any pending records (e.g. NewSessionTickets from TLS 1.3),
-    // then encrypt and send the HTTP request.
-    // Do NOT reset `outgoing_used` here. Any bytes still pending from Phase 1
-    // are correctly transmitted by the next `TransmitTlsData` arm below
-    // (`encode_tls_data` appends at `outgoing[outgoing_used..]`); the
-    // `WriteTraffic` arm further down fail-closes if bytes are still pending
-    // by the time it runs.
-    // Guard against a connection stuck in non-WriteTraffic states post-handshake.
-    // TLS 1.3 typically sends 1-2 NewSessionTicket records; a handful of iterations
-    // covers the legitimate case while still catching pathological peers quickly.
-    let mut post_handshake_rounds = 0u32;
-    // Instant the encrypted HTTP request was transmitted - start of the
-    // upstream-rate window. Set in the `WriteTraffic` arm below; every other
-    // arm of the request-send loop continues or returns, so the compiler can
-    // prove definite initialisation by the time the post-loop read occurs.
-    let req_sent: Option<PreciseInstant>;
+        let mut header_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
+        let mut header_end = 0usize;
+        let mut headers_complete = false;
+        // Track where to start scanning for "\r\n\r\n" — avoids re-scanning
+        // the entire buffer after each TLS record is appended.
+        let mut header_search_offset = 0usize;
 
-    loop {
-        /// Cap on state-machine rounds between handshake-complete and
-        /// first `WriteTraffic`. Bounds record-encode / record-decode iterations
-        /// while rustls processes any trailing post-handshake messages
-        /// (e.g. TLS 1.3 `NewSessionTicket`s).  Each legitimate ticket consumes
-        /// ~2 rounds (decode → discard), so 16 accommodates up to ~8 tickets —
-        /// well beyond what any real server sends.
-        const MAX_POST_HANDSHAKE_ROUNDS: u32 = 16;
+        let mut header_read_rounds = 0u32;
 
-        post_handshake_rounds += 1;
-        if post_handshake_rounds > MAX_POST_HANDSHAKE_ROUNDS {
-            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "kTLS: post-handshake state machine did not reach WriteTraffic \
-                     after {MAX_POST_HANDSHAKE_ROUNDS} iterations"
-                ),
-            )));
-        }
+        while !headers_complete {
+            /// Cap on outer header-read iterations. Each iteration corresponds to
+            /// one network read (or one record-processing pass that asks for more
+            /// data). A healthy small-header response completes in 1-2 iterations;
+            /// even a large-header response over 1-KiB packets sits well below
+            /// 256. Hitting the cap means the rustls state machine is stuck (e.g.
+            /// peer keeps sending records that never advance to `ReadTraffic`) —
+            /// fail fast and attribute the failure rather than waiting for
+            /// `http_timeout`.
+            const MAX_PHASE3_ROUNDS: u32 = 256;
 
-        let status = conn.process_tls_records(&mut incoming[..incoming_used]);
-        let discard = status.discard;
-        // Triggered by peer-supplied TLS data — transient, no host block.
-        let state = status.state.map_err(|err| {
-            KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
-                "TLS post-handshake error:  {err}"
-            )))
-        })?;
-
-        #[expect(
-            clippy::wildcard_enum_match_arm,
-            reason = "all known variants are matched; the @-binding on the terminal arm hides them from the lint"
-        )]
-        match state {
-            ConnectionState::EncodeTlsData(mut etd) => {
-                encode_tls_data(&mut etd, &mut outgoing, &mut outgoing_used);
-                discard_incoming(&mut incoming, &mut incoming_used, discard);
+            header_read_rounds = header_read_rounds.saturating_add(1);
+            if header_read_rounds > MAX_PHASE3_ROUNDS {
+                return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "Phase 3 header-read loop exceeded {MAX_PHASE3_ROUNDS} iterations without completion"
+                    ),
+                )));
             }
-            ConnectionState::TransmitTlsData(ttd) => {
-                transmit_tls_data(ttd, tcp, &outgoing, &mut outgoing_used)
-                    .await
-                    .map_err(KtlsError::KtlsSetupFailedTransient)?;
-                discard_incoming(&mut incoming, &mut incoming_used, discard);
-            }
-            ConnectionState::WriteTraffic(mut wt) => {
-                // Ready to send — encrypt and transmit the HTTP request.
-                // The kTLS socket is one-shot (never pooled), so advertise
-                // Connection: close and let the upstream release the
-                // connection promptly instead of holding it idle.
-                //
-                // The rustls state machine pairs every EncodeTlsData with a
-                // TransmitTlsData before yielding WriteTraffic, so no encoded
-                // bytes should be pending here. wt.encrypt() below writes at
-                // outgoing[0..] and only outgoing[..enc_len] is transmitted,
-                // so pending bytes would be silently clobbered. Fail closed
-                // rather than corrupt the stream if that pairing ever breaks.
-                debug_assert_eq!(
-                    outgoing_used, 0,
-                    "un-transmitted TLS bytes pending at WriteTraffic"
-                );
-                if outgoing_used != 0 {
-                    return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!(
-                            "kTLS: {outgoing_used} un-transmitted TLS bytes pending at \
-                             WriteTraffic; request encryption would clobber them"
-                        ),
-                    )));
+
+            // Process any TLS records already in the incoming buffer
+            let need_more_data = loop {
+                if self.incoming_used == 0 {
+                    break true;
                 }
-                let request = format_http_request(
-                    upstream_path,
-                    host_authority,
-                    resume_offset,
-                    resume_if_range,
-                    volatile_cond,
-                    ConnectionAction::Close,
-                );
-                let plaintext = request.as_bytes();
+                let status = self
+                    .conn
+                    .process_tls_records(&mut self.incoming[..self.incoming_used]);
+                let discard = status.discard;
+                // Triggered by peer-supplied TLS data — transient, no host block.
+                let state = status.state.map_err(|err| {
+                    KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
+                        "TLS read error:  {err}"
+                    )))
+                })?;
 
-                let enc_len = loop {
-                    match wt.encrypt(plaintext, &mut outgoing) {
-                        Ok(n) => break n,
-                        Err(EncryptError::InsufficientSize(isz)) => {
-                            outgoing.resize(isz.required_size, 0);
+                #[expect(clippy::wildcard_enum_match_arm, reason = "clippy false-positive")]
+                match state {
+                    ConnectionState::ReadTraffic(mut rt) => {
+                        let mut total_discard = discard;
+                        while let Some(result) = rt.next_record() {
+                            let AppDataRecord { payload, discard } = result.map_err(|err| {
+                                KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
+                                    "TLS record error:  {err}"
+                                )))
+                            })?;
+                            header_buf.extend_from_slice(payload);
+                            total_discard += discard;
                         }
-                        Err(err) => {
-                            return Err(KtlsError::KtlsSetupFailed(std::io::Error::other(
-                                format!("TLS encrypt error:  {err}"),
+                        discard_incoming(
+                            &mut self.incoming,
+                            &mut self.incoming_used,
+                            total_discard,
+                        );
+
+                        // Check for complete headers (start from where we last left off)
+                        if let Some(end) = header_buf[header_search_offset..]
+                            .array_windows()
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|i| header_search_offset + i + 4)
+                        {
+                            header_end = end;
+                            if header_buf.len() > end {
+                                extra_body.extend_from_slice(&header_buf[end..]);
+                                header_buf.truncate(end);
+                            }
+                            headers_complete = true;
+                            break false;
+                        }
+                        // Next search can skip bytes we've already checked
+                        header_search_offset = header_buf.len().saturating_sub(3);
+                        if header_buf.len() > MAX_UPSTREAM_HEADER_SIZE {
+                            warn_once_or_info!(
+                                "splice proxy: upstream {host_authority} response header size of {} bytes exceeds {} bytes; abandoning the kTLS attempt",
+                                header_buf.len(),
+                                MAX_UPSTREAM_HEADER_SIZE
+                            );
+                            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "upstream response headers too large",
                             )));
                         }
                     }
-                };
+                    ConnectionState::EncodeTlsData(mut etd) => {
+                        // Append at `outgoing[outgoing_used..]` — see the matching
+                        // note in `drain_buffered_records`.  The rustls state
+                        // machine can emit several `EncodeTlsData` states before a
+                        // single `TransmitTlsData`; zeroing here would drop pending
+                        // bytes.
+                        encode_tls_data(&mut etd, &mut self.outgoing, &mut self.outgoing_used);
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    }
+                    ConnectionState::TransmitTlsData(ttd) => {
+                        transmit_tls_data(ttd, self.tcp, &self.outgoing, &mut self.outgoing_used)
+                            .await
+                            .map_err(KtlsError::KtlsSetupFailedTransient)?;
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    }
+                    ConnectionState::BlockedHandshake | ConnectionState::WriteTraffic(_) => {
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                        break true; // Need more data from network
+                    }
+                    state @ (ConnectionState::PeerClosed
+                    | ConnectionState::Closed
+                    | ConnectionState::ReadEarlyData(_)) => {
+                        warn_once_or_debug!(
+                            "kTLS: connection to upstream {host_authority} in terminal state during header read (upstream closed before headers complete?): {state:?}; retrying the upstream read"
+                        );
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                        break true;
+                    }
+                    other => {
+                        warn_once_or_debug!(
+                            "kTLS: unexpected ConnectionState variant during header read from upstream {host_authority}: {other:?}; retrying the upstream read"
+                        );
+                        discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                        break true;
+                    }
+                }
+            };
 
-                discard_incoming(&mut incoming, &mut incoming_used, discard);
-                write_all_to_stream(tcp, &outgoing[..enc_len], WritePhase::Header)
-                    .await
-                    .map_err(KtlsError::KtlsSetupFailedTransient)?;
-                req_sent = Some(PreciseInstant::now());
+            if headers_complete {
                 break;
             }
-            ConnectionState::BlockedHandshake => {
-                // Post-handshake state machine needs more data (e.g., key update).
-                // Read from network to avoid spinning through the iteration limit.
-                discard_incoming(&mut incoming, &mut incoming_used, discard);
-                grow_incoming(&mut incoming, incoming_used, "post-handshake")
+            if need_more_data {
+                grow_incoming(&mut self.incoming, self.incoming_used, "header read")
                     .map_err(KtlsError::KtlsSetupFailed)?;
-                let n = tcp
-                    .read(&mut incoming[incoming_used..])
+                let n = self
+                    .tcp
+                    .read(&mut self.incoming[self.incoming_used..])
                     .await
                     .map_err(KtlsError::KtlsSetupFailedTransient)?;
                 if n == 0 {
                     return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
-                        "server closed during post-handshake processing",
+                        "server closed before sending complete response headers",
                     )));
                 }
-                incoming_used += n;
-            }
-            unexpected_state @ (ConnectionState::ReadTraffic(_)
-            | ConnectionState::PeerClosed
-            | ConnectionState::Closed
-            | ConnectionState::ReadEarlyData(_)) => {
-                warn_once!(
-                    "splice proxy: unexpected ConnectionState during post-handshake request send to upstream {host_authority} (peer closed or sent data before request?): {unexpected_state:?}; discarding the buffered TLS records and retrying the send"
-                );
-                discard_incoming(&mut incoming, &mut incoming_used, discard);
-            }
-            other => {
-                warn_once!(
-                    "splice proxy: unexpected ConnectionState variant during post-handshake request to upstream {host_authority}: {other:?}; discarding the buffered TLS records and retrying the send"
-                );
-                discard_incoming(&mut incoming, &mut incoming_used, discard);
+                self.incoming_used += n;
             }
         }
+
+        Ok((header_buf, header_end))
     }
 
-    // --- Phase 3 of 5: Read Response Headers ---
-    let mut header_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
-    let mut extra_body = Vec::new();
-    let mut header_end = 0usize;
-    let mut headers_complete = false;
-    // Track where to start scanning for "\r\n\r\n" — avoids re-scanning
-    // the entire buffer after each TLS record is appended.
-    let mut header_search_offset = 0usize;
+    /// Drain all complete TLS records from the incoming buffer, appending decrypted
+    /// plaintext to `output`. Handles `EncodeTlsData` and `TransmitTlsData` states
+    /// as side-effects (post-handshake messages). Stops when the buffer is empty or
+    /// a terminal/blocked state is reached.
+    ///
+    /// Shared drain loop used by Phase 4 (`drain_remaining`), called once
+    /// after the initial response is parsed and again per iteration of the
+    /// post-response read loop until the incoming buffer is empty.
+    ///
+    /// Times out after the configured HTTP timeout.
+    async fn drain_buffered_records(&mut self, output: &mut Vec<u8>) -> Result<(), KtlsError> {
+        use rustls::unbuffered::{AppDataRecord, ConnectionState, UnbufferedStatus};
 
-    let mut header_read_rounds = 0u32;
-
-    while !headers_complete {
-        /// Cap on outer header-read iterations. Each iteration corresponds to
-        /// one network read (or one record-processing pass that asks for more
-        /// data). A healthy small-header response completes in 1-2 iterations;
-        /// even a large-header response over 1-KiB packets sits well below
-        /// 256. Hitting the cap means the rustls state machine is stuck (e.g.
-        /// peer keeps sending records that never advance to `ReadTraffic`) —
-        /// fail fast and attribute the failure rather than waiting for
-        /// `http_timeout`.
-        const MAX_PHASE3_ROUNDS: u32 = 256;
-
-        header_read_rounds = header_read_rounds.saturating_add(1);
-        if header_read_rounds > MAX_PHASE3_ROUNDS {
-            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
-                ErrorKind::TimedOut,
-                format!(
-                    "Phase 3 header-read loop exceeded {MAX_PHASE3_ROUNDS} iterations without completion"
-                ),
-            )));
-        }
-
-        // Process any TLS records already in the incoming buffer
-        let need_more_data = loop {
-            if incoming_used == 0 {
-                break true;
-            }
-            let status = conn.process_tls_records(&mut incoming[..incoming_used]);
-            let discard = status.discard;
+        while self.incoming_used > 0 {
+            let UnbufferedStatus { discard, state } = self
+                .conn
+                .process_tls_records(&mut self.incoming[..self.incoming_used]);
             // Triggered by peer-supplied TLS data — transient, no host block.
-            let state = status.state.map_err(|err| {
+            let state = state.map_err(|err| {
                 KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
-                    "TLS read error:  {err}"
+                    "TLS drain error:  {err}"
                 )))
             })?;
 
-            #[expect(clippy::wildcard_enum_match_arm, reason = "clippy false-positive")]
             match state {
                 ConnectionState::ReadTraffic(mut rt) => {
                     let mut total_discard = discard;
                     while let Some(result) = rt.next_record() {
                         let AppDataRecord { payload, discard } = result.map_err(|err| {
-                            KtlsError::KtlsSetupFailedTransient(std::io::Error::other(format!(
-                                "TLS record error:  {err}"
-                            )))
+                            KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!("TLS record error:  {err}"),
+                            ))
                         })?;
-                        header_buf.extend_from_slice(payload);
                         total_discard += discard;
+                        output.extend_from_slice(payload);
                     }
-                    discard_incoming(&mut incoming, &mut incoming_used, total_discard);
-
-                    // Check for complete headers (start from where we last left off)
-                    if let Some(end) = header_buf[header_search_offset..]
-                        .array_windows()
-                        .position(|w| w == b"\r\n\r\n")
-                        .map(|i| header_search_offset + i + 4)
-                    {
-                        header_end = end;
-                        if header_buf.len() > end {
-                            extra_body.extend_from_slice(&header_buf[end..]);
-                            header_buf.truncate(end);
-                        }
-                        headers_complete = true;
-                        break false;
-                    }
-                    // Next search can skip bytes we've already checked
-                    header_search_offset = header_buf.len().saturating_sub(3);
-                    if header_buf.len() > MAX_UPSTREAM_HEADER_SIZE {
-                        warn_once_or_info!(
-                            "splice proxy: upstream {host_authority} response header size of {} bytes exceeds {} bytes; abandoning the kTLS attempt",
-                            header_buf.len(),
-                            MAX_UPSTREAM_HEADER_SIZE
-                        );
-                        return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "upstream response headers too large",
-                        )));
-                    }
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, total_discard);
                 }
                 ConnectionState::EncodeTlsData(mut etd) => {
-                    // Append at `outgoing[outgoing_used..]` — see the matching
-                    // note in `drain_buffered_records`.  The rustls state
-                    // machine can emit several `EncodeTlsData` states before a
-                    // single `TransmitTlsData`; zeroing here would drop pending
-                    // bytes.
-                    encode_tls_data(&mut etd, &mut outgoing, &mut outgoing_used);
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
+                    // Do NOT reset `outgoing_used` here.  The rustls state
+                    // machine may emit several `EncodeTlsData` states in a row
+                    // before a single `TransmitTlsData` (e.g. a ClientHello
+                    // followed by an early-data finished message), and
+                    // `encode_tls_data` appends at `outgoing[*outgoing_used..]`.
+                    // Zeroing would silently drop any bytes still waiting to be
+                    // written.
+                    encode_tls_data(&mut etd, &mut self.outgoing, &mut self.outgoing_used);
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                 }
                 ConnectionState::TransmitTlsData(ttd) => {
-                    transmit_tls_data(ttd, tcp, &outgoing, &mut outgoing_used)
+                    transmit_tls_data(ttd, self.tcp, &self.outgoing, &mut self.outgoing_used)
                         .await
                         .map_err(KtlsError::KtlsSetupFailedTransient)?;
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
                 }
-                ConnectionState::BlockedHandshake | ConnectionState::WriteTraffic(_) => {
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
-                    break true; // Need more data from network
-                }
-                state @ (ConnectionState::PeerClosed
+                ConnectionState::PeerClosed
                 | ConnectionState::Closed
-                | ConnectionState::ReadEarlyData(_)) => {
-                    warn_once_or_debug!(
-                        "kTLS: connection to upstream {host_authority} in terminal state during header read (upstream closed before headers complete?): {state:?}; retrying the upstream read"
-                    );
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
-                    break true;
+                | ConnectionState::ReadEarlyData(_)
+                | ConnectionState::BlockedHandshake
+                | ConnectionState::WriteTraffic(_) => {
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    break;
                 }
                 other => {
-                    warn_once_or_debug!(
-                        "kTLS: unexpected ConnectionState variant during header read from upstream {host_authority}: {other:?}; retrying the upstream read"
+                    warn_once!(
+                        "splice proxy: unexpected ConnectionState variant while draining buffered records: {other:?}; stopping the drain"
                     );
-                    discard_incoming(&mut incoming, &mut incoming_used, discard);
-                    break true;
+                    discard_incoming(&mut self.incoming, &mut self.incoming_used, discard);
+                    break;
                 }
             }
-        };
-
-        if headers_complete {
-            break;
         }
-        if need_more_data {
-            grow_incoming(&mut incoming, incoming_used, "header read")
-                .map_err(KtlsError::KtlsSetupFailed)?;
-            let n = tcp
-                .read(&mut incoming[incoming_used..])
+
+        Ok(())
+    }
+
+    /// Phase 4 of 5: drain the incoming buffer to a TLS record boundary.
+    /// Decrypts every complete record already buffered into `extra_body`,
+    /// then -- if a partial record remains -- keeps reading record-framed
+    /// until the buffer drains empty. The overall `http_timeout` (applied at
+    /// the call site) caps the total wait; each read has its own backstop.
+    async fn drain_remaining(&mut self, extra_body: &mut Vec<u8>) -> Result<(), KtlsError> {
+        // Process any remaining complete TLS records in the incoming buffer.
+        // Their plaintext goes into extra_body.
+        self.drain_buffered_records(extra_body).await?;
+
+        // If there are still unprocessed bytes (partial TLS record), loop reading
+        // from TCP until all records are drained or a per-read timeout fires.
+        // The overall http_timeout (applied at the call site) caps total wait time.
+        if self.incoming_used > 0 {
+            /// Defensive backstop on decrypted body bytes buffered while waiting to
+            /// reach a TLS record boundary. The loop reads record-framed (see
+            /// `record_framed_read_len`), so it now adds at most one record to
+            /// `extra_body` before reaching alignment — this cap can no longer be
+            /// the routine outcome it once was. It still bounds the bytes drained
+            /// *before* the loop (Phase 3/4), which are read greedily and are
+            /// limited only by the 2 MiB incoming-buffer cap (`grow_incoming`); keep
+            /// it comfortably above that so a large legitimate first burst never
+            /// trips it. On a trip: give up on kTLS for this connection (transient —
+            /// no host block) and let the standard streaming path handle the fetch.
+            const MAX_KTLS_EXTRA_BODY: usize = 2 * 1024 * 1024 + 256 * 1024;
+
+            let per_read_timeout = std::time::Duration::from_secs(5);
+
+            // Log how many bytes the current partial TLS record needs.
+            // TLS record header is 5 bytes: [content_type, version_hi, version_lo, length_hi, length_lo].
+            // We skip the first 3 bytes and read the 2-byte big-endian length.
+            if let Some(&[_, _, _, hi, lo, ..]) = self.incoming.get(..self.incoming_used) {
+                let record_len = u16::from_be_bytes([hi, lo]) as usize;
+                debug!(
+                    "kTLS: draining with {} bytes buffered, \
+                     current record needs {} bytes total",
+                    self.incoming_used,
+                    5 + record_len
+                );
+            }
+
+            let mut drain_stop_reason = "";
+            'drain: while self.incoming_used > 0 {
+                grow_incoming(&mut self.incoming, self.incoming_used, "drain")
+                    .map_err(KtlsError::KtlsSetupFailed)?;
+
+                // Bound this read to the end of the current record so it never pulls
+                // the following partial record in — that is what would keep us
+                // perpetually mid-record against a fast upstream. `.max(1)` guards
+                // the abnormal case where a whole record is already buffered but
+                // undrained: a zero-length read slice would misread as EOF.
+                let want = record_framed_read_len(&self.incoming, self.incoming_used).max(1);
+                let read_end = (self.incoming_used + want).min(self.incoming.len());
+
+                match tokio::time::timeout(
+                    per_read_timeout,
+                    self.tcp
+                        .read(&mut self.incoming[self.incoming_used..read_end]),
+                )
                 .await
-                .map_err(KtlsError::KtlsSetupFailedTransient)?;
-            if n == 0 {
+                {
+                    Ok(Ok(n @ 1..)) => {
+                        self.incoming_used += n;
+                    }
+                    Ok(Ok(0)) => {
+                        drain_stop_reason = "upstream EOF";
+                        debug!(
+                            "kTLS: drain stopped ({drain_stop_reason}) with {} bytes buffered",
+                            self.incoming_used
+                        );
+                        break;
+                    }
+                    Ok(Err(ref err)) => {
+                        drain_stop_reason = "read error";
+                        debug!(
+                            "kTLS: drain stopped ({drain_stop_reason}) with {} bytes buffered:  {}",
+                            self.incoming_used,
+                            ErrorReport(err)
+                        );
+                        break;
+                    }
+                    Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                        drain_stop_reason = "per-read timeout";
+                        debug!(
+                            "kTLS: drain stopped ({drain_stop_reason}) with {} bytes buffered",
+                            self.incoming_used
+                        );
+                        break;
+                    }
+                }
+
+                self.drain_buffered_records(extra_body).await?;
+                if extra_body.len() > MAX_KTLS_EXTRA_BODY {
+                    return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::other(
+                        format!(
+                            "kTLS: buffered {} bytes of decrypted body without reaching \
+                             TLS record alignment; falling back to the streaming path",
+                            extra_body.len()
+                        ),
+                    )));
+                }
+                if self.incoming_used == 0 {
+                    break 'drain;
+                }
+            }
+
+            if self.incoming_used > 0 {
+                // Upstream truncation (EOF/reset/stall mid-record) — transient,
+                // no host block.
                 return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "server closed before sending complete response headers",
-                )));
-            }
-            incoming_used += n;
-        }
-    }
-
-    // --- Parse response to check status before setting up kTLS ---
-    // Malformed HTTP from the upstream is not a kTLS issue — surface it as
-    // UpstreamProtocolError so the host stays eligible for kTLS retries.
-    let mut response =
-        parse_upstream_response(&header_buf, header_end, host_authority).map_err(|err| {
-            KtlsError::UpstreamProtocolError(std::io::Error::new(
-                err.kind(),
-                format!("kTLS upstream protocol error:  {err}"),
-            ))
-        })?;
-    response.request_sent_at = req_sent;
-
-    if response.status_code != 200 || response.content_length().is_none_or(|ct| ct == 0) {
-        // Non-spliceable response: the caller will reconnect via the standard
-        // path for a complete fetch, so no need to drain the remaining TLS
-        // records from this one-shot kTLS connection.
-        return Err(KtlsError::ResponseNotSpliceable {
-            response: Box::new(response),
-        });
-    }
-
-    // --- Phase 4 of 5: Drain Remaining Buffer ---
-    // Process any remaining complete TLS records in the incoming buffer.
-    // Their plaintext goes into extra_body.
-    drain_buffered_records(
-        &mut conn,
-        &mut incoming,
-        &mut incoming_used,
-        &mut outgoing,
-        &mut outgoing_used,
-        tcp,
-        &mut extra_body,
-    )
-    .await?;
-
-    // If there are still unprocessed bytes (partial TLS record), loop reading
-    // from TCP until all records are drained or a per-read timeout fires.
-    // The overall http_timeout (applied at the call site) caps total wait time.
-    if incoming_used > 0 {
-        /// Defensive backstop on decrypted body bytes buffered while waiting to
-        /// reach a TLS record boundary. The loop reads record-framed (see
-        /// `record_framed_read_len`), so it now adds at most one record to
-        /// `extra_body` before reaching alignment — this cap can no longer be
-        /// the routine outcome it once was. It still bounds the bytes drained
-        /// *before* the loop (Phase 3/4), which are read greedily and are
-        /// limited only by the 2 MiB incoming-buffer cap (`grow_incoming`); keep
-        /// it comfortably above that so a large legitimate first burst never
-        /// trips it. On a trip: give up on kTLS for this connection (transient —
-        /// no host block) and let the standard streaming path handle the fetch.
-        const MAX_KTLS_EXTRA_BODY: usize = 2 * 1024 * 1024 + 256 * 1024;
-
-        let per_read_timeout = std::time::Duration::from_secs(5);
-
-        // Log how many bytes the current partial TLS record needs.
-        // TLS record header is 5 bytes: [content_type, version_hi, version_lo, length_hi, length_lo].
-        // We skip the first 3 bytes and read the 2-byte big-endian length.
-        if let Some(&[_, _, _, hi, lo, ..]) = incoming.get(..incoming_used) {
-            let record_len = u16::from_be_bytes([hi, lo]) as usize;
-            debug!(
-                "kTLS: draining with {incoming_used} bytes buffered, \
-                 current record needs {} bytes total",
-                5 + record_len
-            );
-        }
-
-        let mut drain_stop_reason = "";
-        'drain: while incoming_used > 0 {
-            grow_incoming(&mut incoming, incoming_used, "drain")
-                .map_err(KtlsError::KtlsSetupFailed)?;
-
-            // Bound this read to the end of the current record so it never pulls
-            // the following partial record in — that is what would keep us
-            // perpetually mid-record against a fast upstream. `.max(1)` guards
-            // the abnormal case where a whole record is already buffered but
-            // undrained: a zero-length read slice would misread as EOF.
-            let want = record_framed_read_len(&incoming, incoming_used).max(1);
-            let read_end = (incoming_used + want).min(incoming.len());
-
-            match tokio::time::timeout(
-                per_read_timeout,
-                tcp.read(&mut incoming[incoming_used..read_end]),
-            )
-            .await
-            {
-                Ok(Ok(n @ 1..)) => {
-                    incoming_used += n;
-                }
-                Ok(Ok(0)) => {
-                    drain_stop_reason = "upstream EOF";
-                    debug!(
-                        "kTLS: drain stopped ({drain_stop_reason}) with {incoming_used} bytes buffered"
-                    );
-                    break;
-                }
-                Ok(Err(ref err)) => {
-                    drain_stop_reason = "read error";
-                    debug!(
-                        "kTLS: drain stopped ({drain_stop_reason}) with {incoming_used} bytes buffered:  {}",
-                        ErrorReport(err)
-                    );
-                    break;
-                }
-                Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                    drain_stop_reason = "per-read timeout";
-                    debug!(
-                        "kTLS: drain stopped ({drain_stop_reason}) with {incoming_used} bytes buffered"
-                    );
-                    break;
-                }
-            }
-
-            drain_buffered_records(
-                &mut conn,
-                &mut incoming,
-                &mut incoming_used,
-                &mut outgoing,
-                &mut outgoing_used,
-                tcp,
-                &mut extra_body,
-            )
-            .await?;
-            if extra_body.len() > MAX_KTLS_EXTRA_BODY {
-                return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::other(
+                    ErrorKind::InvalidData,
                     format!(
-                        "kTLS: buffered {} bytes of decrypted body without reaching \
-                         TLS record alignment; falling back to the streaming path",
-                        extra_body.len()
+                        "kTLS: {} bytes remain in buffer after drain \
+                         ({drain_stop_reason}, partial TLS record could not be completed)",
+                        self.incoming_used
                     ),
                 )));
             }
-            if incoming_used == 0 {
-                break 'drain;
-            }
         }
 
-        if incoming_used > 0 {
-            // Upstream truncation (EOF/reset/stall mid-record) — transient,
-            // no host block.
-            return Err(KtlsError::KtlsSetupFailedTransient(std::io::Error::new(
+        Ok(())
+    }
+
+    /// Phase 5 of 5: hand the RX secrets to the kernel. Consumes the state:
+    /// the rustls connection is dismantled for its secrets, and the record
+    /// buffers are zeroized on the way out. After this the socket belongs to
+    /// the kernel context and must not be read through userspace TLS again.
+    fn extract_secrets(self) -> Result<KtlsRxOffload, KtlsError> {
+        let Self {
+            conn,
+            tcp,
+            incoming: _incoming,
+            incoming_used,
+            outgoing: _outgoing,
+            outgoing_used: _,
+        } = self;
+
+        // The incoming buffer must be fully drained before extracting secrets.
+        // Any unprocessed bytes would mean the RX sequence number from rustls is
+        // behind the actual TLS record count on the wire, causing kTLS decryption
+        // failures (wrong nonce/sequence).
+        // Hard check (not debug_assert): a non-zero incoming_used would mean the rustls
+        // RX sequence number is behind the actual TLS record count on the wire.
+        // Proceeding would configure kTLS with a stale rx_seq, silently producing
+        // garbage on decryption. Fail closed instead.
+        //
+        // The debug_assert catches regressions loudly in tests; the runtime branch
+        // below is the real guard in release builds.
+        debug_assert_eq!(
+            incoming_used, 0,
+            "incoming buffer must be fully drained before kTLS secret extraction"
+        );
+        if incoming_used != 0 {
+            return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!(
-                    "kTLS: {incoming_used} bytes remain in buffer after drain \
-                     ({drain_stop_reason}, partial TLS record could not be completed)"
+                    "kTLS: incoming buffer has {incoming_used} unprocessed bytes \
+                     before secret extraction (rx_seq would be stale)"
                 ),
             )));
         }
-    }
 
-    // --- Phase 5 of 5: kTLS Setup ---
-    // The incoming buffer must be fully drained before extracting secrets.
-    // Any unprocessed bytes would mean the RX sequence number from rustls is
-    // behind the actual TLS record count on the wire, causing kTLS decryption
-    // failures (wrong nonce/sequence).
-    // Hard check (not debug_assert): a non-zero incoming_used would mean the rustls
-    // RX sequence number is behind the actual TLS record count on the wire.
-    // Proceeding would configure kTLS with a stale rx_seq, silently producing
-    // garbage on decryption. Fail closed instead.
-    //
-    // The debug_assert catches regressions loudly in tests; the runtime branch
-    // below is the real guard in release builds.
-    debug_assert_eq!(
-        incoming_used, 0,
-        "incoming buffer must be fully drained before kTLS secret extraction"
-    );
-    if incoming_used != 0 {
-        return Err(KtlsError::KtlsSetupFailed(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "kTLS: incoming buffer has {incoming_used} unprocessed bytes \
-                 before secret extraction (rx_seq would be stale)"
-            ),
-        )));
-    }
-
-    let (version, secret_name, cipher_suite, rx_seq) = {
         let (secrets, kernel_conn) = conn.dangerous_into_kernel_connection().map_err(|err| {
             KtlsError::KtlsSetupFailed(std::io::Error::other(format!(
                 "kTLS secret extraction:  {err}"
@@ -2097,19 +2127,110 @@ async fn unbuffered_ktls_request(
         // for another request (see the comment at the KtlsResult::Ready arm),
         // and configuring TX would add a failure surface (some kernels may
         // reject TX for ciphers they accept for RX) for no gain.
-        ktls::setup_rx(&tcp, rx_seq, rx_secrets, version).map_err(KtlsError::KtlsSetupFailed)?;
+        ktls::setup_rx(&*tcp, rx_seq, rx_secrets, version).map_err(KtlsError::KtlsSetupFailed)?;
         drop(rx);
 
-        (version, secret_name, cipher_suite, rx_seq)
-    };
+        // drain_control_messages can fail for transient reasons (e.g. EAGAIN
+        // between peek and consume). Treat those as transient so a one-off race
+        // does not suppress kTLS for the full KTLS_BLOCK_DURATION. We have not
+        // polled the socket here, so the "no data ready" case is the expected
+        // outcome and is not an error — pass `MaybeIdle`.
+        ktls::drain_control_messages(tcp.as_fd(), ktls::DrainExpect::MaybeIdle)
+            .map_err(KtlsError::KtlsSetupFailedTransient)?;
 
-    // drain_control_messages can fail for transient reasons (e.g. EAGAIN
-    // between peek and consume). Treat those as transient so a one-off race
-    // does not suppress kTLS for the full KTLS_BLOCK_DURATION. We have not
-    // polled the socket here, so the "no data ready" case is the expected
-    // outcome and is not an error — pass `MaybeIdle`.
-    ktls::drain_control_messages(tcp.as_fd(), ktls::DrainExpect::MaybeIdle)
-        .map_err(KtlsError::KtlsSetupFailedTransient)?;
+        Ok(KtlsRxOffload {
+            version,
+            secret_name,
+            cipher_suite,
+            rx_seq,
+        })
+    }
+}
+
+/// Drive an unbuffered TLS handshake, send an HTTP request, read response
+/// headers, drain the buffer to record alignment, and set up kTLS RX -- the
+/// five phases of [`KtlsHandshake`], in order.
+///
+/// Precondition: `tcp` already has the TLS ULP attached
+/// (`ktls::attach_ulp`). The kernel context is in `TLS_BASE` passthrough
+/// mode until `setup_rx`, so all handshake I/O below behaves as plain TCP.
+#[cfg(feature = "ktls")]
+async fn unbuffered_ktls_request(
+    tcp: &mut TcpStream,
+    host: &str,
+    host_authority: &str,
+    upstream_path: &str,
+    resume_offset: u64,
+    resume_if_range: Option<&str>,
+    volatile_cond: Option<&VolatileCondHeaders>,
+) -> Result<KtlsReadyState, KtlsError> {
+    let mut hs = KtlsHandshake::new(tcp, host)?;
+
+    // --- Phase 1 of 5: TLS Handshake ---
+    hs.handshake(host_authority).await?;
+    debug!(
+        "kTLS: TLS handshake completed with {host} \
+         (shared ClientSessionMemoryCache enables resumption for subsequent connections)"
+    );
+
+    // TLS handshake succeeded. From here on, classification follows one
+    // principle: KtlsSetupFailed (600s host block) is reserved for failures
+    // that would repeat deterministically on a retry — pathological peer
+    // state machines (round caps), oversized headers/buffers, internal
+    // invariant violations, and kernel setup_rx rejection. Network-flavored
+    // failures (read/write errors, EOF, truncation) and errors triggered by
+    // peer-supplied TLS data map to KtlsSetupFailedTransient: upstream
+    // flakiness says nothing about this host's kTLS capability and must not
+    // disable kTLS for 600s. Routing outcomes keep their own variants:
+    // ResponseNotSpliceable (non-200/no-CL), UpstreamProtocolError
+    // (malformed HTTP, no block).
+
+    // --- Phase 2 of 5: Send HTTP Request ---
+    let req_sent = hs
+        .send_request(
+            host_authority,
+            upstream_path,
+            resume_offset,
+            resume_if_range,
+            volatile_cond,
+        )
+        .await?;
+
+    // --- Phase 3 of 5: Read Response Headers ---
+    let mut extra_body = Vec::new();
+    let (mut header_buf, header_end) = hs.read_headers(host_authority, &mut extra_body).await?;
+
+    // --- Parse response to check status before setting up kTLS ---
+    // Malformed HTTP from the upstream is not a kTLS issue — surface it as
+    // UpstreamProtocolError so the host stays eligible for kTLS retries.
+    let mut response =
+        parse_upstream_response(&header_buf, header_end, host_authority).map_err(|err| {
+            KtlsError::UpstreamProtocolError(std::io::Error::new(
+                err.kind(),
+                format!("kTLS upstream protocol error:  {err}"),
+            ))
+        })?;
+    response.request_sent_at = Some(req_sent);
+
+    if response.status_code != 200 || response.content_length().is_none_or(|ct| ct == 0) {
+        // Non-spliceable response: the caller will reconnect via the standard
+        // path for a complete fetch, so no need to drain the remaining TLS
+        // records from this one-shot kTLS connection.
+        return Err(KtlsError::ResponseNotSpliceable {
+            response: Box::new(response),
+        });
+    }
+
+    // --- Phase 4 of 5: Drain Remaining Buffer ---
+    hs.drain_remaining(&mut extra_body).await?;
+
+    // --- Phase 5 of 5: kTLS Setup ---
+    let KtlsRxOffload {
+        version,
+        secret_name,
+        cipher_suite,
+        rx_seq,
+    } = hs.extract_secrets()?;
 
     // TLS session resumption is supported via the resumption store shared
     // between TLS_CLIENT_CONFIG and KTLS_CLIENT_CONFIG (init_splice_tls_client_config
