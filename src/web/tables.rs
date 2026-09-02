@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    fmt::{Freshness, FmtLastSeenHealth, FmtTimestamp, HtmlEscape, HtmlEscaped, as_size},
+    fmt::{FmtLastSeenHealth, FmtTimestamp, Freshness, HtmlEscape, HtmlEscaped, as_size},
     table::{Table, tr, write_section_error},
 };
 

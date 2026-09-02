@@ -78,7 +78,11 @@ impl Groups {
     fn group(&mut self, title: &'static str, build: impl FnOnce(&mut DetailsList)) {
         let mut list = DetailsList::new();
         build(&mut list);
-        swrite!(self.out, "<h4 class=\"group\">{title}</h4>{}", list.finish());
+        swrite!(
+            self.out,
+            "<h4 class=\"group\">{title}</h4>{}",
+            list.finish()
+        );
     }
 
     fn finish(self) -> String {

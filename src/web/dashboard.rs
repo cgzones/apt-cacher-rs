@@ -17,12 +17,12 @@ use crate::{
     build_info::{APP_VERSION, get_features},
     cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
-    healthcheck::{Check, HealthReport, cached_health_report},
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
     error::ErrorReport,
     global_cache_quota, global_config,
+    healthcheck::{Check, HealthReport, cached_health_report},
     humanfmt::HumanFmt,
     metrics, swrite,
     tunnel_limiter::active_tunnels,
@@ -33,8 +33,7 @@ use crate::{
 use super::{
     fmt::{
         CacheHitRatio, Colorize, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp, HtmlEscape,
-        MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Utc, Window, YesNo,
-        as_size,
+        MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Utc, Window, YesNo, as_size,
     },
     metrics_page::build_metrics_html,
     page::{
