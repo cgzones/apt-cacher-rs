@@ -294,36 +294,37 @@ pub(crate) struct ChecksumRegistry {
 /// `RegistryInner::next_gen`).
 type ScopeEntries = HashMap<Arc<str>, ([u8; 32], u64)>;
 
+/// One `(host, mirror_path)` scope: its entries and their insertion order.
+#[derive(Debug, Default)]
+struct ScopeState {
+    entries: ScopeEntries,
+    /// Insertion-order log for FIFO eviction within the scope. Each entry
+    /// pairs the relpath with the generation it was inserted at. Entries
+    /// whose generation no longer matches the live entry are stale (the key
+    /// was re-inserted later); the eviction loop skips them and
+    /// `compact_order` periodically removes them.
+    order: VecDeque<(Arc<str>, u64)>,
+}
+
+impl ScopeState {
+    /// Live generation of `relpath`, if present.
+    fn live_generation(&self, relpath: &Arc<str>) -> Option<u64> {
+        self.entries.get(relpath).map(|&(_, generation)| generation)
+    }
+}
+
 #[derive(Debug)]
 struct RegistryInner {
-    /// `(host, mirror_path)` scope to per-relpath `(digest, generation)`.
-    /// The generation is the value of `next_gen` at the moment of the most
-    /// recent insert for that relpath. The scope `Arc` and relpath
-    /// `Arc<str>` are shared with `order`, so `insert` allocates each
-    /// string once.
-    map: HashMap<Arc<RegistryScope>, ScopeEntries>,
+    /// `(host, mirror_path)` scope to its entries and eviction order. The
+    /// scope `Arc` and relpath `Arc<str>` are shared between the map and the
+    /// order log, so `insert` allocates each string once.
+    map: HashMap<Arc<RegistryScope>, ScopeState>,
     /// Total relpath entry count across all scopes (the outer map's `len`
     /// counts scopes, not entries).
     len: usize,
-    /// Insertion-order log for FIFO eviction. Each entry pairs the key with
-    /// the generation it was inserted at. Entries whose generation no longer
-    /// matches the live entry are stale (the key was re-inserted later); the
-    /// eviction loop skips them and `compact_order` periodically removes
-    /// them.
-    order: VecDeque<(Arc<RegistryScope>, Arc<str>, u64)>,
     /// Monotonic counter, incremented on every `insert`. Overflow at 2^64
     /// is unreachable in practice (millennia at any realistic insert rate).
     next_gen: u64,
-}
-
-impl RegistryInner {
-    /// Live generation of `(scope, relpath)`, if present.
-    fn live_generation(&self, scope: &Arc<RegistryScope>, relpath: &Arc<str>) -> Option<u64> {
-        self.map
-            .get(scope)
-            .and_then(|submap| submap.get(relpath))
-            .map(|&(_, generation)| generation)
-    }
 }
 
 impl ChecksumRegistry {
@@ -332,7 +333,6 @@ impl ChecksumRegistry {
             inner: Mutex::new(RegistryInner {
                 map: HashMap::new(),
                 len: 0,
-                order: VecDeque::new(),
                 next_gen: 0,
             }),
             cap: cap.get(),
@@ -340,8 +340,10 @@ impl ChecksumRegistry {
     }
 
     /// Insert (or refresh) an expected digest. At the cap, evicts the oldest
-    /// ~25% of entries in one pass. Re-inserting an existing key refreshes
-    /// its eviction-order position to most-recent.
+    /// ~25% of entries in one pass, taken from the *largest* scope first so
+    /// one oversized (or hostile) index cannot drain the digests of every
+    /// other mirror. Re-inserting an existing key refreshes its
+    /// eviction-order position to most-recent.
     pub(crate) fn insert(&self, host: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
         let mut inner = self.inner.lock();
         let generation = inner.next_gen;
@@ -355,40 +357,41 @@ impl ChecksumRegistry {
                 host: host.to_owned(),
                 mirror_path: mirror_path.to_owned(),
             });
-            inner.map.insert(Arc::clone(&scope), ScopeEntries::new());
+            inner.map.insert(Arc::clone(&scope), ScopeState::default());
             scope
         };
 
-        let submap = inner
+        let state = inner
             .map
             .get_mut(&scope)
             .expect("scope was just looked up or inserted");
         // Reuse the existing relpath allocation on refresh; `Arc<str>:
         // Borrow<str>` makes the borrowed lookup allocation-free.
-        let rel = match submap.get_key_value(relpath) {
+        let rel = match state.entries.get_key_value(relpath) {
             Some((rel, _)) => Arc::clone(rel),
             None => Arc::from(relpath),
         };
-        if submap
+        let inserted = state
+            .entries
             .insert(Arc::clone(&rel), (digest, generation))
-            .is_none()
-        {
+            .is_none();
+        state.order.push_back((rel, generation));
+        if state.order.len() > 2 * state.entries.len() + 16 {
+            compact_order(state);
+        }
+        if inserted {
             inner.len += 1;
         }
-        inner.order.push_back((scope, rel, generation));
 
         if inner.len > self.cap {
             // The dashboard only ever shows the post-eviction count, so a
             // registry permanently sized below its working set looks idle
             // while verification coverage quietly drops.
             info_once!(
-                "Checksum registry reached its {} entry cap; evicting the oldest entries (verification coverage drops for evicted keys)",
+                "Checksum registry reached its {} entry cap; evicting the oldest entries of the largest mirror scope (verification coverage drops for evicted keys)",
                 self.cap
             );
             evict(&mut inner, self.cap);
-        }
-        if inner.order.len() > 2 * self.cap {
-            compact_order(&mut inner);
         }
     }
 
@@ -400,7 +403,7 @@ impl ChecksumRegistry {
         inner
             .map
             .get(&RegistryScopeRef { host, mirror_path })
-            .and_then(|submap| submap.get(relpath))
+            .and_then(|state| state.entries.get(relpath))
             .map(|&(digest, _)| digest)
     }
 
@@ -411,55 +414,77 @@ impl ChecksumRegistry {
 
     #[cfg(test)]
     pub(crate) fn order_len(&self) -> usize {
-        self.inner.lock().order.len()
+        self.inner.lock().map.values().map(|s| s.order.len()).sum()
     }
 }
 
-/// FIFO eviction: pop from the front of `order`, drop live entries whose
-/// generation still matches the map, skip stale ones (re-inserted keys whose
-/// current generation is newer than the popped one). Stale skips do not
-/// count against `quota`, so each pass frees `min(quota, live remaining)`
-/// entries. Scopes whose submap drains empty are removed with it.
+/// Eviction: free `cap / 4` live entries, always from the scope currently
+/// holding the most entries, oldest first. A scope that drains empty is
+/// removed and the next-largest scope pays the remainder. Within a scope,
+/// entries pop from the front of its `order`; stale ones (re-inserted keys
+/// whose live generation is newer) are skipped and do not count against the
+/// quota.
 fn evict(inner: &mut RegistryInner, cap: usize) {
     let quota = (cap / 4).max(1);
     let mut live = 0usize;
     while live < quota {
-        let Some((scope, rel, generation)) = inner.order.pop_front() else {
+        let Some(scope) = largest_scope(inner) else {
             break;
         };
-        let Some(submap) = inner.map.get_mut(&scope) else {
-            continue;
+        let Some(state) = inner.map.get_mut(&scope) else {
+            break;
         };
-        match submap.get(&rel) {
-            Some(&(_, current_gen)) if current_gen == generation => {
-                submap.remove(&rel);
-                inner.len -= 1;
-                live += 1;
-                if submap.is_empty() {
-                    inner.map.remove(&scope);
+        while live < quota {
+            let Some((rel, generation)) = state.order.pop_front() else {
+                break;
+            };
+            match state.entries.get(&rel) {
+                Some(&(_, current_gen)) if current_gen == generation => {
+                    state.entries.remove(&rel);
+                    inner.len -= 1;
+                    live += 1;
+                }
+                _ => {
+                    // Stale entry: the key was re-inserted later (newer gen)
+                    // or already evicted. Drop it; no eviction quota consumed.
                 }
             }
-            _ => {
-                // Stale entry: the key was re-inserted later (newer gen) or
-                // already evicted. Drop it; do not consume eviction quota.
-            }
+        }
+        if state.entries.is_empty() {
+            inner.map.remove(&scope);
+        } else if live < quota {
+            // Its order log drained without meeting the quota: only stale
+            // entries were left, which the pops above already discarded.
+            break;
         }
     }
 }
 
-/// Rebuild `order` keeping only entries whose generation matches the
-/// current live entry in the map. Preserves FIFO order of live entries.
-/// Triggered from `insert` when `order.len() > 2 * cap`, so amortized
-/// O(1) per insert. Worst-case pass is O(order.len()).
-fn compact_order(inner: &mut RegistryInner) {
-    let mut compacted = VecDeque::with_capacity(inner.len);
-    while let Some(entry) = inner.order.pop_front() {
-        let (ref scope, ref rel, generation) = entry;
-        if inner.live_generation(scope, rel) == Some(generation) {
+/// The scope holding the most live entries, if any.
+fn largest_scope(inner: &RegistryInner) -> Option<Arc<RegistryScope>> {
+    // A maximum is order-independent; ties pick an arbitrary scope.
+    let mut best: Option<(&Arc<RegistryScope>, usize)> = None;
+    for (scope, state) in &inner.map {
+        if best.is_none_or(|(_, len)| state.entries.len() > len) {
+            best = Some((scope, state.entries.len()));
+        }
+    }
+    best.map(|(scope, _)| Arc::clone(scope))
+}
+
+/// Rebuild a scope's `order` keeping only entries whose generation matches
+/// the current live entry. Preserves FIFO order of live entries. Triggered
+/// from `insert` when the log outgrows twice the live count, so amortized
+/// O(1) per insert.
+fn compact_order(state: &mut ScopeState) {
+    let mut compacted = VecDeque::with_capacity(state.entries.len());
+    while let Some(entry) = state.order.pop_front() {
+        let (ref rel, generation) = entry;
+        if state.live_generation(rel) == Some(generation) {
             compacted.push_back(entry);
         }
     }
-    inner.order = compacted;
+    state.order = compacted;
 }
 
 /// Verify the finished temp file and, on success, rename it into place.
@@ -1207,6 +1232,29 @@ mod tests {
             "newest entry present"
         );
         assert_eq!(reg.lookup("h", "m", "p0"), None, "oldest entry evicted");
+    }
+
+    #[test]
+    fn registry_evicts_from_the_largest_scope_first() {
+        use std::num::NonZero;
+        // One hostile index (scope B) must not evict another mirror's
+        // digests (scope A): at the cap, the largest scope pays.
+        let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
+        for i in 0..4u8 {
+            reg.insert("a", "m", &format!("a{i}"), [i; 32]);
+        }
+        for i in 0..8u8 {
+            reg.insert("b", "m", &format!("b{i}"), [i; 32]);
+        }
+        assert!(reg.len() <= 8, "registry stayed within cap");
+        for i in 0..4u8 {
+            assert!(
+                reg.lookup("a", "m", &format!("a{i}")).is_some(),
+                "a{i} must survive eviction driven by scope b"
+            );
+        }
+        assert!(reg.lookup("b", "m", "b0").is_none(), "b's oldest evicted");
+        assert!(reg.lookup("b", "m", "b7").is_some(), "b's newest present");
     }
 
     #[test]
