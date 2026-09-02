@@ -1,5 +1,5 @@
 //! Zero-copy client backend: parses requests with httparse, serves cached
-//! files via sendfile(2), fetches misses through `splice_conn` (with
+//! files via sendfile(2), fetches misses through `splice` (with
 //! `splice`) and hands everything else to hyper.
 //!
 //! Handoff contract: `ZeroCopyResult::NotApplicable` gives the connection to
@@ -40,7 +40,7 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(feature = "hyper")]
 use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
 #[cfg(feature = "splice")]
-use crate::splice_conn::SpliceProxyError;
+use crate::splice::SpliceProxyError;
 use crate::{
     APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
     active_downloads::{
@@ -1084,7 +1084,7 @@ async fn try_sendfile_request(
         } => {
             use crate::{
                 deb_mirror::{Mirror, MirrorKind},
-                splice_conn::splice_simple_proxy,
+                splice::splice_simple_proxy,
             };
 
             warn_once_or_info!(
@@ -1296,7 +1296,7 @@ async fn try_sendfile_request(
 
     #[cfg(feature = "splice")]
     {
-        use crate::splice_conn::{SpliceProxyOutcome, splice_proxy};
+        use crate::splice::{SpliceProxyOutcome, splice_proxy};
 
         // Splice fetches on its own path and re-opens a stale copy itself.
         drop(miss);
@@ -1399,7 +1399,7 @@ fn splice_error_outcome(
     prefix: &str,
     subject: std::fmt::Arguments<'_>,
 ) -> ZeroCopyResult {
-    use crate::splice_conn::{AfterHeaderSide, UpstreamFailure};
+    use crate::splice::{AfterHeaderSide, UpstreamFailure};
 
     match err {
         SpliceProxyError::Upstream(UpstreamFailure {

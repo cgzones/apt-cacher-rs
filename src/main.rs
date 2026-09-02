@@ -74,7 +74,7 @@ mod secure_vec;
 mod sendfile_conn;
 mod small_vec_deque;
 #[cfg(feature = "splice")]
-mod splice_conn;
+mod splice;
 mod string_write;
 mod task_cache_scan;
 mod task_setup;
@@ -449,7 +449,7 @@ pub(crate) async fn process_cache_request(
     req: http::Request<http_body_util::Empty<()>>,
     _appstate: AppState,
 ) -> Response<ProxyCacheBody> {
-    splice_conn::splice_cleanup_request(&conn_details, &req).await
+    splice::splice_cleanup_request(&conn_details, &req).await
 }
 
 #[must_use]
@@ -780,12 +780,12 @@ fn init_splice_tls_client_config(tls_config: rustls::ClientConfig) {
         // secrets to the kernel.
         let mut ktls_config = tls_config.clone();
         ktls_config.enable_secret_extraction = true;
-        splice_conn::KTLS_CLIENT_CONFIG
+        splice::KTLS_CLIENT_CONFIG
             .set(Arc::new(ktls_config))
             .expect("function should only be called once");
     }
 
-    splice_conn::TLS_CLIENT_CONFIG
+    splice::TLS_CLIENT_CONFIG
         .set(Arc::new(tls_config))
         .expect("function should only be called once");
 }
