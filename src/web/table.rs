@@ -21,7 +21,9 @@ impl Table {
         // Realistic dashboard tables (Mirrors, Origins) easily exceed 10 KB.
         // Pre-size to skip the reallocation chain.
         let mut out = String::with_capacity(16 * 1024);
-        out.push_str("<table><thead><tr>");
+        // The wrapper is what scrolls when the table is wider than its
+        // section; without it a wide table forces a page-wide scrollbar.
+        out.push_str("<div class=\"tablewrap\"><table><thead><tr>");
         for h in headers {
             out.push_str("<th>");
             out.push_str(h);
@@ -44,7 +46,7 @@ impl Table {
     }
 
     pub(super) fn finish(mut self) -> String {
-        self.out.push_str("</tbody></table>");
+        self.out.push_str("</tbody></table></div>");
         self.out
     }
 }

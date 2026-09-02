@@ -57,6 +57,7 @@ pub(super) fn build_page(
          <html lang=\"en\"{theme_attr}>\
          <head>\
          <meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{title}</title>\
          <link rel=\"stylesheet\" href=\"/style.css\">\
          {FAVICON_LINK}\
@@ -297,7 +298,8 @@ table:not(.details) td:hover { overflow: visible; white-space: normal; word-brea
 body { font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
        color: var(--fg); background: var(--bg); line-height: 1.45; padding: 12px 16px; font-size: 13px; }
 nav { background: var(--nav-bg); border-bottom: 1px solid var(--nav-border); padding: 8px 16px;
-      margin: -12px -16px 12px; display: flex; gap: 18px; align-items: center; font-size: 13px; }
+      margin: -12px -16px 12px; display: flex; flex-wrap: wrap; gap: 6px 18px;
+      align-items: center; font-size: 13px; }
 nav .spacer { flex: 1; }
 nav a { color: var(--link); text-decoration: none; font-weight: 500; }
 nav a:hover { text-decoration: underline; }
@@ -305,6 +307,7 @@ nav a:hover { text-decoration: underline; }
            box-shadow: var(--section-shadow); padding: 10px 14px; margin-bottom: 10px; }
 h3 { color: var(--h-fg); margin-bottom: 6px; border-bottom: 2px solid var(--h-accent);
      padding-bottom: 4px; font-size: 0.95em; }
+.tablewrap { overflow-x: auto; max-width: 100%; }
 table { width: 100%; border-collapse: collapse; margin-top: 6px; }
 table.details { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
                 width: 100%; }
