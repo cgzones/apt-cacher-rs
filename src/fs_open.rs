@@ -259,8 +259,19 @@ mod tests {
         let meta = regular_file_metadata(&file, &path).expect("regular file");
 
         assert_eq!(meta.len(), 10);
-        // btime must survive: `cache_file_http_date` prefers it over mtime.
-        assert!(meta.created().is_ok() || meta.modified().is_ok());
+        // `regular_file_metadata` must stay statx-backed: compare its
+        // `created()` availability against a path-based std stat (which
+        // goes through the same statx). This fails if the helper ever
+        // regresses to an fstat(2), which carries no btime, while staying
+        // green on a filesystem that genuinely reports none -- an `||`
+        // against `modified()` would not, since `modified()` is `Ok`
+        // whenever the stat itself succeeds.
+        let via_path = std::fs::metadata(&path).expect("path stat");
+        assert_eq!(
+            meta.created().is_ok(),
+            via_path.created().is_ok(),
+            "regular_file_metadata must stay statx-backed; an fstat(2) loses btime"
+        );
     }
 
     #[tokio::test]
