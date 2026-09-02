@@ -1995,14 +1995,25 @@ async fn serve_new_file(
         "resume_offset ({resume_offset}) + body ({body_content_length}) must equal total ({total_content_length})"
     );
 
-    let reservation = match global_cache_quota().try_acquire(
-        total_content_length,
-        prev_file_size,
-        &conn_details.debname,
-    ) {
-        Ok(r) => r,
-        Err(QuotaExceeded) => {
-            return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached");
+    let reservation = if conn_details.client.is_cleanup_synthetic() {
+        // Cleanup's own index fetches are admitted over quota: rejecting
+        // them would bail the mirror and the cache could never shrink
+        // (`CacheQuota::acquire_for_cleanup`).
+        global_cache_quota().acquire_for_cleanup(
+            total_content_length,
+            prev_file_size,
+            &conn_details.debname,
+        )
+    } else {
+        match global_cache_quota().try_acquire(
+            total_content_length,
+            prev_file_size,
+            &conn_details.debname,
+        ) {
+            Ok(r) => r,
+            Err(QuotaExceeded) => {
+                return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached");
+            }
         }
     };
 

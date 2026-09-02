@@ -261,32 +261,36 @@ async fn task_cleanup_impl(appstate: &AppState) {
         removed_unreferenced += cleanup_result.removed_unreferenced;
     }
 
+    // The window snapshot must precede the scan: commits landing while the
+    // scan walks are ambiguous to it, and the reconcile tolerates exactly
+    // those (`CacheQuota::subtract_and_reconcile`).
+    let quota = global_cache_quota();
+    let window = quota.begin_reconcile_window();
     match task_cache_scan(&appstate.database).await {
         Ok(scanned) => {
             let actual_cache_size = scanned.bytes;
-            let active_downloading_size = appstate.active_downloads.download_size();
+            let reconciled = quota.subtract_and_reconcile(bytes_removed, actual_cache_size, window);
 
-            let quota = global_cache_quota();
-            let (stored, csize, difference) = quota.subtract_and_reconcile(
-                bytes_removed,
-                actual_cache_size,
-                active_downloading_size,
-            );
-
-            if difference != 0 {
+            if reconciled.difference != 0 {
                 warn!(
-                    "Repaired cache size discrepancy of {}: actual={} ({} files) stored={} corrected={} active={}",
-                    HumanFmt::Size(difference),
+                    "Repaired cache size discrepancy of {}: actual={} ({} files) stored={} expected={} corrected={} committed during scan=+{}/-{}",
+                    HumanFmt::Size(reconciled.difference),
                     HumanFmt::Size(actual_cache_size),
                     scanned.files,
-                    HumanFmt::Size(stored),
-                    HumanFmt::Size(csize),
-                    HumanFmt::Size(active_downloading_size)
+                    HumanFmt::Size(reconciled.stored),
+                    HumanFmt::Size(reconciled.expected),
+                    HumanFmt::Size(reconciled.corrected),
+                    HumanFmt::Size(reconciled.grown_during_scan),
+                    HumanFmt::Size(reconciled.shrunk_during_scan)
                 );
             } else {
                 debug!(
-                    "actual cache size: {actual_cache_size} in {} files; stored cache size: {stored}; active download size: {active_downloading_size}",
-                    scanned.files
+                    "actual cache size: {actual_cache_size} in {} files; stored cache size: {}; expected: {}; committed during scan: +{}/-{}",
+                    scanned.files,
+                    reconciled.stored,
+                    reconciled.expected,
+                    reconciled.grown_during_scan,
+                    reconciled.shrunk_during_scan
                 );
             }
         }

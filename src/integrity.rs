@@ -35,6 +35,7 @@ use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_opti
 use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::{
     cache_layout::ResourceKind,
+    cache_quota::QuotaReservation,
     index_parser::{self, HashAlgo, IndexFormat, StanzaStream},
     metrics,
 };
@@ -199,9 +200,9 @@ pub(crate) struct RenamePlan {
     pub(crate) temp_path: PathBuf,
     /// The final cache path to rename into.
     pub(crate) dest_path: PathBuf,
-    /// Actual bytes on disk after download (passed through to the barrier's
-    /// `Finished` accounting / quota finalisation). For resumed downloads
-    /// this includes the pre-existing prefix.
+    /// Actual bytes on disk after download; `verify_and_rename` finalises
+    /// the quota reservation with it right after the rename. For resumed
+    /// downloads this includes the pre-existing prefix.
     pub(crate) bytes_received: u64,
     /// Precise resource kind, from `ConnectionDetails::resource_kind`.
     pub(crate) resource_kind: ResourceKind,
@@ -500,7 +501,18 @@ fn log_unsupported_packages_compression(leaf: &str, host: &str) {
     );
 }
 
-pub(crate) async fn verify_and_rename(plan: &RenamePlan) -> Result<(), CommitError> {
+/// Verify the finished temp file and rename it into the cache.
+///
+/// `reservation` is finalised inside the same blocking closure as the
+/// `rename(2)`, right after it succeeds: a `spawn_blocking` closure runs to
+/// completion even when the awaiting future is dropped, so a cancelled
+/// commit can never leave the file in the cache with its reservation
+/// reverted. On every failure path the reservation is dropped, which
+/// reverts it.
+pub(crate) async fn verify_and_rename(
+    plan: &RenamePlan,
+    reservation: QuotaReservation,
+) -> Result<(), CommitError> {
     let verify_enabled = global_config().verify_checksums;
 
     // Build the verification kind. Layer-B/C registry lookups happen here -
@@ -575,9 +587,27 @@ pub(crate) async fn verify_and_rename(plan: &RenamePlan) -> Result<(), CommitErr
         return Err(err);
     }
 
-    tokio::fs::rename(&plan.temp_path, &plan.dest_path)
-        .await
-        .map_err(CommitError::Rename)?;
+    let temp_path = plan.temp_path.clone();
+    let dest_path = plan.dest_path.clone();
+    let bytes_received = plan.bytes_received;
+    match tokio::task::spawn_blocking(move || {
+        std::fs::rename(&temp_path, &dest_path).map(|()| reservation.finalize(bytes_received))
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(CommitError::Rename(err)),
+        Err(join_err) => {
+            error!(
+                "Failed to run the rename task for {} from host {}; discarding the download, not caching:  {}",
+                plan.debname,
+                plan.host,
+                ErrorReport(&join_err),
+            );
+            metrics::CACHE_IO_FAILURE.increment();
+            return Err(CommitError::Rename(std::io::Error::other(join_err)));
+        }
+    }
 
     // Post-commit, best-effort: ingest index files into the registry so future
     // downloads are verifiable. Detached so the client connection is never

@@ -38,7 +38,7 @@ use crate::{
     healthcheck::{self, filesystem_space},
     humanfmt::HumanFmt,
     metrics,
-    task_cache_scan::task_cache_scan,
+    task_cache_scan::{CacheScanError, task_cache_scan},
     warn_once_or_debug,
 };
 #[cfg(feature = "hyper")]
@@ -92,6 +92,10 @@ pub(crate) enum MainLoopError {
     /// Signal registration, listener bind, or accept failed.
     #[error("{}", ErrorReport(.0))]
     Io(std::io::Error),
+    /// The startup cache scan failed while a disk quota is configured, so
+    /// the quota could not be enforced.
+    #[error("{}", ErrorReport(.0))]
+    CacheScan(CacheScanError),
 }
 
 pub(crate) async fn main_loop(
@@ -225,82 +229,88 @@ pub(crate) async fn main_loop(
         }
     }
 
-    // Initial cache scan task
+    // Initial cache scan. Awaited before the listener binds: the quota is
+    // enforced against this total, so a download admitted earlier would be
+    // checked against an empty cache, and one committing mid-scan would be
+    // counted twice.
     {
-        let database = database.clone();
-        tokio::task::spawn(async move {
-            let scan_start = Instant::now();
-            match task_cache_scan(&database).await {
-                Ok(totals) => {
-                    let scanned = HumanFmt::Time(scan_start.elapsed().into());
-                    let cache_size = totals.bytes;
-                    let files = totals.files;
-                    let rd = RUNTIMEDETAILS.get().expect("global set in main()");
+        let scan_start = Instant::now();
+        match task_cache_scan(&database).await {
+            Ok(totals) => {
+                let scanned = HumanFmt::Time(scan_start.elapsed().into());
+                let cache_size = totals.bytes;
+                let files = totals.files;
+                let rd = RUNTIMEDETAILS.get().expect("global set in main()");
 
-                    rd.cache_quota.add(cache_size);
+                rd.cache_quota.record_startup_scan(cache_size);
 
-                    // The quota is only the bound this daemon enforces; what
-                    // actually runs out is the filesystem -- and it can run
-                    // out of inodes long before it runs out of bytes, which
-                    // is exactly the ENOSPC an operator cannot explain from
-                    // a byte figure alone. A failed statvfs is already
-                    // warned about inside `filesystem_space`.
-                    let space = filesystem_space(&rd.config.cache_directory).await;
-                    let free = match space {
-                        Some(space) => format!(
-                            "free disk space: {}, free inodes: {}",
-                            HumanFmt::Size(space.free_bytes),
-                            match space.inodes {
-                                Some(inodes) => format!("{} of {}", inodes.free, inodes.total),
-                                None => "unlimited".to_owned(),
-                            }
-                        ),
-                        None => "free disk space: unknown".to_owned(),
-                    };
-
-                    match rd.config.disk_quota.map(NonZero::get) {
-                        Some(quota) if cache_size > quota => {
-                            warn!(
-                                "Startup cache size of {} in {files} files exceeds quota {} ({free}, scanned in {scanned}); downloads are rejected as over quota until cleanup frees space",
-                                HumanFmt::Size(cache_size),
-                                HumanFmt::Size(quota)
-                            );
+                // The quota is only the bound this daemon enforces; what
+                // actually runs out is the filesystem -- and it can run
+                // out of inodes long before it runs out of bytes, which
+                // is exactly the ENOSPC an operator cannot explain from
+                // a byte figure alone. A failed statvfs is already
+                // warned about inside `filesystem_space`.
+                let space = filesystem_space(&rd.config.cache_directory).await;
+                let free = match space {
+                    Some(space) => format!(
+                        "free disk space: {}, free inodes: {}",
+                        HumanFmt::Size(space.free_bytes),
+                        match space.inodes {
+                            Some(inodes) => format!("{} of {}", inodes.free, inodes.total),
+                            None => "unlimited".to_owned(),
                         }
-                        Some(quota) => {
-                            info!(
-                                "Startup cache size: {} in {files} files (quota={}, {free}, scanned in {scanned})",
-                                HumanFmt::Size(cache_size),
-                                HumanFmt::Size(quota)
-                            );
-                        }
-                        None => {
-                            info!(
-                                "Startup cache size: {} in {files} files (quota=unlimited, {free}, scanned in {scanned})",
-                                HumanFmt::Size(cache_size)
-                            );
-                        }
-                    }
+                    ),
+                    None => "free disk space: unknown".to_owned(),
+                };
 
-                    // Inode exhaustion produces an ENOSPC that no byte
-                    // figure explains; same floors as the readiness check.
-                    if let Some(detail) =
-                        healthcheck::low_inodes_detail(space.and_then(|s| s.inodes))
-                    {
+                match rd.config.disk_quota.map(NonZero::get) {
+                    Some(quota) if cache_size > quota => {
                         warn!(
-                            "Cache filesystem `{}` is running out of inodes ({detail}); cache writes will fail with ENOSPC while disk space still looks free",
-                            rd.config.cache_directory.display()
+                            "Startup cache size of {} in {files} files exceeds quota {} ({free}, scanned in {scanned}); downloads are rejected as over quota until cleanup frees space",
+                            HumanFmt::Size(cache_size),
+                            HumanFmt::Size(quota)
+                        );
+                    }
+                    Some(quota) => {
+                        info!(
+                            "Startup cache size: {} in {files} files (quota={}, {free}, scanned in {scanned})",
+                            HumanFmt::Size(cache_size),
+                            HumanFmt::Size(quota)
+                        );
+                    }
+                    None => {
+                        info!(
+                            "Startup cache size: {} in {files} files (quota=unlimited, {free}, scanned in {scanned})",
+                            HumanFmt::Size(cache_size)
                         );
                     }
                 }
-                Err(err) => {
-                    error!(
-                        "Failed to scan the cache directory at startup after {}; the accounted cache size stays unset until the next cleanup reconcile:  {}",
-                        HumanFmt::Time(scan_start.elapsed().into()),
-                        ErrorReport(&err)
+
+                // Inode exhaustion produces an ENOSPC that no byte
+                // figure explains; same floors as the readiness check.
+                if let Some(detail) = healthcheck::low_inodes_detail(space.and_then(|s| s.inodes)) {
+                    warn!(
+                        "Cache filesystem `{}` is running out of inodes ({detail}); cache writes will fail with ENOSPC while disk space still looks free",
+                        rd.config.cache_directory.display()
                     );
                 }
             }
-        });
+            Err(err) => {
+                if config.disk_quota.is_some() {
+                    error!(
+                        "Failed to scan the cache directory at startup after {}; a disk quota is configured and cannot be enforced without the scanned size, aborting startup:  {}",
+                        HumanFmt::Time(scan_start.elapsed().into()),
+                        ErrorReport(&err)
+                    );
+                    return Err(MainLoopError::CacheScan(err));
+                }
+                error!(
+                    "Failed to scan the cache directory at startup after {}; no disk quota is configured, the accounted cache size stays unset until the next cleanup reconcile:  {}",
+                    HumanFmt::Time(scan_start.elapsed().into()),
+                    ErrorReport(&err)
+                );
+            }
+        }
     }
 
     // Scheme cache initialization task (hyper backend only — the splice-only

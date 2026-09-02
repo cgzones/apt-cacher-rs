@@ -80,7 +80,6 @@ pub(crate) enum ActiveDownloadStatus {
     /// late-joiners see after `RecvError` instead of a stale `Download`.
     Verifying {
         path: PathBuf,
-        content_length: ContentLength,
         meta: Arc<UpstreamMetadata>,
     },
     /// Rename-completed (or revalidation-confirmed) cached file.
@@ -259,11 +258,7 @@ pub(crate) async fn await_serveable(
                 drop(st);
                 return Ok(serveable);
             }
-            ActiveDownloadStatus::Verifying {
-                path,
-                content_length: _,
-                meta,
-            } => {
+            ActiveDownloadStatus::Verifying { path, meta } => {
                 let path = path.clone();
                 let meta = Some(Arc::clone(meta));
                 drop(st);
@@ -672,40 +667,6 @@ impl ActiveDownloads {
         metrics::LATE_JOINERS_TOTAL.increment();
         metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
         Some(status)
-    }
-
-    #[must_use]
-    pub(crate) fn download_size(&self) -> u64 {
-        tokio::task::block_in_place(move || {
-            let mut sum = 0;
-
-            for entry in self.inner.read().values() {
-                let content_length = {
-                    let d = entry.status.blocking_read();
-                    match &*d {
-                        ActiveDownloadStatus::Download {
-                            path: _,
-                            content_length,
-                            rx: _,
-                            meta: _,
-                        }
-                        | ActiveDownloadStatus::Verifying {
-                            path: _,
-                            content_length,
-                            meta: _,
-                        } => Some(*content_length),
-                        ActiveDownloadStatus::Init(_)
-                        | ActiveDownloadStatus::Finished { .. }
-                        | ActiveDownloadStatus::Aborted(_) => None,
-                    }
-                };
-                if let Some(content_length) = content_length {
-                    sum += content_length.upper().get();
-                }
-            }
-
-            sum
-        })
     }
 
     #[cfg(feature = "hyper")]

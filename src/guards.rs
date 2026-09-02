@@ -265,14 +265,10 @@ impl DownloadBarrier {
             *lock = match prev {
                 ActiveDownloadStatus::Download {
                     path,
-                    content_length,
+                    content_length: _,
                     rx: _,
                     meta,
-                } => ActiveDownloadStatus::Verifying {
-                    path,
-                    content_length,
-                    meta,
-                },
+                } => ActiveDownloadStatus::Verifying { path, meta },
                 other @ (ActiveDownloadStatus::Init(_)
                 | ActiveDownloadStatus::Verifying { .. }
                 | ActiveDownloadStatus::Finished { .. }
@@ -294,7 +290,7 @@ impl DownloadBarrier {
                 key: data.key,
                 resource_kind: data.resource_kind,
                 raw_uri_path: data.raw_uri_path,
-                quota_reservation: data.quota_reservation,
+                quota_reservation: Some(data.quota_reservation),
             }),
         }
     }
@@ -390,7 +386,10 @@ struct RenameBarrierData {
     key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
-    quota_reservation: QuotaReservation,
+    /// `Some` until `commit` hands it to `integrity::verify_and_rename`,
+    /// which finalises it in the rename step; `None` only for the rest of
+    /// that one `commit` call. Reverted by drop on every other path.
+    quota_reservation: Option<QuotaReservation>,
 }
 
 #[must_use]
@@ -419,11 +418,13 @@ impl RenameBarrier {
     /// Verifying` flip happens in `DownloadBarrier::begin_rename`.
     ///
     /// Cancellation window: if the `commit` future is dropped between the
-    /// `tokio::fs::rename` completing and the status-write lock being
-    /// acquired, the renamed file is already in the cache but the
-    /// `Verifying -> Finished` flip never runs; `Drop for RenameBarrier`
-    /// then flips status to `Aborted` and removes the active-downloads
-    /// entry. The xattr-backed metadata persists on disk regardless, so
+    /// rename completing and the status-write lock being acquired, the
+    /// renamed file is already in the cache but the `Verifying -> Finished`
+    /// flip never runs; `Drop for RenameBarrier` then flips status to
+    /// `Aborted` and removes the active-downloads entry. The quota stays
+    /// right: the reservation is finalised inside the rename's blocking
+    /// closure, which runs to completion regardless of the cancellation.
+    /// The xattr-backed metadata persists on disk regardless, so
     /// post-flight readers lazy-load `ETag` / `Last-Modified` via
     /// `cache_metadata::store().resolve(...)` instead of from the in-process
     /// Arc -- benign for correctness, just slightly slower for the first
@@ -474,7 +475,14 @@ impl RenameBarrier {
                 raw_uri_path: data.raw_uri_path.clone(),
             }
         };
-        if let Err(err) = integrity::verify_and_rename(&plan).await {
+        let reservation = self
+            .data
+            .as_mut()
+            .expect("every sink consumes the instance")
+            .quota_reservation
+            .take()
+            .expect("commit runs once per barrier");
+        if let Err(err) = integrity::verify_and_rename(&plan, reservation).await {
             if let CommitError::Rename(io_err) = &err {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -534,7 +542,8 @@ impl RenameBarrier {
             if checksum_mismatch {
                 temp_path.remove().await;
             }
-            // `data` (and its quota reservation) drops here.
+            // `data` drops here; the reservation was reverted when
+            // `verify_and_rename` dropped it.
             return Err(err);
         }
 
@@ -542,20 +551,14 @@ impl RenameBarrier {
         // old name, so the guard must not try to remove it.
         TempPath::defuse(temp_path);
 
-        // Finalise quota outside the lock, then take the write lock briefly
-        // for the `Verifying -> Finished` status flip.
+        // The quota was finalised in the rename step. Take the write lock
+        // briefly for the `Verifying -> Finished` status flip.
         let data = self.data.take().expect("every sink consumes the instance");
-
-        data.quota_reservation.finalize(plan.bytes_received);
 
         let meta_for_status: Option<Arc<UpstreamMetadata>> = {
             let mut lock = data.status.write().await;
             let meta = match &*lock {
-                ActiveDownloadStatus::Verifying {
-                    path: _,
-                    content_length: _,
-                    meta,
-                } => Some(Arc::clone(meta)),
+                ActiveDownloadStatus::Verifying { path: _, meta } => Some(Arc::clone(meta)),
                 ActiveDownloadStatus::Init(_)
                 | ActiveDownloadStatus::Download { .. }
                 | ActiveDownloadStatus::Finished { .. }

@@ -526,27 +526,37 @@ async fn prepare_cache_target(
         }
     };
 
-    let reservation = match global_cache_quota().try_acquire(
-        ContentLength::Exact(total_content_length),
-        prev_file_size,
-        &conn_details.debname,
-    ) {
-        Ok(r) => r,
-        Err(_err @ QuotaExceeded) => {
-            write_invalid_response(
-                client.stream,
-                client.version,
-                client.action,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Disk quota reached",
-                None,
-            )
-            .await
-            .map_err(|err| SpliceProxyError::Client {
-                phase: quota_phase,
-                err,
-            })?;
-            return Ok(None);
+    let reservation = if conn_details.client.is_cleanup_synthetic() {
+        // Mirrors the hyper gate: cleanup's own index fetches are admitted
+        // over quota (`CacheQuota::acquire_for_cleanup`).
+        global_cache_quota().acquire_for_cleanup(
+            ContentLength::Exact(total_content_length),
+            prev_file_size,
+            &conn_details.debname,
+        )
+    } else {
+        match global_cache_quota().try_acquire(
+            ContentLength::Exact(total_content_length),
+            prev_file_size,
+            &conn_details.debname,
+        ) {
+            Ok(r) => r,
+            Err(_err @ QuotaExceeded) => {
+                write_invalid_response(
+                    client.stream,
+                    client.version,
+                    client.action,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Disk quota reached",
+                    None,
+                )
+                .await
+                .map_err(|err| SpliceProxyError::Client {
+                    phase: quota_phase,
+                    err,
+                })?;
+                return Ok(None);
+            }
         }
     };
 
