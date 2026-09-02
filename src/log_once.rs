@@ -58,3 +58,15 @@ macro_rules! info_once {
         }
     }};
 }
+
+/// [`warn_once_or_info!`] that returns the [`crate::utils::Logged`] proof for
+/// an error variant whose policy is "logged at the throw site". Same per-site
+/// once-gate; the level split lives in `Logged::warn_once_or_info`.
+#[macro_export]
+macro_rules! warn_once_or_info_logged {
+    ($($t:tt)*) => {{
+        static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        $crate::utils::Logged::warn_once_or_info(&FIRED, format_args!($($t)*))
+    }};
+}

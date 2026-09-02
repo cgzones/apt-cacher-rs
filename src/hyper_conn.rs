@@ -531,7 +531,7 @@ async fn serve_unfinished_file(
 
     let md = match regular_file_metadata(&file, &file_path).await {
         Ok(data) => data,
-        Err(CacheAccessFailure) => {
+        Err(CacheAccessFailure(_)) => {
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
@@ -741,7 +741,7 @@ async fn serve_cached_file(
         }
         None => match regular_file_metadata(&file, &file_path).await {
             Ok(m) => m,
-            Err(CacheAccessFailure) => {
+            Err(CacheAccessFailure(_)) => {
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
             }
         },
@@ -1014,7 +1014,7 @@ async fn serve_volatile_file(
 
     let mdata = match regular_file_metadata(&file, &file_path).await {
         Ok(data) => data,
-        Err(CacheAccessFailure) => {
+        Err(CacheAccessFailure(_)) => {
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
         }
     };
@@ -1664,10 +1664,13 @@ async fn serve_new_file(
         .await
         {
             Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
-            Err((err, guard)) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(utils::PartialOpenError::NotFound(guard)) => {
                 (0, None, None, utils::PartialDownload::Fresh(guard))
             }
-            Err((_err, guard)) => {
+            Err(utils::PartialOpenError::Failed {
+                logged: _logged,
+                guard,
+            }) => {
                 // Error already logged in `open_partial_file()`.
                 drop(guard);
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");

@@ -43,11 +43,76 @@ macro_rules! static_assert {
         const _: () = assert!($cond, $msg);
     };
 }
+/// Proof that a failure was logged at its throw site.
+///
+/// `docs/logging.md`: a failure is logged once, at the site that decides the
+/// outcome. Some sites must be that site because the context that makes the
+/// line actionable -- the on-disk path, the upstream authority and attempt
+/// count -- exists only there; the error variant they return then carries
+/// this token instead of (or next to) the error, and the outer arm receiving
+/// it maps silently. The field is private and the only constructors are the
+/// logging helpers below, so such a variant cannot be thrown without its log
+/// line, and a reviewer reading `Logged` at a throw site knows which helper
+/// wrote it.
+///
+/// The helpers log from this module, so the `target` recorded for the line
+/// (visible only in the web interface's log store, which prints targets) is
+/// `utils`, not the throw site's module. The console/file sinks print no
+/// target.
+#[derive(Debug)]
+pub(crate) struct Logged(());
+
+impl Logged {
+    /// `error!` the line and prove it.
+    pub(crate) fn error(args: std::fmt::Arguments<'_>) -> Self {
+        error!("{args}");
+        Self(())
+    }
+
+    /// `warn!` the line and prove it.
+    pub(crate) fn warn(args: std::fmt::Arguments<'_>) -> Self {
+        warn!("{args}");
+        Self(())
+    }
+
+    /// A cached-file syscall failed: bump `CACHE_IO_FAILURE` and `error!`
+    /// the line (the pairing every cache-I/O throw site owes, per
+    /// `CLAUDE.md`).
+    pub(crate) fn cache_io_failure(args: std::fmt::Arguments<'_>) -> Self {
+        metrics::CACHE_IO_FAILURE.increment();
+        Self::error(args)
+    }
+
+    /// The body of [`crate::warn_once_or_info_logged!`]: `fired` is that
+    /// call site's own once-gate, so per-site flood control is unchanged
+    /// from [`crate::warn_once_or_info!`]. Call through the macro, never
+    /// directly -- a shared gate would collapse every site into one.
+    #[cfg(feature = "splice")]
+    pub(crate) fn warn_once_or_info(
+        fired: &'static std::sync::atomic::AtomicBool,
+        args: std::fmt::Arguments<'_>,
+    ) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if !fired.load(Relaxed)
+            && fired
+                .compare_exchange(false, true, Relaxed, Relaxed)
+                .is_ok()
+        {
+            warn!("{args}");
+        } else {
+            info!("{args}");
+        }
+        Self(())
+    }
+}
+
 /// Marker for a cache-file access that failed and was already logged, with
 /// the matching `CACHE_IO_FAILURE` / `CACHE_NON_REGULAR` bump. Callers only
-/// map it to their transport's 500 - never log it a second time.
+/// map it to their transport's 500 - never log it a second time; the carried
+/// [`Logged`] is the proof.
 #[derive(Debug)]
-pub(crate) struct CacheAccessFailure;
+pub(crate) struct CacheAccessFailure(pub(crate) Logged);
 
 /// `fstat` an open cache file and require a regular file.
 ///
@@ -63,21 +128,16 @@ pub(crate) async fn regular_file_metadata(
         Ok(md) if md.file_type().is_file() => Ok(md),
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
-            error!(
+            Err(CacheAccessFailure(Logged::error(format_args!(
                 "Cache file `{}` is not a regular file; refusing to serve it",
                 path.display()
-            );
-            Err(CacheAccessFailure)
+            ))))
         }
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to get metadata of cache file `{}`; refusing to serve it:  {}",
-                path.display(),
-                ErrorReport(&err)
-            );
-            Err(CacheAccessFailure)
-        }
+        Err(err) => Err(CacheAccessFailure(Logged::cache_io_failure(format_args!(
+            "Failed to get metadata of cache file `{}`; refusing to serve it:  {}",
+            path.display(),
+            ErrorReport(&err)
+        )))),
     }
 }
 
@@ -290,16 +350,15 @@ impl PartialResume {
 /// hyper path, `"splice proxy: "` for the splice path).
 ///
 /// Returns `Ok` for both the resumable and fresh outcomes; the caller
-/// distinguishes via `partial`/`offset`.  Returns `Err((io_err, guard))` only
-/// when the open syscall failed with a kind other than `NotFound` — callers
-/// decide whether to bail or fall through to a fresh download (the partial
-/// path is left untouched on the filesystem either way).
+/// distinguishes via `partial`/`offset`.  The `Err` cases are the two ways the
+/// partial file could not be opened, see [`PartialOpenError`]; the partial
+/// path is left untouched on the filesystem either way.
 pub(crate) async fn prepare_partial_resume(
     ibarrier: &InitBarrier<'_>,
     debname: &str,
     mirror: &deb_mirror::Mirror,
     log_prefix: &'static str,
-) -> Result<PartialResume, (std::io::Error, TempPath)> {
+) -> Result<PartialResume, PartialOpenError> {
     match open_partial_file(ibarrier, log_prefix).await {
         Ok((file, size, guard)) if size > 0 => {
             if let Some(if_range) = read_etag(&file, &guard) {
@@ -335,8 +394,21 @@ pub(crate) async fn prepare_partial_resume(
             }
         }
         Ok((_file, _size, guard)) => Ok(PartialResume::fresh(guard)),
-        Err((err, guard)) => Err((err, guard)),
+        Err(err) => Err(err),
     }
+}
+
+/// Why [`prepare_partial_resume`] could not open the partial file. Both
+/// variants hand back the `TempPath` guard for the deterministic partial path
+/// (`keep_on_drop: true`, so dropping it touches nothing on disk).
+pub(crate) enum PartialOpenError {
+    /// No partial file at the path: the normal fresh-download case, not
+    /// logged and not counted. The caller starts a fresh download on the guard.
+    NotFound(TempPath),
+    /// Any other open/stat/seek failure, logged inside `open_partial_file`
+    /// with the path and the matching `CACHE_IO_FAILURE` / `CACHE_NON_REGULAR`
+    /// bump; the caller answers 500 without logging again.
+    Failed { logged: Logged, guard: TempPath },
 }
 
 /// A temporary file-path guard that automatically deletes the underlying file when dropped.
@@ -628,64 +700,62 @@ fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
 async fn open_partial_file(
     ibarrier: &InitBarrier<'_>,
     log_prefix: &'static str,
-) -> Result<(tokio::fs::File, u64, TempPath), (tokio::io::Error, TempPath)> {
+) -> Result<(tokio::fs::File, u64, TempPath), PartialOpenError> {
     use tokio::io::AsyncSeekExt as _;
+
+    /// [`PartialOpenError`] before the guard is attached.
+    enum FileOpsError {
+        NotFound,
+        Failed(Logged),
+    }
 
     async fn file_ops(
         path: &Path,
         log_prefix: &'static str,
-    ) -> Result<(tokio::fs::File, u64), tokio::io::Error> {
+    ) -> Result<(tokio::fs::File, u64), FileOpsError> {
         let mut file = tokio_nofollow_options()
             .write(true)
             .read(true)
             .open(path)
             .await
-            .inspect_err(|err| {
+            .map_err(|err| {
                 // NotFound is the normal "no partial file" case; the caller
                 // turns it into a fresh download.  Don't pollute the failure
                 // metric or logs with it.
-                if err.kind() != tokio::io::ErrorKind::NotFound {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
+                if err.kind() == tokio::io::ErrorKind::NotFound {
+                    FileOpsError::NotFound
+                } else {
+                    FileOpsError::Failed(Logged::cache_io_failure(format_args!(
                         "{log_prefix}failed to open partial file `{}`; returning 500:  {}",
                         path.display(),
-                        ErrorReport(err)
-                    );
+                        ErrorReport(&err)
+                    )))
                 }
             })?;
 
-        let mdata = file.metadata().await.inspect_err(|err| {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
+        let mdata = file.metadata().await.map_err(|err| {
+            FileOpsError::Failed(Logged::cache_io_failure(format_args!(
                 "{log_prefix}failed to get metadata of partial file `{}`; returning 500:  {}",
                 path.display(),
-                ErrorReport(err)
-            );
+                ErrorReport(&err)
+            )))
         })?;
         if !mdata.file_type().is_file() {
             metrics::CACHE_NON_REGULAR.increment();
-            warn!(
+            return Err(FileOpsError::Failed(Logged::warn(format_args!(
                 "{log_prefix}partial file `{}` is not a regular file; returning 500",
                 path.display()
-            );
-            return Err(tokio::io::Error::new(
-                tokio::io::ErrorKind::InvalidData,
-                "Not a regular file",
-            ));
+            ))));
         }
 
         // Seek to the end so subsequent writes append correctly.
-        let size = file
-            .seek(std::io::SeekFrom::End(0))
-            .await
-            .inspect_err(|err| {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "{log_prefix}failed to seek partial file `{}`; returning 500:  {}",
-                    path.display(),
-                    ErrorReport(err)
-                );
-            })?;
+        let size = file.seek(std::io::SeekFrom::End(0)).await.map_err(|err| {
+            FileOpsError::Failed(Logged::cache_io_failure(format_args!(
+                "{log_prefix}failed to seek partial file `{}`; returning 500:  {}",
+                path.display(),
+                ErrorReport(&err)
+            )))
+        })?;
 
         Ok((file, size))
     }
@@ -698,7 +768,8 @@ async fn open_partial_file(
     };
     match file_ops(&guard, log_prefix).await {
         Ok((file, size)) => Ok((file, size, guard)),
-        Err(e) => Err((e, guard)),
+        Err(FileOpsError::NotFound) => Err(PartialOpenError::NotFound(guard)),
+        Err(FileOpsError::Failed(logged)) => Err(PartialOpenError::Failed { logged, guard }),
     }
 }
 

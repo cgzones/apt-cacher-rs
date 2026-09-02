@@ -72,8 +72,8 @@ use crate::upstream_head::{
     plan_fresh_download,
 };
 use crate::utils::{
-    self, CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
-    tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
+    self, CacheAccessFailure, Logged, hint_sequential_read, is_peer_disconnect,
+    regular_file_metadata, tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
 };
 use crate::xattr_helpers;
 use crate::{
@@ -85,7 +85,7 @@ use crate::{
     global_verify_throttle, metrics,
     permitted_host_cache::is_host_allowed_cached,
     scheme_cache, static_assert, upstream_retry, warn_on_content_type_mismatch, warn_once,
-    warn_once_or_debug, warn_once_or_info,
+    warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
 };
 #[cfg(feature = "ktls")]
 use crate::{KTLS_BLOCKED, SchemeKey, SchemeKeyRef};
@@ -769,20 +769,21 @@ fn clear_pipe_writable_cache(sender: &pipe::Sender) {
 /// An upstream connect failure, tagged with whether retrying it can plausibly
 /// succeed. Retrying a deterministic failure costs a full TCP connect plus a
 /// full TLS handshake per attempt and buys nothing.
-enum ConnectError {
-    /// DNS/TCP failure, timeout, or a network error mid-handshake -- retry may help.
-    Transient(std::io::Error),
-    /// Deterministic for this (host, scheme): unparsable server name, certificate
-    /// rejection. Retrying re-runs the same handshake and fails identically.
-    Permanent(std::io::Error),
+struct ConnectError {
+    retry: ConnectRetry,
+    err: std::io::Error,
 }
 
 impl ConnectError {
-    /// The wrapped error, for `ErrorReport` logging.
-    fn io_err(&self) -> &std::io::Error {
-        match self {
-            Self::Transient(err) | Self::Permanent(err) => err,
-        }
+    /// DNS/TCP failure, timeout, or a network error mid-handshake -- retry may help.
+    fn transient(err: std::io::Error) -> Self {
+        ConnectRetry::Transient.attach(err)
+    }
+
+    /// Deterministic for this (host, scheme): unparsable server name, certificate
+    /// rejection. Retrying re-runs the same handshake and fails identically.
+    fn permanent(err: std::io::Error) -> Self {
+        ConnectRetry::Permanent.attach(err)
     }
 }
 
@@ -797,10 +798,7 @@ enum ConnectRetry {
 impl ConnectRetry {
     /// Pair the disposition with the error it was derived from.
     fn attach(self, err: std::io::Error) -> ConnectError {
-        match self {
-            Self::Transient => ConnectError::Transient(err),
-            Self::Permanent => ConnectError::Permanent(err),
-        }
+        ConnectError { retry: self, err }
     }
 }
 
@@ -840,13 +838,13 @@ async fn connect_upstream(
         Some(Scheme::Http) => {
             let tcp = tcp_connect(host, mirror_port(mirror, false))
                 .await
-                .map_err(ConnectError::Transient)?;
+                .map_err(ConnectError::transient)?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
         Some(Scheme::Https) => {
             let tcp = tcp_connect(host, mirror_port(mirror, true))
                 .await
-                .map_err(ConnectError::Transient)?;
+                .map_err(ConnectError::transient)?;
             let tls = tls_connect(tcp, host).await.inspect_err(|_| {
                 metrics::UPSTREAM_TLS_FAILED.increment();
             })?;
@@ -872,7 +870,7 @@ async fn connect_upstream(
                         debug!(
                             "splice proxy: TLS handshake failed for {}, trying HTTP:  {}",
                             mirror.format_authority(),
-                            ErrorReport(err.io_err())
+                            ErrorReport(&err.err)
                         );
                     }
                 },
@@ -887,7 +885,7 @@ async fn connect_upstream(
 
             let tcp = tcp_connect(host, mirror_port(mirror, false))
                 .await
-                .map_err(ConnectError::Transient)?;
+                .map_err(ConnectError::transient)?;
             Ok((UpstreamConn::Tcp(tcp), Scheme::Http))
         }
     }
@@ -948,7 +946,7 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|err| {
         // Pure function of the host string: never retryable.
-        ConnectError::Permanent(std::io::Error::new(
+        ConnectError::permanent(std::io::Error::new(
             ErrorKind::InvalidInput,
             format!("failed to parse server name:  {err}"),
         ))
@@ -960,7 +958,7 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            ConnectError::Transient(std::io::Error::new(
+            ConnectError::transient(std::io::Error::new(
                 ErrorKind::TimedOut,
                 format!(
                     "TLS handshake timed out after {}",
@@ -989,7 +987,7 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
     let native_connector = tokio_native_tls::native_tls::TlsConnector::new().map_err(|err| {
         // Building the connector touches no network: a failure here is the
         // local TLS stack refusing to initialise and repeats identically.
-        ConnectError::Permanent(std::io::Error::other(err))
+        ConnectError::permanent(std::io::Error::other(err))
     })?;
     let connector = tokio_native_tls::TlsConnector::from(native_connector);
 
@@ -999,7 +997,7 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            ConnectError::Transient(std::io::Error::new(
+            ConnectError::transient(std::io::Error::new(
                 ErrorKind::TimedOut,
                 format!(
                     "TLS handshake timed out after {}",
@@ -2673,6 +2671,34 @@ impl BodyTransferError {
             err,
         }
     }
+
+    /// Attribute this failure for the outer arm. The peer sides hand their
+    /// error over unchanged; the proxy-local sides are logged here, where
+    /// `temppath` -- the cache file being written -- is in scope, and hand
+    /// over the proof instead. `phase` names the transfer for both the log
+    /// line and the outer arm's tag.
+    fn into_after_header(self, phase: &'static str, temppath: &Path) -> SpliceProxyError {
+        let Self { side, err } = self;
+        let side = match side {
+            BodyFailureSide::Upstream => AfterHeaderSide::Upstream(err),
+            BodyFailureSide::Client => AfterHeaderSide::Client(err),
+            BodyFailureSide::Cache => {
+                AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
+                    "splice proxy: failed to write the cache file `{}` in {phase}; aborting the transfer and closing the connection:  {}",
+                    temppath.display(),
+                    ErrorReport(&err)
+                )))
+            }
+            // Splice pipes / fd duplication -- not a cached-file syscall, so
+            // `CACHE_IO_FAILURE` stays out of it.
+            BodyFailureSide::Proxy => AfterHeaderSide::Proxy(Logged::error(format_args!(
+                "splice proxy: proxy-side I/O failure in {phase} for `{}`; aborting the transfer and closing the connection:  {}",
+                temppath.display(),
+                ErrorReport(&err)
+            ))),
+        };
+        SpliceProxyError::AfterHeader { phase, side }
+    }
 }
 
 /// The caller must `.await` the join handle after the download barrier has
@@ -4138,7 +4164,7 @@ async fn standard_upstream_connect(
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
     scheme_override: Option<Scheme>,
-) -> Result<UpstreamExchange, SpliceProxyError> {
+) -> Result<UpstreamExchange, UpstreamFailure> {
     // Resolve the scheme decision ONCE per connect: it drives the pool-lookup
     // key, the HTTPS-upgrade accounting, and the connect itself. A per-request
     // redirect forcing the scheme carries no decision, and so does none of the
@@ -4225,27 +4251,27 @@ async fn standard_upstream_connect(
         // A permanent failure repeats identically on every retry, so it skips
         // the budget and drops straight into the terminal branch below --
         // sparing 10 pointless TCP connects and TLS handshakes.
-        let permanent = matches!(err, ConnectError::Permanent(_));
+        let permanent = err.retry == ConnectRetry::Permanent;
         let next = if permanent {
             None
         } else {
             backoff.next_retry(coarsetime::Instant::now())
         };
         let Some(delay) = next else {
-            if permanent {
-                warn_once_or_info!(
+            let logged = if permanent {
+                warn_once_or_info_logged!(
                     "splice proxy: not retrying permanent connect failure to upstream {host_authority} for {upstream_path}; returning 502:  {}",
-                    ErrorReport(err.io_err())
-                );
+                    ErrorReport(&err.err)
+                )
             } else {
                 // The limit names which budget stopped the retries -- attempt
                 // cap or `upstream_retry_budget`.
-                warn_once_or_info!(
+                warn_once_or_info_logged!(
                     "splice proxy: failed to connect to upstream {host_authority} for {upstream_path} after {attempt} connection attempts ({}); returning 502:  {}",
                     backoff.limit(),
-                    ErrorReport(err.io_err())
-                );
-            }
+                    ErrorReport(&err.err)
+                )
+            };
             if let Some(decision) = decision {
                 // Evict a stale cached scheme so the next request re-resolves,
                 // mirroring the hyper backend.
@@ -4263,12 +4289,15 @@ async fn standard_upstream_connect(
                     metrics::HTTPS_UPGRADE_FAILED.increment();
                 }
             }
-            return Err(SpliceProxyError::Upstream);
+            return Err(UpstreamFailure {
+                err: err.err,
+                logged,
+            });
         };
         debug!(
             "splice proxy: failed to connect to {host_authority} after {attempt} connection attempts, will retry in {} ms:  {}",
             delay.as_millis(),
-            ErrorReport(err.io_err())
+            ErrorReport(&err.err)
         );
         tokio::time::sleep(delay).await;
     };
@@ -4296,11 +4325,11 @@ async fn standard_upstream_connect(
     )
     .await
     .map_err(|err| {
-        warn_once_or_info!(
+        let logged = warn_once_or_info_logged!(
             "splice proxy: failed upstream request to {host_authority} for {upstream_path}; returning 502:  {}",
             ErrorReport(&err)
         );
-        SpliceProxyError::Upstream
+        UpstreamFailure { err, logged }
     })?;
 
     let poolable = !resp.connection_close;
@@ -4443,16 +4472,17 @@ async fn follow_redirect(
         Some(redirect_scheme),
     )
     .await
-    .inspect_err(|_| {
+    .map_err(|err| {
         // The throw site inside `standard_upstream_connect` already WARNs
-        // with the underlying error detail (per `SpliceProxyError::Upstream`
-        // log convention); this line adds the redirect breadcrumb so an
-        // operator can correlate the connect failure with the redirect that
-        // pointed at the now-failing target.
+        // with the underlying error detail (the `UpstreamFailure` carries the
+        // proof); this line adds the redirect breadcrumb so an operator can
+        // correlate the connect failure with the redirect that pointed at
+        // the now-failing target.
         warn_once_or_info!(
             "splice proxy: failed to connect to the upstream after a {status} redirect from {} to `{moved_uri}`; returning 502",
             conn_details.mirror
         );
+        SpliceProxyError::Upstream(err)
     })?;
 
     Ok(Some(redirect_path.to_owned()))
@@ -5012,7 +5042,8 @@ async fn discard_partial_and_retry(
     exchange.conn.unset_poolable();
     *exchange =
         standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
-            .await?;
+            .await
+            .map_err(SpliceProxyError::Upstream)?;
     // The fresh connect above does not follow redirects; the caller's top-level
     // redirect handling already ran on the original (now-discarded) response, so
     // follow one redirect here if the retry also lands on a 3xx (the retry is
@@ -5202,6 +5233,7 @@ async fn acquire_upstream(
     )
     .await
     .map(UpstreamAcquire::Exchange)
+    .map_err(SpliceProxyError::Upstream)
 }
 
 /// Splice-based proxy: connects to upstream (HTTP or HTTPS), transfers the response body
@@ -5248,7 +5280,6 @@ pub(crate) async fn splice_proxy(
         status,
     )
     .await
-    .map(|()| SpliceProxyOutcome::Served)
 }
 
 /// Serve a cached volatile file after an upstream `304 Not Modified`: refresh
@@ -5279,13 +5310,13 @@ async fn serve_volatile_304_via_sendfile(
     let file = match tokio_nofollow_options().read(true).open(cache_path).await {
         Ok(f) => f,
         Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to open cached file `{}` after 304; returning 500:  {}",
-                cache_path.display(),
-                ErrorReport(&err)
-            );
-            return Err(SpliceProxyError::Cache);
+            return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+                format_args!(
+                    "splice proxy: failed to open cached file `{}` after 304; returning 500:  {}",
+                    cache_path.display(),
+                    ErrorReport(&err)
+                ),
+            )));
         }
     };
     let file = touch_volatile_mtime(file, cache_path).await;
@@ -5308,7 +5339,10 @@ async fn serve_volatile_304_via_sendfile(
         SendfileResult::Invalid { status, msg } => {
             write_invalid_response(client_stream, conn_version, conn_action, status, msg, None)
                 .await
-                .map_err(|err| SpliceProxyError::Client(err, invalid_tag))?;
+                .map_err(|err| SpliceProxyError::Client {
+                    phase: invalid_tag,
+                    err,
+                })?;
             Ok(())
         }
     }
@@ -5332,7 +5366,7 @@ async fn splice_proxy_drive(
     client_range: RangeRequestHeaders<'_>,
     init_tx: tokio::sync::watch::Sender<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-) -> Result<(), SpliceProxyError> {
+) -> Result<SpliceProxyOutcome, SpliceProxyError> {
     let mirror = &conn_details.mirror;
     let host_authority = mirror.format_authority();
     // Capture the original (pre-redirect) client request path. A 301 redirect
@@ -5379,8 +5413,11 @@ async fn splice_proxy_drive(
             Some(throttled.remaining),
         )
         .await
-        .map_err(|err| SpliceProxyError::Client(err, "verify-throttle 503"))?;
-        return Ok(());
+        .map_err(|err| SpliceProxyError::Client {
+            phase: "verify-throttle 503",
+            err,
+        })?;
+        return Ok(SpliceProxyOutcome::Served);
     }
 
     // Check for a partial download file to resume (permanent files only).
@@ -5400,13 +5437,13 @@ async fn splice_proxy_drive(
             .await
             {
                 Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
-                Err((err, guard)) if err.kind() == ErrorKind::NotFound => {
+                Err(utils::PartialOpenError::NotFound(guard)) => {
                     (0, None, None, utils::PartialDownload::Fresh(guard))
                 }
-                Err((_err, guard)) => {
+                Err(utils::PartialOpenError::Failed { logged, guard }) => {
                     // Error already logged in `open_partial_file()`.
                     drop(guard);
-                    return Err(SpliceProxyError::Cache);
+                    return Err(SpliceProxyError::Cache(logged));
                 }
             }
         } else {
@@ -5425,20 +5462,20 @@ async fn splice_proxy_drive(
             Ok(f) => Some(f),
             Err(err) if err.kind() == ErrorKind::NotFound => None,
             Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to open volatile cached file `{}`; returning 500:  {}",
-                    cache_path.display(),
-                    ErrorReport(&err)
-                );
-                return Err(SpliceProxyError::Cache);
+                return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+                    format_args!(
+                        "Failed to open volatile cached file `{}`; returning 500:  {}",
+                        cache_path.display(),
+                        ErrorReport(&err)
+                    ),
+                )));
             }
         };
         if let Some(file) = file {
             let mdata = match regular_file_metadata(&file, &cache_path).await {
                 Ok(m) => m,
-                Err(CacheAccessFailure) => {
-                    return Err(SpliceProxyError::Cache);
+                Err(CacheAccessFailure(logged)) => {
+                    return Err(SpliceProxyError::Cache(logged));
                 }
             };
 
@@ -5494,8 +5531,11 @@ async fn splice_proxy_drive(
                 None,
             )
             .await
-            .map_err(|err| SpliceProxyError::Client(err, "kTLS upstream reject 502"))?;
-            return Ok(());
+            .map_err(|err| SpliceProxyError::Client {
+                phase: "kTLS upstream reject 502",
+                err,
+            })?;
+            return Ok(SpliceProxyOutcome::Served);
         }
         #[cfg(feature = "ktls")]
         UpstreamAcquire::KtlsNotModified(cache_path) => {
@@ -5509,7 +5549,8 @@ async fn splice_proxy_drive(
                 ibarrier,
                 "kTLS post-304 invalid response",
             )
-            .await;
+            .await
+            .map(|()| SpliceProxyOutcome::Served);
         }
     };
 
@@ -5638,7 +5679,8 @@ async fn splice_proxy_drive(
                 ibarrier,
                 "post-304 invalid response",
             )
-            .await;
+            .await
+            .map(|()| SpliceProxyOutcome::Served);
         }
         DownloadPlan::Passthrough => {
             // Forward non-200/non-206 responses directly to the client instead
@@ -5665,14 +5707,14 @@ async fn splice_proxy_drive(
             ) {
                 Ok(s) => s,
                 Err(err) => {
-                    warn_once_or_info!(
+                    let logged = warn_once_or_info_logged!(
                         "splice proxy: failed to rewrite passthrough headers for {} from mirror {}; returning 502:  {}",
                         conn_details.debname,
                         conn_details.mirror,
                         ErrorReport(&err)
                     );
                     upstream.unset_poolable();
-                    return Err(SpliceProxyError::Upstream);
+                    return Err(SpliceProxyError::Upstream(UpstreamFailure { err, logged }));
                 }
             };
             write_all_to_stream(
@@ -5681,7 +5723,10 @@ async fn splice_proxy_drive(
                 WritePhase::Header,
             )
             .await
-            .map_err(|err| SpliceProxyError::Client(err, "passthrough headers"))?;
+            .map_err(|err| SpliceProxyError::Client {
+                phase: "passthrough headers",
+                err,
+            })?;
 
             // Forward the body that arrived with the headers plus the rest,
             // framed per the upstream's (precedence-resolved) framing.
@@ -5690,13 +5735,16 @@ async fn splice_proxy_drive(
                 .framing
                 .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
                 .await
-                .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "passthrough body"))?;
+                .map_err(|err| SpliceProxyError::AfterHeader {
+                    phase: "passthrough body",
+                    side: AfterHeaderSide::Client(err),
+                })?;
 
             // InitBarrier fires on return, which is correct: nothing was cached
             // PoolGuard::drop handles returning the connection to pool if poolable
             metrics::SERVED_PASSTHROUGH.increment();
             metrics::SERVED_TOTAL.increment();
-            return Ok(());
+            return Ok(SpliceProxyOutcome::Served);
         }
         DownloadPlan::Reject(reason) => {
             reason.record_metrics();
@@ -5714,8 +5762,11 @@ async fn splice_proxy_drive(
                 None,
             )
             .await
-            .map_err(|err| SpliceProxyError::Client(err, "upstream reject 502"))?;
-            return Ok(());
+            .map_err(|err| SpliceProxyError::Client {
+                phase: "upstream reject 502",
+                err,
+            })?;
+            return Ok(SpliceProxyOutcome::Served);
         }
         DownloadPlan::Download {
             total: ContentLength::Exact(total),
@@ -5755,7 +5806,8 @@ async fn splice_proxy_drive(
                 client_range,
                 conn_label,
             )
-            .await;
+            .await
+            .map(|()| SpliceProxyOutcome::Served);
         }
     };
 
@@ -5789,8 +5841,11 @@ async fn splice_proxy_drive(
             total_content_length.get(),
         )
         .await
-        .map_err(|err| SpliceProxyError::Client(err, "416 response"))?;
-        return Ok(());
+        .map_err(|err| SpliceProxyError::Client {
+            phase: "416 response",
+            err,
+        })?;
+        return Ok(SpliceProxyOutcome::Served);
     }
     let (content_range_hdr, client_range_start, client_range_len, is_partial) =
         match client_range_result {
@@ -5801,13 +5856,13 @@ async fn splice_proxy_drive(
     // Create cache directory and temp file
     let dest_dir = conn_details.cache_dir_path();
     if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
-            dest_dir.display(),
-            ErrorReport(&err)
-        );
-        return Err(SpliceProxyError::Cache);
+        return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+            format_args!(
+                "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
+                dest_dir.display(),
+                ErrorReport(&err)
+            ),
+        )));
     }
 
     let filename = Path::new(&conn_details.debname);
@@ -5837,13 +5892,13 @@ async fn splice_proxy_drive(
                 }
                 Err(err) if err.kind() == ErrorKind::NotFound => 0,
                 Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
-                        prev_path.display(),
-                        ErrorReport(&err)
-                    );
-                    return Err(SpliceProxyError::Cache);
+                    return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+                        format_args!(
+                            "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
+                            prev_path.display(),
+                            ErrorReport(&err)
+                        ),
+                    )));
                 }
             }
         }
@@ -5869,8 +5924,11 @@ async fn splice_proxy_drive(
                 None,
             )
             .await
-            .map_err(|err| SpliceProxyError::Client(err, "quota 503"))?;
-            return Ok(());
+            .map_err(|err| SpliceProxyError::Client {
+                phase: "quota 503",
+                err,
+            })?;
+            return Ok(SpliceProxyOutcome::Served);
         }
     };
 
@@ -5913,21 +5971,22 @@ async fn splice_proxy_drive(
                     None,
                 )
                 .await
-                .map_err(|err| SpliceProxyError::Client(err, "partial-size mismatch 500"))?;
-                return Ok(());
+                .map_err(|err| SpliceProxyError::Client {
+                    phase: "partial-size mismatch 500",
+                    err,
+                })?;
+                return Ok(SpliceProxyOutcome::Served);
             }
             (file, guard)
         }
         utils::PartialDownload::Fresh(guard) => utils::create_partial_file(guard, 0o640)
             .await
             .map_err(|(err, path)| {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
+                SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
                     "splice proxy: failed to create partial file `{}`; aborting the download:  {}",
                     path.display(),
                     ErrorReport(&err)
-                );
-                SpliceProxyError::Cache
+                )))
             })?,
         utils::PartialDownload::Volatile => {
             let tmppath: PathBuf = [
@@ -5938,13 +5997,11 @@ async fn splice_proxy_drive(
             .iter()
             .collect();
             tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
+                SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
                     "splice proxy: failed to create temp file `{}`; aborting the download:  {}",
                     tmppath.display(),
                     ErrorReport(&err)
-                );
-                SpliceProxyError::Cache
+                )))
             })?
         }
     };
@@ -5998,8 +6055,11 @@ async fn splice_proxy_drive(
             None,
         )
         .await
-        .map_err(|err| SpliceProxyError::Client(err, "body-CL mismatch 502"))?;
-        return Ok(());
+        .map_err(|err| SpliceProxyError::Client {
+            phase: "body-CL mismatch 502",
+            err,
+        })?;
+        return Ok(SpliceProxyOutcome::Served);
     };
 
     let start = PreciseInstant::now();
@@ -6098,7 +6158,10 @@ async fn splice_proxy_drive(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| SpliceProxyError::Client(err, "response headers"))?;
+    .map_err(|err| SpliceProxyError::Client {
+        phase: "response headers",
+        err,
+    })?;
 
     // For resumed downloads, send the existing partial file content to the client first
     // using sendfile(2) for zero-copy transfer from the cache file to the client socket.
@@ -6112,14 +6175,13 @@ async fn splice_proxy_drive(
                 .read(true)
                 .open(temppath.as_ref())
                 .await
-                .map_err(|err| {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
+                .map_err(|err| SpliceProxyError::AfterHeader {
+                    phase: "resume reopen",
+                    side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
                         "splice proxy: failed to reopen partial file `{}` for resume; aborting the transfer and closing the connection:  {}",
                         temppath.display(),
                         ErrorReport(&err)
-                    );
-                    SpliceProxyError::AfterHeaderIo
+                    ))),
                 })?;
 
             match async_sendfile(
@@ -6132,10 +6194,10 @@ async fn splice_proxy_drive(
             {
                 Ok(sent) => client_bytes_sent += sent,
                 Err((_sent, err)) => {
-                    return Err(SpliceProxyError::AfterHeaderClient(
-                        err,
-                        "resume sendfile to client",
-                    ));
+                    return Err(SpliceProxyError::AfterHeader {
+                        phase: "resume sendfile to client",
+                        side: AfterHeaderSide::Client(err),
+                    });
                 }
             }
         }
@@ -6175,14 +6237,13 @@ async fn splice_proxy_drive(
             Ok(()) => tempfile.flush().await,
             Err(err) => Err(err),
         };
-        write_res.map_err(|err| {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
+        write_res.map_err(|err| SpliceProxyError::AfterHeader {
+            phase: "body prefix to cache",
+            side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
                 "splice proxy: failed to write body prefix to cache file `{}`; aborting the download and closing the connection:  {}",
                 temppath.display(),
                 ErrorReport(&err)
-            );
-            SpliceProxyError::AfterHeaderIo
+            ))),
         })?;
 
         let client_slice = range_slice(
@@ -6285,71 +6346,44 @@ async fn splice_proxy_drive(
             client_disconnected: body_client_disconnected,
             client_bytes: body_client_bytes,
         } = if let Some(zero_copy_upstream) = upstream_guard.zero_copy() {
-                // Zero-copy path for TCP (plain or kTLS)
-                splice_proxy_body(
-                    zero_copy_upstream,
-                    client_stream,
-                    &tempfile,
-                    splice_count,
-                    body_offset,
-                    dbarrier,
-                    &range_filter,
-                    &temppath,
-                )
-                .await
-            } else {
-                // TLS: userspace read, then tee+splice fan-out
-                splice_proxy_body_tls(
-                    &mut upstream_guard,
-                    client_stream,
-                    &tempfile,
-                    splice_count,
-                    body_offset,
-                    dbarrier,
-                    &range_filter,
-                    &temppath,
-                )
-                .await
-            }
-            // Any body-transfer error leaves the upstream mid-message (fewer
-            // than content_length bytes consumed), so the socket still holds
-            // undelivered bytes. `upstream_guard` (still armed here) poisons
-            // the connection on the early return so PoolGuard::drop discards it
-            // rather than re-pooling it -- the next checkout would otherwise log
-            // "pooled connection to ... has unexpected data; connecting fresh".
-            //
-            // The body helpers tag which party broke, so the outer arm can
-            // attribute the failure instead of blaming the client for an
-            // upstream stall. Cache- and proxy-side failures are logged here
-            // (the on-disk path is in scope) and reported as `AfterHeaderIo`,
-            // whose contract is exactly "inner site logs, outer arm silent".
-            .map_err(|BodyTransferError { side, err }| match side {
-                BodyFailureSide::Upstream => {
-                    SpliceProxyError::AfterHeaderUpstream(err, "splice body transfer")
-                }
-                BodyFailureSide::Client => {
-                    SpliceProxyError::AfterHeaderClient(err, "splice body transfer")
-                }
-                BodyFailureSide::Cache => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "splice proxy: failed to write the cache file `{}` in splice body transfer; aborting the transfer and closing the connection:  {}",
-                        temppath.display(),
-                        ErrorReport(&err)
-                    );
-                    SpliceProxyError::AfterHeaderIo
-                }
-                BodyFailureSide::Proxy => {
-                    // Splice pipes / fd duplication -- not a cached-file
-                    // syscall, so `CACHE_IO_FAILURE` stays out of it.
-                    error!(
-                        "splice proxy: proxy-side I/O failure in splice body transfer for `{}`; aborting the transfer and closing the connection:  {}",
-                        temppath.display(),
-                        ErrorReport(&err)
-                    );
-                    SpliceProxyError::AfterHeaderIo
-                }
-            })?;
+            // Zero-copy path for TCP (plain or kTLS)
+            splice_proxy_body(
+                zero_copy_upstream,
+                client_stream,
+                &tempfile,
+                splice_count,
+                body_offset,
+                dbarrier,
+                &range_filter,
+                &temppath,
+            )
+            .await
+        } else {
+            // TLS: userspace read, then tee+splice fan-out
+            splice_proxy_body_tls(
+                &mut upstream_guard,
+                client_stream,
+                &tempfile,
+                splice_count,
+                body_offset,
+                dbarrier,
+                &range_filter,
+                &temppath,
+            )
+            .await
+        }
+        // Any body-transfer error leaves the upstream mid-message (fewer
+        // than content_length bytes consumed), so the socket still holds
+        // undelivered bytes. `upstream_guard` (still armed here) poisons
+        // the connection on the early return so PoolGuard::drop discards it
+        // rather than re-pooling it -- the next checkout would otherwise log
+        // "pooled connection to ... has unexpected data; connecting fresh".
+        //
+        // The body helpers tag which party broke, so the outer arm can
+        // attribute the failure instead of blaming the client for an
+        // upstream stall; the cache- and proxy-side failures are logged
+        // in the mapping (the on-disk path is in scope here).
+        .map_err(|err| err.into_after_header("splice body transfer", &temppath))?;
         dbarrier = returned_dbarrier;
         // The splice body block ran: the upstream-rate and client-rate windows
         // both end here. The demoted-client case reassigns `t_client_done`
@@ -6521,10 +6555,11 @@ async fn splice_proxy_drive(
 
     if !client_succeeded {
         // The actual failure (prefix-write, body splice, or demoted task)
-        // was already logged at its source.  Route through `AfterHeaderIo`
-        // so the outer arm silently closes the connection rather than
-        // emitting a duplicate client-error log line.
-        return Err(SpliceProxyError::AfterHeaderIo);
+        // was already logged at its source, and the download itself ran to
+        // completion; report the lost client as the outcome it is rather
+        // than as an error, so the outer arm closes the connection without
+        // a duplicate client-error log line.
+        return Ok(SpliceProxyOutcome::ClientLost);
     }
 
     metrics::SERVED_SPLICE.increment();
@@ -6544,7 +6579,7 @@ async fn splice_proxy_drive(
         send_db_command(cmd).await;
     }
 
-    Ok(())
+    Ok(SpliceProxyOutcome::Served)
 }
 
 /// Read upstream body into a `Vec<u8>` until EOF, up to `max_bytes`.
@@ -6731,7 +6766,7 @@ async fn serve_cached_cleanup_file(
 ) -> Option<http::Response<ProxyCacheBody>> {
     let mdata = match regular_file_metadata(&file, cache_path).await {
         Ok(data) => data,
-        Err(CacheAccessFailure) => {
+        Err(CacheAccessFailure(_)) => {
             return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
         }
     };
@@ -6849,14 +6884,17 @@ async fn cleanup_upstream_fetch(
         .await
     {
         Ok(v) => v,
-        Err(_err) => {
+        Err(UpstreamFailure {
+            err,
+            logged: _logged,
+        }) => {
             debug!("splice cleanup request to {upstream_path} failed to connect/read headers");
             let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
-            // `SpliceProxyError::Upstream` carries no payload (details were
-            // logged at the throw site); give cleanup's decision log a
-            // generic transport reason instead of a bare 502.
+            // The throw site already logged the failure with its context;
+            // hand cleanup's decision log the transport cause the same way
+            // the hyper backend does, rather than a bare 502.
             resp.extensions_mut().insert(UpstreamFetchError {
-                reason: "upstream connect or response-header read failed".to_owned(),
+                reason: ErrorReport(&err).to_string(),
             });
             return resp;
         }
@@ -7056,12 +7094,12 @@ async fn handle_volatile_buffered_download(
         .read_to_vec(upstream, body_prefix, max_bytes)
         .await
         .map_err(|err| {
-            warn_once_or_info!(
+            let logged = warn_once_or_info_logged!(
                 "splice proxy: volatile buffered download failed for {}; returning 502:  {}",
                 conn_details.debname,
                 ErrorReport(&err)
             );
-            SpliceProxyError::Upstream
+            SpliceProxyError::Upstream(UpstreamFailure { err, logged })
         })?;
 
     let t_upstream_done = PreciseInstant::now();
@@ -7080,7 +7118,10 @@ async fn handle_volatile_buffered_download(
             None,
         )
         .await
-        .map_err(|err| SpliceProxyError::Client(err, "volatile zero-body 502"))?;
+        .map_err(|err| SpliceProxyError::Client {
+            phase: "volatile zero-body 502",
+            err,
+        })?;
         return Ok(());
     };
 
@@ -7104,13 +7145,13 @@ async fn handle_volatile_buffered_download(
             }
             Err(err) if err.kind() == ErrorKind::NotFound => 0,
             Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
-                    prev_path.display(),
-                    ErrorReport(&err)
-                );
-                return Err(SpliceProxyError::Cache);
+                return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+                    format_args!(
+                        "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
+                        prev_path.display(),
+                        ErrorReport(&err)
+                    ),
+                )));
             }
         }
     };
@@ -7132,7 +7173,10 @@ async fn handle_volatile_buffered_download(
                 None,
             )
             .await
-            .map_err(|err| SpliceProxyError::Client(err, "volatile quota 503"))?;
+            .map_err(|err| SpliceProxyError::Client {
+                phase: "volatile quota 503",
+                err,
+            })?;
             return Ok(());
         }
     };
@@ -7168,7 +7212,10 @@ async fn handle_volatile_buffered_download(
             total_content_length.get(),
         )
         .await
-        .map_err(|err| SpliceProxyError::Client(err, "volatile 416 response"))?;
+        .map_err(|err| SpliceProxyError::Client {
+            phase: "volatile 416 response",
+            err,
+        })?;
         return Ok(());
     }
 
@@ -7184,13 +7231,13 @@ async fn handle_volatile_buffered_download(
     // Create cache directory and temp file.
     let dest_dir = conn_details.cache_dir_path();
     if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
-            dest_dir.display(),
-            ErrorReport(&err)
-        );
-        return Err(SpliceProxyError::Cache);
+        return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+            format_args!(
+                "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
+                dest_dir.display(),
+                ErrorReport(&err)
+            ),
+        )));
     }
 
     let filename = Path::new(&conn_details.debname);
@@ -7207,13 +7254,11 @@ async fn handle_volatile_buffered_download(
     .iter()
     .collect();
     let (mut tempfile, temppath) = tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
+        SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
             "splice proxy: failed to create temp file `{}`; aborting the download:  {}",
             tmppath.display(),
             ErrorReport(&err)
-        );
-        SpliceProxyError::Cache
+        )))
     })?;
 
     // Write ETag xattr if present.
@@ -7397,7 +7442,10 @@ async fn handle_volatile_buffered_download(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| SpliceProxyError::Client(err, "volatile response headers"))?;
+    .map_err(|err| SpliceProxyError::Client {
+        phase: "volatile response headers",
+        err,
+    })?;
 
     // Send body (range-filtered if needed) to client.
     let body_slice = &body[client_range_start..client_range_start + client_range_len];
@@ -7414,7 +7462,10 @@ async fn handle_volatile_buffered_download(
             config.http_timeout,
         )
         .await
-        .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "volatile body to client"))?;
+        .map_err(|err| SpliceProxyError::AfterHeader {
+            phase: "volatile body to client",
+            side: AfterHeaderSide::Client(err),
+        })?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
     }
     let t_client_done = PreciseInstant::now();
@@ -7608,7 +7659,8 @@ pub(crate) async fn splice_simple_proxy(
         header_end: hdr_end,
         reused: _,
     } = standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
-        .await?;
+        .await
+        .map_err(SpliceProxyError::Upstream)?;
 
     let t_req_sent = resp.request_sent_at.unwrap_or_else(PreciseInstant::now);
 
@@ -7627,12 +7679,12 @@ pub(crate) async fn splice_simple_proxy(
     ) {
         Ok(s) => s,
         Err(err) => {
-            warn_once_or_info!(
+            let logged = warn_once_or_info_logged!(
                 "simple proxy: failed to rewrite headers for {upstream_path} from {host_authority}; returning 502:  {}",
                 ErrorReport(&err)
             );
             upstream.unset_poolable();
-            return Err(SpliceProxyError::Upstream);
+            return Err(SpliceProxyError::Upstream(UpstreamFailure { err, logged }));
         }
     };
 
@@ -7660,7 +7712,10 @@ pub(crate) async fn splice_simple_proxy(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| SpliceProxyError::Client(err, "simple-proxy headers"))?;
+    .map_err(|err| SpliceProxyError::Client {
+        phase: "simple-proxy headers",
+        err,
+    })?;
 
     // Forward the body that arrived with the headers plus the rest, framed
     // per the upstream's framing. Chunked precedence over Content-Length is
@@ -7672,7 +7727,10 @@ pub(crate) async fn splice_simple_proxy(
         .framing
         .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
         .await
-        .map_err(|err| SpliceProxyError::AfterHeaderClient(err, "simple-proxy body"))?;
+        .map_err(|err| SpliceProxyError::AfterHeader {
+            phase: "simple-proxy body",
+            side: AfterHeaderSide::Client(err),
+        })?;
 
     let t_done = PreciseInstant::now();
     let in_time = request_received_at.elapsed();
@@ -7698,6 +7756,12 @@ pub(crate) async fn splice_simple_proxy(
 /// [`crate::active_downloads::ActiveDownloads::originate`].
 pub(crate) enum SpliceProxyOutcome {
     Served,
+    /// The download ran to completion (cached or not), but the client's
+    /// delivery failed after the response headers went out -- the body
+    /// prefix write, the splice loop, or the demoted file-serve task -- and
+    /// that source logged it. The caller closes the connection without a new
+    /// status and without logging again.
+    ClientLost,
     Concurrent {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
@@ -7711,43 +7775,95 @@ pub(crate) enum SpliceProxyOutcome {
     },
 }
 
-/// Errors that can occur during splice proxy.
+/// Errors out of the splice proxy paths. Every variant reaching a
+/// connection-level outcome goes through the single outer arm,
+/// `sendfile_conn::splice_error_outcome`, whose `match` is exhaustive on
+/// purpose: a new variant is a compile error there, and its logging policy is
+/// decided here, on the variant, not in prose elsewhere.
+///
+/// The payload encodes who logs. An `io::Error` (plus the `phase` tag naming
+/// the response phase that broke, e.g. `"response headers"`,
+/// `"416 response"`, so the operator does not grep-walk the source) means the
+/// outer arm logs it -- it holds the subsystem prefix and the subject. A
+/// [`Logged`] means the throw site already did, because the context that
+/// makes the line actionable (the on-disk path, the upstream authority and
+/// attempt count) exists only there; the outer arm maps it silently. There is
+/// no third case: a variant is never logged twice, and never not at all
+/// (`docs/logging.md`, "A failure is logged once, at the site that decides the
+/// outcome").
 pub(crate) enum SpliceProxyError {
-    /// Error communicating with upstream
-    Upstream,
-    /// Error writing to client.  `&'static str` is a short code-location
-    /// tag (e.g. "response headers", "416 response", "passthrough headers")
-    /// that the outer arm in `sendfile_conn::try_sendfile_request` includes
-    /// in the log so the operator sees which response phase broke without
-    /// grep-walking the source.
-    Client(std::io::Error, &'static str),
-    /// Error with cache file operations
-    Cache,
-    /// Client-side I/O failure after response headers were written.  The
-    /// caller must close the connection without emitting a new HTTP status.
-    /// `&'static str` is a short code-location tag (e.g. "passthrough
-    /// chunked body", "volatile body to client") that the outer arm
-    /// includes in the log so the operator sees which delivery phase
-    /// broke.  Logged at the outer arm with `is_peer_disconnect`-based
-    /// severity (INFO for peer disconnects, WARN otherwise).
-    AfterHeaderClient(std::io::Error, &'static str),
-    /// Upstream-side I/O failure after response headers were written: the
-    /// mirror stalled, hung up, or fell below `min_download_rate` mid-body.
-    /// The caller must close the connection without emitting a new HTTP
-    /// status -- the client has already received a 200/206 header.  Carries
-    /// the same short code-location tag as `AfterHeaderClient`.  Logged at
-    /// the outer arm at WARN: unlike a client hang-up there is no benign
-    /// case, and the throw sites already bumped their dedicated counter
-    /// (`HTTP_TIMEOUT_UPSTREAM_READ`, `RATE_LIMIT_UPSTREAM`,
-    /// `UPSTREAM_PROTOCOL_VIOLATION`), so the line is counter-backed and
-    /// bounded to one per connection.
-    AfterHeaderUpstream(std::io::Error, &'static str),
-    /// Cache-side I/O failure after response headers were written
-    /// (tempfile write, rename, partial-file reopen, etc.).  The caller
-    /// must close the connection.  Unlike `AfterHeaderClient`, the log
-    /// is emitted at the inner throw site - which has the on-disk
-    /// path(s) in scope - and the outer arm matches silently.
-    AfterHeaderIo,
+    /// The upstream connect, request or header read failed before anything
+    /// was written to the client. Logged at the throw site (once-gated WARN,
+    /// then INFO, with the authority, path and attempt count); the outer arm
+    /// answers `502 Bad Gateway` / `"Upstream Error"` silently. The carried
+    /// transport error is for callers that report the cause elsewhere
+    /// (cleanup's decision log).
+    Upstream(UpstreamFailure),
+    /// A write to the client failed before the response headers went out.
+    /// Logged at the outer arm with the `is_peer_disconnect` split (INFO for
+    /// a peer disconnect, WARN otherwise); the connection is closed without a
+    /// new status.
+    Client {
+        phase: &'static str,
+        err: std::io::Error,
+    },
+    /// A cache-file operation failed before the response headers went out.
+    /// Logged at the throw site (ERROR naming the path, plus the
+    /// `CACHE_IO_FAILURE` / `CACHE_NON_REGULAR` bump); the outer arm answers
+    /// `500 Internal Server Error` / `"Cache Access Failure"` silently.
+    Cache(Logged),
+    /// An I/O failure after the response headers were written. The client
+    /// already holds a 200/206 header, so the outer arm closes the
+    /// connection without a new status; `side` says which of the parties
+    /// broke and carries what that party's logging policy needs.
+    AfterHeader {
+        phase: &'static str,
+        side: AfterHeaderSide,
+    },
+}
+
+/// A failed upstream connect / request / header read, see
+/// [`SpliceProxyError::Upstream`]. `err` is the transport cause; `logged`
+/// proves the throw site already reported it with its context.
+pub(crate) struct UpstreamFailure {
+    #[cfg_attr(
+        feature = "hyper",
+        expect(
+            dead_code,
+            reason = "read by the hyper-less `cleanup_upstream_fetch`; with hyper, cleanup fetches through hyper instead"
+        )
+    )]
+    pub(crate) err: std::io::Error,
+    pub(crate) logged: Logged,
+}
+
+/// The party that broke after the response headers went out
+/// ([`SpliceProxyError::AfterHeader`]). Mirrors [`BodyFailureSide`], but each
+/// side carries what its logging policy needs: the peer sides hand the error
+/// to the outer arm, the proxy-local sides own the on-disk path and log at the
+/// throw site. `docs/logging.md`'s body-transfer attribution table reads off
+/// this enum.
+pub(crate) enum AfterHeaderSide {
+    /// The mirror stalled, hung up, or fell below `min_download_rate`
+    /// mid-body. Logged at the outer arm at plain WARN: unlike a client
+    /// hang-up there is no benign case, and the throw sites already bumped
+    /// their dedicated counter (`HTTP_TIMEOUT_UPSTREAM_READ`,
+    /// `RATE_LIMIT_UPSTREAM`, `UPSTREAM_PROTOCOL_VIOLATION`), so the line is
+    /// counter-backed and bounded to one per connection.
+    Upstream(std::io::Error),
+    /// The client socket. Logged at the outer arm with the
+    /// `is_peer_disconnect` split (INFO for a peer disconnect, WARN
+    /// otherwise).
+    Client(std::io::Error),
+    /// A cached-file syscall (tempfile write, rename, partial-file reopen,
+    /// the `splice` into the cache fd). Logged at the throw site (ERROR
+    /// naming the path, plus `CACHE_IO_FAILURE`); the outer arm is silent.
+    Cache(Logged),
+    /// Another proxy-side resource: the internal splice pipes, or the fd
+    /// duplication behind the demoted file-serve task. Logged at the throw
+    /// site (ERROR, no metric -- not a cached-file syscall); the outer arm is
+    /// silent.
+    Proxy(Logged),
 }
 
 #[cfg(test)]

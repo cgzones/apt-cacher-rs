@@ -1249,7 +1249,7 @@ async fn try_sendfile_request(
                     metrics::VOLATILE_HIT.increment();
                     break 'cache_lookup Ok((file, Some(md)));
                 }
-                Err(CacheAccessFailure) => {
+                Err(CacheAccessFailure(_)) => {
                     return ZeroCopyResult::Invalid {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
                         msg: "Cache Access Failure",
@@ -1313,6 +1313,7 @@ async fn try_sendfile_request(
         .await;
         match outcome {
             Ok(SpliceProxyOutcome::Served) => ZeroCopyResult::Served(conn_action),
+            Ok(SpliceProxyOutcome::ClientLost) => ZeroCopyResult::AfterHeaderError,
             Ok(SpliceProxyOutcome::Concurrent { status: dl_status }) => {
                 // Race-loser path: another connection registered the
                 // download between our earlier `attach()` (which saw
@@ -1378,77 +1379,85 @@ async fn try_sendfile_request(
 }
 
 /// The single outer arm for [`SpliceProxyError`]: maps every variant to its
-/// connection-level outcome and logs the variants whose policy is "logged at
-/// the outer arm" (`Client`/`AfterHeaderClient` with `is_peer_disconnect`
-/// severity, `AfterHeaderUpstream` at plain WARN). `Upstream`, `Cache` and
-/// `AfterHeaderIo` were logged at their throw sites and map silently.
+/// connection-level outcome and writes the log lines the variants delegate
+/// to it. The policy -- which variants are logged here and at what
+/// severity, which arrive with a `Logged` proof and map silently -- is
+/// documented on the variants themselves; this `match` only implements it,
+/// and is exhaustive so a new variant lands here as a compile error.
 ///
 /// `prefix` is the registered subsystem prefix,
 /// `subject` names the resource the way that path's other lines do.
 ///
-/// `AfterHeaderUpstream` is not reachable from `splice_simple_proxy` today
-/// (it relays the body itself rather than through `splice_proxy_body{,_tls}`,
-/// the only producers); it is handled uniformly rather than as a panic so
-/// wiring the split into the passthrough relay is not a production hazard.
+/// `AfterHeaderSide::Upstream` is not reachable from `splice_simple_proxy`
+/// today (it relays the body itself rather than through
+/// `splice_proxy_body{,_tls}`, the only producers); it is handled uniformly
+/// rather than as a panic so wiring the split into the passthrough relay is
+/// not a production hazard.
 #[cfg(feature = "splice")]
 fn splice_error_outcome(
     err: SpliceProxyError,
     prefix: &str,
     subject: std::fmt::Arguments<'_>,
 ) -> ZeroCopyResult {
+    use crate::splice_conn::{AfterHeaderSide, UpstreamFailure};
+
     match err {
-        SpliceProxyError::Upstream => ZeroCopyResult::Invalid {
+        SpliceProxyError::Upstream(UpstreamFailure {
+            err: _,
+            logged: _logged,
+        }) => ZeroCopyResult::Invalid {
             status: StatusCode::BAD_GATEWAY,
             msg: "Upstream Error",
         },
-        SpliceProxyError::Cache => ZeroCopyResult::Invalid {
+        SpliceProxyError::Cache(_logged) => ZeroCopyResult::Invalid {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             msg: "Cache Access Failure",
         },
-        SpliceProxyError::Client(err, location) => {
+        SpliceProxyError::Client { phase, err } => {
             if is_peer_disconnect(&err) {
                 info!(
-                    "{prefix}: client error writing {location} (peer disconnect) for {subject}; closing the connection:  {}",
+                    "{prefix}: client error writing {phase} (peer disconnect) for {subject}; closing the connection:  {}",
                     ErrorReport(&err)
                 );
             } else {
                 warn!(
-                    "{prefix}: client error writing {location} for {subject}; closing the connection:  {}",
+                    "{prefix}: client error writing {phase} for {subject}; closing the connection:  {}",
                     ErrorReport(&err)
                 );
             }
             ZeroCopyResult::ClientError
         }
-        SpliceProxyError::AfterHeaderClient(err, location) => {
-            if is_peer_disconnect(&err) {
-                info!(
-                    "{prefix}: client response delivery aborted in {location} (peer disconnect) for {subject}; closing the connection:  {}",
-                    ErrorReport(&err)
-                );
-            } else {
-                warn!(
-                    "{prefix}: client response delivery failed in {location} for {subject}; closing the connection:  {}",
-                    ErrorReport(&err)
-                );
+        SpliceProxyError::AfterHeader { phase, side } => {
+            match side {
+                AfterHeaderSide::Client(err) => {
+                    if is_peer_disconnect(&err) {
+                        info!(
+                            "{prefix}: client response delivery aborted in {phase} (peer disconnect) for {subject}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    } else {
+                        warn!(
+                            "{prefix}: client response delivery failed in {phase} for {subject}; closing the connection:  {}",
+                            ErrorReport(&err)
+                        );
+                    }
+                }
+                // No peer-hung-up case to demote (see the variant doc): every
+                // way here means this mirror failed to deliver a body it had
+                // already promised, and the operator wants to see which
+                // mirror. Counter-backed and bounded to one line per
+                // connection, so it takes the same once-gating exemption as
+                // the delivery split.
+                AfterHeaderSide::Upstream(err) => {
+                    warn!(
+                        "{prefix}: upstream failed in {phase} for {subject}; closing the connection:  {}",
+                        ErrorReport(&err)
+                    );
+                }
+                AfterHeaderSide::Cache(_logged) | AfterHeaderSide::Proxy(_logged) => {}
             }
             ZeroCopyResult::AfterHeaderError
         }
-        // Upstream-side failure mid-body: a stall (`http_timeout`), a
-        // `min_download_rate` breach, or a premature close. Unlike the client
-        // split above there is no benign peer-hung-up case to demote -- every
-        // variant means this mirror failed to deliver a body it had already
-        // promised, and the operator wants to see which mirror. Bounded to one
-        // line per connection and backed by `HTTP_TIMEOUT_UPSTREAM_READ` /
-        // `RATE_LIMIT_UPSTREAM` / `UPSTREAM_PROTOCOL_VIOLATION`, so it takes
-        // the same once-gating exemption as the delivery split.
-        SpliceProxyError::AfterHeaderUpstream(err, location) => {
-            warn!(
-                "{prefix}: upstream failed in {location} for {subject}; closing the connection:  {}",
-                ErrorReport(&err)
-            );
-            ZeroCopyResult::AfterHeaderError
-        }
-        SpliceProxyError::AfterHeaderIo => ZeroCopyResult::AfterHeaderError,
     }
 }
 
@@ -1566,7 +1575,7 @@ pub(crate) async fn serve_file_via_sendfile(
     } else {
         match regular_file_metadata(&file, file_path).await {
             Ok(m) => m,
-            Err(CacheAccessFailure) => {
+            Err(CacheAccessFailure(_)) => {
                 return SendfileResult::Invalid {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     msg: "Cache Access Failure",
@@ -2605,7 +2614,7 @@ async fn serve_unfinished_sendfile(
 
     let metadata = match regular_file_metadata(&file, &file_path).await {
         Ok(m) => m,
-        Err(CacheAccessFailure) => {
+        Err(CacheAccessFailure(_)) => {
             return ZeroCopyResult::Invalid {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 msg: "Cache Access Failure",
