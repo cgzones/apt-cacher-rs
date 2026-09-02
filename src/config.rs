@@ -1,11 +1,17 @@
 //! Daemon configuration: TOML parsing, defaults, CLI overrides and
 //! `validate()`.
 //!
-//! Adding an option: a `DEFAULT_*` const + a `default_*` fn + the serde
-//! field + a `validate()` warning when it has no effect (feature-gated
-//! branches mirror `mmap_threshold`) + a commented entry in
-//! `debian/apt-cacher-rs.conf`. The man page and README document CLI flags
-//! only.
+//! Adding an option: the serde field (struct-level `#[serde(default)]`
+//! supplies missing keys from `Config::default()`, so only a
+//! `deserialize_with` is ever needed on the field) + its value in the
+//! `impl Default for Config` block + a `validate()` warning when it has no
+//! effect + a commented entry in `debian/apt-cacher-rs.conf`. The man page
+//! and README document CLI flags only.
+//!
+//! "Set but has no effect" warnings must test `self.is_set("key")` (the
+//! key's structural presence in the TOML document), never compare the value
+//! against its default: an operator who writes the default value explicitly
+//! still gets the warning. Feature-gated options mirror `mmap_threshold`.
 //!
 //! A CLI flag that *overrides* a config field instead: a `Cli` field in
 //! `main.rs` + a `Config::new` parameter applied on top of the parsed TOML
@@ -24,6 +30,7 @@ use std::{
     time::Duration,
 };
 
+use hashbrown::HashSet;
 use http::StatusCode;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer};
@@ -58,51 +65,12 @@ macro_rules! invalid {
     };
 }
 
-const DEFAULT_CACHE_DIR: &str = "/var/cache/apt-cacher-rs";
 pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = "/etc/apt-cacher-rs/apt-cacher-rs.conf";
-pub(crate) const DEFAULT_DATABASE_PATH: &str = "/var/lib/apt-cacher-rs/apt-cacher-rs.db";
 
-const DEFAULT_BIND_ADDRESS: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
-const DEFAULT_BIND_PORT: NonZero<u16> = nonzero!(3142);
-const DEFAULT_BUF_SIZE: usize = 32 * 1024; // 32 KiB
-const DEFAULT_DATABASE_SLOW_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_DISK_QUOTA: Option<NonZero<u64>> = None;
-const DEFAULT_MIN_DISK_FREE: Option<NonZero<u64>> = Some(nonzero!(512 * 1024 * 1024)); // 512 MiB
-const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
-const DEFAULT_UPSTREAM_RETRY_BUDGET: Duration = Duration::from_secs(30);
-const DEFAULT_HTTPS_UPGRADE_MODE: HttpsUpgradeMode = HttpsUpgradeMode::Auto;
-const DEFAULT_HTTPS_TUNNEL_ENABLED: bool = true;
-const DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS: [NonZero<u16>; 1] = [nonzero!(443)];
-const DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT: Option<NonZero<usize>> = Some(nonzero!(10));
-const DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP: Option<NonZero<usize>> = None;
-const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
-const DEFAULT_LOG_DESTINATION: LogDestination = LogDestination::Console;
-const DEFAULT_LOGSTORE_CAPACITY: NonZero<usize> = nonzero!(100);
-const DEFAULT_MIN_DOWNLOAD_RATE: Option<NonZero<usize>> = Some(nonzero!(10000)); // 10 kB/s
+/// Default of [`Config::rate_check_timeframe`]; a named const (not a field of
+/// `Config::default()`) because `ringbuffer.rs` pins its inline capacity to it
+/// in a `static_assert!`.
 pub(crate) const DEFAULT_RATE_CHECK_TIMEFRAME: NonZero<usize> = nonzero!(30);
-const DEFAULT_MAX_UPSTREAM_DOWNLOADS: Option<NonZero<usize>> = Some(nonzero!(20));
-const DEFAULT_BYHASH_RETENTION_DAYS: NonZero<u64> = nonzero!(90);
-const DEFAULT_USAGE_RETENTION_DAYS: Option<NonZero<u64>> = Some(nonzero!(30));
-const DEFAULT_DB_CHANNEL_CAPACITY: NonZero<usize> = nonzero!(128);
-const DEFAULT_DB_BATCH_FLUSH_MAX_COUNT: NonZero<usize> = nonzero!(256);
-const DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS: NonZero<u64> = nonzero!(15);
-const DEFAULT_MMAP_THRESHOLD: NonZero<u64> = nonzero!(1024 * 1024); // 1MiB
-const DEFAULT_KTLS_MEMORY_LOCK: bool = true;
-const DEFAULT_MAX_OBJECT_SIZE: Option<NonZero<u64>> = Some(nonzero!(2 * 1024 * 1024 * 1024));
-const DEFAULT_UPSTREAM_TCP_NODELAY: bool = true;
-const DEFAULT_REJECT_PDIFF_REQUESTS: bool = true;
-const DEFAULT_VERIFY_CHECKSUMS: bool = true;
-const DEFAULT_VERIFY_CHECKSUMS_MAX_ENTRIES: NonZero<usize> = nonzero!(500_000);
-const DEFAULT_VERIFY_CHECKSUMS_THROTTLE_BASE: Duration = Duration::from_secs(30);
-const DEFAULT_VERIFY_CHECKSUMS_THROTTLE_CAP: Duration = Duration::from_hours(1);
-const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED: bool = false;
-const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL: Option<NonZero<usize>> = Some(nonzero!(3));
-const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE: StatusCode = StatusCode::TOO_MANY_REQUESTS;
-const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_RETRYAFTER: u16 = 5;
-const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_FACTOR: f64 = 0.2;
-const DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MINSIZE: Option<NonZero<u64>> =
-    Some(nonzero!(10 * 1024 * 1024)); // 10 MiB
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) enum HttpsUpgradeMode {
@@ -572,7 +540,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for ClientHost {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Alias {
     pub(crate) main: CacheHost,
@@ -600,7 +568,7 @@ pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Opti
         .map(|alias| &alias.main)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum IpNetOrAddr {
     Net(IpNet),
     Addr(IpAddr),
@@ -634,7 +602,7 @@ impl<'de> Deserialize<'de> for IpNetOrAddr {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(from = "String")]
 pub(crate) enum LogDestination {
     Console,
@@ -734,53 +702,43 @@ impl FromStr for BindOverride {
 
 #[expect(clippy::struct_excessive_bools, reason = "configuration")]
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(PartialEq))]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
     /// Minimum log level severity to output.
     /// Can be overridden via program options.
-    #[serde(default = "default_log_level", deserialize_with = "from_level_name")]
+    #[serde(deserialize_with = "from_level_name")]
     pub(crate) log_level: LevelFilter,
 
     /// Path to log file.
     /// The special value `console` will output to the console.
     /// Can be overridden via program options.
-    #[serde(default = "default_log_file")]
     pub(crate) log_file: LogDestination,
 
     /// Address to listen on.
-    #[serde(default = "default_bind_addr")]
     pub(crate) bind_addr: IpAddr,
 
     /// Port to listen on.
-    #[serde(default = "default_bind_port")]
     pub(crate) bind_port: NonZero<u16>,
 
     /// Path to database.
-    #[serde(default = "default_database_path")]
     pub(crate) database_path: PathBuf,
 
     /// Path to cache directory.
-    #[serde(default = "default_cache_dir")]
     pub(crate) cache_directory: PathBuf,
 
     /// Timeout (in seconds) of database operations after which a warning is generated.
-    #[serde(
-        default = "default_db_slow_timeout",
-        deserialize_with = "from_secs_f64"
-    )]
+    #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) database_slow_timeout: Duration,
 
     /// Timeout (in seconds) for http operations.
-    #[serde(default = "default_http_timeout", deserialize_with = "from_secs_f64")]
+    #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) http_timeout: Duration,
 
     /// Timeout (in seconds) after which an inbound client connection is closed
     /// while waiting for a complete HTTP request -- covers idle keep-alive
     /// connections and slowloris-style partial header sends.
-    #[serde(
-        default = "default_client_idle_timeout",
-        deserialize_with = "from_secs_f64"
-    )]
+    #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) client_idle_timeout: Duration,
 
     /// Wall-clock budget (in seconds) for the whole upstream connect-retry
@@ -788,51 +746,34 @@ pub(crate) struct Config {
     /// whose delay would finish past this budget is not started and the request
     /// fails terminally instead, so a dead mirror cannot pin an active-download
     /// slot for the full schedule.
-    #[serde(
-        default = "default_upstream_retry_budget",
-        deserialize_with = "from_secs_f64"
-    )]
+    #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) upstream_retry_budget: Duration,
 
     /// HTTPS upgrade mode.
-    #[serde(default = "default_https_upgrade_mode")]
     pub(crate) https_upgrade_mode: HttpsUpgradeMode,
 
     /// Size (in bytes) of buffer used for internal data transfer.
-    #[serde(
-        default = "default_buffer_size",
-        deserialize_with = "from_usize_with_magnitude"
-    )]
+    #[serde(deserialize_with = "from_usize_with_magnitude")]
     pub(crate) buffer_size: usize,
 
     /// Number of stored error and warning log messages.
-    #[serde(default = "default_logstore_capacity")]
     pub(crate) logstore_capacity: NonZero<usize>,
 
     /// Disk quota (in bytes) for cache.
-    #[serde(
-        default = "default_disk_quota",
-        deserialize_with = "from_nonzero_u64_with_magnitude"
-    )]
+    #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
     /// Minimum free disk space (in bytes) on the cache filesystem for the
     /// `/healthcheck` endpoint to report healthy. `None` (config value `0`)
     /// disables the check.
-    #[serde(
-        default = "default_min_disk_free",
-        deserialize_with = "from_nonzero_u64_with_magnitude"
-    )]
+    #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) min_disk_free: Option<NonZero<u64>>,
 
     /// Maximum size (in bytes) of a single upstream object that will be
     /// downloaded and cached. An upstream response declaring a larger
     /// Content-Length is rejected with 502 Bad Gateway before any bytes are
     /// stored. Set to `0` to disable the cap.
-    #[serde(
-        default = "default_max_object_size",
-        deserialize_with = "from_nonzero_u64_with_magnitude"
-    )]
+    #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) max_object_size: Option<NonZero<u64>>,
 
     /// Backstop retention time (in days) for files acquired "by-hash".
@@ -843,104 +784,75 @@ pub(crate) struct Config {
     /// applies as a fallback - when no current Release can be read for a
     /// by-hash directory, or for an on-disk digest type the Release does not
     /// list - so it rarely governs disk usage on a healthy mirror.
-    #[serde(default = "default_byhash_retention_days")]
     pub(crate) byhash_retention_days: NonZero<u64>,
 
     /// Retention time (in days) for usage logs.
-    #[serde(
-        default = "default_usage_retention_days",
-        deserialize_with = "from_nonzero_u64"
-    )]
+    #[serde(deserialize_with = "from_nonzero_u64")]
     pub(crate) usage_retention_days: Option<NonZero<u64>>,
 
     /// Mirror aliases.
-    #[serde(default = "default_aliases")]
     pub(crate) aliases: Vec<Alias>,
 
     /// List of allowed mirrors.
-    #[serde(default = "default_allowed_mirrors")]
     pub(crate) allowed_mirrors: Vec<ConfigDomainName>,
 
     /// List of mirrors supporting only http.
-    #[serde(default = "default_http_only_mirrors")]
     pub(crate) http_only_mirrors: Vec<ConfigDomainName>,
 
     /// List of clients permitted to use the proxy.
     /// Empty means all clients are allowed.
-    #[serde(default = "default_allowed_proxy_clients")]
     pub(crate) allowed_proxy_clients: Vec<IpNetOrAddr>,
 
     /// List of clients permitted to use the web-interface.
     /// Empty means all clients are allowed.
     /// None means setting is inherited from `allowed_proxy_clients`.
-    #[serde(default = "default_allowed_webif_clients")]
     pub(crate) allowed_webif_clients: Option<Vec<IpNetOrAddr>>,
 
     /// Whether https tunneling is enabled.
-    #[serde(default = "default_https_tunnel_enabled")]
     pub(crate) https_tunnel_enabled: bool,
 
     /// Allowed ports for https tunneling.
-    #[serde(default = "default_https_tunnel_allowed_ports")]
     pub(crate) https_tunnel_allowed_ports: Vec<NonZero<u16>>,
 
     /// Allowed mirrors for https tunneling.
-    #[serde(default = "default_https_tunnel_allowed_mirrors")]
     pub(crate) https_tunnel_allowed_mirrors: Vec<DomainName>,
 
     /// Maximum number of concurrent HTTPS tunnel connections per client IP.
     /// `None` means unlimited.
-    #[serde(
-        default = "default_https_tunnel_max_connections_per_client",
-        deserialize_with = "from_nonzero_usize"
-    )]
+    #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) https_tunnel_max_connections_per_client: Option<NonZero<usize>>,
 
     /// Maximum number of concurrent plain-HTTP connections accepted per source
     /// IP address. `None` means unlimited. Set to bound resource use against
     /// half-open connection floods on deployments exposed to less-trusted
     /// networks. Note: clients behind a NAT share a single IP for this cap.
-    #[serde(
-        default = "default_max_connections_per_client_ip",
-        deserialize_with = "from_nonzero_usize"
-    )]
+    #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) max_connections_per_client_ip: Option<NonZero<usize>>,
 
     /// Minimum transfer rate (in bytes per second) for downloads and uploads.
     /// Connections that fail to fulfill this limit are cancelled.
-    #[serde(
-        default = "default_min_download_rate",
-        deserialize_with = "from_nonzero_usize_with_magnitude"
-    )]
+    #[serde(deserialize_with = "from_nonzero_usize_with_magnitude")]
     pub(crate) min_download_rate: Option<NonZero<usize>>,
 
     /// Sliding window (in seconds) over which the minimum transfer rate is measured.
-    #[serde(default = "default_rate_check_timeframe")]
     pub(crate) rate_check_timeframe: NonZero<usize>,
 
     /// Maximum number of concurrent upstream downloads.
     /// `None` means unlimited.
-    #[serde(
-        default = "default_max_upstream_downloads",
-        deserialize_with = "from_nonzero_usize"
-    )]
+    #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) max_upstream_downloads: Option<NonZero<usize>>,
 
     /// Capacity of the internal database command channel.
-    #[serde(default = "default_db_channel_capacity")]
     pub(crate) db_channel_capacity: NonZero<usize>,
 
     /// Maximum number of pending database events buffered before a batch flush.
-    #[serde(default = "default_db_batch_flush_max_count")]
     pub(crate) db_batch_flush_max_count: NonZero<usize>,
 
     /// Interval (in seconds) between database batch flushes and mirror
     /// `last_seen` syncs.
-    #[serde(default = "default_db_batch_flush_interval_secs")]
     pub(crate) db_batch_flush_interval_secs: NonZero<u64>,
 
     /// Threshold (in bytes) for using memory-mapped files for large downloads.
-    #[serde(default = "default_mmap_threshold")]
     pub(crate) mmap_threshold: NonZero<u64>,
 
     /// Whether to pin the kTLS handshake buffers (which hold TLS secrets and
@@ -948,20 +860,17 @@ pub(crate) struct Config {
     /// swap. Disable in mlock-restricted environments (containers, tight
     /// `RLIMIT_MEMLOCK`). Zeroize-on-drop and core-dump exclusion stay
     /// active regardless.
-    #[serde(default = "default_ktls_memory_lock")]
     pub(crate) ktls_memory_lock: bool,
 
     /// Whether to set `TCP_NODELAY` on upstream sockets (hyper, splice, and
     /// CONNECT tunnels).  Mirror requests are typically a small header
     /// followed by a long body read; disabling Nagle's algorithm avoids the
     /// 40 ms ACK delay the kernel can otherwise add to every request.
-    #[serde(default = "default_upstream_tcp_nodelay")]
     pub(crate) upstream_tcp_nodelay: bool,
 
     /// Whether to reject differential (pdiff) resource requests with 410 Gone.
     /// When disabled, diff requests are proxied to the upstream mirror but not cached
     /// (while full resources are always cached).
-    #[serde(default = "default_reject_pdiff_requests")]
     pub(crate) reject_pdiff_requests: bool,
 
     /// Whether to verify the integrity of cached content against the
@@ -970,7 +879,6 @@ pub(crate) struct Config {
     /// Defence in depth: APT's client-side GPG check remains the root of
     /// trust. Verification reads each verifiable file back once before
     /// `rename`; the cost is one extra (page-cache-hot) full read.
-    #[serde(default = "default_verify_checksums")]
     pub(crate) verify_checksums: bool,
 
     /// Upper bound on the in-memory checksum registry (entries). The registry
@@ -978,7 +886,6 @@ pub(crate) struct Config {
     /// by parsing index files as they flow through. At the cap, the oldest
     /// entries are evicted in bulk. One full Debian `main`/amd64 `Packages` is
     /// ~64k entries.
-    #[serde(default = "default_verify_checksums_max_entries")]
     pub(crate) verify_checksums_max_entries: NonZero<usize>,
 
     /// Backoff window (in seconds) applied to a resource after its download
@@ -987,46 +894,91 @@ pub(crate) struct Config {
     /// consecutive failure up to `verify_checksums_throttle_cap`; a
     /// successfully verified download clears it. 0 disables the throttle.
     /// Only effective when `verify_checksums` is enabled.
-    #[serde(
-        default = "default_verify_checksums_throttle_base",
-        deserialize_with = "from_secs_f64"
-    )]
+    #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) verify_checksums_throttle_base: Duration,
 
     /// Upper bound (in seconds) on the exponential verification-failure
     /// backoff window.
-    #[serde(
-        default = "default_verify_checksums_throttle_cap",
-        deserialize_with = "from_secs_f64"
-    )]
+    #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) verify_checksums_throttle_cap: Duration,
 
-    #[serde(default = "default_experimental_parallel_hack_enabled")]
     pub(crate) experimental_parallel_hack_enabled: bool,
 
-    #[serde(
-        default = "default_experimental_parallel_hack_maxparallel",
-        deserialize_with = "from_nonzero_usize"
-    )]
+    #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) experimental_parallel_hack_maxparallel: Option<NonZero<usize>>,
 
-    #[serde(
-        default = "default_experimental_parallel_hack_statuscode",
-        deserialize_with = "statuscode_from_u32"
-    )]
+    #[serde(deserialize_with = "statuscode_from_u32")]
     pub(crate) experimental_parallel_hack_statuscode: StatusCode,
 
-    #[serde(default = "default_experimental_parallel_hack_retryafter")]
     pub(crate) experimental_parallel_hack_retryafter: u16,
 
-    #[serde(default = "default_experimental_parallel_hack_factor")]
     pub(crate) experimental_parallel_hack_factor: f64,
 
-    #[serde(
-        default = "default_experimental_parallel_hack_minsize",
-        deserialize_with = "from_nonzero_u64_with_magnitude"
-    )]
+    #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) experimental_parallel_hack_minsize: Option<NonZero<u64>>,
+
+    /// Top-level keys the TOML document spelled out, recorded by
+    /// [`Self::from_toml`] before deserialization. This is what
+    /// [`Self::is_set`] answers from; a value equal to its default is
+    /// indistinguishable from an absent key once deserialized.
+    #[serde(skip)]
+    present: HashSet<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            log_level: LevelFilter::INFO,
+            log_file: LogDestination::Console,
+            bind_addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            bind_port: nonzero!(3142),
+            database_path: PathBuf::from("/var/lib/apt-cacher-rs/apt-cacher-rs.db"),
+            cache_directory: PathBuf::from("/var/cache/apt-cacher-rs"),
+            database_slow_timeout: Duration::from_secs(2),
+            http_timeout: Duration::from_secs(10),
+            client_idle_timeout: Duration::from_mins(2),
+            upstream_retry_budget: Duration::from_secs(30),
+            https_upgrade_mode: HttpsUpgradeMode::Auto,
+            buffer_size: 32 * 1024, // 32 KiB
+            logstore_capacity: nonzero!(100),
+            disk_quota: None,
+            min_disk_free: Some(nonzero!(512 * 1024 * 1024)), // 512 MiB
+            max_object_size: Some(nonzero!(2 * 1024 * 1024 * 1024)), // 2 GiB
+            byhash_retention_days: nonzero!(90),
+            usage_retention_days: Some(nonzero!(30)),
+            aliases: Vec::new(),
+            allowed_mirrors: Vec::new(),
+            http_only_mirrors: Vec::new(),
+            allowed_proxy_clients: Vec::new(),
+            allowed_webif_clients: None,
+            https_tunnel_enabled: true,
+            https_tunnel_allowed_ports: vec![nonzero!(443)],
+            https_tunnel_allowed_mirrors: Vec::new(),
+            https_tunnel_max_connections_per_client: Some(nonzero!(10)),
+            max_connections_per_client_ip: None,
+            min_download_rate: Some(nonzero!(10000)), // 10 kB/s
+            rate_check_timeframe: DEFAULT_RATE_CHECK_TIMEFRAME,
+            max_upstream_downloads: Some(nonzero!(20)),
+            db_channel_capacity: nonzero!(128),
+            db_batch_flush_max_count: nonzero!(256),
+            db_batch_flush_interval_secs: nonzero!(15),
+            mmap_threshold: nonzero!(1024 * 1024), // 1 MiB
+            ktls_memory_lock: true,
+            upstream_tcp_nodelay: true,
+            reject_pdiff_requests: true,
+            verify_checksums: true,
+            verify_checksums_max_entries: nonzero!(500_000),
+            verify_checksums_throttle_base: Duration::from_secs(30),
+            verify_checksums_throttle_cap: Duration::from_hours(1),
+            experimental_parallel_hack_enabled: false,
+            experimental_parallel_hack_maxparallel: Some(nonzero!(3)),
+            experimental_parallel_hack_statuscode: StatusCode::TOO_MANY_REQUESTS,
+            experimental_parallel_hack_retryafter: 5,
+            experimental_parallel_hack_factor: 0.2,
+            experimental_parallel_hack_minsize: Some(nonzero!(10 * 1024 * 1024)), // 10 MiB
+            present: HashSet::new(),
+        }
+    }
 }
 
 fn from_level_name<'de, D>(deserializer: D) -> Result<LevelFilter, D::Error>
@@ -1165,198 +1117,6 @@ where
     let u: u64 = Deserialize::deserialize(deserializer)?;
 
     Ok(NonZero::new(u))
-}
-
-const fn default_log_level() -> LevelFilter {
-    DEFAULT_LOG_LEVEL
-}
-
-fn default_log_file() -> LogDestination {
-    DEFAULT_LOG_DESTINATION
-}
-
-const fn default_bind_addr() -> IpAddr {
-    DEFAULT_BIND_ADDRESS
-}
-
-const fn default_bind_port() -> NonZero<u16> {
-    DEFAULT_BIND_PORT
-}
-
-fn default_database_path() -> PathBuf {
-    PathBuf::from(DEFAULT_DATABASE_PATH)
-}
-
-fn default_cache_dir() -> PathBuf {
-    PathBuf::from(DEFAULT_CACHE_DIR)
-}
-
-const fn default_db_slow_timeout() -> Duration {
-    DEFAULT_DATABASE_SLOW_TIMEOUT
-}
-
-const fn default_http_timeout() -> Duration {
-    DEFAULT_HTTP_TIMEOUT
-}
-
-const fn default_client_idle_timeout() -> Duration {
-    DEFAULT_CLIENT_IDLE_TIMEOUT
-}
-
-const fn default_upstream_retry_budget() -> Duration {
-    DEFAULT_UPSTREAM_RETRY_BUDGET
-}
-
-const fn default_https_upgrade_mode() -> HttpsUpgradeMode {
-    DEFAULT_HTTPS_UPGRADE_MODE
-}
-
-const fn default_buffer_size() -> usize {
-    DEFAULT_BUF_SIZE
-}
-
-const fn default_aliases() -> Vec<Alias> {
-    Vec::new()
-}
-
-const fn default_allowed_proxy_clients() -> Vec<IpNetOrAddr> {
-    Vec::new()
-}
-
-const fn default_allowed_webif_clients() -> Option<Vec<IpNetOrAddr>> {
-    None
-}
-
-const fn default_allowed_mirrors() -> Vec<ConfigDomainName> {
-    Vec::new()
-}
-
-const fn default_http_only_mirrors() -> Vec<ConfigDomainName> {
-    Vec::new()
-}
-
-const fn default_disk_quota() -> Option<NonZero<u64>> {
-    DEFAULT_DISK_QUOTA
-}
-
-const fn default_min_disk_free() -> Option<NonZero<u64>> {
-    DEFAULT_MIN_DISK_FREE
-}
-
-const fn default_https_tunnel_enabled() -> bool {
-    DEFAULT_HTTPS_TUNNEL_ENABLED
-}
-
-fn default_https_tunnel_allowed_ports() -> Vec<NonZero<u16>> {
-    DEFAULT_HTTPS_TUNNEL_ALLOWED_PORTS.to_vec()
-}
-
-const fn default_https_tunnel_allowed_mirrors() -> Vec<DomainName> {
-    Vec::new()
-}
-
-const fn default_https_tunnel_max_connections_per_client() -> Option<NonZero<usize>> {
-    DEFAULT_HTTPS_TUNNEL_MAX_CONNECTIONS_PER_CLIENT
-}
-
-const fn default_max_connections_per_client_ip() -> Option<NonZero<usize>> {
-    DEFAULT_MAX_CONNECTIONS_PER_CLIENT_IP
-}
-
-const fn default_byhash_retention_days() -> NonZero<u64> {
-    DEFAULT_BYHASH_RETENTION_DAYS
-}
-
-const fn default_usage_retention_days() -> Option<NonZero<u64>> {
-    DEFAULT_USAGE_RETENTION_DAYS
-}
-
-const fn default_reject_pdiff_requests() -> bool {
-    DEFAULT_REJECT_PDIFF_REQUESTS
-}
-
-const fn default_verify_checksums() -> bool {
-    DEFAULT_VERIFY_CHECKSUMS
-}
-
-const fn default_verify_checksums_max_entries() -> NonZero<usize> {
-    DEFAULT_VERIFY_CHECKSUMS_MAX_ENTRIES
-}
-
-const fn default_verify_checksums_throttle_base() -> Duration {
-    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_BASE
-}
-
-const fn default_verify_checksums_throttle_cap() -> Duration {
-    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_CAP
-}
-
-const fn default_logstore_capacity() -> NonZero<usize> {
-    DEFAULT_LOGSTORE_CAPACITY
-}
-
-const fn default_min_download_rate() -> Option<NonZero<usize>> {
-    DEFAULT_MIN_DOWNLOAD_RATE
-}
-
-const fn default_rate_check_timeframe() -> NonZero<usize> {
-    DEFAULT_RATE_CHECK_TIMEFRAME
-}
-
-const fn default_max_upstream_downloads() -> Option<NonZero<usize>> {
-    DEFAULT_MAX_UPSTREAM_DOWNLOADS
-}
-
-const fn default_db_channel_capacity() -> NonZero<usize> {
-    DEFAULT_DB_CHANNEL_CAPACITY
-}
-
-const fn default_db_batch_flush_max_count() -> NonZero<usize> {
-    DEFAULT_DB_BATCH_FLUSH_MAX_COUNT
-}
-
-const fn default_db_batch_flush_interval_secs() -> NonZero<u64> {
-    DEFAULT_DB_BATCH_FLUSH_INTERVAL_SECS
-}
-
-const fn default_mmap_threshold() -> NonZero<u64> {
-    DEFAULT_MMAP_THRESHOLD
-}
-
-const fn default_ktls_memory_lock() -> bool {
-    DEFAULT_KTLS_MEMORY_LOCK
-}
-
-const fn default_max_object_size() -> Option<NonZero<u64>> {
-    DEFAULT_MAX_OBJECT_SIZE
-}
-
-const fn default_upstream_tcp_nodelay() -> bool {
-    DEFAULT_UPSTREAM_TCP_NODELAY
-}
-
-const fn default_experimental_parallel_hack_enabled() -> bool {
-    DEFAULT_EXPERIMENTAL_PARALLEL_HACK_ENABLED
-}
-
-const fn default_experimental_parallel_hack_maxparallel() -> Option<NonZero<usize>> {
-    DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MAXPARALLEL
-}
-
-const fn default_experimental_parallel_hack_statuscode() -> StatusCode {
-    DEFAULT_EXPERIMENTAL_PARALLEL_HACK_STATUSCODE
-}
-
-const fn default_experimental_parallel_hack_retryafter() -> u16 {
-    DEFAULT_EXPERIMENTAL_PARALLEL_HACK_RETRYAFTER
-}
-
-const fn default_experimental_parallel_hack_factor() -> f64 {
-    DEFAULT_EXPERIMENTAL_PARALLEL_HACK_FACTOR
-}
-
-const fn default_experimental_parallel_hack_minsize() -> Option<NonZero<u64>> {
-    DEFAULT_EXPERIMENTAL_PARALLEL_HACK_MINSIZE
 }
 
 #[must_use]
@@ -1508,17 +1268,14 @@ impl Config {
     ) -> Result<(Self, bool, Vec<String>), ConfigError> {
         let (mut config, fallback) = match std::fs::read_to_string(file) {
             Ok(content) => (
-                toml::from_str::<Self>(&content).map_err(ConfigError::Parse)?,
+                Self::from_toml(&content).map_err(ConfigError::Parse)?,
                 false,
             ),
             Err(err)
                 if err.kind() == std::io::ErrorKind::NotFound
                     && file == Path::new(DEFAULT_CONFIGURATION_PATH) =>
             {
-                (
-                    toml::from_str::<Self>("").expect("built-in defaults must parse"),
-                    true,
-                )
+                (Self::default(), true)
             }
             Err(err) => {
                 return Err(ConfigError::Read {
@@ -1541,6 +1298,30 @@ impl Config {
         let warnings = config.validate()?;
 
         Ok((config, fallback, warnings))
+    }
+
+    /// Parse a TOML document, recording which top-level keys it spells out
+    /// (see [`Self::is_set`]) before deserializing it.
+    ///
+    /// Parses to a spanned table first so unknown-key and type errors keep
+    /// their line/column information.
+    fn from_toml(content: &str) -> Result<Self, toml::de::Error> {
+        let table = toml::de::DeTable::parse(content)?;
+        let present = table
+            .get_ref()
+            .keys()
+            .map(|key| key.get_ref().to_string())
+            .collect();
+        let mut config = Self::deserialize(toml::de::Deserializer::from(table))?;
+        config.present = present;
+        Ok(config)
+    }
+
+    /// Whether the configuration file spelled out `key` as a top-level entry,
+    /// regardless of the value it assigned. `false` for built-in defaults and
+    /// CLI overrides.
+    fn is_set(&self, key: &str) -> bool {
+        self.present.contains(key)
     }
 
     fn apply_bind(&mut self, bind: BindOverride) {
@@ -1804,32 +1585,18 @@ impl Config {
             }
         }
 
-        if !self.https_tunnel_enabled
-            && self.https_tunnel_allowed_ports != default_https_tunnel_allowed_ports()
-        {
-            warnings.push(
-                "https_tunnel_allowed_ports is set but has no effect while https_tunnel_enabled is false"
-                    .to_string(),
-            );
-        }
-
-        if !self.https_tunnel_enabled
-            && self.https_tunnel_allowed_mirrors != default_https_tunnel_allowed_mirrors()
-        {
-            warnings.push(
-                "https_tunnel_allowed_mirrors is set but has no effect while https_tunnel_enabled is false"
-                    .to_string(),
-            );
-        }
-
-        if !self.https_tunnel_enabled
-            && self.https_tunnel_max_connections_per_client
-                != default_https_tunnel_max_connections_per_client()
-        {
-            warnings.push(
-                "https_tunnel_max_connections_per_client is set but has no effect while https_tunnel_enabled is false"
-                    .to_string(),
-            );
+        if !self.https_tunnel_enabled {
+            for key in [
+                "https_tunnel_allowed_ports",
+                "https_tunnel_allowed_mirrors",
+                "https_tunnel_max_connections_per_client",
+            ] {
+                if self.is_set(key) {
+                    warnings.push(format!(
+                        "{key} is set but has no effect while https_tunnel_enabled is false"
+                    ));
+                }
+            }
         }
 
         if self.https_upgrade_mode == HttpsUpgradeMode::Never && !self.https_tunnel_enabled {
@@ -1856,8 +1623,11 @@ impl Config {
             }
         }
 
+        // Deliberately a value comparison, not `is_set`: this is a hard
+        // error, and spelling out the default (`rate_check_timeframe = 30`)
+        // next to a disabled `min_download_rate` must keep starting the daemon.
         if self.min_download_rate.is_none()
-            && self.rate_check_timeframe != default_rate_check_timeframe()
+            && self.rate_check_timeframe != DEFAULT_RATE_CHECK_TIMEFRAME
         {
             invalid!(
                 "rate_check_timeframe is set to {}s but min_download_rate is disabled",
@@ -1880,7 +1650,7 @@ impl Config {
         }
 
         #[cfg(not(feature = "mmap"))]
-        if self.mmap_threshold != DEFAULT_MMAP_THRESHOLD {
+        if self.is_set("mmap_threshold") {
             warnings.push(format!(
                 "mmap_threshold is set to {} but mmap feature is not enabled",
                 self.mmap_threshold
@@ -1888,23 +1658,20 @@ impl Config {
         }
 
         #[cfg(not(feature = "ktls"))]
-        if !self.ktls_memory_lock {
-            warnings
-                .push("ktls_memory_lock is disabled but ktls feature is not enabled".to_owned());
+        if self.is_set("ktls_memory_lock") {
+            warnings.push("ktls_memory_lock is set but ktls feature is not enabled".to_owned());
         }
 
-        #[expect(clippy::float_cmp, reason = "compare against default value")]
         if !self.experimental_parallel_hack_enabled
-            && (self.experimental_parallel_hack_maxparallel
-                != default_experimental_parallel_hack_maxparallel()
-                || self.experimental_parallel_hack_statuscode
-                    != default_experimental_parallel_hack_statuscode()
-                || self.experimental_parallel_hack_retryafter
-                    != default_experimental_parallel_hack_retryafter()
-                || self.experimental_parallel_hack_factor
-                    != default_experimental_parallel_hack_factor()
-                || self.experimental_parallel_hack_minsize
-                    != default_experimental_parallel_hack_minsize())
+            && [
+                "experimental_parallel_hack_maxparallel",
+                "experimental_parallel_hack_statuscode",
+                "experimental_parallel_hack_retryafter",
+                "experimental_parallel_hack_factor",
+                "experimental_parallel_hack_minsize",
+            ]
+            .into_iter()
+            .any(|key| self.is_set(key))
         {
             warnings.push(
                 "experimental_parallel_hack options are set but experimental_parallel_hack_enabled is false".to_string(),
@@ -1957,19 +1724,17 @@ impl Config {
 
         if !self.verify_checksums {
             // An explicit 0 means deliberately disabled -- no warning.
-            for (name, value, default) in [
+            for (name, value) in [
                 (
                     "verify_checksums_throttle_base",
                     self.verify_checksums_throttle_base,
-                    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_BASE,
                 ),
                 (
                     "verify_checksums_throttle_cap",
                     self.verify_checksums_throttle_cap,
-                    DEFAULT_VERIFY_CHECKSUMS_THROTTLE_CAP,
                 ),
             ] {
-                if value != default && !value.is_zero() {
+                if self.is_set(name) && !value.is_zero() {
                     warnings.push(format!(
                         "{name} ({}s) has no effect while verify_checksums is disabled",
                         value.as_secs_f64()
@@ -2137,16 +1902,16 @@ mod test {
 
     #[test]
     fn test_bind_override_applied() {
-        let base = || toml::from_str::<Config>("").expect("built-in defaults must parse");
+        let base = Config::default;
 
         let mut config = base();
         config.apply_bind(bind("127.0.0.1"));
         assert_eq!(config.bind_addr, IpAddr::from(Ipv4Addr::LOCALHOST));
-        assert_eq!(config.bind_port, DEFAULT_BIND_PORT);
+        assert_eq!(config.bind_port, nonzero!(3142_u16));
 
         let mut config = base();
         config.apply_bind(bind(":3143"));
-        assert_eq!(config.bind_addr, DEFAULT_BIND_ADDRESS);
+        assert_eq!(config.bind_addr, IpAddr::from(Ipv6Addr::UNSPECIFIED));
         assert_eq!(config.bind_port, nonzero!(3143_u16));
 
         let mut config = base();
@@ -2495,27 +2260,27 @@ mod test {
 
     #[test]
     fn verify_checksums_defaults_on() {
-        let cfg: Config = toml::from_str("").expect("empty config parses");
+        let cfg = Config::from_toml("").expect("empty config parses");
         assert!(cfg.verify_checksums);
         assert_eq!(cfg.verify_checksums_max_entries.get(), 500_000);
     }
 
     #[test]
     fn verify_checksums_can_be_disabled() {
-        let cfg: Config = toml::from_str("verify_checksums = false").expect("config parses");
+        let cfg = Config::from_toml("verify_checksums = false").expect("config parses");
         assert!(!cfg.verify_checksums);
     }
 
     #[test]
     fn verify_throttle_defaults() {
-        let cfg: Config = toml::from_str("").expect("empty config parses");
+        let cfg = Config::from_toml("").expect("empty config parses");
         assert_eq!(cfg.verify_checksums_throttle_base, Duration::from_secs(30));
         assert_eq!(cfg.verify_checksums_throttle_cap, Duration::from_hours(1));
     }
 
     #[test]
     fn verify_throttle_overrides_parse() {
-        let cfg: Config = toml::from_str(
+        let cfg = Config::from_toml(
             "verify_checksums_throttle_base = 0.5\nverify_checksums_throttle_cap = 60",
         )
         .expect("config parses");
@@ -2528,7 +2293,7 @@ mod test {
 
     #[test]
     fn verify_throttle_cap_below_base_warns() {
-        let mut cfg: Config = toml::from_str(
+        let mut cfg = Config::from_toml(
             "verify_checksums_throttle_base = 60\nverify_checksums_throttle_cap = 30",
         )
         .expect("config parses");
@@ -2543,7 +2308,7 @@ mod test {
 
     #[test]
     fn verify_throttle_set_while_verify_off_warns() {
-        let mut cfg: Config = toml::from_str(
+        let mut cfg = Config::from_toml(
             "verify_checksums = false\nverify_checksums_throttle_base = 60\nverify_checksums_throttle_cap = 120",
         )
         .expect("config parses");
@@ -2559,13 +2324,31 @@ mod test {
     }
 
     #[test]
-    fn verify_throttle_defaults_or_zero_while_verify_off_do_not_warn() {
+    fn verify_throttle_explicit_defaults_while_verify_off_warn() {
+        // Presence, not value, decides: spelling out the default values is
+        // still "set" and still has no effect.
+        let mut cfg = Config::from_toml(
+            "verify_checksums = false\nverify_checksums_throttle_base = 30\nverify_checksums_throttle_cap = 3600",
+        )
+        .expect("config parses");
+        let warnings = cfg.validate().expect("config validates");
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("has no effect while verify_checksums is disabled"))
+                .count(),
+            2,
+            "expected warnings for both throttle options, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn verify_throttle_unset_or_zero_while_verify_off_do_not_warn() {
         for toml_input in [
             "verify_checksums = false",
             "verify_checksums = false\nverify_checksums_throttle_base = 0\nverify_checksums_throttle_cap = 0",
-            "verify_checksums = false\nverify_checksums_throttle_base = 30\nverify_checksums_throttle_cap = 3600",
         ] {
-            let mut cfg: Config = toml::from_str(toml_input).expect("config parses");
+            let mut cfg = Config::from_toml(toml_input).expect("config parses");
             let warnings = cfg.validate().expect("config validates");
             assert!(
                 !warnings
@@ -2574,5 +2357,157 @@ mod test {
                 "unexpected warning for `{toml_input}`: {warnings:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Defaults and key presence
+    // -----------------------------------------------------------------
+
+    fn warnings_for(toml_input: &str) -> Vec<String> {
+        let mut cfg = Config::from_toml(toml_input).expect("config parses");
+        cfg.validate().expect("config validates")
+    }
+
+    #[test]
+    fn default_equals_empty_document() {
+        // Struct-level `#[serde(default)]` makes the empty document and
+        // `Default` the same value; the built-in fallback in `Config::new`
+        // relies on that.
+        let parsed = Config::from_toml("").expect("empty config parses");
+        assert_eq!(parsed, Config::default());
+        assert!(parsed.present.is_empty());
+
+        let warnings = Config::default().validate().expect("defaults validate");
+        assert!(warnings.is_empty(), "defaults must not warn: {warnings:?}");
+    }
+
+    #[test]
+    fn is_set_records_top_level_keys_regardless_of_value() {
+        let cfg = Config::from_toml(
+            "bind_port = 3142\nhttps_tunnel_enabled = true\naliases = []\n[[unused_table]]",
+        )
+        .expect_err("unknown table is rejected");
+        assert!(
+            cfg.to_string().contains("unused_table"),
+            "unknown-key error names the key: {cfg}"
+        );
+
+        let cfg = Config::from_toml("bind_port = 3142\nhttps_tunnel_enabled = true\naliases = []")
+            .expect("config parses");
+        assert!(cfg.is_set("bind_port"));
+        assert!(cfg.is_set("https_tunnel_enabled"));
+        assert!(cfg.is_set("aliases"));
+        assert!(!cfg.is_set("bind_addr"));
+        assert!(!cfg.is_set("mmap_threshold"));
+        assert!(!Config::default().is_set("bind_port"));
+    }
+
+    #[test]
+    fn https_tunnel_options_explicit_defaults_while_disabled_warn() {
+        let warnings = warnings_for(
+            "https_tunnel_enabled = false\n\
+             https_tunnel_allowed_ports = [443]\n\
+             https_tunnel_allowed_mirrors = []\n\
+             https_tunnel_max_connections_per_client = 10",
+        );
+        for key in [
+            "https_tunnel_allowed_ports",
+            "https_tunnel_allowed_mirrors",
+            "https_tunnel_max_connections_per_client",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w
+                    == &format!(
+                        "{key} is set but has no effect while https_tunnel_enabled is false"
+                    )),
+                "expected no-effect warning for {key}, got: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn https_tunnel_options_unset_or_enabled_do_not_warn() {
+        for toml_input in [
+            "https_tunnel_enabled = false",
+            "https_tunnel_enabled = true\nhttps_tunnel_allowed_ports = [443]\nhttps_tunnel_max_connections_per_client = 10",
+        ] {
+            let warnings = warnings_for(toml_input);
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| w.contains("has no effect while https_tunnel_enabled is false")),
+                "unexpected warning for `{toml_input}`: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_hack_options_explicit_defaults_while_disabled_warn() {
+        const NEEDLE: &str = "experimental_parallel_hack options are set but experimental_parallel_hack_enabled is false";
+        for line in [
+            "experimental_parallel_hack_maxparallel = 3",
+            "experimental_parallel_hack_statuscode = 429",
+            "experimental_parallel_hack_retryafter = 5",
+            "experimental_parallel_hack_factor = 0.2",
+            "experimental_parallel_hack_minsize = '10Mi'",
+        ] {
+            let warnings = warnings_for(line);
+            assert!(
+                warnings.iter().any(|w| w == NEEDLE),
+                "expected no-effect warning for `{line}`, got: {warnings:?}"
+            );
+        }
+
+        for toml_input in [
+            "",
+            "experimental_parallel_hack_enabled = false",
+            "experimental_parallel_hack_enabled = true\nexperimental_parallel_hack_maxparallel = 3",
+        ] {
+            let warnings = warnings_for(toml_input);
+            assert!(
+                !warnings.iter().any(|w| w == NEEDLE),
+                "unexpected warning for `{toml_input}`: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mmap_threshold_set_warns_only_without_mmap_feature() {
+        let warnings = warnings_for("mmap_threshold = 1048576");
+        let warned = warnings
+            .iter()
+            .any(|w| w == "mmap_threshold is set to 1048576 but mmap feature is not enabled");
+        assert_eq!(
+            warned,
+            !cfg!(feature = "mmap"),
+            "mmap_threshold warning must track the mmap feature: {warnings:?}"
+        );
+        assert!(
+            !warnings_for("")
+                .iter()
+                .any(|w| w.contains("mmap feature is not enabled")),
+            "unset mmap_threshold must not warn"
+        );
+    }
+
+    #[test]
+    fn ktls_memory_lock_set_warns_only_without_ktls_feature() {
+        for line in ["ktls_memory_lock = true", "ktls_memory_lock = false"] {
+            let warnings = warnings_for(line);
+            let warned = warnings
+                .iter()
+                .any(|w| w == "ktls_memory_lock is set but ktls feature is not enabled");
+            assert_eq!(
+                warned,
+                !cfg!(feature = "ktls"),
+                "ktls_memory_lock warning must track the ktls feature for `{line}`: {warnings:?}"
+            );
+        }
+        assert!(
+            !warnings_for("")
+                .iter()
+                .any(|w| w.contains("ktls feature is not enabled")),
+            "unset ktls_memory_lock must not warn"
+        );
     }
 }
