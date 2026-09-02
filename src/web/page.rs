@@ -309,6 +309,7 @@ h3 { color: var(--h-fg); margin-bottom: 6px; border-bottom: 2px solid var(--h-ac
      padding-bottom: 4px; font-size: 0.95em; }
 .tablewrap { overflow-x: auto; max-width: 100%; }
 table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+table td, table th { font-variant-numeric: tabular-nums; }
 table.details { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
                 width: 100%; }
 table.details thead { display: none; }
@@ -328,7 +329,7 @@ footer hr { border: none; border-top: 1px solid var(--nav-border); margin-bottom
 p { margin: 4px 0; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 h4.mini { font-size: 0.85em; margin: 4px 0; }
-pre.log { white-space: pre-wrap; word-break: break-all; font-size: 0.85em;
+pre.log { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.85em;
           max-height: 80vh; overflow-y: auto; }
 
 @media (prefers-reduced-motion: reduce) {
