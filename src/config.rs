@@ -1600,7 +1600,13 @@ impl Config {
             }
         }
 
-        if self.https_tunnel_enabled && self.https_tunnel_allowed_mirrors.is_empty() {
+        // Only when the operator configured tunneling explicitly: the stock
+        // defaults (enabled, empty list) must start without a warning, and
+        // every refused CONNECT logs its reason on its own.
+        if self.https_tunnel_enabled
+            && self.https_tunnel_allowed_mirrors.is_empty()
+            && (self.is_set("https_tunnel_enabled") || self.is_set("https_tunnel_allowed_ports"))
+        {
             warnings.push(
                 "https_tunnel_enabled is true but https_tunnel_allowed_mirrors is empty; every CONNECT request will be refused (list the tunnel targets, or disable https_tunnel_enabled)"
                     .to_string(),
