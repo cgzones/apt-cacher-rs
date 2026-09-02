@@ -36,6 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-hack
+      - uses: taiki-e/install-action@nextest
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
@@ -47,7 +48,7 @@ jobs:
         run: cargo hack $HACK clippy --all-targets --locked -- -D warnings -D clippy::pedantic
 
       - name: Test
-        run: cargo hack $HACK test --locked
+        run: cargo hack $HACK nextest run --all-targets --locked
 
       # Over the powerset, not one config: an intra-doc link to a cfg-gated
       # item resolves in the build that compiles it and dangles in the others.
