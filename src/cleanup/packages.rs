@@ -14,7 +14,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     AppState, ClientInfo, Never, ProxyCacheBody,
-    cache_layout::{CacheLayout, CachedFlavor, ConnectionDetails, ResourceKind, dists_debname},
+    cache_layout::{CacheLayout, ConnectionDetails, ResourceKind, dists_debname},
     config::Config,
     deb_mirror::Mirror,
     error::{ErrorReport, ProxyCacheError, UpstreamFetchError},
@@ -409,9 +409,12 @@ pub(super) async fn reduce_file_list(
     }
 }
 
-/// The only two cache layouts that can host a `Packages` index. Replaces
-/// passing the full `CacheLayout` into the fetcher, which forced three
-/// unreachable match arms.
+/// The only two resource kinds that can be a `Packages` index. A two-variant
+/// projection onto [`ResourceKind`] rather than the kind itself, so a fetch
+/// plan cannot name a `Pool` or `ByHash` kind; the cache layout of the
+/// fetched index derives from the kind through [`ResourceKind::layout`], the
+/// same table the serve path uses, so cleanup cannot cache an index under a
+/// tree the serve path never reads.
 #[derive(Clone, Copy)]
 pub(super) enum PackagesLayout {
     Dists,
@@ -419,14 +422,7 @@ pub(super) enum PackagesLayout {
 }
 
 impl PackagesLayout {
-    pub(super) fn cache_layout(self) -> CacheLayout {
-        match self {
-            Self::Dists => CacheLayout::Dists,
-            Self::Flat => CacheLayout::Flat,
-        }
-    }
-
-    pub(super) fn resource_kind(self) -> ResourceKind {
+    pub(super) const fn resource_kind(self) -> ResourceKind {
         match self {
             Self::Dists => ResourceKind::Packages,
             Self::Flat => ResourceKind::FlatMetadata,
@@ -546,8 +542,6 @@ pub(super) async fn try_fetch_packages_file(
             mirror: mirror.clone(),
             aliased_host: None,
             debname: debname.cache_name(pkgfmt),
-            cached_flavor: CachedFlavor::Volatile,
-            layout: layout.cache_layout(),
             resource_kind,
         };
 
@@ -655,15 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn packages_layout_maps_cache_layout_and_resource_kind() {
-        assert!(matches!(
-            PackagesLayout::Dists.cache_layout(),
-            CacheLayout::Dists
-        ));
-        assert!(matches!(
-            PackagesLayout::Flat.cache_layout(),
-            CacheLayout::Flat
-        ));
+    fn packages_layout_maps_resource_kind_and_derives_its_layout() {
         assert!(matches!(
             PackagesLayout::Dists.resource_kind(),
             ResourceKind::Packages
@@ -671,6 +657,16 @@ mod tests {
         assert!(matches!(
             PackagesLayout::Flat.resource_kind(),
             ResourceKind::FlatMetadata
+        ));
+        // The index is cached under the layout the serve path derives for the
+        // same kind: `Dists` for a structured index, the flat tree otherwise.
+        assert!(matches!(
+            PackagesLayout::Dists.resource_kind().layout(),
+            CacheLayout::Dists
+        ));
+        assert!(matches!(
+            PackagesLayout::Flat.resource_kind().layout(),
+            CacheLayout::Flat
         ));
     }
 

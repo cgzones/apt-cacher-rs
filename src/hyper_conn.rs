@@ -1007,7 +1007,7 @@ async fn serve_volatile_file(
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     debug_assert_eq!(
-        conn_details.cached_flavor,
+        conn_details.cached_flavor(),
         CachedFlavor::Volatile,
         "serve_volatile_file() assumes volatile flavor"
     );
@@ -1354,7 +1354,7 @@ async fn download_file(
 
     let elapsed = start.elapsed();
     let in_time = conn_details.request_received_at.elapsed();
-    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+    let volatile = if conn_details.cached_flavor() == CachedFlavor::Volatile {
         "volatile "
     } else {
         ""
@@ -1655,7 +1655,7 @@ async fn serve_new_file(
         expected_total: resume_expected_total,
         if_range: resume_if_range,
         mut partial,
-    } = if conn_details.cached_flavor == CachedFlavor::Permanent
+    } = if conn_details.cached_flavor() == CachedFlavor::Permanent
         && matches!(cfstate, CacheFileStat::New)
     {
         match utils::prepare_partial_resume(
@@ -1799,7 +1799,7 @@ async fn serve_new_file(
     let plan = match plan_download(
         &head,
         ResumeState::new(resume_offset, resume_expected_total),
-        conn_details.cached_flavor,
+        conn_details.cached_flavor(),
         cached,
         config.max_object_size,
     ) {
@@ -1844,7 +1844,7 @@ async fn serve_new_file(
             // A resume never revalidates: there is no cached copy to serve.
             plan_fresh_download(
                 &head,
-                conn_details.cached_flavor,
+                conn_details.cached_flavor(),
                 None,
                 config.max_object_size,
             )
@@ -2185,7 +2185,7 @@ async fn serve_new_file(
         });
     }
 
-    if conn_details.cached_flavor != CachedFlavor::Volatile
+    if conn_details.cached_flavor() != CachedFlavor::Volatile
         && config.experimental_parallel_hack_enabled
     {
         let curr_downloads = appstate.active_downloads.download_count();
@@ -2317,19 +2317,19 @@ pub(crate) async fn process_cache_request(
         Ok(file) => {
             // CACHE_HITS only counts permanent-file hits; volatile hits live
             // in VOLATILE_HIT / VOLATILE_REFETCHED.
-            if conn_details.cached_flavor == CachedFlavor::Permanent {
+            if conn_details.cached_flavor() == CachedFlavor::Permanent {
                 metrics::CACHE_HITS.increment();
             }
 
             trace!(
                 "File {} found, serving {} version...",
                 cache_path.display(),
-                match conn_details.cached_flavor {
+                match conn_details.cached_flavor() {
                     CachedFlavor::Permanent => "permanent",
                     CachedFlavor::Volatile => "volatile",
                 }
             );
-            match conn_details.cached_flavor {
+            match conn_details.cached_flavor() {
                 CachedFlavor::Volatile => {
                     serve_volatile_file(conn_details, req, file, cache_path, appstate).await
                 }
@@ -2339,7 +2339,7 @@ pub(crate) async fn process_cache_request(
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            match conn_details.cached_flavor {
+            match conn_details.cached_flavor() {
                 CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
                 CachedFlavor::Volatile => {
                     // Cleanup-synthetic probes are operator bookkeeping, not
@@ -2654,8 +2654,6 @@ async fn pre_process_client_request(
                             mirror: plan.mirror,
                             aliased_host: plan.aliased_host,
                             debname: plan.debname,
-                            cached_flavor: plan.cached_flavor,
-                            layout: plan.layout,
                             resource_kind: plan.resource_kind,
                         };
                         return process_cache_request(conn_details, req, appstate).await;

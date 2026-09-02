@@ -136,13 +136,16 @@ pub(crate) enum CachedFlavor {
 }
 
 /// Owned discriminator for the [`crate::deb_mirror::ResourceFile`] variant a
-/// request classified to.  [`RequestClass`] flattens a resource into
-/// `(cached_flavor, layout)`, which cannot tell `Packages` apart from other
-/// `Dists`/`Volatile` metadata; integrity needs the precise kind both to pick
-/// a verification strategy and to decide whether to ingest the file as an
-/// index.  Populated by [`classify_request`]'s exhaustive match, so a new
-/// `ResourceFile` variant compile-errors the classifier (the existing safety
-/// net) and forces a decision here too.
+/// request classified to, and the single truth table behind a resource's
+/// [`CachedFlavor`] and [`CacheLayout`] ([`Self::cached_flavor`] /
+/// [`Self::layout`]).  Nothing stores those two alongside the kind: every
+/// consumer derives them, so a kind whose layout disagrees with its flavor is
+/// unrepresentable.  The precise kind is still needed on its own - integrity
+/// picks a verification strategy by it and decides whether to ingest the file
+/// as an index, which `(flavor, layout)` cannot tell (`Packages` vs any other
+/// `Dists`/`Volatile` metadata).  Populated by [`classify_request`]'s
+/// exhaustive match, so a new `ResourceFile` variant compile-errors the
+/// classifier (the existing safety net) and forces a decision here too.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResourceKind {
     /// Structured `pool/...` `.deb`/`.udeb`/`.ddeb`.
@@ -167,6 +170,46 @@ pub(crate) enum ResourceKind {
     FlatPool,
     /// Flat-repository content-addressed `by-hash/SHA*/<hex>`.
     FlatByHash,
+}
+
+impl ResourceKind {
+    /// Whether this kind is refresh-checked metadata or content that never
+    /// changes under its name.  `Release`-family files and every index are
+    /// `Volatile`; pool packages and content-addressed by-hash blobs are
+    /// `Permanent`.
+    #[must_use]
+    pub(crate) const fn cached_flavor(self) -> CachedFlavor {
+        match self {
+            Self::Pool | Self::ByHash | Self::FlatPool | Self::FlatByHash => {
+                CachedFlavor::Permanent
+            }
+            Self::Release
+            | Self::ComponentRelease
+            | Self::Packages
+            | Self::Sources
+            | Self::Translation
+            | Self::Icon
+            | Self::FlatMetadata => CachedFlavor::Volatile,
+        }
+    }
+
+    /// The on-disk tree this kind is cached under (see the module-level
+    /// per-variant table).
+    #[must_use]
+    pub(crate) const fn layout(self) -> CacheLayout {
+        match self {
+            Self::Pool => CacheLayout::StructuredPool,
+            Self::Release
+            | Self::ComponentRelease
+            | Self::Packages
+            | Self::Sources
+            | Self::Translation
+            | Self::Icon => CacheLayout::Dists,
+            Self::ByHash => CacheLayout::DistsByHash,
+            Self::FlatMetadata | Self::FlatPool => CacheLayout::Flat,
+            Self::FlatByHash => CacheLayout::FlatByHash,
+        }
+    }
 }
 
 /// On-disk cache layout for a request.  Doubles as the discriminator on
@@ -365,16 +408,28 @@ pub(crate) struct ConnectionDetails {
     pub(crate) mirror: Mirror,
     pub(crate) aliased_host: Option<&'static CacheHost>,
     pub(crate) debname: String,
-    pub(crate) cached_flavor: CachedFlavor,
-    pub(crate) layout: CacheLayout,
+    /// The classified kind; [`Self::cached_flavor`] and [`Self::layout`] are
+    /// derived from it rather than stored, so the three cannot disagree.
     pub(crate) resource_kind: ResourceKind,
 }
 
 impl ConnectionDetails {
+    /// [`ResourceKind::cached_flavor`] of this request's resource.
+    #[must_use]
+    pub(crate) const fn cached_flavor(&self) -> CachedFlavor {
+        self.resource_kind.cached_flavor()
+    }
+
+    /// [`ResourceKind::layout`] of this request's resource.
+    #[must_use]
+    pub(crate) const fn layout(&self) -> CacheLayout {
+        self.resource_kind.layout()
+    }
+
     /// The entry identity every per-entry store keys on.
     #[must_use]
     pub(crate) fn key(&self) -> CacheEntryKeyRef<'_> {
-        CacheEntryKeyRef::new(&self.mirror, &self.debname, self.layout)
+        CacheEntryKeyRef::new(&self.mirror, &self.debname, self.layout())
     }
 
     /// Build the absolute directory path holding this request's cached file.
@@ -424,7 +479,10 @@ impl ConnectionDetails {
             "path construction must not contain absolute components"
         );
 
-        let subdir = self.layout.cache_subdir().unwrap_or_else(|| Path::new(""));
+        let subdir = self
+            .layout()
+            .cache_subdir()
+            .unwrap_or_else(|| Path::new(""));
         assert!(
             subdir.is_relative(),
             "path construction must not contain absolute components"
@@ -440,7 +498,7 @@ impl ConnectionDetails {
         // Pre-size for the final length (+1 per separator) so `push` doesn't
         // grow the underlying OsString — this runs once per request on both
         // dispatch hot paths (same rationale as `mirror_cache_path_impl`).
-        let is_flat = self.layout.is_flat();
+        let is_flat = self.layout().is_flat();
         let capacity = root.as_os_str().len()
             + 1
             + host.len()
@@ -543,14 +601,13 @@ pub(crate) fn dists_debname(
 }
 
 /// The result of [`classify_request`]: the decoded, validated mirror path,
-/// the per-variant `(debname, cached_flavor, layout)` triple needed to build
-/// [`ConnectionDetails`], and any deferred origin record to be sent post-hoc.
+/// the per-variant `(debname, resource_kind)` pair needed to build
+/// [`ConnectionDetails`] (flavor and layout derive from the kind), and any
+/// deferred origin record to be sent post-hoc.
 #[derive(Debug)]
 pub(crate) struct RequestClass {
     pub(crate) mirror_path: String,
     pub(crate) debname: String,
-    pub(crate) cached_flavor: CachedFlavor,
-    pub(crate) layout: CacheLayout,
     pub(crate) resource_kind: ResourceKind,
     pub(crate) origin_fields: Option<OriginFields>,
 }
@@ -590,7 +647,7 @@ pub(crate) enum ClassifyError<'a> {
 // ---------------------------------------------------------------------------
 
 /// Decode + validate every URL-borne field in `resource`, then derive the
-/// on-disk classification (`debname`, `cached_flavor`, `layout`).  This is
+/// on-disk classification (`debname`, `resource_kind`).  This is
 /// the single source of truth behind `request_dispatch::dispatch_request`,
 /// shared by the hyper (`hyper_conn.rs`) and sendfile (`sendfile_conn.rs`)
 /// dispatchers.
@@ -608,8 +665,8 @@ pub(crate) fn classify_request<'a>(
     client: &ClientInfo,
 ) -> Result<RequestClass, ClassifyError<'a>> {
     // Each arm decodes/validates only the fields that variant carries, then
-    // assembles the (mirror_path, debname, cached_flavor, layout,
-    // resource_kind, origin_fields) `RequestClass`.
+    // assembles the (mirror_path, debname, resource_kind, origin_fields)
+    // `RequestClass`; flavor and layout follow from the kind.
     match resource {
         ResourceFile::Pool {
             mirror_path,
@@ -629,8 +686,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: filename.into_owned(),
-                cached_flavor: CachedFlavor::Permanent,
-                layout: CacheLayout::StructuredPool,
                 resource_kind: ResourceKind::Pool,
                 origin_fields: None,
             })
@@ -651,8 +706,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{filename}"),
-                cached_flavor: CachedFlavor::Volatile,
-                layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::Release,
                 origin_fields: None,
             })
@@ -671,8 +724,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: filename.into_owned(),
-                cached_flavor: CachedFlavor::Permanent,
-                layout: CacheLayout::DistsByHash,
                 resource_kind: ResourceKind::ByHash,
                 origin_fields: None,
             })
@@ -695,8 +746,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{component}_{filename}"),
-                cached_flavor: CachedFlavor::Volatile,
-                layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::Icon,
                 origin_fields: None,
             })
@@ -719,8 +768,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{component}_{filename}"),
-                cached_flavor: CachedFlavor::Volatile,
-                layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::Sources,
                 origin_fields: None,
             })
@@ -743,8 +790,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: format!("{distribution}_{component}_{filename}"),
-                cached_flavor: CachedFlavor::Volatile,
-                layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::Translation,
                 origin_fields: None,
             })
@@ -772,8 +817,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: dists_debname(&distribution, &component, &architecture, &filename),
-                cached_flavor: CachedFlavor::Volatile,
-                layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::ComponentRelease,
                 origin_fields: None,
             })
@@ -810,8 +853,6 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: dists_debname(&distribution, &component, &architecture, &filename),
-                cached_flavor: CachedFlavor::Volatile,
-                layout: CacheLayout::Dists,
                 resource_kind: ResourceKind::Packages,
                 origin_fields,
             })
@@ -828,12 +869,8 @@ pub(crate) fn classify_request<'a>(
                 "Decoded flat mirror path: `{mirror_path}`; Decoded flat filename: `{filename}` (kind: {kind:?}; client {client})"
             );
 
-            let (cached_flavor, layout, resource_kind) = match kind {
-                FlatKind::Metadata => (
-                    CachedFlavor::Volatile,
-                    CacheLayout::Flat,
-                    ResourceKind::FlatMetadata,
-                ),
+            let resource_kind = match kind {
+                FlatKind::Metadata => ResourceKind::FlatMetadata,
                 FlatKind::Pool => {
                     // `parse_request_path` runs `is_flat_deb_filename` on
                     // the *raw* URL segment, so a percent-encoded
@@ -845,24 +882,14 @@ pub(crate) fn classify_request<'a>(
                     if !is_flat_deb_filename(&filename) {
                         return Err(ClassifyError::NonDebPool { filename });
                     }
-                    (
-                        CachedFlavor::Permanent,
-                        CacheLayout::Flat,
-                        ResourceKind::FlatPool,
-                    )
+                    ResourceKind::FlatPool
                 }
-                FlatKind::ByHash => (
-                    CachedFlavor::Permanent,
-                    CacheLayout::FlatByHash,
-                    ResourceKind::FlatByHash,
-                ),
+                FlatKind::ByHash => ResourceKind::FlatByHash,
             };
 
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: filename.into_owned(),
-                cached_flavor,
-                layout,
                 resource_kind,
                 origin_fields: None,
             })
@@ -919,8 +946,8 @@ mod tests {
         let class = classify_request(&res, &fake_client()).unwrap();
         assert_eq!(class.mirror_path, "debian");
         assert_eq!(class.debname, "firefox-esr_115.9.1esr-1_amd64.deb");
-        assert_eq!(class.cached_flavor, CachedFlavor::Permanent);
-        assert_eq!(class.layout, CacheLayout::StructuredPool);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::StructuredPool);
         assert!(class.origin_fields.is_none());
     }
 
@@ -945,8 +972,8 @@ mod tests {
         };
         let class = classify_request(&res, &fake_client()).unwrap();
         assert_eq!(class.debname, "sid_InRelease");
-        assert_eq!(class.cached_flavor, CachedFlavor::Volatile);
-        assert_eq!(class.layout, CacheLayout::Dists);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
         assert!(class.origin_fields.is_none());
     }
 
@@ -961,8 +988,8 @@ mod tests {
         };
         let class = classify_request(&res, &fake_client()).unwrap();
         assert_eq!(class.debname, "sid_main_binary-amd64_Packages.gz");
-        assert_eq!(class.cached_flavor, CachedFlavor::Volatile);
-        assert_eq!(class.layout, CacheLayout::Dists);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
         let origin = class
             .origin_fields
             .expect("binary-amd64 must record an origin");
@@ -1000,8 +1027,8 @@ mod tests {
             class.debname,
             "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
         );
-        assert_eq!(class.cached_flavor, CachedFlavor::Permanent);
-        assert_eq!(class.layout, CacheLayout::DistsByHash);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::DistsByHash);
     }
 
     #[test]
@@ -1014,7 +1041,7 @@ mod tests {
         };
         let class = classify_request(&icon, &fake_client()).unwrap();
         assert_eq!(class.debname, "sid_main_icons-128x128.tar.gz");
-        assert_eq!(class.layout, CacheLayout::Dists);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
 
         let sources = ResourceFile::Sources {
             mirror_path: "debian",
@@ -1044,8 +1071,8 @@ mod tests {
         };
         let class = classify_request(&res, &fake_client()).unwrap();
         assert_eq!(class.debname, "InRelease");
-        assert_eq!(class.cached_flavor, CachedFlavor::Volatile);
-        assert_eq!(class.layout, CacheLayout::Flat);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
     }
 
     #[test]
@@ -1057,8 +1084,8 @@ mod tests {
         };
         let class = classify_request(&res, &fake_client()).unwrap();
         assert_eq!(class.debname, "twilio-cli_5.0.0_amd64.deb");
-        assert_eq!(class.cached_flavor, CachedFlavor::Permanent);
-        assert_eq!(class.layout, CacheLayout::Flat);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
     }
 
     #[test]
@@ -1092,8 +1119,8 @@ mod tests {
             "api/packages/85/debian/pool/php-zts/main"
         );
         assert_eq!(class.debname, "php-zts-cli_8.5.7-1_amd64.deb");
-        assert_eq!(class.cached_flavor, CachedFlavor::Permanent);
-        assert_eq!(class.layout, CacheLayout::Flat);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
         assert_eq!(class.resource_kind, ResourceKind::FlatPool);
     }
 
@@ -1105,8 +1132,8 @@ mod tests {
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         };
         let class = classify_request(&res, &fake_client()).unwrap();
-        assert_eq!(class.layout, CacheLayout::FlatByHash);
-        assert_eq!(class.cached_flavor, CachedFlavor::Permanent);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::FlatByHash);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
     }
 
     #[test]
@@ -1158,6 +1185,30 @@ mod tests {
                 decoded,
             }) if decoded == "../escape"
         ));
+    }
+
+    /// The whole `ResourceKind -> (CachedFlavor, CacheLayout)` table as one
+    /// literal, so a new kind (or a moved one) is decided here, not defaulted.
+    #[test]
+    fn resource_kind_flavor_and_layout_table() {
+        use CacheLayout::{Dists, DistsByHash, Flat, FlatByHash, StructuredPool};
+        use CachedFlavor::{Permanent, Volatile};
+        for (kind, flavor, layout) in [
+            (ResourceKind::Pool, Permanent, StructuredPool),
+            (ResourceKind::Release, Volatile, Dists),
+            (ResourceKind::ComponentRelease, Volatile, Dists),
+            (ResourceKind::Packages, Volatile, Dists),
+            (ResourceKind::Sources, Volatile, Dists),
+            (ResourceKind::Translation, Volatile, Dists),
+            (ResourceKind::Icon, Volatile, Dists),
+            (ResourceKind::ByHash, Permanent, DistsByHash),
+            (ResourceKind::FlatMetadata, Volatile, Flat),
+            (ResourceKind::FlatPool, Permanent, Flat),
+            (ResourceKind::FlatByHash, Permanent, FlatByHash),
+        ] {
+            assert_eq!(kind.cached_flavor(), flavor, "{kind:?} flavor");
+            assert_eq!(kind.layout(), layout, "{kind:?} layout");
+        }
     }
 
     #[test]

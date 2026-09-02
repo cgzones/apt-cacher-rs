@@ -575,7 +575,7 @@ pub(super) async fn acquire_upstream(
                 // reconnect bumps `record_upstream_status` itself.
                 match plan_fresh_download::<PathBuf>(
                     &response.head(),
-                    conn_details.cached_flavor,
+                    conn_details.cached_flavor(),
                     None,
                     global_config().max_object_size,
                 ) {

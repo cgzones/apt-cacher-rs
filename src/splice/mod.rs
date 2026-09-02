@@ -489,7 +489,7 @@ async fn prepare_cache_target(
         "path construction must not contain absolute components"
     );
 
-    let prev_file_size = match conn_details.cached_flavor {
+    let prev_file_size = match conn_details.cached_flavor() {
         CachedFlavor::Volatile => {
             let prev_path = dest_dir.join(filename);
             match tokio::fs::symlink_metadata(&prev_path).await {
@@ -805,7 +805,7 @@ fn log_splice_completion(
     client_succeeded: bool,
 ) {
     let in_time = conn_details.request_received_at.elapsed();
-    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+    let volatile = if conn_details.cached_flavor() == CachedFlavor::Volatile {
         "volatile "
     } else {
         ""
@@ -905,7 +905,7 @@ async fn open_partial_resume(
     ibarrier: &InitBarrier<'_>,
     conn_details: &ConnectionDetails,
 ) -> Result<utils::PartialResume, SpliceProxyError> {
-    if conn_details.cached_flavor != CachedFlavor::Permanent {
+    if conn_details.cached_flavor() != CachedFlavor::Permanent {
         return Ok(utils::PartialResume::volatile());
     }
     match utils::prepare_partial_resume(
@@ -935,7 +935,7 @@ async fn open_partial_resume(
 async fn read_volatile_validators(
     conn_details: &ConnectionDetails,
 ) -> Result<Option<(VolatileCondHeaders, PathBuf)>, SpliceProxyError> {
-    if conn_details.cached_flavor != CachedFlavor::Volatile {
+    if conn_details.cached_flavor() != CachedFlavor::Volatile {
         return Ok(None);
     }
     let cache_path = conn_details.cache_file_path();
@@ -1038,7 +1038,7 @@ async fn plan_upstream_response(
     match plan_download(
         &exchange.response.head(),
         ResumeState::new(resume.offset, resume.expected_total),
-        conn_details.cached_flavor,
+        conn_details.cached_flavor(),
         volatile_cache_path,
         global_config().max_object_size,
     ) {
@@ -1077,7 +1077,7 @@ async fn plan_upstream_response(
             // A resume never revalidates: there is no cached copy to serve.
             Ok(plan_fresh_download(
                 &exchange.response.head(),
-                conn_details.cached_flavor,
+                conn_details.cached_flavor(),
                 None,
                 global_config().max_object_size,
             ))

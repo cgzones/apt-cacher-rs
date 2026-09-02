@@ -1151,8 +1151,6 @@ async fn try_sendfile_request(
         mirror: plan.mirror,
         aliased_host: plan.aliased_host,
         debname: plan.debname,
-        cached_flavor: plan.cached_flavor,
-        layout: plan.layout,
         resource_kind: plan.resource_kind,
     };
 
@@ -1169,7 +1167,7 @@ async fn try_sendfile_request(
         // misses that attached; `attach()` already bumped that counter. The
         // volatile case is accounted for via `VOLATILE_REFETCHED` by the
         // originator.
-        if conn_details.cached_flavor == CachedFlavor::Permanent {
+        if conn_details.cached_flavor() == CachedFlavor::Permanent {
             metrics::CACHE_MISSES.increment();
         }
 
@@ -1217,7 +1215,7 @@ async fn try_sendfile_request(
         // treat as cache miss so splice/hyper can fetch a fresh copy from
         // upstream. Keep the metadata for the serve path so it doesn't
         // fstat a second time.
-        if conn_details.cached_flavor == CachedFlavor::Volatile {
+        if conn_details.cached_flavor() == CachedFlavor::Volatile {
             match regular_file_metadata(&file, &cache_path).await {
                 Ok(md) => {
                     let last_modified = md
@@ -1265,7 +1263,7 @@ async fn try_sendfile_request(
         Ok((file, mdata)) => {
             // CACHE_HITS only counts permanent-file hits; fresh volatile hits
             // were already bumped as VOLATILE_HIT in the cache_lookup block.
-            if conn_details.cached_flavor == CachedFlavor::Permanent {
+            if conn_details.cached_flavor() == CachedFlavor::Permanent {
                 metrics::CACHE_HITS.increment();
             }
 
@@ -1287,7 +1285,7 @@ async fn try_sendfile_request(
     // Cache miss or stale volatile file: a permanent file not found is a real
     // cache miss; a volatile file not found or stale is a refetch.
     match &miss {
-        CacheMiss::NotFound => match conn_details.cached_flavor {
+        CacheMiss::NotFound => match conn_details.cached_flavor() {
             CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
             CachedFlavor::Volatile => metrics::VOLATILE_REFETCHED.increment(),
         },

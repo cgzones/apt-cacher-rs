@@ -43,7 +43,7 @@ use tracing::{debug, trace};
 
 use crate::{
     ClientInfo,
-    cache_layout::{self, CacheLayout, CachedFlavor, ClassifyError, ResourceKind},
+    cache_layout::{self, ClassifyError, ResourceKind},
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
     database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
@@ -66,8 +66,6 @@ pub(crate) struct CachePlan {
     pub(crate) mirror: Mirror,
     pub(crate) aliased_host: Option<&'static CacheHost>,
     pub(crate) debname: String,
-    pub(crate) cached_flavor: CachedFlavor,
-    pub(crate) layout: CacheLayout,
     pub(crate) request_received_at: PreciseInstant,
     pub(crate) resource_kind: ResourceKind,
     _private: (),
@@ -488,7 +486,8 @@ fn decide_request(
                     Some(cache) => cache,
                     None => requested_host.as_cache_host(),
                 };
-                if class.layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
+                let layout = class.resource_kind.layout();
+                if layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
                     warn_once_or_info!(
                         "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing {uri_path} through uncached for client {client}"
                     );
@@ -498,7 +497,7 @@ fn decide_request(
                         requested_host,
                         requested_port,
                         class.mirror_path,
-                        class.layout.mirror_kind(),
+                        layout.mirror_kind(),
                     );
 
                     let pending_origin = class.origin_fields.map(|fields| Origin {
@@ -513,8 +512,6 @@ fn decide_request(
                             mirror,
                             aliased_host,
                             debname: class.debname,
-                            cached_flavor: class.cached_flavor,
-                            layout: class.layout,
                             request_received_at,
                             resource_kind: class.resource_kind,
                             _private: (),
@@ -578,6 +575,7 @@ mod tests {
 
     use super::*;
     use crate::ClientInfo;
+    use crate::cache_layout::CacheLayout;
     use crate::test_support::local_client;
 
     fn fake_client() -> ClientInfo {
@@ -782,7 +780,7 @@ mod tests {
         else {
             unreachable!("expected Cache outcome")
         };
-        assert_eq!(plan.layout, CacheLayout::StructuredPool);
+        assert_eq!(plan.resource_kind.layout(), CacheLayout::StructuredPool);
         assert_eq!(plan.debname, "firefox_1.0_amd64.deb");
         assert!(pending_origin.is_none());
     }
@@ -806,7 +804,7 @@ mod tests {
         else {
             unreachable!("expected Cache outcome")
         };
-        assert_eq!(plan.layout, CacheLayout::Dists);
+        assert_eq!(plan.resource_kind.layout(), CacheLayout::Dists);
         let origin = pending_origin.expect("binary-amd64 must record an origin");
         assert_eq!(origin.distribution, "sid");
         assert_eq!(origin.component, "main");

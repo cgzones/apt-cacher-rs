@@ -171,7 +171,7 @@ pub(crate) fn finish_cached_serve(
         .aliased_host
         .map_or_else(String::new, |alias| format!(" aliased to host {alias}"));
     let in_time = cd.request_received_at.elapsed();
-    let volatile = if cd.cached_flavor == CachedFlavor::Volatile {
+    let volatile = if cd.cached_flavor() == CachedFlavor::Volatile {
         "volatile "
     } else {
         ""
