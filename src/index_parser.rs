@@ -540,9 +540,14 @@ pub(crate) fn registry_key_for_download(debname: &str) -> String {
 pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
 
+    /// Read granularity for whole-file hashing. 1 MiB rather than the
+    /// kernel's default readahead window: cleanup hashes the whole cache and
+    /// commit hashes every download, so this is the read-syscall count for
+    /// both. Heap, not stack — a 1 MiB array would blow the frame.
+    const HASH_READ_BUFFER: usize = 1024 * 1024;
+
     let mut hasher = D::new();
-    #[expect(clippy::large_stack_arrays, reason = "ensure efficient file hashing")]
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; HASH_READ_BUFFER];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -556,6 +561,29 @@ pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_open_file_matches_one_shot_across_buffer_boundaries() {
+        use sha2::Digest as _;
+        use std::io::Write as _;
+
+        // Larger than the 1 MiB read buffer, and not a multiple of it.
+        let payload: Vec<u8> = (0..(1024 * 1024 + 4096))
+            .map(|i: u32| u8::try_from(i % 251).expect("i % 251 is in 0..251, fits in u8"))
+            .collect();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.bin");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            f.write_all(&payload).expect("write");
+        }
+
+        let mut file = std::fs::File::open(&path).expect("open");
+        let streamed = hash_open_file::<sha2::Sha256>(&mut file).expect("hash");
+
+        assert_eq!(streamed, sha2::Sha256::digest(&payload).to_vec());
+    }
 
     #[test]
     fn parse_hex_field_sha256() {

@@ -240,6 +240,27 @@ pub(crate) fn hint_sequential_read(
     }
 }
 
+/// Tell the kernel the pages of `file` are no longer needed, after a full
+/// read that was not on behalf of a client.
+///
+/// Cleanup hashes its way through the whole cache on a schedule; without
+/// this, one pass streams every file through the page cache and evicts the
+/// hot serving set. Deliberately NOT used at commit time, where the file was
+/// just written and may be served within milliseconds. Failure is non-fatal
+/// — the first is logged at warn level, subsequent ones at debug.
+pub(crate) fn release_page_cache(file: impl std::os::fd::AsFd, display_path: &Path) {
+    use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+
+    // Offset 0, length 0: the whole file, per posix_fadvise(2).
+    if let Err(errno) = posix_fadvise(file, 0, 0, PosixFadviseAdvice::POSIX_FADV_DONTNEED) {
+        warn_once_or_debug!(
+            "Failed to release the page cache via posix_fadvise(2) for `{}`; the cleanup pass keeps its pages resident:  {}",
+            display_path.display(),
+            ErrorReport(&errno)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

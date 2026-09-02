@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::fs_open::nofollow_nonblock_options;
+use crate::fs_open::{hint_sequential_read, nofollow_nonblock_options, release_page_cache};
 use crate::index_parser::{HashAlgo, hash_open_file};
 use crate::metrics;
 use crate::verified_marker::{has_valid_marker, stamp};
@@ -58,6 +58,10 @@ pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> 
         return Verdict::Match;
     }
 
+    // Past the memo fast path, which reads nothing but one xattr: from here
+    // the whole file is read, so the readahead hint is worth its syscall.
+    hint_sequential_read(&file, pre_size, path);
+
     let computed = match algo {
         HashAlgo::Sha256 => match hash_open_file::<sha2::Sha256>(&mut file) {
             Ok(h) => h,
@@ -74,6 +78,11 @@ pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> 
             }
         },
     };
+
+    // The pages were read for a scheduled integrity pass, not for a client.
+    // Without this a full cleanup streams the entire cache through the page
+    // cache and evicts the hot serving set.
+    release_page_cache(&file, path);
 
     if computed.as_slice() == expected {
         // Only stamp when the file is still the one we hashed — a swap
@@ -115,7 +124,24 @@ pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> 
     }
 }
 
+/// Bound on concurrent whole-file hashes. Cleanup runs up to ten mirror
+/// tasks, each of which would otherwise hash independently: ten concurrent
+/// cold reads saturate the disk queue the serve path shares. Three keeps the
+/// device busy without owning it.
+const VERIFY_CONCURRENCY: usize = 3;
+
+static VERIFY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(VERIFY_CONCURRENCY);
+
 pub(super) async fn verify_cache_file(path: PathBuf, algo: HashAlgo, expected: Vec<u8>) -> Verdict {
+    let _permit = match VERIFY_SLOTS.acquire().await {
+        Ok(permit) => permit,
+        // `AcquireError` is a tuple struct with a private field, so the
+        // usual explicit destructure is not available here. It can only be
+        // returned by a closed semaphore, and this one is a private static
+        // that nothing closes.
+        Err(err) => return Verdict::IoError(std::io::Error::other(err)),
+    };
+
     match tokio::task::spawn_blocking(move || verify_file_sync(&path, algo, &expected)).await {
         Ok(v) => v,
         Err(join_err) => Verdict::IoError(std::io::Error::other(join_err)),
