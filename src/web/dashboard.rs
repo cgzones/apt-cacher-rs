@@ -17,6 +17,7 @@ use crate::{
     build_info::{APP_VERSION, get_features},
     cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
+    healthcheck::{Check, HealthReport, cached_health_report},
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
@@ -36,7 +37,10 @@ use super::{
         as_size,
     },
     metrics_page::build_metrics_html,
-    page::{Page, QueryOptions, build_nav_html, build_page},
+    page::{
+        Page, PageTitle, QueryOptions, build_heading_html, build_nav_html, build_page,
+        build_setup_hint_html,
+    },
     response::WebResponse,
     table::{DetailsList, write_collapsible_section, write_section, write_section_error},
     tables::{
@@ -61,6 +65,10 @@ struct DashboardData {
     maintenance_html: String,
     cache_stats_html: String,
     metrics_html: String,
+    health_html: String,
+    /// Whether any mirror has ever been contacted. A dashboard of zeroes on
+    /// a fresh install needs the setup hint more than it needs the tables.
+    seen_traffic: bool,
     generation_start: Instant,
     /// Wall-clock time spent on the parallel DB-query block (mirrors,
     /// origins, clients, top packages, bandwidth) — excluding the FS work
@@ -247,6 +255,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     );
 
     let metrics_html = build_metrics_html();
+    let health_html = build_health_html(&cached_health_report().await);
 
     DashboardData {
         mirror,
@@ -260,10 +269,47 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         maintenance_html,
         cache_stats_html,
         metrics_html,
+        health_html,
+        seen_traffic: !mirrors.is_empty(),
         generation_start: start,
         db_elapsed,
         fs_elapsed,
     }
+}
+
+/// The five readiness checks the `/healthcheck` endpoint reports, rendered
+/// on the page so an operator does not have to fetch JSON to learn whether
+/// the daemon is serving.
+fn build_health_html(report: &HealthReport) -> String {
+    struct CheckCell<'a> {
+        ok: bool,
+        detail: Option<&'a str>,
+    }
+    impl Display for CheckCell<'_> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            if self.ok {
+                f.write_str("<span class=\"ok\">OK</span>")
+            } else {
+                write!(
+                    f,
+                    "<span class=\"alert\">{}</span>",
+                    HtmlEscape(self.detail.unwrap_or("failed")),
+                )
+            }
+        }
+    }
+
+    let mut t = DetailsList::new();
+    for check in report.checks() {
+        let Check {
+            key: _,
+            label,
+            ok,
+            detail,
+        } = check;
+        t.row(label, CheckCell { ok, detail });
+    }
+    t.finish()
 }
 
 fn build_daemon_status_html(
@@ -612,7 +658,19 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
 
     let mut body = String::with_capacity(8 * 1024);
     body.push_str(&nav);
+    body.push_str(&build_heading_html());
 
+    if !data.seen_traffic {
+        body.push_str(&build_setup_hint_html(
+            RUNTIMEDETAILS
+                .get()
+                .expect("initialized in main()")
+                .config
+                .bind_port,
+        ));
+    }
+
+    write_section(&mut body, "Health", &data.health_html);
     write_section(&mut body, "Daemon Status", &data.daemon_status_html);
     write_section(&mut body, "Configuration", &data.configuration_html);
     write_section(&mut body, "Maintenance", &data.maintenance_html);
@@ -622,7 +680,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     swrite!(
         body,
         "<div class=\"section\"><details>\
-         <summary><h3 id=\"metrics-head\">Metrics</h3></summary>\
+         <summary><h2 id=\"metrics-head\">Metrics</h2></summary>\
          {}</details></div>",
         data.metrics_html,
     );
@@ -633,6 +691,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         "mirrors-head",
         data.mirror.rows,
         None,
+        "No mirror has served a request yet.",
         &data.mirror.html,
     );
     write_collapsible_section(
@@ -641,6 +700,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         "origins-head",
         data.origin.rows,
         None,
+        "No Packages index has been fetched yet, so no distribution, component or architecture is known.",
         &data.origin.html,
     );
     write_collapsible_section(
@@ -649,6 +709,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         "clients-head",
         data.client.rows,
         None,
+        "No client has fetched anything through this proxy yet.",
         &data.client.html,
     );
 
@@ -674,6 +735,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         "packages-head",
         total_package_rows,
         None,
+        "No package has been delivered yet.",
         &top_packages_body,
     );
 
@@ -683,19 +745,26 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         "uncacheables-head",
         data.uncacheable.rows,
         Some(UNCACHEABLES_MAX.get()),
+        "Nothing has been requested that the cache had to pass through untouched.",
         &data.uncacheable.html,
     );
 
+    // Rounded to whole milliseconds so the three figures share a unit;
+    // `HumanFmt::Time` otherwise mixes "30.0ms" with "1.00ms" in one line.
+    let whole_ms = |d: std::time::Duration| {
+        HumanFmt::Time(std::time::Duration::from_millis(
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+        ))
+    };
     swrite!(
         body,
-        "<footer><hr><p>All dates are in UTC.&nbsp;&nbsp;&nbsp;--&nbsp;&nbsp;&nbsp;\
-         Generated in {} (db {}, disk {}).</p></footer>",
-        HumanFmt::Time(data.generation_start.elapsed().into()),
-        HumanFmt::Time(data.db_elapsed),
-        HumanFmt::Time(data.fs_elapsed),
+        "<footer><hr><p>All dates are in UTC. Generated in {} (db {}, disk {}).</p></footer>",
+        whole_ms(data.generation_start.elapsed().into()),
+        whole_ms(data.db_elapsed),
+        whole_ms(data.fs_elapsed),
     );
 
-    build_page("apt-cacher-rs web interface", body, options)
+    build_page(PageTitle("apt-cacher-rs"), body, options)
 }
 
 pub(super) async fn serve_dashboard(appstate: &AppState, options: QueryOptions) -> WebResponse {

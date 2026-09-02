@@ -122,17 +122,23 @@ impl CheckResult {
         matches!(self, Self::Pass)
     }
 
-    fn write_json(&self, out: &mut String) {
-        out.push_str("{\"ok\":");
+    fn detail(&self) -> Option<&str> {
         match self {
-            Self::Pass => out.push_str("true}"),
-            Self::Fail(detail) => {
-                out.push_str("false,\"detail\":\"");
-                json_escape_into(out, detail);
-                out.push_str("\"}");
-            }
+            Self::Pass => None,
+            Self::Fail(detail) => Some(detail),
         }
     }
+}
+
+/// One readiness check, as both renderers see it: the `/healthcheck` JSON
+/// keys on `key`, the dashboard prints `label`. Sourcing both from
+/// [`HealthReport::checks`] is what keeps the endpoint and the page from
+/// drifting apart.
+pub(crate) struct Check<'a> {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) ok: bool,
+    pub(crate) detail: Option<&'a str>,
 }
 
 /// Aggregated result of all readiness checks.
@@ -158,8 +164,11 @@ impl HealthReport {
         database.ok() && cache_write.ok() && quota.ok() && disk_free.ok() && inodes_free.ok()
     }
 
+    /// Every check in the order `/healthcheck` reports them. Destructures
+    /// `Self`, so a new check is a compile error here rather than a field
+    /// silently missing from both the endpoint and the dashboard.
     #[must_use]
-    pub(crate) fn to_json(&self) -> String {
+    pub(crate) fn checks(&self) -> [Check<'_>; 5] {
         let Self {
             database,
             cache_write,
@@ -167,6 +176,23 @@ impl HealthReport {
             disk_free,
             inodes_free,
         } = self;
+        [
+            ("database", "Database", database),
+            ("cache_write", "Cache Write", cache_write),
+            ("quota", "Disk Quota", quota),
+            ("disk_free", "Free Disk Space", disk_free),
+            ("inodes_free", "Free Inodes", inodes_free),
+        ]
+        .map(|(key, label, result)| Check {
+            key,
+            label,
+            ok: result.ok(),
+            detail: result.detail(),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn to_json(&self) -> String {
         let mut out = String::with_capacity(128);
         out.push_str("{\"status\":\"");
         out.push_str(if self.healthy() {
@@ -174,16 +200,23 @@ impl HealthReport {
         } else {
             "unhealthy"
         });
-        out.push_str("\",\"checks\":{\"database\":");
-        database.write_json(&mut out);
-        out.push_str(",\"cache_write\":");
-        cache_write.write_json(&mut out);
-        out.push_str(",\"quota\":");
-        quota.write_json(&mut out);
-        out.push_str(",\"disk_free\":");
-        disk_free.write_json(&mut out);
-        out.push_str(",\"inodes_free\":");
-        inodes_free.write_json(&mut out);
+        out.push_str("\",\"checks\":{");
+        for (i, check) in self.checks().into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(check.key);
+            out.push_str("\":{\"ok\":");
+            match check.detail {
+                None => out.push_str("true}"),
+                Some(detail) => {
+                    out.push_str("false,\"detail\":\"");
+                    json_escape_into(&mut out, detail);
+                    out.push_str("\"}");
+                }
+            }
+        }
         out.push_str("}}");
         out
     }

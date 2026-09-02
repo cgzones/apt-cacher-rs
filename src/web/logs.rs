@@ -2,11 +2,11 @@
 
 use tracing::error;
 
-use crate::{LOGSTORE, error::ErrorReport, swrite};
+use crate::{LOGSTORE, error::ErrorReport, global_config, swrite};
 
 use super::{
     fmt::HtmlEscape,
-    page::{Page, QueryOptions, build_nav_html, build_page},
+    page::{Page, PageTitle, QueryOptions, build_heading_html, build_nav_html, build_page},
     response::WebResponse,
 };
 
@@ -47,10 +47,12 @@ pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
 
     let nav = build_nav_html(Page::Logs, options);
 
+    let heading = build_heading_html();
+    let capacity = global_config().logstore_capacity;
     let body_html = format_args!(
-        "{nav}\
+        "{nav}{heading}\
          <div class=\"section\">\
-         <h3>Log Entries <span class=\"count\">{entry_count}</span></h3>\
+         <h2>Log Entries <span class=\"count\">{entry_count} / {capacity}</span></h2>\
          <pre class=\"log\">{escaped_logs}</pre>\
          </div>\
          <footer><hr><p>All dates are in UTC.</p></footer>"
@@ -58,7 +60,7 @@ pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
 
     // The logs page is a tailing view; auto-refresh would fight the reader.
     let html = build_page(
-        "apt-cacher-rs logs",
+        PageTitle("apt-cacher-rs logs"),
         body_html,
         QueryOptions {
             theme: options.theme,

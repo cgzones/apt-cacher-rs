@@ -2,9 +2,61 @@
 //! options (`theme`, `refresh`), the `<html>` skeleton, the `<nav>` bar, the
 //! stylesheet served at `/style.css` and the favicon.
 
-use std::fmt::{self, Display, Formatter};
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::LazyLock,
+};
 
 use crate::swrite;
+
+use super::fmt::HtmlEscape;
+
+/// The system hostname, read once at first use.
+///
+/// Without it two daemons are indistinguishable in a browser tab and in a
+/// screenshot pasted into a ticket; it is the only instance identity the
+/// server can put in the page, since the URL the client typed never reaches
+/// us in a form worth trusting.
+static HOSTNAME: LazyLock<Box<str>> = LazyLock::new(|| {
+    nix::unistd::gethostname()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .unwrap_or_else(|| String::from("unknown host"))
+        .into_boxed_str()
+});
+
+/// Renders `<page> on <hostname>`. The page part is `&'static str` so no
+/// user-controlled value can reach the `<title>`; the hostname is escaped
+/// because it is only as well-formed as the machine's configuration.
+#[derive(Clone, Copy)]
+pub(super) struct PageTitle(pub(super) &'static str);
+
+impl Display for PageTitle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{} on {}", self.0, HtmlEscape(&HOSTNAME))
+    }
+}
+
+/// First-run guidance. With nothing fetched yet the dashboard is a wall of
+/// zeroes, and the one thing its reader needs is the line that points apt at
+/// this daemon.
+pub(super) fn build_setup_hint_html(port: std::num::NonZero<u16>) -> String {
+    format!(
+        "<div class=\"section setup\"><h2>Getting Started</h2>\
+         <p>No mirror has been contacted yet. Point apt at this proxy by writing \
+         <code>Acquire::http::Proxy \"http://{}:{port}\";</code> into \
+         <code>/etc/apt/apt.conf.d/01proxy</code> on a client.</p></div>",
+        HtmlEscape(&HOSTNAME),
+    )
+}
+
+/// The page heading, carrying the same identity as the `<title>`.
+pub(super) fn build_heading_html() -> String {
+    format!(
+        "<h1>apt-cacher-rs <span class=\"host\">on {}</span></h1>",
+        HtmlEscape(&HOSTNAME)
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Page chrome
@@ -43,10 +95,10 @@ pub(super) struct QueryOptions {
     pub(super) refresh_secs: Option<u32>,
 }
 
-/// `title` is interpolated into `<title>` without HTML-escaping. The
-/// `&'static str` bound prevents user-controlled values from sneaking in.
+/// `title` renders the page name and the instance identity; see
+/// [`PageTitle`] for why each half is safe to interpolate.
 pub(super) fn build_page(
-    title: &'static str,
+    title: PageTitle,
     body_html: impl Display,
     options: QueryOptions,
 ) -> String {
@@ -184,6 +236,8 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
                 swrite!(html, "<a href=\"{href}\">{label}</a>");
             }
             html.push_str("<span class=\"dim\">|</span>");
+            html.push_str("<a href=\"/healthcheck\">Health JSON</a>");
+            html.push_str("<span class=\"dim\">|</span>");
             let target = QueryUrl {
                 path: "/",
                 options: QueryOptions {
@@ -278,7 +332,7 @@ details > summary::-webkit-details-marker { display: none; }
 details > summary::before { content: "\25B6\FE0E"; display: inline-block; margin-right: 6px;
                              font-size: 0.7em; transition: transform 0.2s ease; }
 details[open] > summary::before { transform: rotate(90deg); }
-details > summary > h3 { display: inline; }
+details > summary > h2 { display: inline; }
 .count { display: inline-block; background: var(--count-bg); border-radius: 10px;
          padding: 1px 8px; font-size: 0.72em; font-weight: 600; vertical-align: middle;
          margin-left: 6px; min-width: 18px; text-align: center; line-height: 1.6; }
@@ -303,7 +357,9 @@ nav a { color: var(--link); text-decoration: none; font-weight: 500; }
 nav a:hover { text-decoration: underline; }
 .section { background: var(--section-bg); border: 1px solid var(--section-border); border-radius: 5px;
            box-shadow: var(--section-shadow); padding: 10px 14px; margin-bottom: 10px; }
-h3 { color: var(--h-fg); margin-bottom: 6px; border-bottom: 2px solid var(--h-accent);
+h1 { font-size: 1.15em; color: var(--h-fg); font-weight: 600; margin-bottom: 10px; }
+h1 .host { color: var(--details-key-fg); font-weight: 500; }
+h2 { color: var(--h-fg); margin-bottom: 6px; border-bottom: 2px solid var(--h-accent);
      padding-bottom: 4px; font-size: 0.95em; }
 .tablewrap { overflow-x: auto; max-width: 100%; }
 table { width: 100%; border-collapse: collapse; margin-top: 6px; }
@@ -324,10 +380,17 @@ footer { color: var(--footer-fg); font-size: 0.82em; margin-top: 8px; }
 footer hr { border: none; border-top: 1px solid var(--nav-border); margin-bottom: 6px; }
 p { margin: 4px 0; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-h4.mini { font-size: 0.85em; margin: 4px 0; }
-h4.group { font-size: 0.85em; color: var(--h-fg); margin: 12px 0 2px;
+h3.mini { font-size: 0.85em; margin: 4px 0; }
+h3.group { font-size: 0.85em; color: var(--h-fg); margin: 12px 0 2px;
            border-bottom: 1px solid var(--section-border); padding-bottom: 3px; }
-h4.group:first-of-type { margin-top: 4px; }
+h3.group:first-of-type { margin-top: 4px; }
+.empty { color: var(--details-key-fg); font-size: 0.9em; margin: 4px 0; }
+.setup code { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-size: 0.95em;
+              background: var(--count-bg); padding: 1px 5px; border-radius: 3px; }
+meter.bar { width: 42px; height: 7px; vertical-align: middle; margin-left: 5px; }
+meter.bar::-webkit-meter-bar { background: var(--count-bg); border: none; border-radius: 3px; }
+meter.bar::-webkit-meter-optimum-value { background: var(--h-accent); border-radius: 3px; }
+meter.bar::-moz-meter-bar { background: var(--h-accent); border-radius: 3px; }
 pre.log { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.85em;
           max-height: 80vh; overflow-y: auto; }
 

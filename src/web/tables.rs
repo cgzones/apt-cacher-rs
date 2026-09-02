@@ -192,6 +192,8 @@ mod mirror_cells {
 
     use crate::humanfmt::HumanFmt;
 
+    use super::super::fmt::Meter;
+
     pub(super) struct DirSizeCell {
         pub size: u64,
         pub total: u64,
@@ -203,6 +205,13 @@ mod mirror_cells {
                 #[expect(clippy::cast_precision_loss, reason = "only for display purposes")]
                 let pct = self.size as f64 / self.total as f64 * 100.0;
                 write!(f, " ({pct:.1}%)")?;
+                Display::fmt(
+                    &Meter {
+                        value: self.size,
+                        max: self.total,
+                    },
+                    f,
+                )?;
             }
             Ok(())
         }
@@ -242,7 +251,20 @@ mod mirror_cells {
                 let pct = (self.delivered.saturating_sub(self.downloaded)) as f64
                     / self.delivered as f64
                     * 100.0;
-                write!(f, "{pct:.1}%")
+                write!(f, "{pct:.1}%")?;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped to the 0..=100 meter scale"
+                )]
+                let filled = pct.clamp(0.0, 100.0) as u64;
+                Display::fmt(
+                    &Meter {
+                        value: filled,
+                        max: 100,
+                    },
+                    f,
+                )
             }
         }
     }
@@ -303,7 +325,7 @@ pub(super) async fn build_mirror_table(
         "Cache Efficiency",
         "Disk Space",
         "File Count",
-        "Avg / Max File Size",
+        "Avg / Max Size",
         "Debs / Metadata",
     ]);
 
@@ -534,8 +556,10 @@ pub(super) async fn build_top_packages_table(
 
     let rows = packages.len();
     let headers: &[&str] = match view {
-        TopPackagesView::ByCount => &["Package", "Deliveries", "Package Size"],
-        TopPackagesView::BySize => &["Package", "Total Size", "Deliveries", "Package Size"],
+        // "Package Size" meant the size of one copy in one table and the
+        // cumulative bytes in the other; name each for what it counts.
+        TopPackagesView::ByCount => &["Package", "Deliveries", "Size Each"],
+        TopPackagesView::BySize => &["Package", "Delivered Total", "Deliveries", "Size Each"],
     };
     let mut table = Table::new(headers);
 

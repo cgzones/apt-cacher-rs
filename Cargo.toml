@@ -63,7 +63,7 @@ lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "x
 memfd = "0.6.4"
 memmap2 = { version = "0.9", optional = true }
 memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
-nix = { version = "0.31", features = ["fs", "resource", "user"] }
+nix = { version = "0.31", features = ["fs", "hostname", "resource", "user"] }
 parking_lot = "0.12.5"
 pin-project = "1.1.11"
 rand = "0.10.1"

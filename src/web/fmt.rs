@@ -128,18 +128,48 @@ impl Display for FmtTimestamp {
     }
 }
 
-/// Renders the age of a `SystemTime` as a bare duration (e.g. "5d 3h"),
-/// or "N/A" when missing.
+/// Renders the age of a `SystemTime` as a duration (e.g. "5d 3h") inside a
+/// `<time>` carrying the absolute instant, or "N/A" when missing.
+///
+/// The age is the useful figure at a glance and the absolute timestamp is
+/// what you need to correlate against a log; every other timestamp on the
+/// page shows the absolute value, so this one carries both rather than
+/// leaving the reader to do the arithmetic.
 pub(super) struct FmtMTimeAge(pub(super) Option<SystemTime>);
 impl Display for FmtMTimeAge {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(mt) => match mt.elapsed() {
-                Ok(dur) => Display::fmt(&HumanFmt::Time(dur), f),
-                Err(_) => f.write_str("in future"),
-            },
-            None => f.write_str("N/A"),
+        let Some(mt) = self.0 else {
+            return f.write_str("N/A");
+        };
+        let Ok(dur) = mt.elapsed() else {
+            return f.write_str("in future");
+        };
+        let stamp = Utc::from_offset(OffsetDateTime::from(mt));
+        write!(f, "{} ago ({stamp})", HumanFmt::Time(dur))
+    }
+}
+
+/// A `<meter>` bar rendered beside a value.
+///
+/// The page's CSP is `style-src 'self'`, which forbids the inline
+/// `style="width:37%"` a `<div>` bar would need; `<meter>` carries its fill
+/// in `value`/`max` attributes instead, and brings the right ARIA role with
+/// it. Renders nothing when there is no scale to draw against.
+pub(super) struct Meter {
+    pub(super) value: u64,
+    pub(super) max: u64,
+}
+impl Display for Meter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.max == 0 {
+            return Ok(());
         }
+        write!(
+            f,
+            "<meter class=\"bar\" value=\"{}\" max=\"{}\"></meter>",
+            self.value.min(self.max),
+            self.max,
+        )
     }
 }
 
@@ -416,6 +446,13 @@ impl Display for DiskUsage {
                     &Colorize {
                         inner: format_args!("{inner}"),
                         class,
+                    },
+                    f,
+                )?;
+                Display::fmt(
+                    &Meter {
+                        value: self.cache_size,
+                        max: q,
                     },
                     f,
                 )

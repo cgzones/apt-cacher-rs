@@ -135,16 +135,21 @@ impl DetailsList {
 
 /// Append a `<div class="section">` wrapping a titled HTML body.
 pub(super) fn write_section(out: &mut String, title: &'static str, body: &str) {
-    swrite!(out, "<div class=\"section\"><h3>{title}</h3>{body}</div>");
+    swrite!(out, "<div class=\"section\"><h2>{title}</h2>{body}</div>");
 }
 
 /// Append a collapsible `<details>` section. Expanded by default unless empty.
+///
+/// `empty_note` is what the section says when it has no rows. A section that
+/// renders nothing at all leaves a first run looking broken rather than
+/// idle, so every caller has to say what "no rows" means for its data.
 pub(super) fn write_collapsible_section(
     out: &mut String,
     title: &'static str,
     id: &'static str,
     row_count: usize,
     total_count: Option<usize>,
+    empty_note: &'static str,
     body: &str,
 ) {
     let open_attr = if row_count > 0 { " open" } else { "" };
@@ -155,10 +160,33 @@ pub(super) fn write_collapsible_section(
     swrite!(
         out,
         "<div class=\"section\"><details{open_attr}>\
-         <summary><h3 id=\"{id}\">{title}</h3>\
+         <summary><h2 id=\"{id}\">{title}</h2>\
          <span class=\"count\">{row_count}{total_count_fmt}</span></summary>\
-         {body}</details></div>"
+         {}</details></div>",
+        EmptyOr {
+            body,
+            note: empty_note,
+            rows: row_count,
+        },
     );
+}
+
+/// Renders `body`, or the empty-state note in its place when there are no
+/// rows to show.
+struct EmptyOr<'a> {
+    body: &'a str,
+    note: &'static str,
+    rows: usize,
+}
+
+impl Display for EmptyOr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.rows == 0 && self.body.is_empty() {
+            write!(f, "<p class=\"empty\">{}</p>", self.note)
+        } else {
+            f.write_str(self.body)
+        }
+    }
 }
 
 /// Per-section error placeholder (so a single failed query doesn't kill the page).
