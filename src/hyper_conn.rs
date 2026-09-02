@@ -2000,7 +2000,7 @@ async fn serve_new_file(
         prev_file_size,
         &conn_details.debname,
     ) {
-        Ok(r) => Some(r),
+        Ok(r) => r,
         Err(QuotaExceeded) => {
             return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached");
         }

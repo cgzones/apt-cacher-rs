@@ -531,7 +531,7 @@ async fn prepare_cache_target(
         prev_file_size,
         &conn_details.debname,
     ) {
-        Ok(r) => Some(r),
+        Ok(r) => r,
         Err(_err @ QuotaExceeded) => {
             write_invalid_response(
                 client.stream,

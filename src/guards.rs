@@ -86,7 +86,7 @@ impl<'a> InitBarrier<'a> {
         mut self,
         path: PathBuf,
         content_length: ContentLength,
-        quota_reservation: Option<QuotaReservation>,
+        quota_reservation: QuotaReservation,
         meta: Arc<UpstreamMetadata>,
     ) -> DownloadBarrier {
         let data = self.data.take().expect("every sink consumes the instance");
@@ -177,7 +177,9 @@ struct DownloadBarrierData {
     resource_kind: ResourceKind,
     raw_uri_path: String,
     tx: tokio::sync::watch::Sender<()>,
-    quota_reservation: Option<QuotaReservation>,
+    /// Minted only by `CacheQuota::try_acquire`, so holding a barrier proves
+    /// the quota was checked; `commit` finalises it, `Drop` reverts it.
+    quota_reservation: QuotaReservation,
     /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
     bytes_since_ping: u64,
     /// Whether any ping was sent yet — the first one is unbatched.
@@ -388,7 +390,7 @@ struct RenameBarrierData {
     key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
-    quota_reservation: Option<QuotaReservation>,
+    quota_reservation: QuotaReservation,
 }
 
 #[must_use]
@@ -544,9 +546,7 @@ impl RenameBarrier {
         // for the `Verifying -> Finished` status flip.
         let data = self.data.take().expect("every sink consumes the instance");
 
-        if let Some(reservation) = data.quota_reservation {
-            reservation.finalize(plan.bytes_received);
-        }
+        data.quota_reservation.finalize(plan.bytes_received);
 
         let meta_for_status: Option<Arc<UpstreamMetadata>> = {
             let mut lock = data.status.write().await;
