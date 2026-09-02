@@ -18,14 +18,12 @@ use crate::{
     config::Config,
     deb_mirror::Mirror,
     error::{ErrorReport, ProxyCacheError, UpstreamFetchError},
-    index_parser::{Stanza, hex_encode, structured_lookup_key},
+    index_parser::{Stanza, StanzaStream, hex_encode, structured_lookup_key},
     limits::{
-        CappedLine, MAX_DECOMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN, PackagesCompression,
-        decompressed_limit, packages_reader, read_line_capped,
+        MAX_DECOMPRESSED_PACKAGES_SIZE, PackagesCompression, decompressed_limit, packages_reader,
     },
     metrics,
     precise_instant::PreciseInstant,
-    warn_once_or_debug,
 };
 // `process_cache_request` has a hyper implementation and a splice-only stub
 // (in `main.rs`) that bridges to `splice_cleanup_request`; cleanup calls it
@@ -194,18 +192,6 @@ pub(super) struct ReduceContext<'a> {
 /// structured archives the on-disk cache flattens that to the basename, so
 /// the lookup key is the basename portion.  For flat archives the URL path
 /// is the on-disk path verbatim, so the lookup key is the relpath itself.
-async fn flush_stanza(
-    stanza: &mut Stanza,
-    file_list: &mut HashMap<OsString, SpanClass>,
-    ctx: &mut ReduceContext<'_>,
-) {
-    process_stanza(stanza, file_list, ctx).await;
-    stanza.reset();
-}
-
-/// Body of [`flush_stanza`] split out so a single trailing `stanza.reset()`
-/// covers every exit path. Borrows `stanza` immutably; the caller is
-/// responsible for clearing it afterwards.
 async fn process_stanza(
     stanza: &Stanza,
     file_list: &mut HashMap<OsString, SpanClass>,
@@ -228,17 +214,9 @@ async fn process_stanza(
     let path = ctx.root.join(lookup_key);
 
     match stanza.chosen() {
-        None => {
-            // Fires once per cached file per cycle on a digest-less index,
-            // so degrade after the first; matches `integrity.rs`'s handling of
-            // the same condition.
-            warn_once_or_debug!(
-                "Packages stanza for `{}` from mirror {} advertises no SHA256/SHA512; retaining cache file `{}` without verification",
-                filename.escape_debug(),
-                ctx.mirror,
-                path.display(),
-            );
-        }
+        // Retained without verification; `StanzaStream` already warned about
+        // the digest-less stanza.
+        None => {}
         Some((algo, expected)) => {
             // No pre-verify stat: `verify_file_sync` opens the file `O_NOFOLLOW
             // | O_NONBLOCK` and `fstat`s the descriptor it actually hashed, so
@@ -352,58 +330,34 @@ pub(super) async fn reduce_file_list(
         };
     };
 
-    let mut reader = packages_reader(
+    let reader = packages_reader(
         file,
         compression,
         decompressed_limit(Some(compressed_size)),
         buffer_size,
     );
 
-    let mut buffer = String::with_capacity(128);
-    let mut line_buf: Vec<u8> = Vec::with_capacity(128);
-    let mut stanza = Stanza::new().with_source(format!("index `{filename}`"));
+    // `filename` is the synthetic memfd name, so name the mirror as well.
+    let mut stanzas = StanzaStream::new(
+        reader,
+        Stanza::new().with_source(format!("mirror {} index `{filename}`", ctx.mirror)),
+    );
     loop {
-        buffer.clear();
-        match read_line_capped(
-            &mut *reader,
-            &mut buffer,
-            &mut line_buf,
-            MAX_METADATA_LINE_LEN,
-        )
-        .await
-        {
-            Ok(CappedLine::Eof) => {
-                // Flush the final stanza if the Packages file doesn't end
-                // with a blank line.
-                if !stanza.is_empty() {
-                    flush_stanza(&mut stanza, file_list, ctx).await;
+        match stanzas.next().await {
+            Ok(Some(stanza)) => {
+                process_stanza(stanza, file_list, ctx).await;
+                // Every candidate is referenced: nothing left to reduce.
+                if file_list.is_empty() {
+                    return Ok(());
                 }
-                return Ok(());
             }
+            Ok(None) => return Ok(()),
             Err(err) => {
                 error!(
                     "Failed to read Packages file `{filename}` (may exceed the size limit); skipping this mirror's reconcile this cycle:  {}",
                     ErrorReport(&err)
                 );
                 return Err(err);
-            }
-            Ok(CappedLine::Skipped) => {
-                // A line longer than MAX_METADATA_LINE_LEN can't be one
-                // of the fields the stanza parser cares about (Filename,
-                // SHA256, SHA512 are all well under the cap); some
-                // packages legitimately ship multi-kilobyte `Provides:`
-                // or `Depends:` fields. Treat it as a non-blank line so
-                // the stanza isn't flushed prematurely.
-            }
-            Ok(CappedLine::Line { .. }) => {
-                if buffer.trim().is_empty() {
-                    flush_stanza(&mut stanza, file_list, ctx).await;
-                    if file_list.is_empty() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                stanza.ingest(&buffer);
             }
         }
     }
@@ -612,6 +566,7 @@ mod tests {
         config::ClientHost,
         deb_mirror::MirrorKind,
         index_parser::{HashAlgo, hex_decode_exact, parse_filename_field, parse_hex_field},
+        limits::MAX_METADATA_LINE_LEN,
         nonzero,
     };
 
@@ -929,7 +884,8 @@ mod tests {
         s.ingest("Package: stub\n");
         s.ingest("Description: a stub\n");
         s.ingest(" continued description text\n");
-        assert!(s.is_empty());
+        assert!(s.filename.is_none());
+        assert_eq!(s.chosen(), None);
     }
 
     #[tokio::test]
@@ -1090,7 +1046,7 @@ mod tests {
             MirrorKind::Structured,
         );
         // `dummy_1.0_amd64.deb` is the structured-lookup-key (basename) of
-        // the Filename: above; reaching `flush_stanza` with the stanza
+        // the Filename: above; reaching `StanzaStream::complete` with the stanza
         // intact removes the entry from the candidate list, proving the
         // parser kept its place through the oversize line.
         tokio::fs::write(dir.path().join("dummy_1.0_amd64.deb"), deb_body)

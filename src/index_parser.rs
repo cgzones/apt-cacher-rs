@@ -6,9 +6,14 @@
 //! `task_cleanup`'s 24h sweep (and its tests). Cold-path only; the helpers
 //! stay free of hot-path-specific coupling.
 
-use std::path::Path;
+use std::{io, path::Path};
 
-use crate::warn_once;
+use tokio::io::AsyncBufRead;
+
+use crate::{
+    limits::{CappedLine, MAX_METADATA_LINE_LEN, read_line_capped},
+    warn_once, warn_once_or_debug,
+};
 
 /// Extract the `Filename:` field's relative-path value from a Debian
 /// `Packages` stanza line, discarding the reject reason. Production code
@@ -199,10 +204,6 @@ impl Stanza {
         }
     }
 
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.filename.is_none() && self.sha256.is_none() && self.sha512.is_none()
-    }
-
     pub(crate) fn reset(&mut self) {
         self.filename = None;
         self.sha256 = None;
@@ -246,6 +247,16 @@ impl Stanza {
         }
     }
 
+    /// The digest fields this stanza's consumer can use, for the digest-less
+    /// warn: a SHA512-only index is digest-less to a SHA256-only consumer.
+    const fn usable_digests(&self) -> &'static str {
+        if self.want_sha512 {
+            "SHA256/SHA512"
+        } else {
+            "SHA256"
+        }
+    }
+
     /// Preferred `(algo, expected-digest)` pair: SHA256 wins, SHA512 fallback.
     pub(crate) fn chosen(&self) -> Option<(HashAlgo, &[u8])> {
         self.sha256
@@ -256,6 +267,114 @@ impl Stanza {
                     .as_ref()
                     .map(|h| (HashAlgo::Sha512, h.as_slice()))
             })
+    }
+}
+
+/// Streams the stanzas of a (decoded) Debian `Packages` index, one complete
+/// stanza per [`Self::next`].
+///
+/// The one line loop both consumers drive: cleanup's candidate reduce
+/// (`cleanup::packages::reduce_file_list`) and the checksum-registry ingest
+/// (`integrity::ingest_packages_file`) used to each spell out the
+/// [`read_line_capped`] loop with its EOF / skipped-line / blank-line /
+/// error arms, so the line-cap and flush semantics - which decide which debs
+/// count as referenced - could drift between them. They still differ in how
+/// they decode the file ([`crate::limits::packages_reader`]) and in what an
+/// unreadable index means (cleanup bails the mirror, ingest degrades); both
+/// stay at the callers, outside this loop.
+///
+/// Pull-style rather than a `for_each_stanza(sink)` visitor for the reason
+/// `cache_walk::Walker` is: cleanup's per-stanza work is async and its tasks
+/// are spawned, and an `AsyncFnMut` sink's call future cannot be bounded
+/// `Send` on stable. A caller keeps its natural loop shape and stops by
+/// leaving the loop.
+///
+/// Yields only stanzas with a `Filename:`; one whose consumer-usable digest
+/// fields are all absent is still yielded (cleanup retains the file without
+/// verification, ingest has nothing to register) after the once-gated warn
+/// both consumers used to emit, so the warn has one wording and one site.
+/// A line over [`MAX_METADATA_LINE_LEN`] counts as non-blank (multi-kilobyte
+/// `Provides:`/`Depends:` fields are legitimate and never a field the
+/// stanza cares about) so the stanza is not flushed prematurely; a trailing
+/// stanza without a closing blank line is flushed at EOF.
+pub(crate) struct StanzaStream<R> {
+    reader: R,
+    stanza: Stanza,
+    line: String,
+    line_buf: Vec<u8>,
+    done: bool,
+}
+
+impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
+    pub(crate) fn new(reader: R, stanza: Stanza) -> Self {
+        Self {
+            reader,
+            stanza,
+            line: String::with_capacity(128),
+            line_buf: Vec::with_capacity(128),
+            done: false,
+        }
+    }
+
+    /// The next stanza carrying a `Filename:`, or `Ok(None)` at EOF. A read
+    /// error (size/line limit, invalid UTF-8, I/O) ends the stream; the
+    /// caller decides what an unreadable index means.
+    pub(crate) async fn next(&mut self) -> io::Result<Option<&Stanza>> {
+        if self.done {
+            return Ok(None);
+        }
+        // The stanza handed out by the previous call is consumed.
+        self.stanza.reset();
+        loop {
+            self.line.clear();
+            let read = read_line_capped(
+                &mut self.reader,
+                &mut self.line,
+                &mut self.line_buf,
+                MAX_METADATA_LINE_LEN,
+            )
+            .await;
+            match read {
+                Ok(CappedLine::Eof) => {
+                    self.done = true;
+                    return Ok(self.complete());
+                }
+                Ok(CappedLine::Skipped) => {}
+                Ok(CappedLine::Line { bytes: _ }) => {
+                    if !self.line.trim().is_empty() {
+                        self.stanza.ingest(&self.line);
+                    } else if self.stanza.filename.is_some() {
+                        return Ok(self.complete());
+                    } else {
+                        // A blank run, or a stanza without `Filename:`:
+                        // nothing either consumer acts on.
+                        self.stanza.reset();
+                    }
+                }
+                Err(err) => {
+                    self.done = true;
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Hand out the accumulated stanza if it names a file, warning once when
+    /// it advertises none of the digests its consumer can use.
+    fn complete(&self) -> Option<&Stanza> {
+        let filename = self.stanza.filename.as_deref()?;
+        if self.stanza.chosen().is_none() {
+            // Fires per stanza on a digest-less index (a SHA512-only mirror
+            // is digest-less to the SHA256-only registry ingest), so degrade
+            // after the first.
+            warn_once_or_debug!(
+                "Packages stanza for `{}` from {} advertises no {} digest; the package it names is exempt from checksum verification",
+                filename.escape_debug(),
+                self.stanza.source_label(),
+                self.stanza.usable_digests()
+            );
+        }
+        Some(&self.stanza)
     }
 }
 
@@ -418,9 +537,7 @@ pub(crate) fn registry_key_for_download(debname: &str) -> String {
 }
 
 /// Hash the contents of an open file. Synchronous; blocks the current thread.
-pub(crate) fn hash_open_file<D: sha2::Digest>(
-    file: &mut std::fs::File,
-) -> std::io::Result<Vec<u8>> {
+pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
 
     let mut hasher = D::new();
@@ -468,6 +585,85 @@ mod tests {
             s.chosen(),
             Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
         );
+    }
+
+    /// Drain a stream into `(filename, chosen digest)` pairs.
+    async fn collect_stanzas(input: &[u8], stanza: Stanza) -> Vec<(String, Option<HashAlgo>)> {
+        let mut stream = StanzaStream::new(input, stanza);
+        let mut out = Vec::new();
+        while let Some(s) = stream.next().await.expect("readable") {
+            out.push((
+                s.filename
+                    .clone()
+                    .expect("only stanzas with a Filename are yielded"),
+                s.chosen().map(|(algo, _)| algo),
+            ));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn stanza_stream_yields_named_stanzas_and_flushes_at_eof() {
+        let input = format!(
+            "Package: a\nFilename: pool/a.deb\nSHA256: {}\n\n\
+             Package: skipped\nVersion: 1\n\n\n\
+             Package: b\nFilename: pool/b.deb\nSHA512: {}\n\n\
+             Package: c\nFilename: pool/c.deb\n",
+            hex_encode(&[0x11; 32]),
+            hex_encode(&[0x22; 64]),
+        );
+        let got = collect_stanzas(input.as_bytes(), Stanza::new()).await;
+        assert_eq!(
+            got,
+            vec![
+                ("pool/a.deb".to_owned(), Some(HashAlgo::Sha256)),
+                ("pool/b.deb".to_owned(), Some(HashAlgo::Sha512)),
+                ("pool/c.deb".to_owned(), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stanza_stream_sha256_only_consumer_ignores_sha512() {
+        let input = format!(
+            "Filename: pool/b.deb\nSHA512: {}\n",
+            hex_encode(&[0x22; 64]),
+        );
+        let got = collect_stanzas(input.as_bytes(), Stanza::new_sha256_only()).await;
+        assert_eq!(got, vec![("pool/b.deb".to_owned(), None)]);
+    }
+
+    #[tokio::test]
+    async fn stanza_stream_overlong_line_does_not_split_a_stanza() {
+        let long = "x".repeat(MAX_METADATA_LINE_LEN + 1);
+        let input = format!(
+            "Filename: pool/a.deb\nProvides: {long}\nSHA256: {}\n\n",
+            hex_encode(&[0x11; 32]),
+        );
+        let got = collect_stanzas(input.as_bytes(), Stanza::new()).await;
+        assert_eq!(got, vec![("pool/a.deb".to_owned(), Some(HashAlgo::Sha256))]);
+    }
+
+    #[tokio::test]
+    async fn stanza_stream_empty_input_and_early_exit() {
+        let mut stream = StanzaStream::new(&b""[..], Stanza::new());
+        assert!(stream.next().await.expect("readable").is_none());
+        assert!(stream.next().await.expect("readable").is_none());
+
+        let input = b"Filename: pool/a.deb\n\nFilename: pool/b.deb\n\n";
+        let mut stream = StanzaStream::new(&input[..], Stanza::new());
+        let first = stream.next().await.expect("readable").expect("first");
+        assert_eq!(first.filename.as_deref(), Some("pool/a.deb"));
+        // Leaving the loop here is the early exit; nothing else is read.
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn stanza_stream_propagates_invalid_utf8_and_ends() {
+        let input = b"Filename: pool/a.deb\n\xff\xfe\n";
+        let mut stream = StanzaStream::new(&input[..], Stanza::new());
+        assert!(stream.next().await.is_err());
+        assert!(stream.next().await.expect("ended").is_none());
     }
 
     #[test]

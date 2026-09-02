@@ -35,7 +35,7 @@ use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::utils::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
 use crate::{
     cache_layout::ResourceKind,
-    index_parser::{self, HashAlgo, IndexFormat},
+    index_parser::{self, HashAlgo, IndexFormat, StanzaStream},
     metrics,
 };
 use crate::{
@@ -863,44 +863,24 @@ pub(crate) async fn ingest_packages_file(
             u64::MAX
         }
     };
-    let mut reader = limits::packages_reader(
+    let reader = limits::packages_reader(
         file,
         compression,
         limits::decompressed_limit(NonZero::new(compressed_size)),
         buffer_size,
     );
 
-    let mut line = String::with_capacity(128);
-    let mut line_buf: Vec<u8> = Vec::with_capacity(128);
-    let mut stanza = index_parser::Stanza::new_sha256_only()
-        .with_source(format!("{host}/{mirror_path} index `{}`", path.display()));
+    let mut stanzas = StanzaStream::new(
+        reader,
+        index_parser::Stanza::new_sha256_only()
+            .with_source(format!("{host}/{mirror_path} index `{}`", path.display())),
+    );
     loop {
-        line.clear();
-        match limits::read_line_capped(
-            &mut *reader,
-            &mut line,
-            &mut line_buf,
-            limits::MAX_METADATA_LINE_LEN,
-        )
-        .await
-        {
-            Ok(limits::CappedLine::Eof) => {
-                flush_stanza_into_registry(&mut stanza, registry, host, mirror_path, format);
-                return Ok(());
+        match stanzas.next().await {
+            Ok(Some(stanza)) => {
+                ingest_stanza_into_registry(stanza, registry, host, mirror_path, format);
             }
-            Ok(limits::CappedLine::Skipped) => {
-                // A line longer than MAX_METADATA_LINE_LEN can't be one of
-                // the fields the stanza parser cares about (Filename,
-                // SHA256, SHA512 are all well under the cap). Treat it as a
-                // non-blank line so the stanza isn't flushed prematurely.
-            }
-            Ok(limits::CappedLine::Line { bytes: _ }) => {
-                if line.trim().is_empty() {
-                    flush_stanza_into_registry(&mut stanza, registry, host, mirror_path, format);
-                } else {
-                    stanza.ingest(&line);
-                }
-            }
+            Ok(None) => return Ok(()),
             Err(err) => {
                 warn!(
                     "Failed to read `{}` during Packages ingestion (may exceed size/line limits); aborting the ingest of this index:  {}",
@@ -963,8 +943,12 @@ pub(crate) async fn ingest_release_file(
     Ok(())
 }
 
-fn flush_stanza_into_registry(
-    stanza: &mut index_parser::Stanza,
+/// Register one stanza's `(Filename, SHA256)` pair. A stanza without a
+/// usable SHA256 (a SHA512-only mirror leaves every stanza that way, so deb
+/// verification stays off for the whole archive) was already warned about
+/// by [`StanzaStream`] and registers nothing.
+fn ingest_stanza_into_registry(
+    stanza: &index_parser::Stanza,
     registry: &ChecksumRegistry,
     host: &str,
     mirror_path: &str,
@@ -975,18 +959,7 @@ fn flush_stanza_into_registry(
         && let Some(key) = index_parser::registry_key_from_filename_field(filename, format)
     {
         registry.insert(host, mirror_path, &key, sha256);
-    } else if let Some(filename) = stanza.filename.as_deref()
-        && stanza.sha256.is_none()
-    {
-        // A mirror publishing only SHA512 leaves every stanza digest-less,
-        // so the registry stays empty and deb verification is silently off
-        // for that whole archive.
-        warn_once_or_debug!(
-            "Packages stanza for `{}` from host {host} carries no SHA256; deb verification stays unavailable for this mirror",
-            filename.escape_debug()
-        );
     }
-    stanza.reset();
 }
 
 #[cfg(test)]
