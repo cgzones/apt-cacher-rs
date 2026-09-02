@@ -39,7 +39,7 @@ use crate::{
     humanfmt::HumanFmt,
     metrics,
     task_cache_scan::{CacheScanError, task_cache_scan},
-    warn_once_or_debug,
+    warn_once_or_debug, warn_once_or_info,
 };
 #[cfg(feature = "hyper")]
 use crate::{build_info::APP_USER_AGENT, scheme_cache};
@@ -527,34 +527,56 @@ pub(crate) async fn main_loop(
             n = listener.accept() => n
         };
 
-        let (stream, client) = next
-            .map(|(stream, client)| (stream, ClientInfo::new(client)))
-            .inspect_err(|err| {
+        let (stream, client) = match next {
+            Ok((stream, client)) => (stream, ClientInfo::new(client)),
+            // Descriptor/buffer exhaustion and a peer that reset before
+            // accept() are load conditions, not listener faults: an idle
+            // connection flood must degrade service, never stop the daemon.
+            // Back off briefly so a saturated loop does not spin.
+            Err(err) if is_transient_accept_error(&err) => {
+                metrics::ACCEPT_TRANSIENT_FAILURES.increment();
+                warn_once_or_info!(
+                    "Failed to accept a client connection; retrying after {}:  {}",
+                    HumanFmt::Time(ACCEPT_RETRY_DELAY),
+                    ErrorReport(&err)
+                );
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+            Err(err) => {
                 error!(
                     "Failed to accept a client connection; stopping the daemon:  {}",
-                    ErrorReport(err)
+                    ErrorReport(&err)
                 );
-            })
-            .map_err(MainLoopError::Io)?;
+                return Err(MainLoopError::Io(err));
+            }
+        };
 
         metrics::CONNECTIONS_ACCEPTED.increment();
 
-        let Some(client_counter) = client_counter::ClientCounter::try_new(
+        let client_counter = match client_counter::ClientCounter::try_new(
             client.ip(),
             config.max_connections_per_client_ip,
-        ) else {
-            // Per rejected connection, on exactly the path a flood exercises.
-            warn_once_or_debug!(
-                "Rejecting connection from client {client}: \
-                 `max_connections_per_client_ip` ({}) reached, closing the socket without a response",
-                config
-                    .max_connections_per_client_ip
-                    .expect("limit reached implies a configured cap")
-            );
-            // Drop the stream; closing the socket is the cheapest available
-            // signal — sending a 503 would itself be subject to the same load.
-            drop(stream);
-            continue;
+            config.max_connections,
+        ) {
+            Ok(counter) => counter,
+            Err(cap) => {
+                // Per rejected connection, on exactly the path a flood exercises.
+                match cap {
+                    client_counter::ConnectionCap::PerIp(max) => warn_once_or_debug!(
+                        "Rejecting connection from client {client}: \
+                         `max_connections_per_client_ip` ({max}) reached, closing the socket without a response"
+                    ),
+                    client_counter::ConnectionCap::Global(max) => warn_once_or_debug!(
+                        "Rejecting connection from client {client}: \
+                         `max_connections` ({max}) reached, closing the socket without a response"
+                    ),
+                }
+                // Drop the stream; closing the socket is the cheapest available
+                // signal — sending a 503 would itself be subject to the same load.
+                drop(stream);
+                continue;
+            }
         };
 
         debug!("New client connection from {client}");
@@ -578,5 +600,48 @@ pub(crate) async fn main_loop(
 
             drop(client_counter);
         });
+    }
+}
+
+/// Pause after a transient `accept(2)` failure before retrying.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Whether an `accept(2)` error is a passing load condition worth retrying
+/// (descriptor or buffer exhaustion, a peer gone before accept) rather than
+/// a broken listener.
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
+    let Some(errno) = err.raw_os_error().map(nix::errno::Errno::from_raw) else {
+        return false;
+    };
+    errno == nix::errno::Errno::EMFILE
+        || errno == nix::errno::Errno::ENFILE
+        || errno == nix::errno::Errno::ENOBUFS
+        || errno == nix::errno::Errno::ENOMEM
+        || errno == nix::errno::Errno::ECONNABORTED
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::*;
+
+    #[test]
+    fn fd_and_buffer_exhaustion_are_transient() {
+        for errno in [
+            nix::errno::Errno::EMFILE,
+            nix::errno::Errno::ENFILE,
+            nix::errno::Errno::ENOBUFS,
+            nix::errno::Errno::ENOMEM,
+            nix::errno::Errno::ECONNABORTED,
+        ] {
+            let err = std::io::Error::from_raw_os_error(errno as i32);
+            assert!(is_transient_accept_error(&err), "{errno}");
+        }
+    }
+
+    #[test]
+    fn other_accept_errors_are_fatal() {
+        let err = std::io::Error::from_raw_os_error(nix::errno::Errno::EBADF as i32);
+        assert!(!is_transient_accept_error(&err));
+        assert!(!is_transient_accept_error(&std::io::Error::other("x")));
     }
 }

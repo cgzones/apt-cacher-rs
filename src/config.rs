@@ -36,6 +36,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer};
 use tracing::level_filters::LevelFilter;
 
+use crate::client_counter;
 use crate::humanfmt::HumanFmt;
 use crate::limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::nonzero;
@@ -830,6 +831,14 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) max_connections_per_client_ip: Option<NonZero<usize>>,
 
+    /// Maximum number of concurrent accepted connections across all clients
+    /// (plain HTTP and CONNECT tunnels alike); excess connections are closed
+    /// at accept time.  `None` means unlimited.  Defaults to three quarters
+    /// of the soft `RLIMIT_NOFILE` so an idle-connection flood cannot drive
+    /// `accept(2)` into `EMFILE` and starve cache files and upstream sockets.
+    #[serde(deserialize_with = "from_nonzero_usize")]
+    pub(crate) max_connections: Option<NonZero<usize>>,
+
     /// Minimum transfer rate (in bytes per second) for downloads and uploads.
     /// Connections that fail to fulfill this limit are cancelled.
     #[serde(deserialize_with = "from_nonzero_usize_with_magnitude")]
@@ -957,6 +966,7 @@ impl Default for Config {
             https_tunnel_allowed_mirrors: Vec::new(),
             https_tunnel_max_connections_per_client: Some(nonzero!(10)),
             max_connections_per_client_ip: None,
+            max_connections: Some(client_counter::default_max_connections()),
             min_download_rate: Some(nonzero!(10000)), // 10 kB/s
             rate_check_timeframe: DEFAULT_RATE_CHECK_TIMEFRAME,
             max_upstream_downloads: Some(nonzero!(20)),

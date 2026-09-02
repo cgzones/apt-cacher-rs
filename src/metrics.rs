@@ -113,6 +113,11 @@ pub(crate) static SERVED_WEBUI: Counter = Counter::new();
 /// `max_connections_per_client_ip` are included here and also counted
 /// in `CONNECTION_REJECTED_PER_IP_CAP`.
 pub(crate) static CONNECTIONS_ACCEPTED: Counter = Counter::new();
+/// `accept(2)` failures the listener loop retried instead of stopping the
+/// daemon: EMFILE/ENFILE (descriptor exhaustion), ENOBUFS/ENOMEM, and
+/// ECONNABORTED.  Climbing values mean the process is at its fd budget --
+/// check `max_connections` against `LimitNOFILE`.
+pub(crate) static ACCEPT_TRANSIENT_FAILURES: Counter = Counter::new();
 
 /// Upstream response class buckets (2xx/3xx/4xx/5xx/other).
 pub(crate) static UPSTREAM_STATUS_2XX: Counter = Counter::new();
@@ -218,6 +223,11 @@ pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();
 /// cap (`max_connections_per_client_ip`) was reached. Climbing values
 /// indicate a noisy or malicious source IP; consider alerting.
 pub(crate) static CONNECTION_REJECTED_PER_IP_CAP: Counter = Counter::new();
+/// Connections rejected at accept time because the global cap
+/// (`max_connections`) was reached.  Climbing values mean the daemon is at
+/// its connection budget: either a flood, or a cap sized below the real
+/// client population (raise `max_connections` and `LimitNOFILE` together).
+pub(crate) static CONNECTION_REJECTED_GLOBAL_CAP: Counter = Counter::new();
 
 /// Highest concurrent connection count observed from any single source IP.
 /// Only updated when `max_connections_per_client_ip` is configured (the

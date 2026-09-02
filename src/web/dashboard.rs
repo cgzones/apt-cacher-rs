@@ -321,6 +321,13 @@ fn build_daemon_status_html(
             metrics::CONNECTED_CLIENTS_PEAK.get(),
         ),
     );
+    if let Some(cap) = rd.config.max_connections {
+        t.row_tip(
+            "Connection Cap (global)",
+            "`max_connections`: connections beyond it are closed at accept time. Defaults to three quarters of the soft RLIMIT_NOFILE.",
+            cap,
+        );
+    }
     if let Some(cap) = rd.config.max_connections_per_client_ip {
         t.row_tip(
             "Per-Client-IP Connections (peak / cap)",

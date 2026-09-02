@@ -615,6 +615,16 @@ pub(super) fn build_metrics_html() -> String {
         "Plain-HTTP connections dropped at accept time because `max_connections_per_client_ip` was reached. Stays at 0 unless the cap is configured; climbing values point to a noisy or malicious source IP.",
         WarnNonzero(metrics::CONNECTION_REJECTED_PER_IP_CAP.get()),
     );
+    t.row_tip(
+        "Accept Failures (retried)",
+        "accept(2) failures retried after a short pause instead of stopping the daemon: descriptor exhaustion (EMFILE/ENFILE), ENOBUFS/ENOMEM, ECONNABORTED. Climbing values mean the process is at its file-descriptor budget.",
+        WarnNonzero(metrics::ACCEPT_TRANSIENT_FAILURES.get()),
+    );
+    t.row_tip(
+        "Connections Rejected (global cap)",
+        "Connections dropped at accept time because `max_connections` was reached. Climbing values mean a flood or a cap sized below the real client population.",
+        WarnNonzero(metrics::CONNECTION_REJECTED_GLOBAL_CAP.get()),
+    );
     t.finish()
 }
 
