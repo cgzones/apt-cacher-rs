@@ -1571,14 +1571,15 @@ async fn serve_new_file(
         CacheFileStat::New => (true, 0),
     };
 
-    let mut host = None;
-
     for (name, value) in req.headers() {
         match name {
+            // `Host` is deliberately NOT taken from the client: the ACL and
+            // the cache key come from the request-target authority, and a
+            // client-chosen `Host` would select another vhost on the same
+            // server while the response is cached under the permitted one.
             &USER_AGENT | &RANGE | &IF_RANGE | &ACCEPT | &IF_MODIFIED_SINCE | &CACHE_CONTROL
-            | &CONNECTION => (),
+            | &CONNECTION | &HOST => (),
             n if n == PROXY_CONNECTION => (),
-            &HOST => host = Some(value),
 
             _ => {
                 metrics::UNHANDLED_REQUEST_HEADERS.increment();
@@ -1589,15 +1590,10 @@ async fn serve_new_file(
             }
         }
     }
-    // mark immutable
-    let host = match host {
-        Some(h) => h,
-        None => {
-            // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers
-            &HeaderValue::from_str(&conn_details.mirror.format_authority())
-                .expect("connection host should be valid")
-        }
-    };
+    // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers
+    let host = HeaderValue::from_str(&conn_details.mirror.format_authority())
+        .expect("connection host should be valid");
+    let host = &host;
 
     let mut req_uri = Cow::Borrowed(req.uri());
 
@@ -2684,6 +2680,11 @@ async fn pre_process_client_request(
     parts
         .headers
         .insert(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT));
+    // Same rule as the cache-fetch path: the upstream `Host` is the
+    // request-target authority, never the client's own header.
+    if let Some(authority) = parts.uri.authority() {
+        parts.headers.insert(HOST, host_header_from_uri(authority));
+    }
 
     // TODO: tweak http version?
     let fwd_request = Request::from_parts(parts, Empty::new());
