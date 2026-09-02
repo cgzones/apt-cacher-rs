@@ -1887,9 +1887,6 @@ async fn splice_proxy_drive(
     )
     .await?;
 
-    // Uncork before entering the splice loop, which uses SPLICE_F_MORE for coalescing
-    drop(cork);
-
     // Client-rate-window end after the prefix write; covers
     // the case where the splice loop never runs (whole body in the prefix).
     // Reassigned after the splice body block and the demoted file-serve task.
@@ -1906,6 +1903,14 @@ async fn splice_proxy_drive(
         &mut rates,
     )
     .await?;
+
+    // Uncork only now. The client splice in `body.rs::tee_and_splice` sets
+    // SPLICE_F_MORE on every chunk, including the last, and SPLICE_F_MORE
+    // becomes MSG_MORE: the kernel holds the final sub-MSS segment until the
+    // peer ACKs, which for a client with nothing left to send is its delayed
+    // ACK, up to 200 ms later. The uncork is what flushes that tail, so the
+    // guard has to outlive the body — the same lifetime `volatile.rs` keeps.
+    drop(cork);
 
     // The full upstream body is now drained: either the splice loop consumed
     // exactly `splice_count` bytes, or `splice_count` was 0 because the whole
