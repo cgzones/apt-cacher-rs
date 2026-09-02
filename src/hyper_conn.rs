@@ -1650,9 +1650,12 @@ async fn serve_new_file(
     // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
     // `partial.discard_resume()` is used only when a stale partial must be
     // discarded (200 fallback from unsupported Range, 416, invalid Content-Range).
-    let (resume_offset, resume_expected_total, resume_if_range, mut partial) = if conn_details
-        .cached_flavor
-        == CachedFlavor::Permanent
+    let utils::PartialResume {
+        offset: resume_offset,
+        expected_total: resume_expected_total,
+        if_range: resume_if_range,
+        mut partial,
+    } = if conn_details.cached_flavor == CachedFlavor::Permanent
         && matches!(cfstate, CacheFileStat::New)
     {
         match utils::prepare_partial_resume(
@@ -1663,10 +1666,8 @@ async fn serve_new_file(
         )
         .await
         {
-            Ok(r) => (r.offset, r.expected_total, r.if_range, r.partial),
-            Err(utils::PartialOpenError::NotFound(guard)) => {
-                (0, None, None, utils::PartialDownload::Fresh(guard))
-            }
+            Ok(r) => r,
+            Err(utils::PartialOpenError::NotFound(guard)) => utils::PartialResume::fresh(guard),
             Err(utils::PartialOpenError::Failed {
                 logged: _logged,
                 guard,
@@ -1677,7 +1678,7 @@ async fn serve_new_file(
             }
         }
     } else {
-        (0, None, None, utils::PartialDownload::Volatile)
+        utils::PartialResume::volatile()
     };
 
     let fwd_request = build_fwd_request(

@@ -346,10 +346,12 @@ mod tests {
             .await
             .expect("lstat")
             .file_type();
+        // The counter is process-global and other unit tests in this binary
+        // bump it concurrently, so assert the delta as a lower bound.
         let before = metrics::CACHE_NON_REGULAR.get();
         let out = handle_anomalous_entry(&link, ft, DirAction::Skip).await;
         assert!(matches!(out, AnomalyOutcome::Removed));
-        assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
+        assert!(metrics::CACHE_NON_REGULAR.get() > before);
         assert!(!link.exists());
     }
 
@@ -362,10 +364,12 @@ mod tests {
             .await
             .expect("lstat")
             .file_type();
+        // The counter is process-global and other unit tests in this binary
+        // bump it concurrently, so assert the delta as a lower bound.
         let before = metrics::CACHE_DIRECTORY_UNEXPECTED.get();
         let out = handle_anomalous_entry(&sub, ft, DirAction::Skip).await;
         assert!(matches!(out, AnomalyOutcome::Skipped));
-        assert_eq!(metrics::CACHE_DIRECTORY_UNEXPECTED.get(), before + 1);
+        assert!(metrics::CACHE_DIRECTORY_UNEXPECTED.get() > before);
         assert!(sub.exists());
     }
 

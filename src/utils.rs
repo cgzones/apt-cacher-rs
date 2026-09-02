@@ -337,7 +337,6 @@ impl PartialResume {
 
     /// A volatile file: no partial-file semantics, the download starts at
     /// byte 0 into a random temp file.
-    #[cfg(feature = "splice")]
     pub(crate) fn volatile() -> Self {
         Self {
             offset: 0,
