@@ -42,6 +42,7 @@ use http::{StatusCode, uri::Uri};
 use tracing::{debug, trace};
 
 use crate::{
+    build_info::APP_VIA_PSEUDONYM,
     cache_layout::{self, ClassifyError, ConnectionDetails},
     client_info::ClientInfo,
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
@@ -91,6 +92,11 @@ pub(crate) enum RejectReason {
     /// (`/Packages.diff/T-...`, `/Sources.diff/T-...`,
     /// `/Translation-XX.diff/T-...`).
     DiffRequest,
+    /// The request's `Via` already names this proxy: it was asked to fetch
+    /// from itself (a wildcard `allowed_mirrors` entry covering its own
+    /// name).  Forwarding would loop and would let the loopback hop evaluate
+    /// the web-interface ACL for the outer client.
+    LoopDetected,
 }
 
 impl RejectReason {
@@ -110,6 +116,7 @@ impl RejectReason {
                 (StatusCode::BAD_REQUEST, "Unsupported request")
             }
             Self::DiffRequest => (StatusCode::GONE, "Diff requests are not supported"),
+            Self::LoopDetected => (StatusCode::LOOP_DETECTED, "Proxy loop detected"),
         }
     }
 }
@@ -186,6 +193,28 @@ pub(crate) fn preflight_method(
             Err(RejectReason::UnsupportedMethod)
         }
     }
+}
+
+/// Loop gate shared by both backends: a `Via` element whose received-by
+/// token is this proxy's pseudonym means the request has already passed
+/// through here (RFC 9110 §7.6.3).  `via_values` are the raw `Via` header
+/// values of the request, comma lists included.
+pub(crate) fn preflight_via<'a>(
+    via_values: impl IntoIterator<Item = &'a str>,
+    client: &ClientInfo,
+) -> Result<(), RejectReason> {
+    let names_us = via_values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .any(|element| element.split_whitespace().nth(1) == Some(APP_VIA_PSEUDONYM));
+    if names_us {
+        warn_once_or_info!(
+            "Request from client {client} already passed through this proxy (Via names `{APP_VIA_PSEUDONYM}`); returning 508"
+        );
+        metrics::PROXY_LOOP_REJECTED.increment();
+        return Err(RejectReason::LoopDetected);
+    }
+    Ok(())
 }
 
 /// Where an accepted `GET` is headed.

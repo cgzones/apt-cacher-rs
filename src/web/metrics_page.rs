@@ -209,6 +209,11 @@ pub(super) fn build_metrics_html() -> String {
         ),
     );
     t.row_tip(
+        "Proxy Loops Rejected",
+        "Requests refused with 508 because their `Via` already named this proxy. Any value means an `allowed_mirrors` wildcard covers the proxy's own name.",
+        WarnNonzero(metrics::PROXY_LOOP_REJECTED.get()),
+    );
+    t.row_tip(
         "Uncacheable Evictions",
         "Recent uncacheable (host, path) entries evicted from the in-memory ring buffer because of overflow.",
         format_args!(

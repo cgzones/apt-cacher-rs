@@ -228,6 +228,10 @@ pub(crate) static CONNECTION_REJECTED_PER_IP_CAP: Counter = Counter::new();
 /// its connection budget: either a flood, or a cap sized below the real
 /// client population (raise `max_connections` and `LimitNOFILE` together).
 pub(crate) static CONNECTION_REJECTED_GLOBAL_CAP: Counter = Counter::new();
+/// Requests refused with 508 because their `Via` already named this proxy:
+/// the proxy was asked to fetch from itself.  Any value means an
+/// `allowed_mirrors` wildcard covers the proxy's own name.
+pub(crate) static PROXY_LOOP_REJECTED: Counter = Counter::new();
 
 /// Highest concurrent connection count observed from any single source IP.
 /// Only updated when `max_connections_per_client_ip` is configured (the

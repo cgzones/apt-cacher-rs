@@ -8,6 +8,9 @@ pub(crate) const APP_USER_AGENT: &str =
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
 pub(crate) const APP_VIA: &str = concat!("1.1 ", env!("CARGO_PKG_NAME"));
+/// The received-by token of [`APP_VIA`]: what an incoming `Via` element
+/// carries when the request already passed through this proxy.
+pub(crate) const APP_VIA_PSEUDONYM: &str = env!("CARGO_PKG_NAME");
 
 #[must_use]
 #[inline]

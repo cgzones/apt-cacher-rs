@@ -84,7 +84,7 @@ use crate::{
     rate_log,
     request_dispatch::{
         ClientAcls, DispatchOutcome, PassthroughReason, RequestKind, RequestTarget,
-        dispatch_request, preflight_method, preflight_target,
+        dispatch_request, preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
     scheme_cache, static_assert, tunnel_limiter,
@@ -2629,6 +2629,16 @@ async fn pre_process_client_request(
                     let (status, msg) = reason.response_parts();
                     return quick_response(status, msg);
                 }
+            }
+
+            let via_values = req
+                .headers()
+                .get_all(VIA)
+                .iter()
+                .filter_map(|v| v.to_str().ok());
+            if let Err(reason) = preflight_via(via_values, &client) {
+                let (status, msg) = reason.response_parts();
+                return quick_response(status, msg);
             }
 
             let (requested_host, requested_port) = match preflight_target(

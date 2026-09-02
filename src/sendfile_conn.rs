@@ -28,7 +28,7 @@ use std::{
 use bytes::{BytesMut, buf::Buf as _};
 use http::{
     StatusCode,
-    header::{CONNECTION, HOST},
+    header::{CONNECTION, HOST, VIA},
 };
 use nix::sys::sendfile::sendfile;
 #[cfg(feature = "hyper")]
@@ -77,7 +77,7 @@ use crate::{
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
     request_dispatch::{
         ClientAcls, DispatchOutcome, RejectReason, RequestKind, RequestTarget, dispatch_request,
-        preflight_method, preflight_target,
+        preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, WireBody},
     static_assert, swrite, tunnel_limiter,
@@ -629,7 +629,8 @@ fn reject_result(
         | RejectReason::UnsupportedMethod
         | RejectReason::UnsupportedScheme
         | RejectReason::MissingHost
-        | RejectReason::InvalidPort => ZeroCopyResult::Invalid { status, msg },
+        | RejectReason::InvalidPort
+        | RejectReason::LoopDetected => ZeroCopyResult::Invalid { status, msg },
     }
 }
 
@@ -994,6 +995,15 @@ async fn try_sendfile_request(
         Err(reason) => {
             return reject_result(reason, || compute_conn_action(&req, *conn_version, &client));
         }
+    }
+
+    let via_values = req
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case(VIA.as_str()))
+        .filter_map(|h| str::from_utf8(h.value).ok());
+    if let Err(reason) = preflight_via(via_values, &client) {
+        return reject_result(reason, || compute_conn_action(&req, *conn_version, &client));
     }
 
     let uri = match req
