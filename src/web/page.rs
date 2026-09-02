@@ -253,18 +253,18 @@ pub(super) const CSS: &str = r#"
     --section-shadow: light-dark(0 1px 3px rgba(0,0,0,0.06), 0 1px 3px rgba(0,0,0,0.3));
     --h-fg: light-dark(#2c3e50, #c0d0e8);
     --h-accent: light-dark(#4a7bcc, #6fa3e8);
-    --th-bg: light-dark(#4a7bcc, #3a5080);
+    --th-bg: light-dark(#3a63a8, #3a5080);
     --th-fg: #fff;
     --td-border: light-dark(#eee, #2a3040);
     --row-hover-bg: light-dark(#f0f4ff, #2a3550);
-    --details-key-fg: light-dark(#6b7b8d, #7a8a9d);
+    --details-key-fg: light-dark(#5b6878, #8a99ab);
     --details-val-fg: light-dark(#2c3e50, #c0d0e8);
     --details-hover-bg: light-dark(#f0f6ff, #2a3550);
-    --link: light-dark(#4a7bcc, #6fa3e8);
+    --link: light-dark(#2f5fa8, #6fa3e8);
     --count-bg: light-dark(rgba(128,128,128,0.15), rgba(111,163,232,0.2));
-    --footer-fg: light-dark(#888, #6a7a8a);
-    --ok: light-dark(#2e8b3d, #6cc070);
-    --warn: light-dark(#b87a18, #e6b855);
+    --footer-fg: light-dark(#6b7280, #7e8d9c);
+    --ok: light-dark(#217a31, #6cc070);
+    --warn: light-dark(#8f5e0f, #e6b855);
     --alert: light-dark(#c0392b, #e88a8a);
     --error-fg: light-dark(#b23a3a, #e88a8a);
 }
