@@ -2,7 +2,7 @@
 //! `user.apt_cacher_rs.*` attribute the daemon persists.
 //!
 //! A persisted attribute is a type implementing [`XattrValue`] (`ETag`,
-//! `LastModified`, [`ExpectedSize`], cleanup's `CleanupMarker`); the generic
+//! `LastModified`, [`ExpectedSize`], [`verified_marker::CleanupMarker`]); the generic
 //! [`try_read`] / [`read`] / [`write`] / [`remove`] helpers own the whole
 //! degradation policy once - the `XATTR_SUPPORTED` short-circuit, the
 //! absent/unsupported/`ENODATA` collapse to `None`, the malformed-value scrub
@@ -19,7 +19,7 @@
 //! `current_thread` runtime (including `#[tokio::test]` without
 //! `flavor = "multi_thread"`) will **panic**. The [`std::fs::File`] impl
 //! issues the syscall directly and is for callers already on a blocking
-//! thread (cleanup's digest verification).
+//! thread (cleanup's digest verification and `integrity::verify_temp_file`).
 
 use std::{
     borrow::Cow,
