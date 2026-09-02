@@ -564,13 +564,15 @@ mod tests {
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
 
         let before = metrics::CACHE_NON_REGULAR.get();
-        let (logged, guard) = match open_partial_file(path.clone(), "").await {
-            Err(PartialOpenError::Failed { logged, guard }) => (logged, guard),
+        let guard = match open_partial_file(path.clone(), "").await {
+            Err(PartialOpenError::Failed {
+                logged: Logged { .. },
+                guard,
+            }) => guard,
             Ok(_) | Err(PartialOpenError::NotFound(_)) => {
                 unreachable!("a FIFO is not a partial")
             }
         };
-        let _proof: Logged = logged;
         assert!(
             metrics::CACHE_NON_REGULAR.get() > before,
             "the anomaly is counted"

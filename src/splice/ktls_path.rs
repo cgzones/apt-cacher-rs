@@ -616,7 +616,7 @@ impl<'a> KtlsHandshake<'a> {
         handshake_result.map_err(KtlsError::TlsFailed)
     }
 
-    /// Phase 2 of 5: process any pending records (e.g. NewSessionTickets from
+    /// Phase 2 of 5: process any pending records (e.g. `NewSessionTickets` from
     /// TLS 1.3), then encrypt and send the HTTP request. Returns the instant
     /// the encrypted request was transmitted -- the start of the
     /// upstream-rate window.

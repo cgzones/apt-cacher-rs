@@ -1656,7 +1656,7 @@ mod tests {
         // Second buffer: just the `\n` that finishes the closing CRLF.
         let part2: &[u8] = b"\n";
         let (body2, c2) = feed_collect(&mut decoder, part2).expect("part2 decode");
-        assert!(body2.is_empty());
+        assert_eq!(body2, b"");
         assert_eq!(c2, Consumed { raw: 1, done: true });
     }
 
@@ -1717,7 +1717,7 @@ mod tests {
         let mut body = Vec::new();
         for part in [&b"a"[..], b";", b"x", b"\r", b"\n"] {
             let (payload, consumed) = feed_collect(&mut decoder, part).expect("size line piece");
-            assert!(payload.is_empty());
+            assert_eq!(payload, b"");
             assert_eq!(
                 consumed,
                 Consumed {
@@ -1824,7 +1824,7 @@ mod tests {
         // 64 bytes without a CRLF are still tolerated (the cap is `> 64`).
         let (body, consumed) =
             dechunk_once(&long_line[..64], 1024).expect("64-byte size line still pending");
-        assert!(body.is_empty());
+        assert_eq!(body, b"");
         assert_eq!(
             consumed,
             Consumed {

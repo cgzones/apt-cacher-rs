@@ -553,7 +553,10 @@ pub(crate) async fn main_loop(
         let appstate = appstate.clone();
         tokio::task::spawn(async move {
             #[cfg(feature = "sendfile")]
-            sendfile_conn::handle_sendfile_connection(stream, client, appstate).await;
+            Box::pin(sendfile_conn::handle_sendfile_connection(
+                stream, client, appstate,
+            ))
+            .await;
 
             #[cfg(not(feature = "sendfile"))]
             handle_hyper_connection(stream, client, appstate, None).await;

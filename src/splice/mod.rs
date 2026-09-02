@@ -337,18 +337,16 @@ async fn resolve_client_range(
     total: u64,
     phase_416: &'static str,
 ) -> Result<Option<ClientRangePlan>, SpliceProxyError> {
-    match ClientRangePlan::from_parsed(parsed, total) {
-        Ok(plan) => Ok(Some(plan)),
-        Err(RangeNotSatisfiable) => {
-            write_416_response(client.stream, client.version, client.action, total)
-                .await
-                .map_err(|err| SpliceProxyError::Client {
-                    phase: phase_416,
-                    err,
-                })?;
-            Ok(None)
-        }
+    if let Ok(plan) = ClientRangePlan::from_parsed(parsed, total) {
+        return Ok(Some(plan));
     }
+    write_416_response(client.stream, client.version, client.action, total)
+        .await
+        .map_err(|err| SpliceProxyError::Client {
+            phase: phase_416,
+            err,
+        })?;
+    Ok(None)
 }
 
 /// Render the `200 OK` / `206 Partial Content` head of a splice-served body:
@@ -892,10 +890,10 @@ async fn reject_if_verify_throttled(
 
 /// Check for a partial download file to resume (permanent files only).
 /// Opens the file upfront (if it exists and is non-empty) to get size + mtime
-/// from the same file descriptor, avoiding TOCTOU races between metadata() and open().
-/// The guard uses keep_on_drop: true so the partial file survives on fallback
+/// from the same file descriptor, avoiding TOCTOU races between `metadata()` and `open()`.
+/// The guard uses `keep_on_drop: true` so the partial file survives on fallback
 /// (e.g., concurrent download → hyper path picks it up for resume).
-/// Explicit guard.remove() is used only when a stale partial must be discarded.
+/// Explicit `guard.remove()` is used only when a stale partial must be discarded.
 async fn open_partial_resume(
     ibarrier: &InitBarrier<'_>,
     conn_details: &ConnectionDetails,
@@ -982,8 +980,8 @@ async fn read_volatile_validators(
 /// redirect (301/302/307/308) if the target host is allowed -- no loops,
 /// matching hyper -- and does so first, before the resume/304/passthrough
 /// handling, so those all operate on the (possibly redirected) response,
-/// mirroring hyper_conn.rs which follows the redirect before its
-/// NOT_MODIFIED check. Then discards malformed validators, counts a fresh
+/// mirroring `hyper_conn.rs` which follows the redirect before its
+/// `NOT_MODIFIED` check. Then discards malformed validators, counts a fresh
 /// volatile body, and classifies the head; a resume anomaly discards the
 /// partial (re-fetching without `Range` when the response is unusable) and
 /// re-plans the fresh head. No reconnect helper runs past this point, so
@@ -1154,7 +1152,7 @@ async fn relay_passthrough(
 }
 
 /// Answer a protocol-violating or unusable upstream response with a 502.
-/// Body bytes in the header_buf tail or on the socket cannot be safely
+/// Body bytes in the `header_buf` tail or on the socket cannot be safely
 /// skipped, so the connection does not return to the pool.
 async fn reject_upstream_response(
     upstream: &mut PoolGuard,
@@ -1252,7 +1250,7 @@ fn log_download_start(
 /// For resumed downloads, send the existing partial file content to the
 /// client first using sendfile(2) for zero-copy transfer from the cache file
 /// to the client socket. With a client Range, only send the overlap of
-/// [0, resume_offset) with the range. Returns the bytes sent.
+/// `[0, resume_offset)` with the range. Returns the bytes sent.
 async fn send_resumed_prefix(
     client_stream: &TcpStream,
     temppath: &TempPath,

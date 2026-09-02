@@ -394,6 +394,10 @@ where
 }
 
 #[cfg(feature = "mmap")]
+#[expect(
+    clippy::inline_always,
+    reason = "function has only 1 caller and is a tail call"
+)]
 #[inline(always)]
 fn serve_cached_file_mmap(
     conn_details: ConnectionDetails,
@@ -2582,76 +2586,74 @@ async fn pre_process_client_request(
     };
 
     let (req, passthrough_reason, requested_host, requested_port, passthrough_request_received_at) =
-        match passthrough {
-            Some((reason, requested_host, requested_port, request_received_at)) => (
+        if let Some((reason, requested_host, requested_port, request_received_at)) = passthrough {
+            (
                 strip_request_body(client, req),
                 reason,
                 requested_host,
                 requested_port,
                 request_received_at,
-            ),
-            None => {
-                metrics::REQUESTS_TOTAL.increment();
+            )
+        } else {
+            metrics::REQUESTS_TOTAL.increment();
 
-                let acls = ClientAcls::from(global_config());
+            let acls = ClientAcls::from(global_config());
 
-                match preflight_method(req.method().as_str(), &client, &acls) {
-                    Ok(RequestKind::Connect) => return connect_response(client, req),
-                    Ok(RequestKind::Get) => {}
-                    Err(reason) => {
-                        let (status, msg) = reason.response_parts();
-                        return quick_response(status, msg);
-                    }
+            match preflight_method(req.method().as_str(), &client, &acls) {
+                Ok(RequestKind::Connect) => return connect_response(client, req),
+                Ok(RequestKind::Get) => {}
+                Err(reason) => {
+                    let (status, msg) = reason.response_parts();
+                    return quick_response(status, msg);
                 }
+            }
 
-                let (requested_host, requested_port) = match preflight_target(
-                    req.uri(),
-                    req.version() == http::Version::HTTP_11,
-                    || req.headers().contains_key(HOST),
-                    &client,
-                    &acls,
-                ) {
-                    Ok(RequestTarget::Proxy { host, port }) => (host, port),
-                    Ok(RequestTarget::WebUi) => {
-                        return serve_web_interface(req.uri(), &appstate)
-                            .await
-                            .into_hyper_response();
-                    }
-                    Err(reason) => {
-                        let (status, msg) = reason.response_parts();
-                        return quick_response(status, msg);
-                    }
-                };
-
-                let requested_host = match authorize_cache_access(&client, requested_host) {
-                    Ok(rh) => rh,
-                    Err((status, msg)) => return quick_response(status, msg),
-                };
-
-                let req = strip_request_body(client, req);
-
-                match dispatch_request(req.uri().path(), requested_host, requested_port, &client)
-                    .await
-                {
-                    DispatchOutcome::Cache(conn_details) => {
-                        return process_cache_request(conn_details, req, appstate).await;
-                    }
-                    DispatchOutcome::Reject(reason) => {
-                        let (status, msg) = reason.response_parts();
-                        return quick_response(status, msg);
-                    }
-                    DispatchOutcome::Passthrough {
-                        reason,
-                        requested_host,
-                        request_received_at,
-                    } => (
-                        req,
-                        reason,
-                        requested_host,
-                        requested_port,
-                        request_received_at,
-                    ),
+            let (requested_host, requested_port) = match preflight_target(
+                req.uri(),
+                req.version() == http::Version::HTTP_11,
+                || req.headers().contains_key(HOST),
+                &client,
+                &acls,
+            ) {
+                Ok(RequestTarget::Proxy { host, port }) => (host, port),
+                Ok(RequestTarget::WebUi) => {
+                    return serve_web_interface(req.uri(), &appstate)
+                        .await
+                        .into_hyper_response();
                 }
+                Err(reason) => {
+                    let (status, msg) = reason.response_parts();
+                    return quick_response(status, msg);
+                }
+            };
+
+            let requested_host = match authorize_cache_access(&client, requested_host) {
+                Ok(rh) => rh,
+                Err((status, msg)) => return quick_response(status, msg),
+            };
+
+            let req = strip_request_body(client, req);
+
+            match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await
+            {
+                DispatchOutcome::Cache(conn_details) => {
+                    return process_cache_request(conn_details, req, appstate).await;
+                }
+                DispatchOutcome::Reject(reason) => {
+                    let (status, msg) = reason.response_parts();
+                    return quick_response(status, msg);
+                }
+                DispatchOutcome::Passthrough {
+                    reason,
+                    requested_host,
+                    request_received_at,
+                } => (
+                    req,
+                    reason,
+                    requested_host,
+                    requested_port,
+                    request_received_at,
+                ),
             }
         };
 

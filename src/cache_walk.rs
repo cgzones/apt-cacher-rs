@@ -52,8 +52,8 @@ use crate::{error::ErrorReport, log_once::Logged, metrics};
 pub(crate) struct WalkContext {
     /// Noun (with article) naming the tree in every line: `"the cache
     /// directory"`, `"a mirror directory"`, `"a by-hash directory"`.  Reads
-    /// as `Failed to read {what} `path``, `Unrecognized symlink entry `path`
-    /// in {what}; ...`.
+    /// as `Failed to read {what} <path>` and `Unrecognized symlink entry
+    /// <path> in {what}; ...`.
     pub(crate) what: &'static str,
     /// What a failed `read_dir` / `next_entry` does to the walk, carrying
     /// the consequence clause of its error line.
@@ -244,7 +244,7 @@ impl<T: Copy + Send + Sync> Walker<T> {
         let open = self.current.as_ref()?;
         Some(Entry {
             ctx: self.ctx,
-            dir_entry,
+            dirent: dir_entry,
             name,
             rel_dir: &open.frame.rel,
             tag: open.frame.tag,
@@ -348,7 +348,7 @@ async fn classify(ctx: &'static WalkContext, dir_entry: &DirEntry) -> Option<Ent
 #[derive(Debug)]
 pub(crate) struct Entry<'w, T> {
     ctx: &'static WalkContext,
-    dir_entry: &'w DirEntry,
+    dirent: &'w DirEntry,
     name: &'w OsStr,
     rel_dir: &'w Path,
     tag: T,
@@ -377,7 +377,7 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
     /// Full path of the entry.
     #[must_use]
     pub(crate) fn path(&self) -> PathBuf {
-        self.dir_entry.path()
+        self.dirent.path()
     }
 
     /// Path of the entry relative to the walk root (`"a.deb"` for a root
@@ -432,7 +432,7 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
     /// failed (`error!` + `CACHE_IO_FAILURE`, with the walk's
     /// [`WalkContext::entry_failure`] clause).
     pub(crate) async fn metadata(&self) -> Option<std::fs::Metadata> {
-        match self.dir_entry.metadata().await {
+        match self.dirent.metadata().await {
             Ok(meta) => {
                 let same_kind = match self.kind {
                     EntryKind::File => meta.is_file(),
@@ -625,12 +625,12 @@ mod tests {
         let absent = dir.path().join("absent");
 
         let (events, outcome) = collect(&absent, &ABORT, OnMissing::Tolerate, &[]).await;
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::new());
         assert!(matches!(outcome, WalkOutcome::RootMissing), "{outcome:?}");
 
         let before = metrics::CACHE_IO_FAILURE.get();
         let (events, outcome) = collect(&absent, &ABORT, OnMissing::Fail, &[]).await;
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::new());
         let WalkOutcome::Aborted { logged: _, err } = outcome else {
             unreachable!("expected Aborted, got {outcome:?}")
         };
@@ -640,7 +640,7 @@ mod tests {
         // `Fail` with a `Continue` policy: logged, then the (empty) walk
         // completes.
         let (events, outcome) = collect(&absent, &CONTINUE, OnMissing::Fail, &[]).await;
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::new());
         assert!(matches!(outcome, WalkOutcome::Complete), "{outcome:?}");
     }
 

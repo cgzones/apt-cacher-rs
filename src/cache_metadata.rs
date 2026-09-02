@@ -134,23 +134,25 @@ pub(crate) fn write_upstream_metadata(
         last_modified,
     } = meta;
     if let Some(etag) = etag {
-        match ETag::parse(etag) {
-            Some(etag) => xattr_helpers::write(file, display_path, &etag),
-            None => warn_once_or_info!(
+        if let Some(etag) = ETag::parse(etag) {
+            xattr_helpers::write(file, display_path, &etag);
+        } else {
+            warn_once_or_info!(
                 "Skipping write of malformed ETag to `{}`: `{}`",
                 display_path.display(),
                 etag.escape_debug()
-            ),
+            );
         }
     }
     if let Some((raw, _time)) = last_modified {
-        match LastModified::parse(raw) {
-            Some(lm) => xattr_helpers::write(file, display_path, &lm),
-            None => warn_once_or_info!(
+        if let Some(lm) = LastModified::parse(raw) {
+            xattr_helpers::write(file, display_path, &lm);
+        } else {
+            warn_once_or_info!(
                 "Skipping write of malformed Last-Modified to `{}`: `{}`",
                 display_path.display(),
                 raw.escape_debug()
-            ),
+            );
         }
     }
     if let Some(size) = expected_size {
@@ -617,7 +619,7 @@ mod tests {
         );
         assert_eq!(etag.as_deref(), Some("W/\"abc\""));
         assert_eq!(lm.as_deref(), Some("Thu, 01 Jan 1970 00:00:00 GMT"));
-        assert!(rejected.is_empty());
+        assert_eq!(rejected, Vec::<String>::new());
     }
 
     #[test]
@@ -660,7 +662,7 @@ mod tests {
         let mut rejected = Vec::new();
         let (etag, lm) =
             check_upstream_validators(Some("bad".into()), Some("worse".into()), |invalid| {
-                rejected.push(format!("{invalid:?}"))
+                rejected.push(format!("{invalid:?}"));
             });
         assert_eq!(etag, None);
         assert_eq!(lm, None);
