@@ -392,8 +392,10 @@ pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 
 /// Cache entries observed to be non-regular non-directory files (FIFO,
 /// socket, device, symlink).  Bumped by serving paths (which then return
-/// 5xx), download paths (which abort the download), and cleanup paths
-/// (which actively unlink such entries in pool / flat / by-hash / `tmp/`).
+/// 5xx), download paths (which abort the download), and every directory
+/// walk (`cache_walk.rs`, on sight): the startup scan and the dashboard
+/// leave such an entry in place, cleanup unlinks it wherever it walks
+/// (pool / flat / `dists/` / by-hash / `tmp/`).
 /// A non-zero count indicates either a hostile filesystem or a
 /// misconfigured cache directory and is worth operator attention.
 /// Disjoint from `CACHE_IO_FAILURE`: a non-regular-file detection is
@@ -410,24 +412,28 @@ pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 pub(crate) static CACHE_NON_REGULAR: Counter = Counter::new();
 
 /// Cache entries observed to be directories in places where the cache
-/// layout only expects regular files (pool / flat / by-hash subtrees).
-/// In those subtrees cleanup leaves the directory in place and emits a
+/// layout does not allow one (an unknown host dir at the cache root, a
+/// non-layout dir in a mirror dir, anything in a pool / by-hash leaf).
+/// Bumped through `cache_walk::Entry::report_unexpected` by the walk that
+/// knows the layout; cleanup leaves the directory in place and emits a
 /// warn — the cache layout has no recursive-remove semantics there and
 /// a directory typically indicates operator action (e.g. a `mv` into the
 /// cache tree).  The single exception is `tmp/`, where stray directories
-/// are recursively removed; that bump also increments this counter so
-/// the dashboard surfaces the event consistently.  Distinct from
+/// are recursively removed once aged; the bump there fires on every
+/// cycle the directory is seen, like everywhere else.  Distinct from
 /// `CACHE_NON_REGULAR` because the operator response differs: a stray
 /// directory is usually benign-but-wasteful; a stray FIFO/socket/symlink
 /// is a security-relevant tampering signal.
 pub(crate) static CACHE_DIRECTORY_UNEXPECTED: Counter = Counter::new();
 
-/// Cache entries observed to be regular files at locations where only
-/// host directories are expected (currently the cache root, where the
-/// only legitimate children are alias-resolved host dirs).  Cleanup /
-/// scan leaves the file in place and emits a warn — like a stray
-/// directory at the cache root, this is typically an operator artefact
-/// (e.g. a hand-placed `.txt` note) rather than a tampering signal.
+/// Cache entries observed to be regular files where the layout does not
+/// allow one: at the cache root (whose only legitimate children are
+/// alias-resolved host dirs), a non-deb file directly in a mirror dir,
+/// or a non-UTF-8-named file cleanup can never match against an index.
+/// Bumped through `cache_walk::Entry::report_unexpected`; the file is
+/// left in place with a warn — like a stray directory, this is typically
+/// an operator artefact (e.g. a hand-placed `.txt` note) rather than a
+/// tampering signal.
 /// Distinct from `CACHE_NON_REGULAR` (FIFO/socket/device/symlink, which
 /// are security-relevant) and `CACHE_DIRECTORY_UNEXPECTED` (the
 /// directory-shaped counterpart inside mirror subtrees).

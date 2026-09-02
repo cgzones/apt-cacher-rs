@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{self, ErrorKind};
+use std::io;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -10,6 +10,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     AppState, RETENTION_TIME,
     cache_layout::CacheLayout,
+    cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker},
     config::Config,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
@@ -33,7 +34,7 @@ use crate::cleanup::partials::cleanup_tmp_dir;
 use crate::cleanup::refs::{
     ByHashReferenceSet, active_origin_distributions, build_byhash_reference_set, byhash_dir_present,
 };
-use crate::cleanup::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry, scan_candidates};
+use crate::cleanup::scan::{remove_non_regular, scan_candidates};
 use crate::cleanup::sweep::{SpanTable, SweepResult, sweep_aged_metadata, sweep_candidates};
 
 /// Retention class of a scanned cache-tree entry, selecting its sweep span from
@@ -570,14 +571,20 @@ async fn run_byhash_unit(unit: &ByHashUnit, ctx: &MirrorCtx<'_>) -> Result<UnitS
 /// unreferenced-but-covered candidates become `ByHashCovered` (swept past
 /// `grace`, counted as `removed_unreferenced`); anything uncovered,
 /// unclassifiable, or in age mode (`reference` is `None`) stays `ByHashUncovered`
-/// (swept past `backstop`). Non-regular entries (symlink / FIFO / stray dir) are
-/// removed / skipped inline via `handle_anomalous_entry(DirAction::Skip)` and a
-/// removed one counts toward `removed`, matching the old walk. Removal, metadata
-/// invalidation, future-timestamp and I/O-error handling all flow through
-/// [`sweep_candidates`].
+/// (swept past `backstop`). A symlink / FIFO / socket / device is unlinked
+/// inline and counts toward `removed`; a stray directory is reported and
+/// retained. Removal, metadata invalidation, future-timestamp and I/O-error
+/// handling all flow through [`sweep_candidates`].
 ///
 /// `NotFound` is treated as "nothing to do" (TOCTOU: the caller pre-probes with
 /// `byhash_dir_present`, but the tree may vanish in between).
+static BYHASH_WALK: WalkContext = WalkContext {
+    what: "a by-hash directory",
+    dir_failure: DirFailure::Abort("abandoning its cleanup this cycle"),
+    entry_failure: "retaining it",
+    non_regular: "removing it",
+};
+
 async fn sweep_byhash_dir(
     byhash_path: &Path,
     reference: Option<&ByHashReferenceSet>,
@@ -591,60 +598,21 @@ async fn sweep_byhash_dir(
     let mut anomaly_removed = 0u64;
     let mut referenced_kept = 0u64;
 
-    let mut dir = match tokio::fs::read_dir(byhash_path).await {
-        Ok(d) => d,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(ByHashOutcome::default()),
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to read by-hash directory `{}`; abandoning its cleanup this cycle:  {}",
-                byhash_path.display(),
-                ErrorReport(&err)
-            );
-            return Err(err);
-        }
-    };
+    let mut walker = Walker::new(byhash_path, &BYHASH_WALK, OnMissing::Tolerate, ());
 
-    loop {
-        let entry = match dir.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to iterate by-hash directory `{}`; abandoning its cleanup this cycle:  {}",
-                    byhash_path.display(),
-                    ErrorReport(&err)
-                );
-                return Err(err);
-            }
-        };
-        // lstat semantics on tokio's `DirEntry`, so a planted symlink is seen as
-        // itself (non-regular) rather than followed. The full path is built only
-        // on the two branches that need it, never per surviving entry.
-        let file_type = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to inspect by-hash entry `{}`; retaining it:  {}",
-                    entry.path().display(),
-                    ErrorReport(&err)
-                );
+    while let Some(entry) = walker.next().await {
+        match entry.kind() {
+            EntryKind::NonRegular => {
+                if remove_non_regular(&entry.path()).await {
+                    anomaly_removed += 1;
+                }
                 continue;
             }
-        };
-
-        if !file_type.is_file() {
-            // A symlink/FIFO/socket/device is removed (counted); a stray dir is
-            // skipped — the DirAction::Skip anomaly routing the old walk used.
-            if matches!(
-                handle_anomalous_entry(&entry.path(), file_type, DirAction::Skip).await,
-                AnomalyOutcome::Removed
-            ) {
-                anomaly_removed += 1;
+            EntryKind::Dir => {
+                entry.report_unexpected("retaining it and excluding its contents from cleanup");
+                continue;
             }
-            continue;
+            EntryKind::File => {}
         }
 
         // Classify against the reference set inline (reference mode). A
@@ -654,7 +622,7 @@ async fn sweep_byhash_dir(
         // unreferenced covered digest gets the grace span; an uncovered
         // algorithm, an unclassifiable name, or age mode (`reference` is `None`)
         // gets the backstop, exactly as the old walk treated them.
-        let name = entry.file_name();
+        let name = entry.name();
         let classified = reference
             .zip(name.to_str())
             .and_then(|(refset, digest)| refset.classify(digest).map(|c| (refset, c)));
@@ -667,7 +635,12 @@ async fn sweep_byhash_dir(
             Some(_) | None => SpanClass::ByHashUncovered,
         };
 
-        candidates.insert(name, class);
+        candidates.insert(name.to_owned(), class);
+    }
+
+    match walker.finish() {
+        WalkOutcome::Complete | WalkOutcome::RootMissing => {}
+        WalkOutcome::Aborted(err) => return Err(err),
     }
 
     let survivors = candidates.len() as u64;

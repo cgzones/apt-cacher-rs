@@ -242,6 +242,7 @@ impl<T: Copy + Send + Sync> Walker<T> {
             ctx: self.ctx,
             dir_entry,
             name,
+            rel_dir: &open.frame.rel,
             tag: open.frame.tag,
             kind: *kind,
             descend: &mut self.descend,
@@ -346,6 +347,7 @@ pub(crate) struct Entry<'w, T> {
     ctx: &'static WalkContext,
     dir_entry: &'w DirEntry,
     name: &'w OsStr,
+    rel_dir: &'w Path,
     tag: T,
     kind: EntryKind,
     descend: &'w mut Option<T>,
@@ -373,6 +375,14 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
     #[must_use]
     pub(crate) fn path(&self) -> PathBuf {
         self.dir_entry.path()
+    }
+
+    /// Path of the entry relative to the walk root (`"a.deb"` for a root
+    /// entry, `"amd64/a.deb"` one level down); rejoining it onto the root
+    /// gives [`Entry::path`].
+    #[must_use]
+    pub(crate) fn rel_path(&self) -> PathBuf {
+        self.rel_dir.join(self.name)
     }
 
     /// Ask the walker to read this directory's contents (after the current
@@ -493,12 +503,8 @@ mod tests {
         let mut events = Vec::new();
         let mut walker = Walker::new(root, ctx, missing, 0u8);
         while let Some(mut entry) = walker.next().await {
-            let rel = entry
-                .path()
-                .strip_prefix(root)
-                .expect("entry paths sit below the root")
-                .to_path_buf();
-            events.push((rel, entry.kind(), entry.tag()));
+            events.push((entry.rel_path(), entry.kind(), entry.tag()));
+            assert_eq!(root.join(entry.rel_path()), entry.path());
             if entry.kind() == EntryKind::Dir
                 && entry
                     .name()
@@ -606,6 +612,7 @@ mod tests {
         let entry = walker.next().await.expect("one entry");
         assert_eq!(entry.name(), name);
         assert!(entry.name().to_str().is_none());
+        assert_eq!(entry.rel_path(), PathBuf::from(name));
         assert_eq!(entry.path(), dir.path().join(name));
     }
 

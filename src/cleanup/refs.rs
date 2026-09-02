@@ -1,4 +1,3 @@
-use std::io::ErrorKind;
 use std::path::Path;
 use std::time::Duration;
 
@@ -7,6 +6,7 @@ use hashbrown::HashSet;
 use tracing::{debug, error, warn};
 
 use crate::cache_layout::CacheLayout;
+use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker};
 use crate::database::OriginEntry;
 use crate::error::ErrorReport;
 use crate::index_parser::{ByHashRef, HashAlgo, hex_decode_exact, parse_release_byhash_digests};
@@ -88,24 +88,19 @@ fn is_release_filename(name: &str, layout: CacheLayout) -> bool {
 /// orphaned; if any expected dist is missing we bail to age mode. Pass an empty
 /// slice for the flat tree, which has a single root `{In,}Release` and no
 /// per-dist union.
+static RELEASE_WALK: WalkContext = WalkContext {
+    what: "a Release directory",
+    dir_failure: DirFailure::Abort("falling back to age-based retention for its by-hash tree"),
+    entry_failure: "ignoring it for by-hash reconciliation",
+    non_regular: "ignoring it for by-hash reconciliation",
+};
+
 pub(super) async fn build_byhash_reference_set(
     release_dir: &Path,
     layout: CacheLayout,
     expected_dists: &[String],
 ) -> Option<ByHashReferenceSet> {
-    let mut dir = match tokio::fs::read_dir(release_dir).await {
-        Ok(d) => d,
-        Err(err) if err.kind() == ErrorKind::NotFound => return None,
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to read Release directory `{}` for by-hash reconciliation; falling back to age-based retention:  {}",
-                release_dir.display(),
-                ErrorReport(&err)
-            );
-            return None;
-        }
-    };
+    let mut walker = Walker::new(release_dir, &RELEASE_WALK, OnMissing::Tolerate, ());
 
     let mut set = ByHashReferenceSet {
         sha256: HashSet::new(),
@@ -116,22 +111,14 @@ pub(super) async fn build_byhash_reference_set(
     // `expected_dists` below. Only populated when there is something to check.
     let mut seen_dists: HashSet<String> = HashSet::new();
 
-    loop {
-        let entry = match dir.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to iterate Release directory `{}` for by-hash reconciliation; falling back to age-based retention:  {}",
-                    release_dir.display(),
-                    ErrorReport(&err)
-                );
-                return None;
-            }
-        };
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
+    while let Some(entry) = walker.next().await {
+        // `by-hash/` (and any flat URL-dir) sits next to the Release files;
+        // a non-regular entry was reported by the walker and is left to the
+        // metadata sweep.
+        if entry.kind() != EntryKind::File {
+            continue;
+        }
+        let Some(name) = entry.name().to_str() else {
             continue;
         };
         if !is_release_filename(name, layout) {
@@ -175,6 +162,14 @@ pub(super) async fn build_byhash_reference_set(
                 }
             }
         }
+    }
+
+    match walker.finish() {
+        WalkOutcome::Complete => {}
+        // An absent directory has no Release files by definition; an
+        // unreadable one was logged by the walker.  Neither is a reason to
+        // warn about a Release-less tree.
+        WalkOutcome::RootMissing | WalkOutcome::Aborted(_) => return None,
     }
 
     // Reference mode reconciles the whole union `by-hash/` tree at once, so an

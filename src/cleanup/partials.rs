@@ -1,13 +1,20 @@
-use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use tracing::{debug, error};
 
+use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker};
 use crate::error::ErrorReport;
 use crate::metrics;
 
-use super::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry};
+use super::scan::{remove_non_regular, remove_stray_dir};
+
+static TMP_WALK: WalkContext = WalkContext {
+    what: "a tmp directory",
+    dir_failure: DirFailure::Continue("leaving its unread entries unreaped this cycle"),
+    entry_failure: "retaining it this cycle",
+    non_regular: "removing it once it is older than a week",
+};
 
 /// Remove stale entries from a single `tmp/` directory.
 ///
@@ -16,7 +23,8 @@ use super::scan::{AnomalyOutcome, DirAction, handle_anomalous_entry};
 /// `model.rs` actually moves this threshold. Any other artifact
 /// (defensive — current code only writes `.partial` here) is deleted once it has
 /// aged past `FOREIGN_MAX_AGE`, the longer threshold acknowledging that we don't
-/// know what produced it.
+/// know what produced it; a stray directory or non-regular entry is reported
+/// on every cycle it is seen and reaped on the same schedule.
 ///
 /// Called by the engine's `Partials` unit arm once per mirror per layout
 /// (structured `<cache>/<cache_path>/tmp` and flat `<cache>/flat/<flat_root>/tmp`
@@ -28,58 +36,19 @@ pub(super) async fn cleanup_tmp_dir(
     now: SystemTime,
     partial_max_age: Duration,
 ) -> u64 {
+    // `TMP_WALK.non_regular` spells this out as "a week"; keep them in step.
     const FOREIGN_MAX_AGE: Duration = Duration::from_hours(7 * 24);
 
     let partial_cutoff = now - partial_max_age;
     let foreign_cutoff = now - FOREIGN_MAX_AGE;
 
-    let mut entries = match tokio::fs::read_dir(tmp_dir).await {
-        Ok(e) => e,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            return 0;
-        }
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to read tmp directory `{}`; skipping this directory this cycle:  {}",
-                tmp_dir.display(),
-                ErrorReport(&err)
-            );
-            return 0;
-        }
-    };
-
     let mut removed = 0u64;
 
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to iterate tmp directory `{}`; ending this directory's sweep early:  {}",
-                    tmp_dir.display(),
-                    ErrorReport(&err)
-                );
-                break;
-            }
-        };
+    let mut walker = Walker::new(tmp_dir, &TMP_WALK, OnMissing::Tolerate, ());
 
-        let (mdata, file_type) = match entry.metadata().await {
-            Ok(m) => {
-                let ft = m.file_type();
-                (m, ft)
-            }
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to stat tmp entry `{}`; retaining it and skipping it this cycle:  {}",
-                    entry.path().display(),
-                    ErrorReport(&err)
-                );
-                continue;
-            }
+    while let Some(entry) = walker.next().await {
+        let Some(mdata) = entry.metadata().await else {
+            continue;
         };
 
         let mtime = match mdata.modified() {
@@ -94,13 +63,19 @@ pub(super) async fn cleanup_tmp_dir(
                 SystemTime::UNIX_EPOCH
             }
         };
+        // The tmp/ producer (`download_file`) only writes regular files, so
+        // a directory here is anomalous however young it is; the walker
+        // already reported a non-regular entry.
+        if entry.kind() == EntryKind::Dir {
+            entry.report_unexpected("removing it once it is older than a week");
+        }
         // Apply the per-suffix `.partial` policy only to regular files: a
         // symlink-to-dir or a stray directory named `*.partial` should not
         // be measured by `len()` (zero for a symlink) and should be reaped
         // under the longer foreign cutoff instead.
-        let is_partial = file_type.is_file()
+        let is_partial = entry.kind() == EntryKind::File
             && entry
-                .file_name()
+                .name()
                 .to_str()
                 .is_some_and(|name| name.ends_with(".partial"));
         let stale = if is_partial {
@@ -121,24 +96,26 @@ pub(super) async fn cleanup_tmp_dir(
         }
 
         let path = entry.path();
-        // The tmp/ producer (`download_file`) only writes regular files, so a
-        // directory or non-regular entry here is anomalous. Centralized handler
-        // covers both (`RemoveAll` for directories, `remove_file` for everything
-        // else).
-        if file_type.is_dir() || !file_type.is_file() {
-            let outcome = handle_anomalous_entry(&path, file_type, DirAction::RemoveAll).await;
-            if matches!(outcome, AnomalyOutcome::Removed) {
-                removed += 1;
-            }
-        } else if let Err(err) = tokio::fs::remove_file(&path).await {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to remove stale tmp entry `{}`; retaining it:  {}",
-                path.display(),
-                ErrorReport(&err)
-            );
-        } else {
-            debug!("Removed stale tmp entry `{}`", path.display());
+        let gone = match entry.kind() {
+            EntryKind::Dir => remove_stray_dir(&path).await,
+            EntryKind::NonRegular => remove_non_regular(&path).await,
+            EntryKind::File => match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    debug!("Removed stale tmp entry `{}`", path.display());
+                    true
+                }
+                Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to remove stale tmp entry `{}`; retaining it:  {}",
+                        path.display(),
+                        ErrorReport(&err)
+                    );
+                    false
+                }
+            },
+        };
+        if gone {
             removed += 1;
         }
     }

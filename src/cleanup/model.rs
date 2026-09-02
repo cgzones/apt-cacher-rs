@@ -137,29 +137,37 @@ pub(super) struct PartialsUnit {
 pub(super) struct TreeSpec {
     /// On-disk root of the tree to scan.
     pub root: PathBuf,
-    /// When `false`: depth-1 walk, basename keys, deb-named-directory warning.
-    /// When `true`: recursive walk, relpath keys, honouring `skip_subdirs` and
-    /// `boundaries`.
-    pub recurse: bool,
-    /// Sub-directory names to skip entirely during recursive traversal (e.g.
-    /// `by-hash/` and `tmp/` for flat mirrors). Unused when `recurse` is `false`.
-    pub skip_subdirs: &'static [&'static str],
-    /// Mirror paths of registered siblings that live *inside* this mirror's
-    /// path. When the recursive walk reaches a directory whose mirror-path
-    /// equivalent hits one of these, the subtree is skipped (the nested mirror
-    /// owns it and runs its own cleanup). Unused when `recurse` is `false`.
-    pub boundaries: Vec<String>,
+    /// How far below `root` the scan reaches.
+    pub walk: Walk,
+}
+
+/// Recursion policy of a [`TreeSpec`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Walk {
+    /// Depth-1 walk with basename keys - the structured pool's shape, where
+    /// a deb-named directory is a stray entry.
+    Shallow,
+    /// Full walk with relpath keys - the flat tree's shape.
+    Recursive {
+        /// Sub-directory names skipped wherever they occur (`by-hash/` and
+        /// `tmp/` for flat mirrors).
+        skip_subdirs: &'static [&'static str],
+        /// Mirror paths of registered siblings that live *inside* this
+        /// mirror's path (`deb_mirror::derive_nested_paths`). When the walk
+        /// reaches a directory whose mirror-path equivalent is at or inside
+        /// one of these, the subtree is skipped (the nested mirror owns it
+        /// and runs its own cleanup).
+        boundaries: Vec<String>,
+    },
 }
 
 impl TreeSpec {
-    /// A depth-1, unbounded walk of `root` — the structured pool's shape;
+    /// A depth-1, unbounded walk of `root` - the structured pool's shape;
     /// [`ReconcileFacet::FlatTree`] is the only recursive tree.
     fn shallow(root: PathBuf) -> Self {
         Self {
             root,
-            recurse: false,
-            skip_subdirs: &[],
-            boundaries: Vec::new(),
+            walk: Walk::Shallow,
         }
     }
 }
@@ -560,9 +568,10 @@ pub(super) fn classify_mirror(
         facet,
         tree: TreeSpec {
             root: unit_root(facet.cache_layout(), &cache_root, &flat_root),
-            recurse: true,
-            skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
-            boundaries: nested,
+            walk: Walk::Recursive {
+                skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
+                boundaries: nested,
+            },
         },
         groups: flat_groups,
         policy: ReconcilePolicy::ReferencedOrAge {
@@ -931,9 +940,10 @@ mod tests {
                     facet: ReconcileFacet::FlatTree,
                     tree: TreeSpec {
                         root: PathBuf::from("/cache/deb.debian.org/flat/debian"),
-                        recurse: true,
-                        skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
-                        boundaries: Vec::new(),
+                        walk: Walk::Recursive {
+                            skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
+                            boundaries: Vec::new(),
+                        },
                     },
                     groups: vec![SourceGroup {
                         source: IndexSource::FlatPackages {
@@ -1130,11 +1140,12 @@ mod tests {
         let units = classify_mirror(&entry, nested.clone(), &config);
         let flat_tree = flat_tree_unit(&units);
 
-        assert_eq!(flat_tree.tree.boundaries, nested);
-        assert!(flat_tree.tree.recurse);
         assert_eq!(
-            flat_tree.tree.skip_subdirs,
-            &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP]
+            flat_tree.tree.walk,
+            Walk::Recursive {
+                skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
+                boundaries: nested,
+            }
         );
     }
 

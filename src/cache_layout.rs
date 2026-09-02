@@ -115,7 +115,7 @@ pub(crate) const SUBDIR_TMP: &str = "tmp";
 /// Layout subdirectory names that may legitimately appear under each
 /// `{cache_directory}/{host}/{mirror_path}/` directory.  The startup cache
 /// scan recurses into each and tallies its size; anything else triggers an
-/// "Unrecognized entry" warning.
+/// "Unrecognized directory entry" warning.
 ///
 /// `tmp/` is intentionally **not** listed here: it is partial-download
 /// scratch space (not part of the served cache layout), is handled

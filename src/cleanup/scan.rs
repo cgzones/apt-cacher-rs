@@ -1,275 +1,180 @@
+use std::borrow::Cow;
 use std::ffi::OsString;
-use std::io::{self, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 
 use hashbrown::HashMap;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
+use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker};
 use crate::cleanup::engine::SpanClass;
-use crate::cleanup::model::TreeSpec;
+use crate::cleanup::model::{TreeSpec, Walk};
 use crate::deb_mirror::{NestedMirrorRelation, is_deb_package, nested_mirror_relation};
 use crate::error::ErrorReport;
 use crate::metrics;
 
-/// Specifies how a stray directory anomaly should be handled.
-#[derive(Clone, Copy)]
-pub(super) enum DirAction {
-    /// Log and skip; the directory is left on disk.
-    Skip,
-    /// Log and recursively remove via `remove_dir_all`.
-    RemoveAll,
-}
-
-/// Outcome of [`handle_anomalous_entry`].
-pub(super) enum AnomalyOutcome {
-    /// The entry was successfully removed from disk.
-    Removed,
-    /// The entry was not removed (either skipped by policy or removal failed).
-    Skipped,
-}
-
-/// Handle a non-regular or unexpected-directory cache entry.
-///
-/// - Non-directory non-regular (symlink / FIFO / socket / device): bumps
-///   [`metrics::CACHE_NON_REGULAR`], logs a warning, and calls
-///   `remove_file`.  Returns [`AnomalyOutcome::Removed`] on success or
-///   [`AnomalyOutcome::Skipped`] on I/O error (after bumping
-///   [`metrics::CACHE_IO_FAILURE`] and logging).
-/// - Directory: bumps [`metrics::CACHE_DIRECTORY_UNEXPECTED`]; then either
-///   skips ([`DirAction::Skip`]) or removes recursively via `remove_dir_all`
-///   ([`DirAction::RemoveAll`]).
-pub(super) async fn handle_anomalous_entry(
-    path: &Path,
-    file_type: std::fs::FileType,
-    action: DirAction,
-) -> AnomalyOutcome {
-    if file_type.is_dir() {
-        metrics::CACHE_DIRECTORY_UNEXPECTED.increment();
-        match action {
-            DirAction::Skip => {
-                warn!(
-                    "Unexpected directory `{}` in the cache; retaining it and excluding its contents from cleanup",
-                    path.display()
-                );
-                AnomalyOutcome::Skipped
-            }
-            DirAction::RemoveAll => {
-                warn!("Removing directory tmp entry `{}`", path.display());
-                match tokio::fs::remove_dir_all(path).await {
-                    Ok(()) => {
-                        debug!("Removed directory tmp entry `{}`", path.display());
-                        AnomalyOutcome::Removed
-                    }
-                    Err(err) => {
-                        metrics::CACHE_IO_FAILURE.increment();
-                        error!(
-                            "Failed to remove directory tmp entry `{}`; retaining it:  {}",
-                            path.display(),
-                            ErrorReport(&err)
-                        );
-                        AnomalyOutcome::Skipped
-                    }
-                }
-            }
+/// Unlink a symlink / FIFO / socket / device the walker reported: cleanup
+/// removes non-regular entries wherever it walks (pool, flat tree, `dists/`,
+/// by-hash, `tmp/`).  The detection warn and `CACHE_NON_REGULAR` bump are
+/// the walker's; this owns the removal and its outcome lines.  Returns
+/// whether the entry is gone.
+pub(super) async fn remove_non_regular(path: &Path) -> bool {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {
+            debug!("Removed non-regular entry `{}`", path.display());
+            true
         }
-    } else {
-        metrics::CACHE_NON_REGULAR.increment();
-        warn!(
-            "Non-regular entry `{}` in the cache; removing it",
-            path.display()
-        );
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {
-                debug!("Removed non-regular entry `{}`", path.display());
-                AnomalyOutcome::Removed
-            }
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to remove non-regular entry `{}`; retaining it:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                );
-                AnomalyOutcome::Skipped
-            }
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to remove non-regular entry `{}`; retaining it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            false
         }
     }
 }
 
+/// Recursively remove a stray directory from `tmp/` - the one place cleanup
+/// removes a directory rather than retaining it (see
+/// `metrics::CACHE_DIRECTORY_UNEXPECTED`).  The caller has already reported
+/// it through `Entry::report_unexpected`.  Returns whether the entry is gone.
+pub(super) async fn remove_stray_dir(path: &Path) -> bool {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => {
+            debug!("Removed directory tmp entry `{}`", path.display());
+            true
+        }
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to remove directory tmp entry `{}`; retaining it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            false
+        }
+    }
+}
+
+static RECONCILE_WALK: WalkContext = WalkContext {
+    what: "a mirror directory",
+    dir_failure: DirFailure::Abort("abandoning this cleanup unit"),
+    entry_failure: "retaining it and excluding it from cleanup",
+    non_regular: "removing it",
+};
+
 /// Unified on-disk candidate scanner, driven by the unit's [`TreeSpec`].
 ///
-/// With `tree.recurse = false` reproduces the old `scan_cached_files` exactly:
-/// depth-1, basename keys, deb-named-directory warning (`CACHE_DIRECTORY_UNEXPECTED`),
-/// inline removal of non-regular non-directory entries (`CACHE_NON_REGULAR`).
+/// [`Walk::Shallow`] is the structured pool's shape: depth-1, basename keys,
+/// a deb-named directory is reported as unexpected.  [`Walk::Recursive`] is
+/// the flat tree's shape: relpath keys (forward-slash joined), `skip_subdirs`
+/// and nested-mirror boundaries are not entered.  Either way only
+/// `.deb`/`.udeb`/`.ddeb`-named regular files become candidates; every
+/// symlink / FIFO / socket / device met on the way is unlinked, and an
+/// unreadable directory abandons the unit (`Err`) - reconciling against a
+/// partial candidate set would grace-sweep live debs.
 ///
-/// With `tree.recurse = true` reproduces the old `scan_flat_cached_debs` exactly:
-/// stack-based recursive walk, relpath keys (forward-slash joined), skips
-/// `tree.skip_subdirs` and nested-mirror boundaries, inline removal of
-/// symlinks and other non-regular entries.
+/// Candidates are keyed by the entry's path *relative to `tree.root`*, which
+/// is what `sweep_candidates` rejoins to reach the file - so it must stay
+/// exactly that and never, say, a basename for a nested entry.
 pub(super) async fn scan_candidates(
     tree: &TreeSpec,
     mirror_path: &str,
 ) -> Result<HashMap<OsString, SpanClass>, io::Error> {
     let mut ret = HashMap::new();
-    let mut stack: Vec<(PathBuf, String)> = vec![(tree.root.clone(), String::new())];
+    let mut walker = Walker::new(&tree.root, &RECONCILE_WALK, OnMissing::Tolerate, ());
 
-    while let Some((current, rel_prefix)) = stack.pop() {
-        let mut dir = match tokio::fs::read_dir(&current).await {
-            Ok(d) => d,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to read directory `{}`; abandoning this cleanup unit:  {}",
-                    current.display(),
-                    ErrorReport(&err)
-                );
-                return Err(err);
+    while let Some(mut entry) = walker.next().await {
+        match entry.kind() {
+            EntryKind::NonRegular => {
+                remove_non_regular(&entry.path()).await;
+                continue;
             }
-        };
+            EntryKind::Dir => {
+                match &tree.walk {
+                    // A pool holds no directories, but the mirror-level
+                    // layout dirs (`dists/`, `tmp/`) share its root and are
+                    // the startup scan's business; only a deb-named one is
+                    // out of place here.
+                    Walk::Shallow => {
+                        if entry.name().to_str().is_none_or(is_deb_package) {
+                            entry.report_unexpected(
+                                "retaining it and excluding its contents from cleanup",
+                            );
+                        }
+                    }
+                    Walk::Recursive {
+                        skip_subdirs,
+                        boundaries,
+                    } => {
+                        let Some(name_str) = entry.name().to_str() else {
+                            entry.report_unexpected(
+                                "retaining it and excluding its contents from cleanup",
+                            );
+                            continue;
+                        };
+                        // The by-hash subtree (handled by the by-hash
+                        // cleanup) and the tmp partial-download dir.
+                        if skip_subdirs.contains(&name_str) {
+                            continue;
+                        }
 
-        loop {
-            let entry = match dir.next_entry().await {
-                Ok(Some(e)) => e,
-                Ok(None) => break,
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to iterate directory `{}`; abandoning this cleanup unit:  {}",
-                        current.display(),
-                        ErrorReport(&err)
-                    );
-                    return Err(err);
-                }
-            };
-            let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                // Attribute the anomaly by the entry's real type instead of
-                // blanket-charging `CACHE_DIRECTORY_UNEXPECTED`: a non-UTF-8
-                // name can sit on a directory, a regular file, or a non-regular
-                // entry. Mirror `handle_anomalous_entry`'s dir-vs-non-dir split
-                // (there is no mirror-subtree "unexpected regular" counter --
-                // `CACHE_UNEXPECTED_REGULAR` is cache-root-scoped).
-                match entry.file_type().await {
-                    Ok(ft) if ft.is_dir() => metrics::CACHE_DIRECTORY_UNEXPECTED.increment(),
-                    Ok(_) => metrics::CACHE_NON_REGULAR.increment(),
-                    Err(err) => {
-                        metrics::CACHE_IO_FAILURE.increment();
-                        error!(
-                            "Failed to get file type of `{}`; the cache anomaly stays unclassified:  {}",
-                            entry.path().display(),
-                            ErrorReport(&err)
-                        );
+                        // Translate the on-disk position back to a
+                        // mirror-path equivalent (`<mirror_path>/<rel>`) so
+                        // it can be compared against the registered nested
+                        // mirror paths.  A hit delimits a boundary: the
+                        // nested mirror owns everything inside, so do not
+                        // descend.  Only UTF-8-named directories are ever
+                        // descended into, so the relative path is UTF-8 and
+                        // the lossy conversion is exact.
+                        let rel_path = entry.rel_path();
+                        let rel = rel_path.to_string_lossy();
+                        let candidate: Cow<'_, str> = if mirror_path.is_empty() {
+                            rel
+                        } else {
+                            Cow::Owned(format!("{mirror_path}/{rel}"))
+                        };
+                        match nested_mirror_relation(&candidate, boundaries) {
+                            NestedMirrorRelation::Boundary => trace!(
+                                "Skipping `{}` during flat cleanup: nested mirror root for `{candidate}`",
+                                entry.path().display(),
+                            ),
+                            NestedMirrorRelation::Container | NestedMirrorRelation::Unrelated => {
+                                entry.descend(());
+                            }
+                        }
                     }
                 }
-                if tree.recurse {
-                    warn!(
-                        "Unrecognized entry `{}` in mirror directory; retaining it and excluding it from cleanup",
-                        entry.path().display()
-                    );
-                } else {
-                    warn!(
-                        "Unrecognized entry `{}` in mirror root directory; retaining it and excluding it from cleanup",
-                        entry.path().display()
-                    );
-                }
-                continue;
-            };
-
-            // Structured (depth-1): mirror `scan_flat_cached_debs` — structured
-            // Pool admits `.deb`/`.udeb`/`.ddeb`, so filter by name before
-            // touching disk.  Flat (recursive): filter after all type checks.
-            if !tree.recurse && !is_deb_package(name_str) {
                 continue;
             }
-
-            // Use `file_type()` (lstat semantics) so a symlink planted in
-            // the cache by a hostile filesystem doesn't trick us into
-            // walking outside the cache tree.
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to get file type of `{}`; retaining the entry and excluding it from cleanup:  {}",
-                        entry.path().display(),
-                        ErrorReport(&err)
-                    );
-                    continue;
-                }
-            };
-
-            if file_type.is_dir() {
-                if tree.recurse {
-                    // Skip the by-hash subtree (handled by the by-hash
-                    // cleanup), the tmp partial-download dir, and recurse
-                    // everything else.
-                    if tree.skip_subdirs.contains(&name_str) {
-                        continue;
-                    }
-                    let child_rel = if rel_prefix.is_empty() {
-                        name_str.to_owned()
-                    } else {
-                        format!("{rel_prefix}/{name_str}")
-                    };
-
-                    // Translate the on-disk position back to a mirror-path
-                    // equivalent (`<mirror_path>/<child_rel>`) so it can be
-                    // compared against the registered nested mirror paths.
-                    // Hits delimit a boundary: the nested mirror owns
-                    // everything inside, so do not descend.
-                    let owned_full;
-                    let candidate_full: &str = if mirror_path.is_empty() {
-                        child_rel.as_str()
-                    } else {
-                        owned_full = format!("{mirror_path}/{child_rel}");
-                        owned_full.as_str()
-                    };
-                    if nested_mirror_relation(candidate_full, &tree.boundaries)
-                        == NestedMirrorRelation::Boundary
-                    {
-                        trace!(
-                            "Skipping `{}` during flat cleanup: nested mirror root for `{candidate_full}`",
-                            entry.path().display(),
-                        );
-                        continue;
-                    }
-
-                    stack.push((entry.path(), child_rel));
-                } else {
-                    handle_anomalous_entry(&entry.path(), file_type, DirAction::Skip).await;
-                }
-                continue;
-            }
-
-            if !file_type.is_file() {
-                handle_anomalous_entry(&entry.path(), file_type, DirAction::Skip).await;
-                continue;
-            }
-
-            // Flat (recursive): filter by deb name after all type checks.
-            if tree.recurse && !is_deb_package(name_str) {
-                continue;
-            }
-
-            let key = if tree.recurse && !rel_prefix.is_empty() {
-                format!("{rel_prefix}/{name_str}")
-            } else {
-                name_str.to_owned()
-            };
-            // The key is the entry's path relative to `tree.root`, which is
-            // what `sweep_candidates` rejoins to reach the file -- so it must
-            // stay exactly that and never, say, a basename for a nested entry.
-            debug_assert_eq!(
-                entry.path(),
-                tree.root.join(&key),
-                "candidate key must rejoin onto the tree root"
-            );
-            ret.insert(OsString::from(key), SpanClass::Deb);
+            EntryKind::File => {}
         }
+
+        let Some(name_str) = entry.name().to_str() else {
+            // Debnames are URL-decoded ASCII, so a non-UTF-8 name can never
+            // be a cached deb nor match any index entry.
+            entry.report_unexpected("retaining it and excluding it from cleanup");
+            continue;
+        };
+        if !is_deb_package(name_str) {
+            continue;
+        }
+
+        let key = entry.rel_path();
+        debug_assert_eq!(
+            entry.path(),
+            tree.root.join(&key),
+            "candidate key must rejoin onto the tree root"
+        );
+        ret.insert(key.into_os_string(), SpanClass::Deb);
     }
 
-    Ok(ret)
+    match walker.finish() {
+        WalkOutcome::Complete | WalkOutcome::RootMissing => Ok(ret),
+        WalkOutcome::Aborted(err) => Err(err),
+    }
 }
 
 #[cfg(test)]
@@ -278,57 +183,28 @@ mod tests {
 
     use super::*;
     use crate::cache_layout::{SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
-    use crate::metrics;
 
     #[tokio::test]
-    async fn anomaly_symlink_removed_as_non_regular() {
+    async fn remove_non_regular_unlinks_a_symlink() {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("t");
         tokio::fs::write(&target, b"x").await.expect("t");
         let link = dir.path().join("l");
         tokio::fs::symlink(&target, &link).await.expect("symlink");
-        let ft = tokio::fs::symlink_metadata(&link)
-            .await
-            .expect("lstat")
-            .file_type();
-        // The counter is process-global and other unit tests in this binary
-        // bump it concurrently, so assert the delta as a lower bound.
-        let before = metrics::CACHE_NON_REGULAR.get();
-        let out = handle_anomalous_entry(&link, ft, DirAction::Skip).await;
-        assert!(matches!(out, AnomalyOutcome::Removed));
-        assert!(metrics::CACHE_NON_REGULAR.get() > before);
+        assert!(remove_non_regular(&link).await);
         assert!(!link.exists());
+        assert!(target.exists(), "the link, not its target, is removed");
     }
 
     #[tokio::test]
-    async fn anomaly_stray_dir_skipped_as_unexpected() {
+    async fn remove_stray_dir_removes_recursively() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sub = dir.path().join("d");
         tokio::fs::create_dir(&sub).await.expect("dir");
-        let ft = tokio::fs::symlink_metadata(&sub)
+        tokio::fs::write(sub.join("nested"), b"x")
             .await
-            .expect("lstat")
-            .file_type();
-        // The counter is process-global and other unit tests in this binary
-        // bump it concurrently, so assert the delta as a lower bound.
-        let before = metrics::CACHE_DIRECTORY_UNEXPECTED.get();
-        let out = handle_anomalous_entry(&sub, ft, DirAction::Skip).await;
-        assert!(matches!(out, AnomalyOutcome::Skipped));
-        assert!(metrics::CACHE_DIRECTORY_UNEXPECTED.get() > before);
-        assert!(sub.exists());
-    }
-
-    #[tokio::test]
-    async fn anomaly_tmp_dir_removed_with_remove_all() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sub = dir.path().join("d");
-        tokio::fs::create_dir(&sub).await.expect("dir");
-        let ft = tokio::fs::symlink_metadata(&sub)
-            .await
-            .expect("lstat")
-            .file_type();
-        let out = handle_anomalous_entry(&sub, ft, DirAction::RemoveAll).await;
-        assert!(matches!(out, AnomalyOutcome::Removed));
+            .expect("nested");
+        assert!(remove_stray_dir(&sub).await);
         assert!(!sub.exists());
     }
 
@@ -346,9 +222,7 @@ mod tests {
             .expect("nested");
         let tree = TreeSpec {
             root: dir.path().to_path_buf(),
-            recurse: false,
-            skip_subdirs: &[],
-            boundaries: Vec::new(),
+            walk: Walk::Shallow,
         };
         let map = scan_candidates(&tree, "debian").await.expect("scan");
         assert!(map.contains_key(OsStr::new("a_1.0_amd64.deb")));
@@ -356,6 +230,10 @@ mod tests {
             !map.keys()
                 .any(|k| k.to_string_lossy().contains("b_1.0_amd64.deb")),
             "never recurses"
+        );
+        assert!(
+            dir.path().join("dists").is_dir(),
+            "layout dirs are retained"
         );
     }
 
@@ -368,13 +246,78 @@ mod tests {
         tokio::fs::write(dir.path().join("amd64/c_1.0_amd64.deb"), b"z")
             .await
             .expect("deb");
+        tokio::fs::create_dir(dir.path().join(SUBDIR_TMP))
+            .await
+            .expect("tmp");
+        tokio::fs::write(dir.path().join("tmp/d_1.0_amd64.deb"), b"z")
+            .await
+            .expect("tmp deb");
         let tree = TreeSpec {
             root: dir.path().to_path_buf(),
-            recurse: true,
-            skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
-            boundaries: Vec::new(),
+            walk: Walk::Recursive {
+                skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
+                boundaries: Vec::new(),
+            },
         };
         let map = scan_candidates(&tree, "apt").await.expect("scan");
         assert!(map.contains_key(OsStr::new("amd64/c_1.0_amd64.deb")));
+        assert_eq!(map.len(), 1, "skip_subdirs are not entered");
+    }
+
+    #[tokio::test]
+    async fn scan_candidates_flat_stops_at_nested_mirror_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for sub in ["amd64", "amd64/special", "other"] {
+            tokio::fs::create_dir(dir.path().join(sub))
+                .await
+                .expect("sub");
+            tokio::fs::write(dir.path().join(sub).join("p_1.0_all.deb"), b"z")
+                .await
+                .expect("deb");
+        }
+        let tree = TreeSpec {
+            root: dir.path().to_path_buf(),
+            walk: Walk::Recursive {
+                skip_subdirs: &[],
+                boundaries: vec!["apt/amd64/special".to_owned()],
+            },
+        };
+        let map = scan_candidates(&tree, "apt").await.expect("scan");
+        // `amd64/` is the container of the nested mirror: entered, its own
+        // debs are candidates; `amd64/special/` is the nested mirror's own.
+        assert!(map.contains_key(OsStr::new("amd64/p_1.0_all.deb")));
+        assert!(map.contains_key(OsStr::new("other/p_1.0_all.deb")));
+        assert!(!map.contains_key(OsStr::new("amd64/special/p_1.0_all.deb")));
+    }
+
+    #[tokio::test]
+    async fn scan_candidates_unlinks_non_regular_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(dir.path().join("a_1.0_amd64.deb"), b"x")
+            .await
+            .expect("deb");
+        let link = dir.path().join("l_1.0_amd64.deb");
+        tokio::fs::symlink(dir.path().join("a_1.0_amd64.deb"), &link)
+            .await
+            .expect("symlink");
+        let tree = TreeSpec {
+            root: dir.path().to_path_buf(),
+            walk: Walk::Shallow,
+        };
+        let map = scan_candidates(&tree, "debian").await.expect("scan");
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(OsStr::new("a_1.0_amd64.deb")));
+        assert!(!link.exists(), "the symlink is unlinked, not a candidate");
+    }
+
+    #[tokio::test]
+    async fn scan_candidates_absent_root_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tree = TreeSpec {
+            root: dir.path().join("absent"),
+            walk: Walk::Shallow,
+        };
+        let map = scan_candidates(&tree, "debian").await.expect("scan");
+        assert!(map.is_empty());
     }
 }

@@ -2016,17 +2016,17 @@ fn build_metrics_html() -> String {
     );
     t.row_tip(
         "Cache Non-Regular Files",
-        "Cache entries observed as non-regular non-directory files (FIFO, socket, device, symlink); also bumped for stray directories on some serving/sweep paths. Bumped by serving paths (which then return 5xx), download paths (which abort), and cleanup paths (which actively unlink these in pool/flat/by-hash/tmp).",
+        "Cache entries observed as non-regular non-directory files (FIFO, socket, device, symlink); also bumped for stray directories on some serving/sweep paths. Bumped by serving paths (which then return 5xx), download paths (which abort), and every directory walk: the startup scan and this dashboard leave the entry in place, cleanup unlinks it (pool/flat/dists/by-hash/tmp).",
         AlertNonzero(metrics::CACHE_NON_REGULAR.get()),
     );
     t.row_tip(
         "Cache Unexpected Directories",
-        "Cache entries observed as directories where only regular files are expected (pool/flat/by-hash). Cleanup leaves the directory in place and emits a warn; the tmp/ subtree is the sole exception where the directory is recursively removed. Operator action is usually required to investigate the stray directory.",
+        "Cache entries observed as directories where the cache layout does not allow one (an unknown host at the cache root, a non-layout directory in a mirror, anything in a pool or by-hash leaf). Cleanup leaves the directory in place and emits a warn; the tmp/ subtree is the sole exception where the directory is recursively removed once aged. Operator action is usually required to investigate the stray directory.",
         WarnNonzero(metrics::CACHE_DIRECTORY_UNEXPECTED.get()),
     );
     t.row_tip(
         "Cache Unexpected Regular Files",
-        "Cache entries observed as regular files at locations where only host directories are expected (the cache root). Scan leaves the file in place and emits a warn; this is typically an operator artefact (e.g. a hand-placed note) rather than a tampering signal.",
+        "Cache entries observed as regular files where the cache layout does not allow one (the cache root, a non-deb file directly in a mirror directory, a non-UTF-8-named file cleanup cannot match). The file is left in place with a warn; this is typically an operator artefact (e.g. a hand-placed note) rather than a tampering signal.",
         WarnNonzero(metrics::CACHE_UNEXPECTED_REGULAR.get()),
     );
     t.row_tip(

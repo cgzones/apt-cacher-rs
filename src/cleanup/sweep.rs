@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -7,12 +6,14 @@ use hashbrown::HashMap;
 use tracing::{debug, error, warn};
 
 use crate::cache_layout::{CacheEntryKeyRef, CacheLayout};
+use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker};
 use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
 use crate::{cache_metadata, info_once, metrics, warn_once_or_info};
 
 use super::engine::SpanClass;
+use super::scan::remove_non_regular;
 
 /// Drop the in-memory `cache_metadata` entry keyed by `(mirror, basename, layout)`.
 /// Non-UTF-8 filenames are silently skipped: debnames are URL-decoded ASCII,
@@ -237,8 +238,9 @@ pub(super) async fn sweep_candidates(
 /// by-hash cycle reclaim the now-unreferenced files.
 ///
 /// Sub-directories -- notably the `by-hash/` and `tmp/` subtrees, swept
-/// separately -- and non-regular entries are skipped. A flat `layout` (the flat
-/// root co-mingles indexes with `.deb` files) leaves any deb-named entry to the
+/// separately -- are skipped; a symlink / FIFO / socket / device is unlinked,
+/// as everywhere cleanup walks. A flat `layout` (the flat root co-mingles
+/// indexes with `.deb` files) leaves any deb-named entry to the
 /// reference-based flat-deb cleanup; the structured `dists/` tree holds no debs,
 /// so the filter is skipped there. Only the direct children are scanned (no
 /// recursion), so nested mirrors -- which own their own flat root and cleanup --
@@ -246,6 +248,13 @@ pub(super) async fn sweep_candidates(
 ///
 /// `now` is injected for testability, matching [`sweep_candidates`]: birthtime is
 /// not backdatable on Linux, so removal cannot be exercised via mtime alone.
+static METADATA_WALK: WalkContext = WalkContext {
+    what: "a metadata directory",
+    dir_failure: DirFailure::Continue("leaving its unread entries unswept this cycle"),
+    entry_failure: "retaining it",
+    non_regular: "removing it",
+};
+
 pub(super) async fn sweep_aged_metadata(
     dir: &Path,
     keep_span: Duration,
@@ -261,64 +270,31 @@ pub(super) async fn sweep_aged_metadata(
         removed_unreferenced: 0,
     };
 
-    let mut entries = match tokio::fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(err) if err.kind() == ErrorKind::NotFound => return result,
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "Failed to read metadata directory `{}`; skipping its metadata sweep this cycle:  {}",
-                dir.display(),
-                ErrorReport(&err)
-            );
-            return result;
-        }
-    };
+    let mut walker = Walker::new(dir, &METADATA_WALK, OnMissing::Tolerate, ());
 
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to iterate metadata directory `{}`; ending its metadata sweep early:  {}",
-                    dir.display(),
-                    ErrorReport(&err)
-                );
-                break;
+    while let Some(entry) = walker.next().await {
+        match entry.kind() {
+            // `by-hash/`, `tmp/` and flat URL-dirs are swept by their own
+            // units.
+            EntryKind::Dir => continue,
+            EntryKind::NonRegular => {
+                remove_non_regular(&entry.path()).await;
+                continue;
             }
-        };
+            EntryKind::File => {}
+        }
 
         // The flat root co-mingles volatile indexes with `.deb` files; the debs
         // are reconciled (with checksums) by the flat-deb cleanup, so leave them
         // be and sweep only the index metadata. `dists/` has no debs. Filtered
         // by name before the stat, so the whole deb population costs no syscalls.
-        let file_name = entry.file_name();
-        if skip_debs && file_name.to_str().is_some_and(is_deb_package) {
+        if skip_debs && entry.name().to_str().is_some_and(is_deb_package) {
             continue;
         }
 
-        // `entry.metadata()` has lstat semantics on tokio's `DirEntry`, so a
-        // symlink planted here is seen as itself (non-regular) and skipped.
-        let data = match entry.metadata().await {
-            Ok(m) => m,
-            Err(err) => {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to stat metadata entry `{}`; retaining it:  {}",
-                    entry.path().display(),
-                    ErrorReport(&err)
-                );
-                continue;
-            }
+        let Some(data) = entry.metadata().await else {
+            continue;
         };
-
-        // Only regular files are volatile indexes; the `by-hash/` subtree and
-        // any other directory or non-regular entry is handled elsewhere.
-        if !data.file_type().is_file() {
-            continue;
-        }
 
         let path = entry.path();
 
