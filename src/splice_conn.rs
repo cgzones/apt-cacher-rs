@@ -107,6 +107,86 @@ struct VolatileCondHeaders {
     if_none_match: Option<Arc<str>>,
 }
 
+/// The client side of a splice exchange: the socket plus the protocol
+/// version and keep-alive decision every response head is rendered with.
+/// `Copy`, so the phase helpers take it by value instead of repeating the
+/// stream/version/action triple in their signatures.
+#[derive(Clone, Copy)]
+struct ClientConn<'a> {
+    stream: &'a TcpStream,
+    version: ConnectionVersion,
+    action: ConnectionAction,
+}
+
+/// The slice of the object the client asked for, resolved against the total
+/// size once that is known: the whole object (`200 OK`) unless the client's
+/// `Range` was satisfiable (`206 Partial Content`, echoing `content_range`).
+/// The streaming drive and the buffered volatile path both derive it via
+/// [`ClientRangePlan::from_parsed`], so the two cannot drift.
+#[derive(Debug, PartialEq, Eq)]
+struct ClientRangePlan {
+    /// `Content-Range` value of a 206; `None` means the whole object.
+    content_range: Option<String>,
+    /// First object byte to send.
+    start: u64,
+    /// Bytes to send; the whole object when `content_range` is `None`.
+    len: u64,
+}
+
+/// The client's `Range` cannot be satisfied for this object size
+/// ([`ClientRangePlan::from_parsed`]); the response is a 416.
+#[derive(Debug, PartialEq, Eq)]
+struct RangeNotSatisfiable;
+
+impl ClientRangePlan {
+    /// Resolve the parsed `Range` (`None` when the request carried none)
+    /// against the object's `total` size. A malformed `Range` and a failed
+    /// `If-Range` precondition both serve the whole object (RFC 9110
+    /// sections 14.2 and 13.1.5).
+    fn from_parsed(parsed: Option<ParsedRange>, total: u64) -> Result<Self, RangeNotSatisfiable> {
+        match parsed {
+            Some(ParsedRange::NotSatisfiable) => Err(RangeNotSatisfiable),
+            Some(ParsedRange::Satisfiable(content_range, start, len)) => Ok(Self {
+                content_range: Some(content_range),
+                start,
+                len,
+            }),
+            Some(ParsedRange::Invalid | ParsedRange::IfRangeFailed) | None => Ok(Self {
+                content_range: None,
+                start: 0,
+                len: total,
+            }),
+        }
+    }
+
+    /// Whether the response is a `206 Partial Content`.
+    fn is_partial(&self) -> bool {
+        self.content_range.is_some()
+    }
+
+    /// One past the last object byte to send.
+    fn end(&self) -> u64 {
+        self.start + self.len
+    }
+
+    fn status(&self) -> StatusCode {
+        if self.is_partial() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        }
+    }
+
+    /// The status line of the response head.
+    fn status_line(&self) -> &'static str {
+        if self.is_partial() {
+            "206 Partial Content"
+        } else {
+            "200 OK"
+        }
+    }
+}
+
 /// Pre-computed byte offsets for range-filtering the splice loop output.
 /// `skip` bytes are suppressed at the start, then `send` bytes are forwarded.
 struct SpliceRangeFilter {
@@ -5388,11 +5468,15 @@ pub(crate) async fn splice_proxy(
         }
     };
 
+    let client = ClientConn {
+        stream: client_stream,
+        version: conn_version,
+        action: conn_action,
+    };
+
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     splice_proxy_drive(
-        client_stream,
-        conn_version,
-        conn_action,
+        client,
         conn_details,
         upstream_path,
         appstate,
@@ -5469,18 +5553,122 @@ async fn serve_volatile_304_via_sendfile(
     }
 }
 
+/// Resolve the client's parsed `Range` against the object's `total` size,
+/// answering the 416 on the client's behalf when it cannot be satisfied
+/// (`Ok(None)`; `phase_416` tags a failed 416 write).
+async fn resolve_client_range(
+    client: ClientConn<'_>,
+    parsed: Option<ParsedRange>,
+    total: u64,
+    phase_416: &'static str,
+) -> Result<Option<ClientRangePlan>, SpliceProxyError> {
+    match ClientRangePlan::from_parsed(parsed, total) {
+        Ok(plan) => Ok(Some(plan)),
+        Err(RangeNotSatisfiable) => {
+            write_416_response(client.stream, client.version, client.action, total)
+                .await
+                .map_err(|err| SpliceProxyError::Client {
+                    phase: phase_416,
+                    err,
+                })?;
+            Ok(None)
+        }
+    }
+}
+
+/// Render the `200 OK` / `206 Partial Content` head of a splice-served body:
+/// the same bytes for the streaming drive and the buffered volatile path.
+/// Deliberately not built on `ResponseHead::render`, which orders the
+/// headers differently; the wire bytes are pinned by the
+/// `splice_response_head_renders_the_pinned_bytes` test.
+fn render_splice_response_head(
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    upstream_resp: &UpstreamResponse,
+    range: &ClientRangePlan,
+    content_type: &str,
+    date: &str,
+) -> String {
+    // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
+    let age: u32 = 0;
+    let status_line = range.status_line();
+    let response_content_length = range.len;
+    format!(
+        "{conn_version} {status_line}\r\n\
+         Date: {date}\r\n\
+         Via: {APP_VIA}\r\n\
+         Connection: {conn_action}\r\n\
+         Content-Length: {response_content_length}\r\n\
+         Content-Type: {content_type}\r\n\
+         {last_modified_header}\
+         {etag_header}\
+         Accept-Ranges: bytes\r\n\
+         Age: {age}\r\n\
+         {content_range_header}\
+         \r\n",
+        last_modified_header = OptHeader("Last-Modified", upstream_resp.last_modified.as_deref()),
+        etag_header = OptHeader("ETag", upstream_resp.etag.as_deref()),
+        content_range_header = OptHeader("Content-Range", range.content_range.as_deref()),
+    )
+}
+
+/// Write the response head of a splice-served body to the client. The
+/// caller has corked the socket, so the head coalesces with the body bytes
+/// written right after. Records the client status and the per-response
+/// `REQUESTS_SPLICE` bump, and returns the instant the first byte headed to
+/// the client (start of the client-rate window). `phase` tags a failed
+/// write.
+async fn write_splice_response_headers(
+    client: ClientConn<'_>,
+    conn_details: &ConnectionDetails,
+    upstream_resp: &UpstreamResponse,
+    range: &ClientRangePlan,
+    phase: &'static str,
+) -> Result<PreciseInstant, SpliceProxyError> {
+    let content_type = content_type_for_cached_file(&conn_details.debname);
+    warn_on_content_type_mismatch(
+        upstream_resp.content_type.as_deref(),
+        &conn_details.mirror,
+        &conn_details.debname,
+    );
+    let date = format_http_date();
+    let response_headers = render_splice_response_head(
+        client.version,
+        client.action,
+        upstream_resp,
+        range,
+        content_type,
+        &date,
+    );
+
+    trace!(
+        "Outgoing {} response:\n{response_headers}",
+        range.status_line()
+    );
+
+    metrics::record_client_status(range.status());
+    // Bump once per splice-served response, regardless of whether the body
+    // ends up flowing through `splice_proxy_body{,_tls}`, the body-prefix
+    // direct write, or the buffered volatile write.
+    metrics::REQUESTS_SPLICE.increment();
+    // Start of the client-rate window: the first byte heading to the client.
+    let t_client_first = PreciseInstant::now();
+    write_all_to_stream(
+        client.stream,
+        response_headers.as_bytes(),
+        WritePhase::Header,
+    )
+    .await
+    .map_err(|err| SpliceProxyError::Client { phase, err })?;
+    Ok(t_client_first)
+}
+
 /// Body of [`splice_proxy`] after the originate check has succeeded. Kept as
 /// a separate fn returning `Result<(), SpliceProxyError>` so the many
 /// `Ok(())` early-returns scattered through the body do not need to be
 /// rewritten just because the outer success type changed.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "function has only 1 caller and is a tail call"
-)]
 async fn splice_proxy_drive(
-    client_stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
+    client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     upstream_path: &str,
     appstate: &AppState,
@@ -5488,6 +5676,11 @@ async fn splice_proxy_drive(
     init_tx: tokio::sync::watch::Sender<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
+    let ClientConn {
+        stream: client_stream,
+        version: conn_version,
+        action: conn_action,
+    } = client;
     let mirror = &conn_details.mirror;
     let host_authority = mirror.format_authority();
     // Capture the original (pre-redirect) client request path. A 301 redirect
@@ -5915,9 +6108,7 @@ async fn splice_proxy_drive(
         DownloadPlan::Download { .. } => {
             return handle_volatile_buffered_download(
                 &mut upstream,
-                client_stream,
-                conn_version,
-                conn_action,
+                client,
                 conn_details,
                 original_uri_path,
                 &upstream_resp,
@@ -5953,26 +6144,16 @@ async fn splice_proxy_drive(
             upstream_resp.etag.as_deref(),
         )
     });
-    // Range is not satisfiable — return 416.
-    if matches!(client_range_result, Some(ParsedRange::NotSatisfiable)) {
-        write_416_response(
-            client_stream,
-            conn_version,
-            conn_action,
-            total_content_length.get(),
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client {
-            phase: "416 response",
-            err,
-        })?;
+    let Some(range_plan) = resolve_client_range(
+        client,
+        client_range_result,
+        total_content_length.get(),
+        "416 response",
+    )
+    .await?
+    else {
         return Ok(SpliceProxyOutcome::Served);
-    }
-    let (content_range_hdr, client_range_start, client_range_len, is_partial) =
-        match client_range_result {
-            Some(ParsedRange::Satisfiable(cr, start, len)) => (Some(cr), start, len, true),
-            _ => (None, 0, total_content_length.get(), false),
-        };
+    };
 
     // Create cache directory and temp file
     let dest_dir = conn_details.cache_dir_path();
@@ -6223,74 +6404,25 @@ async fn splice_proxy_drive(
         );
     }
 
-    // Write response headers to client
-    let last_modified_str = upstream_resp.last_modified.as_deref();
-    let content_type = content_type_for_cached_file(&conn_details.debname);
-    warn_on_content_type_mismatch(
-        upstream_resp.content_type.as_deref(),
-        &conn_details.mirror,
-        &conn_details.debname,
-    );
-    let date = format_http_date();
-    // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
-    let age: u32 = 0;
-    let (status_line, response_content_length) = if is_partial {
-        ("206 Partial Content", client_range_len)
-    } else {
-        ("200 OK", total_content_length.get())
-    };
-    let response_headers = format!(
-        "{conn_version} {status_line}\r\n\
-         Date: {date}\r\n\
-         Via: {APP_VIA}\r\n\
-         Connection: {conn_action}\r\n\
-         Content-Length: {response_content_length}\r\n\
-         Content-Type: {content_type}\r\n\
-         {last_modified_header}\
-         {etag_header}\
-         Accept-Ranges: bytes\r\n\
-         Age: {age}\r\n\
-         {content_range_header}\
-         \r\n",
-        last_modified_header = OptHeader("Last-Modified", last_modified_str),
-        etag_header = OptHeader("ETag", upstream_resp.etag.as_deref()),
-        content_range_header = OptHeader("Content-Range", content_range_hdr.as_ref()),
-    );
-
     // Cork the socket to coalesce headers + body prefix into fewer TCP segments
     let cork = CorkGuard::new_optional(client_stream);
 
-    trace!("Outgoing {status_line} response:\n{response_headers}");
-
-    metrics::record_client_status(if is_partial {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
-    });
-    // Bump once per splice-served response, regardless of whether the body
-    // ends up flowing through `splice_proxy_body{,_tls}`, the body-prefix
-    // direct write, or the kTLS-extra-body direct write.
-    metrics::REQUESTS_SPLICE.increment();
-    // Start of the client-rate window: the first byte heading to the client.
-    let t_client_first = PreciseInstant::now();
-    write_all_to_stream(
-        client_stream,
-        response_headers.as_bytes(),
-        WritePhase::Header,
+    // Write response headers to client
+    let t_client_first = write_splice_response_headers(
+        client,
+        conn_details,
+        &upstream_resp,
+        &range_plan,
+        "response headers",
     )
-    .await
-    .map_err(|err| SpliceProxyError::Client {
-        phase: "response headers",
-        err,
-    })?;
+    .await?;
 
     // For resumed downloads, send the existing partial file content to the client first
     // using sendfile(2) for zero-copy transfer from the cache file to the client socket.
     // With a client Range, only send the overlap of [0, resume_offset) with the range.
     if resume_offset > 0 {
-        let client_range_end = client_range_start + client_range_len;
-        let send_start = client_range_start.min(resume_offset);
-        let send_end = client_range_end.min(resume_offset);
+        let send_start = range_plan.start.min(resume_offset);
+        let send_end = range_plan.end().min(resume_offset);
         if send_end > send_start {
             let partial_reader = tokio_nofollow_options()
                 .read(true)
@@ -6370,8 +6502,8 @@ async fn splice_proxy_drive(
         let client_slice = range_slice(
             body_prefix,
             pre_loop_file_pos,
-            client_range_start,
-            client_range_len,
+            range_plan.start,
+            range_plan.len,
         );
         if !client_slice.is_empty() {
             let config = global_config();
@@ -6437,7 +6569,7 @@ async fn splice_proxy_drive(
         // Compute client range relative to splice region for the body transfer.
         // splice_file_start is the file offset where the splice region begins.
         let splice_file_start = resume_offset + body_content_length.get() - splice_count;
-        let client_range_end = client_range_start + client_range_len;
+        let client_range_end = range_plan.end();
         let splice_file_end = splice_file_start + splice_count;
         // How many bytes to skip at the start of the splice region before sending to client.
         // Worked example: total file = 1000, resume_offset = 0, splice_file_start = 0,
@@ -6447,7 +6579,7 @@ async fn splice_proxy_drive(
         //   client_send = min(500, 1000) - (0 + 200) = 300 (send exactly the range)
         // If the range ends past the splice region (e.g. due to a body prefix already
         // consumed), the min() clamps to splice_file_end and saturating_sub clamps at 0.
-        let client_skip = client_range_start.saturating_sub(splice_file_start);
+        let client_skip = range_plan.start.saturating_sub(splice_file_start);
         // How many bytes to send to client from within the splice region.
         let client_send = client_range_end
             .min(splice_file_end)
@@ -6644,11 +6776,8 @@ async fn splice_proxy_drive(
             body_content_length.get(),
             t_upstream_done.duration_since(t_req_sent),
         );
-        let client = if client_succeeded {
-            rate_log::client_segment(
-                response_content_length,
-                t_client_done.duration_since(t_client_first),
-            )
+        let client_seg = if client_succeeded {
+            rate_log::client_segment(range_plan.len, t_client_done.duration_since(t_client_first))
         } else {
             rate_log::client_disconnect_segment(
                 client_bytes_sent,
@@ -6656,7 +6785,7 @@ async fn splice_proxy_drive(
             )
         };
         info!(
-            "{} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({upstream}, {client}){}",
+            "{} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({upstream}, {client_seg}){}",
             if client_succeeded {
                 "Served and cached"
             } else {
@@ -6693,7 +6822,7 @@ async fn splice_proxy_drive(
             size: total_content_length.get(),
             elapsed,
             kind: TransferKind::Delivery {
-                partial: is_partial,
+                partial: range_plan.is_partial(),
             },
             client_ip: conn_details.client.ip(),
         });
@@ -7167,9 +7296,7 @@ async fn read_dechunk_body_to_vec(
 )]
 async fn handle_volatile_buffered_download(
     upstream: &mut PoolGuard,
-    client_stream: &TcpStream,
-    conn_version: ConnectionVersion,
-    conn_action: ConnectionAction,
+    client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     // The original (pre-redirect) client request URI path. Used for
     // `RenamePlan.raw_uri_path` and the recorded `Origin` so registry keys
@@ -7182,6 +7309,11 @@ async fn handle_volatile_buffered_download(
     client_range: RangeRequestHeaders<'_>,
     conn_label: ConnLabel,
 ) -> Result<(), SpliceProxyError> {
+    let ClientConn {
+        stream: client_stream,
+        version: conn_version,
+        action: conn_action,
+    } = client;
     let max_bytes: usize = VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER
         .get()
         .try_into()
@@ -7324,30 +7456,16 @@ async fn handle_volatile_buffered_download(
         parsed
     });
 
-    // Range is not satisfiable — return 416.
-    if matches!(client_range_result, Some(ParsedRange::NotSatisfiable)) {
-        write_416_response(
-            client_stream,
-            conn_version,
-            conn_action,
-            total_content_length.get(),
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client {
-            phase: "volatile 416 response",
-            err,
-        })?;
+    let Some(range_plan) = resolve_client_range(
+        client,
+        client_range_result,
+        total_content_length.get(),
+        "volatile 416 response",
+    )
+    .await?
+    else {
         return Ok(());
-    }
-
-    #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
-    let (content_range_hdr, client_range_start, client_range_len, is_partial) =
-        match client_range_result {
-            Some(ParsedRange::Satisfiable(cr, start, len)) => {
-                (Some(cr), start as usize, len as usize, true)
-            }
-            _ => (None, 0, body.len(), false),
-        };
+    };
 
     // Create cache directory and temp file.
     let dest_dir = conn_details.cache_dir_path();
@@ -7509,67 +7627,22 @@ async fn handle_volatile_buffered_download(
     // Serve the client from the in-memory body. The cache is already persisted
     // (best-effort above), so an early return on a client write failure no
     // longer loses the downloaded body.
-    let last_modified_str = upstream_resp.last_modified.as_deref().unwrap_or("");
-    let content_type = content_type_for_cached_file(&conn_details.debname);
-    warn_on_content_type_mismatch(
-        upstream_resp.content_type.as_deref(),
-        &conn_details.mirror,
-        &conn_details.debname,
-    );
-    let date = format_http_date();
-    // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
-    let age: u32 = 0;
-    let (status_line, response_content_length) = if is_partial {
-        ("206 Partial Content", client_range_len)
-    } else {
-        ("200 OK", body.len())
-    };
-    let response_headers = format!(
-        "{conn_version} {status_line}\r\n\
-         Date: {date}\r\n\
-         Via: {APP_VIA}\r\n\
-         Connection: {conn_action}\r\n\
-         Content-Length: {response_content_length}\r\n\
-         Content-Type: {content_type}\r\n\
-         {last_modified_header}\
-         {etag_header}\
-         Accept-Ranges: bytes\r\n\
-         Age: {age}\r\n\
-         {content_range_header}\
-         \r\n",
-        last_modified_header = OptHeader(
-            "Last-Modified",
-            (!last_modified_str.is_empty()).then_some(last_modified_str),
-        ),
-        etag_header = OptHeader("ETag", upstream_resp.etag.as_deref()),
-        content_range_header = OptHeader("Content-Range", content_range_hdr.as_ref()),
-    );
 
     // Cork to coalesce headers + body into fewer TCP segments.
     let cork = CorkGuard::new_optional(client_stream);
 
-    trace!("Outgoing {status_line} response:\n{response_headers}");
-
-    metrics::record_client_status(if is_partial {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
-    });
-    metrics::REQUESTS_SPLICE.increment();
-    let t_client_first = PreciseInstant::now();
-    write_all_to_stream(
-        client_stream,
-        response_headers.as_bytes(),
-        WritePhase::Header,
+    let t_client_first = write_splice_response_headers(
+        client,
+        conn_details,
+        upstream_resp,
+        &range_plan,
+        "volatile response headers",
     )
-    .await
-    .map_err(|err| SpliceProxyError::Client {
-        phase: "volatile response headers",
-        err,
-    })?;
+    .await?;
 
     // Send body (range-filtered if needed) to client.
-    let body_slice = &body[client_range_start..client_range_start + client_range_len];
+    #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
+    let body_slice = &body[range_plan.start as usize..range_plan.end() as usize];
     {
         let config = global_config();
         let mut volatile_rc = config
@@ -7614,10 +7687,7 @@ async fn handle_volatile_buffered_download(
                 total_content_length.get(),
                 t_upstream_done.duration_since(t_req_sent),
             ),
-            rate_log::client_segment(
-                response_content_length as u64,
-                t_client_done.duration_since(t_client_first),
-            ),
+            rate_log::client_segment(range_plan.len, t_client_done.duration_since(t_client_first),),
         );
 
         // Record delivery in database.
@@ -7627,7 +7697,7 @@ async fn handle_volatile_buffered_download(
             size: total_content_length.get(),
             elapsed,
             kind: TransferKind::Delivery {
-                partial: is_partial,
+                partial: range_plan.is_partial(),
             },
             client_ip: conn_details.client.ip(),
         });
@@ -8002,6 +8072,130 @@ mod tests {
         assert_eq!(label(TlsMode::Userspace, true), " (TLS, reused)");
         #[cfg(feature = "ktls")]
         assert_eq!(label(TlsMode::Kernel, false), " (kTLS)");
+    }
+
+    #[test]
+    fn client_range_plan_resolves_every_parsed_range() {
+        let whole = || ClientRangePlan {
+            content_range: None,
+            start: 0,
+            len: 1000,
+        };
+        assert_eq!(ClientRangePlan::from_parsed(None, 1000), Ok(whole()));
+        assert_eq!(
+            ClientRangePlan::from_parsed(Some(ParsedRange::Invalid), 1000),
+            Ok(whole())
+        );
+        assert_eq!(
+            ClientRangePlan::from_parsed(Some(ParsedRange::IfRangeFailed), 1000),
+            Ok(whole())
+        );
+        assert_eq!(
+            ClientRangePlan::from_parsed(Some(ParsedRange::NotSatisfiable), 1000),
+            Err(RangeNotSatisfiable)
+        );
+        assert!(!whole().is_partial());
+        assert_eq!(whole().end(), 1000);
+        assert_eq!(whole().status(), StatusCode::OK);
+        assert_eq!(whole().status_line(), "200 OK");
+
+        let partial = ClientRangePlan::from_parsed(
+            Some(ParsedRange::Satisfiable(
+                "bytes 200-499/1000".to_owned(),
+                200,
+                300,
+            )),
+            1000,
+        )
+        .expect("satisfiable");
+        assert_eq!(
+            partial,
+            ClientRangePlan {
+                content_range: Some("bytes 200-499/1000".to_owned()),
+                start: 200,
+                len: 300,
+            }
+        );
+        assert!(partial.is_partial());
+        assert_eq!(partial.end(), 500);
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.status_line(), "206 Partial Content");
+    }
+
+    /// Pins the wire bytes of the splice response head shared by the
+    /// streaming drive and the buffered volatile path (header order included).
+    #[test]
+    fn splice_response_head_renders_the_pinned_bytes() {
+        let date = "Fri, 02 Jan 2026 00:00:00 GMT";
+
+        let headers = b"HTTP/1.1 200 OK\r\n\
+                        Content-Length: 1000\r\n\
+                        Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
+                        ETag: \"abc\"\r\n\
+                        \r\n";
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+        let whole = ClientRangePlan::from_parsed(None, 1000).expect("no range");
+        let head = render_splice_response_head(
+            ConnectionVersion::Http11,
+            ConnectionAction::KeepAlive,
+            &resp,
+            &whole,
+            "application/vnd.debian.binary-package",
+            date,
+        );
+        assert_eq!(
+            head,
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Date: {date}\r\n\
+                 Via: {APP_VIA}\r\n\
+                 Connection: keep-alive\r\n\
+                 Content-Length: 1000\r\n\
+                 Content-Type: application/vnd.debian.binary-package\r\n\
+                 Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
+                 ETag: \"abc\"\r\n\
+                 Accept-Ranges: bytes\r\n\
+                 Age: 0\r\n\
+                 \r\n"
+            )
+        );
+
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+        let partial = ClientRangePlan::from_parsed(
+            Some(ParsedRange::Satisfiable(
+                "bytes 200-499/1000".to_owned(),
+                200,
+                300,
+            )),
+            1000,
+        )
+        .expect("satisfiable");
+        let head = render_splice_response_head(
+            ConnectionVersion::Http10,
+            ConnectionAction::Close,
+            &resp,
+            &partial,
+            "text/plain",
+            date,
+        );
+        assert_eq!(
+            head,
+            format!(
+                "HTTP/1.0 206 Partial Content\r\n\
+                 Date: {date}\r\n\
+                 Via: {APP_VIA}\r\n\
+                 Connection: close\r\n\
+                 Content-Length: 300\r\n\
+                 Content-Type: text/plain\r\n\
+                 Accept-Ranges: bytes\r\n\
+                 Age: 0\r\n\
+                 Content-Range: bytes 200-499/1000\r\n\
+                 \r\n"
+            )
+        );
     }
 
     #[test]
