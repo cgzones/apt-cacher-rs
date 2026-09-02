@@ -61,8 +61,9 @@ use crate::{
     cache_paths::{CachePaths, MirrorSite},
     client_info::ClientInfo,
     config::CacheHost,
+    database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
-        FlatKind, Mirror, MirrorKind, ResourceFile, is_deb_package, is_flat_deb_filename,
+        FlatKind, Mirror, MirrorKind, Origin, ResourceFile, is_deb_package, is_flat_deb_filename,
         valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
     },
     precise_instant::PreciseInstant,
@@ -342,9 +343,37 @@ pub(crate) struct ConnectionDetails {
     /// The classified kind; [`Self::cached_flavor`] and [`Self::layout`] are
     /// derived from it rather than stored, so the three cannot disagree.
     pub(crate) resource_kind: ResourceKind,
+    /// The `Origin` this request would register, for real-arch `Packages`
+    /// requests only.  Recorded by [`Self::record_origin`] once the request
+    /// is *answered* (a cache hit, or a 2xx/304 upstream head) -- never at
+    /// dispatch time, so a probe the upstream 404s mints no row.  Boxed:
+    /// only index requests carry one, and `ConnectionDetails` rides inside
+    /// per-request enums whose size the other variants set.
+    pub(crate) origin_fields: Option<Box<OriginFields>>,
 }
 
 impl ConnectionDetails {
+    /// Enqueue this request's `Origin` row, if it carries one.  Idempotent
+    /// per request (the DB batch dedups identical rows) and skipped for
+    /// cleanup's synthetic index fetches, which are bookkeeping, not client
+    /// demand.  Non-blocking: it runs on the request path, so a saturated
+    /// DB queue must not stall request handling.
+    pub(crate) fn record_origin(&self) {
+        let Some(fields) = &self.origin_fields else {
+            return;
+        };
+        if self.client.is_cleanup_synthetic() {
+            return;
+        }
+        let origin = Origin {
+            mirror: self.mirror.clone(),
+            distribution: fields.distribution.clone(),
+            component: fields.component.clone(),
+            architecture: fields.architecture.clone(),
+        };
+        send_db_command_nonblocking(DatabaseCommand::Origin(DbCmdOrigin { origin }));
+    }
+
     /// [`ResourceKind::cached_flavor`] of this request's resource.
     #[must_use]
     pub(crate) const fn cached_flavor(&self) -> CachedFlavor {
@@ -431,7 +460,7 @@ impl std::fmt::Display for ValidateKind {
 /// non-special architecture; `None` for every other variant (and for the
 /// `dep11`/`i18n`/`source` pseudo-architectures, which are never recorded as
 /// origins).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct OriginFields {
     pub(crate) distribution: String,
     pub(crate) component: String,

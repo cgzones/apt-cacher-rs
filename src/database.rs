@@ -348,6 +348,14 @@ pub(crate) struct DownloadRow {
 ///
 /// `PartialEq` supports batch-level dedup in the DB task: every Packages
 /// request for an origin enqueues the same upsert.
+/// A mirror row without origins, as returned by
+/// [`Database::get_mirrors_without_origins`].
+#[derive(Debug)]
+pub(crate) struct OrphanMirror {
+    pub(crate) id: i64,
+    pub(crate) entry: MirrorEntry,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OriginRow {
     pub(crate) mirror_id: i64,
@@ -1186,6 +1194,82 @@ impl Database {
         Ok(())
     }
 
+    /// Drop `origins` rows last seen before `cutoff` (seconds since the
+    /// epoch): an origin no client asked for within the retention window
+    /// would otherwise cost a `Packages` fetch cascade on every cleanup run
+    /// and a dashboard row forever.
+    pub(crate) async fn delete_stale_origins(&self, cutoff: Duration) -> Result<u64, Error> {
+        let cutoff_epoch = i64::try_from(cutoff.as_secs())
+            .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))?;
+
+        let result = query!(r"DELETE FROM origins WHERE last_seen < ?;", cutoff_epoch)
+            .execute(&self.conn)
+            .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Mirror rows no `origins` row references any more.  Cleanup drops the
+    /// ones whose cache tree is gone as well (see
+    /// [`Self::delete_mirrors`]); the row id travels along for that.
+    pub(crate) async fn get_mirrors_without_origins(&self) -> Result<Vec<OrphanMirror>, Error> {
+        struct Row {
+            id: i64,
+            host: ClientHost,
+            port: u16,
+            path: String,
+            kind: i64,
+        }
+
+        let rows = query_as!(
+            Row,
+            r#"
+              SELECT id, host AS "host: ClientHost", port AS "port: u16", path, kind AS "kind!: i64"
+              FROM mirrors_v2
+              WHERE NOT EXISTS (SELECT 1 FROM origins WHERE origins.mirror_id = mirrors_v2.id);
+            "#,
+        )
+        .fetch_all(&self.conn)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| OrphanMirror {
+                id: row.id,
+                entry: MirrorEntry {
+                    host: row.host,
+                    port: row.port,
+                    path: row.path,
+                    kind: row.kind,
+                },
+            })
+            .collect())
+    }
+
+    /// Delete mirror rows by id together with every row referencing them.
+    pub(crate) async fn delete_mirrors(&self, ids: &[i64]) -> Result<(), Error> {
+        let mut tx = self.conn.begin().await?;
+
+        for id in ids {
+            query!(r"DELETE FROM origins WHERE mirror_id = ?;", id)
+                .execute(&mut *tx)
+                .await?;
+            query!(r"DELETE FROM downloads WHERE mirror_id = ?;", id)
+                .execute(&mut *tx)
+                .await?;
+            query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", id)
+                .execute(&mut *tx)
+                .await?;
+            query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     pub(crate) async fn delete_usage_logs(&self, keep_date: Duration) -> Result<(), Error> {
         let keep_epoch = i64::try_from(keep_date.as_secs())
             .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))?;
@@ -1215,5 +1299,90 @@ impl Database {
         tx.commit().await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    async fn temp_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::connect(&dir.path().join("t.db"), Duration::from_secs(5))
+            .await
+            .expect("connect");
+        db.init_tables().await.expect("schema");
+        (dir, db)
+    }
+
+    /// Insert a mirror row directly: `upsert_mirror_id` resolves aliases
+    /// through `global_config()`, which no unit test can initialise.
+    async fn insert_mirror(db: &Database, path: &str) -> i64 {
+        let row = query(
+            "INSERT INTO mirrors_v2 (host, port, path, kind) VALUES ('deb.example.org', 0, ?, 0) RETURNING id",
+        )
+        .bind(path)
+        .fetch_one(&db.conn)
+        .await
+        .expect("insert mirror");
+        sqlx::Row::get(&row, 0)
+    }
+
+    #[tokio::test]
+    async fn delete_stale_origins_keeps_recent_rows() {
+        let (_dir, db) = temp_db().await;
+        let fresh_id = insert_mirror(&db, "fresh").await;
+        let stale_id = insert_mirror(&db, "stale").await;
+        let row = |mirror_id| OriginRow {
+            mirror_id,
+            distribution: "sid".to_owned(),
+            component: "main".to_owned(),
+            architecture: "amd64".to_owned(),
+        };
+        db.batch_upsert_origins(&[row(fresh_id), row(stale_id)])
+            .await
+            .expect("upsert origins");
+        query("UPDATE origins SET last_seen = 1000 WHERE mirror_id = ?")
+            .bind(stale_id)
+            .execute(&db.conn)
+            .await
+            .expect("backdate");
+
+        db.delete_stale_origins(Duration::from_secs(2000))
+            .await
+            .expect("delete stale");
+
+        let left = db.get_origins().await.expect("get origins");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].mirror_path, "fresh");
+    }
+
+    #[tokio::test]
+    async fn mirrors_without_origins_lists_only_orphans() {
+        let (_dir, db) = temp_db().await;
+        let with_id = insert_mirror(&db, "with").await;
+        let without_id = insert_mirror(&db, "without").await;
+        db.batch_upsert_origins(&[OriginRow {
+            mirror_id: with_id,
+            distribution: "sid".to_owned(),
+            component: "main".to_owned(),
+            architecture: "amd64".to_owned(),
+        }])
+        .await
+        .expect("upsert origins");
+
+        let orphans = db.get_mirrors_without_origins().await.expect("query");
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, without_id);
+        assert_eq!(orphans[0].entry.path, "without");
+
+        db.delete_mirrors(&[without_id]).await.expect("delete");
+        assert!(
+            db.get_mirrors_without_origins()
+                .await
+                .expect("query")
+                .is_empty()
+        );
+        assert_eq!(db.get_mirrors().await.expect("mirrors").len(), 1);
     }
 }

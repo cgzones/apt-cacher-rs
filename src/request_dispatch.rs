@@ -45,10 +45,8 @@ use crate::{
     cache_layout::{self, ClassifyError, ConnectionDetails},
     client_info::ClientInfo,
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
-    database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
-        Mirror, Origin, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path,
-        parse_request_path,
+        Mirror, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path, parse_request_path,
     },
     error::ErrorReport,
     flat_blocklist, global_config, info_once, metrics,
@@ -328,26 +326,16 @@ pub(crate) enum DispatchOutcome {
 
 /// Output of [`decide_request`].
 ///
-/// Mirrors [`DispatchOutcome`] but attaches the deferred `pending_origin` to
-/// the `Cache` arm only - the one outcome it can legally accompany - so a
-/// non-`Cache` decision cannot carry a stray origin.  The async wrapper drives
-/// that side-effect, then maps to the backend-facing `DispatchOutcome`.  The
-/// split lets unit tests exercise the routing logic without standing up the DB
-/// task channel.
+/// Mirrors [`DispatchOutcome`] without the async wrapper's side-effects
+/// (`record_uncacheable`), so unit tests exercise the routing logic without
+/// standing up the DB task channel.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "transient value: built in decide_request and destructured immediately in \
-              dispatch_request, never stored or collected, so the variant-size gap is \
-              irrelevant; boxing the details would add a per-request heap alloc on the cache path"
-)]
 enum Decision {
-    /// `pending_origin` is `Some` when `class.origin_fields` indicated a real
-    /// (non-pseudo) architecture; the wrapper forwards it to `send_db_command_nonblocking`
-    /// before returning the `Cache` outcome.
+    /// `conn_details.origin_fields` is `Some` when `class.origin_fields`
+    /// indicated a real (non-pseudo) architecture; the backend records it
+    /// once the request is answered.
     Cache {
         conn_details: ConnectionDetails,
-        pending_origin: Option<Origin>,
     },
     Reject(RejectReason),
     Passthrough {
@@ -383,17 +371,11 @@ pub(crate) async fn dispatch_request(
         request_received_at,
     );
     match decision {
-        Decision::Cache {
-            conn_details,
-            pending_origin,
-        } => {
-            if let Some(origin) = pending_origin {
-                // Nonblocking: this runs pre-response on the dispatch path,
-                // so a saturated DB queue must not stall request handling.
-                send_db_command_nonblocking(DatabaseCommand::Origin(DbCmdOrigin { origin }));
-            }
-            DispatchOutcome::Cache(conn_details)
-        }
+        // The `Origin` row rides along in `conn_details.origin_fields` and is
+        // recorded by the backend once the request is answered
+        // (`ConnectionDetails::record_origin`), not here: a probe the
+        // upstream 404s must not mint a row.
+        Decision::Cache { conn_details } => DispatchOutcome::Cache(conn_details),
         Decision::Reject(reason) => DispatchOutcome::Reject(reason),
         Decision::Passthrough {
             reason,
@@ -487,13 +469,6 @@ fn decide_request(
                         layout.mirror_kind(),
                     );
 
-                    let pending_origin = class.origin_fields.map(|fields| Origin {
-                        mirror: mirror.clone(),
-                        distribution: fields.distribution,
-                        component: fields.component,
-                        architecture: fields.architecture,
-                    });
-
                     return Decision::Cache {
                         conn_details: ConnectionDetails {
                             client: *client,
@@ -502,8 +477,8 @@ fn decide_request(
                             aliased_host,
                             debname: class.debname,
                             resource_kind: class.resource_kind,
+                            origin_fields: class.origin_fields.map(Box::new),
                         },
-                        pending_origin,
                     };
                 }
             }
@@ -760,16 +735,12 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        let Decision::Cache {
-            conn_details,
-            pending_origin,
-        } = decision
-        else {
+        let Decision::Cache { conn_details } = decision else {
             unreachable!("expected Cache outcome")
         };
         assert_eq!(conn_details.layout(), CacheLayout::StructuredPool);
         assert_eq!(conn_details.debname, "firefox_1.0_amd64.deb");
-        assert!(pending_origin.is_none());
+        assert!(conn_details.origin_fields.is_none());
     }
 
     #[test]
@@ -784,15 +755,14 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        let Decision::Cache {
-            conn_details,
-            pending_origin,
-        } = decision
-        else {
+        let Decision::Cache { conn_details } = decision else {
             unreachable!("expected Cache outcome")
         };
         assert_eq!(conn_details.layout(), CacheLayout::Dists);
-        let origin = pending_origin.expect("binary-amd64 must record an origin");
+        let origin = conn_details
+            .origin_fields
+            .as_ref()
+            .expect("binary-amd64 must record an origin");
         assert_eq!(origin.distribution, "sid");
         assert_eq!(origin.component, "main");
         assert_eq!(origin.architecture, "binary-amd64");

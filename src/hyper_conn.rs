@@ -1799,7 +1799,17 @@ async fn serve_new_file(
         cached,
         config.max_object_size,
     ) {
-        Ok(plan) => plan,
+        Ok(plan) => {
+            // Answered by the upstream (fresh body or a 304): this is the
+            // point the request's Origin row is earned.
+            if matches!(
+                plan,
+                DownloadPlan::NotModified(_) | DownloadPlan::Download { .. }
+            ) {
+                conn_details.record_origin();
+            }
+            plan
+        }
         Err(anomaly) => {
             match anomaly {
                 ResumeAnomaly::RangeIgnored => info!(
@@ -2330,6 +2340,7 @@ pub(crate) async fn process_cache_request(
             if conn_details.cached_flavor() == CachedFlavor::Permanent {
                 metrics::CACHE_HITS.increment();
             }
+            conn_details.record_origin();
 
             trace!(
                 "File {} found, serving {} version...",

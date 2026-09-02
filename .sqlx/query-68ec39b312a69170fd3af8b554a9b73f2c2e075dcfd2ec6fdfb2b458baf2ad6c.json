@@ -6,17 +6,30 @@
       {
         "name": "id",
         "ordinal": 0,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mirrors_v2",
+            "name": "id"
+          }
+        }
       },
       {
         "name": "kind!: i64",
         "ordinal": 1,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mirrors_v2",
+            "name": "kind"
+          }
+        }
       },
       {
         "name": "was_inserted!: bool",
         "ordinal": 2,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": "Expression"
       }
     ],
     "parameters": {

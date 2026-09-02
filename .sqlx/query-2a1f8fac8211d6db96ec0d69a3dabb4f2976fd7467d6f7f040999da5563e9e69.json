@@ -6,14 +6,20 @@
       {
         "name": "id!: i64",
         "ordinal": 0,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mirrors_v2",
+            "name": "id"
+          }
+        }
       }
     ],
     "parameters": {
       "Right": 3
     },
     "nullable": [
-      true
+      false
     ]
   },
   "hash": "2a1f8fac8211d6db96ec0d69a3dabb4f2976fd7467d6f7f040999da5563e9e69"

@@ -517,6 +517,7 @@ pub(super) async fn try_fetch_packages_file(
             aliased_host: None,
             debname: debname.cache_name(pkgfmt),
             resource_kind,
+            origin_fields: None,
         };
 
         let mut response = process_cache_request(conn_details, req, appstate.clone()).await;

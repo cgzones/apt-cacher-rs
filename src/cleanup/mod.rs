@@ -24,10 +24,80 @@ use hashbrown::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    AppState, config::CacheHost, database::resolved_cache_host, deb_mirror::derive_nested_paths,
-    error::ErrorReport, global_cache_quota, global_config, humanfmt::HumanFmt, metrics,
-    task_cache_scan::task_cache_scan, xattr_helpers,
+    AppState,
+    cache_paths::CachePaths,
+    config::{CacheHost, Config},
+    database::{Database, resolved_cache_host},
+    deb_mirror::{Mirror, derive_nested_paths},
+    error::ErrorReport,
+    global_cache_quota, global_config,
+    humanfmt::HumanFmt,
+    limits::RETENTION_TIME,
+    metrics,
+    task_cache_scan::task_cache_scan,
+    xattr_helpers,
 };
+
+/// Drop `origins` rows unseen for [`RETENTION_TIME`] and mirror rows that
+/// have neither an origin left nor a cache tree on disk.  Both are minted by
+/// client demand and only ever grew; without this every probed index would
+/// cost a unit walk and an upstream fetch cascade per cleanup run forever.
+/// A DB failure is logged and skipped -- the per-mirror work must still run.
+async fn prune_stale_rows(database: &Database, config: &Config) {
+    let now_secs = coarsetime::Clock::now_since_epoch().as_secs();
+    let cutoff = Duration::from_secs(now_secs.saturating_sub(RETENTION_TIME.as_secs()));
+    match database.delete_stale_origins(cutoff).await {
+        Ok(0) => {}
+        Ok(removed) => info!(
+            "Removed {removed} origin rows not requested within {}",
+            HumanFmt::Time(RETENTION_TIME)
+        ),
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!(
+                "Failed to remove stale origin rows; retaining them until the next cleanup run:  {}",
+                ErrorReport(&err)
+            );
+        }
+    }
+
+    let orphans = match database.get_mirrors_without_origins().await {
+        Ok(orphans) => orphans,
+        Err(err) => {
+            metrics::DB_OPERATION_FAILED.increment();
+            error!(
+                "Failed to look up mirror rows without origins; retaining them until the next cleanup run:  {}",
+                ErrorReport(&err)
+            );
+            return;
+        }
+    };
+    let paths = CachePaths::new(&config.cache_directory);
+    let mut gone = Vec::new();
+    for orphan in orphans {
+        let site = orphan.entry.site_with_aliases(&config.aliases);
+        let has_tree =
+            paths.mirror_dir(site).exists() || paths.flat_root(site.host, site.port).exists();
+        if !has_tree {
+            info!(
+                "Removing mirror row {} without origins or cached files",
+                Mirror::from(orphan.entry)
+            );
+            gone.push(orphan.id);
+        }
+    }
+    if gone.is_empty() {
+        return;
+    }
+    if let Err(err) = database.delete_mirrors(&gone).await {
+        metrics::DB_OPERATION_FAILED.increment();
+        error!(
+            "Failed to remove {} mirror rows without origins or cached files; retaining them until the next cleanup run:  {}",
+            gone.len(),
+            ErrorReport(&err)
+        );
+    }
+}
 
 /// Delay between daemon startup and the first scheduled cleanup run.
 pub(crate) const FIRST_CLEANUP_DELAY_SECS: u64 = 60 * 60;
@@ -118,6 +188,8 @@ async fn task_cleanup_impl(appstate: &AppState) {
             );
         }
     }
+
+    prune_stale_rows(&appstate.database, config).await;
 
     let mirrors = match appstate.database.get_mirrors().await {
         Ok(m) => m,

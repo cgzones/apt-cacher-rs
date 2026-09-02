@@ -1690,6 +1690,15 @@ async fn splice_proxy_drive(
         reused: _,
     } = exchange;
 
+    // Answered by the upstream (fresh body or a 304): this is the point the
+    // request's Origin row is earned.
+    if matches!(
+        plan,
+        DownloadPlan::NotModified(_) | DownloadPlan::Download { .. }
+    ) {
+        conn_details.record_origin();
+    }
+
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified(cache_path) => {
             // Upstream confirms the cached copy is still current: refresh the

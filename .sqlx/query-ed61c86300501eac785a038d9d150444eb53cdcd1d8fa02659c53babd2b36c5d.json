@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM origins WHERE last_seen < ?;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "ed61c86300501eac785a038d9d150444eb53cdcd1d8fa02659c53babd2b36c5d"
+}

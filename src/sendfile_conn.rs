@@ -1230,6 +1230,7 @@ async fn try_sendfile_request(
             if conn_details.cached_flavor() == CachedFlavor::Permanent {
                 metrics::CACHE_HITS.increment();
             }
+            conn_details.record_origin();
 
             return serve_file_via_sendfile(
                 stream,

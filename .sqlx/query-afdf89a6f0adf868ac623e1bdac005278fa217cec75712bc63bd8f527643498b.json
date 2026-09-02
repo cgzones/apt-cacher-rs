@@ -1,11 +1,22 @@
 {
   "db_name": "SQLite",
-  "query": "\n              SELECT host AS \"host: ClientHost\", port AS \"port: u16\", path, kind AS \"kind!: i64\"\n              FROM mirrors_v2\n              WHERE kind = 0 AND (path = 'flat' OR path LIKE 'flat/%');\n            ",
+  "query": "\n              SELECT id, host AS \"host: ClientHost\", port AS \"port: u16\", path, kind AS \"kind!: i64\"\n              FROM mirrors_v2\n              WHERE NOT EXISTS (SELECT 1 FROM origins WHERE origins.mirror_id = mirrors_v2.id);\n            ",
   "describe": {
     "columns": [
       {
-        "name": "host: ClientHost",
+        "name": "id",
         "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mirrors_v2",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "host: ClientHost",
+        "ordinal": 1,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -16,7 +27,7 @@
       },
       {
         "name": "port: u16",
-        "ordinal": 1,
+        "ordinal": 2,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -27,7 +38,7 @@
       },
       {
         "name": "path",
-        "ordinal": 2,
+        "ordinal": 3,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -38,7 +49,7 @@
       },
       {
         "name": "kind!: i64",
-        "ordinal": 3,
+        "ordinal": 4,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -55,8 +66,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "76ebc408279a3a585e9fced16abd69cc503167c6b171f25a29fdf4ff9599f664"
+  "hash": "afdf89a6f0adf868ac623e1bdac005278fa217cec75712bc63bd8f527643498b"
 }
