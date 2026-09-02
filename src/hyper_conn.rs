@@ -1954,6 +1954,24 @@ async fn serve_new_file(
                     conn_details.debname,
                     conn_details.mirror
                 ),
+                // hyper frames upstream bodies itself, so the planner never
+                // yields these two here; the splice relay is their only
+                // producer.  Listed for the exhaustive match.
+                #[cfg(feature = "splice")]
+                RejectReason::InconsistentBodyFraming {
+                    content_length,
+                    prefix_len,
+                } => warn_once_or_info!(
+                    "Body prefix ({prefix_len} bytes) exceeds body content length ({content_length} bytes) for {} from mirror {}; returning 502",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+                #[cfg(feature = "splice")]
+                RejectReason::InterimResponse { status } => warn_once_or_info!(
+                    "Upstream sent interim response {status} for {} from mirror {}; returning 502",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
             }
             return quick_response(StatusCode::BAD_GATEWAY, reason.body());
         }

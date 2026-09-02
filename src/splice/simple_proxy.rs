@@ -13,13 +13,16 @@ use crate::cache_layout;
 use crate::database_task::{DatabaseCommand, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{Mirror, Origin};
 use crate::error::ErrorReport;
-use crate::http_helpers::{ConnectionAction, ConnectionVersion, WritePhase, write_all_to_stream};
+use crate::http_helpers::{
+    ConnectionAction, ConnectionVersion, WritePhase, write_all_to_stream, write_invalid_response,
+};
 use crate::humanfmt::HumanFmt;
 use crate::limits::MAX_UPSTREAM_HEADERS;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_log;
 use crate::{
-    build_info::APP_VIA, client_counter, client_info::ClientInfo, metrics, warn_once_or_info_logged,
+    build_info::APP_VIA, client_counter, client_info::ClientInfo, metrics, warn_once_or_info,
+    warn_once_or_info_logged,
 };
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
@@ -178,6 +181,34 @@ pub(crate) async fn splice_simple_proxy(
         resp.status_code
     );
 
+    // Fail closed before any byte of the head goes out: an interim head or a
+    // body prefix beyond the declared length would hand the client bytes the
+    // upstream appended (a forged second response). The socket still holds
+    // the unread remainder, so the connection must not be pooled.
+    let body_prefix = &hdr_buf[hdr_end..];
+    if let Err(reason) = resp.check_relayable(body_prefix.len() as u64) {
+        reason.record_metrics();
+        warn_once_or_info!(
+            "simple proxy: unrelayable upstream response {} for {upstream_path} from {host_authority} ({}); returning 502",
+            resp.status_code,
+            reason.body()
+        );
+        upstream.unset_poolable();
+        return write_invalid_response(
+            client_stream,
+            conn_version,
+            conn_action,
+            StatusCode::BAD_GATEWAY,
+            reason.body(),
+            None,
+        )
+        .await
+        .map_err(|err| SpliceProxyError::Client {
+            phase: "simple-proxy reject 502",
+            err,
+        });
+    }
+
     // Rewrite response headers: adjust HTTP version and Connection header
     // to match the client's protocol version and keep-alive strategy.
     let rewritten_headers = match rewrite_simple_proxy_headers(
@@ -231,7 +262,6 @@ pub(crate) async fn splice_simple_proxy(
     // already resolved in the parser (RFC 9112 §6.1), and
     // `rewrite_simple_proxy_headers` above stripped the ignored
     // Content-Length, so the headers and the body framing agree.
-    let body_prefix = &hdr_buf[hdr_end..];
     let forwarded: u64 = resp
         .framing
         .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)

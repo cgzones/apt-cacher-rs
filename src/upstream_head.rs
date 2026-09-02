@@ -193,6 +193,22 @@ pub(crate) enum RejectReason {
     NoContentLength,
     /// `Content-Length: 0`: the cache cannot hold an empty object.
     ZeroContentLength,
+    /// The body bytes that arrived in the same read as the head already
+    /// exceed the declared `Content-Length`.  Relaying them would hand the
+    /// client whatever the upstream appended (a forged second response)
+    /// and desynchronise its keep-alive connection.  Only the splice relay
+    /// frames bodies itself; hyper's client never yields this.
+    #[cfg(feature = "splice")]
+    InconsistentBodyFraming {
+        content_length: u64,
+        prefix_len: u64,
+    },
+    /// A 1xx interim head.  The proxy never forwards interim responses: the
+    /// final response is still on the upstream socket, and relaying the
+    /// interim one as a bodyless final answer would desynchronise the
+    /// client.  Splice-only for the same reason as above.
+    #[cfg(feature = "splice")]
+    InterimResponse { status: u16 },
 }
 
 impl RejectReason {
@@ -205,6 +221,10 @@ impl RejectReason {
             Self::Oversize { .. } => "Upstream resource too large",
             Self::NoContentLength => "no Content-Length",
             Self::ZeroContentLength => "Zero Content-Length",
+            #[cfg(feature = "splice")]
+            Self::InconsistentBodyFraming { .. } => "Inconsistent body framing",
+            #[cfg(feature = "splice")]
+            Self::InterimResponse { .. } => "Unexpected interim response",
         }
     }
 
@@ -219,6 +239,10 @@ impl RejectReason {
             Self::InconsistentContentRange { .. }
             | Self::NoContentLength
             | Self::ZeroContentLength => {
+                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+            }
+            #[cfg(feature = "splice")]
+            Self::InconsistentBodyFraming { .. } | Self::InterimResponse { .. } => {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
             }
             Self::Oversize { .. } => {

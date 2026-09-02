@@ -485,6 +485,19 @@ pub(super) fn warn_upstream_reject(
             conn_details.debname,
             conn_details.mirror
         ),
+        RejectReason::InconsistentBodyFraming {
+            content_length,
+            prefix_len,
+        } => warn_once_or_info!(
+            "splice proxy: body prefix ({prefix_len} bytes) exceeds body content length ({content_length} bytes) for {} from mirror {}{origin}; returning 502",
+            conn_details.debname,
+            conn_details.mirror
+        ),
+        RejectReason::InterimResponse { status } => warn_once_or_info!(
+            "splice proxy: upstream sent interim response {status} for {} from mirror {}{origin}; returning 502",
+            conn_details.debname,
+            conn_details.mirror
+        ),
     }
 }
 

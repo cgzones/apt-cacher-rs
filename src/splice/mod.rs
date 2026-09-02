@@ -1107,6 +1107,11 @@ async fn relay_passthrough(
         upstream_resp.status_code
     );
 
+    let body_prefix = &header_buf[header_end..];
+    if let Err(reason) = upstream_resp.check_relayable(body_prefix.len() as u64) {
+        return reject_upstream_response(upstream, client, conn_details, reason).await;
+    }
+
     metrics::REQUESTS_PASSTHROUGH.increment();
     metrics::record_client_status(upstream_resp.status_code);
 
@@ -1146,7 +1151,6 @@ async fn relay_passthrough(
 
     // Forward the body that arrived with the headers plus the rest,
     // framed per the upstream's (precedence-resolved) framing.
-    let body_prefix = &header_buf[header_end..];
     upstream_resp
         .framing
         .relay_to_client(upstream, client.stream, body_prefix, VOLATILE_BODY_MAX)

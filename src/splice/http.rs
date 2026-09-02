@@ -34,7 +34,7 @@ use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::sendfile_conn::write_all_to_stream_rated;
-use crate::upstream_head::UpstreamHead;
+use crate::upstream_head::{RejectReason, UpstreamHead};
 use crate::{
     build_info::APP_USER_AGENT,
     cache_metadata::{self, InvalidValidator},
@@ -332,6 +332,29 @@ pub(super) struct UpstreamResponse {
 }
 
 impl UpstreamResponse {
+    /// Whether this head plus the `prefix_len` body bytes that arrived with
+    /// it can be relayed to a client as-is.  Runs *before* any byte of the
+    /// head is written: an interim (1xx) head or a body prefix longer than
+    /// the declared `Content-Length` fails closed as a 502, and the caller
+    /// must not return the upstream connection to the pool (its socket
+    /// still carries the unread remainder).
+    pub(super) fn check_relayable(&self, prefix_len: u64) -> Result<(), RejectReason> {
+        if self.status_code.is_informational() {
+            return Err(RejectReason::InterimResponse {
+                status: self.status_code.as_u16(),
+            });
+        }
+        if let BodyFraming::ContentLength(content_length) = self.framing
+            && prefix_len > content_length
+        {
+            return Err(RejectReason::InconsistentBodyFraming {
+                content_length,
+                prefix_len,
+            });
+        }
+        Ok(())
+    }
+
     /// The body's fixed length, only when the response is length-delimited
     /// (`Content-Length`). `None` for chunked or close-delimited framing.
     pub(super) fn content_length(&self) -> Option<u64> {
