@@ -19,7 +19,9 @@
 //! `current_thread` runtime (including `#[tokio::test]` without
 //! `flavor = "multi_thread"`) will **panic**. The [`std::fs::File`] impl
 //! issues the syscall directly and is for callers already on a blocking
-//! thread (cleanup's digest verification and `integrity::verify_temp_file`).
+//! thread (cleanup's digest verification and `integrity::verify_temp_file`);
+//! so does [`XattrFile`], which wraps a tokio file for a caller that has
+//! entered `block_in_place` itself to batch several operations.
 
 use std::{
     borrow::Cow,
@@ -36,7 +38,14 @@ use xattr::FileExt as _;
 use crate::{error::ErrorReport, log_once::warn_once_or_info_gated, warn_once_or_debug};
 
 /// Wrapper to implement [`xattr::FileExt`] for [`tokio::fs::File`].
-struct XattrFile<'a>(&'a tokio::fs::File);
+///
+/// As an [`XattrTarget`] it issues the syscall *directly*, unlike the
+/// [`tokio::fs::File`] impl: it is for a caller that has already entered one
+/// [`tokio::task::block_in_place`] section around several attribute
+/// operations on the same file (see
+/// `cache_metadata::write_upstream_metadata`), so the download path pays one
+/// worker demotion instead of one per attribute.
+pub(crate) struct XattrFile<'a>(pub(crate) &'a tokio::fs::File);
 
 impl std::os::fd::AsRawFd for XattrFile<'_> {
     #[inline]
@@ -47,8 +56,8 @@ impl std::os::fd::AsRawFd for XattrFile<'_> {
 
 impl xattr::FileExt for XattrFile<'_> {}
 
-/// An open file the helpers address by descriptor. The two impls differ
-/// only in how the blocking syscall reaches the kernel (see the module doc's
+/// An open file the helpers address by descriptor. The impls differ only in
+/// how the blocking syscall reaches the kernel (see the module doc's
 /// runtime requirement).
 pub(crate) trait XattrTarget {
     fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>>;
@@ -67,6 +76,20 @@ impl XattrTarget for tokio::fs::File {
 
     fn remove(&self, key: &'static str) -> io::Result<()> {
         tokio::task::block_in_place(|| XattrFile(self).remove_xattr(key))
+    }
+}
+
+impl XattrTarget for XattrFile<'_> {
+    fn get(&self, key: &'static str) -> io::Result<Option<Vec<u8>>> {
+        self.get_xattr(key)
+    }
+
+    fn set(&self, key: &'static str, value: &[u8]) -> io::Result<()> {
+        self.set_xattr(key, value)
+    }
+
+    fn remove(&self, key: &'static str) -> io::Result<()> {
+        self.remove_xattr(key)
     }
 }
 

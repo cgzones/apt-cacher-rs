@@ -133,31 +133,37 @@ pub(crate) fn write_upstream_metadata(
         etag,
         last_modified,
     } = meta;
-    if let Some(etag) = etag {
-        if let Some(etag) = ETag::parse(etag) {
-            xattr_helpers::write(file, display_path, &etag);
-        } else {
-            warn_once_or_info!(
-                "Skipping write of malformed ETag to `{}`: `{}`",
-                display_path.display(),
-                etag.escape_debug()
-            );
+    // One blocking section for all three attributes: writing them through
+    // the `tokio::fs::File` target would demote the worker once per
+    // attribute, and every fresh download writes up to three.
+    tokio::task::block_in_place(|| {
+        let file = &xattr_helpers::XattrFile(file);
+        if let Some(etag) = etag {
+            if let Some(etag) = ETag::parse(etag) {
+                xattr_helpers::write(file, display_path, &etag);
+            } else {
+                warn_once_or_info!(
+                    "Skipping write of malformed ETag to `{}`: `{}`",
+                    display_path.display(),
+                    etag.escape_debug()
+                );
+            }
         }
-    }
-    if let Some((raw, _time)) = last_modified {
-        if let Some(lm) = LastModified::parse(raw) {
-            xattr_helpers::write(file, display_path, &lm);
-        } else {
-            warn_once_or_info!(
-                "Skipping write of malformed Last-Modified to `{}`: `{}`",
-                display_path.display(),
-                raw.escape_debug()
-            );
+        if let Some((raw, _time)) = last_modified {
+            if let Some(lm) = LastModified::parse(raw) {
+                xattr_helpers::write(file, display_path, &lm);
+            } else {
+                warn_once_or_info!(
+                    "Skipping write of malformed Last-Modified to `{}`: `{}`",
+                    display_path.display(),
+                    raw.escape_debug()
+                );
+            }
         }
-    }
-    if let Some(size) = expected_size {
-        xattr_helpers::write(file, display_path, &ExpectedSize(size));
-    }
+        if let Some(size) = expected_size {
+            xattr_helpers::write(file, display_path, &ExpectedSize(size));
+        }
+    });
 }
 
 /// A malformed upstream validator discarded by [`check_upstream_validators`],
