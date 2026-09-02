@@ -7,6 +7,7 @@ use std::{
     pin::Pin,
     sync::{Arc, OnceLock},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::BytesMut;
@@ -72,7 +73,7 @@ use crate::upstream_head::{
     plan_fresh_download,
 };
 use crate::utils::{
-    self, CacheAccessFailure, Logged, hint_sequential_read, is_peer_disconnect,
+    self, CacheAccessFailure, Logged, TempPath, hint_sequential_read, is_peer_disconnect,
     regular_file_metadata, tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
 };
 use crate::xattr_helpers;
@@ -229,7 +230,7 @@ const TLS_READ_BUF_SIZE: usize = 256 * 1024;
 
 /// Cadence of the upstream rate-check tick in `splice_proxy_body_tls`'s
 /// read loop.
-const RATE_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+const RATE_TICK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
 const VOLATILE_BODY_MAX: usize = 1024 * 1024;
@@ -2031,7 +2032,7 @@ impl<'a> KtlsHandshake<'a> {
             /// no host block) and let the standard streaming path handle the fetch.
             const MAX_KTLS_EXTRA_BODY: usize = 2 * 1024 * 1024 + 256 * 1024;
 
-            let per_read_timeout = std::time::Duration::from_secs(5);
+            let per_read_timeout = Duration::from_secs(5);
 
             // Log how many bytes the current partial TLS record needs.
             // TLS record header is 5 bytes: [content_type, version_hi, version_lo, length_hi, length_lo].
@@ -5061,7 +5062,7 @@ async fn forward_chunked_buf(
     client: &TcpStream,
     client_rate_checker: &mut Option<RateChecker>,
     client_total: &mut u64,
-    http_timeout: std::time::Duration,
+    http_timeout: Duration,
 ) -> std::io::Result<bool> {
     let consumed = match decoder.feed(data, |_payload| {}) {
         Ok(consumed) => consumed,
@@ -5663,6 +5664,424 @@ async fn write_splice_response_headers(
     Ok(t_client_first)
 }
 
+/// Everything a download writes into: the open temp/partial file with its
+/// path guard, the final cache path, and the barrier the download reports
+/// progress on. Built by [`prepare_cache_target`], consumed by
+/// [`commit_and_record`].
+struct CacheTarget {
+    tempfile: tokio::fs::File,
+    temppath: TempPath,
+    dest_path: PathBuf,
+    dbarrier: DownloadBarrier,
+}
+
+/// Reserve the cache quota and open the file the body is written into: the
+/// cache directory, the previous volatile copy's size (freed by the
+/// overwrite), the quota reservation, the temp/partial file per `partial`,
+/// the validator and expected-size xattrs, and the `InitBarrier ->
+/// DownloadBarrier` transition. Shared by the streaming drive and the
+/// buffered volatile path (which always passes `PartialDownload::Volatile`).
+///
+/// `Ok(None)` means a rejection was already written to the client: the
+/// `503 Disk quota reached` (tagged `quota_phase`) or the 500 for a
+/// `Resumable` partial that does not hold exactly `resume_offset` bytes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call per download path; the arguments are the download's identity"
+)]
+async fn prepare_cache_target(
+    client: ClientConn<'_>,
+    conn_details: &ConnectionDetails,
+    upstream_resp: &UpstreamResponse,
+    partial: utils::PartialDownload,
+    resume_offset: u64,
+    total_content_length: NonZero<u64>,
+    ibarrier: InitBarrier<'_>,
+    quota_phase: &'static str,
+) -> Result<Option<CacheTarget>, SpliceProxyError> {
+    // Create cache directory and temp file
+    let dest_dir = conn_details.cache_dir_path();
+    if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
+        return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+            format_args!(
+                "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
+                dest_dir.display(),
+                ErrorReport(&err)
+            ),
+        )));
+    }
+
+    let filename = Path::new(&conn_details.debname);
+    assert!(
+        filename.is_relative(),
+        "path construction must not contain absolute components"
+    );
+
+    let prev_file_size = match conn_details.cached_flavor {
+        CachedFlavor::Volatile => {
+            let prev_path = dest_dir.join(filename);
+            match tokio::fs::symlink_metadata(&prev_path).await {
+                Ok(m) if m.file_type().is_file() => m.len(),
+                Ok(_) => {
+                    metrics::CACHE_NON_REGULAR.increment();
+                    error!(
+                        "splice proxy: previous cache file `{}` is not a regular file; counting it as 0 bytes for the quota and overwriting it",
+                        prev_path.display()
+                    );
+                    // `task_cache_scan` skips non-regular entries entirely
+                    // (symlinks/FIFOs/sockets/dirs are not tallied into the
+                    // tracked cache size), so the quota never accounted for
+                    // them — there's nothing to "free" on overwrite.  0 is
+                    // correct here and does not produce a reconciliation
+                    // discrepancy.
+                    0
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => 0,
+                Err(err) => {
+                    return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
+                        format_args!(
+                            "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
+                            prev_path.display(),
+                            ErrorReport(&err)
+                        ),
+                    )));
+                }
+            }
+        }
+        CachedFlavor::Permanent => {
+            // permanent files are never overwritten
+            0
+        }
+    };
+
+    let reservation = match global_cache_quota().try_acquire(
+        ContentLength::Exact(total_content_length),
+        prev_file_size,
+        &conn_details.debname,
+    ) {
+        Ok(r) => Some(r),
+        Err(_err @ QuotaExceeded) => {
+            write_invalid_response(
+                client.stream,
+                client.version,
+                client.action,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Disk quota reached",
+                None,
+            )
+            .await
+            .map_err(|err| SpliceProxyError::Client {
+                phase: quota_phase,
+                err,
+            })?;
+            return Ok(None);
+        }
+    };
+
+    // Create/open the output file: partial path for permanent files, random temp for volatile.
+    // Defuse the guard once we take ownership of the partial path — from here on, the
+    // download's own TempPath (keep_on_drop: true) manages the file lifetime.
+    let (tempfile, temppath) = match partial {
+        utils::PartialDownload::Resumable { mut file, guard } => {
+            // Resume: use the file already opened during the partial-file check.
+            // The file handle has been held open since the check, so no TOCTOU race.
+            // Verify the file size matches expectations (should always hold since
+            // we've held the fd open, but check as defense-in-depth).
+            use tokio::io::AsyncSeekExt as _;
+            let current_size = match file.seek(std::io::SeekFrom::End(0)).await {
+                Ok(size) => size,
+                Err(err) => {
+                    // Substituting 0 makes the mismatch branch below report an
+                    // empty partial file, which is not what happened -- the
+                    // discarded errno is the whole diagnosis.
+                    error!(
+                        "splice proxy: failed to determine partial file size for {} from mirror {}; treating the partial as empty and returning 500:  {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        ErrorReport(&err)
+                    );
+                    0
+                }
+            };
+            if current_size != resume_offset {
+                error!(
+                    "splice proxy: partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd; aborting the resume and returning 500",
+                    conn_details.debname, conn_details.mirror
+                );
+                write_invalid_response(
+                    client.stream,
+                    client.version,
+                    client.action,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Cache Access Failure",
+                    None,
+                )
+                .await
+                .map_err(|err| SpliceProxyError::Client {
+                    phase: "partial-size mismatch 500",
+                    err,
+                })?;
+                return Ok(None);
+            }
+            (file, guard)
+        }
+        utils::PartialDownload::Fresh(guard) => utils::create_partial_file(guard, 0o640)
+            .await
+            .map_err(|(err, path)| {
+                SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
+                    "splice proxy: failed to create partial file `{}`; aborting the download:  {}",
+                    path.display(),
+                    ErrorReport(&err)
+                )))
+            })?,
+        utils::PartialDownload::Volatile => {
+            let tmppath: PathBuf = [
+                &global_config().cache_directory,
+                Path::new(SUBDIR_TMP),
+                filename,
+            ]
+            .iter()
+            .collect();
+            tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
+                SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
+                    "splice proxy: failed to create temp file `{}`; aborting the download:  {}",
+                    tmppath.display(),
+                    ErrorReport(&err)
+                )))
+            })?
+        }
+    };
+
+    // Write ETag xattr early so it survives partial downloads for resume
+    if let Some(ref etag) = upstream_resp.etag {
+        write_etag(&tempfile, &temppath, etag);
+    }
+    // Persist upstream Last-Modified to xattr (RFC 9110 §10.2.2: forward origin's value)
+    if let Some(ref lm) = upstream_resp.last_modified {
+        write_last_modified(&tempfile, &temppath, lm);
+    }
+    // Persist expected total size so a future resume can detect upstream file changes.
+    xattr_helpers::write_expected_size(&tempfile, &temppath, total_content_length.get());
+
+    let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
+        upstream_resp.etag.clone(),
+        upstream_resp.last_modified.clone(),
+    );
+    let dbarrier = ibarrier
+        .download(
+            temppath.to_path_buf(),
+            ContentLength::Exact(total_content_length),
+            reservation,
+            Arc::new(download_meta),
+        )
+        .await;
+
+    Ok(Some(CacheTarget {
+        tempfile,
+        temppath,
+        dest_path: dest_dir.join(filename),
+        dbarrier,
+    }))
+}
+
+/// Sync and commit the fully written download into the cache, then record
+/// the `Download` transfer and the `Origin` row. Returns `Some(elapsed)` --
+/// the download duration from `start` to the commit, which the `Delivery`
+/// record shares -- when the file landed in the cache. `None` means
+/// `commit` failed: it logged the cause and dropped the barrier, the
+/// temp-file guard removed the partial, and nothing is cached (future
+/// requests re-download), so no DB row is written.
+///
+/// The `Origin` row uses `original_uri_path`, the pre-redirect client
+/// request path, so the recorded origin layout is stable across upstream
+/// redirects (the redirected `upstream_path` would otherwise poison the DB
+/// with a different origin row for the same logical download).
+async fn commit_and_record(
+    target: CacheTarget,
+    conn_details: &ConnectionDetails,
+    original_uri_path: &str,
+    total_content_length: NonZero<u64>,
+    start: PreciseInstant,
+) -> Option<Duration> {
+    let CacheTarget {
+        tempfile,
+        temppath,
+        dest_path,
+        dbarrier,
+    } = target;
+
+    // Sync cache file to ensure durability
+    if let Err(err) = tempfile.sync_all().await {
+        metrics::CACHE_IO_FAILURE.increment();
+        error!(
+            "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
+            temppath.display(),
+            ErrorReport(&err)
+        );
+    }
+    drop(tempfile);
+
+    // Move temp file to final cache path.
+    // Lock to block all downloading tasks, since the file from the
+    // path of the downloading state is going to be moved.
+    let rbarrier = dbarrier.begin_rename().await;
+
+    let cache_committed = rbarrier
+        .commit(temppath, dest_path, total_content_length.get())
+        .await
+        .is_ok();
+
+    let elapsed = start.elapsed();
+
+    if !cache_committed {
+        return None;
+    }
+
+    // Record download in database (mirrors download_file() in hyper_conn.rs).
+    let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
+        mirror: conn_details.mirror.clone(),
+        debname: conn_details.debname.clone(),
+        size: total_content_length.get(),
+        elapsed,
+        client_ip: conn_details.client.ip(),
+        kind: TransferKind::Download,
+    });
+    send_db_command(cmd).await;
+
+    // Record origin in database for this cached download.  This is an
+    // intentional asymmetry with the hyper backend: `Origin::from_path` is
+    // only called from the hyper simple-proxy passthrough in
+    // `hyper_conn.rs`; the hyper cache-download paths in
+    // `download_file`/`serve_new_file` never record an Origin row.  The
+    // splice path records Origins for cached downloads too, so it is doing
+    // strictly more origin-recording work than hyper.  Treat the splice
+    // origin write as the source of truth for cached-download origins for
+    // now.
+    if let Some(origin) = Origin::from_path(
+        original_uri_path,
+        conn_details.mirror.host().clone(),
+        conn_details.mirror.port(),
+    ) && !cache_layout::is_pseudo_arch(&origin.architecture)
+    {
+        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        send_db_command(cmd).await;
+    }
+
+    Some(elapsed)
+}
+
+/// Per-request rate-logging timestamps for the completion line
+/// ([`log_splice_completion`]).
+struct RateTimestamps {
+    /// Start of the upstream-rate window: the instant the upstream request
+    /// was sent (falls back to a local instant only for bare-parser
+    /// responses, i.e. tests).
+    t_req_sent: PreciseInstant,
+    /// End of the upstream-rate window. Initialised at construction so the
+    /// case where the splice loop never runs (whole body arrived with the
+    /// headers) still has a sane figure; reassigned right after the splice
+    /// body block when it does run.
+    t_upstream_done: PreciseInstant,
+    /// Start of the client-rate window: just before the response-header
+    /// write.
+    t_client_first: PreciseInstant,
+    /// End of the client-rate window: first set after the prefix writes,
+    /// then reassigned after the splice body block and after the demoted
+    /// file-serve task completes.
+    t_client_done: PreciseInstant,
+    /// Best-effort count of body bytes written toward the client, for the
+    /// disconnect segment.
+    client_bytes_sent: u64,
+}
+
+impl RateTimestamps {
+    /// Open the upstream-rate window at `t_req_sent` and close it now; the
+    /// client-window instants start as this same instant and are reassigned
+    /// as that window opens and closes.
+    fn new(t_req_sent: PreciseInstant) -> Self {
+        let t_upstream_done = PreciseInstant::now();
+        Self {
+            t_req_sent,
+            t_upstream_done,
+            t_client_first: t_upstream_done,
+            t_client_done: t_upstream_done,
+            client_bytes_sent: 0,
+        }
+    }
+
+    fn upstream_window(&self) -> Duration {
+        self.t_upstream_done.duration_since(self.t_req_sent)
+    }
+
+    fn client_window(&self) -> Duration {
+        self.t_client_done.duration_since(self.t_client_first)
+    }
+}
+
+/// The completion line of a download that landed in the cache: "Served and
+/// cached ..." when the client got the whole response, "Cached ..." when
+/// the client was lost mid-body (that failure was logged at its source).
+/// `upstream_bytes` is the wire body (the remainder on a resume),
+/// `client_bytes` the response body the client was promised.
+fn log_splice_completion(
+    conn_details: &ConnectionDetails,
+    conn_label: ConnLabel,
+    rates: &RateTimestamps,
+    upstream_bytes: u64,
+    client_bytes: u64,
+    resume_offset: u64,
+    client_succeeded: bool,
+) {
+    let in_time = conn_details.request_received_at.elapsed();
+    let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
+        "volatile "
+    } else {
+        ""
+    };
+    let upstream = rate_log::upstream_segment(upstream_bytes, rates.upstream_window());
+    let client = if client_succeeded {
+        rate_log::client_segment(client_bytes, rates.client_window())
+    } else {
+        rate_log::client_disconnect_segment(rates.client_bytes_sent, rates.client_window())
+    };
+    info!(
+        "{} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({upstream}, {client}){}",
+        if client_succeeded {
+            "Served and cached"
+        } else {
+            "Cached"
+        },
+        conn_details.debname,
+        conn_details.mirror,
+        conn_details.client,
+        HumanFmt::Time(in_time),
+        if resume_offset > 0 {
+            format!(", resumed from {}", HumanFmt::Size(resume_offset))
+        } else {
+            String::new()
+        },
+    );
+}
+
+/// Record the `Delivery` transfer of a cached download the client received
+/// in full; `elapsed` is the download duration from [`commit_and_record`].
+async fn record_delivery(
+    conn_details: &ConnectionDetails,
+    total_content_length: NonZero<u64>,
+    elapsed: Duration,
+    partial: bool,
+) {
+    let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
+        mirror: conn_details.mirror.clone(),
+        debname: conn_details.debname.clone(),
+        size: total_content_length.get(),
+        elapsed,
+        kind: TransferKind::Delivery { partial },
+        client_ip: conn_details.client.ip(),
+    });
+    send_db_command(cmd).await;
+}
+
 /// Body of [`splice_proxy`] after the originate check has succeeded. Kept as
 /// a separate fn returning `Result<(), SpliceProxyError>` so the many
 /// `Ok(())` early-returns scattered through the body do not need to be
@@ -6155,182 +6574,20 @@ async fn splice_proxy_drive(
         return Ok(SpliceProxyOutcome::Served);
     };
 
-    // Create cache directory and temp file
-    let dest_dir = conn_details.cache_dir_path();
-    if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
-        return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
-            format_args!(
-                "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
-                dest_dir.display(),
-                ErrorReport(&err)
-            ),
-        )));
-    }
-
-    let filename = Path::new(&conn_details.debname);
-    assert!(
-        filename.is_relative(),
-        "path construction must not contain absolute components"
-    );
-
-    let prev_file_size = match conn_details.cached_flavor {
-        CachedFlavor::Volatile => {
-            let prev_path = dest_dir.join(filename);
-            match tokio::fs::symlink_metadata(&prev_path).await {
-                Ok(m) if m.file_type().is_file() => m.len(),
-                Ok(_) => {
-                    metrics::CACHE_NON_REGULAR.increment();
-                    error!(
-                        "splice proxy: previous cache file `{}` is not a regular file; counting it as 0 bytes for the quota and overwriting it",
-                        prev_path.display()
-                    );
-                    // `task_cache_scan` skips non-regular entries entirely
-                    // (symlinks/FIFOs/sockets/dirs are not tallied into the
-                    // tracked cache size), so the quota never accounted for
-                    // them — there's nothing to "free" on overwrite.  0 is
-                    // correct here and does not produce a reconciliation
-                    // discrepancy.
-                    0
-                }
-                Err(err) if err.kind() == ErrorKind::NotFound => 0,
-                Err(err) => {
-                    return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
-                        format_args!(
-                            "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
-                            prev_path.display(),
-                            ErrorReport(&err)
-                        ),
-                    )));
-                }
-            }
-        }
-        CachedFlavor::Permanent => {
-            // permanent files are never overwritten
-            0
-        }
+    let Some(mut target) = prepare_cache_target(
+        client,
+        conn_details,
+        &upstream_resp,
+        partial,
+        resume_offset,
+        total_content_length,
+        ibarrier,
+        "quota 503",
+    )
+    .await?
+    else {
+        return Ok(SpliceProxyOutcome::Served);
     };
-
-    let reservation = match global_cache_quota().try_acquire(
-        ContentLength::Exact(total_content_length),
-        prev_file_size,
-        &conn_details.debname,
-    ) {
-        Ok(r) => Some(r),
-        Err(_err @ QuotaExceeded) => {
-            write_invalid_response(
-                client_stream,
-                conn_version,
-                conn_action,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Disk quota reached",
-                None,
-            )
-            .await
-            .map_err(|err| SpliceProxyError::Client {
-                phase: "quota 503",
-                err,
-            })?;
-            return Ok(SpliceProxyOutcome::Served);
-        }
-    };
-
-    // Create/open the output file: partial path for permanent files, random temp for volatile.
-    // Defuse the guard once we take ownership of the partial path — from here on, the
-    // download's own TempPath (keep_on_drop: true) manages the file lifetime.
-    let (mut tempfile, temppath) = match partial {
-        utils::PartialDownload::Resumable { mut file, guard } => {
-            // Resume: use the file already opened during the partial-file check.
-            // The file handle has been held open since the check, so no TOCTOU race.
-            // Verify the file size matches expectations (should always hold since
-            // we've held the fd open, but check as defense-in-depth).
-            use tokio::io::AsyncSeekExt as _;
-            let current_size = match file.seek(std::io::SeekFrom::End(0)).await {
-                Ok(size) => size,
-                Err(err) => {
-                    // Substituting 0 makes the mismatch branch below report an
-                    // empty partial file, which is not what happened -- the
-                    // discarded errno is the whole diagnosis.
-                    error!(
-                        "splice proxy: failed to determine partial file size for {} from mirror {}; treating the partial as empty and returning 500:  {}",
-                        conn_details.debname,
-                        conn_details.mirror,
-                        ErrorReport(&err)
-                    );
-                    0
-                }
-            };
-            if current_size != resume_offset {
-                error!(
-                    "splice proxy: partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd; aborting the resume and returning 500",
-                    conn_details.debname, conn_details.mirror
-                );
-                write_invalid_response(
-                    client_stream,
-                    conn_version,
-                    conn_action,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Cache Access Failure",
-                    None,
-                )
-                .await
-                .map_err(|err| SpliceProxyError::Client {
-                    phase: "partial-size mismatch 500",
-                    err,
-                })?;
-                return Ok(SpliceProxyOutcome::Served);
-            }
-            (file, guard)
-        }
-        utils::PartialDownload::Fresh(guard) => utils::create_partial_file(guard, 0o640)
-            .await
-            .map_err(|(err, path)| {
-                SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
-                    "splice proxy: failed to create partial file `{}`; aborting the download:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                )))
-            })?,
-        utils::PartialDownload::Volatile => {
-            let tmppath: PathBuf = [
-                &global_config().cache_directory,
-                Path::new(SUBDIR_TMP),
-                filename,
-            ]
-            .iter()
-            .collect();
-            tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
-                SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
-                    "splice proxy: failed to create temp file `{}`; aborting the download:  {}",
-                    tmppath.display(),
-                    ErrorReport(&err)
-                )))
-            })?
-        }
-    };
-
-    // Write ETag xattr early so it survives partial downloads for resume
-    if let Some(ref etag) = upstream_resp.etag {
-        write_etag(&tempfile, &temppath, etag);
-    }
-    // Persist upstream Last-Modified to xattr (RFC 9110 §10.2.2: forward origin's value)
-    if let Some(ref lm) = upstream_resp.last_modified {
-        write_last_modified(&tempfile, &temppath, lm);
-    }
-    // Persist expected total size so a future resume can detect upstream file changes.
-    xattr_helpers::write_expected_size(&tempfile, &temppath, total_content_length.get());
-
-    let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
-        upstream_resp.etag.clone(),
-        upstream_resp.last_modified.clone(),
-    );
-    let mut dbarrier = ibarrier
-        .download(
-            temppath.to_path_buf(),
-            ContentLength::Exact(total_content_length),
-            reservation,
-            Arc::new(download_meta),
-        )
-        .await;
 
     let body_prefix = &header_buf[header_end..];
 
@@ -6366,24 +6623,9 @@ async fn splice_proxy_drive(
 
     let start = PreciseInstant::now();
 
-    // Per-request rate-logging timestamps.
-    //   - `t_req_sent`: start of the upstream-rate window (instant the upstream
-    //     request was sent; falls back to `start` only for bare-parser
-    //     responses, i.e. tests).
-    //   - `t_upstream_done`: end of the upstream-rate window. Initialised here
-    //     so the case where the splice loop never runs (whole body arrived with
-    //     the headers) still has a sane figure; reassigned right after the
-    //     splice body block when it does run.
-    //   - `t_client_first`: start of the client-rate window (just before the
-    //     response-header write below).
-    //   - `t_client_done`: end of the client-rate window; first set after the
-    //     prefix writes, then reassigned after the splice body block and after
-    //     the demoted file-serve task completes.
-    //   - `client_bytes_sent`: best-effort count of body bytes written toward
-    //     the client, for the disconnect segment.
-    let t_req_sent = upstream_resp.request_sent_at.unwrap_or(start);
-    let mut t_upstream_done = PreciseInstant::now();
-    let mut client_bytes_sent: u64 = 0;
+    // Per-request rate-logging timestamps; the upstream-rate window ends
+    // here in case the splice loop never runs.
+    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at.unwrap_or(start));
 
     if resume_offset > 0 {
         #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
@@ -6408,7 +6650,7 @@ async fn splice_proxy_drive(
     let cork = CorkGuard::new_optional(client_stream);
 
     // Write response headers to client
-    let t_client_first = write_splice_response_headers(
+    rates.t_client_first = write_splice_response_headers(
         client,
         conn_details,
         &upstream_resp,
@@ -6426,13 +6668,13 @@ async fn splice_proxy_drive(
         if send_end > send_start {
             let partial_reader = tokio_nofollow_options()
                 .read(true)
-                .open(temppath.as_ref())
+                .open(target.temppath.as_ref())
                 .await
                 .map_err(|err| SpliceProxyError::AfterHeader {
                     phase: "resume reopen",
                     side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
                         "splice proxy: failed to reopen partial file `{}` for resume; aborting the transfer and closing the connection:  {}",
-                        temppath.display(),
+                        target.temppath.display(),
                         ErrorReport(&err)
                     ))),
                 })?;
@@ -6445,7 +6687,7 @@ async fn splice_proxy_drive(
             )
             .await
             {
-                Ok(sent) => client_bytes_sent += sent,
+                Ok(sent) => rates.client_bytes_sent += sent,
                 Err((_sent, err)) => {
                     return Err(SpliceProxyError::AfterHeader {
                         phase: "resume sendfile to client",
@@ -6486,15 +6728,15 @@ async fn splice_proxy_drive(
         // deferred write error -- and a truncated file would be renamed in as
         // a success. Flushing before the splice loop also keeps the queued
         // write from racing the loop's raw `splice(2)` appends to the same fd.
-        let write_res = match tempfile.write_all(body_prefix).await {
-            Ok(()) => tempfile.flush().await,
+        let write_res = match target.tempfile.write_all(body_prefix).await {
+            Ok(()) => target.tempfile.flush().await,
             Err(err) => Err(err),
         };
         write_res.map_err(|err| SpliceProxyError::AfterHeader {
             phase: "body prefix to cache",
             side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
                 "splice proxy: failed to write body prefix to cache file `{}`; aborting the download and closing the connection:  {}",
-                temppath.display(),
+                target.temppath.display(),
                 ErrorReport(&err)
             ))),
         })?;
@@ -6544,12 +6786,12 @@ async fn splice_proxy_drive(
                 prefix_client_failed = true;
             } else {
                 metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
-                client_bytes_sent += client_slice.len() as u64;
+                rates.client_bytes_sent += client_slice.len() as u64;
             }
         }
 
         // Notify concurrent clients of progress
-        dbarrier.ping();
+        target.dbarrier.ping();
     }
 
     // Uncork before entering the splice loop, which uses SPLICE_F_MORE for coalescing
@@ -6558,7 +6800,7 @@ async fn splice_proxy_drive(
     // Client-rate-window end after the prefix write; covers
     // the case where the splice loop never runs (whole body in the prefix).
     // Reassigned after the splice body block and the demoted file-serve task.
-    let mut t_client_done = PreciseInstant::now();
+    rates.t_client_done = PreciseInstant::now();
 
     // Transfer the remaining body
     let (demoted_handle, body_client_disconnected) = if splice_count > 0 {
@@ -6589,7 +6831,7 @@ async fn splice_proxy_drive(
             send: client_send,
         };
 
-        // `dbarrier` is moved in by value: on success it's returned for the
+        // `target.dbarrier` is moved in by value: on success it's returned for the
         // rename step; on a structured rate-timeout it's already consumed into
         // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
         // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
@@ -6603,12 +6845,12 @@ async fn splice_proxy_drive(
             splice_proxy_body(
                 zero_copy_upstream,
                 client_stream,
-                &tempfile,
+                &target.tempfile,
                 splice_count,
                 body_offset,
-                dbarrier,
+                target.dbarrier,
                 &range_filter,
-                &temppath,
+                &target.temppath,
             )
             .await
         } else {
@@ -6616,12 +6858,12 @@ async fn splice_proxy_drive(
             splice_proxy_body_tls(
                 &mut upstream_guard,
                 client_stream,
-                &tempfile,
+                &target.tempfile,
                 splice_count,
                 body_offset,
-                dbarrier,
+                target.dbarrier,
                 &range_filter,
-                &temppath,
+                &target.temppath,
             )
             .await
         }
@@ -6636,14 +6878,14 @@ async fn splice_proxy_drive(
         // attribute the failure instead of blaming the client for an
         // upstream stall; the cache- and proxy-side failures are logged
         // in the mapping (the on-disk path is in scope here).
-        .map_err(|err| err.into_after_header("splice body transfer", &temppath))?;
-        dbarrier = returned_dbarrier;
+        .map_err(|err| err.into_after_header("splice body transfer", &target.temppath))?;
+        target.dbarrier = returned_dbarrier;
         // The splice body block ran: the upstream-rate and client-rate windows
         // both end here. The demoted-client case reassigns `t_client_done`
         // again after the file-serve task completes.
-        t_upstream_done = PreciseInstant::now();
-        t_client_done = t_upstream_done;
-        client_bytes_sent += body_client_bytes;
+        rates.t_upstream_done = PreciseInstant::now();
+        rates.t_client_done = rates.t_upstream_done;
+        rates.client_bytes_sent += body_client_bytes;
         (demoted_handle, body_client_disconnected)
     } else {
         (None, false)
@@ -6661,72 +6903,18 @@ async fn splice_proxy_drive(
     // Drop it now before the sync+rename to free the upstream socket promptly.
     drop(upstream);
 
-    // Sync cache file to ensure durability
-    if let Err(err) = tempfile.sync_all().await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
-            temppath.display(),
-            ErrorReport(&err)
-        );
-    }
-    drop(tempfile);
-
-    // Move temp file to final cache path
-    let dest_file_path = dest_dir.join(filename);
-
-    // Lock to block all downloading tasks, since the file from the
-    // path of the downloading state is going to be moved.
-    let rbarrier = dbarrier.begin_rename().await;
-
-    let cache_committed = rbarrier
-        .commit(temppath, dest_file_path, total_content_length.get())
-        .await
-        .is_ok();
-    // On failure commit() logged the cause and dropped the barrier; the
-    // temp-file guard removed the partial. The body was already fully
-    // delivered to the client; this only leaves the cache without the file
-    // (future requests re-download). The DB records below are skipped
-    // because nothing was cached, but we still finish the client-facing
-    // bookkeeping (await the demoted task, count the delivery) before
-    // returning.
-
-    let elapsed = start.elapsed();
-
-    if cache_committed {
-        // Record download in database (mirrors download_file() in hyper_conn.rs).
-        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-            mirror: conn_details.mirror.clone(),
-            debname: conn_details.debname.clone(),
-            size: total_content_length.get(),
-            elapsed,
-            client_ip: conn_details.client.ip(),
-            kind: TransferKind::Download,
-        });
-        send_db_command(cmd).await;
-
-        // Record origin in database for this cached download.  This is an
-        // intentional asymmetry with the hyper backend: `Origin::from_path` is
-        // only called from the hyper simple-proxy passthrough in
-        // `hyper_conn.rs`; the hyper cache-download paths in
-        // `download_file`/`serve_new_file` never record an Origin row.  The
-        // splice path records Origins for cached downloads too, so it is doing
-        // strictly more origin-recording work than hyper.  Treat the splice
-        // origin write as the source of truth for cached-download origins for
-        // now.  Use the original (pre-redirect) client request path so the
-        // recorded origin layout is stable across upstream redirects (the
-        // redirected `upstream_path` would otherwise poison the DB with a
-        // different origin row for the same logical download).
-        if let Some(origin) = Origin::from_path(
-            original_uri_path,
-            conn_details.mirror.host().clone(),
-            conn_details.mirror.port(),
-        ) && !cache_layout::is_pseudo_arch(&origin.architecture)
-        {
-            let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-            send_db_command(cmd).await;
-        }
-    }
+    // Commit the finished body to the cache. On failure the body was
+    // already fully delivered to the client; this only leaves the cache
+    // without the file, and we still finish the client-facing bookkeeping
+    // (await the demoted task, count the delivery) before returning.
+    let committed = commit_and_record(
+        target,
+        conn_details,
+        original_uri_path,
+        total_content_length,
+        start,
+    )
+    .await;
 
     // If the first client was demoted to file-serve, wait for the
     // background task to finish sending before returning control to the
@@ -6736,11 +6924,11 @@ async fn splice_proxy_drive(
     let demoted_client_succeeded = if let Some(handle) = demoted_handle {
         let succeeded = match handle.await {
             Ok(DeliveryResult::Success(bytes)) => {
-                client_bytes_sent += bytes;
+                rates.client_bytes_sent += bytes;
                 true
             }
             Ok(DeliveryResult::Failure(bytes)) => {
-                client_bytes_sent += bytes;
+                rates.client_bytes_sent += bytes;
                 false
             }
             Err(err) => {
@@ -6753,7 +6941,7 @@ async fn splice_proxy_drive(
         };
         // The demoted file-serve task is the last thing to write to the
         // client, so the client-rate window ends here.
-        t_client_done = PreciseInstant::now();
+        rates.t_client_done = PreciseInstant::now();
         succeeded
     } else {
         true
@@ -6765,41 +6953,15 @@ async fn splice_proxy_drive(
     // Only log a completion "…cached…" line when the file actually landed in
     // the cache; the commit-failure path already logged an ERROR (rename) or
     // commit() logged the mismatch/verify failure internally.
-    if cache_committed {
-        let in_time = conn_details.request_received_at.elapsed();
-        let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
-            "volatile "
-        } else {
-            ""
-        };
-        let upstream = rate_log::upstream_segment(
+    if committed.is_some() {
+        log_splice_completion(
+            conn_details,
+            conn_label,
+            &rates,
             body_content_length.get(),
-            t_upstream_done.duration_since(t_req_sent),
-        );
-        let client_seg = if client_succeeded {
-            rate_log::client_segment(range_plan.len, t_client_done.duration_since(t_client_first))
-        } else {
-            rate_log::client_disconnect_segment(
-                client_bytes_sent,
-                t_client_done.duration_since(t_client_first),
-            )
-        };
-        info!(
-            "{} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({upstream}, {client_seg}){}",
-            if client_succeeded {
-                "Served and cached"
-            } else {
-                "Cached"
-            },
-            conn_details.debname,
-            conn_details.mirror,
-            conn_details.client,
-            HumanFmt::Time(in_time),
-            if resume_offset > 0 {
-                format!(", resumed from {}", HumanFmt::Size(resume_offset))
-            } else {
-                String::new()
-            },
+            range_plan.len,
+            resume_offset,
+            client_succeeded,
         );
     }
 
@@ -6815,18 +6977,14 @@ async fn splice_proxy_drive(
     metrics::SERVED_SPLICE.increment();
     metrics::SERVED_TOTAL.increment();
 
-    if cache_committed {
-        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-            mirror: conn_details.mirror.clone(),
-            debname: conn_details.debname.clone(),
-            size: total_content_length.get(),
+    if let Some(elapsed) = committed {
+        record_delivery(
+            conn_details,
+            total_content_length,
             elapsed,
-            kind: TransferKind::Delivery {
-                partial: range_plan.is_partial(),
-            },
-            client_ip: conn_details.client.ip(),
-        });
-        send_db_command(cmd).await;
+            range_plan.is_partial(),
+        )
+        .await;
     }
 
     Ok(SpliceProxyOutcome::Served)
@@ -6987,9 +7145,7 @@ fn cleanup_response(status: StatusCode) -> http::Response<ProxyCacheBody> {
 
 /// Parse the `max-age` directive from a request's `Cache-Control` header.
 #[cfg(not(feature = "hyper"))]
-fn cache_control_max_age(
-    req: &http::Request<http_body_util::Empty<()>>,
-) -> Option<std::time::Duration> {
+fn cache_control_max_age(req: &http::Request<http_body_util::Empty<()>>) -> Option<Duration> {
     let value = req
         .headers()
         .get(http::header::CACHE_CONTROL)?
@@ -6999,7 +7155,7 @@ fn cache_control_max_age(
         .split(',')
         .find_map(|directive| directive.trim().strip_prefix("max-age="))
         .and_then(|secs| secs.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
+        .map(Duration::from_secs)
 }
 
 /// Serve a cleanup index request from the already-open cache file, if fresh.
@@ -7355,7 +7511,7 @@ async fn handle_volatile_buffered_download(
             SpliceProxyError::Upstream(UpstreamFailure { err, logged })
         })?;
 
-    let t_upstream_done = PreciseInstant::now();
+    let mut rates = RateTimestamps::new(t_req_sent);
 
     let Some(total_content_length) = NonZero::new(body.len() as u64) else {
         debug!(
@@ -7382,57 +7538,6 @@ async fn handle_volatile_buffered_download(
         "splice proxy{conn_label}: buffered volatile download of {} from mirror {} for client {} ({} bytes)...",
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
-
-    let prev_file_size = {
-        let prev_path = conn_details.cache_file_path();
-
-        match tokio::fs::symlink_metadata(&prev_path).await {
-            Ok(m) if m.file_type().is_file() => m.len(),
-            Ok(_) => {
-                metrics::CACHE_NON_REGULAR.increment();
-                error!(
-                    "splice proxy: previous cache file `{}` is not a regular file; counting it as 0 bytes for the quota and overwriting it",
-                    prev_path.display()
-                );
-                0
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => 0,
-            Err(err) => {
-                return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
-                    format_args!(
-                        "splice proxy: failed to stat existing volatile file `{}`; returning 500:  {}",
-                        prev_path.display(),
-                        ErrorReport(&err)
-                    ),
-                )));
-            }
-        }
-    };
-
-    // Acquire cache quota with exact known size.
-    let reservation = match global_cache_quota().try_acquire(
-        ContentLength::Exact(total_content_length),
-        prev_file_size,
-        &conn_details.debname,
-    ) {
-        Ok(r) => Some(r),
-        Err(_err @ QuotaExceeded) => {
-            write_invalid_response(
-                client_stream,
-                conn_version,
-                conn_action,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Disk quota reached",
-                None,
-            )
-            .await
-            .map_err(|err| SpliceProxyError::Client {
-                phase: "volatile quota 503",
-                err,
-            })?;
-            return Ok(());
-        }
-    };
 
     // Parse client Range against the now-known total size.
     let cache_time = HttpDate::now();
@@ -7467,62 +7572,20 @@ async fn handle_volatile_buffered_download(
         return Ok(());
     };
 
-    // Create cache directory and temp file.
-    let dest_dir = conn_details.cache_dir_path();
-    if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
-        return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
-            format_args!(
-                "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
-                dest_dir.display(),
-                ErrorReport(&err)
-            ),
-        )));
-    }
-
-    let filename = Path::new(&conn_details.debname);
-    assert!(
-        filename.is_relative(),
-        "path construction must not contain absolute components"
-    );
-
-    let tmppath: PathBuf = [
-        &global_config().cache_directory,
-        Path::new(SUBDIR_TMP),
-        filename,
-    ]
-    .iter()
-    .collect();
-    let (mut tempfile, temppath) = tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
-        SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
-            "splice proxy: failed to create temp file `{}`; aborting the download:  {}",
-            tmppath.display(),
-            ErrorReport(&err)
-        )))
-    })?;
-
-    // Write ETag xattr if present.
-    if let Some(ref etag) = upstream_resp.etag {
-        write_etag(&tempfile, &temppath, etag);
-    }
-    // Persist upstream Last-Modified to xattr (RFC 9110 §10.2.2: forward origin's value)
-    if let Some(ref lm) = upstream_resp.last_modified {
-        write_last_modified(&tempfile, &temppath, lm);
-    }
-
-    let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
-        upstream_resp.etag.clone(),
-        upstream_resp.last_modified.clone(),
-    );
-
-    // Transition barrier: InitBarrier → DownloadBarrier.
-    let mut dbarrier: DownloadBarrier = ibarrier
-        .download(
-            temppath.to_path_buf(),
-            ContentLength::Exact(total_content_length),
-            reservation,
-            Arc::new(download_meta),
-        )
-        .await;
+    let Some(mut target) = prepare_cache_target(
+        client,
+        conn_details,
+        upstream_resp,
+        utils::PartialDownload::Volatile,
+        0,
+        total_content_length,
+        ibarrier,
+        "volatile quota 503",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
 
     let start = PreciseInstant::now();
 
@@ -7537,8 +7600,8 @@ async fn handle_volatile_buffered_download(
     // pool; the follow-up `flush` waits for it, so a failure (e.g. disk full)
     // surfaces here -- `sync_all` below never reports a deferred write error,
     // and without the flush a truncated file would be committed as a success.
-    let write_res = match tempfile.write_all(&body).await {
-        Ok(()) => tempfile.flush().await,
+    let write_res = match target.tempfile.write_all(&body).await {
+        Ok(()) => target.tempfile.flush().await,
         Err(err) => Err(err),
     };
     let cache_write_ok = match write_res {
@@ -7547,82 +7610,31 @@ async fn handle_volatile_buffered_download(
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "splice proxy: failed to write volatile body to cache file `{}`; serving the buffered body to the client without caching it:  {}",
-                temppath.display(),
+                target.temppath.display(),
                 ErrorReport(&err)
             );
             false
         }
     };
-    if cache_write_ok {
-        dbarrier.ping();
-
-        // Sync cache file.
-        if let Err(err) = tempfile.sync_all().await {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            );
-        }
-    }
-    drop(tempfile);
 
     // Persist via rename+commit, only if the body reached the temp file. When
-    // the write failed, `dbarrier` is dropped here without a rename — its Drop
-    // records the terminal aborted state, correct since nothing is on disk for
-    // late joiners to serve.
-    let dest_file_path = dest_dir.join(filename);
-    let cache_committed = if cache_write_ok {
-        // Move temp file to final cache path.
-        let rbarrier = dbarrier.begin_rename().await;
-
-        // On failure commit() logged the cause and dropped the barrier; the
-        // temp-file guard removed the partial. The DB records below are
-        // skipped because nothing was cached.
-        rbarrier
-            .commit(temppath, dest_file_path, total_content_length.get())
-            .await
-            .is_ok()
-    } else {
-        false
-    };
-
-    let elapsed = start.elapsed();
-
-    if cache_committed {
-        // Record download in database (mirrors download_file() in hyper_conn.rs).
-        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-            mirror: conn_details.mirror.clone(),
-            debname: conn_details.debname.clone(),
-            size: total_content_length.get(),
-            elapsed,
-            client_ip: conn_details.client.ip(),
-            kind: TransferKind::Download,
-        });
-        send_db_command(cmd).await;
-
-        // Record origin in database for this cached (volatile-buffered)
-        // download.  As in `splice_proxy_drive`, this is an intentional
-        // asymmetry with the hyper backend: in `hyper_conn.rs`, `Origin::from_path`
-        // is only called from the simple-proxy passthrough; hyper's cache
-        // paths (`download_file`/`serve_new_file`) never record an Origin row.
-        // The splice path records Origins for cached downloads too, so it is
-        // doing strictly more origin-recording work than hyper.  Use the
-        // original (pre-redirect) client request path so the recorded origin
-        // layout is stable across upstream redirects (the redirected
-        // `upstream_path` would otherwise poison the DB with a different
-        // origin row for the same logical download).
-        if let Some(origin) = Origin::from_path(
+    // the write failed, the barrier is dropped without a rename at the end of
+    // the function — its Drop records the terminal aborted state, correct
+    // since nothing is on disk for late joiners to serve.
+    let committed = if cache_write_ok {
+        target.dbarrier.ping();
+        commit_and_record(
+            target,
+            conn_details,
             original_uri_path,
-            conn_details.mirror.host().clone(),
-            conn_details.mirror.port(),
-        ) && !cache_layout::is_pseudo_arch(&origin.architecture)
-        {
-            let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-            send_db_command(cmd).await;
-        }
-    }
+            total_content_length,
+            start,
+        )
+        .await
+    } else {
+        drop(target.tempfile);
+        None
+    };
 
     // Serve the client from the in-memory body. The cache is already persisted
     // (best-effort above), so an early return on a client write failure no
@@ -7631,7 +7643,7 @@ async fn handle_volatile_buffered_download(
     // Cork to coalesce headers + body into fewer TCP segments.
     let cork = CorkGuard::new_optional(client_stream);
 
-    let t_client_first = write_splice_response_headers(
+    rates.t_client_first = write_splice_response_headers(
         client,
         conn_details,
         upstream_resp,
@@ -7661,8 +7673,9 @@ async fn handle_volatile_buffered_download(
             side: AfterHeaderSide::Client(err),
         })?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
+        rates.client_bytes_sent += body_slice.len() as u64;
     }
-    let t_client_done = PreciseInstant::now();
+    rates.t_client_done = PreciseInstant::now();
 
     drop(cork);
 
@@ -7670,38 +7683,25 @@ async fn handle_volatile_buffered_download(
     metrics::SERVED_SPLICE.increment();
     metrics::SERVED_TOTAL.increment();
 
-    if cache_committed {
-        let in_time = conn_details.request_received_at.elapsed();
-        let volatile = if conn_details.cached_flavor == CachedFlavor::Volatile {
-            "volatile "
-        } else {
-            ""
-        };
-        info!(
-            "Served and cached {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({}, {})",
-            conn_details.debname,
-            conn_details.mirror,
-            conn_details.client,
-            HumanFmt::Time(in_time),
-            rate_log::upstream_segment(
-                total_content_length.get(),
-                t_upstream_done.duration_since(t_req_sent),
-            ),
-            rate_log::client_segment(range_plan.len, t_client_done.duration_since(t_client_first),),
+    if let Some(elapsed) = committed {
+        log_splice_completion(
+            conn_details,
+            conn_label,
+            &rates,
+            total_content_length.get(),
+            range_plan.len,
+            0,
+            true,
         );
 
         // Record delivery in database.
-        let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-            mirror: conn_details.mirror.clone(),
-            debname: conn_details.debname.clone(),
-            size: total_content_length.get(),
+        record_delivery(
+            conn_details,
+            total_content_length,
             elapsed,
-            kind: TransferKind::Delivery {
-                partial: range_plan.is_partial(),
-            },
-            client_ip: conn_details.client.ip(),
-        });
-        send_db_command(cmd).await;
+            range_plan.is_partial(),
+        )
+        .await;
     }
 
     Ok(())
