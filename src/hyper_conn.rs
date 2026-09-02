@@ -1802,10 +1802,7 @@ async fn serve_new_file(
         Ok(plan) => {
             // Answered by the upstream (fresh body or a 304): this is the
             // point the request's Origin row is earned.
-            if matches!(
-                plan,
-                DownloadPlan::NotModified(_) | DownloadPlan::Download { .. }
-            ) {
+            if plan.is_answered() {
                 conn_details.record_origin();
             }
             plan

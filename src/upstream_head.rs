@@ -275,6 +275,20 @@ pub(crate) enum DownloadPlan<C> {
     },
 }
 
+impl<C> DownloadPlan<C> {
+    /// Whether the upstream answered the request with usable content: a
+    /// fresh body to cache, or a 304 confirming the cached copy.  The point a
+    /// request earns its `Origin` row (`ConnectionDetails::record_origin`);
+    /// a passthrough or a reject is not an answer.
+    #[must_use]
+    pub(crate) const fn is_answered(&self) -> bool {
+        match self {
+            Self::NotModified(_) | Self::Download { .. } => true,
+            Self::Passthrough | Self::Reject(_) => false,
+        }
+    }
+}
+
 /// Classify an upstream response.
 ///
 /// `cached` is the stale cached copy a conditional request was sent for
