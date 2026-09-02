@@ -44,7 +44,10 @@ use crate::{
     },
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{self, CacheMiss, CachedFlavor, ConnectionDetails},
-    cache_metadata::{self, InvalidValidator, UpstreamMetadata, check_upstream_validators},
+    cache_metadata::{
+        self, InvalidValidator, UpstreamMetadata, check_upstream_validators,
+        write_upstream_metadata,
+    },
     cache_paths::CachePaths,
     cache_quota::QuotaExceeded,
     channel_body::ChannelBody,
@@ -58,8 +61,6 @@ use crate::{
     error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
     full_body, global_cache_quota, global_config, global_verify_throttle,
     guards::{DownloadBarrier, InitBarrier},
-    http_etag::write_etag,
-    http_last_modified::write_last_modified,
     http_range::HttpDate,
     humanfmt::HumanFmt,
     metrics,
@@ -86,7 +87,6 @@ use crate::{
     },
     warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
     web_interface::serve_web_interface,
-    xattr_helpers,
 };
 #[cfg(feature = "tls_rustls")]
 use hyper_rustls::HttpsConnector;
@@ -2126,18 +2126,17 @@ async fn serve_new_file(
         }
     };
 
-    // Write ETag xattr early so it survives partial downloads for resume
-    if let Some(ref etag) = upstream_etag {
-        write_etag(&outfile, &outpath, etag);
-    }
-    // Write upstream Last-Modified xattr early so it survives partial downloads
-    if let Some(ref lm) = upstream_last_modified {
-        write_last_modified(&outfile, &outpath, lm);
-    }
-    // Write expected total size so resume can detect upstream file changes
-    if let ContentLength::Exact(total) = total_content_length {
-        xattr_helpers::write_expected_size(&outfile, &outpath, total.get());
-    }
+    let upstream_metadata = Arc::new(UpstreamMetadata::from_upstream(
+        upstream_etag,
+        upstream_last_modified,
+    ));
+    // Persist the validators (and the expected total, so a resume can detect
+    // an upstream change) early, so they survive an interrupted download.
+    let expected_size = match total_content_length {
+        ContentLength::Exact(total) => Some(total.get()),
+        ContentLength::Unknown(_) => None,
+    };
+    write_upstream_metadata(&outfile, &outpath, &upstream_metadata, expected_size);
 
     if resume_offset > 0 {
         info!(
@@ -2153,11 +2152,6 @@ async fn serve_new_file(
             conn_details.debname, conn_details.mirror, conn_details.client
         );
     }
-
-    let upstream_metadata = Arc::new(UpstreamMetadata::from_upstream(
-        upstream_etag,
-        upstream_last_modified,
-    ));
 
     let dbarrier = ibarrier
         .download(

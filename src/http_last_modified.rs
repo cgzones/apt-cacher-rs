@@ -1,9 +1,6 @@
-use std::path::Path;
+use std::{borrow::Cow, sync::atomic::AtomicBool};
 
-use crate::{http_range::HttpDate, warn_once_or_info, xattr_helpers};
-
-/// The extended attribute name used to store upstream `Last-Modified` values.
-const XATTR_LAST_MODIFIED: &str = "user.apt_cacher_rs.last_modified";
+use crate::{http_range::HttpDate, xattr_helpers::XattrValue};
 
 /// Validate that a string is a parseable HTTP-date per RFC 9110 §5.6.7,
 /// IMF-fixdate form only - legacy RFC 850 and asctime are rejected as
@@ -15,50 +12,47 @@ pub(crate) fn is_valid_http_date(s: &str) -> bool {
     HttpDate::parse(s).is_some()
 }
 
-/// Read a `Last-Modified` value from the file's extended attributes,
-/// distinguishing transient I/O errors from a stable "no value" outcome.
-///
-/// See [`xattr_helpers::try_read_helper`] for the semantics; a stored
-/// value that fails to parse as an HTTP-date is scrubbed and reported
-/// as `Ok(None)`.
-pub(crate) fn try_read_last_modified(
-    file: &tokio::fs::File,
-    display_path: &Path,
-) -> Result<Option<(String, HttpDate)>, xattr_helpers::XattrIoError> {
-    let Some(data) = xattr_helpers::try_read_helper(file, display_path, XATTR_LAST_MODIFIED)?
-    else {
-        return Ok(None);
-    };
-
-    let Some(time) = HttpDate::parse(&data) else {
-        warn_once_or_info!(
-            "Discarding malformed Last-Modified from `{}`: `{}`",
-            display_path.display(),
-            data.escape_debug()
-        );
-
-        xattr_helpers::remove_helper(file, display_path, XATTR_LAST_MODIFIED);
-
-        return Ok(None);
-    };
-
-    Ok(Some((data, time)))
+/// A validated upstream `Last-Modified` value, persisted on a cached file as
+/// `user.apt_cacher_rs.last_modified` (RFC 9110 §10.2.2: forward the
+/// origin's value). Carries both the raw header string (for the
+/// `Last-Modified` response header) and its parsed [`HttpDate`] (for
+/// `If-Modified-Since` comparison), so consumers never re-parse.
+/// Constructed only by [`XattrValue::parse`], so it is always an IMF-fixdate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LastModified {
+    raw: String,
+    time: HttpDate,
 }
 
-/// Write a `Last-Modified` value to the file's extended attributes.
-///
-/// Malformed values are skipped. Logs warnings on failure but never propagates errors.
-pub(crate) fn write_last_modified(file: &tokio::fs::File, display_path: &Path, value: &str) {
-    if !is_valid_http_date(value) {
-        warn_once_or_info!(
-            "Skipping write of malformed Last-Modified to `{}`: `{}`",
-            display_path.display(),
-            value.escape_debug()
-        );
-        return;
+impl LastModified {
+    pub(crate) fn into_parts(self) -> (String, HttpDate) {
+        let Self { raw, time } = self;
+        (raw, time)
+    }
+}
+
+impl XattrValue for LastModified {
+    const KEY: &'static str = "user.apt_cacher_rs.last_modified";
+    const LABEL: &'static str = "Last-Modified";
+    const WRITE_FAILURE_CONSEQUENCE: &'static str =
+        "the value will not survive a restart and this file cannot be revalidated by date";
+
+    fn discard_gate() -> &'static AtomicBool {
+        static GATE: AtomicBool = AtomicBool::new(false);
+        &GATE
     }
 
-    xattr_helpers::write_helper(file, display_path, XATTR_LAST_MODIFIED, value.as_bytes());
+    fn parse(raw: &str) -> Option<Self> {
+        HttpDate::parse(raw).map(|time| Self {
+            raw: raw.to_owned(),
+            time,
+        })
+    }
+
+    fn render(&self) -> Cow<'_, str> {
+        let Self { raw, time: _ } = self;
+        Cow::Borrowed(raw)
+    }
 }
 
 #[cfg(test)]
@@ -75,29 +69,24 @@ mod tests {
         assert!(!is_valid_http_date("Thu, 32 Jan 1970 00:00:00 GMT"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn write_then_read_last_modified() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("probe");
-        let file = tokio::fs::File::create(&path).await.expect("create file");
-
+    #[test]
+    fn last_modified_parse_and_render() {
         let value = "Tue, 21 Mar 2361 19:15:09 GMT";
-        write_last_modified(&file, &path, value);
-
-        // Skip the round-trip assertion when xattrs aren't supported on the test FS.
-        if let Ok(Some((got_str, got_time))) = try_read_last_modified(&file, &path) {
-            assert_eq!(got_str, value);
-            assert_eq!(got_time, HttpDate::from_secs(12_345_678_909));
-        }
+        let parsed = LastModified::parse(value).expect("IMF-fixdate");
+        assert_eq!(parsed.render(), value);
+        let (raw, time) = parsed.into_parts();
+        assert_eq!(raw, value);
+        assert_eq!(time, HttpDate::from_secs(12_345_678_909));
+        assert!(LastModified::parse("garbage").is_none());
+        assert!(LastModified::parse("").is_none());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn write_skips_malformed() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let path = dir.path().join("probe");
-        let file = tokio::fs::File::create(&path).await.expect("create file");
+    #[test]
+    fn last_modified_scrubs_malformed_and_round_trips() {
+        use crate::xattr_helpers::tests::assert_scrubs_malformed_and_round_trips;
 
-        write_last_modified(&file, &path, "garbage");
-        assert!(matches!(try_read_last_modified(&file, &path), Ok(None)));
+        let valid = LastModified::parse("Thu, 01 Jan 1970 00:00:00 GMT").expect("valid date");
+        assert_scrubs_malformed_and_round_trips(b"garbage", &valid);
+        assert_scrubs_malformed_and_round_trips(b"Thu, 32 Jan 1970 00:00:00 GMT", &valid);
     }
 }

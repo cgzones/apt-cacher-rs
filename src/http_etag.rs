@@ -1,9 +1,6 @@
-use std::path::Path;
+use std::{borrow::Cow, sync::atomic::AtomicBool};
 
-use crate::{warn_once_or_info, xattr_helpers};
-
-/// The extended attribute name used to store `ETag` values.
-const XATTR_ETAG: &str = "user.apt_cacher_rs.etag";
+use crate::xattr_helpers::XattrValue;
 
 /// Return the opaque-tag portion of an `ETag`, stripping the `W/` prefix if present.
 ///
@@ -31,58 +28,39 @@ pub(crate) fn is_valid_etag(s: &str) -> bool {
             .all(|&c| c == 0x21 || (0x23..=0x7E).contains(&c) || c >= 0x80)
 }
 
-/// Read an `ETag` from the file's extended attributes, distinguishing
-/// transient I/O errors from a stable "no value" outcome.
-///
-/// See [`xattr_helpers::try_read_helper`] for the semantics; a malformed
-/// stored `ETag` is scrubbed and reported as `Ok(None)`.
-pub(crate) fn try_read_etag(
-    file: &tokio::fs::File,
-    display_path: &Path,
-) -> Result<Option<String>, xattr_helpers::XattrIoError> {
-    let Some(data) = xattr_helpers::try_read_helper(file, display_path, XATTR_ETAG)? else {
-        return Ok(None);
-    };
+/// A validated `ETag`, persisted on a cached file as
+/// `user.apt_cacher_rs.etag` and served back as the response validator.
+/// Constructed only by [`XattrValue::parse`], so a stored or written value is
+/// always well-formed per RFC 9110 §8.8.3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ETag(String);
 
-    if !is_valid_etag(&data) {
-        warn_once_or_info!(
-            "Discarding malformed ETag from `{}`: `{}`",
-            display_path.display(),
-            data.escape_debug()
-        );
-
-        xattr_helpers::remove_helper(file, display_path, XATTR_ETAG);
-
-        return Ok(None);
+impl ETag {
+    pub(crate) fn into_string(self) -> String {
+        let Self(etag) = self;
+        etag
     }
-
-    Ok(Some(data))
 }
 
-/// Read an `ETag` from the file's extended attributes.
-///
-/// Returns `None` on any error (graceful degradation).  Callers that
-/// need to distinguish transient I/O errors from a stable "no value"
-/// outcome should use [`try_read_etag`].
-#[must_use]
-pub(crate) fn read_etag(file: &tokio::fs::File, display_path: &Path) -> Option<String> {
-    try_read_etag(file, display_path).ok().flatten()
-}
+impl XattrValue for ETag {
+    const KEY: &'static str = "user.apt_cacher_rs.etag";
+    const LABEL: &'static str = "ETag";
+    const WRITE_FAILURE_CONSEQUENCE: &'static str =
+        "the value will not survive a restart and this file cannot be resumed or revalidated";
 
-/// Write an `ETag` to the file's extended attributes.
-///
-/// Malformed values are skipped. Logs warnings on failure but never propagates errors.
-pub(crate) fn write_etag(file: &tokio::fs::File, display_path: &Path, etag: &str) {
-    if !is_valid_etag(etag) {
-        warn_once_or_info!(
-            "Skipping write of malformed ETag to `{}`: `{}`",
-            display_path.display(),
-            etag.escape_debug()
-        );
-        return;
+    fn discard_gate() -> &'static AtomicBool {
+        static GATE: AtomicBool = AtomicBool::new(false);
+        &GATE
     }
 
-    xattr_helpers::write_helper(file, display_path, XATTR_ETAG, etag.as_bytes());
+    fn parse(raw: &str) -> Option<Self> {
+        is_valid_etag(raw).then(|| Self(raw.to_owned()))
+    }
+
+    fn render(&self) -> Cow<'_, str> {
+        let Self(etag) = self;
+        Cow::Borrowed(etag)
+    }
 }
 
 /// Strong `ETag` comparison per RFC 9110 §8.8.3.2: both tags must be strong
@@ -290,5 +268,26 @@ mod tests {
         // not panic or read past the end.
         assert!(!if_none_match("\"abc", "\"abc\""));
         assert!(!if_none_match("\"abc, \"def\"", "\"def\""));
+    }
+
+    #[test]
+    fn etag_parse_and_render() {
+        let strong = ETag::parse("\"abc\"").expect("strong ETag");
+        assert_eq!(strong.render(), "\"abc\"");
+        assert_eq!(strong.into_string(), "\"abc\"");
+        let weak = ETag::parse("W/\"abc\"").expect("weak ETag");
+        assert_eq!(weak.render(), "W/\"abc\"");
+        assert!(ETag::parse("abc").is_none());
+        assert!(ETag::parse("").is_none());
+        assert!(ETag::parse("\"a b\"").is_none());
+    }
+
+    #[test]
+    fn etag_scrubs_malformed_and_round_trips() {
+        use crate::xattr_helpers::tests::assert_scrubs_malformed_and_round_trips;
+
+        let valid = ETag::parse("\"306ed-61a5ca11810f3\"").expect("valid ETag");
+        assert_scrubs_malformed_and_round_trips(b"unquoted", &valid);
+        assert_scrubs_malformed_and_round_trips(b"\"\xff\"", &ETag::parse("W/\"w\"").unwrap());
     }
 }

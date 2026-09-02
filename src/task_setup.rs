@@ -151,10 +151,13 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
     // Check for extended attribute support
     {
         // Probe the same namespace the runtime uses (`user.apt_cacher_rs.*` —
-        // see `xattr_helpers.rs`, `http_etag.rs`, `http_last_modified.rs`) so a
-        // filesystem or LSM policy that allows the generic `user.*` namespace
-        // but restricts custom prefixes does not pass the probe while still
-        // blocking real reads/writes at runtime.
+        // every `xattr_helpers::XattrValue::KEY`) so a filesystem or LSM
+        // policy that allows the generic `user.*` namespace but restricts
+        // custom prefixes does not pass the probe while still blocking real
+        // reads/writes at runtime. This is a capability probe, so it uses the
+        // raw `xattr::FileExt` calls on purpose: the typed `xattr_helpers`
+        // layer short-circuits on the very `XATTR_SUPPORTED` flag this probe
+        // decides, and its degradation warns would misreport a probe failure.
         const XATTR_PROBE: &str = "user.apt_cacher_rs.probe";
         const XATTR_PROBE_VALUE: &[u8] = b"probe";
 

@@ -68,12 +68,10 @@ use crate::database_task::{
 use crate::deb_mirror::Origin;
 use crate::error::ErrorReport;
 use crate::guards::{DownloadBarrier, InitBarrier};
-use crate::http_etag::write_etag;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, WritePhase, write_416_response,
     write_all_to_stream, write_invalid_response,
 };
-use crate::http_last_modified::write_last_modified;
 use crate::http_range::{HttpDate, ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
 use crate::precise_instant::PreciseInstant;
@@ -90,13 +88,13 @@ use crate::utils::{
     self, CacheAccessFailure, Logged, TempPath, is_peer_disconnect, regular_file_metadata,
     tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
 };
-use crate::xattr_helpers;
 use crate::{
     APP_VIA, AppState, ContentLength,
     active_downloads::{ActiveDownloadStatus, OriginateOutcome},
-    cache_metadata, content_type_for_cached_file, global_cache_quota, global_config,
-    global_verify_throttle, metrics, static_assert, warn_on_content_type_mismatch,
-    warn_once_or_info, warn_once_or_info_logged,
+    cache_metadata::{self, write_upstream_metadata},
+    content_type_for_cached_file, global_cache_quota, global_config, global_verify_throttle,
+    metrics, static_assert, warn_on_content_type_mismatch, warn_once_or_info,
+    warn_once_or_info_logged,
 };
 
 use acquire::{
@@ -619,20 +617,17 @@ async fn prepare_cache_target(
         }
     };
 
-    // Write ETag xattr early so it survives partial downloads for resume
-    if let Some(ref etag) = upstream_resp.etag {
-        write_etag(&tempfile, &temppath, etag);
-    }
-    // Persist upstream Last-Modified to xattr (RFC 9110 §10.2.2: forward origin's value)
-    if let Some(ref lm) = upstream_resp.last_modified {
-        write_last_modified(&tempfile, &temppath, lm);
-    }
-    // Persist expected total size so a future resume can detect upstream file changes.
-    xattr_helpers::write_expected_size(&tempfile, &temppath, total_content_length.get());
-
     let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
         upstream_resp.etag.clone(),
         upstream_resp.last_modified.clone(),
+    );
+    // Persist the validators and the expected total early, so they survive
+    // an interrupted download for resume.
+    write_upstream_metadata(
+        &tempfile,
+        &temppath,
+        &download_meta,
+        Some(total_content_length.get()),
     );
     let dbarrier = ibarrier
         .download(

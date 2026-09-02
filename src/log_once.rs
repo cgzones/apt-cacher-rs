@@ -70,3 +70,24 @@ macro_rules! warn_once_or_info_logged {
         $crate::utils::Logged::warn_once_or_info(&FIRED, format_args!($($t)*))
     }};
 }
+
+/// [`warn_once_or_info!`] with a caller-owned gate, for generic code: a
+/// `static` inside a generic function body is one gate shared by every
+/// instantiation, so a per-type site (see `xattr_helpers::XattrValue`) must
+/// hand its own in. Same load-before-CAS shape as the macros.
+pub(crate) fn warn_once_or_info_gated(
+    fired: &'static std::sync::atomic::AtomicBool,
+    args: std::fmt::Arguments<'_>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    if !fired.load(Relaxed)
+        && fired
+            .compare_exchange(false, true, Relaxed, Relaxed)
+            .is_ok()
+    {
+        tracing::warn!("{args}");
+    } else {
+        tracing::info!("{args}");
+    }
+}

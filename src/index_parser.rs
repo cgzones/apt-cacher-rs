@@ -134,6 +134,15 @@ impl HashAlgo {
             Self::Sha512 => "SHA512",
         }
     }
+
+    /// Inverse of [`Self::as_str`]; `None` for anything else.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "SHA256" => Some(Self::Sha256),
+            "SHA512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
 }
 
 /// Accumulated state of the current Debian `Packages` stanza.

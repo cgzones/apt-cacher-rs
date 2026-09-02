@@ -26,7 +26,8 @@
 //! The xattrs on the cached file remain the persistent source of truth.
 //! This cache is empty at boot; the first read for each file falls back
 //! to the xattr helpers and inserts the result. xattr writes still happen
-//! on the download path (see `xattr_helpers::write_*`) so the values
+//! on the download path (every backend calls [`write_upstream_metadata`]
+//! on the same [`UpstreamMetadata`] it later publishes) so the values
 //! survive process restarts.
 //!
 //! # Publication invariant
@@ -48,7 +49,7 @@
 //! matching xattrs — fix that caller, not the assertion.
 //!
 //! The assertion is skipped when the xattr read produced `(None, None)`:
-//! `xattr_helpers::write_helper` is best-effort and silently swallows
+//! `xattr_helpers::write` is best-effort and silently swallows
 //! `ErrorKind::Unsupported`, so on filesystems without xattr support a
 //! caller's xattr write is a no-op and the racing `resolve` legitimately
 //! reads `(None, None)` while `set` publishes `Some(...)`.  The publisher's
@@ -74,10 +75,11 @@ use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::{
     cache_layout::{CacheEntryKey, CacheEntryKeyRef},
-    http_etag::{is_valid_etag, try_read_etag},
-    http_last_modified::{is_valid_http_date, try_read_last_modified},
+    http_etag::{ETag, is_valid_etag},
+    http_last_modified::{LastModified, is_valid_http_date},
     http_range::HttpDate,
     warn_once, warn_once_or_info,
+    xattr_helpers::{self, ExpectedSize, XattrValue as _},
 };
 
 /// Upstream-supplied metadata for a single cached file.  Used both as the
@@ -107,6 +109,52 @@ impl UpstreamMetadata {
             etag: etag.map(Arc::from),
             last_modified,
         }
+    }
+}
+
+/// Persist a download's upstream metadata on its cache file: the `ETag` and
+/// `Last-Modified` validators from `meta`, plus the expected total size when
+/// the upstream announced one (so a resume can detect an upstream change).
+/// Written early, on the partial/temp file, so the values survive an
+/// interrupted download for resume; every backend calls this on the very
+/// [`UpstreamMetadata`] it hands the download barrier, which is what keeps
+/// the publication invariant (module docs) trivially true.
+///
+/// `meta`'s strings were validated once per upstream response by
+/// [`check_upstream_validators`], so the re-parse here cannot fail; the
+/// skip arm is the defensive fallback for a caller that bypassed it.
+pub(crate) fn write_upstream_metadata(
+    file: &tokio::fs::File,
+    display_path: &Path,
+    meta: &UpstreamMetadata,
+    expected_size: Option<u64>,
+) {
+    let UpstreamMetadata {
+        etag,
+        last_modified,
+    } = meta;
+    if let Some(etag) = etag {
+        match ETag::parse(etag) {
+            Some(etag) => xattr_helpers::write(file, display_path, &etag),
+            None => warn_once_or_info!(
+                "Skipping write of malformed ETag to `{}`: `{}`",
+                display_path.display(),
+                etag.escape_debug()
+            ),
+        }
+    }
+    if let Some((raw, _time)) = last_modified {
+        match LastModified::parse(raw) {
+            Some(lm) => xattr_helpers::write(file, display_path, &lm),
+            None => warn_once_or_info!(
+                "Skipping write of malformed Last-Modified to `{}`: `{}`",
+                display_path.display(),
+                raw.escape_debug()
+            ),
+        }
+    }
+    if let Some(size) = expected_size {
+        xattr_helpers::write(file, display_path, &ExpectedSize(size));
     }
 }
 
@@ -219,9 +267,14 @@ impl CacheMetadataStore {
         // a best-effort `Arc` containing whichever fields succeeded for
         // this request but do not insert — see the "Negative caching
         // and transient errors" section in the module docs.
-        let etag_res = try_read_etag(file, path).map(|o| o.map(Arc::from));
-        let last_modified_res =
-            try_read_last_modified(file, path).map(|o| o.map(|(s, t)| (Arc::from(s), t)));
+        let etag_res = xattr_helpers::try_read::<ETag>(file, path)
+            .map(|o| o.map(|etag| Arc::from(etag.into_string())));
+        let last_modified_res = xattr_helpers::try_read::<LastModified>(file, path).map(|o| {
+            o.map(|lm| {
+                let (raw, time) = lm.into_parts();
+                (Arc::from(raw), time)
+            })
+        });
         let (etag, last_modified) = match (etag_res, last_modified_res) {
             (Ok(etag), Ok(last_modified)) => (etag, last_modified),
             (etag_res, last_modified_res) => {
@@ -244,8 +297,8 @@ impl CacheMetadataStore {
         // In release we trust the publisher's value.
         //
         // Exception: if our xattr read produced `(None, None)`, treat it
-        // as "xattrs unavailable on this FS" (the `write_helper` is best-
-        // effort and silently swallows `ErrorKind::Unsupported`), trust
+        // as "xattrs unavailable on this FS" (`xattr_helpers::write` is
+        // best-effort and silently swallows `ErrorKind::Unsupported`), trust
         // the publisher, and skip the assert.  Asserting here would fire
         // spuriously on filesystems without xattr support.
         let owned = <Self as ResolveOwn<K>>::own(key);
@@ -390,8 +443,18 @@ mod tests {
     use super::*;
     use crate::cache_layout::CacheLayout;
     use crate::deb_mirror::{Mirror, MirrorKind};
-    use crate::http_etag::write_etag;
-    use crate::http_last_modified::write_last_modified;
+
+    fn write_etag(file: &File, path: &Path, etag: &str) {
+        xattr_helpers::write(file, path, &ETag::parse(etag).expect("valid ETag"));
+    }
+
+    fn write_last_modified(file: &File, path: &Path, value: &str) {
+        xattr_helpers::write(
+            file,
+            path,
+            &LastModified::parse(value).expect("valid HTTP-date"),
+        );
+    }
 
     fn fixture_key() -> CacheEntryKey {
         use crate::config::ClientHost;
@@ -437,6 +500,41 @@ mod tests {
         write_etag(&file, &path, "\"xyz\"");
         let second = store.resolve(&key, &file, &path);
         assert_eq!(second.etag.as_deref(), Some("\"abc\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn write_upstream_metadata_persists_what_resolve_reads() {
+        let store = CacheMetadataStore::new();
+        let (_dir, file, path) = fixture_file().await;
+        let meta = UpstreamMetadata::from_upstream(
+            Some("\"abc\"".into()),
+            Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
+        );
+        write_upstream_metadata(&file, &path, &meta, Some(4096));
+
+        let resolved = store.resolve(&fixture_key(), &file, &path);
+        // Skip on filesystems that reject xattr writes.
+        if resolved.etag.is_none() && resolved.last_modified.is_none() {
+            return;
+        }
+        assert_eq!(
+            resolved.as_ref(),
+            &meta,
+            "the published value is what was persisted"
+        );
+        assert_eq!(
+            xattr_helpers::read::<ExpectedSize>(&file, &path),
+            Some(ExpectedSize(4096))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn write_upstream_metadata_without_size_leaves_no_expected_size() {
+        let (_dir, file, path) = fixture_file().await;
+        let meta = UpstreamMetadata::from_upstream(Some("\"abc\"".into()), None);
+        write_upstream_metadata(&file, &path, &meta, None);
+        assert_eq!(xattr_helpers::read::<ExpectedSize>(&file, &path), None);
+        assert!(xattr_helpers::read::<LastModified>(&file, &path).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

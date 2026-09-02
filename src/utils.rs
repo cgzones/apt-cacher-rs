@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     Never, cache_paths::CachePaths, deb_mirror, error::ErrorReport, guards::InitBarrier,
-    http_etag::read_etag, humanfmt::HumanFmt, metrics, warn_once_or_debug, xattr_helpers,
+    http_etag::ETag, humanfmt::HumanFmt, metrics, warn_once_or_debug, xattr_helpers,
 };
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
@@ -366,8 +366,11 @@ pub(crate) async fn prepare_partial_resume(
 ) -> Result<PartialResume, PartialOpenError> {
     match open_partial_file(ibarrier, log_prefix).await {
         Ok((file, size, guard)) if size > 0 => {
-            if let Some(if_range) = read_etag(&file, &guard) {
-                let expected_total = xattr_helpers::read_expected_size(&file, &guard);
+            if let Some(if_range) = xattr_helpers::read::<ETag>(&file, &guard) {
+                let if_range = if_range.into_string();
+                let expected_total =
+                    xattr_helpers::read::<xattr_helpers::ExpectedSize>(&file, &guard)
+                        .map(|xattr_helpers::ExpectedSize(size)| size);
                 // The total is only known when the partial carries the
                 // expected-size xattr; narrate its absence instead of
                 // placeholdering it.

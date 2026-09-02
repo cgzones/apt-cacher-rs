@@ -1,15 +1,14 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
-use xattr::FileExt as _;
-
-use crate::error::ErrorReport;
-use crate::index_parser::{HashAlgo, hash_open_file, hex_encode};
+use crate::index_parser::{HashAlgo, byhash_digest_for_algo, hash_open_file, hex_encode};
 use crate::metrics;
 use crate::utils::nofollow_nonblock_options;
-use crate::warn_once_or_debug;
+use crate::xattr_helpers::{self, XattrValue};
 
-/// Xattr recording a successful cleanup digest verification, formatted as
-/// `"{ino}:{size}:{algo}:{expected-digest-hex}"`.
+/// Xattr recording a successful cleanup digest verification, persisted as
+/// `user.apt_cacher_rs.cleanup_verified` = `"{ino}:{size}:{algo}:{digest-hex}"`.
 ///
 /// A later cycle skips re-hashing when inode, size, algorithm, and expected
 /// digest all still match — the daily full-cache re-read otherwise scales
@@ -17,31 +16,101 @@ use crate::warn_once_or_debug;
 /// means an index update that changes the expected content invalidates the
 /// marker automatically; binding `(ino, size)` means any re-download
 /// (temp file + rename, so a fresh inode) invalidates it too.
-const XATTR_CLEANUP_VERIFIED: &str = "user.apt_cacher_rs.cleanup_verified";
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CleanupMarker {
+    ino: u64,
+    size: u64,
+    algo: HashAlgo,
+    digest: Vec<u8>,
+}
 
-fn verified_marker(ino: u64, size: u64, algo: HashAlgo, expected: &[u8]) -> String {
-    format!("{ino}:{size}:{}:{}", algo.as_str(), hex_encode(expected))
+impl CleanupMarker {
+    fn new(ino: u64, size: u64, algo: HashAlgo, expected: &[u8]) -> Self {
+        Self {
+            ino,
+            size,
+            algo,
+            digest: expected.to_vec(),
+        }
+    }
+
+    /// Whether the marker was stamped for exactly this file identity and
+    /// expected digest.
+    fn matches(&self, ino: u64, size: u64, algo: HashAlgo, expected: &[u8]) -> bool {
+        let Self {
+            ino: my_ino,
+            size: my_size,
+            algo: my_algo,
+            digest,
+        } = self;
+        *my_ino == ino && *my_size == size && *my_algo == algo && digest == expected
+    }
+}
+
+impl XattrValue for CleanupMarker {
+    const KEY: &'static str = "user.apt_cacher_rs.cleanup_verified";
+    const LABEL: &'static str = "cleanup verification marker";
+    // Without any log a per-file stamp failure is indistinguishable from
+    // working memoization, and every cycle silently re-hashes the whole cache.
+    const WRITE_FAILURE_CONSEQUENCE: &'static str =
+        "digest verification is not memoized and every cleanup cycle re-hashes this file";
+
+    fn discard_gate() -> &'static AtomicBool {
+        static GATE: AtomicBool = AtomicBool::new(false);
+        &GATE
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.split(':');
+        let ino = parts.next()?.parse().ok()?;
+        let size = parts.next()?.parse().ok()?;
+        let algo = HashAlgo::parse(parts.next()?)?;
+        let digest = byhash_digest_for_algo(algo, parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            ino,
+            size,
+            algo,
+            digest,
+        })
+    }
+
+    fn render(&self) -> Cow<'_, str> {
+        let Self {
+            ino,
+            size,
+            algo,
+            digest,
+        } = self;
+        Cow::Owned(format!(
+            "{ino}:{size}:{}:{}",
+            algo.as_str(),
+            hex_encode(digest)
+        ))
+    }
 }
 
 /// Whether `file` carries a verified marker matching the current identity
 /// and expected digest. Any read failure or mismatch counts as "not
-/// verified" (the caller re-hashes and re-stamps).
+/// verified" (the caller re-hashes and re-stamps); a malformed marker is
+/// scrubbed by the xattr layer.
 fn has_valid_marker(
     file: &std::fs::File,
+    path: &Path,
     ino: u64,
     size: u64,
     algo: HashAlgo,
     expected: &[u8],
 ) -> bool {
-    let Ok(Some(value)) = file.get_xattr(XATTR_CLEANUP_VERIFIED) else {
-        return false;
-    };
-    value == verified_marker(ino, size, algo, expected).as_bytes()
+    xattr_helpers::read::<CleanupMarker>(file, path)
+        .is_some_and(|marker| marker.matches(ino, size, algo, expected))
 }
 
 /// Stamp the verified marker after a successful digest match. Best-effort:
-/// failure (e.g. filesystem without xattr support) just means the next
-/// cycle re-hashes.
+/// a failure (logged once by the xattr layer, e.g. a filesystem without
+/// xattr support) just means the next cycle re-hashes.
 fn stamp_marker(
     file: &std::fs::File,
     path: &Path,
@@ -50,19 +119,7 @@ fn stamp_marker(
     algo: HashAlgo,
     expected: &[u8],
 ) {
-    let value = verified_marker(ino, size, algo, expected);
-    if let Err(err) = file.set_xattr(XATTR_CLEANUP_VERIFIED, value.as_bytes()) {
-        // Same graceful degradation as xattr_helpers::write_helper, which
-        // warns per file -- here that would be once per referenced file per
-        // cycle on an xattr-less filesystem, hence the once-macro. Without
-        // any log a per-file stamp failure is indistinguishable from working
-        // memoization, and every cycle silently re-hashes the whole cache.
-        warn_once_or_debug!(
-            "Failed to stamp the cleanup verification marker on `{}`; digest verification is not memoized and every cleanup cycle re-hashes this file:  {}",
-            path.display(),
-            ErrorReport(&err)
-        );
-    }
+    xattr_helpers::write(file, path, &CleanupMarker::new(ino, size, algo, expected));
 }
 
 /// Outcome of verifying a cache file against an expected digest.
@@ -113,7 +170,7 @@ pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> 
 
     // Memoized fast path: verified in an earlier cycle and unchanged since
     // (same inode/size, same expected digest) — skip the full read+hash.
-    if has_valid_marker(&file, pre_ino, pre_size, algo, expected) {
+    if has_valid_marker(&file, path, pre_ino, pre_size, algo, expected) {
         metrics::CLEANUP_CHECKSUM_SKIPS.increment();
         return Verdict::Match;
     }
@@ -254,7 +311,7 @@ mod tests {
         // support (stamping is best-effort); only assert the fast path
         // where it actually stuck.
         let file = std::fs::File::open(&path).expect("open");
-        let stamped = matches!(file.get_xattr(XATTR_CLEANUP_VERIFIED), Ok(Some(_)));
+        let stamped = xattr_helpers::read::<CleanupMarker>(&file, &path).is_some();
         if stamped {
             // The counter is process-global and other unit tests in this
             // binary bump it concurrently, so assert the delta as a lower
@@ -277,5 +334,43 @@ mod tests {
             verify_file_sync(&path, HashAlgo::Sha256, &wrong),
             Verdict::Mismatch { .. }
         ));
+    }
+
+    #[test]
+    fn cleanup_marker_parse_and_render() {
+        let digest = [0xabu8; 32];
+        let marker = CleanupMarker::new(42, 1234, HashAlgo::Sha256, &digest);
+        let rendered = marker.render();
+        assert_eq!(rendered, format!("42:1234:SHA256:{}", hex_encode(&digest)));
+        assert_eq!(CleanupMarker::parse(&rendered), Some(marker));
+
+        let sha512 = [0x11u8; 64];
+        let marker = CleanupMarker::new(7, 0, HashAlgo::Sha512, &sha512);
+        assert_eq!(
+            CleanupMarker::parse(&marker.render()).as_ref(),
+            Some(&marker)
+        );
+        assert!(marker.matches(7, 0, HashAlgo::Sha512, &sha512));
+        assert!(!marker.matches(8, 0, HashAlgo::Sha512, &sha512));
+        assert!(!marker.matches(7, 1, HashAlgo::Sha512, &sha512));
+        assert!(!marker.matches(7, 0, HashAlgo::Sha256, &sha512));
+        assert!(!marker.matches(7, 0, HashAlgo::Sha512, &[0x22u8; 64]));
+
+        let hex = hex_encode(&digest);
+        assert!(CleanupMarker::parse("").is_none());
+        assert!(CleanupMarker::parse("42:1234:SHA256").is_none());
+        assert!(CleanupMarker::parse(&format!("x:1234:SHA256:{hex}")).is_none());
+        assert!(CleanupMarker::parse(&format!("42:1234:MD5:{hex}")).is_none());
+        // Digest length must match the algorithm.
+        assert!(CleanupMarker::parse(&format!("42:1234:SHA512:{hex}")).is_none());
+        assert!(CleanupMarker::parse(&format!("42:1234:SHA256:{hex}:extra")).is_none());
+    }
+
+    #[test]
+    fn cleanup_marker_scrubs_malformed_and_round_trips() {
+        use crate::xattr_helpers::tests::assert_scrubs_malformed_and_round_trips;
+
+        let marker = CleanupMarker::new(42, 1234, HashAlgo::Sha256, &[0xcdu8; 32]);
+        assert_scrubs_malformed_and_round_trips(b"42:1234:SHA256:nothex", &marker);
     }
 }
