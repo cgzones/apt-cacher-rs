@@ -39,7 +39,7 @@ use super::{
     metrics_page::build_metrics_html,
     page::{Page, QueryOptions, build_nav_html, build_page},
     response::WebResponse,
-    table::{DetailsTable, write_collapsible_section, write_section, write_section_error},
+    table::{DetailsList, write_collapsible_section, write_section, write_section_error},
     tables::{
         DirStats, Section, TopPackagesView, build_client_table, build_mirror_table,
         build_origin_table, build_top_packages_table, build_uncacheable_table,
@@ -294,7 +294,7 @@ fn build_daemon_status_html(
     let log_cap = rd.config.logstore_capacity.get();
     let log_class = RatioClass::new(log_entries as u64, log_cap as u64);
 
-    let mut t = DetailsTable::new();
+    let mut t = DetailsList::new();
     t.row("Version", APP_VERSION);
     t.row("Features", get_features(false).replace('\n', " "));
     t.row(
@@ -421,7 +421,7 @@ fn build_daemon_status_html(
 }
 
 fn build_configuration_html(rd: &RuntimeDetails, https_mode: &'static str) -> String {
-    let mut t = DetailsTable::new();
+    let mut t = DetailsList::new();
     t.row(
         "Bind Address + Port",
         format_args!("{} : {}", rd.config.bind_addr, rd.config.bind_port),
@@ -528,7 +528,7 @@ fn build_maintenance_html(
     let next_rel =
         std::time::Duration::from_secs(as_size(next_cleanup_epoch.saturating_sub(now_epoch)));
 
-    let mut t = DetailsTable::new();
+    let mut t = DetailsList::new();
     t.row(
         "Last Cleanup",
         EpochAndRel {
@@ -595,7 +595,7 @@ fn build_cache_stats_html(
         }
     };
 
-    let mut t = DetailsTable::new();
+    let mut t = DetailsList::new();
     t.row("Fetched from Upstream", HumanFmt::Size(total_downloaded_u));
     t.row("Served to Clients", HumanFmt::Size(total_delivered_u));
     t.row("Bandwidth Saved", HumanFmt::Size(bandwidth_saved_u));

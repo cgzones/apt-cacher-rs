@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     fmt::{AlertNonzero, WarnNonzero, alert_if, warn_if},
-    table::DetailsTable,
+    table::DetailsList,
 };
 
 pub(super) fn build_metrics_html() -> String {
@@ -56,7 +56,7 @@ pub(super) fn build_metrics_html() -> String {
     let served_webui = metrics::SERVED_WEBUI.get();
     let connections_accepted = metrics::CONNECTIONS_ACCEPTED.get();
 
-    let mut t = DetailsTable::new();
+    let mut t = DetailsList::new();
     t.row_tip(
         "Total Requests \u{2192} Served (Web UI Requests \u{2192} Served) / Connections Accepted",
         "Total HTTP requests handled \u{2192} requests whose response body was fully delivered to the client; same split for the web interface. Plus TCP connections accepted from clients since the daemon started.",

@@ -290,9 +290,7 @@ details > summary > h3 { display: inline; }
 .dim { opacity: 0.4; }
 time { border-bottom: 1px dotted transparent; transition: border-color 0.15s; }
 time:hover { border-bottom-color: currentColor; }
-table:not(.details) td { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-table:not(.details) td:hover { overflow: visible; white-space: normal; word-break: break-all;
-                                max-width: none; }
+table td { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -310,17 +308,15 @@ h3 { color: var(--h-fg); margin-bottom: 6px; border-bottom: 2px solid var(--h-ac
 .tablewrap { overflow-x: auto; max-width: 100%; }
 table { width: 100%; border-collapse: collapse; margin-top: 6px; }
 table td, table th { font-variant-numeric: tabular-nums; }
-table.details { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                width: 100%; }
-table.details thead { display: none; }
-table.details tbody { display: contents; }
-table.details tr { display: flex; flex-direction: column; padding: 4px 10px;
+dl.details { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+             width: 100%; margin-top: 6px; }
+dl.details > div { display: flex; flex-direction: column; padding: 4px 10px;
                    border-left: 3px solid transparent; }
-table.details tr:hover { border-left-color: var(--h-accent); background: var(--details-hover-bg); }
-table.details td { border: none; padding: 0; }
-table.details td:first-child { font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.03em;
-                                color: var(--details-key-fg); font-weight: 600; }
-table.details td:last-child { color: var(--details-val-fg); font-weight: 600; font-size: 0.92em; }
+dl.details > div:hover { border-left-color: var(--h-accent); background: var(--details-hover-bg); }
+dl.details dt { font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.03em;
+                color: var(--details-key-fg); font-weight: 600; }
+dl.details dd { color: var(--details-val-fg); font-weight: 600; font-size: 0.92em;
+                font-variant-numeric: tabular-nums; }
 th { background: var(--th-bg); color: var(--th-fg); padding: 4px 10px; text-align: left; font-size: 0.85em; }
 td { padding: 4px 10px; border-bottom: 1px solid var(--td-border); }
 tr:hover td { background: var(--row-hover-bg); }

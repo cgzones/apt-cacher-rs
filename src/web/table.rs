@@ -14,6 +14,9 @@ use super::fmt::HtmlEscape;
 
 pub(super) struct Table {
     out: String,
+    /// Reused across cells so [`Table::cell`] can inspect a rendered value
+    /// without allocating per cell.
+    scratch: String,
 }
 
 impl Table {
@@ -30,15 +33,39 @@ impl Table {
             out.push_str("</th>");
         }
         out.push_str("</tr></thead><tbody>");
-        Self { out }
+        Self {
+            out,
+            scratch: String::with_capacity(128),
+        }
     }
 
     pub(super) fn start_row(&mut self) {
         self.out.push_str("<tr>");
     }
 
+    /// Cell contents longer than this get a `title` attribute repeating the
+    /// full value. The stylesheet truncates cells at 220px, which is roughly
+    /// 30 characters at the table font size; the lower bound errs towards
+    /// titling a cell that would have fitted rather than missing one that
+    /// gets an ellipsis.
+    const TITLE_THRESHOLD: usize = 24;
+
+    /// Append a cell. A value that renders as plain text also goes into a
+    /// `title` attribute, which is the only way to read it once the
+    /// stylesheet has truncated it — the cell text alone is unreachable by
+    /// keyboard and touch. Values that render markup (`<time>`, a colourised
+    /// `<span>`) cannot be reused verbatim in an attribute, so they are
+    /// emitted bare.
     pub(super) fn cell(&mut self, value: impl Display) {
-        swrite!(self.out, "<td>{value}</td>");
+        let Self { out, scratch } = self;
+        scratch.clear();
+        swrite!(scratch, "{value}");
+
+        if scratch.len() > Self::TITLE_THRESHOLD && !scratch.contains('<') {
+            swrite!(out, "<td title=\"{scratch}\">{scratch}</td>");
+        } else {
+            swrite!(out, "<td>{scratch}</td>");
+        }
     }
 
     pub(super) fn end_row(&mut self) {
@@ -62,23 +89,28 @@ macro_rules! tr {
 }
 pub(super) use tr;
 
-/// Key-value details table with grid layout.
-pub(super) struct DetailsTable {
+/// Key-value list with grid layout.
+///
+/// A `<dl>` rather than a `<table>`: the grid needs `display: contents` on
+/// the row container, which strips a table of its roles in the accessibility
+/// tree and so loses every label-to-value association. A description list
+/// carries that association in the markup itself and survives the same CSS.
+pub(super) struct DetailsList {
     out: String,
 }
 
-impl DetailsTable {
+impl DetailsList {
     pub(super) fn new() -> Self {
         let mut out = String::with_capacity(1024);
-        out.push_str("<table class=\"details\"><thead></thead><tbody>");
+        out.push_str("<dl class=\"details\">");
         Self { out }
     }
 
     pub(super) fn row(&mut self, label: &'static str, value: impl Display) {
-        swrite!(self.out, "<tr><td>{label}</td><td>{value}</td></tr>");
+        swrite!(self.out, "<div><dt>{label}</dt><dd>{value}</dd></div>");
     }
 
-    /// Like [`Self::row`], but renders the label cell with a `title` tooltip
+    /// Like [`Self::row`], but renders the label with a `title` tooltip
     /// shown when the user hovers over it. The `tooltip` is interpolated
     /// directly into the `title=""` attribute without HTML-escaping; the
     /// `&'static str` bound prevents user-controlled values from sneaking
@@ -91,12 +123,12 @@ impl DetailsTable {
     ) {
         swrite!(
             self.out,
-            "<tr><td title=\"{tooltip}\">{label}</td><td>{value}</td></tr>"
+            "<div><dt title=\"{tooltip}\">{label}</dt><dd>{value}</dd></div>"
         );
     }
 
     pub(super) fn finish(mut self) -> String {
-        self.out.push_str("</tbody></table>");
+        self.out.push_str("</dl>");
         self.out
     }
 }
