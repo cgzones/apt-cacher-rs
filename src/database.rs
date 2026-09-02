@@ -1071,8 +1071,15 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn cleanup_invalid_rows(&self) -> Result<(), Error> {
-        // Remove downloads/deliveries with invalid client_ip (not exactly 16 bytes)
+    /// Repair usage rows an older version or a manual edit could have left
+    /// with a `client_ip` that is not a 16-byte encoded address.
+    ///
+    /// Startup only. The daemon has never written such a row, and the DELETE
+    /// holds the write lock for a full scan of both usage tables — during
+    /// which the batch flusher stalls and the request path can block in
+    /// `send_db_command`. Paying that once at startup is a repair; paying it
+    /// daily is a tax on a condition that cannot arise.
+    pub(crate) async fn cleanup_invalid_usage_rows(&self) -> Result<(), Error> {
         let downloads_deleted = query!(r"DELETE FROM downloads WHERE length(client_ip) != 16;")
             .execute(&self.conn)
             .await?;
@@ -1095,16 +1102,25 @@ impl Database {
             );
         }
 
-        // Remove mirrors whose `host` no longer parses through
-        // `DomainName::new` or whose `kind` is outside the [`MirrorKind`]
-        // invariant.  Cascade to origins/downloads/deliveries.
-        //
-        // The host check uses `DomainName::new` (not `is_valid_config_domain`) so
-        // the row set this function purges is exactly the set of rows
-        // downstream code — notably `flat_blocklist::init` — relies on
-        // being absent.  Any future tightening of `DomainName::new` then
-        // automatically also tightens cleanup, instead of opening a
-        // panic gap between the two validators.
+        Ok(())
+    }
+
+    /// Remove mirrors whose `host` no longer parses through
+    /// `DomainName::new` or whose `kind` is outside the [`MirrorKind`]
+    /// invariant.  Cascade to origins/downloads/deliveries.
+    ///
+    /// The host check uses `DomainName::new` (not `is_valid_config_domain`) so
+    /// the row set this function purges is exactly the set of rows
+    /// downstream code — notably `flat_blocklist::init` — relies on
+    /// being absent.  Any future tightening of `DomainName::new` then
+    /// automatically also tightens cleanup, instead of opening a
+    /// panic gap between the two validators.
+    ///
+    /// Runs at startup and on every cleanup cycle: unlike the usage-row
+    /// scrub, `mirrors_v2` is bounded by the mirror count, so the scan stays
+    /// cheap, and `flat_blocklist::init` needs the invariant it guarantees
+    /// to hold continuously, not just after a restart.
+    pub(crate) async fn cleanup_invalid_rows(&self) -> Result<(), Error> {
         {
             struct MirrorRow {
                 id: i64,
@@ -1374,6 +1390,14 @@ mod retention_tests {
         (dir, db)
     }
 
+    async fn count(db: &Database) -> i64 {
+        let row = query("SELECT COUNT(*) FROM downloads")
+            .fetch_one(&db.conn)
+            .await
+            .expect("count");
+        sqlx::Row::get(&row, 0)
+    }
+
     /// Insert a mirror row directly: `upsert_mirror_id` resolves aliases
     /// through `global_config()`, which no unit test can initialise.
     async fn insert_mirror(db: &Database, path: &str) -> i64 {
@@ -1523,5 +1547,36 @@ mod retention_tests {
                 .is_empty()
         );
         assert_eq!(db.get_mirrors().await.expect("mirrors").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_row_scrub_is_startup_only() {
+        let (_dir, db) = temp_db().await;
+        let mirror_id = insert_mirror(&db, "scrub").await;
+
+        // A row an older version could have written: client_ip is not 16 bytes.
+        query(
+            "INSERT INTO downloads (mirror_id, debname, size, duration, client_ip, timestamp) \
+             VALUES (?, 'a.deb', 1, 1, ?, 1)",
+        )
+        .bind(mirror_id)
+        .bind(vec![0u8; 4])
+        .execute(&db.conn)
+        .await
+        .expect("insert short client_ip");
+
+        // The periodic path must not scan the usage tables.
+        db.cleanup_invalid_rows().await.expect("periodic cleanup");
+        assert_eq!(
+            count(&db).await,
+            1,
+            "the daily cycle must not scan the usage tables"
+        );
+
+        // The startup path still repairs it.
+        db.cleanup_invalid_usage_rows()
+            .await
+            .expect("startup scrub");
+        assert_eq!(count(&db).await, 0, "startup must still repair legacy rows");
     }
 }

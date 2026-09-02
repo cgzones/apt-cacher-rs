@@ -127,6 +127,17 @@ pub(crate) async fn main_loop(
         .map_err(MainLoopError::Database)?;
 
     database
+        .cleanup_invalid_usage_rows()
+        .await
+        .inspect_err(|err| {
+            error!(
+                "Failed to clean up invalid usage rows; aborting startup:  {}",
+                ErrorReport(err)
+            );
+        })
+        .map_err(MainLoopError::Database)?;
+
+    database
         .cleanup_invalid_rows()
         .await
         .inspect_err(|err| {
