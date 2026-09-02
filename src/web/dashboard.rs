@@ -81,6 +81,10 @@ struct DashboardData {
 /// by `statvfs`, and the wall-clock time spent in the FS walks (separated
 /// from `db_elapsed` for the dashboard footer).
 ///
+/// The mirror list is `None` when the query failed, which callers must not
+/// collapse into the empty list: "no mirror is known" and "no mirror has
+/// ever been seen" lead to opposite pages.
+///
 /// This is a free async fn rather than an inline `tokio::join!` branch so
 /// rustc can prove `Send` for the future without tripping over higher-rank
 /// lifetime auto-trait inference at the spawn site.
@@ -88,7 +92,7 @@ async fn build_mirror_section(
     database: &Database,
     now_epoch: i64,
 ) -> (
-    Vec<MirrorStatEntry>,
+    Option<Vec<MirrorStatEntry>>,
     Section,
     DirStats,
     Option<u64>,
@@ -102,7 +106,7 @@ async fn build_mirror_section(
         Ok(m) => {
             let (section, aggregate) =
                 build_mirror_table(&m, now_epoch, &config.cache_directory).await;
-            (m, section, aggregate)
+            (Some(m), section, aggregate)
         }
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
@@ -112,11 +116,7 @@ async fn build_mirror_section(
             );
             let mut buf = String::new();
             write_section_error(&mut buf, "mirrors", &err);
-            (
-                Vec::new(),
-                Section { html: buf, rows: 0 },
-                DirStats::default(),
-            )
+            (None, Section { html: buf, rows: 0 }, DirStats::default())
         }
     };
 
@@ -185,6 +185,16 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     // directory scans, which are reported separately as `fs_elapsed`.
     let total_parallel: std::time::Duration = parallel_start.elapsed().into();
     let db_elapsed = total_parallel.saturating_sub(fs_elapsed);
+
+    // A failed mirror query is not evidence of a fresh install. Suppress the
+    // setup hint in that case: pairing "No mirror has been contacted yet.
+    // Point apt at this proxy" with a Mirrors section already showing a
+    // database error tells an established operator to reinstall.
+    let seen_traffic = match &mirrors {
+        None => true,
+        Some(mirrors) => !mirrors.is_empty(),
+    };
+    let mirrors = mirrors.unwrap_or_default();
 
     let uncacheable = build_uncacheable_table();
 
