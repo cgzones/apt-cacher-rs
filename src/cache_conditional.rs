@@ -27,8 +27,8 @@ use crate::cache_metadata;
 #[cfg(feature = "sendfile")]
 use crate::http_helpers::find_header;
 use crate::{
-    ClientInfo,
     cache_metadata::UpstreamMetadata,
+    client_info::ClientInfo,
     http_etag::if_none_match,
     http_range::{HttpDate, ParsedRange, cache_file_http_date, compute_age, http_parse_range},
     warn_once_or_debug,

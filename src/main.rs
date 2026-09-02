@@ -19,6 +19,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(feature = "hyper")]
 mod accounted_body;
 mod active_downloads;
+mod build_info;
 mod cache_conditional;
 mod cache_layout;
 mod cache_metadata;
@@ -29,8 +30,10 @@ mod cache_walk;
 mod channel_body;
 mod cleanup;
 mod client_counter;
+mod client_info;
 mod config;
 mod connect_tunnel;
+mod content_type;
 mod database;
 mod database_task;
 mod deb_mirror;
@@ -62,6 +65,7 @@ mod metrics;
 mod mmap_body;
 mod permitted_host_cache;
 mod precise_instant;
+mod proxy_body;
 #[cfg(feature = "hyper")]
 mod rate_checked_body;
 mod rate_checker;
@@ -96,12 +100,8 @@ mod xz_stream;
 
 use std::{
     fmt::Debug,
-    fmt::Display,
     io::IsTerminal as _,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    num::NonZero,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -109,19 +109,10 @@ use std::{
     time::Duration,
 };
 
+use build_info::{APP_VERSION, get_features};
 use clap::Parser;
 #[cfg(feature = "ktls")]
 use hashbrown::HashMap;
-use http::Response;
-#[cfg(feature = "hyper")]
-use http::StatusCode;
-use http_body::{Body, Frame, SizeHint};
-use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
-use pin_project::pin_project;
-#[cfg(all(feature = "mmap", feature = "hyper"))]
-use rate_checked_body::{MaybeRated, RateCheckedBodyErr};
-#[cfg(feature = "hyper")]
-use response_head::ResponseHead;
 use time::format_description::well_known::Rfc2822;
 use tokio::runtime::Builder;
 use tracing::{debug, error, info, trace, warn};
@@ -139,141 +130,8 @@ const _: () = assert!(
     "ensure casts from usize to u64 via 'as' do not truncate"
 );
 
-pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
-
-pub(crate) const APP_VIA: &str = concat!("1.1 ", env!("CARGO_PKG_NAME"));
-
-const RETENTION_TIME: Duration = Duration::from_hours(8 * 7 * 24); /* 8 weeks */
-
-pub(crate) const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(1024 * 1024); /* 1MiB */
-
-/// Maximum age for volatile cache entries before they are treated as stale.
-pub(crate) const VOLATILE_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
-
 /// Maximum time to wait for the database task to drain on shutdown before giving up.
 const DB_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Warn (once) if the upstream `Content-Type` differs from the type derived
-/// from the cached file's basename. The non-standard `binary/octet-stream`
-/// is widely advertised by Debian mirrors and is treated as a no-op rather
-/// than a mismatch to keep the log quiet.
-pub(crate) fn warn_on_content_type_mismatch(
-    upstream: Option<&str>,
-    mirror: &deb_mirror::Mirror,
-    debname: &str,
-) {
-    let Some(upstream_ct) = upstream else {
-        return;
-    };
-    if upstream_ct.eq_ignore_ascii_case("binary/octet-stream") {
-        return;
-    }
-
-    let expected = content_type_for_cached_file(debname);
-    if upstream_ct.eq_ignore_ascii_case(expected) {
-        return;
-    }
-    // `application/x-deb` is the legacy unregistered alias for the
-    // IANA-registered `application/vnd.debian.binary-package`; treat them
-    // as equivalent.
-    if expected == "application/vnd.debian.binary-package"
-        && upstream_ct.eq_ignore_ascii_case("application/x-deb")
-    {
-        return;
-    }
-    // `application/x-gzip` is the legacy non-standard alias for the
-    // IANA-registered `application/gzip` (RFC 6713); treat them as equivalent.
-    if expected == "application/gzip" && upstream_ct.eq_ignore_ascii_case("application/x-gzip") {
-        return;
-    }
-    warn_once_or_info!(
-        "Upstream Content-Type `{upstream_ct}` differs from the expected `{expected}` for {debname} from {mirror}; caching and serving the file anyway"
-    );
-}
-
-/// Derive the Content-Type for a cached file based on its filename extension.
-#[must_use]
-pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
-    if deb_mirror::is_deb_package(filename) {
-        return "application/vnd.debian.binary-package";
-    }
-
-    // Match on the basename so both flat (`Packages`) and structured
-    // (`sid_main_binary-amd64_Packages`) debnames classify correctly.
-    let basename = filename.rsplit_once('_').map_or(filename, |(_, b)| b);
-    if matches!(basename, "InRelease" | "Release" | "Packages" | "Sources") {
-        return "text/plain";
-    }
-
-    let extension = filename.rsplit_once('.').map(|(_, ext)| ext);
-
-    match extension {
-        Some("gz") => "application/gzip",
-        Some("xz") => "application/x-xz",
-        Some("bz2") => "application/x-bzip2",
-        Some("lz4") => "application/x-lz4",
-        Some("zst") => "application/zstd",
-        Some("gpg") => "application/pgp-signature",
-        _ => "application/octet-stream",
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct ClientInfo {
-    addr: SocketAddr,
-    is_cleanup: bool,
-}
-
-/// Address attached to in-process requests synthesised by `task_cleanup`
-/// (Packages fetches for the GC reference set).  Distinct from `127.0.0.1`
-/// so logging and metrics can distinguish real loopback clients from the
-/// cleanup-driven probes.
-pub(crate) const CLEANUP_CLIENT_ADDR: SocketAddr =
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0));
-
-impl ClientInfo {
-    #[must_use]
-    pub(crate) fn new(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            is_cleanup: false,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn new_cleanup() -> Self {
-        Self {
-            addr: CLEANUP_CLIENT_ADDR,
-            is_cleanup: true,
-        }
-    }
-
-    #[must_use]
-    #[inline]
-    pub(crate) fn ip(&self) -> IpAddr {
-        self.addr.ip().to_canonical()
-    }
-
-    /// `true` when this client is the in-process sentinel used by
-    /// `task_cleanup` to fetch a Packages index — never a real client.
-    /// Used by upstream-error logging to demote a routine 4xx during a
-    /// cleanup probe (e.g. the deliberate `.xz → .gz → raw` walk) from
-    /// WARN to DEBUG.
-    #[must_use]
-    #[inline]
-    pub(crate) fn is_cleanup_synthetic(&self) -> bool {
-        self.is_cleanup
-    }
-}
-
-impl Display for ClientInfo {
-    #[inline]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.ip())
-    }
-}
 
 pub(crate) use scheme_cache::Scheme;
 #[cfg(feature = "ktls")]
@@ -284,260 +142,12 @@ pub(crate) static KTLS_BLOCKED: OnceLock<
     parking_lot::RwLock<HashMap<SchemeKey, coarsetime::Instant>>,
 > = OnceLock::new();
 
-#[must_use]
-#[cfg(feature = "hyper")]
-fn quick_response<T: Into<bytes::Bytes>>(
-    status: StatusCode,
-    message: T,
-) -> Response<ProxyCacheBody> {
-    ResponseHead::error(status).into_hyper(full_body(message))
-}
-
-/// Box `Full<Bytes>` into [`ProxyCacheBody::Boxed`] for
-/// small, fully-buffered responses (status pages, HTML, static assets).
-pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
-    let body = Full::new(content.into()).map_err(|never| match never {});
-    ProxyCacheBody::Boxed(BoxBody::new(body))
-}
-
-#[pin_project(project = EnumProj)]
-#[cfg_attr(
-    all(feature = "mmap", feature = "hyper"),
-    expect(
-        clippy::large_enum_variant,
-        reason = "Mmap is the zero-allocation hot path; boxing it would add a heap \
-                  alloc per cached-file response which is exactly what this variant exists to avoid"
-    )
-)]
-enum ProxyCacheBody {
-    #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap(
-        #[pin] MaybeRated<accounted_body::AccountedBody<mmap_body::MmapBody>>,
-        ClientInfo,
-    ),
-    Boxed(#[pin] BoxBody<bytes::Bytes, Box<error::ProxyCacheError>>),
-}
-
-impl Debug for ProxyCacheBody {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(_, _) => f.debug_tuple("Mmap").finish(),
-            Self::Boxed(_) => f.debug_tuple("Boxed").finish(),
-        }
-    }
-}
-
-impl Body for ProxyCacheBody {
-    type Data = ProxyCacheBodyData;
-
-    type Error = Box<error::ProxyCacheError>;
-
-    #[inline]
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.project() {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            EnumProj::Mmap(memory_map, client) => memory_map
-                .poll_frame(cx)
-                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
-                .map_err(|rerr| match *rerr {
-                    RateCheckedBodyErr::RateTimeout(error) => {
-                        Box::new(error::ProxyCacheError::ClientDownloadRate {
-                            error,
-                            client: *client,
-                        })
-                    }
-                    RateCheckedBodyErr::Inner(never) => match never {},
-                }),
-
-            EnumProj::Boxed(bytes) => bytes
-                .poll_frame(cx)
-                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes)),
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> SizeHint {
-        match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(mmap_body, _) => mmap_body.size_hint(),
-            Self::Boxed(box_body) => box_body.size_hint(),
-        }
-    }
-
-    #[inline]
-    fn is_end_stream(&self) -> bool {
-        match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(mmap_body, _) => mmap_body.is_end_stream(),
-            Self::Boxed(box_body) => box_body.is_end_stream(),
-        }
-    }
-}
-
-enum ProxyCacheBodyData {
-    #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap(mmap_body::MmapData),
-    Bytes(bytes::Bytes),
-}
-
-impl bytes::buf::Buf for ProxyCacheBodyData {
-    fn remaining(&self) -> usize {
-        match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(memory_map) => memory_map.remaining(),
-            Self::Bytes(bytes) => bytes.remaining(),
-        }
-    }
-
-    fn chunk(&self) -> &[u8] {
-        match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(memory_map) => memory_map.chunk(),
-            Self::Bytes(bytes) => bytes.chunk(),
-        }
-    }
-
-    fn advance(&mut self, cnt: usize) {
-        match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(memory_map) => memory_map.advance(cnt),
-            Self::Bytes(bytes) => bytes.advance(cnt),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) database: database::Database,
     #[cfg(feature = "hyper")]
     pub(crate) https_client: hyper_conn::HttpClient,
     pub(crate) active_downloads: active_downloads::ActiveDownloads,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ContentLength {
-    /// An exact size
-    Exact(NonZero<u64>),
-    /// A limit for an unknown size
-    Unknown(NonZero<u64>),
-}
-
-impl ContentLength {
-    #[must_use]
-    const fn upper(self) -> NonZero<u64> {
-        match self {
-            Self::Exact(s) | Self::Unknown(s) => s,
-        }
-    }
-}
-
-impl Display for ContentLength {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Exact(size) => write!(f, "exact {size} bytes"),
-            Self::Unknown(limit) => write!(f, "up to {limit} bytes"),
-        }
-    }
-}
-
-#[must_use]
-#[cfg(not(feature = "hyper"))]
-pub(crate) async fn process_cache_request(
-    conn_details: cache_layout::ConnectionDetails,
-    req: http::Request<http_body_util::Empty<()>>,
-    _appstate: AppState,
-) -> Response<ProxyCacheBody> {
-    splice::splice_cleanup_request(&conn_details, &req).await
-}
-
-#[must_use]
-#[inline]
-pub(crate) const fn get_features(version: bool) -> &'static str {
-    #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-    macro_rules! feature_tls {
-        () => {
-            "hyper"
-        };
-    }
-
-    #[cfg(feature = "tls_rustls")]
-    macro_rules! feature_tls {
-        () => {
-            "rustls"
-        };
-    }
-
-    // Expand to the literal "true" when `feature` is enabled, "false" otherwise.
-    macro_rules! feature_bool {
-        ($name:ident, $feature:literal) => {
-            #[cfg(feature = $feature)]
-            macro_rules! $name {
-                () => {
-                    "true"
-                };
-            }
-            #[cfg(not(feature = $feature))]
-            macro_rules! $name {
-                () => {
-                    "false"
-                };
-            }
-        };
-    }
-
-    feature_bool!(feature_hyper, "hyper");
-    feature_bool!(feature_mmap, "mmap");
-    feature_bool!(feature_sendfile, "sendfile");
-    feature_bool!(feature_splice, "splice");
-    feature_bool!(feature_ktls, "ktls");
-
-    if version {
-        concat!(
-            env!("CARGO_PKG_VERSION"),
-            "\n",
-            "TLS=",
-            feature_tls!(),
-            "\n",
-            "hyper=",
-            feature_hyper!(),
-            "\n",
-            "mmap=",
-            feature_mmap!(),
-            "\n",
-            "sendfile=",
-            feature_sendfile!(),
-            "\n",
-            "splice=",
-            feature_splice!(),
-            "\n",
-            "ktls=",
-            feature_ktls!(),
-        )
-    } else {
-        concat!(
-            "TLS=",
-            feature_tls!(),
-            "\n",
-            "hyper=",
-            feature_hyper!(),
-            "\n",
-            "mmap=",
-            feature_mmap!(),
-            "\n",
-            "sendfile=",
-            feature_sendfile!(),
-            "\n",
-            "splice=",
-            feature_splice!(),
-            "\n",
-            "ktls=",
-            feature_ktls!(),
-        )
-    }
 }
 
 #[derive(Parser)]
@@ -1100,68 +710,4 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     result
         .map(|()| std::process::ExitCode::SUCCESS)
         .map_err(Into::into)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::content_type_for_cached_file;
-
-    #[test]
-    fn content_type_for_text_manifests() {
-        // Flat-repo debnames (no distribution prefix).
-        assert_eq!(content_type_for_cached_file("InRelease"), "text/plain");
-        assert_eq!(content_type_for_cached_file("Release"), "text/plain");
-        assert_eq!(content_type_for_cached_file("Packages"), "text/plain");
-        assert_eq!(content_type_for_cached_file("Sources"), "text/plain");
-
-        // Structured-layout debnames (distribution / component / arch prefixes).
-        assert_eq!(content_type_for_cached_file("sid_InRelease"), "text/plain");
-        assert_eq!(content_type_for_cached_file("sid_Release"), "text/plain");
-        assert_eq!(
-            content_type_for_cached_file("sid_main_binary-amd64_Release"),
-            "text/plain"
-        );
-        assert_eq!(
-            content_type_for_cached_file("sid_main_binary-amd64_Packages"),
-            "text/plain"
-        );
-        assert_eq!(
-            content_type_for_cached_file("sid_main_Sources"),
-            "text/plain"
-        );
-    }
-
-    #[test]
-    fn content_type_for_release_gpg() {
-        assert_eq!(
-            content_type_for_cached_file("Release.gpg"),
-            "application/pgp-signature"
-        );
-        assert_eq!(
-            content_type_for_cached_file("sid_Release.gpg"),
-            "application/pgp-signature"
-        );
-    }
-
-    #[test]
-    fn compressed_manifest_keeps_compression_content_type() {
-        // Compressed manifests must keep their compression Content-Type —
-        // the `_Packages` suffix on `Packages.gz` must not coerce it to text.
-        assert_eq!(
-            content_type_for_cached_file("sid_main_binary-amd64_Packages.gz"),
-            "application/gzip"
-        );
-        assert_eq!(
-            content_type_for_cached_file("sid_main_Sources.xz"),
-            "application/x-xz"
-        );
-        assert_eq!(
-            content_type_for_cached_file("firefox-esr_115.9.1esr-1_amd64.deb"),
-            "application/vnd.debian.binary-package"
-        );
-        assert_eq!(
-            content_type_for_cached_file("unknown_no_extension"),
-            "application/octet-stream"
-        );
-    }
 }

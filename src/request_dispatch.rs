@@ -42,8 +42,8 @@ use http::{StatusCode, uri::Uri};
 use tracing::{debug, trace};
 
 use crate::{
-    ClientInfo,
     cache_layout::{self, ClassifyError, ConnectionDetails},
+    client_info::ClientInfo,
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
     database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
@@ -561,8 +561,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
-    use crate::ClientInfo;
     use crate::cache_layout::CacheLayout;
+    use crate::client_info::ClientInfo;
     use crate::test_support::local_client;
 
     fn fake_client() -> ClientInfo {

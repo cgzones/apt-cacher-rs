@@ -8,7 +8,6 @@ use std::time::Duration;
 use http::StatusCode;
 use tracing::trace;
 
-use crate::RETENTION_TIME;
 use crate::cache_layout::CacheLayout;
 use crate::cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
 use crate::cleanup::packages::FetchFailure;
@@ -16,6 +15,7 @@ use crate::cleanup::sweep::SpanTable;
 use crate::config::Config;
 use crate::database::MirrorEntry;
 use crate::deb_mirror::{MirrorKind, flat_pool_archive_root};
+use crate::limits::RETENTION_TIME;
 
 /// Grace period for unreferenced cached deb files. Apt updates that bypass
 /// the proxy register their origin lazily; this delay prevents a freshly

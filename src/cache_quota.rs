@@ -2,7 +2,7 @@ use std::{cmp::Ordering, num::NonZero, sync::Arc};
 
 use tracing::{error, trace};
 
-use crate::{ContentLength, humanfmt::HumanFmt, metrics, warn_once_or_info};
+use crate::{humanfmt::HumanFmt, metrics, upstream_head::ContentLength, warn_once_or_info};
 
 /// Represents a quota violation.
 pub(crate) struct QuotaExceeded;

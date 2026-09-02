@@ -2,7 +2,8 @@
 //! `cfg(not(feature = "hyper"))`): [`splice_cleanup_request`] serves a fresh
 //! enough cached copy or fetches through `acquire::standard_upstream_connect`
 //! and returns an `http::Response<ProxyCacheBody>` the way the hyper backend's
-//! `process_cache_request` would.
+//! `process_cache_request` would; [`process_cache_request`] is the
+//! signature-compatible entry cleanup calls in both builds.
 
 use std::{io::ErrorKind, path::Path, time::Duration};
 
@@ -20,7 +21,12 @@ use crate::utils::{
     CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
 };
 use crate::warn_once_or_info;
-use crate::{ProxyCacheBody, VOLATILE_CACHE_MAX_AGE, error::UpstreamFetchError, full_body};
+use crate::{
+    AppState,
+    error::UpstreamFetchError,
+    limits::VOLATILE_CACHE_MAX_AGE,
+    proxy_body::{ProxyCacheBody, full_body},
+};
 
 use super::UpstreamFailure;
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
@@ -241,4 +247,14 @@ async fn cleanup_upstream_fetch(
             resp
         }
     }
+}
+
+#[must_use]
+#[cfg(not(feature = "hyper"))]
+pub(crate) async fn process_cache_request(
+    conn_details: ConnectionDetails,
+    req: http::Request<http_body_util::Empty<()>>,
+    _appstate: AppState,
+) -> http::Response<ProxyCacheBody> {
+    splice_cleanup_request(&conn_details, &req).await
 }

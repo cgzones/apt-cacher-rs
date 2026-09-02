@@ -1,6 +1,6 @@
 use http_body::{Body, Frame, SizeHint};
 
-use crate::{ContentLength, error::MirrorDownloadRate, metrics};
+use crate::{error::MirrorDownloadRate, metrics, upstream_head::ContentLength};
 
 #[derive(Debug)]
 pub(crate) enum ChannelBodyError {

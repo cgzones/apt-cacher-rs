@@ -38,7 +38,7 @@ mod upstream;
 mod volatile;
 
 #[cfg(not(feature = "hyper"))]
-pub(crate) use cleanup_bridge::splice_cleanup_request;
+pub(crate) use cleanup_bridge::process_cache_request;
 #[cfg(feature = "ktls")]
 pub(crate) use ktls_path::KTLS_CLIENT_CONFIG;
 pub(crate) use simple_proxy::splice_simple_proxy;
@@ -82,19 +82,21 @@ use crate::sendfile_conn::{
 };
 use crate::tcp_cork_guard::CorkGuard;
 use crate::upstream_head::{
-    DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, plan_download, plan_fresh_download,
+    ContentLength, DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, plan_download,
+    plan_fresh_download,
 };
 use crate::utils::{
     self, CacheAccessFailure, Logged, TempPath, is_peer_disconnect, regular_file_metadata,
     tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
 };
 use crate::{
-    APP_VIA, AppState, ContentLength,
+    AppState,
     active_downloads::{ActiveDownloadStatus, OriginateOutcome},
+    build_info::APP_VIA,
     cache_metadata::{self, write_upstream_metadata},
-    content_type_for_cached_file, global_cache_quota, global_config, global_verify_throttle,
-    metrics, static_assert, warn_on_content_type_mismatch, warn_once_or_info,
-    warn_once_or_info_logged,
+    content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
+    global_cache_quota, global_config, global_verify_throttle, metrics, static_assert,
+    warn_once_or_info, warn_once_or_info_logged,
 };
 
 use acquire::{

@@ -16,13 +16,14 @@ use sqlx::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    CLEANUP_CLIENT_ADDR, RETENTION_TIME,
     cache_paths::MirrorSite,
+    client_info::CLEANUP_CLIENT_ADDR,
     config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
     deb_mirror::{Mirror, MirrorKind},
     error::ErrorReport,
     flat_blocklist, global_config,
     humanfmt::HumanFmt,
+    limits::RETENTION_TIME,
     warn_once_or_info,
 };
 

@@ -13,14 +13,16 @@ use coarsetime::Instant;
 use tracing::error;
 
 use crate::{
-    APP_VERSION, AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails, cache_metadata,
+    AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails,
+    build_info::{APP_VERSION, get_features},
+    cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
     database_task::DB_TASK_QUEUE_SENDER,
     error::ErrorReport,
-    get_features, global_cache_quota, global_config,
+    global_cache_quota, global_config,
     humanfmt::HumanFmt,
     metrics, swrite,
     tunnel_limiter::active_tunnels,

@@ -36,8 +36,8 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer};
 use tracing::level_filters::LevelFilter;
 
-use crate::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::humanfmt::HumanFmt;
+use crate::limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER;
 use crate::nonzero;
 
 /// Failure while loading or validating the configuration.

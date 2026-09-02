@@ -245,8 +245,8 @@ pub(super) async fn byhash_dir_present(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RETENTION_TIME;
     use crate::config::ClientHost;
+    use crate::limits::RETENTION_TIME;
     use crate::{index_parser::hex_encode, swrite};
 
     fn origin(distribution: &str, age: Duration) -> OriginEntry {

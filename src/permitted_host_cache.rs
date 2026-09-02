@@ -4,8 +4,8 @@ use hashbrown::HashMap;
 use http::StatusCode;
 
 use crate::{
-    ClientInfo, config::ClientHost, global_config, metrics, request_dispatch::client_permitted,
-    warn_once_or_info,
+    client_info::ClientInfo, config::ClientHost, global_config, metrics,
+    request_dispatch::client_permitted, warn_once_or_info,
 };
 
 #[must_use]

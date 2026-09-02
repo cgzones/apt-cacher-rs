@@ -18,9 +18,9 @@ use pin_project::{pin_project, pinned_drop};
 use tracing::info;
 
 use crate::{
-    ClientInfo,
     cache_layout::ConnectionDetails,
     client_counter::ClientDownload,
+    client_info::ClientInfo,
     database_task::{DatabaseCommand, send_db_command_nonblocking},
     delivery::{AbortCause, Mechanism, Role, ServeOutcome, finish_cached_serve},
     humanfmt::HumanFmt,

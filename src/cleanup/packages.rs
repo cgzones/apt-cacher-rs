@@ -13,8 +13,9 @@ use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _, BufWriter};
 use tracing::{debug, error, warn};
 
 use crate::{
-    AppState, ClientInfo, Never, ProxyCacheBody,
+    AppState, Never,
     cache_layout::{CacheLayout, ConnectionDetails, ResourceKind, dists_debname},
+    client_info::ClientInfo,
     config::Config,
     deb_mirror::Mirror,
     error::{ErrorReport, ProxyCacheError, UpstreamFetchError},
@@ -24,14 +25,15 @@ use crate::{
     },
     metrics,
     precise_instant::PreciseInstant,
+    proxy_body::ProxyCacheBody,
 };
 // `process_cache_request` has a hyper implementation and a splice-only stub
-// (in `main.rs`) that bridges to `splice_cleanup_request`; cleanup calls it
-// identically in both builds.
+// (in `splice/cleanup_bridge.rs`) that bridges to `splice_cleanup_request`;
+// cleanup calls it identically in both builds.
 #[cfg(feature = "hyper")]
 use crate::hyper_conn::process_cache_request;
 #[cfg(not(feature = "hyper"))]
-use crate::process_cache_request;
+use crate::splice::process_cache_request;
 
 use super::engine::{SpanClass, UnitStats};
 use super::sweep::invalidate_metadata_for;
@@ -586,6 +588,7 @@ mod tests {
         index_parser::{HashAlgo, hex_decode_exact, parse_filename_field, parse_hex_field},
         limits::MAX_METADATA_LINE_LEN,
         nonzero,
+        proxy_body::full_body,
     };
 
     /// A candidate map for the reduce tests: every entry is `Deb`-class and
@@ -684,7 +687,7 @@ mod tests {
 
         let config: Config = toml::from_str("").expect("default config");
         let payload = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n\n";
-        let mut body = crate::full_body(bytes::Bytes::from_static(payload));
+        let mut body = full_body(bytes::Bytes::from_static(payload));
 
         let (mut file, written) =
             packages_body_to_memfd("apt_cacher_rs_test_count", &mut body, &config)
@@ -710,7 +713,7 @@ mod tests {
         // A single 4 KiB data frame against a 1 KiB cap: the first chunk already
         // overshoots, so buffering must bail with an error (not truncate, which
         // would silently shrink the reference set and over-evict).
-        let mut body = crate::full_body(bytes::Bytes::from(vec![b'x'; 4096]));
+        let mut body = full_body(bytes::Bytes::from(vec![b'x'; 4096]));
         let memfd = MemfdOptions::new()
             .create("apt_cacher_rs_test_over_cap")
             .expect("memfd");
@@ -729,7 +732,7 @@ mod tests {
     async fn body_to_file_accepts_body_at_cap() {
         let config: Config = toml::from_str("").expect("default config");
         // Exactly at the cap: `written > max_bytes` is strict, so this is kept.
-        let mut body = crate::full_body(bytes::Bytes::from(vec![b'y'; 1024]));
+        let mut body = full_body(bytes::Bytes::from(vec![b'y'; 1024]));
         let memfd = MemfdOptions::new()
             .create("apt_cacher_rs_test_at_cap")
             .expect("memfd");

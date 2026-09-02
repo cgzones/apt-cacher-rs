@@ -21,7 +21,9 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 
 #[cfg(feature = "hyper")]
-use crate::{APP_NAME, ProxyCacheBody, http_range::format_http_date, metrics};
+use crate::{
+    build_info::APP_NAME, http_range::format_http_date, metrics, proxy_body::ProxyCacheBody,
+};
 
 /// Content-Security-Policy applied to every HTML page.
 ///

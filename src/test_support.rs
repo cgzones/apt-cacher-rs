@@ -3,7 +3,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::{
-    ClientInfo,
+    client_info::ClientInfo,
     config::ClientHost,
     deb_mirror::{Mirror, MirrorKind},
 };

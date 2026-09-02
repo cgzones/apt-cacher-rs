@@ -22,8 +22,8 @@ use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::tcp_cork_guard::CorkGuard;
 use crate::utils;
 use crate::{
-    VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, client_counter, global_config, metrics, warn_once,
-    warn_once_or_debug, warn_once_or_info_logged,
+    client_counter, global_config, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics,
+    warn_once, warn_once_or_debug, warn_once_or_info_logged,
 };
 
 use super::http::{BodyFraming, UpstreamResponse};

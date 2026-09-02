@@ -3,7 +3,10 @@ use std::fmt::Display;
 #[cfg(feature = "hyper")]
 use crate::channel_body::ChannelBodyError;
 #[cfg(feature = "hyper")]
-use crate::{ClientInfo, ContentLength, deb_mirror::Mirror, rate_checker::InsufficientRate};
+use crate::{
+    client_info::ClientInfo, deb_mirror::Mirror, rate_checker::InsufficientRate,
+    upstream_head::ContentLength,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorDownloadRate {

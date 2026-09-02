@@ -9,12 +9,16 @@
 //! mirror-path bounds, `sendfile_conn`'s request-header cap). The two
 //! *configurable* bounds (`max_object_size`, `client_idle_timeout`) live
 //! on [`crate::config::Config`] and are reached via `global_config()`;
-//! everything here is a compile-time constant or a pure helper.
+//! everything here is a compile-time constant or a pure helper. The three
+//! cache-policy constants the backends, cleanup and the database share
+//! (`RETENTION_TIME`, `VOLATILE_CACHE_MAX_AGE`,
+//! `VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER`) live here as well.
 
 use std::io;
 use std::num::NonZero;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncRead, ReadBuf};
 
@@ -56,6 +60,13 @@ pub(crate) const MAX_METADATA_LINE_LEN: usize = 8 * 1024;
 /// this: an FQDN is capped at 253 bytes by RFC 1035 and a `:port` suffix
 /// adds at most 6 bytes.
 pub(crate) const MAX_AUTHORITY_LEN: usize = 259;
+
+pub(crate) const RETENTION_TIME: Duration = Duration::from_hours(8 * 7 * 24); /* 8 weeks */
+
+pub(crate) const VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER: NonZero<u64> = nonzero!(1024 * 1024); /* 1MiB */
+
+/// Maximum age for volatile cache entries before they are treated as stale.
+pub(crate) const VOLATILE_CACHE_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// Returns `true` if a declared upstream Content-Length of `declared` bytes is
 /// within the configured `max_object_size` cap. A `None` cap disables the

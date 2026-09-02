@@ -58,8 +58,8 @@ use hashbrown::Equivalent;
 use tracing::trace;
 
 use crate::{
-    ClientInfo,
     cache_paths::{CachePaths, MirrorSite},
+    client_info::ClientInfo,
     config::CacheHost,
     deb_mirror::{
         FlatKind, Mirror, MirrorKind, ResourceFile, is_deb_package, is_flat_deb_filename,
@@ -802,7 +802,7 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ClientInfo;
+    use crate::client_info::ClientInfo;
     use crate::deb_mirror::{FlatKind, ResourceFile};
     use crate::test_support::local_client;
 

@@ -12,7 +12,7 @@ use core::num::NonZero;
 use http::{StatusCode, uri::Uri};
 use tracing::info;
 
-use crate::{ClientInfo, config::Config, limits, metrics, warn_once_or_info};
+use crate::{client_info::ClientInfo, config::Config, limits, metrics, warn_once_or_info};
 
 /// A rejected CONNECT target: the status/body the backend should return to the
 /// client. All logging and metric bumping already happened inside

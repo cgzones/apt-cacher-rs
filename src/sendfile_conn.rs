@@ -42,16 +42,18 @@ use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
 #[cfg(feature = "splice")]
 use crate::splice::SpliceProxyError;
 use crate::{
-    APP_NAME, AppState, ClientInfo, ContentLength, Never, VOLATILE_CACHE_MAX_AGE,
+    AppState, Never,
     active_downloads::{
         AbortReason, ActiveDownloadStatus, JoinFailure, Serveable, await_serveable,
     },
+    build_info::APP_NAME,
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
     cache_metadata::{self},
     client_counter,
+    client_info::ClientInfo,
     connect_tunnel::{ConnectReject, validate_connect_target},
-    content_type_for_cached_file,
+    content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
     delivery::{AbortCause, Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{ErrorReport, errno_to_io_error},
@@ -63,6 +65,7 @@ use crate::{
     },
     http_range::format_http_date,
     humanfmt::HumanFmt,
+    limits::VOLATILE_CACHE_MAX_AGE,
     metrics,
     permitted_host_cache::authorize_cache_access,
     precise_instant::PreciseInstant,
@@ -73,6 +76,7 @@ use crate::{
     },
     response_head::{ResponseHead, WireBody},
     static_assert, swrite, tunnel_limiter,
+    upstream_head::ContentLength,
     utils::{
         CacheAccessFailure, hint_sequential_read, is_peer_disconnect, regular_file_metadata,
         tokio_nofollow_options,

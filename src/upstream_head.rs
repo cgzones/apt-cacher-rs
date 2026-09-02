@@ -31,14 +31,41 @@
 //! generic `C` and comes back only inside [`DownloadPlan::NotModified`], so
 //! neither backend has to write a "304 without a cached copy" arm.
 
-use std::num::NonZero;
+use std::{fmt::Display, num::NonZero};
 
 use http::StatusCode;
 
 use crate::{
-    ContentLength, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, cache_layout::CachedFlavor, limits,
+    cache_layout::CachedFlavor,
+    limits::{self, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER},
     metrics,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentLength {
+    /// An exact size
+    Exact(NonZero<u64>),
+    /// A limit for an unknown size
+    Unknown(NonZero<u64>),
+}
+
+impl ContentLength {
+    #[must_use]
+    pub(crate) const fn upper(self) -> NonZero<u64> {
+        match self {
+            Self::Exact(s) | Self::Unknown(s) => s,
+        }
+    }
+}
+
+impl Display for ContentLength {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(size) => write!(f, "exact {size} bytes"),
+            Self::Unknown(limit) => write!(f, "up to {limit} bytes"),
+        }
+    }
+}
 
 /// The part of an upstream response head the download decision reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

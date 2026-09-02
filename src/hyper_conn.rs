@@ -36,12 +36,12 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(feature = "mmap")]
 use crate::mmap_body::MmapBody;
 use crate::{
-    APP_USER_AGENT, APP_VIA, AppState, ClientInfo, ContentLength, Never, ProxyCacheBody, Scheme,
-    VOLATILE_CACHE_MAX_AGE,
+    AppState, Never, Scheme,
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
         AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
     },
+    build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
     cache_layout::{self, CacheMiss, CachedFlavor, ConnectionDetails},
     cache_metadata::{
@@ -52,21 +52,23 @@ use crate::{
     cache_quota::QuotaExceeded,
     channel_body::ChannelBody,
     client_counter,
+    client_info::ClientInfo,
     config::ClientHost,
     connect_tunnel::{ConnectReject, validate_connect_target},
-    content_type_for_cached_file,
+    content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     database_task::{DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::Origin,
     delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError},
-    full_body, global_cache_quota, global_config, global_verify_throttle,
+    global_cache_quota, global_config, global_verify_throttle,
     guards::{DownloadBarrier, InitBarrier},
     http_range::HttpDate,
     humanfmt::HumanFmt,
+    limits::VOLATILE_CACHE_MAX_AGE,
     metrics,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
-    quick_response,
+    proxy_body::{ProxyCacheBody, full_body, quick_response},
     rate_checked_body::{MaybeRated, RateCheckedBodyErr},
     rate_checker::RateCheckDirection,
     rate_log,
@@ -77,15 +79,15 @@ use crate::{
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
     scheme_cache, static_assert, tunnel_limiter,
     upstream_head::{
-        DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead, plan_download,
-        plan_fresh_download,
+        ContentLength, DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead,
+        plan_download, plan_fresh_download,
     },
     upstream_retry,
     utils::{
         self, CacheAccessFailure, TempPath, hint_sequential_read, is_peer_disconnect,
         regular_file_metadata, tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
     },
-    warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
+    warn_once_or_debug, warn_once_or_info,
     web::serve_web_interface,
 };
 #[cfg(feature = "tls_rustls")]

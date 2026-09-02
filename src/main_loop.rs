@@ -20,10 +20,8 @@ use crate::hyper_conn::handle_hyper_connection;
 use crate::hyper_conn::{HttpClient, request_with_retry};
 #[cfg(feature = "sendfile")]
 use crate::sendfile_conn;
-#[cfg(feature = "hyper")]
-use crate::{APP_USER_AGENT, scheme_cache};
 use crate::{
-    AppState, ClientInfo, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
+    AppState, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
     active_downloads::ActiveDownloads,
     cache_metadata,
     cache_paths::CachePaths,
@@ -31,6 +29,7 @@ use crate::{
         CLEANUP_INTERVAL_SECS, FIRST_CLEANUP_DELAY_SECS, set_next_cleanup_epoch, task_cleanup,
     },
     client_counter,
+    client_info::ClientInfo,
     database::Database,
     database_task::{self, db_loop},
     deb_mirror,
@@ -42,6 +41,8 @@ use crate::{
     utils::filesystem_space,
     warn_once_or_debug,
 };
+#[cfg(feature = "hyper")]
+use crate::{build_info::APP_USER_AGENT, scheme_cache};
 
 /// One-line accounting emitted on every shutdown path: what the process did
 /// over its lifetime, and what it is dropping on the floor. Without it a

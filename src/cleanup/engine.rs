@@ -9,7 +9,7 @@ use hashbrown::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    AppState, RETENTION_TIME,
+    AppState,
     cache_layout::CacheLayout,
     cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker},
     config::Config,
@@ -17,6 +17,7 @@ use crate::{
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
     error::ErrorReport,
     humanfmt::HumanFmt,
+    limits::RETENTION_TIME,
     metrics,
     utils::Logged,
 };

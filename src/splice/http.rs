@@ -36,7 +36,7 @@ use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::upstream_head::UpstreamHead;
 use crate::{
-    APP_USER_AGENT,
+    build_info::APP_USER_AGENT,
     cache_metadata::{self, InvalidValidator},
     global_config, metrics, warn_once_or_info,
 };

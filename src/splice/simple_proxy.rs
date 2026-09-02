@@ -18,7 +18,9 @@ use crate::humanfmt::HumanFmt;
 use crate::limits::MAX_UPSTREAM_HEADERS;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_log;
-use crate::{APP_VIA, ClientInfo, client_counter, metrics, warn_once_or_info_logged};
+use crate::{
+    build_info::APP_VIA, client_counter, client_info::ClientInfo, metrics, warn_once_or_info_logged,
+};
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
 use super::{AfterHeaderSide, SpliceProxyError, UpstreamFailure, VOLATILE_BODY_MAX};

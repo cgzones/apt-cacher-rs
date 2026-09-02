@@ -3,7 +3,6 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{error, info, warn};
 
 use crate::{
-    ContentLength,
     active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads},
     cache_layout::{CacheEntryKey, CacheEntryKeyRef, CacheLayout, ConnectionDetails, ResourceKind},
     cache_metadata::{self, UpstreamMetadata},
@@ -15,6 +14,7 @@ use crate::{
     humanfmt::HumanFmt,
     integrity::{self, CommitError, RenamePlan},
     metrics,
+    upstream_head::ContentLength,
     utils::TempPath,
 };
 #[cfg(feature = "splice")]

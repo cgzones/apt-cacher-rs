@@ -179,7 +179,10 @@ impl ResponseHead<'_> {
             },
         };
 
-        use crate::{APP_NAME, APP_VIA, http_range::format_http_date};
+        use crate::{
+            build_info::{APP_NAME, APP_VIA},
+            http_range::format_http_date,
+        };
 
         let emits_server = self.emits_server();
         let emits_connection = self.emits_connection();
@@ -274,7 +277,10 @@ impl ResponseHead<'_> {
         conn_action: ConnectionAction,
     ) -> String {
         use crate::{
-            APP_NAME, APP_VIA, http_helpers::OptHeader, http_range::format_http_date, swrite,
+            build_info::{APP_NAME, APP_VIA},
+            http_helpers::OptHeader,
+            http_range::format_http_date,
+            swrite,
         };
 
         let Self {
@@ -369,7 +375,7 @@ mod tests {
         };
 
         use super::*;
-        use crate::{APP_NAME, APP_VIA};
+        use crate::build_info::{APP_NAME, APP_VIA};
 
         fn render(head: ResponseHead<'_>) -> http::Response<()> {
             head.into_hyper(())
@@ -467,7 +473,7 @@ mod tests {
     #[cfg(feature = "sendfile")]
     mod wire {
         use super::*;
-        use crate::{APP_NAME, APP_VIA};
+        use crate::build_info::{APP_NAME, APP_VIA};
 
         fn render(head: &ResponseHead<'_>) -> String {
             head.render(ConnectionVersion::Http11, ConnectionAction::KeepAlive)
