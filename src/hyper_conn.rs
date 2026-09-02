@@ -850,7 +850,22 @@ async fn serve_cached_file_buf(
     let config = global_config();
     let client = conn_details.client;
 
-    if let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await {
+    // Every caller hands over a file freshly opened for this response, so at
+    // `start == 0` (the whole-file case, i.e. every non-Range request) the
+    // descriptor already sits where the seek would put it. tokio's `seek`
+    // is a blocking-pool round trip, so skipping it drops a `spawn_blocking`
+    // handoff from the common cache hit.
+    #[cfg(debug_assertions)]
+    {
+        let position = tokio::io::AsyncSeekExt::stream_position(&mut file).await;
+        debug_assert!(
+            matches!(position, Ok(0)),
+            "callers must hand over a freshly opened cache file positioned at 0"
+        );
+    }
+    if start != 0
+        && let Err(err) = file.seek(std::io::SeekFrom::Start(start)).await
+    {
         metrics::CACHE_IO_FAILURE.increment();
         error!(
             "Failed to seek cached file `{}` to offset {start}/{file_size}; returning 500:  {}",
