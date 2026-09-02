@@ -814,7 +814,8 @@ pub(crate) struct Config {
     /// Allowed ports for https tunneling.
     pub(crate) https_tunnel_allowed_ports: Vec<NonZero<u16>>,
 
-    /// Allowed mirrors for https tunneling.
+    /// Allowed mirrors for https tunneling.  Fail-closed like
+    /// [`Self::allowed_mirrors`]: an empty list permits no CONNECT target.
     pub(crate) https_tunnel_allowed_mirrors: Vec<DomainName>,
 
     /// Maximum number of concurrent HTTPS tunnel connections per client IP.
@@ -1597,6 +1598,13 @@ impl Config {
                     ));
                 }
             }
+        }
+
+        if self.https_tunnel_enabled && self.https_tunnel_allowed_mirrors.is_empty() {
+            warnings.push(
+                "https_tunnel_enabled is true but https_tunnel_allowed_mirrors is empty; every CONNECT request will be refused (list the tunnel targets, or disable https_tunnel_enabled)"
+                    .to_string(),
+            );
         }
 
         if self.https_upgrade_mode == HttpsUpgradeMode::Never && !self.https_tunnel_enabled {

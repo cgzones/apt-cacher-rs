@@ -606,6 +606,11 @@ pub(super) fn build_metrics_html() -> String {
         WarnNonzero(metrics::TUNNEL_TRANSFER_FAILED.get()),
     );
     t.row_tip(
+        "Tunnels Closed (idle)",
+        "Established CONNECT tunnels torn down after `client_idle_timeout` without a byte in either direction. Informational: idle sockets reclaimed, not failures.",
+        metrics::TUNNEL_IDLE_CLOSED.get(),
+    );
+    t.row_tip(
         "Connections Rejected (per-IP cap)",
         "Plain-HTTP connections dropped at accept time because `max_connections_per_client_ip` was reached. Stays at 0 unless the cap is configured; climbing values point to a noisy or malicious source IP.",
         WarnNonzero(metrics::CONNECTION_REJECTED_PER_IP_CAP.get()),

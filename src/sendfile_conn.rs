@@ -52,7 +52,9 @@ use crate::{
     cache_metadata::{self},
     client_counter,
     client_info::ClientInfo,
-    connect_tunnel::{ConnectReject, validate_connect_target},
+    connect_tunnel::{
+        ConnectReject, copy_bidirectional_idle, report_tunnel_outcome, validate_connect_target,
+    },
     content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
     delivery::{AbortCause, Mechanism, Role, ServeOutcome, finish_cached_serve},
@@ -905,48 +907,15 @@ async fn run_connect_tunnel(
         return;
     }
 
-    let mut stream = stream;
     let start = PreciseInstant::now();
-    match tokio::io::copy_bidirectional_with_sizes(
-        &mut stream,
+    let outcome = copy_bidirectional_idle(
+        stream,
         &mut upstream,
         config.buffer_size,
-        config.buffer_size,
+        config.client_idle_timeout,
     )
-    .await
-    {
-        Ok((from_client, from_server)) => {
-            metrics::BYTES_TUNNELED_CLIENT_TO_UPSTREAM.increment_by(from_client);
-            metrics::BYTES_TUNNELED_UPSTREAM_TO_CLIENT.increment_by(from_server);
-            info!(
-                "Tunneled client {client} wrote {} and received {} from {host}:{port} in {}",
-                HumanFmt::Size(from_client),
-                HumanFmt::Size(from_server),
-                HumanFmt::Time(start.elapsed())
-            );
-        }
-        Err(err) => {
-            metrics::TUNNEL_TRANSFER_FAILED.increment();
-            // OS-level `ETIMEDOUT` (TCP keepalive / `TCP_USER_TIMEOUT`) is a
-            // network condition, not a code error; log at info.
-            if err.kind() == ErrorKind::TimedOut {
-                info!(
-                    "Tunnel for client {client} to {host}:{port} timed out:  {}",
-                    ErrorReport(&err)
-                );
-            } else if is_peer_disconnect(&err) {
-                info!(
-                    "Tunnel for client {client} to {host}:{port} closed by peer:  {}",
-                    ErrorReport(&err)
-                );
-            } else {
-                error!(
-                    "Failed to tunnel the connection for client {client} to {host}:{port}; closing the tunnel:  {}",
-                    ErrorReport(&err)
-                );
-            }
-        }
-    }
+    .await;
+    report_tunnel_outcome(&outcome, &client, &host, port, start.elapsed());
 }
 
 /// Try to serve a request using sendfile(2).

@@ -54,7 +54,9 @@ use crate::{
     client_counter,
     client_info::ClientInfo,
     config::ClientHost,
-    connect_tunnel::{ConnectReject, validate_connect_target},
+    connect_tunnel::{
+        ConnectReject, copy_bidirectional_idle, report_tunnel_outcome, validate_connect_target,
+    },
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     database_task::{DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::Origin,
@@ -2289,25 +2291,18 @@ async fn tunnel(
             ErrorReport(&err)
         );
     }
-    let mut upgraded = TokioIo::new(upgraded);
+    let upgraded = TokioIo::new(upgraded);
 
     /* Proxying data */
-    let bufsize = config.buffer_size;
-
-    // not rate-checked
-    let (from_client, from_server) =
-        tokio::io::copy_bidirectional_with_sizes(&mut upgraded, &mut server, bufsize, bufsize)
-            .await?;
-
-    metrics::BYTES_TUNNELED_CLIENT_TO_UPSTREAM.increment_by(from_client);
-    metrics::BYTES_TUNNELED_UPSTREAM_TO_CLIENT.increment_by(from_server);
-
-    info!(
-        "Tunneled client {client} wrote {} and received {} from {host}:{port} in {}",
-        HumanFmt::Size(from_client),
-        HumanFmt::Size(from_server),
-        HumanFmt::Time(start.elapsed())
-    );
+    // not rate-checked; idle-bounded by `client_idle_timeout`
+    let outcome = copy_bidirectional_idle(
+        upgraded,
+        &mut server,
+        config.buffer_size,
+        config.client_idle_timeout,
+    )
+    .await;
+    report_tunnel_outcome(&outcome, &client, host, port, start.elapsed());
 
     Ok(())
 }
@@ -2439,18 +2434,13 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
         let _active_tunnel_guard = active_tunnel_guard;
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
+                // The relay outcome is reported inside `tunnel`; only the
+                // upstream connect can still fail here.
                 if let Err(err) = tunnel(client, upgraded, &host, port).await {
                     metrics::TUNNEL_TRANSFER_FAILED.increment();
-                    // OS-level `ETIMEDOUT` (TCP keepalive / `TCP_USER_TIMEOUT`)
-                    // is a network condition, not a code error; log at info.
                     if err.kind() == std::io::ErrorKind::TimedOut {
                         info!(
                             "Tunnel for client {client} to {host}:{port} timed out:  {}",
-                            ErrorReport(&err)
-                        );
-                    } else if is_peer_disconnect(&err) {
-                        info!(
-                            "Tunnel for client {client} to {host}:{port} closed by peer:  {}",
                             ErrorReport(&err)
                         );
                     } else {

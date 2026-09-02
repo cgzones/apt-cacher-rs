@@ -206,6 +206,10 @@ pub(crate) static TUNNEL_REJECTED_CAPACITY: Counter = Counter::new();
 /// and mid-transfer errors from `copy_bidirectional_with_sizes`. Climbing
 /// values point to flaky upstream tunnels or aborted clients.
 pub(crate) static TUNNEL_TRANSFER_FAILED: Counter = Counter::new();
+/// Established tunnels torn down because neither side sent a byte for
+/// `client_idle_timeout`.  Not a failure: a parked CONNECT socket is
+/// reclaimed instead of pinning fds and an upstream connection.
+pub(crate) static TUNNEL_IDLE_CLOSED: Counter = Counter::new();
 /// Peak concurrent CONNECT tunnels (sum across all source IPs).  Use to
 /// validate `https_tunnel_max_connections_per_client` headroom.
 pub(crate) static CONNECT_TUNNEL_ACTIVE_PEAK: Peak = Peak::new();
