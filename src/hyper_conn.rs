@@ -516,6 +516,12 @@ fn serve_cached_file_mmap(
 }
 
 #[must_use]
+#[expect(
+    clippy::unused_async,
+    reason = "regular_file_metadata went synchronous; the sole caller awaits \
+              this in an async match arm alongside other async branches, so \
+              staying async keeps the call site uniform"
+)]
 async fn serve_unfinished_file(
     conn_details: ConnectionDetails,
     mut file: tokio::fs::File,
@@ -527,7 +533,7 @@ async fn serve_unfinished_file(
 ) -> Response<ProxyCacheBody> {
     let config = global_config();
 
-    let md = match regular_file_metadata(&file, &file_path).await {
+    let md = match regular_file_metadata(&file, &file_path) {
         Ok(data) => data,
         Err(CacheAccessFailure(_)) => {
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
@@ -734,7 +740,7 @@ async fn serve_cached_file(
             );
             m
         }
-        None => match regular_file_metadata(&file, &file_path).await {
+        None => match regular_file_metadata(&file, &file_path) {
             Ok(m) => m,
             Err(CacheAccessFailure(_)) => {
                 return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
@@ -1007,7 +1013,7 @@ async fn serve_volatile_file(
         "serve_volatile_file() assumes volatile flavor"
     );
 
-    let mdata = match regular_file_metadata(&file, &file_path).await {
+    let mdata = match regular_file_metadata(&file, &file_path) {
         Ok(data) => data,
         Err(CacheAccessFailure(_)) => {
             return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");

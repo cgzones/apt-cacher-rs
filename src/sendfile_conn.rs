@@ -1187,7 +1187,7 @@ async fn try_sendfile_request(
         // upstream. Keep the metadata for the serve path so it doesn't
         // fstat a second time.
         if conn_details.cached_flavor() == CachedFlavor::Volatile {
-            match regular_file_metadata(&file, &cache_path).await {
+            match regular_file_metadata(&file, &cache_path) {
                 Ok(md) => {
                     let last_modified = md
                         .modified()
@@ -1543,7 +1543,7 @@ pub(crate) async fn serve_file_via_sendfile(
     let mdata = if let Some(m) = prefetched_mdata {
         m
     } else {
-        match regular_file_metadata(&file, file_path).await {
+        match regular_file_metadata(&file, file_path) {
             Ok(m) => m,
             Err(CacheAccessFailure(_)) => {
                 return SendfileResult::Invalid {
@@ -2582,7 +2582,7 @@ async fn serve_unfinished_sendfile(
         };
     };
 
-    let metadata = match regular_file_metadata(&file, &file_path).await {
+    let metadata = match regular_file_metadata(&file, &file_path) {
         Ok(m) => m,
         Err(CacheAccessFailure(_)) => {
             return ZeroCopyResult::Invalid {

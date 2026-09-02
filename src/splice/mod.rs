@@ -958,7 +958,7 @@ async fn read_volatile_validators(
             )));
         }
     };
-    let mdata = match regular_file_metadata(&file, &cache_path).await {
+    let mdata = match regular_file_metadata(&file, &cache_path) {
         Ok(m) => m,
         Err(CacheAccessFailure(logged)) => {
             return Err(SpliceProxyError::Cache(logged));

@@ -109,17 +109,40 @@ pub(crate) async fn probe_dir(path: &Path, purpose: &'static str) -> std::io::Re
 #[derive(Debug)]
 pub(crate) struct CacheAccessFailure(pub(crate) Logged);
 
-/// `fstat` an open cache file and require a regular file.
+/// `statx` an open cache file and require a regular file.
 ///
 /// The single owner of the "stat failed -> `CACHE_IO_FAILURE`, non-regular ->
 /// `CACHE_NON_REGULAR`" policy for files about to be served: every serve path
 /// (hyper, sendfile, splice) goes through here so no path can silently skip
 /// the anomaly accounting.
-pub(crate) async fn regular_file_metadata(
+///
+/// Synchronous on purpose. `tokio::fs::File::metadata` is a `spawn_blocking`
+/// under the hood — a condvar wake of a pool thread, a wake back to the
+/// worker and two context switches for a stat of an in-memory inode, paid on
+/// every cache hit. The late-joiner path in `sendfile_conn.rs` already stats
+/// inline for the same reason.
+///
+/// It must stay a `statx`, not an `fstat`: `cache_file_http_date` reads
+/// `Metadata::created()` (btime) and only falls back to mtime, while
+/// `touch_volatile_mtime` repurposes mtime as "last revalidated". `fstat(2)`
+/// carries no btime and nix 0.31 wraps no `statx`, so the fd is borrowed into
+/// a `std::fs::File` and std's own `statx` is used.
+pub(crate) fn regular_file_metadata(
     file: &tokio::fs::File,
     path: &Path,
 ) -> Result<std::fs::Metadata, CacheAccessFailure> {
-    match file.metadata().await {
+    use std::mem::ManuallyDrop;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let result = {
+        // SAFETY: `file` owns the descriptor and outlives this borrow, and
+        // `ManuallyDrop` keeps the wrapper from closing it on drop, so the
+        // borrowed `File` never takes ownership of the fd.
+        let borrowed = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) });
+        borrowed.metadata()
+    };
+
+    match result {
         Ok(md) if md.file_type().is_file() => Ok(md),
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
@@ -213,6 +236,41 @@ pub(crate) fn hint_sequential_read(
             "Failed to hint sequential reads via posix_fadvise(2) for `{}`; falling back to the kernel's default readahead:  {}",
             display_path.display(),
             ErrorReport(&errno)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn regular_file_metadata_reports_size_without_blocking_pool() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cached.deb");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            f.write_all(b"0123456789").expect("write");
+        }
+        let file = tokio::fs::File::open(&path).await.expect("open");
+
+        let meta = regular_file_metadata(&file, &path).expect("regular file");
+
+        assert_eq!(meta.len(), 10);
+        // btime must survive: `cache_file_http_date` prefers it over mtime.
+        assert!(meta.created().is_ok() || meta.modified().is_ok());
+    }
+
+    #[tokio::test]
+    async fn regular_file_metadata_rejects_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = tokio::fs::File::open(dir.path()).await.expect("open dir");
+
+        assert!(
+            regular_file_metadata(&file, dir.path()).is_err(),
+            "a directory is not a regular file and must be refused"
         );
     }
 }

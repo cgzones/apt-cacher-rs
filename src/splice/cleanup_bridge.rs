@@ -65,7 +65,7 @@ async fn serve_cached_cleanup_file(
     cache_path: &Path,
     req: &http::Request<http_body_util::Empty<()>>,
 ) -> Option<http::Response<ProxyCacheBody>> {
-    let mdata = match regular_file_metadata(&file, cache_path).await {
+    let mdata = match regular_file_metadata(&file, cache_path) {
         Ok(data) => data,
         Err(CacheAccessFailure(_)) => {
             return Some(cleanup_response(StatusCode::INTERNAL_SERVER_ERROR));
