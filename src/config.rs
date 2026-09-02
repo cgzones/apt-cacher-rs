@@ -809,7 +809,10 @@ pub(crate) struct Config {
     /// None means setting is inherited from `allowed_proxy_clients`.
     pub(crate) allowed_webif_clients: Option<Vec<IpNetOrAddr>>,
 
-    /// Whether https tunneling is enabled.
+    /// Whether https tunneling (`CONNECT`) is enabled.  Off by default: a
+    /// tunnel is an open TCP relay to every host in
+    /// [`Self::https_tunnel_allowed_mirrors`], so it is enabled together
+    /// with that list.
     pub(crate) https_tunnel_enabled: bool,
 
     /// Allowed ports for https tunneling.
@@ -961,7 +964,7 @@ impl Default for Config {
             http_only_mirrors: Vec::new(),
             allowed_proxy_clients: Vec::new(),
             allowed_webif_clients: None,
-            https_tunnel_enabled: true,
+            https_tunnel_enabled: false,
             https_tunnel_allowed_ports: vec![nonzero!(443)],
             https_tunnel_allowed_mirrors: Vec::new(),
             https_tunnel_max_connections_per_client: Some(nonzero!(10)),
@@ -1610,13 +1613,9 @@ impl Config {
             }
         }
 
-        // Only when the operator configured tunneling explicitly: the stock
-        // defaults (enabled, empty list) must start without a warning, and
-        // every refused CONNECT logs its reason on its own.
-        if self.https_tunnel_enabled
-            && self.https_tunnel_allowed_mirrors.is_empty()
-            && (self.is_set("https_tunnel_enabled") || self.is_set("https_tunnel_allowed_ports"))
-        {
+        // Tunneling is off by default, so reaching here means the operator
+        // enabled it without listing a single permitted target.
+        if self.https_tunnel_enabled && self.https_tunnel_allowed_mirrors.is_empty() {
             warnings.push(
                 "https_tunnel_enabled is true but https_tunnel_allowed_mirrors is empty; every CONNECT request will be refused (list the tunnel targets, or disable https_tunnel_enabled)"
                     .to_string(),
