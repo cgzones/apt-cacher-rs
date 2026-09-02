@@ -55,7 +55,6 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "sha2 0.11.0",
- "smallvec",
  "sqlx",
  "tempfile",
  "thiserror",
