@@ -27,7 +27,7 @@ use tokio::{
 
 use crate::cache_layout::ConnectionDetails;
 use crate::error::ErrorReport;
-use crate::http_helpers::{ConnectionAction, OptHeader, find_header};
+use crate::http_helpers::{ConnectionAction, OptHeader, find_header, find_header_end};
 use crate::http_range::parse_content_range;
 use crate::humanfmt::HumanFmt;
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
@@ -164,13 +164,13 @@ async fn read_upstream_response_headers(
         }
 
         // Scan only the tail not yet covered (plus a 3-byte overlap to catch
-        // a \r\n\r\n that straddles the previous read boundary).
+        // a terminator that straddles the previous read boundary). The
+        // terminator test is `find_header_end`'s, which accepts the bare-LF
+        // endings httparse accepts: a CRLF-only scan would swallow an
+        // LF-only upstream's body as header bytes.
         let scan_from = search_offset.saturating_sub(3);
-        if let Some(rel) = buf[scan_from..]
-            .array_windows()
-            .position(|w| w == b"\r\n\r\n")
-        {
-            return Ok(scan_from + rel + 4);
+        if let Some(rel) = find_header_end(&buf[scan_from..]) {
+            return Ok(scan_from + rel);
         }
         search_offset = buf.len();
 

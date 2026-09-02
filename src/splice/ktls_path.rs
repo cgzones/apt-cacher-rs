@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::deb_mirror::Mirror;
 use crate::error::{ErrorReport, Transience};
-use crate::http_helpers::{ConnectionAction, WritePhase, write_all_to_stream};
+use crate::http_helpers::{ConnectionAction, WritePhase, find_header_end, write_all_to_stream};
 use crate::humanfmt::HumanFmt;
 use crate::ktls;
 use crate::ktls::UlpAttachError;
@@ -858,11 +858,12 @@ impl<'a> KtlsHandshake<'a> {
                             total_discard,
                         );
 
-                        // Check for complete headers (start from where we last left off)
-                        if let Some(end) = header_buf[header_search_offset..]
-                            .array_windows()
-                            .position(|w| w == b"\r\n\r\n")
-                            .map(|i| header_search_offset + i + 4)
+                        // Check for complete headers (start from where we
+                        // last left off). `find_header_end` accepts the
+                        // bare-LF endings httparse accepts, like the
+                        // standard path's scanner.
+                        if let Some(end) = find_header_end(&header_buf[header_search_offset..])
+                            .map(|i| header_search_offset + i)
                         {
                             header_end = end;
                             if header_buf.len() > end {
