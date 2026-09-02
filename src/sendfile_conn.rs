@@ -2091,8 +2091,15 @@ async fn sendfile_chunk_loop(
                 // retry one sendfile *inside* `try_io`: tokio's readiness
                 // tick makes the EAGAIN observation and the cache clear
                 // atomic, and a wakeup arriving during the syscall survives.
-                let chunk_size =
-                    std::cmp::min(remaining.try_into().unwrap_or(usize::MAX), MAX_PER_SYSCALL);
+                // Bounded like the inline fast path: if a wakeup drained the
+                // socket between the batch's EAGAIN and this probe, the call
+                // below is no longer a cheap readiness observation but a real
+                // transfer running on the worker thread, and an unbounded
+                // chunk would move a full autotuned send buffer out of a
+                // possibly cold file there -- exactly the exposure
+                // `SMALL_SERVE_INLINE_MAX` exists to cap.
+                let chunk_size = usize::try_from(std::cmp::min(remaining, SMALL_SERVE_INLINE_MAX))
+                    .unwrap_or(MAX_PER_SYSCALL);
                 let mut off = *file_offset;
                 match socket.try_io(Interest::WRITABLE, || {
                     loop {
