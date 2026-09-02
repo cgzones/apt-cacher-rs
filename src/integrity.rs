@@ -212,7 +212,8 @@ fn stamp_verified(file: &std::fs::File, path: &Path, algo: HashAlgo, expected: &
     match file.metadata() {
         Ok(meta) => verified_marker::stamp(file, path, meta.ino(), meta.len(), algo, expected),
         Err(err) => {
-            debug!(
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
                 "Failed to stat `{}` after hashing; skipping the cleanup verification marker, so the next cleanup cycle re-hashes it:  {}",
                 path.display(),
                 ErrorReport(&err)
