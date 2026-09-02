@@ -309,6 +309,15 @@ pub(super) async fn standard_upstream_connect(
 /// non-200 forwarding path.
 ///
 /// Times out after the configured HTTP timeout.
+/// Where a followed redirect landed: the mirror the retry/resume logic must
+/// keep talking to, its `Host` authority and the redirected path.
+pub(super) struct RedirectTarget {
+    /// Used only for upstream dispatch/formatting; never persisted.
+    pub(super) mirror: Mirror,
+    pub(super) authority: String,
+    pub(super) path: String,
+}
+
 pub(super) async fn follow_redirect(
     exchange: &mut UpstreamExchange,
     conn_details: &ConnectionDetails,
@@ -316,7 +325,7 @@ pub(super) async fn follow_redirect(
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
-) -> Result<Option<String>, SpliceProxyError> {
+) -> Result<Option<RedirectTarget>, SpliceProxyError> {
     let status = exchange.response.status_code;
     let Some(location) = exchange.response.location.as_deref() else {
         // Every other reject branch below logs; without this one a broken
@@ -442,7 +451,11 @@ pub(super) async fn follow_redirect(
         SpliceProxyError::Upstream(err)
     })?;
 
-    Ok(Some(redirect_path.to_owned()))
+    Ok(Some(RedirectTarget {
+        authority: redirect_authority.into_owned(),
+        path: redirect_path.to_owned(),
+        mirror: redirect_mirror,
+    }))
 }
 
 /// Log an upstream response the planner rejected (`DownloadPlan::Reject`).

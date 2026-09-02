@@ -1005,7 +1005,7 @@ async fn plan_upstream_response(
     volatile_cond: Option<&VolatileCondHeaders>,
     volatile_cache_path: Option<PathBuf>,
 ) -> Result<DownloadPlan<PathBuf>, SpliceProxyError> {
-    let redirected_path_owned = if matches!(
+    let redirect = if matches!(
         exchange.response.status_code,
         StatusCode::MOVED_PERMANENTLY
             | StatusCode::FOUND
@@ -1024,7 +1024,19 @@ async fn plan_upstream_response(
     } else {
         None
     };
-    let upstream_path = redirected_path_owned.as_deref().unwrap_or(upstream_path);
+    // After a redirect every further upstream exchange -- including the
+    // discard-and-retry below -- talks to the redirect target, not to the
+    // original mirror with the redirected path.
+    let (upstream_mirror, host_authority, upstream_path) = redirect.as_ref().map_or(
+        (&conn_details.mirror, host_authority, upstream_path),
+        |target| {
+            (
+                &target.mirror,
+                target.authority.as_str(),
+                target.path.as_str(),
+            )
+        },
+    );
 
     exchange.response.discard_invalid_validators(conn_details);
 
@@ -1069,7 +1081,7 @@ async fn plan_upstream_response(
             if anomaly.needs_refetch() {
                 discard_partial_and_retry(
                     &mut resume.partial,
-                    &conn_details.mirror,
+                    upstream_mirror,
                     host_authority,
                     upstream_path,
                     exchange,
