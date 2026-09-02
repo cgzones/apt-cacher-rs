@@ -23,6 +23,7 @@ mod cache_conditional;
 mod cache_layout;
 mod cache_metadata;
 mod cache_quota;
+mod cache_walk;
 #[cfg(feature = "hyper")]
 mod channel_body;
 mod cleanup;

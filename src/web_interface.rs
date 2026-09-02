@@ -25,19 +25,22 @@ use http_body::{Body, Frame, SizeHint};
 #[cfg(feature = "hyper")]
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 use crate::tunnel_limiter::active_tunnels;
 #[cfg(feature = "hyper")]
 use crate::{APP_NAME, ProxyCacheBody, http_range::format_http_date};
 use crate::{
-    APP_VERSION, AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails, cache_metadata,
+    APP_VERSION, AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails,
+    cache_layout::SUBDIR_FLAT_BYHASH,
+    cache_metadata,
+    cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker},
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
     database::{Database, MirrorStatEntry},
     database_task::DB_TASK_QUEUE_SENDER,
-    deb_mirror::VALID_DEB_EXTENSIONS,
+    deb_mirror::is_deb_package,
     error::ErrorReport,
     get_features, global_cache_quota, global_checksum_registry, global_config,
     global_verify_throttle,
@@ -2516,7 +2519,7 @@ type DirStatsCache = parking_lot::Mutex<HashMap<PathBuf, (Instant, DirStats)>>;
 static DIR_STATS_CACHE: LazyLock<DirStatsCache> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-async fn cached_mirror_directory_size(path: &Path) -> Result<DirStats, tokio::io::Error> {
+async fn cached_mirror_directory_size(path: &Path) -> DirStats {
     // Bind the lookup to a local so the `MutexGuard` drops at this `;`,
     // before any `.await` below — `parking_lot::Mutex` held across an
     // await is a deadlock waiting for someone to extend the body.
@@ -2524,80 +2527,67 @@ async fn cached_mirror_directory_size(path: &Path) -> Result<DirStats, tokio::io
     if let Some((ts, stats)) = cached
         && ts.elapsed().as_secs() < DIR_STATS_TTL_SECS
     {
-        return Ok(stats);
+        return stats;
     }
-    let stats = mirror_directory_size(path, 0, false).await?;
+    let stats = mirror_directory_size(path).await;
     DIR_STATS_CACHE
         .lock()
         .insert(path.to_path_buf(), (Instant::now(), stats));
-    Ok(stats)
+    stats
 }
 
-async fn mirror_directory_size(
-    path: &Path,
-    depth: u8,
-    in_byhash: bool,
-) -> Result<DirStats, tokio::io::Error> {
-    const MAX_DIR_DEPTH: u8 = 16;
+static DASHBOARD_WALK: WalkContext = WalkContext {
+    what: "a mirror directory",
+    dir_failure: DirFailure::Continue("excluding its unread entries from the reported cache size"),
+    entry_failure: "excluding it from the reported cache size",
+    non_regular: "excluding it from the reported cache size",
+};
 
-    if depth >= MAX_DIR_DEPTH {
-        warn!(
-            "Reached depth limit of {} while scanning mirror directory `{}`; everything below it is excluded from the reported cache size",
-            MAX_DIR_DEPTH,
-            path.display()
-        );
-        return Ok(DirStats::default());
-    }
-
-    let mut dir = match tokio::fs::read_dir(path).await {
-        Ok(dir) => dir,
-        Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
-            return Ok(DirStats::default());
-        }
-        Err(err) => return Err(err),
-    };
+/// Tally every regular file below `path` for the dashboard's Mirrors table.
+///
+/// Unlike the startup scan this walk knows nothing about the layout: every
+/// directory is descended into (`tmp/` and nested mirrors included), and
+/// every regular file counts.  The walker's tag remembers whether the
+/// directory sits under a `by-hash/` subtree.  Anomalies (a symlink, a stat
+/// failure, an unreadable subdirectory) are logged and counted by the walker
+/// like everywhere else and the walk carries on, so one bad entry no longer
+/// drops the whole mirror from the table.
+async fn mirror_directory_size(path: &Path) -> DirStats {
     let mut stats = DirStats::default();
+    let mut walker = Walker::new(path, &DASHBOARD_WALK, OnMissing::Tolerate, false);
 
-    while let Some(entry) = dir.next_entry().await? {
-        let entry_path = entry.path();
-        let mdata = tokio::fs::symlink_metadata(&entry_path).await?;
-
-        if mdata.is_file() {
-            let len = mdata.len();
-            stats.size += len;
-            stats.files += 1;
-            stats.max_file_size = stats.max_file_size.max(len);
-            if in_byhash {
-                stats.byhash_files += 1;
+    while let Some(mut entry) = walker.next().await {
+        match entry.kind() {
+            EntryKind::NonRegular => {}
+            EntryKind::File => {
+                let Some(mdata) = entry.metadata().await else {
+                    continue;
+                };
+                let len = mdata.len();
+                stats.size += len;
+                stats.files += 1;
+                stats.max_file_size = stats.max_file_size.max(len);
+                if entry.tag() {
+                    stats.byhash_files += 1;
+                }
+                if entry.name().to_str().is_some_and(is_deb_package) {
+                    stats.deb_files += 1;
+                } else {
+                    stats.metadata_files += 1;
+                }
+                if let Ok(mtime) = mdata.modified() {
+                    stats.oldest_mtime = merge_min(stats.oldest_mtime, Some(mtime));
+                    stats.newest_mtime = merge_max(stats.newest_mtime, Some(mtime));
+                }
             }
-            if entry_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| VALID_DEB_EXTENSIONS.contains(&ext))
-            {
-                stats.deb_files += 1;
-            } else {
-                stats.metadata_files += 1;
+            EntryKind::Dir => {
+                let in_byhash = entry.tag() || entry.name() == SUBDIR_FLAT_BYHASH;
+                entry.descend(in_byhash);
             }
-            if let Ok(mtime) = mdata.modified() {
-                stats.oldest_mtime = merge_min(stats.oldest_mtime, Some(mtime));
-                stats.newest_mtime = merge_max(stats.newest_mtime, Some(mtime));
-            }
-        } else if mdata.is_dir() {
-            let descend_in_byhash =
-                in_byhash || entry_path.file_name().is_some_and(|n| n == "by-hash");
-            let sub = Box::pin(mirror_directory_size(
-                &entry_path,
-                depth + 1,
-                descend_in_byhash,
-            ))
-            .await?;
-            stats.merge(sub);
         }
-        // Symlinks are intentionally skipped
     }
 
-    Ok(stats)
+    stats
 }
 
 // ---------------------------------------------------------------------------
@@ -2611,16 +2601,6 @@ mod mirror_cells {
     use std::fmt::{self, Display, Formatter};
 
     use crate::humanfmt::HumanFmt;
-
-    pub(super) struct OptCount<T: Display>(pub Option<T>);
-    impl<T: Display> Display for OptCount<T> {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            match &self.0 {
-                Some(v) => Display::fmt(v, f),
-                None => f.write_str("N/A"),
-            }
-        }
-    }
 
     pub(super) struct DirSizeCell {
         pub size: u64,
@@ -2676,16 +2656,6 @@ mod mirror_cells {
             }
         }
     }
-
-    pub(super) struct DebMetaCell(pub Option<(usize, usize)>);
-    impl Display for DebMetaCell {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            match self.0 {
-                Some((deb, meta)) => write!(f, "{deb} / {meta}"),
-                None => f.write_str("N/A"),
-            }
-        }
-    }
 }
 
 async fn build_mirror_table(
@@ -2693,7 +2663,7 @@ async fn build_mirror_table(
     now_epoch: i64,
     cache_path: &Path,
 ) -> (String, usize, DirStats) {
-    use mirror_cells::{AvgMaxCell, DebMetaCell, DirSizeCell, EfficiencyCell, OptCount};
+    use mirror_cells::{AvgMaxCell, DirSizeCell, EfficiencyCell};
 
     if mirrors.is_empty() {
         return (String::new(), 0, DirStats::default());
@@ -2711,21 +2681,13 @@ async fn build_mirror_table(
     // recursive walk per known mirror. We process in fixed-size chunks so
     // (a) at most `DIR_SCAN_CONCURRENCY` walks run at once and (b) the
     // collected order matches `mirror_paths` (and therefore `sorted`).
-    let mut dir_stats: Vec<Option<DirStats>> = Vec::with_capacity(mirror_paths.len());
+    let mut dir_stats: Vec<DirStats> = Vec::with_capacity(mirror_paths.len());
     for chunk in mirror_paths.chunks(DIR_SCAN_CONCURRENCY) {
-        let chunk_stats = futures_util::future::join_all(chunk.iter().map(|mirror_path| async {
-            match cached_mirror_directory_size(mirror_path).await {
-                Ok(stats) => Some(stats),
-                Err(err) => {
-                    error!(
-                        "Failed to gather the size of directory `{}`; excluding it from the reported cache size:  {}",
-                        mirror_path.display(),
-                        ErrorReport(&err)
-                    );
-                    None
-                }
-            }
-        }))
+        let chunk_stats = futures_util::future::join_all(
+            chunk
+                .iter()
+                .map(|mirror_path| cached_mirror_directory_size(mirror_path)),
+        )
         .await;
         dir_stats.extend(chunk_stats);
     }
@@ -2737,7 +2699,7 @@ async fn build_mirror_table(
         cache.retain(|k, _| mirror_paths.iter().any(|p| p == k));
     }
 
-    let total_cache_size: u64 = dir_stats.iter().filter_map(|s| s.map(|st| st.size)).sum();
+    let total_cache_size: u64 = dir_stats.iter().map(|st| st.size).sum();
 
     // -- Build the table ------------------------------------------------------------------
     let mut table = Table::new(&[
@@ -2754,26 +2716,9 @@ async fn build_mirror_table(
         "Debs / Metadata",
     ]);
 
-    for (mirror, dir_stat) in sorted.iter().zip(&dir_stats) {
+    for (mirror, stats) in sorted.iter().zip(&dir_stats) {
         let downloaded_bytes = as_size(mirror.total_download_size);
         let delivered_bytes = as_size(mirror.total_delivery_size);
-
-        let (file_count, dir_size, avg_max, deb_meta) = match dir_stat {
-            Some(stats) => (
-                Some(stats.files),
-                Some(DirSizeCell {
-                    size: stats.size,
-                    total: total_cache_size,
-                }),
-                Some(AvgMaxCell {
-                    files: stats.files,
-                    size: stats.size,
-                    max_file: stats.max_file_size,
-                }),
-                Some((stats.deb_files, stats.metadata_files)),
-            ),
-            None => (None, None, None, None),
-        };
 
         tr!(
             table,
@@ -2798,15 +2743,22 @@ async fn build_mirror_table(
                 downloaded: mirror.total_download_size,
                 delivered: mirror.total_delivery_size,
             },
-            OptCount(dir_size),
-            OptCount(file_count),
-            OptCount(avg_max),
-            DebMetaCell(deb_meta),
+            DirSizeCell {
+                size: stats.size,
+                total: total_cache_size,
+            },
+            stats.files,
+            AvgMaxCell {
+                files: stats.files,
+                size: stats.size,
+                max_file: stats.max_file_size,
+            },
+            format_args!("{} / {}", stats.deb_files, stats.metadata_files),
         );
     }
 
     let mut aggregate = DirStats::default();
-    for stats in dir_stats.iter().flatten() {
+    for stats in &dir_stats {
         aggregate.merge(*stats);
     }
 

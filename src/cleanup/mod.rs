@@ -9,7 +9,6 @@ mod verify;
 
 use engine::run_mirror_units;
 use model::classify_mirror;
-use scan::derive_nested_paths;
 
 use std::{
     sync::{
@@ -25,8 +24,8 @@ use hashbrown::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::{
-    AppState, config::CacheHost, database::resolved_cache_host, error::ErrorReport,
-    global_cache_quota, global_config, humanfmt::HumanFmt, metrics,
+    AppState, config::CacheHost, database::resolved_cache_host, deb_mirror::derive_nested_paths,
+    error::ErrorReport, global_cache_quota, global_config, humanfmt::HumanFmt, metrics,
     task_cache_scan::task_cache_scan, xattr_helpers,
 };
 

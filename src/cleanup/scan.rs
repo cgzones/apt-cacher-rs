@@ -7,7 +7,7 @@ use tracing::{debug, error, trace, warn};
 
 use crate::cleanup::engine::SpanClass;
 use crate::cleanup::model::TreeSpec;
-use crate::deb_mirror::{is_deb_package, is_strict_path_descendant, path_starts_with_segment};
+use crate::deb_mirror::{NestedMirrorRelation, is_deb_package, nested_mirror_relation};
 use crate::error::ErrorReport;
 use crate::metrics;
 
@@ -225,7 +225,9 @@ pub(super) async fn scan_candidates(
                         owned_full = format!("{mirror_path}/{child_rel}");
                         owned_full.as_str()
                     };
-                    if is_nested_mirror_boundary(candidate_full, &tree.boundaries) {
+                    if nested_mirror_relation(candidate_full, &tree.boundaries)
+                        == NestedMirrorRelation::Boundary
+                    {
                         trace!(
                             "Skipping `{}` during flat cleanup: nested mirror root for `{candidate_full}`",
                             entry.path().display(),
@@ -268,63 +270,6 @@ pub(super) async fn scan_candidates(
     }
 
     Ok(ret)
-}
-
-/// Derive the paths of mirrors registered under the same `(host, port)` that
-/// live *inside* `mirror_path` (segment-aligned), given the sorted list of
-/// sibling paths on that host (which may include `mirror_path` itself; self
-/// is filtered out by the segment-alignment check).
-///
-/// The empty-`mirror_path` case denotes a host-root mirror that nests every
-/// other path on the host.
-///
-/// Sorted input lets the lookup skip directly to the prefix region via
-/// `partition_point`.  Within that region, lexicographic order can still
-/// interleave non-segment-aligned siblings (e.g. `debian-security` between
-/// `debian` and `debian/...` since `-` < `/` in ASCII), so segment alignment
-/// is enforced via `is_strict_path_descendant`; the surrounding `take_while`
-/// is a safe termination optimisation, since entries sharing the byte prefix
-/// are contiguous in lexicographic order.
-#[must_use]
-pub(super) fn derive_nested_paths(mirror_path: &str, host_paths_sorted: &[&str]) -> Vec<String> {
-    if mirror_path.is_empty() {
-        return host_paths_sorted
-            .iter()
-            .filter(|p| !p.is_empty())
-            .map(|p| (*p).to_owned())
-            .collect();
-    }
-    // `take_while` terminates the scan once we leave the contiguous
-    // byte-prefix region.  Within that region the byte prefix alone is too
-    // loose — `debian-security` starts with `debian` but is not a
-    // segment-aligned descendant — so `is_strict_path_descendant` filters
-    // out non-aligned siblings.
-    let start = host_paths_sorted.partition_point(|p| *p <= mirror_path);
-    host_paths_sorted[start..]
-        .iter()
-        .take_while(|p| p.starts_with(mirror_path))
-        .filter(|p| is_strict_path_descendant(p, mirror_path))
-        .map(|p| (*p).to_owned())
-        .collect()
-}
-
-/// Whether the on-disk position `candidate` (the mirror-path-equivalent of
-/// a subdir reached during recursion) sits at or inside a registered nested
-/// mirror's root.  Match semantics are segment-aligned:
-///
-/// - `apt/amd64` matches the registered root `apt/amd64` (equality).
-/// - `apt/amd64/foo` matches the registered root `apt/amd64` (descendant --
-///   the walker has already entered the nested subtree).
-/// - `apt/amd64` does **not** match the registered root `apt/amd64/special`:
-///   recursion must continue into `apt/amd64` so the walker can reach the
-///   real boundary at `apt/amd64/special`.
-/// - `apt-tools` does not match the registered root `apt` (segment-aligned,
-///   not a byte prefix).
-#[must_use]
-fn is_nested_mirror_boundary(candidate: &str, nested_mirror_paths: &[String]) -> bool {
-    nested_mirror_paths
-        .iter()
-        .any(|p| path_starts_with_segment(candidate, p))
 }
 
 #[cfg(test)]
@@ -431,95 +376,5 @@ mod tests {
         };
         let map = scan_candidates(&tree, "apt").await.expect("scan");
         assert!(map.contains_key(OsStr::new("amd64/c_1.0_amd64.deb")));
-    }
-
-    fn sorted(paths: &[&'static str]) -> Vec<&'static str> {
-        let mut v = paths.to_vec();
-        v.sort_unstable();
-        v
-    }
-
-    #[test]
-    fn derive_nested_paths_basic_nesting() {
-        let host = sorted(&["debian", "debian/security", "debian/x/y", "unrelated"]);
-        assert_eq!(
-            derive_nested_paths("debian", &host),
-            vec!["debian/security".to_owned(), "debian/x/y".to_owned()]
-        );
-    }
-
-    #[test]
-    fn derive_nested_paths_skips_non_segment_aligned_prefix_neighbour() {
-        // `debian-security` sorts between `debian` and `debian/...` (`-` < `/`)
-        // but is not a nested child; the segment-alignment filter must exclude
-        // it without halting the surrounding `take_while`, so `debian/foo` and
-        // `debian/security` are still returned.
-        let host = sorted(&["debian", "debian-security", "debian/foo", "debian/security"]);
-        assert_eq!(
-            derive_nested_paths("debian", &host),
-            vec!["debian/foo".to_owned(), "debian/security".to_owned()]
-        );
-    }
-
-    #[test]
-    fn derive_nested_paths_empty_mirror_path_nests_all_others() {
-        let host = sorted(&["", "debian", "debian/security"]);
-        assert_eq!(
-            derive_nested_paths("", &host),
-            vec!["debian".to_owned(), "debian/security".to_owned()]
-        );
-    }
-
-    #[test]
-    fn derive_nested_paths_excludes_self() {
-        let host = sorted(&["debian"]);
-        assert_eq!(derive_nested_paths("debian", &host), [] as [String; 0]);
-    }
-
-    #[test]
-    fn derive_nested_paths_no_match() {
-        let host = sorted(&["apt", "debian"]);
-        assert_eq!(derive_nested_paths("ubuntu", &host), [] as [String; 0]);
-    }
-
-    #[test]
-    fn derive_nested_paths_handles_underscore_sibling() {
-        // `debian_updates` (underscore) must not be treated as nested under
-        // `debian` even though it shares the `debian` byte prefix.
-        // Likewise `debian-security` (hyphen, sorts before `debian/...`)
-        // must be excluded.  Only `debian/foo` is a true nested child.
-        let host = sorted(&["debian", "debian-security", "debian_updates", "debian/foo"]);
-        assert_eq!(
-            derive_nested_paths("debian", &host),
-            vec!["debian/foo".to_owned()]
-        );
-    }
-
-    #[test]
-    fn is_nested_mirror_boundary_equality_match() {
-        let nested = vec!["apt/amd64".to_owned()];
-        assert!(is_nested_mirror_boundary("apt/amd64", &nested));
-    }
-
-    #[test]
-    fn is_nested_mirror_boundary_descendant_inside_nested_subtree() {
-        let nested = vec!["apt/amd64".to_owned()];
-        assert!(is_nested_mirror_boundary("apt/amd64/foo", &nested));
-    }
-
-    #[test]
-    fn is_nested_mirror_boundary_ancestor_must_recurse() {
-        // Regression guard against the reversed-argument bug: a candidate
-        // that is a strict ancestor of a registered nested root is NOT a
-        // boundary -- the walker has to continue down to reach the real
-        // nested root.
-        let nested = vec!["apt/amd64/special".to_owned()];
-        assert!(!is_nested_mirror_boundary("apt/amd64", &nested));
-    }
-
-    #[test]
-    fn is_nested_mirror_boundary_segment_aligned_non_match() {
-        let nested = vec!["apt".to_owned()];
-        assert!(!is_nested_mirror_boundary("apt-tools", &nested));
     }
 }
