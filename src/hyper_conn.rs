@@ -86,7 +86,7 @@ use crate::{
         regular_file_metadata, tokio_nofollow_options, tokio_tempfile, touch_volatile_mtime,
     },
     warn_on_content_type_mismatch, warn_once_or_debug, warn_once_or_info,
-    web_interface::serve_web_interface,
+    web::serve_web_interface,
 };
 #[cfg(feature = "tls_rustls")]
 use hyper_rustls::HttpsConnector;

@@ -78,7 +78,7 @@ use crate::{
         tokio_nofollow_options,
     },
     warn_once, warn_once_or_debug, warn_once_or_info,
-    web_interface::{WebResponse, serve_web_interface},
+    web::{WebResponse, serve_web_interface},
 };
 
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
@@ -520,7 +520,7 @@ async fn graceful_close(stream: &TcpStream) {
 /// Serve a local web-interface request directly from the sendfile path.
 ///
 /// The web-interface ACL has already been enforced by `preflight_target`.
-/// The hyper-based handler exists in `web_interface::serve_web_interface`; this
+/// The hyper-based handler exists in `web::serve_web_interface`; this
 /// wrapper invokes it and serializes the resulting `WebResponse`
 /// onto the raw `TcpStream` with handwritten headers, so webui responses look
 /// the same regardless of which connection backend served them.

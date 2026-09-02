@@ -1,7 +1,7 @@
 //! One directory walker for every pass over the cache tree.
 //!
 //! The startup / post-cleanup size scan (`task_cache_scan`), the dashboard
-//! size walk (`web_interface`) and every cleanup unit (`cleanup/`) used to
+//! size walk (`web`) and every cleanup unit (`cleanup/`) used to
 //! each hand-roll a `read_dir` / `next_entry` / `file_type` loop, and with it
 //! the "Failed to read / iterate / inspect" error lines, the
 //! `CACHE_IO_FAILURE` bumps and the anomaly taxonomy:

@@ -90,7 +90,7 @@ mod upstream_head;
 mod upstream_retry;
 mod utils;
 mod verify_throttle;
-mod web_interface;
+mod web;
 mod xattr_helpers;
 mod xz_stream;
 
