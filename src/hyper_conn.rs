@@ -2647,15 +2647,7 @@ async fn pre_process_client_request(
                 match dispatch_request(req.uri().path(), requested_host, requested_port, &client)
                     .await
                 {
-                    DispatchOutcome::Cache(plan) => {
-                        let conn_details = ConnectionDetails {
-                            client,
-                            request_received_at: plan.request_received_at,
-                            mirror: plan.mirror,
-                            aliased_host: plan.aliased_host,
-                            debname: plan.debname,
-                            resource_kind: plan.resource_kind,
-                        };
+                    DispatchOutcome::Cache(conn_details) => {
                         return process_cache_request(conn_details, req, appstate).await;
                     }
                     DispatchOutcome::Reject(reason) => {

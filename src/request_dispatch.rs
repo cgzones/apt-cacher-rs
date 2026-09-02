@@ -43,7 +43,7 @@ use tracing::{debug, trace};
 
 use crate::{
     ClientInfo,
-    cache_layout::{self, ClassifyError, ResourceKind},
+    cache_layout::{self, ClassifyError, ConnectionDetails},
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
     database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
@@ -56,20 +56,6 @@ use crate::{
     uncacheables::record_uncacheable,
     warn_once_or_debug, warn_once_or_info,
 };
-
-/// Post-classification payload routed through the cache pipeline.
-///
-/// Mirrors the fields of [`crate::cache_layout::ConnectionDetails`] minus
-/// `client`, which the caller adds when assembling `ConnectionDetails`.
-#[derive(Debug)]
-pub(crate) struct CachePlan {
-    pub(crate) mirror: Mirror,
-    pub(crate) aliased_host: Option<&'static CacheHost>,
-    pub(crate) debname: String,
-    pub(crate) request_received_at: PreciseInstant,
-    pub(crate) resource_kind: ResourceKind,
-    _private: (),
-}
 
 /// Reason the pre-flight or the dispatcher refused a request with a fixed
 /// 4xx response.
@@ -318,9 +304,10 @@ impl PassthroughReason {
 /// `record_uncacheable`, so the two backends stay structurally in sync.
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
-    /// Route through the cache pipeline using `plan` as the
-    /// `ConnectionDetails` seed.
-    Cache(CachePlan),
+    /// Route through the cache pipeline; the request's `ConnectionDetails`
+    /// are complete (the dispatcher already holds `client`), so the backend
+    /// hands them straight to its cache pipeline.
+    Cache(ConnectionDetails),
     /// Refuse with a fixed 4xx response.  Logging and metric bumping
     /// already done.
     Reject(RejectReason),
@@ -352,14 +339,14 @@ pub(crate) enum DispatchOutcome {
     clippy::large_enum_variant,
     reason = "transient value: built in decide_request and destructured immediately in \
               dispatch_request, never stored or collected, so the variant-size gap is \
-              irrelevant; boxing the plan would add a per-request heap alloc on the cache path"
+              irrelevant; boxing the details would add a per-request heap alloc on the cache path"
 )]
 enum Decision {
     /// `pending_origin` is `Some` when `class.origin_fields` indicated a real
     /// (non-pseudo) architecture; the wrapper forwards it to `send_db_command_nonblocking`
     /// before returning the `Cache` outcome.
     Cache {
-        plan: CachePlan,
+        conn_details: ConnectionDetails,
         pending_origin: Option<Origin>,
     },
     Reject(RejectReason),
@@ -397,7 +384,7 @@ pub(crate) async fn dispatch_request(
     );
     match decision {
         Decision::Cache {
-            plan,
+            conn_details,
             pending_origin,
         } => {
             if let Some(origin) = pending_origin {
@@ -405,7 +392,7 @@ pub(crate) async fn dispatch_request(
                 // so a saturated DB queue must not stall request handling.
                 send_db_command_nonblocking(DatabaseCommand::Origin(DbCmdOrigin { origin }));
             }
-            DispatchOutcome::Cache(plan)
+            DispatchOutcome::Cache(conn_details)
         }
         Decision::Reject(reason) => DispatchOutcome::Reject(reason),
         Decision::Passthrough {
@@ -508,13 +495,13 @@ fn decide_request(
                     });
 
                     return Decision::Cache {
-                        plan: CachePlan {
+                        conn_details: ConnectionDetails {
+                            client: *client,
+                            request_received_at,
                             mirror,
                             aliased_host,
                             debname: class.debname,
-                            request_received_at,
                             resource_kind: class.resource_kind,
-                            _private: (),
                         },
                         pending_origin,
                     };
@@ -774,14 +761,14 @@ mod tests {
             PreciseInstant::now(),
         );
         let Decision::Cache {
-            plan,
+            conn_details,
             pending_origin,
         } = decision
         else {
             unreachable!("expected Cache outcome")
         };
-        assert_eq!(plan.resource_kind.layout(), CacheLayout::StructuredPool);
-        assert_eq!(plan.debname, "firefox_1.0_amd64.deb");
+        assert_eq!(conn_details.layout(), CacheLayout::StructuredPool);
+        assert_eq!(conn_details.debname, "firefox_1.0_amd64.deb");
         assert!(pending_origin.is_none());
     }
 
@@ -798,13 +785,13 @@ mod tests {
             PreciseInstant::now(),
         );
         let Decision::Cache {
-            plan,
+            conn_details,
             pending_origin,
         } = decision
         else {
             unreachable!("expected Cache outcome")
         };
-        assert_eq!(plan.resource_kind.layout(), CacheLayout::Dists);
+        assert_eq!(conn_details.layout(), CacheLayout::Dists);
         let origin = pending_origin.expect("binary-amd64 must record an origin");
         assert_eq!(origin.distribution, "sid");
         assert_eq!(origin.component, "main");
