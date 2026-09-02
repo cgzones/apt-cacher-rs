@@ -335,7 +335,7 @@ pub(crate) enum DispatchOutcome {
         // and in sendfile's `NotApplicable` handoff.
         reason: PassthroughReason,
         requested_host: ClientHost,
-        // Consumed by both backends: `splice_simple_proxy` (`splice_conn.rs`,
+        // Consumed by both backends: `splice_simple_proxy` (`splice/simple_proxy.rs`,
         // via the sendfile dispatch) and `PassthroughBody` (`hyper_conn.rs`).
         request_received_at: PreciseInstant,
     },

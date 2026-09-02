@@ -26,7 +26,7 @@ use crate::xz_stream::xz_decoder;
     not(feature = "splice"),
     expect(
         dead_code,
-        reason = "splice_conn.rs is the sole consumer; not compiled without splice"
+        reason = "splice/http.rs is the sole consumer; not compiled without splice"
     )
 )]
 pub(crate) const MAX_UPSTREAM_HEADER_SIZE: usize = 8192;

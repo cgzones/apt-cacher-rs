@@ -1,6 +1,6 @@
 //! Backend-neutral classification of an upstream response head.
 //!
-//! `hyper_conn.rs::serve_new_file` and `splice_conn.rs::splice_proxy_drive`
+//! `hyper_conn.rs::serve_new_file` and `splice/mod.rs::splice_proxy_drive`
 //! fetch the same upstream resources and must reach the same decisions on the
 //! (status, resume state, `Content-Range`, `Content-Length`, cached flavor)
 //! truth table: 304 revalidation, non-2xx relay, resume anomalies, the
@@ -12,7 +12,7 @@
 //!   status, the length-delimited `Content-Length` (already resolved against
 //!   chunked framing, RFC 9112 section 6.1) and the parsed `Content-Range`.
 //!   Constructors: [`UpstreamHead::from_response`] for hyper's
-//!   `http::Response` and `splice_conn::UpstreamResponse::head` for splice's
+//!   `http::Response` and `splice::http::UpstreamResponse::head` for splice's
 //!   httparse-based parser.  Validator and metadata headers (`ETag`,
 //!   `Last-Modified`, `Content-Type`) are deliberately absent: no shared
 //!   decision reads them and each backend validates them on its own schedule.

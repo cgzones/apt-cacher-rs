@@ -2007,8 +2007,8 @@ async fn serve_new_file(
         }
     };
 
-    // Wording mirrors `splice_conn.rs::UpstreamResponse::discard_invalid_validators`
-    // modulo the subsystem prefix (`docs/logging.md`, cross-backend parity).
+    // Wording mirrors `splice/http.rs::UpstreamResponse::discard_invalid_validators`
+    // modulo the subsystem prefix.
     let (upstream_etag, upstream_last_modified) = check_upstream_validators(
         fwd_response
             .headers()

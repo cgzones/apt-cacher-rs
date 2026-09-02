@@ -3,7 +3,7 @@
 //!
 //! These routines manipulate the incoming/outgoing TLS buffers and the rustls
 //! `UnbufferedClientConnection` state machine. They are kept here (rather than
-//! inline in `splice_conn.rs`) so that the orchestration of
+//! inline in `splice/ktls_path.rs`) so that the orchestration of
 //! `unbuffered_ktls_request` stays readable.
 
 use std::io::{self, ErrorKind};

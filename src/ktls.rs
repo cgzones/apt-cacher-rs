@@ -498,7 +498,7 @@ pub(crate) fn is_available() -> bool {
 /// Whether this kernel's `TLS_RX` accepts the given TLS version + cipher,
 /// according to the matrix built by [`is_available`]'s probe.
 ///
-/// The gate in `splice_conn.rs` calls this before `setup_rx` so an unsupported
+/// The gate in `splice/ktls_path.rs` calls this before `setup_rx` so an unsupported
 /// combo fails fast (deterministic `KtlsSetupFailed`) instead of wasting a full
 /// upstream request. An unknown version/cipher returns `false`. If the matrix
 /// isn't published yet (not AVAILABLE), or was never populated (mask 0 —

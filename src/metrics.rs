@@ -401,7 +401,7 @@ pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();
 /// fails, that is reported separately under `CACHE_IO_FAILURE`.  Unexpected
 /// directories are tracked separately under `CACHE_DIRECTORY_UNEXPECTED`
 /// when detected on dedicated directory-classification paths; however a
-/// number of serving paths (`main.rs`, `sendfile_conn.rs`, `splice_conn.rs`)
+/// number of serving paths (`main.rs`, `sendfile_conn.rs`, `splice/`)
 /// and TOCTOU-safe sweep paths in the `cleanup/` submodule still bump
 /// `CACHE_NON_REGULAR` for directories encountered at file locations.
 /// Treat the counter as "any non-regular entry where a regular file was

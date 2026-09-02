@@ -518,7 +518,7 @@ pub(crate) struct OriginFields {
 /// This helper is the single source of truth for the list; adding a future
 /// pseudo-arch (e.g. `signed-by`) is a one-line change here. Call sites:
 /// the `origin_fields` arm in [`classify_request`] and the deferred-`Origin`
-/// DB-emission filters in `hyper_conn.rs` and `splice_conn.rs`.
+/// DB-emission filters in `hyper_conn.rs`, `splice/mod.rs` and `splice/simple_proxy.rs`.
 #[must_use]
 pub(crate) fn is_pseudo_arch(arch: &str) -> bool {
     matches!(arch, "dep11" | "i18n" | "source")
