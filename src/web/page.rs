@@ -330,6 +330,12 @@ p { margin: 4px 0; }
 h4.mini { font-size: 0.85em; margin: 4px 0; }
 pre.log { white-space: pre-wrap; word-break: break-all; font-size: 0.85em;
           max-height: 80vh; overflow-y: auto; }
+
+@media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    details > summary::before { transition: none; }
+    time { transition: none; }
+}
 "#;
 
 // ---------------------------------------------------------------------------

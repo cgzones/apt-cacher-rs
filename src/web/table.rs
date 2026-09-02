@@ -25,7 +25,7 @@ impl Table {
         // section; without it a wide table forces a page-wide scrollbar.
         out.push_str("<div class=\"tablewrap\"><table><thead><tr>");
         for h in headers {
-            out.push_str("<th>");
+            out.push_str("<th scope=\"col\">");
             out.push_str(h);
             out.push_str("</th>");
         }
