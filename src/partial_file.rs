@@ -115,7 +115,20 @@ pub(crate) async fn prepare_partial_resume(
     mirror: &deb_mirror::Mirror,
     log_prefix: &'static str,
 ) -> Result<PartialResume, PartialOpenError> {
-    match open_partial_file(ibarrier, log_prefix).await {
+    let path = partial_path_for_barrier(CachePaths::global(), ibarrier);
+    prepare_partial_resume_at(path, debname, mirror, log_prefix).await
+}
+
+/// [`prepare_partial_resume`] for an already-derived partial `path`: the
+/// pure half, kept free of the `global_config()` lookup so the lifecycle is
+/// unit-testable against a temporary directory.
+async fn prepare_partial_resume_at(
+    path: PathBuf,
+    debname: &str,
+    mirror: &deb_mirror::Mirror,
+    log_prefix: &'static str,
+) -> Result<PartialResume, PartialOpenError> {
+    match open_partial_file(path, log_prefix).await {
         Ok((file, size, guard)) if size > 0 => {
             if let Some(if_range) = xattr_helpers::read::<ETag>(&file, &guard) {
                 let if_range = if_range.into_string();
@@ -160,6 +173,7 @@ pub(crate) async fn prepare_partial_resume(
 /// Why [`prepare_partial_resume`] could not open the partial file. Both
 /// variants hand back the `TempPath` guard for the deterministic partial path
 /// (`keep_on_drop: true`, so dropping it touches nothing on disk).
+#[derive(Debug)]
 pub(crate) enum PartialOpenError {
     /// No partial file at the path: the normal fresh-download case, not
     /// logged and not counted. The caller starts a fresh download on the guard.
@@ -174,6 +188,7 @@ pub(crate) enum PartialOpenError {
 ///
 /// When `keep_on_drop` is set to `true`, the file is preserved on drop instead of being deleted.
 /// This is used for partial download files that should survive failures for later resumption.
+#[derive(Debug)]
 pub(crate) struct TempPath {
     path: Option<PathBuf>,
     keep_on_drop: bool,
@@ -322,7 +337,7 @@ pub(crate) async fn tokio_tempfile(
 }
 
 /// Build the deterministic on-disk path for a download's `.partial` temp
-/// file: [`CachePaths::partial_file`] for the download's layout and site,
+/// file under `paths`: [`CachePaths::partial_file`] for the download's layout and site,
 /// i.e. the `tmp/` sibling of the eventual rename target
 /// (`{anchor}/tmp/{debname}.partial`), so the atomic `rename(2)` after the
 /// download finishes stays within the same filesystem.
@@ -334,13 +349,13 @@ pub(crate) async fn tokio_tempfile(
 /// across different sub-directories (`apt/amd64/foo.deb` vs
 /// `apt/arm64/foo.deb`) is implicit in the site's mirror path, which equals
 /// the URL-dir verbatim under the host-anchored flat layout.
-fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
+fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier<'_>) -> PathBuf {
     let filename = format!("{debname}.partial", debname = ibarrier.debname());
-    CachePaths::global().partial_file(ibarrier.layout(), ibarrier.site(), Path::new(&filename))
+    paths.partial_file(ibarrier.layout(), ibarrier.site(), Path::new(&filename))
 }
 
-/// Open an existing partial file for writing at the end, returning the file, its current size,
-/// and a `TempPath` guard with `keep_on_drop: true`.
+/// Open the existing partial file at `path` for writing at the end, returning the file,
+/// its current size, and a `TempPath` guard with `keep_on_drop: true`.
 ///
 /// Uses `write(true)` + seek instead of `append(true)` so that splice(2) can use explicit
 /// file offsets (`O_APPEND` is incompatible with splice's offset parameter).
@@ -348,7 +363,7 @@ fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
 /// By opening the file and querying size from the same file handle, this avoids
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
 async fn open_partial_file(
-    ibarrier: &InitBarrier<'_>,
+    path: PathBuf,
     log_prefix: &'static str,
 ) -> Result<(tokio::fs::File, u64, TempPath), PartialOpenError> {
     use tokio::io::AsyncSeekExt as _;
@@ -410,8 +425,6 @@ async fn open_partial_file(
         Ok((file, size))
     }
 
-    let path = partial_path_for_barrier(ibarrier);
-
     let guard = TempPath {
         path: Some(path),
         keep_on_drop: true,
@@ -458,4 +471,188 @@ pub(crate) async fn create_partial_file(
             keep_on_drop: true,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::*;
+    use crate::{test_support::structured_mirror, xattr_helpers::tests::plant_raw};
+
+    /// `TempPath::drop` unlinks on the blocking pool; wait for it to land.
+    async fn wait_until_absent(path: &Path) -> bool {
+        for _ in 0..1000 {
+            if !path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    fn partial_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("mirror/tmp/foo_1.0_amd64.deb.partial")
+    }
+
+    #[tokio::test]
+    async fn tempfile_is_removed_on_drop_and_kept_after_defuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("volatile");
+
+        let (file, guard) = tokio_tempfile(&base, 0o640).await.expect("tempfile");
+        let removed = guard.to_path_buf();
+        assert_ne!(removed, base, "the temp file gets a random extension");
+        assert!(removed.is_file(), "temp file exists while guarded");
+        drop(file);
+        drop(guard);
+        assert!(
+            wait_until_absent(&removed).await,
+            "dropping the guard unlinks the temp file"
+        );
+
+        let (file, guard) = tokio_tempfile(&base, 0o640).await.expect("tempfile");
+        let kept = guard.defuse();
+        drop(file);
+        assert!(kept.is_file(), "defuse hands the file over intact");
+    }
+
+    #[tokio::test]
+    async fn partial_lifecycle_create_keep_reopen_remove() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+
+        let guard = match open_partial_file(path.clone(), "").await {
+            Err(PartialOpenError::NotFound(guard)) => guard,
+            Ok(_) | Err(PartialOpenError::Failed { .. }) => {
+                unreachable!("no partial exists yet")
+            }
+        };
+        assert_eq!(&*guard, path.as_path());
+
+        // create_partial_file creates the tmp/ parent and hands back a
+        // keep-on-drop guard.
+        let (mut file, guard) = create_partial_file(guard, 0o640)
+            .await
+            .expect("create partial");
+        file.write_all(b"hello").await.expect("write");
+        file.flush().await.expect("flush");
+        drop(file);
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(path.is_file(), "a partial survives its guard");
+
+        // Reopening lands at the end of the existing bytes.
+        let (file, size, guard) = open_partial_file(path.clone(), "")
+            .await
+            .expect("partial reopens");
+        assert_eq!(size, 5);
+        drop(file);
+
+        let returned = guard.remove().await;
+        assert_eq!(returned, path);
+        assert!(!path.exists(), "remove unlinks regardless of keep_on_drop");
+    }
+
+    #[tokio::test]
+    async fn open_partial_file_rejects_a_non_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+
+        let before = metrics::CACHE_NON_REGULAR.get();
+        let (logged, guard) = match open_partial_file(path.clone(), "").await {
+            Err(PartialOpenError::Failed { logged, guard }) => (logged, guard),
+            Ok(_) | Err(PartialOpenError::NotFound(_)) => {
+                unreachable!("a FIFO is not a partial")
+            }
+        };
+        let _proof: Logged = logged;
+        assert!(
+            metrics::CACHE_NON_REGULAR.get() > before,
+            "the anomaly is counted"
+        );
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(path.exists(), "the guard keeps the path untouched");
+    }
+
+    // The xattr read runs through `block_in_place`, which needs the
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_partial_resume_discards_a_partial_without_etag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"stale").expect("write");
+        let mirror = structured_mirror("deb.example.org", "debian");
+
+        let resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
+            .await
+            .expect("a discarded partial is a fresh download");
+        assert_eq!(resume.offset, 0);
+        assert_eq!(resume.expected_total, None);
+        assert_eq!(resume.if_range, None);
+        let PartialDownload::Fresh(guard) = resume.partial else {
+            unreachable!("no ETag means no resume")
+        };
+        assert!(!path.exists(), "the stale partial is unlinked");
+        assert_eq!(&*guard, path.as_path(), "the guard still reserves the path");
+    }
+
+    // The xattr read runs through `block_in_place`, which needs the
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_partial_resume_resumes_a_partial_with_etag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"partial-bytes").expect("write");
+        let std_file = std::fs::File::open(&path).expect("open");
+        if !plant_raw::<ETag>(&std_file, b"\"strong\"") {
+            // Filesystem without user xattrs: the resume branch cannot be
+            // exercised here.
+            return;
+        }
+        drop(std_file);
+        let mirror = structured_mirror("deb.example.org", "debian");
+
+        let mut resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
+            .await
+            .expect("the partial reopens");
+        assert_eq!(resume.offset, 13);
+        assert_eq!(resume.expected_total, None, "no expected-size xattr");
+        assert_eq!(resume.if_range.as_deref(), Some("\"strong\""));
+        assert!(
+            matches!(resume.partial, PartialDownload::Resumable { .. }),
+            "a strong ETag makes the partial resumable"
+        );
+
+        // A rejected resume (416 upstream) downgrades to a fresh download on
+        // the same path.
+        resume.partial.discard_resume().await;
+        assert!(
+            matches!(resume.partial, PartialDownload::Fresh(_)),
+            "discard_resume yields Fresh"
+        );
+        assert!(!path.exists(), "the stale partial is unlinked");
+    }
+
+    #[tokio::test]
+    async fn prepare_partial_resume_treats_an_empty_partial_as_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"").expect("write");
+        let mirror = structured_mirror("deb.example.org", "debian");
+
+        let resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
+            .await
+            .expect("an empty partial is a fresh download");
+        assert_eq!(resume.offset, 0);
+        assert!(matches!(resume.partial, PartialDownload::Fresh(_)));
+    }
 }
