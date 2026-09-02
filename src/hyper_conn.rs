@@ -2245,7 +2245,13 @@ async fn serve_new_file(
                     )
                 };
 
-                let response = head.into_hyper(empty_body());
+                // apt only reaches its transient-error/`Retry-After` path for
+                // an error response that *has* a body: `Content-Length: 0`
+                // sets `haveContent = TRI_FALSE` and
+                // `basehttp.cc:ERROR_UNRECOVERABLE` fails the item
+                // permanently. A non-empty body is what makes the nudge a
+                // retry rather than a hard failure.
+                let response = head.into_hyper(full_body("Download in progress"));
 
                 trace!("Outgoing parallel download hack response: {response:?}");
 
