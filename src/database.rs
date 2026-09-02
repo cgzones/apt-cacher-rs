@@ -17,9 +17,9 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     CLEANUP_CLIENT_ADDR, RETENTION_TIME,
-    cache_layout::SUBDIR_FLAT,
+    cache_paths::MirrorSite,
     config::{Alias, CacheHost, ClientHost, DomainName, resolve_alias},
-    deb_mirror::{Mirror, MirrorKind, mirror_cache_path_impl},
+    deb_mirror::{Mirror, MirrorKind},
     error::ErrorReport,
     flat_blocklist, global_config,
     humanfmt::HumanFmt,
@@ -109,63 +109,30 @@ impl MirrorEntry {
         self.host.format_authority(self.port())
     }
 
-    /// On-disk host identity for this mirror, resolved through configured
-    /// aliases.  The DB stores the raw client-supplied host, but
-    /// `ConnectionDetails::cache_dir_path` writes cached files under the
-    /// alias' `main` host.  Cleanup / scan code must use the same resolution
-    /// so the paths line up; raw `self.host` would point at an empty (or
-    /// non-existent) sibling directory whenever the request arrived via an
-    /// alias.
+    /// The alias-resolved on-disk identity of this mirror, for every
+    /// `CachePaths` derivation (`mirror_dir`, `entry_dir`, `tmp_dir`, ...).
+    /// The DB stores the raw client-supplied host, but `ConnectionDetails::site`
+    /// places cached files under the alias' `main` host.  Cleanup / scan code
+    /// must use the same resolution so the paths line up; raw `self.host`
+    /// would point at an empty (or non-existent) sibling directory whenever
+    /// the request arrived via an alias.
     #[must_use]
-    pub(crate) fn cache_host(&self) -> &CacheHost {
-        resolved_cache_host(&global_config().aliases, &self.host)
+    pub(crate) fn site(&self) -> MirrorSite<'_> {
+        self.site_with_aliases(&global_config().aliases)
     }
 
-    #[must_use]
-    pub(crate) fn cache_path(&self) -> PathBuf {
-        self.cache_path_with_aliases(&global_config().aliases)
-    }
-
-    /// Pure sibling of [`Self::cache_path`] taking the alias table explicitly
+    /// Pure sibling of [`Self::site`] taking the alias table explicitly
     /// instead of reaching for `global_config()`. `global_config()` panics
     /// outside a running daemon, so a pure caller that already carries its
     /// own `&Config` (e.g. `cleanup::model::classify_mirror`) uses this to
     /// stay unit-testable without a `main()`-initialized global.
     #[must_use]
-    pub(crate) fn cache_path_with_aliases(&self, aliases: &[Alias]) -> PathBuf {
-        let cache = resolved_cache_host(aliases, &self.host);
-        mirror_cache_path_impl(cache, self.port(), &self.path)
-    }
-
-    /// On-disk flat root for this mirror: `<cache_dir>/<host>/flat/<mirror_path>`.
-    /// Callers append further segments (`by-hash`, `tmp`, …) as needed.
-    ///
-    /// Pure: takes the alias table explicitly instead of reaching for
-    /// `global_config()`, which panics outside a running daemon; a pure caller
-    /// that already carries its own `&Config` (e.g.
-    /// `cleanup::model::classify_mirror`) uses this to stay unit-testable
-    /// without a `main()`-initialized global. See [`Self::cache_path_with_aliases`].
-    #[must_use]
-    pub(crate) fn flat_root_path_with_aliases(
-        &self,
-        cache_dir: &Path,
-        aliases: &[Alias],
-    ) -> PathBuf {
-        let mirror_path = Path::new(&self.path);
-        assert!(
-            mirror_path.is_relative(),
-            "mirror path must be relative when building the flat root"
-        );
-        let cache = resolved_cache_host(aliases, &self.host);
-        let host_dir = cache.format_cache_dir(self.port());
-        [
-            cache_dir,
-            Path::new(host_dir.as_ref()),
-            Path::new(SUBDIR_FLAT),
-            mirror_path,
-        ]
-        .iter()
-        .collect()
+    pub(crate) fn site_with_aliases<'a>(&'a self, aliases: &'a [Alias]) -> MirrorSite<'a> {
+        MirrorSite {
+            host: resolved_cache_host(aliases, &self.host),
+            port: self.port(),
+            path: &self.path,
+        }
     }
 }
 
@@ -245,16 +212,15 @@ impl MirrorStatEntry {
         }
     }
 
-    /// Same alias-resolution semantics as [`MirrorEntry::cache_host`].
+    /// The alias-resolved on-disk identity of this mirror; same resolution
+    /// as [`MirrorEntry::site`].
     #[must_use]
-    fn cache_host(&self) -> &CacheHost {
-        resolved_cache_host(&global_config().aliases, &self.host)
-    }
-
-    #[must_use]
-    pub(crate) fn cache_path(&self) -> PathBuf {
-        let cache = self.cache_host();
-        mirror_cache_path_impl(cache, self.port(), &self.path)
+    pub(crate) fn site(&self) -> MirrorSite<'_> {
+        MirrorSite {
+            host: resolved_cache_host(&global_config().aliases, &self.host),
+            port: self.port(),
+            path: &self.path,
+        }
     }
 }
 

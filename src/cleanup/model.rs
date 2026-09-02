@@ -2,14 +2,15 @@
 //! how leftovers are retained. No I/O — classification and the sweep decision
 //! are unit-testable truth tables.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use http::StatusCode;
 use tracing::trace;
 
 use crate::RETENTION_TIME;
-use crate::cache_layout::{CacheLayout, SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
+use crate::cache_layout::CacheLayout;
+use crate::cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
 use crate::cleanup::packages::FetchFailure;
 use crate::cleanup::sweep::SpanTable;
 use crate::config::Config;
@@ -50,8 +51,8 @@ pub(super) enum ReconcileFacet {
 
 impl ReconcileFacet {
     /// The layout this facet's tree is anchored under: it *places* the tree
-    /// (see [`unit_root`]) and is the key its sweep invalidates `cache_metadata`
-    /// on. Derived here rather than carried alongside the facet so the root the
+    /// (`CachePaths::entry_dir`) and is the key its sweep invalidates
+    /// `cache_metadata` on. Derived here rather than carried alongside the facet so the root the
     /// classifier builds and the key the engine invalidates on cannot disagree.
     pub(super) const fn cache_layout(self) -> CacheLayout {
         match self {
@@ -100,7 +101,7 @@ pub(super) struct ReconcileUnit {
 /// set is incomplete) sweeps past `backstop`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ByHashUnit {
-    /// Places the tree (see [`unit_root`]) and keys its `cache_metadata`
+    /// Places the tree (`CachePaths::entry_dir`) and keys its `cache_metadata`
     /// invalidation.
     pub layout: CacheLayout,
     pub root: PathBuf,
@@ -114,7 +115,7 @@ pub(super) struct ByHashUnit {
 /// reference source at all.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MetadataUnit {
-    /// Places the tree (see [`unit_root`]) and keys its `cache_metadata`
+    /// Places the tree (`CachePaths::entry_dir`) and keys its `cache_metadata`
     /// invalidation.
     pub layout: CacheLayout,
     pub root: PathBuf,
@@ -442,26 +443,6 @@ pub(super) fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
     Some((head, prefix))
 }
 
-/// On-disk root of the tree a unit with this `layout` scans, derived exactly the
-/// way the serve path builds its cache directory: [`CacheLayout::is_flat`] picks
-/// the anchor, [`CacheLayout::cache_subdir`] appends the layout's subdirectory.
-///
-/// Sharing that derivation with `ConnectionDetails::cache_dir_path` is the point.
-/// Cleanup used to hand-join the same `SUBDIR_*` constants, so if a layout's
-/// on-disk position ever moved, cleanup would keep scanning the old one — finding
-/// nothing, reaping nothing, and saying nothing.
-fn unit_root(layout: CacheLayout, cache_root: &Path, flat_root: &Path) -> PathBuf {
-    let anchor = if layout.is_flat() {
-        flat_root
-    } else {
-        cache_root
-    };
-    match layout.cache_subdir() {
-        Some(subdir) => anchor.join(subdir),
-        None => anchor.to_path_buf(),
-    }
-}
-
 /// Classify one `mirrors_v2` row into the ordered [`CleanupUnit`]s the engine
 /// will probe and sweep this cycle.
 ///
@@ -478,11 +459,14 @@ fn unit_root(layout: CacheLayout, cache_root: &Path, flat_root: &Path) -> PathBu
 /// under `entry.path` (`scan::derive_nested_paths`); it becomes the
 /// [`ReconcileFacet::FlatTree`] unit's walk boundaries.
 ///
-/// On-disk paths are computed via `entry.cache_path_with_aliases`/
-/// `flat_root_path_with_aliases` (using `config.aliases`) rather than
-/// reaching for `global_config()` (as the `cache_path` convenience method
-/// does): `global_config()` panics outside a running daemon, and this
-/// function must stay callable from a plain unit test.
+/// Every unit root is a [`CachePaths::entry_dir`] / [`CachePaths::tmp_dir`]
+/// of the mirror's alias-resolved site - the same derivation the serve path
+/// writes through (`ConnectionDetails::cache_file_path`), so a layout whose
+/// on-disk position moved cannot leave cleanup scanning the old one (finding
+/// nothing, reaping nothing, and saying nothing).  Both are computed from
+/// `config` (`entry.site_with_aliases(&config.aliases)`) rather than
+/// `global_config()`, which panics outside a running daemon: this function
+/// must stay callable from a plain unit test.
 pub(super) fn classify_mirror(
     entry: &MirrorEntry,
     nested: Vec<String>,
@@ -490,9 +474,8 @@ pub(super) fn classify_mirror(
 ) -> Vec<CleanupUnit> {
     let is_flat = entry.kind() == MirrorKind::Flat;
 
-    let cache_path = entry.cache_path_with_aliases(&config.aliases);
-    let cache_root: PathBuf = config.cache_directory.join(&cache_path);
-    let flat_root = entry.flat_root_path_with_aliases(&config.cache_directory, &config.aliases);
+    let paths = CachePaths::new(&config.cache_directory);
+    let site = entry.site_with_aliases(&config.aliases);
 
     let byhash_backstop = Duration::from_secs(24 * 60 * 60 * config.byhash_retention_days.get());
 
@@ -503,21 +486,18 @@ pub(super) fn classify_mirror(
     // derived from the layout.
     for layout in [CacheLayout::StructuredPool, CacheLayout::Flat] {
         units.push(CleanupUnit::Partials(PartialsUnit {
-            root: unit_root(layout, &cache_root, &flat_root).join(SUBDIR_TMP),
+            root: paths.tmp_dir(layout, site),
             span: PARTIALS_KEEP_SPAN,
         }));
     }
 
     if is_flat {
-        trace!(
-            "Skipping structured-pool cleanup for flat mirror {}",
-            cache_path.display()
-        );
+        trace!("Skipping structured-pool cleanup for flat mirror {site}");
     } else {
         let facet = ReconcileFacet::StructuredPool;
         units.push(CleanupUnit::Reconcile(ReconcileUnit {
             facet,
-            tree: TreeSpec::shallow(unit_root(facet.cache_layout(), &cache_root, &flat_root)),
+            tree: TreeSpec::shallow(paths.entry_dir(facet.cache_layout(), site)),
             groups: vec![SourceGroup {
                 source: IndexSource::OriginPackages {
                     origin_rows_of: OriginOwner::SelfRow,
@@ -567,7 +547,7 @@ pub(super) fn classify_mirror(
     units.push(CleanupUnit::Reconcile(ReconcileUnit {
         facet,
         tree: TreeSpec {
-            root: unit_root(facet.cache_layout(), &cache_root, &flat_root),
+            root: paths.entry_dir(facet.cache_layout(), site),
             walk: Walk::Recursive {
                 skip_subdirs: &[SUBDIR_FLAT_BYHASH, SUBDIR_TMP],
                 boundaries: nested,
@@ -584,7 +564,7 @@ pub(super) fn classify_mirror(
         let layout = CacheLayout::Dists;
         units.push(CleanupUnit::Metadata(MetadataUnit {
             layout,
-            root: unit_root(layout, &cache_root, &flat_root),
+            root: paths.entry_dir(layout, site),
             span: METADATA_KEEP_SPAN,
         }));
     }
@@ -592,7 +572,7 @@ pub(super) fn classify_mirror(
     let layout = CacheLayout::Flat;
     units.push(CleanupUnit::Metadata(MetadataUnit {
         layout,
-        root: unit_root(layout, &cache_root, &flat_root),
+        root: paths.entry_dir(layout, site),
         span: METADATA_KEEP_SPAN,
     }));
 
@@ -600,10 +580,10 @@ pub(super) fn classify_mirror(
         let layout = CacheLayout::DistsByHash;
         units.push(CleanupUnit::ByHash(ByHashUnit {
             layout,
-            root: unit_root(layout, &cache_root, &flat_root),
+            root: paths.entry_dir(layout, site),
             // The dists metadata tree -- the same root the structured
             // `Metadata` unit sweeps.
-            release_dir: unit_root(CacheLayout::Dists, &cache_root, &flat_root),
+            release_dir: paths.entry_dir(CacheLayout::Dists, site),
             dist_gate: DistGate::ActiveOriginDists,
             grace: UNREFERENCED_KEEP_SPAN,
             backstop: byhash_backstop,
@@ -613,9 +593,9 @@ pub(super) fn classify_mirror(
     let layout = CacheLayout::FlatByHash;
     units.push(CleanupUnit::ByHash(ByHashUnit {
         layout,
-        root: unit_root(layout, &cache_root, &flat_root),
+        root: paths.entry_dir(layout, site),
         // The flat root -- the same root the flat `Metadata` unit sweeps.
-        release_dir: unit_root(CacheLayout::Flat, &cache_root, &flat_root),
+        release_dir: paths.entry_dir(CacheLayout::Flat, site),
         dist_gate: DistGate::None,
         grace: UNREFERENCED_KEEP_SPAN,
         backstop: byhash_backstop,
@@ -864,7 +844,8 @@ mod tests {
 
     // classify_mirror
 
-    use crate::config::ClientHost;
+    use crate::cache_paths::MirrorSite;
+    use crate::config::{Alias, ClientHost};
 
     fn test_entry(host: &str, path: &str, kind: MirrorKind) -> MirrorEntry {
         MirrorEntry::new_for_test(
@@ -907,8 +888,8 @@ mod tests {
         let units = classify_mirror(&entry, Vec::new(), &config);
 
         // The roots are spelled out rather than derived so this test pins the
-        // on-disk positions themselves; `unit_root` derives them from
-        // `CacheLayout::cache_subdir`, the same helper the serve path uses, so a
+        // on-disk positions themselves; `classify_mirror` derives them from
+        // `CachePaths::entry_dir`, the same helper the serve path uses, so a
         // layout that moves on disk moves cleanup's scan with it.
         assert_eq!(
             units,
@@ -990,24 +971,61 @@ mod tests {
     }
 
     #[test]
-    fn unit_root_matches_the_serve_path_layout_positions() {
-        // The on-disk position of every layout comes from
-        // `CacheLayout::cache_subdir`/`is_flat`, which is what
-        // `ConnectionDetails::cache_path_impl` builds the serve path from.
-        let cache_root = PathBuf::from("/cache/host/debian");
-        let flat_root = PathBuf::from("/cache/host/flat/debian");
-        for (layout, expected) in [
-            (CacheLayout::StructuredPool, "/cache/host/debian"),
-            (CacheLayout::Dists, "/cache/host/debian/dists"),
-            (CacheLayout::DistsByHash, "/cache/host/debian/dists/by-hash"),
-            (CacheLayout::Flat, "/cache/host/flat/debian"),
-            (CacheLayout::FlatByHash, "/cache/host/flat/debian/by-hash"),
-        ] {
-            assert_eq!(
-                unit_root(layout, &cache_root, &flat_root),
-                PathBuf::from(expected),
-                "{layout:?} root"
-            );
+    fn unit_roots_are_the_serve_path_entry_dirs_of_the_aliased_site() {
+        // Every root cleanup scans is `CachePaths::entry_dir`/`tmp_dir` of
+        // the same `MirrorSite` the serve path writes through - including
+        // the alias resolution: the row names the alias host, the tree lives
+        // under the alias' main host.
+        let entry = test_entry("mirror.alias.org", "debian", MirrorKind::Structured);
+        let mut config = test_config("/cache");
+        config.aliases = vec![Alias {
+            main: ClientHost::new("deb.debian.org".to_owned())
+                .expect("valid host")
+                .into_cache_host(),
+            aliases: vec![ClientHost::new("mirror.alias.org".to_owned()).expect("valid host")],
+        }];
+        let paths = CachePaths::new(&config.cache_directory);
+        let main = ClientHost::new("deb.debian.org".to_owned())
+            .expect("valid host")
+            .into_cache_host();
+        let site = MirrorSite {
+            host: &main,
+            port: None,
+            path: "debian",
+        };
+        assert_eq!(
+            paths.mirror_dir(site),
+            PathBuf::from("/cache/deb.debian.org/debian")
+        );
+
+        let units = classify_mirror(&entry, Vec::new(), &config);
+        assert_eq!(units.len(), 8);
+        for unit in &units {
+            match unit {
+                CleanupUnit::Reconcile(r) => {
+                    assert_eq!(r.tree.root, paths.entry_dir(r.facet.cache_layout(), site));
+                }
+                CleanupUnit::ByHash(b) => {
+                    assert_eq!(b.root, paths.entry_dir(b.layout, site));
+                    let release_layout = if b.layout.is_flat() {
+                        CacheLayout::Flat
+                    } else {
+                        CacheLayout::Dists
+                    };
+                    assert_eq!(b.release_dir, paths.entry_dir(release_layout, site));
+                }
+                CleanupUnit::Metadata(m) => {
+                    assert_eq!(m.root, paths.entry_dir(m.layout, site));
+                }
+                CleanupUnit::Partials(p) => {
+                    assert!(
+                        p.root == paths.tmp_dir(CacheLayout::StructuredPool, site)
+                            || p.root == paths.tmp_dir(CacheLayout::Flat, site),
+                        "partials root {} is a layout tmp dir",
+                        p.root.display()
+                    );
+                }
+            }
         }
     }
 

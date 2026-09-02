@@ -43,8 +43,9 @@ use crate::{
         AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
     },
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{self, CacheMiss, CachedFlavor, ConnectionDetails, SUBDIR_TMP},
+    cache_layout::{self, CacheMiss, CachedFlavor, ConnectionDetails},
     cache_metadata::{self, InvalidValidator, UpstreamMetadata, check_upstream_validators},
+    cache_paths::CachePaths,
     cache_quota::QuotaExceeded,
     channel_body::ChannelBody,
     client_counter,
@@ -2106,9 +2107,7 @@ async fn serve_new_file(
         }
         utils::PartialDownload::Volatile => {
             // Volatile file: random temp file
-            let tmppath: PathBuf = [&config.cache_directory, Path::new(SUBDIR_TMP), filename]
-                .iter()
-                .collect();
+            let tmppath = CachePaths::new(&config.cache_directory).scratch_file(filename);
             match tokio_tempfile(&tmppath, 0o640).await {
                 Ok((f, p)) => (f, p),
                 Err(err) => {

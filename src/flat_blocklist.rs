@@ -42,7 +42,7 @@ use parking_lot::RwLock;
 use tracing::warn;
 
 use crate::{
-    cache_layout::{SUBDIR_FLAT, SUBDIR_FLAT_PREFIX},
+    cache_paths::{SUBDIR_FLAT, SUBDIR_FLAT_PREFIX},
     config::{CacheHost, resolve_alias},
     database::Database,
     global_config,

@@ -1,11 +1,12 @@
-use std::{borrow::Cow, path::Path};
+use std::{borrow::Cow, num::NonZero, path::Path};
 
 use hashbrown::HashMap;
 use tracing::{debug, error, trace};
 
 use crate::{
-    cache_layout::{KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
+    cache_paths::{CachePaths, KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
     cache_walk::{DirFailure, Entry, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker},
+    config::CacheHost,
     database::{Database, MirrorEntry},
     deb_mirror::{
         MirrorKind, NestedMirrorRelation, derive_nested_paths, is_deb_package,
@@ -68,6 +69,15 @@ enum Level {
     ByHash,
 }
 
+/// The mirror rows sharing one `{host[:port]}` cache directory, keyed by
+/// that directory's name, plus the resolved host the name came from so the
+/// host-level `flat/` root can be derived once per bucket.
+struct HostBucket<'a> {
+    host: &'a CacheHost,
+    port: Option<NonZero<u16>>,
+    mirrors: Vec<&'a MirrorEntry>,
+}
+
 static CACHE_ROOT_WALK: WalkContext = WalkContext {
     what: "the cache directory",
     dir_failure: DirFailure::Abort("abandoning the cache scan"),
@@ -106,7 +116,8 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
         }
     };
 
-    let cache_path = &config.cache_directory;
+    let paths = CachePaths::new(&config.cache_directory);
+    let cache_path = paths.root();
 
     trace!("Scanning directory `{}`...", cache_path.display());
 
@@ -117,22 +128,27 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
     // bucket (sorted, as `derive_nested_paths` requires).  Keys are owned
     // `String`s because the `Cow` from `format_cache_dir` may borrow from
     // local data (the formatted port).
-    let mut mirrors_by_dir: HashMap<String, Vec<&MirrorEntry>> =
-        HashMap::with_capacity(mirrors.len());
+    let mut mirrors_by_dir: HashMap<String, HostBucket<'_>> = HashMap::with_capacity(mirrors.len());
     let mut paths_by_host_dir: HashMap<String, Vec<&str>> = HashMap::with_capacity(mirrors.len());
     for mirror in &mirrors {
-        let dir_name = mirror
-            .cache_host()
-            .format_cache_dir(mirror.port())
-            .into_owned();
+        let site = mirror.site_with_aliases(&config.aliases);
+        let dir_name = site.host.format_cache_dir(site.port).into_owned();
         paths_by_host_dir
             .entry(dir_name.clone())
             .or_default()
             .push(mirror.path.as_str());
-        mirrors_by_dir.entry(dir_name).or_default().push(mirror);
+        mirrors_by_dir
+            .entry(dir_name)
+            .or_insert_with(|| HostBucket {
+                host: site.host,
+                port: site.port,
+                mirrors: Vec::new(),
+            })
+            .mirrors
+            .push(mirror);
     }
-    for paths in paths_by_host_dir.values_mut() {
-        paths.sort_unstable();
+    for mirror_paths in paths_by_host_dir.values_mut() {
+        mirror_paths.sort_unstable();
     }
 
     let mut totals = ScanTotals::default();
@@ -175,7 +191,7 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             continue;
         };
 
-        let Some(mirrors_here) = mirrors_by_dir.get(name_str) else {
+        let Some(bucket) = mirrors_by_dir.get(name_str) else {
             entry.report_unexpected(
                 "no registered mirror matches it, so not counting it or its contents towards the cache size",
             );
@@ -195,16 +211,23 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             .map(Vec::as_slice)
             .unwrap_or_default();
 
-        let host_path = entry.path();
-        for mirror in mirrors_here {
+        // The bucket key is the host directory's name, so the walker's entry
+        // and the derived host dir must be the same directory.
+        debug_assert_eq!(
+            entry.path(),
+            paths.host_dir(bucket.host, bucket.port),
+            "the walked host directory must be the one CachePaths derives for its bucket"
+        );
+        for mirror in &bucket.mirrors {
             let nested = derive_nested_paths(&mirror.path, host_paths);
-            totals += scan_mirror_dir(&host_path, mirror, &nested).await;
+            let mirror_dir = paths.mirror_dir(mirror.site_with_aliases(&config.aliases));
+            totals += scan_mirror_dir(&mirror_dir, mirror, &nested).await;
         }
 
         // The host-level `flat/` subtree is a sibling of mirror dirs.
         // Scan once per host regardless of how many mirror rows live
         // under it — flat content is owned at the host level.
-        let flat_path = host_path.join(SUBDIR_FLAT);
+        let flat_path = paths.flat_root(bucket.host, bucket.port);
         match probe_dir(&flat_path, "host-level flat root").await {
             Ok(true) => {
                 let (_outcome, flat_totals) =
@@ -229,29 +252,20 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
     }
 }
 
-/// Tally one mirror row's `<host>/<mirror_path>/` tree.  `nested` lists the
-/// registered mirror paths strictly below `mirror.path` on this host (see
-/// `derive_nested_paths`), which the walk treats as foreign territory.
+/// Tally one mirror row's `<host>/<mirror_path>/` tree at `mirror_path`
+/// (`CachePaths::mirror_dir`).  `nested` lists the registered mirror paths
+/// strictly below `mirror.path` on this host (see `derive_nested_paths`),
+/// which the walk treats as foreign territory.
 #[must_use]
-async fn scan_mirror_dir(host_path: &Path, mirror: &MirrorEntry, nested: &[String]) -> ScanTotals {
-    let mirror_path = {
-        let mut p = host_path.to_path_buf();
-        let mpath = Path::new(&mirror.path);
-        // `MirrorEntry::path` is validated relative by `valid_mirrorname` at
-        // insertion; a debug_assert catches a corrupted DB row during
-        // development without paying for a runtime check on every scan.
-        debug_assert!(
-            mpath.is_relative(),
-            "path construction must not contain absolute components"
-        );
-        p.push(mpath);
-        p
-    };
-
+async fn scan_mirror_dir(
+    mirror_path: &Path,
+    mirror: &MirrorEntry,
+    nested: &[String],
+) -> ScanTotals {
     trace!("Scanning mirror directory `{}`...", mirror_path.display());
 
     let (outcome, totals) = scan_tree(
-        &mirror_path,
+        mirror_path,
         &MIRROR_WALK,
         Level::Mirror,
         &mirror.path,

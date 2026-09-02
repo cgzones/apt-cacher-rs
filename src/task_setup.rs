@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use xattr::FileExt as _;
 
 use crate::{
-    cache_layout::SUBDIR_TMP, error::ErrorReport, global_config, utils::nofollow_options,
+    cache_paths::CachePaths, error::ErrorReport, global_config, utils::nofollow_options,
     xattr_helpers::set_xattr_supported,
 };
 
@@ -204,7 +204,7 @@ pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
         }
     }
 
-    let cache_tmp_path = cache_path.join(SUBDIR_TMP);
+    let cache_tmp_path = CachePaths::new(cache_path).scratch_dir();
 
     std::fs::create_dir_all(&cache_tmp_path)
         .map_err(SetupError::io("create directory", &cache_tmp_path))?;

@@ -1254,7 +1254,7 @@ async fn resolve_origin_packages_self(
         "Found {} active origins and {} cached deb files for mirror {mirror} (`{}`)",
         active_origins.len(),
         cached_files.len(),
-        entry.cache_path().display(),
+        entry.site(),
     );
 
     // Diagnostic: cached debs exist but cleanup will fetch no Packages

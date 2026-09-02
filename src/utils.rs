@@ -8,16 +8,8 @@ use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    Never,
-    cache_layout::{SUBDIR_FLAT, SUBDIR_TMP},
-    config::CacheHost,
-    deb_mirror,
-    error::ErrorReport,
-    global_config,
-    guards::InitBarrier,
-    http_etag::read_etag,
-    humanfmt::HumanFmt,
-    metrics, warn_once_or_debug, xattr_helpers,
+    Never, cache_paths::CachePaths, deb_mirror, error::ErrorReport, guards::InitBarrier,
+    http_etag::read_etag, humanfmt::HumanFmt, metrics, warn_once_or_debug, xattr_helpers,
 };
 
 /// Compile-time macro for creating a `NonZero` value, panicking if the value is zero.
@@ -631,75 +623,21 @@ pub(crate) async fn tokio_tempfile(
 }
 
 /// Build the deterministic on-disk path for a download's `.partial` temp
-/// file.  The tmp file lives as a *sibling* of the eventual rename target,
-/// so the atomic `rename(2)` after the download finishes stays within the
-/// same filesystem.
+/// file: [`CachePaths::partial_file`] for the download's layout and site,
+/// i.e. the `tmp/` sibling of the eventual rename target
+/// (`{anchor}/tmp/{debname}.partial`), so the atomic `rename(2)` after the
+/// download finishes stays within the same filesystem.
 ///
-/// Layout (parallels [`crate::cache_layout::ConnectionDetails::cache_dir_path`]):
-///
-/// - Structured: `{cache_directory}/{host}/{mirror_path}/tmp/{debname}.partial`
-/// - Flat:        `{cache_directory}/{host}/flat/{mirror_path}/tmp/{debname}.partial`
-///
-/// `{host}` is the alias-resolved host when the request was redirected
-/// (mirroring [`crate::cache_layout::ConnectionDetails::cache_dir_path`]); otherwise it is the
-/// mirror's own host.  Using the same host on both sides keeps the
-/// `.partial` co-located with its rename target so the sibling guarantee
-/// holds.
-///
-/// Disambiguation between flat-pool `.deb`s sharing a basename across
-/// different sub-directories (`apt/amd64/foo.deb` vs `apt/arm64/foo.deb`)
-/// is implicit in [`crate::deb_mirror::Mirror::path`], which equals the
-/// URL-dir verbatim under the host-anchored flat layout.
+/// The site comes from [`InitBarrier::site`], which resolves the alias'
+/// main host exactly like `ConnectionDetails::site` does for the rename
+/// target; using the same host on both sides is what keeps the sibling
+/// guarantee.  Disambiguation between flat-pool `.deb`s sharing a basename
+/// across different sub-directories (`apt/amd64/foo.deb` vs
+/// `apt/arm64/foo.deb`) is implicit in the site's mirror path, which equals
+/// the URL-dir verbatim under the host-anchored flat layout.
 fn partial_path_for_barrier(ibarrier: &InitBarrier<'_>) -> PathBuf {
-    let mirror = ibarrier.mirror();
-    let layout = ibarrier.layout();
-    // Resolve to the on-disk cache identity.  Mirrors the rule in
-    // `ConnectionDetails::cache_dir_path` so the `.partial` lands next to the
-    // eventual rename target.
-    let host: &CacheHost = match ibarrier.aliased_host() {
-        Some(cache) => cache,
-        None => mirror.host().as_cache_host(),
-    };
     let filename = format!("{debname}.partial", debname = ibarrier.debname());
-    let filename_path = Path::new(&filename);
-    assert!(
-        filename_path.is_relative(),
-        "path construction must not contain absolute components"
-    );
-
-    if layout.is_flat() {
-        let host_dir = host.format_cache_dir(mirror.port());
-        let host_path = Path::new(&*host_dir);
-        assert!(
-            host_path.is_relative(),
-            "path construction must not contain absolute components"
-        );
-        let mirror_path_relative = Path::new(mirror.path());
-        assert!(
-            mirror_path_relative.is_relative(),
-            "path construction must not contain absolute components"
-        );
-        [
-            &global_config().cache_directory,
-            host_path,
-            Path::new(SUBDIR_FLAT),
-            mirror_path_relative,
-            Path::new(SUBDIR_TMP),
-            filename_path,
-        ]
-        .iter()
-        .collect()
-    } else {
-        let mirror_dir = deb_mirror::mirror_cache_path_impl(host, mirror.port(), mirror.path());
-        [
-            &global_config().cache_directory,
-            mirror_dir.as_path(),
-            Path::new(SUBDIR_TMP),
-            filename_path,
-        ]
-        .iter()
-        .collect()
-    }
+    CachePaths::global().partial_file(ibarrier.layout(), ibarrier.site(), Path::new(&filename))
 }
 
 /// Open an existing partial file for writing at the end, returning the file, its current size,

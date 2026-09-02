@@ -31,9 +31,8 @@ use crate::tunnel_limiter::active_tunnels;
 #[cfg(feature = "hyper")]
 use crate::{APP_NAME, ProxyCacheBody, http_range::format_http_date};
 use crate::{
-    APP_VERSION, AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails,
-    cache_layout::SUBDIR_FLAT_BYHASH,
-    cache_metadata,
+    APP_VERSION, AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails, cache_metadata,
+    cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH},
     cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker},
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
@@ -2672,9 +2671,10 @@ async fn build_mirror_table(
     let mut sorted: Vec<&MirrorStatEntry> = mirrors.iter().collect();
     sorted.sort_unstable_by_key(|m| Reverse(m.last_seen));
 
+    let paths = CachePaths::new(cache_path);
     let mirror_paths: Vec<PathBuf> = sorted
         .iter()
-        .map(|mirror| [cache_path, &mirror.cache_path()].iter().collect())
+        .map(|mirror| paths.mirror_dir(mirror.site()))
         .collect();
 
     // Bound disk fan-out: cold-cache rebuilds otherwise spawn one concurrent

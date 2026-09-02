@@ -59,7 +59,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::cache_conditional::RangeRequestHeaders;
 use crate::cache_layout;
-use crate::cache_layout::{CachedFlavor, ConnectionDetails, SUBDIR_TMP};
+use crate::cache_layout::{CachedFlavor, ConnectionDetails};
+use crate::cache_paths::CachePaths;
 use crate::cache_quota::QuotaExceeded;
 use crate::database_task::{
     DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command,
@@ -607,13 +608,7 @@ async fn prepare_cache_target(
                 )))
             })?,
         utils::PartialDownload::Volatile => {
-            let tmppath: PathBuf = [
-                &global_config().cache_directory,
-                Path::new(SUBDIR_TMP),
-                filename,
-            ]
-            .iter()
-            .collect();
+            let tmppath = CachePaths::global().scratch_file(filename);
             tokio_tempfile(&tmppath, 0o640).await.map_err(|err| {
                 SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
                     "splice proxy: failed to create temp file `{}`; aborting the download:  {}",

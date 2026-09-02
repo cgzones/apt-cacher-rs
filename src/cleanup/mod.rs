@@ -156,9 +156,8 @@ async fn task_cleanup_impl(appstate: &AppState) {
     // Group mirror paths by (cache_host, port) and sort each group once so
     // each mirror's nested-paths derivation is O(k) over its host's siblings
     // instead of O(n) over every mirror.  Keying on the alias-resolved
-    // `CacheHost` (the same identity `MirrorEntry::cache_path` and
-    // `flat_root_path_with_aliases` use to build on-disk paths) matches the cleanup
-    // layout: two DB rows whose raw `ClientHost` differs but resolves to
+    // `CacheHost` (the same identity `MirrorEntry::site_with_aliases` hands
+    // `CachePaths` to build on-disk paths) matches the cleanup layout: two DB rows whose raw `ClientHost` differs but resolves to
     // the same `main` host share `<cache>/<main_host>/…` on disk, so they
     // must share a nesting bucket — otherwise a parent's flat-cleanup could
     // recurse into and age-evict files owned by a sibling alias's mirror.

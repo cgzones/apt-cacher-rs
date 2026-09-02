@@ -25,7 +25,8 @@ use crate::{APP_USER_AGENT, scheme_cache};
 use crate::{
     AppState, ClientInfo, DB_DRAIN_TIMEOUT, OUTPUT_LOG_FILE, RUNTIMEDETAILS,
     active_downloads::ActiveDownloads,
-    cache_layout, cache_metadata,
+    cache_metadata,
+    cache_paths::CachePaths,
     cleanup::{
         CLEANUP_INTERVAL_SECS, FIRST_CLEANUP_DELAY_SECS, set_next_cleanup_epoch, task_cleanup,
     },
@@ -209,12 +210,9 @@ pub(crate) async fn main_loop(
     // mirror's legacy flat dir and warn so the operator can reclaim
     // space; we deliberately do not remove anything automatically because
     // a misconfigured alias change could otherwise wipe live cache.
+    let paths = CachePaths::new(&config.cache_directory);
     for mirror in &mirrors {
-        let legacy_flat = config
-            .cache_directory
-            .join(mirror.cache_host().format_cache_dir(mirror.port()).as_ref())
-            .join(&mirror.path)
-            .join(cache_layout::SUBDIR_FLAT);
+        let legacy_flat = paths.legacy_flat_dir(mirror.site_with_aliases(&config.aliases));
         match tokio::fs::symlink_metadata(&legacy_flat).await {
             Ok(md) if md.file_type().is_dir() => {
                 warn!(

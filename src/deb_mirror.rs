@@ -1,11 +1,8 @@
-use std::{borrow::Cow, num::NonZero, path::PathBuf, sync::OnceLock};
+use std::{borrow::Cow, num::NonZero, sync::OnceLock};
 
 use tracing::debug;
 
-use crate::{
-    config::{CacheHost, ClientHost},
-    database,
-};
+use crate::{config::ClientHost, database};
 
 /// On-disk layout family of a mirror.  Stored in the `mirrors_v2.kind`
 /// INTEGER column (added by the `20260512155314_mirror_kind` migration);
@@ -175,33 +172,6 @@ impl std::fmt::Display for Mirror {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.format_authority(), self.path)
     }
-}
-
-#[expect(
-    clippy::pathbuf_init_then_push,
-    reason = "the auto-suggestion `.join()` allocates a fresh PathBuf and \
-              throws away the with_capacity sizing we want here"
-)]
-pub(crate) fn mirror_cache_path_impl(
-    host: &CacheHost,
-    port: Option<NonZero<u16>>,
-    path: &str,
-) -> PathBuf {
-    let host_dir = host.format_cache_dir(port);
-    // Pre-size for the eventual final length so PathBuf::push doesn't grow
-    // the underlying OsString.  +1 for the path separator inserted between
-    // the two pushes.  This path is built per served file and showed up at
-    // 95 % of worker stacks in profiles dominated by Path/Vec growth.
-    let mut cache_path = PathBuf::with_capacity(host_dir.len() + 1 + path.len());
-    cache_path.push(host_dir.as_ref());
-    cache_path.push(path);
-
-    assert!(
-        cache_path.is_relative(),
-        "cache path must be relative in order to be joined with the host directory"
-    );
-
-    cache_path
 }
 
 #[derive(Debug, PartialEq)]

@@ -22,6 +22,7 @@ mod active_downloads;
 mod cache_conditional;
 mod cache_layout;
 mod cache_metadata;
+mod cache_paths;
 mod cache_quota;
 mod cache_walk;
 #[cfg(feature = "hyper")]

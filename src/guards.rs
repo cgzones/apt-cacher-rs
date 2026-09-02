@@ -7,9 +7,9 @@ use crate::{
     active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads},
     cache_layout::{CacheEntryKey, CacheEntryKeyRef, CacheLayout, ConnectionDetails, ResourceKind},
     cache_metadata::{self, UpstreamMetadata},
+    cache_paths::MirrorSite,
     cache_quota::QuotaReservation,
     config::CacheHost,
-    deb_mirror::Mirror,
     error::ErrorReport,
     global_verify_throttle,
     humanfmt::HumanFmt,
@@ -29,9 +29,9 @@ struct InitBarrierData<'a> {
     key: CacheEntryKeyRef<'a>,
     /// When the request was resolved against an alias mapping, the on-disk
     /// host directory is the alias' main host (not `mirror.host()`).  Kept
-    /// here so that `partial_path_for_barrier` lays the `.partial` next to
-    /// the eventual rename target produced by
-    /// `ConnectionDetails::cache_dir_path`, which also uses this host.
+    /// here so that [`InitBarrier::site`] resolves the same site as
+    /// `ConnectionDetails::site` and `partial_path_for_barrier` lays the
+    /// `.partial` next to the eventual rename target.
     aliased_host: Option<&'static CacheHost>,
     resource_kind: ResourceKind,
     /// The raw client request URI path (pre-normalisation, pre-redirect),
@@ -116,15 +116,6 @@ impl<'a> InitBarrier<'a> {
     }
 
     #[must_use]
-    pub(crate) fn mirror(&self) -> &Mirror {
-        self.data
-            .as_ref()
-            .expect("every sink consumes the instance")
-            .key
-            .mirror
-    }
-
-    #[must_use]
     pub(crate) fn debname(&self) -> &str {
         self.data
             .as_ref()
@@ -142,16 +133,27 @@ impl<'a> InitBarrier<'a> {
             .layout
     }
 
-    /// Aliased host the request was redirected to, if any.  Matches the
-    /// host used by `ConnectionDetails::cache_dir_path` so callers (notably
-    /// `partial_path_for_barrier`) can place the `.partial` file in the
-    /// same host directory as the eventual rename target.
+    /// The alias-resolved on-disk identity of the download's mirror - the
+    /// same site `ConnectionDetails::site` resolves (alias' `main` host when
+    /// the request was redirected, else the mirror's own host), so
+    /// `partial_path_for_barrier` places the `.partial` in the same tree
+    /// as the eventual rename target.
     #[must_use]
-    pub(crate) fn aliased_host(&self) -> Option<&'static CacheHost> {
-        self.data
+    pub(crate) fn site(&self) -> MirrorSite<'_> {
+        let data = self
+            .data
             .as_ref()
-            .expect("every sink consumes the instance")
-            .aliased_host
+            .expect("every sink consumes the instance");
+        let mirror = data.key.mirror;
+        let host = match data.aliased_host {
+            Some(cache) => cache,
+            None => mirror.host().as_cache_host(),
+        };
+        MirrorSite {
+            host,
+            port: mirror.port(),
+            path: mirror.path(),
+        }
     }
 }
 

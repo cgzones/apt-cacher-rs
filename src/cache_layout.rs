@@ -39,14 +39,14 @@
 //! disambiguate per-distribution copies that share the same on-disk
 //! `mirror_path`.
 //!
-//! # Subdir constants
+//! # Paths
 //!
-//! Use [`SUBDIR_DISTS`], [`SUBDIR_DISTS_BYHASH`], [`SUBDIR_FLAT`], and
-//! [`SUBDIR_FLAT_BYHASH`] anywhere a layout subdirectory is referenced —
-//! both in dispatch sites that build [`ConnectionDetails`] and in cleanup
-//! / scan tasks that walk the cache tree.  Wrap with `Path::new(...)` at
-//! the use site.  [`KNOWN_MIRROR_SUBDIRS`] is the list of legitimate
-//! mirror-level subdirectories the startup scan recurses into.
+//! The joins themselves - and the subdirectory names (`dists/`, `flat/`,
+//! `by-hash/`, `tmp/`) - live in [`crate::cache_paths`]: this module decides
+//! *which* [`CacheLayout`] a resource has, [`crate::cache_paths::CachePaths`]
+//! turns a layout plus a [`crate::cache_paths::MirrorSite`] into the
+//! directory, and every scan / cleanup task derives its roots from the same
+//! helper.
 
 use std::{
     borrow::Cow,
@@ -59,69 +59,14 @@ use tracing::trace;
 
 use crate::{
     ClientInfo,
+    cache_paths::{CachePaths, MirrorSite},
     config::CacheHost,
     deb_mirror::{
         FlatKind, Mirror, MirrorKind, ResourceFile, is_deb_package, is_flat_deb_filename,
         valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
     },
-    global_config,
     precise_instant::PreciseInstant,
 };
-
-// ---------------------------------------------------------------------------
-// Subdir constants
-// ---------------------------------------------------------------------------
-
-// Subdirectory string constants.  Callers wrap with `Path::new(...)` at the
-// use site since `Path::new` is not yet stable as a `const fn` in static
-// context.
-//
-// TODO: convert these to `&'static Path` constants once `Path::new` is
-// stable as a `const fn` in static context (tracking issue
-// https://github.com/rust-lang/rust/issues/143874).  Call sites then drop
-// their `Path::new(...)` wrappers.
-
-/// Subdirectory holding `dists/`-anchored metadata (`Release`, `Packages*`,
-/// etc.) under each `{host}/{mirror_path}/` cache root.
-pub(crate) const SUBDIR_DISTS: &str = "dists";
-
-/// Subdirectory holding by-hash content-addressed files belonging to the
-/// structured `dists/` layout.
-pub(crate) const SUBDIR_DISTS_BYHASH: &str = "dists/by-hash";
-
-/// Host-level subdirectory anchoring every flat (trivial) repository served
-/// from a given host.  The on-disk layout below it mirrors the URL path
-/// verbatim: e.g. a flat-pool request for
-/// `apt/amd64/twilio_5.0.0_amd64.deb` lands at
-/// `{cache}/{host}/flat/apt/amd64/twilio_5.0.0_amd64.deb`.
-pub(crate) const SUBDIR_FLAT: &str = "flat";
-
-/// Prefix for mirror paths that collide with the host-level flat layout
-/// (i.e. paths starting with `"flat/"`).  Used by [`crate::flat_blocklist`]
-/// to detect collision patterns.
-pub(crate) const SUBDIR_FLAT_PREFIX: &str = "flat/";
-
-/// Subdirectory holding by-hash content-addressed files belonging to a flat
-/// repository.  Appended below `{cache}/{host}/flat/{mirror_path}/` for a
-/// `Flat::ByHash` request.
-pub(crate) const SUBDIR_FLAT_BYHASH: &str = "by-hash";
-
-/// Partial-download scratch directory.  Lives per-mirror at
-/// `{cache}/{host}/{mirror_path}/tmp/` (structured) and
-/// `{cache}/{host}/flat/{mirror_path}/tmp/` (flat).  Files here are owned by
-/// `cleanup_tmp_dir`, never tallied in the cache-size sweep.
-pub(crate) const SUBDIR_TMP: &str = "tmp";
-
-/// Layout subdirectory names that may legitimately appear under each
-/// `{cache_directory}/{host}/{mirror_path}/` directory.  The startup cache
-/// scan recurses into each and tallies its size; anything else triggers an
-/// "Unrecognized directory entry" warning.
-///
-/// `tmp/` is intentionally **not** listed here: it is partial-download
-/// scratch space (not part of the served cache layout), is handled
-/// separately by `task_cache_scan` with its own skip branch, and is reaped
-/// by `cleanup_tmp_dir` rather than tallied.
-pub(crate) const KNOWN_MIRROR_SUBDIRS: &[&str] = &[SUBDIR_DISTS];
 
 // ---------------------------------------------------------------------------
 // Cache-flavor and connection types (moved from main.rs)
@@ -233,20 +178,6 @@ pub(crate) enum CacheLayout {
 }
 
 impl CacheLayout {
-    /// On-disk subdir below the layout-anchored cache root for this
-    /// variant.  Returns `None` when the file lives directly under the
-    /// anchored root (structured pool, flat metadata / flat pool); the
-    /// `by-hash` segment is the only suffix represented here.
-    #[must_use]
-    pub(crate) fn cache_subdir(self) -> Option<&'static Path> {
-        match self {
-            Self::StructuredPool | Self::Flat => None,
-            Self::Dists => Some(Path::new(SUBDIR_DISTS)),
-            Self::DistsByHash => Some(Path::new(SUBDIR_DISTS_BYHASH)),
-            Self::FlatByHash => Some(Path::new(SUBDIR_FLAT_BYHASH)),
-        }
-    }
-
     /// Whether this layout is anchored under the per-host `flat/`
     /// subdirectory rather than directly under `{host}/{mirror_path}/`.
     #[must_use]
@@ -398,7 +329,7 @@ pub(crate) enum CacheMiss {
 
 /// Per-request state carried across the cache pipeline.  Owns enough of the
 /// classified resource to assemble the on-disk path via
-/// [`Self::cache_dir_path`].
+/// [`Self::cache_file_path`].
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionDetails {
     pub(crate) client: ClientInfo,
@@ -432,97 +363,39 @@ impl ConnectionDetails {
         CacheEntryKeyRef::new(&self.mirror, &self.debname, self.layout())
     }
 
-    /// Build the absolute directory path holding this request's cached file.
-    /// The full file path is `<this>/<debname>`; the leaf is appended by the
-    /// caller.
-    ///
-    /// Structured layouts → `{cache}/{host}/{mirror_path}/{subdir?}/`
-    /// Flat layouts        → `{cache}/{host}/flat/{mirror_path}/{by-hash?}/`
-    ///
-    /// The flat branch embeds the URL path verbatim under the host-level
-    /// `flat/` sibling, so disambiguation between flat-pool subdirs
-    /// (e.g. `apt/amd64/foo.deb` vs `apt/arm64/foo.deb`) is implicit in
-    /// `mirror.path()` rather than a separately threaded field.
+    /// The alias-resolved on-disk identity of this request's mirror: the
+    /// alias' `main` host when the request was resolved against an alias
+    /// mapping, else the mirror's own host.  `utils::create_partial_file`
+    /// resolves the same site through `InitBarrier::site`, so the `.partial`
+    /// lands next to its rename target.
+    #[must_use]
+    pub(crate) fn site(&self) -> MirrorSite<'_> {
+        let host = match self.aliased_host {
+            Some(cache) => cache,
+            None => self.mirror.host().as_cache_host(),
+        };
+        MirrorSite {
+            host,
+            port: self.mirror.port(),
+            path: self.mirror.path(),
+        }
+    }
+
+    /// The absolute directory holding this request's cached file
+    /// ([`CachePaths::entry_dir`] for its layout and site).  The full file
+    /// path is [`Self::cache_file_path`]; the leaf is appended there, not
+    /// by callers.
     #[must_use]
     pub(crate) fn cache_dir_path(&self) -> PathBuf {
-        self.cache_path_impl(None)
+        CachePaths::global().entry_dir(self.layout(), self.site())
     }
 
     /// [`Self::cache_dir_path`] plus the `debname` leaf, in one pre-sized
-    /// allocation — use this instead of pushing/joining the filename onto
+    /// allocation - use this instead of pushing/joining the filename onto
     /// the directory path.
     #[must_use]
     pub(crate) fn cache_file_path(&self) -> PathBuf {
-        self.cache_path_impl(Some(&self.debname))
-    }
-
-    #[expect(
-        clippy::pathbuf_init_then_push,
-        reason = "the auto-suggestion `.join()` allocates a fresh PathBuf and \
-                  throws away the with_capacity sizing we want here"
-    )]
-    fn cache_path_impl(&self, leaf: Option<&str>) -> PathBuf {
-        let root = &global_config().cache_directory;
-
-        let host = match self.aliased_host {
-            Some(cache) => cache.format_cache_dir(self.mirror.port()),
-            None => self.mirror.host().format_cache_dir(self.mirror.port()),
-        };
-        assert!(
-            Path::new(host.as_ref()).is_relative(),
-            "path construction must not contain absolute components"
-        );
-
-        let uri_path = self.mirror.path();
-        assert!(
-            Path::new(uri_path).is_relative(),
-            "path construction must not contain absolute components"
-        );
-
-        let subdir = self
-            .layout()
-            .cache_subdir()
-            .unwrap_or_else(|| Path::new(""));
-        assert!(
-            subdir.is_relative(),
-            "path construction must not contain absolute components"
-        );
-
-        if let Some(leaf) = leaf {
-            assert!(
-                Path::new(leaf).is_relative(),
-                "path construction must not contain absolute components"
-            );
-        }
-
-        // Pre-size for the final length (+1 per separator) so `push` doesn't
-        // grow the underlying OsString — this runs once per request on both
-        // dispatch hot paths (same rationale as `mirror_cache_path_impl`).
-        let is_flat = self.layout().is_flat();
-        let capacity = root.as_os_str().len()
-            + 1
-            + host.len()
-            + 1
-            + if is_flat { SUBDIR_FLAT.len() + 1 } else { 0 }
-            + uri_path.len()
-            + 1
-            + subdir.as_os_str().len()
-            + 1
-            + leaf.map_or(0, |l| l.len() + 1);
-
-        let mut path = PathBuf::with_capacity(capacity);
-        path.push(root.as_path());
-        path.push(host.as_ref());
-        if is_flat {
-            path.push(SUBDIR_FLAT);
-        }
-        path.push(uri_path);
-        path.push(subdir);
-        if let Some(leaf) = leaf {
-            path.push(leaf);
-        }
-
-        path
+        CachePaths::global().entry_file(self.layout(), self.site(), Path::new(&self.debname))
     }
 }
 

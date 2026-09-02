@@ -182,7 +182,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
-    use crate::cache_layout::{SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
+    use crate::cache_paths::{SUBDIR_FLAT_BYHASH, SUBDIR_TMP};
 
     #[tokio::test]
     async fn remove_non_regular_unlinks_a_symlink() {
