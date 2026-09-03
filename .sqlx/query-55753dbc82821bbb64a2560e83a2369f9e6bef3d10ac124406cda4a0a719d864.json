@@ -1,0 +1,42 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                COALESCE((SELECT SUM(size) FROM downloads  WHERE timestamp >= ?1), 0) AS \"day_downloaded!: i64\",\n                COALESCE((SELECT SUM(size) FROM deliveries WHERE timestamp >= ?1), 0) AS \"day_delivered!: i64\",\n                COALESCE((SELECT SUM(size) FROM downloads  WHERE timestamp >= ?2), 0) AS \"week_downloaded!: i64\",\n                COALESCE((SELECT SUM(size) FROM deliveries WHERE timestamp >= ?2), 0) AS \"week_delivered!: i64\";\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "day_downloaded!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "day_delivered!: i64",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "week_downloaded!: i64",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "week_delivered!: i64",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "55753dbc82821bbb64a2560e83a2369f9e6bef3d10ac124406cda4a0a719d864"
+}

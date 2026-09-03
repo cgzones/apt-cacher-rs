@@ -191,6 +191,16 @@ async fn task_cleanup_impl(appstate: &AppState) {
 
     prune_stale_rows(&appstate.database, config).await;
 
+    // The mutating pre-pass (`cleanup_invalid_rows`, `delete_usage_logs`,
+    // `prune_stale_rows`) is done, so drop the dashboard's memoized
+    // aggregates now rather than only at the tail: the mirror lookup below
+    // can abort the run after those deletions have landed, and every future
+    // early return between here and the tail is covered too. Invalidating
+    // mid-run is harmless -- a dashboard load during the per-mirror work
+    // repopulates the slot with mid-run state, which the tail invalidation
+    // clears again.
+    crate::web::invalidate_dashboard_aggregates().await;
+
     let mirrors = match appstate.database.get_mirrors().await {
         Ok(m) => m,
         Err(err) => {
@@ -373,6 +383,12 @@ async fn task_cleanup_impl(appstate: &AppState) {
     metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
     metrics::LAST_CLEANUP_FILES_REMOVED.set(files_removed);
     metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(bytes_removed);
+
+    // Second invalidation: the per-mirror units above removed rows of their
+    // own, and the pre-pass one is long stale by now. Cleanup is the only
+    // thing that removes rows, and an operator reloads the page precisely to
+    // confirm the run took effect.
+    crate::web::invalidate_dashboard_aggregates().await;
 
     info!(
         "Finished cleanup task in {}: retained {} files, removed {} files of size {}",

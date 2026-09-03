@@ -16,7 +16,7 @@ use tracing::error;
 use crate::{
     cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH},
     cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker},
-    database::{Database, MirrorStatEntry},
+    database::{ClientStatEntry, MirrorStatEntry, OriginEntry, TopPackageEntry},
     deb_mirror::is_deb_package,
     error::ErrorReport,
     humanfmt::HumanFmt,
@@ -32,6 +32,7 @@ use super::{
 /// A rendered dashboard table together with its row count, which the page
 /// shows next to the section heading and uses to decide whether the
 /// section starts expanded.
+#[derive(Clone)]
 pub(super) struct Section {
     pub(super) html: String,
     pub(super) rows: usize,
@@ -386,28 +387,34 @@ pub(super) async fn build_mirror_table(
     )
 }
 
-pub(super) async fn build_origin_table(database: &Database, now_epoch: i64) -> Section {
-    let mut origins = match database.get_origins().await {
-        Ok(o) => o,
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!(
-                "Failed to query the origins for the dashboard; rendering the origin section with an error notice:  {}",
-                ErrorReport(&err)
-            );
-            let mut buf = String::new();
-            write_section_error(&mut buf, "origins", &err);
-            return Section { html: buf, rows: 0 };
-        }
-    };
+/// Log a failed dashboard query and render its section's error notice.
+///
+/// One place so every section reports a DB failure identically: the
+/// `DB_OPERATION_FAILED` bump, an ERROR naming the section, and the notice
+/// the reader sees in place of the table.
+pub(super) fn db_error_section(label: &'static str, err: &sqlx::Error) -> Section {
+    metrics::DB_OPERATION_FAILED.increment();
+    error!(
+        "Failed to query the {label} for the dashboard; rendering that section with an error notice:  {}",
+        ErrorReport(err)
+    );
+    let mut buf = String::new();
+    write_section_error(&mut buf, label, err);
+    Section { html: buf, rows: 0 }
+}
 
+/// Renders borrowed rows (like [`build_mirror_table`]) rather than owning
+/// them: the rows come from the memoized aggregate block, which several
+/// concurrent renders share.
+pub(super) fn render_origin_table(origins: &[OriginEntry], now_epoch: i64) -> Section {
     if origins.is_empty() {
         return Section::EMPTY;
     }
 
-    origins.sort_unstable_by_key(|o| Reverse(o.last_seen));
+    let mut sorted: Vec<&OriginEntry> = origins.iter().collect();
+    sorted.sort_unstable_by_key(|o| Reverse(o.last_seen));
 
-    let rows = origins.len();
+    let rows = sorted.len();
     let mut table = Table::new(&[
         "Mirror",
         "Distribution",
@@ -416,7 +423,7 @@ pub(super) async fn build_origin_table(database: &Database, now_epoch: i64) -> S
         "Last Seen",
     ]);
 
-    for origin in origins {
+    for origin in sorted {
         tr!(
             marked Freshness::of(origin.last_seen, now_epoch).row_class(),
             table,
@@ -437,28 +444,16 @@ pub(super) async fn build_origin_table(database: &Database, now_epoch: i64) -> S
     }
 }
 
-pub(super) async fn build_client_table(database: &Database, now_epoch: i64) -> Section {
-    let mut clients = match database.get_clients_with_stats().await {
-        Ok(o) => o,
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!(
-                "Failed to query the clients for the dashboard; rendering the client section with an error notice:  {}",
-                ErrorReport(&err)
-            );
-            let mut buf = String::new();
-            write_section_error(&mut buf, "clients", &err);
-            return Section { html: buf, rows: 0 };
-        }
-    };
-
+/// See [`render_origin_table`] on why the rows are borrowed.
+pub(super) fn render_client_table(clients: &[ClientStatEntry], now_epoch: i64) -> Section {
     if clients.is_empty() {
         return Section::EMPTY;
     }
 
-    clients.sort_unstable_by_key(|c| Reverse(c.last_seen));
+    let mut sorted: Vec<&ClientStatEntry> = clients.iter().collect();
+    sorted.sort_unstable_by_key(|c| Reverse(c.last_seen));
 
-    let rows = clients.len();
+    let rows = sorted.len();
     let mut table = Table::new(&[
         "IP",
         "Last Seen",
@@ -467,7 +462,7 @@ pub(super) async fn build_client_table(database: &Database, now_epoch: i64) -> S
         "Requests",
     ]);
 
-    for client in clients {
+    for client in sorted {
         let downloaded = as_size(client.total_downloaded);
         let delivered = as_size(client.total_delivered);
         tr!(
@@ -522,37 +517,15 @@ pub(super) enum TopPackagesView {
 }
 
 /// Number of rows in each "Top Packages" table.
-const TOP_PACKAGES_LIMIT: u32 = 5;
+pub(super) const TOP_PACKAGES_LIMIT: u32 = 5;
 
-pub(super) async fn build_top_packages_table(
-    database: &Database,
+/// See [`render_origin_table`] on why the rows are borrowed. Both views are
+/// rendered from one aggregate pass (`Database::get_top_packages`), so the
+/// caller hands the same `TopPackages` to this function twice.
+pub(super) fn render_top_packages_table(
+    packages: &[TopPackageEntry],
     view: TopPackagesView,
 ) -> Section {
-    let (label, result) = match view {
-        TopPackagesView::ByCount => (
-            "top packages by count",
-            database.get_top_packages(TOP_PACKAGES_LIMIT).await,
-        ),
-        TopPackagesView::BySize => (
-            "top packages by size",
-            database.get_top_packages_by_size(TOP_PACKAGES_LIMIT).await,
-        ),
-    };
-
-    let packages = match result {
-        Ok(p) => p,
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!(
-                "Failed to query the {label} for the dashboard; rendering that section with an error notice:  {}",
-                ErrorReport(&err)
-            );
-            let mut buf = String::new();
-            write_section_error(&mut buf, label, &err);
-            return Section { html: buf, rows: 0 };
-        }
-    };
-
     if packages.is_empty() {
         return Section::EMPTY;
     }

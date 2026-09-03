@@ -295,6 +295,30 @@ pub(crate) struct TopPackageEntry {
     pub(crate) package_size: i64,
 }
 
+/// The dashboard's two Top-Packages rankings, from one aggregate pass.
+///
+/// The two tables rank the same `GROUP BY debname` aggregate differently, so
+/// they used to be two statements scanning `deliveries` end to end for the
+/// same numbers. [`Database::get_top_packages`] ranks both ways in one query
+/// and splits the result here.
+#[derive(Debug)]
+pub(crate) struct TopPackages {
+    /// Most deliveries first.
+    pub(crate) by_count: Vec<TopPackageEntry>,
+    /// Most bytes delivered first.
+    pub(crate) by_size: Vec<TopPackageEntry>,
+}
+
+/// Bytes downloaded from upstream and delivered to clients over the
+/// dashboard's two reporting windows, from one statement.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BandwidthWindows {
+    /// `(downloaded, delivered)` over the last 24 hours.
+    pub(crate) day: (i64, i64),
+    /// `(downloaded, delivered)` over the last 7 days.
+    pub(crate) week: (i64, i64),
+}
+
 /// Pre-converted SQL-ready row for a `deliveries` insert. Constructed once by
 /// the producer side of the batch pipeline so the per-event hot path stays
 /// out of `i64::try_from` and IPv6-mapping conversions.
@@ -782,26 +806,45 @@ impl Database {
             .collect())
     }
 
-    /// Total bytes downloaded from upstream and delivered to clients since the given epoch.
-    pub(crate) async fn get_bandwidth_since(&self, since_epoch: i64) -> Result<(i64, i64), Error> {
+    /// Bytes downloaded from upstream and delivered to clients over both of
+    /// the dashboard's reporting windows.
+    ///
+    /// One statement rather than two calls of a single-window query: the four
+    /// scalar subselects each ride `idx_{downloads,deliveries}_timestamp`, and
+    /// issuing them together costs one round trip through the pool instead of
+    /// two. Both windows consequently degrade together on error, which is what
+    /// the single "N/A" fallback in the Cache Statistics section expects.
+    pub(crate) async fn get_bandwidth_windows(
+        &self,
+        day_epoch: i64,
+        week_epoch: i64,
+    ) -> Result<BandwidthWindows, Error> {
         struct Row {
-            downloaded: i64,
-            delivered: i64,
+            day_downloaded: i64,
+            day_delivered: i64,
+            week_downloaded: i64,
+            week_delivered: i64,
         }
 
         let row = query_as!(
             Row,
             r#"
             SELECT
-                COALESCE((SELECT SUM(size) FROM downloads  WHERE timestamp >= ?1), 0) AS "downloaded!: i64",
-                COALESCE((SELECT SUM(size) FROM deliveries WHERE timestamp >= ?1), 0) AS "delivered!: i64";
+                COALESCE((SELECT SUM(size) FROM downloads  WHERE timestamp >= ?1), 0) AS "day_downloaded!: i64",
+                COALESCE((SELECT SUM(size) FROM deliveries WHERE timestamp >= ?1), 0) AS "day_delivered!: i64",
+                COALESCE((SELECT SUM(size) FROM downloads  WHERE timestamp >= ?2), 0) AS "week_downloaded!: i64",
+                COALESCE((SELECT SUM(size) FROM deliveries WHERE timestamp >= ?2), 0) AS "week_delivered!: i64";
             "#,
-            since_epoch
+            day_epoch,
+            week_epoch
         )
         .fetch_one(&self.conn)
         .await?;
 
-        Ok((row.downloaded, row.delivered))
+        Ok(BandwidthWindows {
+            day: (row.day_downloaded, row.day_delivered),
+            week: (row.week_downloaded, row.week_delivered),
+        })
     }
 
     /// Trivial liveness query backing the `/healthcheck` database check.
@@ -811,60 +854,101 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn get_top_packages(&self, limit: u32) -> Result<Vec<TopPackageEntry>, Error> {
+    /// Both Top-Packages rankings from one pass over `deliveries`.
+    ///
+    /// The two tables the dashboard renders differ only in their ordering, so
+    /// this ranks the aggregate both ways with `ROW_NUMBER()` and returns the
+    /// union of the two top-`limit` sets -- at most `2 * limit` rows -- rather
+    /// than scanning the table twice. The aggregate CTE is referenced exactly
+    /// once, so there is no CTE-materialisation question.
+    pub(crate) async fn get_top_packages(&self, limit: u32) -> Result<TopPackages, Error> {
+        struct RankedPackage {
+            debname: String,
+            delivery_count: i64,
+            total_delivered: i64,
+            package_size: i64,
+            rank_by_count: i64,
+            rank_by_size: i64,
+        }
+
         // Exclude volatile resources (Release/Packages/Translation/...) — their
-        // filename does not change, so they would otherwise dominate by count.
+        // filename does not change, so they would otherwise dominate by count,
+        // and their repeated re-delivery would dominate the by-size table too.
         // Permanent .deb packages always end in `.deb`, `.udeb`, or `.ddeb`
         // (see `deb_mirror::VALID_DEB_EXTENSIONS`).
-        query_as!(
-            TopPackageEntry,
+        //
+        // `debname` as the secondary sort key is a tie-break the two separate
+        // queries never had: without it equal counts order arbitrarily, which
+        // is untestable and makes consecutive dashboard loads reshuffle rows.
+        let rows = query_as!(
+            RankedPackage,
             r#"
+            WITH agg AS (
+                SELECT
+                    debname,
+                    COUNT(*) AS delivery_count,
+                    SUM(size) AS total_delivered,
+                    MAX(size) AS package_size
+                FROM deliveries
+                WHERE debname LIKE '%.deb'
+                   OR debname LIKE '%.udeb'
+                   OR debname LIKE '%.ddeb'
+                GROUP BY debname
+            ),
+            ranked AS (
+                SELECT
+                    debname,
+                    delivery_count,
+                    total_delivered,
+                    package_size,
+                    ROW_NUMBER() OVER (ORDER BY delivery_count DESC, debname ASC) AS rank_by_count,
+                    ROW_NUMBER() OVER (ORDER BY total_delivered DESC, debname ASC) AS rank_by_size
+                FROM agg
+            )
             SELECT
                 debname AS "debname!: String",
-                COUNT(*) AS "delivery_count!: i64",
-                SUM(size) AS "total_delivered!: i64",
-                MAX(size) AS "package_size!: i64"
-            FROM deliveries
-            WHERE debname LIKE '%.deb'
-               OR debname LIKE '%.udeb'
-               OR debname LIKE '%.ddeb'
-            GROUP BY debname
-            ORDER BY COUNT(*) DESC
-            LIMIT ?;
+                delivery_count AS "delivery_count!: i64",
+                total_delivered AS "total_delivered!: i64",
+                package_size AS "package_size!: i64",
+                rank_by_count AS "rank_by_count!: i64",
+                rank_by_size AS "rank_by_size!: i64"
+            FROM ranked
+            WHERE rank_by_count <= ?1 OR rank_by_size <= ?1
+            ORDER BY rank_by_count;
             "#,
             limit
         )
         .fetch_all(&self.conn)
-        .await
-    }
+        .await?;
 
-    pub(crate) async fn get_top_packages_by_size(
-        &self,
-        limit: u32,
-    ) -> Result<Vec<TopPackageEntry>, Error> {
-        // Same volatile-resource exclusion as `get_top_packages`: repeatedly
-        // re-delivered metadata (e.g. `Packages.xz`) would otherwise
-        // accumulate SUM(size) and dominate the by-size table too.
-        query_as!(
-            TopPackageEntry,
-            r#"
-            SELECT
-                debname AS "debname!: String",
-                COUNT(*) AS "delivery_count!: i64",
-                SUM(size) AS "total_delivered!: i64",
-                MAX(size) AS "package_size!: i64"
-            FROM deliveries
-            WHERE debname LIKE '%.deb'
-               OR debname LIKE '%.udeb'
-               OR debname LIKE '%.ddeb'
-            GROUP BY debname
-            ORDER BY SUM(size) DESC
-            LIMIT ?;
-            "#,
-            limit
-        )
-        .fetch_all(&self.conn)
-        .await
+        let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
+        let limit = i64::from(limit);
+        let mut by_count = Vec::with_capacity(rows.len().min(capacity));
+        // (rank, entry) so the by-size ranking can be restored without
+        // re-deriving it from the totals — the tie-break lives in SQL.
+        let mut by_size: Vec<(i64, TopPackageEntry)> = Vec::new();
+        for row in rows {
+            let entry = || TopPackageEntry {
+                debname: row.debname.clone(),
+                delivery_count: row.delivery_count,
+                total_delivered: row.total_delivered,
+                package_size: row.package_size,
+            };
+            if row.rank_by_size <= limit {
+                by_size.push((row.rank_by_size, entry()));
+            }
+            if row.rank_by_count <= limit {
+                by_count.push(entry());
+            }
+        }
+        // `ORDER BY rank_by_count` already ordered `by_count`; `by_size` holds
+        // at most `limit` elements, so this sort is on 5 items by default.
+        by_size.sort_unstable_by_key(|&(rank, _)| rank);
+
+        Ok(TopPackages {
+            by_count,
+            by_size: by_size.into_iter().map(|(_rank, entry)| entry).collect(),
+        })
     }
 
     /// Hydrate the in-memory mirror-id cache at startup.
@@ -1578,5 +1662,140 @@ mod retention_tests {
             .await
             .expect("startup scrub");
         assert_eq!(count(&db).await, 0, "startup must still repair legacy rows");
+    }
+
+    /// Insert a `deliveries` row for the dashboard aggregate tests.
+    async fn insert_delivery(db: &Database, mirror_id: i64, debname: &str, size: i64, ts: i64) {
+        query(
+            "INSERT INTO deliveries (mirror_id, debname, size, duration, partial, client_ip, timestamp) \
+             VALUES (?, ?, ?, 1, 0, X'00000000000000000000ffff7f000001', ?)",
+        )
+        .bind(mirror_id)
+        .bind(debname)
+        .bind(size)
+        .bind(ts)
+        .execute(&db.conn)
+        .await
+        .expect("insert delivery");
+    }
+
+    async fn insert_download(db: &Database, mirror_id: i64, debname: &str, size: i64, ts: i64) {
+        query(
+            "INSERT INTO downloads (mirror_id, debname, size, duration, client_ip, timestamp) \
+             VALUES (?, ?, ?, 1, X'00000000000000000000ffff7f000001', ?)",
+        )
+        .bind(mirror_id)
+        .bind(debname)
+        .bind(size)
+        .bind(ts)
+        .execute(&db.conn)
+        .await
+        .expect("insert download");
+    }
+
+    fn names(entries: &[TopPackageEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.debname.as_str()).collect()
+    }
+
+    /// The two rankings come from one pass, so they must still disagree where
+    /// the old pair of queries disagreed: `many.deb` wins by count, `big.deb`
+    /// by bytes.
+    #[tokio::test]
+    async fn top_packages_ranks_by_count_and_by_size_independently() {
+        let (_dir, db) = temp_db().await;
+        let mirror = insert_mirror(&db, "debian").await;
+
+        for _ in 0..5 {
+            insert_delivery(&db, mirror, "many.deb", 10, 1_000).await;
+        }
+        insert_delivery(&db, mirror, "big.deb", 5_000, 1_000).await;
+        insert_delivery(&db, mirror, "mid.udeb", 100, 1_000).await;
+        insert_delivery(&db, mirror, "mid.udeb", 100, 1_000).await;
+
+        let top = db.get_top_packages(3).await.expect("top packages");
+
+        assert_eq!(names(&top.by_count), ["many.deb", "mid.udeb", "big.deb"]);
+        assert_eq!(names(&top.by_size), ["big.deb", "mid.udeb", "many.deb"]);
+
+        let many = &top.by_count[0];
+        assert_eq!(many.delivery_count, 5);
+        assert_eq!(many.total_delivered, 50);
+        assert_eq!(many.package_size, 10, "package_size is MAX(size), one copy");
+    }
+
+    /// Volatile index files are re-delivered constantly and would dominate
+    /// both rankings; only `.deb`/`.udeb`/`.ddeb` may appear.
+    #[tokio::test]
+    async fn top_packages_excludes_non_package_deliveries() {
+        let (_dir, db) = temp_db().await;
+        let mirror = insert_mirror(&db, "debian").await;
+
+        for _ in 0..20 {
+            insert_delivery(&db, mirror, "Packages.xz", 9_999, 1_000).await;
+        }
+        insert_delivery(&db, mirror, "only.ddeb", 1, 1_000).await;
+
+        let top = db.get_top_packages(5).await.expect("top packages");
+
+        assert_eq!(names(&top.by_count), ["only.ddeb"]);
+        assert_eq!(names(&top.by_size), ["only.ddeb"]);
+    }
+
+    /// Equal counts used to order arbitrarily; the SQL tie-break makes the
+    /// order deterministic, which is what keeps the dashboard from
+    /// reshuffling rows between loads.
+    #[tokio::test]
+    async fn top_packages_breaks_ties_by_name() {
+        let (_dir, db) = temp_db().await;
+        let mirror = insert_mirror(&db, "debian").await;
+
+        for name in ["c.deb", "a.deb", "b.deb"] {
+            insert_delivery(&db, mirror, name, 100, 1_000).await;
+        }
+
+        let top = db.get_top_packages(2).await.expect("top packages");
+
+        assert_eq!(names(&top.by_count), ["a.deb", "b.deb"]);
+        assert_eq!(names(&top.by_size), ["a.deb", "b.deb"]);
+    }
+
+    /// Both windows come from one statement now; each must still filter on
+    /// its own cutoff.
+    #[tokio::test]
+    async fn bandwidth_windows_filter_each_cutoff_separately() {
+        let (_dir, db) = temp_db().await;
+        let mirror = insert_mirror(&db, "debian").await;
+
+        // Timestamps: 100 is inside both windows, 50 only inside the week
+        // window, 10 outside both.
+        insert_download(&db, mirror, "a.deb", 1, 100).await;
+        insert_download(&db, mirror, "b.deb", 2, 50).await;
+        insert_download(&db, mirror, "c.deb", 4, 10).await;
+        insert_delivery(&db, mirror, "a.deb", 8, 100).await;
+        insert_delivery(&db, mirror, "b.deb", 16, 50).await;
+        insert_delivery(&db, mirror, "c.deb", 32, 10).await;
+
+        let windows = db
+            .get_bandwidth_windows(100, 50)
+            .await
+            .expect("bandwidth windows");
+
+        assert_eq!(windows.day, (1, 8), "day window covers timestamp >= 100");
+        assert_eq!(
+            windows.week,
+            (1 + 2, 8 + 16),
+            "week window covers timestamp >= 50"
+        );
+    }
+
+    /// An empty database must report zeroes, not an error or a missing row.
+    #[tokio::test]
+    async fn bandwidth_windows_report_zero_on_an_empty_database() {
+        let (_dir, db) = temp_db().await;
+
+        let windows = db.get_bandwidth_windows(0, 0).await.expect("bandwidth");
+
+        assert_eq!(windows.day, (0, 0));
+        assert_eq!(windows.week, (0, 0));
     }
 }

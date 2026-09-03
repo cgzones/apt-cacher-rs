@@ -26,6 +26,7 @@ mod tables;
 use http::StatusCode;
 use tracing::{debug, trace};
 
+pub(crate) use dashboard::invalidate_aggregates as invalidate_dashboard_aggregates;
 pub(crate) use response::WebResponse;
 
 use crate::{AppState, healthcheck::cached_health_report, metrics};

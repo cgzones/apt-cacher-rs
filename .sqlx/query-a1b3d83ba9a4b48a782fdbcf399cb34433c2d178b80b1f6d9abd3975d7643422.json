@@ -1,0 +1,61 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            WITH agg AS (\n                SELECT\n                    debname,\n                    COUNT(*) AS delivery_count,\n                    SUM(size) AS total_delivered,\n                    MAX(size) AS package_size\n                FROM deliveries\n                WHERE debname LIKE '%.deb'\n                   OR debname LIKE '%.udeb'\n                   OR debname LIKE '%.ddeb'\n                GROUP BY debname\n            ),\n            ranked AS (\n                SELECT\n                    debname,\n                    delivery_count,\n                    total_delivered,\n                    package_size,\n                    ROW_NUMBER() OVER (ORDER BY delivery_count DESC, debname ASC) AS rank_by_count,\n                    ROW_NUMBER() OVER (ORDER BY total_delivered DESC, debname ASC) AS rank_by_size\n                FROM agg\n            )\n            SELECT\n                debname AS \"debname!: String\",\n                delivery_count AS \"delivery_count!: i64\",\n                total_delivered AS \"total_delivered!: i64\",\n                package_size AS \"package_size!: i64\",\n                rank_by_count AS \"rank_by_count!: i64\",\n                rank_by_size AS \"rank_by_size!: i64\"\n            FROM ranked\n            WHERE rank_by_count <= ?1 OR rank_by_size <= ?1\n            ORDER BY rank_by_count;\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "debname!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "deliveries",
+            "name": "debname"
+          }
+        }
+      },
+      {
+        "name": "delivery_count!: i64",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "total_delivered!: i64",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "package_size!: i64",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "rank_by_count!: i64",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "rank_by_size!: i64",
+        "ordinal": 5,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a1b3d83ba9a4b48a782fdbcf399cb34433c2d178b80b1f6d9abd3975d7643422"
+}

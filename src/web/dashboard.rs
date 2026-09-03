@@ -7,6 +7,7 @@
 use std::{
     borrow::Cow,
     fmt::{self, Display, Formatter},
+    sync::Arc,
 };
 
 use coarsetime::Instant;
@@ -19,7 +20,9 @@ use crate::{
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
     config::HttpsUpgradeMode,
-    database::{Database, MirrorStatEntry},
+    database::{
+        BandwidthWindows, ClientStatEntry, Database, MirrorStatEntry, OriginEntry, TopPackages,
+    },
     error::ErrorReport,
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
@@ -40,13 +43,11 @@ use super::{
         build_setup_hint_html,
     },
     response::WebResponse,
-    table::{
-        DetailsList, write_collapsible_details, write_collapsible_section, write_section,
-        write_section_error,
-    },
+    table::{DetailsList, write_collapsible_details, write_collapsible_section, write_section},
     tables::{
-        DirStats, Section, TopPackagesView, build_client_table, build_mirror_table,
-        build_origin_table, build_top_packages_table, build_uncacheable_table,
+        DirStats, Section, TOP_PACKAGES_LIMIT, TopPackagesView, build_mirror_table,
+        build_uncacheable_table, db_error_section, render_client_table, render_origin_table,
+        render_top_packages_table,
     },
 };
 
@@ -83,79 +84,170 @@ struct DashboardData {
     fs_elapsed: std::time::Duration,
 }
 
-/// Fetch the mirror list and walk each mirror's cache directory to populate
-/// the Mirrors table. Returns the loaded mirrors (used downstream for the
-/// Maintenance and Cache Statistics sections), the rendered table
-/// [`Section`], the aggregated `DirStats`, the free disk space reported
-/// by `statvfs`, and the wall-clock time spent in the FS walks (separated
-/// from `db_elapsed` for the dashboard footer).
+/// Every dashboard query that scans the whole `downloads` / `deliveries`
+/// history, fetched as one unit so the memo below can cover all of them.
+struct DashboardAggregates {
+    /// Also feeds the Maintenance and Cache Statistics sections. A *failed*
+    /// mirror query must not reach them as an empty list: "no mirror is
+    /// known" and "no mirror has ever been seen" lead to opposite pages, so
+    /// the failure stays an `Err` in [`AggregateResults`] instead.
+    mirrors: Vec<MirrorStatEntry>,
+    origins: Vec<OriginEntry>,
+    clients: Vec<ClientStatEntry>,
+    top_packages: TopPackages,
+    bandwidth: BandwidthWindows,
+}
+
+/// The same five results before the all-or-nothing check, so a partial
+/// failure still renders four good sections and one error notice.
+struct AggregateResults {
+    mirrors: Result<Vec<MirrorStatEntry>, sqlx::Error>,
+    origins: Result<Vec<OriginEntry>, sqlx::Error>,
+    clients: Result<Vec<ClientStatEntry>, sqlx::Error>,
+    top_packages: Result<TopPackages, sqlx::Error>,
+    bandwidth: Result<BandwidthWindows, sqlx::Error>,
+}
+
+/// Memoized aggregate block. A `tokio::sync::Mutex` held *across* the
+/// refresh gives single-flight semantics, as `healthcheck::HEALTH_CACHE`
+/// does: concurrent dashboard loads queue behind one pass over the usage
+/// tables instead of each issuing its own.
+static AGGREGATE_CACHE: tokio::sync::Mutex<Option<(Instant, Arc<DashboardAggregates>)>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// Memoization window. Deliberately short: the page's auto-refresh defaults
+/// to 30 s and goes down to 1 s (`page::QueryOptions`), so a longer window
+/// would render identical numbers on consecutive refreshes. This slot exists
+/// to collapse a burst — concurrent loads, a rapid manual reload — not to
+/// serve a stale page.
+const AGGREGATES_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(5);
+
+/// Run the five aggregate queries concurrently on one task.
+async fn fetch_aggregates(database: &Database, now_epoch: i64) -> AggregateResults {
+    let day_cutoff = now_epoch.saturating_sub(24 * 60 * 60);
+    let week_cutoff = now_epoch.saturating_sub(7 * 24 * 60 * 60);
+
+    let (mirrors, origins, clients, top_packages, bandwidth) = tokio::join!(
+        database.get_mirrors_with_stats(),
+        database.get_origins(),
+        database.get_clients_with_stats(),
+        database.get_top_packages(TOP_PACKAGES_LIMIT),
+        database.get_bandwidth_windows(day_cutoff, week_cutoff),
+    );
+
+    AggregateResults {
+        mirrors,
+        origins,
+        clients,
+        top_packages,
+        bandwidth,
+    }
+}
+
+/// Serve the memoized aggregates, refreshing them when older than
+/// [`AGGREGATES_TTL`].
 ///
-/// The mirror list is `None` when the query failed, which callers must not
-/// collapse into the empty list: "no mirror is known" and "no mirror has
-/// ever been seen" lead to opposite pages.
+/// The slot is populated only when every query succeeded. `sqlx::Error` is
+/// not `Clone`, so a failure could not be stored anyway, and returning the
+/// raw per-query results on a partial failure keeps today's behaviour: each
+/// section renders its own error notice and the next load retries at once.
+async fn cached_aggregates(
+    database: &Database,
+    now_epoch: i64,
+) -> Result<Arc<DashboardAggregates>, Box<AggregateResults>> {
+    let mut cache = AGGREGATE_CACHE.lock().await;
+    if let Some((at, aggregates)) = cache.as_ref()
+        && at.elapsed() < AGGREGATES_TTL
+    {
+        return Ok(Arc::clone(aggregates));
+    }
+
+    let AggregateResults {
+        mirrors,
+        origins,
+        clients,
+        top_packages,
+        bandwidth,
+    } = fetch_aggregates(database, now_epoch).await;
+
+    match (mirrors, origins, clients, top_packages, bandwidth) {
+        (Ok(mirrors), Ok(origins), Ok(clients), Ok(top_packages), Ok(bandwidth)) => {
+            let aggregates = Arc::new(DashboardAggregates {
+                mirrors,
+                origins,
+                clients,
+                top_packages,
+                bandwidth,
+            });
+            // Timestamp taken after the queries complete, not before, so a
+            // slow pass does not pre-expire its own entry.
+            *cache = Some((Instant::now(), Arc::clone(&aggregates)));
+            drop(cache);
+            Ok(aggregates)
+        }
+        (mirrors, origins, clients, top_packages, bandwidth) => {
+            drop(cache);
+            Err(Box::new(AggregateResults {
+                mirrors,
+                origins,
+                clients,
+                top_packages,
+                bandwidth,
+            }))
+        }
+    }
+}
+
+/// Drop the memoized aggregates so the next dashboard load re-queries.
+///
+/// Called by the cleanup task: cleanup is the only thing that *removes* rows
+/// (orphan mirror rows, stale origins, expired usage logs), and an operator
+/// who has just run a cleanup reloads the page precisely to see it took
+/// effect. Row *insertions* need no invalidation — a count a few seconds
+/// behind is what [`AGGREGATES_TTL`] already accepts.
+pub(crate) async fn invalidate_aggregates() {
+    *AGGREGATE_CACHE.lock().await = None;
+}
+
+/// Walk each mirror's cache directory for the Mirrors table and probe the
+/// filesystem for free space. The DB half of what used to be one
+/// `build_mirror_section` now rides the memoized aggregate block; what is
+/// left is the FS work the dashboard footer reports as `disk`.
 ///
 /// This is a free async fn rather than an inline `tokio::join!` branch so
 /// rustc can prove `Send` for the future without tripping over higher-rank
 /// lifetime auto-trait inference at the spawn site.
-async fn build_mirror_section(
-    database: &Database,
+async fn build_mirror_fs_section(
+    mirrors: &[MirrorStatEntry],
     now_epoch: i64,
-) -> (
-    Option<Vec<MirrorStatEntry>>,
-    Section,
-    DirStats,
-    Option<u64>,
-    std::time::Duration,
-) {
+) -> (Section, DirStats, Option<u64>) {
     let config = global_config();
 
-    let mirrors_result = database.get_mirrors_with_stats().await;
-    let fs_start = Instant::now();
-    let (mirrors, section, agg) = match mirrors_result {
-        Ok(m) => {
-            let (section, aggregate) =
-                build_mirror_table(&m, now_epoch, &config.cache_directory).await;
-            (Some(m), section, aggregate)
-        }
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!(
-                "Failed to query the mirrors for the dashboard; rendering the mirror section with an error notice:  {}",
-                ErrorReport(&err)
-            );
-            let mut buf = String::new();
-            write_section_error(&mut buf, "mirrors", &err);
-            (None, Section { html: buf, rows: 0 }, DirStats::default())
-        }
-    };
+    let ((section, aggregate), free_disk_bytes) = tokio::join!(
+        build_mirror_table(mirrors, now_epoch, &config.cache_directory),
+        // statvfs() can stall on slow/hung filesystems (NFS, FUSE, dying
+        // disks); run it on the blocking pool so it cannot wedge the tokio
+        // worker.
+        async {
+            let result =
+                tokio::task::spawn_blocking(|| nix::sys::statvfs::statvfs(&config.cache_directory))
+                    .await
+                    .expect("task should not panic");
 
-    // statvfs() can stall on slow/hung filesystems (NFS, FUSE, dying disks);
-    // run it on the blocking pool so it cannot wedge the tokio worker.
-    let free_disk_bytes = {
-        let result =
-            tokio::task::spawn_blocking(|| nix::sys::statvfs::statvfs(&config.cache_directory))
-                .await
-                .expect("task should not panic");
+            let stat = result
+                .inspect_err(|err| {
+                    warn_once_or_debug!(
+                        "statvfs({}) failed:  {err}",
+                        config.cache_directory.display()
+                    );
+                })
+                .ok();
 
-        let stat = result
-            .inspect_err(|err| {
-                warn_once_or_debug!(
-                    "statvfs({}) failed:  {err}",
-                    config.cache_directory.display()
-                );
-            })
-            .ok();
+            stat.and_then(|s| s.blocks_available().checked_mul(s.fragment_size()))
+        },
+    );
 
-        stat.and_then(|s| s.blocks_available().checked_mul(s.fragment_size()))
-    };
-
-    (
-        mirrors,
-        section,
-        agg,
-        free_disk_bytes,
-        fs_start.elapsed().into(),
-    )
+    (section, aggregate, free_disk_bytes)
 }
 
 async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
@@ -164,46 +256,88 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     let now = Utc::now();
     let now_epoch = now.inner().unix_timestamp();
 
-    let day_cutoff = now_epoch.saturating_sub(24 * 60 * 60);
-    let week_cutoff = now_epoch.saturating_sub(7 * 24 * 60 * 60);
+    // The whole aggregate block, memoized: one pass over the usage tables
+    // per `AGGREGATES_TTL` no matter how many loads arrive. Timed directly
+    // rather than derived by subtracting the FS work, so the footer's `db`
+    // figure is exact — and reads ~0 on a memo hit, which is accurate: this
+    // render did no database work.
+    let db_start = Instant::now();
+    let aggregates = cached_aggregates(&appstate.database, now_epoch).await;
+    let db_elapsed: std::time::Duration = db_start.elapsed().into();
 
-    // Run all DB queries and the (DB+FS) mirror builder concurrently. The
-    // mirror branch waits on `get_mirrors_with_stats`, then drives the
-    // per-mirror directory scans; the rest of the dashboard's DB queries
-    // proceed in parallel with that FS work instead of blocking on it.
-    let parallel_start = Instant::now();
-    let (
-        (mirrors, mirror, aggregate_dir_stats, free_disk_bytes, fs_elapsed),
-        origin,
-        client,
-        top_packages_by_count,
-        top_packages_by_size,
-        bandwidth_day_result,
-        bandwidth_week_result,
-    ) = tokio::join!(
-        build_mirror_section(&appstate.database, now_epoch),
-        build_origin_table(&appstate.database, now_epoch),
-        build_client_table(&appstate.database, now_epoch),
-        build_top_packages_table(&appstate.database, TopPackagesView::ByCount),
-        build_top_packages_table(&appstate.database, TopPackagesView::BySize),
-        appstate.database.get_bandwidth_since(day_cutoff),
-        appstate.database.get_bandwidth_since(week_cutoff),
-    );
-    // "DB elapsed" approximates the wall-clock cost of the parallel block
-    // attributable to non-FS work — i.e. everything except the mirror
-    // directory scans, which are reported separately as `fs_elapsed`.
-    let total_parallel: std::time::Duration = parallel_start.elapsed().into();
-    let db_elapsed = total_parallel.saturating_sub(fs_elapsed);
+    // Normalize the memo hit and the partial-failure path into one set of
+    // per-section results, so each section below is rendered exactly once.
+    let (mirrors, origins, clients, top_packages, bandwidth) = match &aggregates {
+        Ok(agg) => (
+            Ok(agg.mirrors.as_slice()),
+            Ok(agg.origins.as_slice()),
+            Ok(agg.clients.as_slice()),
+            Ok(&agg.top_packages),
+            Ok(agg.bandwidth),
+        ),
+        Err(results) => (
+            results.mirrors.as_deref(),
+            results.origins.as_deref(),
+            results.clients.as_deref(),
+            results.top_packages.as_ref(),
+            results.bandwidth.as_ref().copied(),
+        ),
+    };
+
+    let origin = match origins {
+        Ok(rows) => render_origin_table(rows, now_epoch),
+        Err(err) => db_error_section("origins", err),
+    };
+    let client = match clients {
+        Ok(rows) => render_client_table(rows, now_epoch),
+        Err(err) => db_error_section("clients", err),
+    };
+    // Both tables come from one query, so one failure is one log line and one
+    // notice text shown twice — not two independent section failures.
+    let (top_packages_by_count, top_packages_by_size) = match top_packages {
+        Ok(pkgs) => (
+            render_top_packages_table(&pkgs.by_count, TopPackagesView::ByCount),
+            render_top_packages_table(&pkgs.by_size, TopPackagesView::BySize),
+        ),
+        Err(err) => {
+            let notice = db_error_section("top packages", err);
+            (notice.clone(), notice)
+        }
+    };
 
     // A failed mirror query is not evidence of a fresh install. Suppress the
     // setup hint in that case: pairing "No mirror has been contacted yet.
     // Point apt at this proxy" with a Mirrors section already showing a
     // database error tells an established operator to reinstall.
-    let seen_traffic = match &mirrors {
-        None => true,
-        Some(mirrors) => !mirrors.is_empty(),
+    let mirror_rows = mirrors.unwrap_or_default();
+    let seen_traffic = mirrors.is_err() || !mirror_rows.is_empty();
+
+    // The FS half of the Mirrors section: the per-mirror directory walks and
+    // the `statvfs` probe, reported as `disk` in the footer.
+    //
+    // This runs *after* the aggregate block rather than beside it, because
+    // the mirror rows it walks come from that block. The walk used to start
+    // as soon as `get_mirrors_with_stats` resolved and overlap the remaining
+    // queries, so a load missing both memos (the 5s one here, the 60s
+    // `DIR_STATS_TTL_SECS` in the walk -- a 30s auto-refresh misses this one
+    // every time and that one every other time) now pays `db + disk` where
+    // it used to pay roughly the larger of the two. The penalty is bounded
+    // by the aggregate block's own duration, and folding the duplicate scans
+    // away cut that from 726ms to 201ms on a ~400k-row `deliveries` table:
+    // below a ~525ms cold walk the sequential path is still the faster of
+    // the two, and above it the gap asymptotes to ~200ms of a multi-second
+    // load. Restoring the overlap costs a second memo slot for the mirror
+    // query alone; measure a large cache before paying for it, and note
+    // that the walk's own per-file blocking-pool hop (R4 in
+    // `docs/perf-review-2026-09-02.md`) is the bigger lever there.
+    let fs_start = Instant::now();
+    let (mirror_table, aggregate_dir_stats, free_disk_bytes) =
+        build_mirror_fs_section(mirror_rows, now_epoch).await;
+    let fs_elapsed: std::time::Duration = fs_start.elapsed().into();
+    let mirror = match mirrors {
+        Ok(_rows) => mirror_table,
+        Err(err) => db_error_section("mirrors", err),
     };
-    let mirrors = mirrors.unwrap_or_default();
 
     let uncacheable = build_uncacheable_table();
 
@@ -244,12 +378,11 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     );
 
     let configuration_html = build_configuration_html(rd, https_mode);
-    let maintenance_html = build_maintenance_html(&mirrors, now_epoch, next_cleanup_epoch);
+    let maintenance_html = build_maintenance_html(mirror_rows, now_epoch, next_cleanup_epoch);
 
     let cache_stats_html = build_cache_stats_html(
-        &mirrors,
-        bandwidth_day_result,
-        bandwidth_week_result,
+        mirror_rows,
+        bandwidth,
         &aggregate_dir_stats,
         cache_size,
         free_disk_bytes,
@@ -258,7 +391,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
 
     let metrics_html = build_metrics_html();
     let hero_html = build_hero_html(
-        &mirrors,
+        mirror_rows,
         cache_size,
         rd.config.disk_quota.map(std::num::NonZero::get),
     );
@@ -602,8 +735,7 @@ fn build_maintenance_html(
 
 fn build_cache_stats_html(
     mirrors: &[MirrorStatEntry],
-    bandwidth_day_result: Result<(i64, i64), sqlx::Error>,
-    bandwidth_week_result: Result<(i64, i64), sqlx::Error>,
+    bandwidth_result: Result<BandwidthWindows, &sqlx::Error>,
     aggregate: &DirStats,
     cache_size: u64,
     free_disk_bytes: Option<u64>,
@@ -615,26 +747,16 @@ fn build_cache_stats_html(
 
     let uncacheable_count = get_uncacheables().read().len();
 
-    let bandwidth_day = match bandwidth_day_result {
-        Ok(v) => Some(v),
+    // One statement covers both windows, so they succeed or fail together.
+    let (bandwidth_day, bandwidth_week) = match bandwidth_result {
+        Ok(windows) => (Some(windows.day), Some(windows.week)),
         Err(err) => {
             metrics::DB_OPERATION_FAILED.increment();
             error!(
-                "Failed to query the 24h bandwidth window; the dashboard reports it as N/A:  {}",
-                ErrorReport(&err)
+                "Failed to query the bandwidth windows; the dashboard reports both as N/A:  {}",
+                ErrorReport(err)
             );
-            None
-        }
-    };
-    let bandwidth_week = match bandwidth_week_result {
-        Ok(v) => Some(v),
-        Err(err) => {
-            metrics::DB_OPERATION_FAILED.increment();
-            error!(
-                "Failed to query the 7d bandwidth window; the dashboard reports it as N/A:  {}",
-                ErrorReport(&err)
-            );
-            None
+            (None, None)
         }
     };
 
