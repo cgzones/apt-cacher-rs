@@ -8,7 +8,7 @@
 //! `XzStream` rather than the `Read`-adapter `XzReader` because only the
 //! former takes a memory limit: the LZMA2 dictionary size comes verbatim from
 //! the (untrusted) block header and is allocated before any output reaches
-//! the callers' decompression caps.  [`limits::MAX_XZ_DICT_SIZE`] bounds it.
+//! the callers' decompression caps.  [`crate::limits::MAX_XZ_DICT_SIZE`] bounds it.
 
 use std::future::Future as _;
 use std::io;

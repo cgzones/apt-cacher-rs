@@ -2,8 +2,8 @@
 //! `user.apt_cacher_rs.*` attribute the daemon persists.
 //!
 //! A persisted attribute is a type implementing [`XattrValue`] (`ETag`,
-//! `LastModified`, [`ExpectedSize`], [`verified_marker::CleanupMarker`]); the generic
-//! [`try_read`] / [`read`] / [`write`] / [`remove`] helpers own the whole
+//! `LastModified`, [`ExpectedSize`], [`crate::verified_marker::CleanupMarker`]); the generic
+//! [`try_read`] / [`read`] / [`write()`] / [`remove`] helpers own the whole
 //! degradation policy once - the `XATTR_SUPPORTED` short-circuit, the
 //! absent/unsupported/`ENODATA` collapse to `None`, the malformed-value scrub
 //! and its once-gated warn, and the transient-failure warn - so a new
@@ -110,7 +110,7 @@ impl XattrTarget for std::fs::File {
 /// A value persisted as one `user.apt_cacher_rs.*` extended attribute.
 ///
 /// A type implementing this is valid by construction (its only constructors
-/// are [`Self::parse`] and validating `new`s), so [`write`] never has to
+/// are [`Self::parse`] and validating `new`s), so [`write()`] never has to
 /// validate; [`try_read`] scrubs a stored value [`Self::parse`] rejects.
 pub(crate) trait XattrValue: Sized {
     /// Full attribute name, `user.apt_cacher_rs.<name>`.
