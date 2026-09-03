@@ -805,8 +805,15 @@ mod tests {
         );
         assert_eq!(parse_filename_field("Filename: pool/../escape.deb\n"), None);
         assert_eq!(parse_filename_field("Filename: /etc/shadow\n"), None);
-        assert_eq!(parse_filename_field("Filename: ./foo.deb\n"), None);
         assert_eq!(parse_filename_field("Filename: a//b.deb\n"), None);
+        // A leading `./` is NOT traversal and is normalised away rather than
+        // rejected (flat archives publish every stanza that way); a `..`
+        // behind it still is.
+        assert_eq!(
+            parse_filename_field("Filename: ./foo.deb\n"),
+            Some("foo.deb"),
+        );
+        assert_eq!(parse_filename_field("Filename: ./../escape.deb\n"), None);
         assert_eq!(
             parse_filename_field("Filename: pool\\main\\evil.deb\n"),
             None,

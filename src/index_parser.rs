@@ -41,6 +41,9 @@ enum FilenameField<'a> {
 
 /// Classify one stanza line as a `Filename:` field.
 ///
+/// Leading `./` segments are stripped ([`strip_leading_dot_segments`]) before
+/// the gate, so the value matches the cache path the key is compared against.
+///
 /// **Security**: rejects empty values, absolute paths, ASCII control bytes
 /// (including NUL and DEL), backslash, and any segment equal to `..` or `.`.
 /// An attacker-controlled upstream `Packages` stanza could otherwise inject a
@@ -51,11 +54,34 @@ fn classify_filename_field(line: &str) -> FilenameField<'_> {
     let Some(filepath) = line.strip_prefix("Filename: ") else {
         return FilenameField::Absent;
     };
-    let filepath = filepath.trim_start();
+    let filepath = strip_leading_dot_segments(filepath.trim_start());
     if !is_safe_filename_relpath(filepath) {
         return FilenameField::Unsafe(filepath);
     }
     FilenameField::Value(filepath)
+}
+
+/// Strip the leading `./` segments an index generator may prefix onto a
+/// repo-relative path, so the value matches the cache path it is keyed
+/// against.
+///
+/// `apt-ftparchive packages .` (and `apt-ftparchive release .`) writes the
+/// directory argument verbatim, so whole flat archives publish every
+/// `Filename:` as `./<deb>`. Those are not traversal - `.` resolves to the
+/// same directory - but the cleanup candidate map and the checksum registry
+/// are keyed by the path relative to the mirror root, so an unstripped `./`
+/// misses every lookup just as silently as a rejection.
+///
+/// Deliberately leading-only: it keeps the borrow (no allocation on the
+/// per-stanza path), and an interior `.` segment - which would need one to
+/// normalise - is not something any generator emits. Those still fail
+/// [`is_safe_filename_relpath`], as do `..` segments at any position: a
+/// leading `../` is left in place for the gate to reject.
+fn strip_leading_dot_segments(mut s: &str) -> &str {
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s
 }
 
 /// `true` iff `s` is a safe relative path: non-empty, no leading `/`, no
@@ -412,11 +438,14 @@ pub(crate) enum IndexFormat {
 /// - flat repos: the URL path is the on-disk path verbatim, so the key is the
 ///   validated relpath itself.
 ///
-/// Returns `None` when the relpath fails `is_safe_filename_relpath`.
+/// Returns `None` when the relpath fails `is_safe_filename_relpath` (after
+/// [`strip_leading_dot_segments`]; a `Stanza`'s value is already stripped,
+/// this repeats it so the function gates a raw field the same way).
 pub(crate) fn registry_key_from_filename_field(
     filename_field: &str,
     format: IndexFormat,
 ) -> Option<String> {
+    let filename_field = strip_leading_dot_segments(filename_field);
     if !is_safe_filename_relpath(filename_field) {
         return None;
     }
@@ -485,7 +514,9 @@ fn release_hash_entries(
 /// `Release` / `InRelease` file's `SHA256:` section.
 ///
 /// Handles the `InRelease` clearsigned wrapper by stopping at the PGP
-/// signature boundary. Paths failing `is_safe_filename_relpath` are skipped.
+/// signature boundary. Leading `./` segments are stripped
+/// ([`strip_leading_dot_segments`]) so the key matches the request's URI
+/// path; paths failing `is_safe_filename_relpath` are skipped.
 pub(crate) fn parse_release_checksums(
     content: &str,
 ) -> impl Iterator<Item = (String, [u8; 32])> + '_ {
@@ -494,6 +525,7 @@ pub(crate) fn parse_release_checksums(
             return None;
         }
         let digest = hex_decode_exact::<32>(hex)?;
+        let path = strip_leading_dot_segments(path);
         if !is_safe_filename_relpath(path) {
             return None;
         }
@@ -602,6 +634,40 @@ mod tests {
             Some("pool/main/a/abc/abc_1.0_amd64.deb"),
         );
         assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0xab; 32].as_slice())));
+    }
+
+    #[test]
+    fn stanza_ingest_strips_leading_dot_slash() {
+        // `apt-ftparchive packages .` writes the directory argument verbatim,
+        // so whole flat archives (e.g. NVIDIA's CUDA repos) publish every
+        // `Filename:` as `./<deb>`. Rejecting those loses each package's
+        // cleanup reference and cleanup-time digest.
+        let mut s = Stanza::new();
+        s.ingest("Filename: ./collectx-bringup_1.22.1-1_amd64.deb\n");
+        assert_eq!(
+            s.filename.as_deref(),
+            Some("collectx-bringup_1.22.1-1_amd64.deb"),
+        );
+    }
+
+    #[test]
+    fn filename_field_strips_repeated_leading_dot_segments() {
+        assert_eq!(
+            parse_filename_field("Filename: .././a.deb\n"),
+            None,
+            "a `..` segment survives the leading-dot strip and stays rejected"
+        );
+        assert_eq!(
+            parse_filename_field("Filename: ././pool/a.deb\n"),
+            Some("pool/a.deb"),
+        );
+        assert_eq!(
+            parse_filename_field("Filename: pool/./a.deb\n"),
+            None,
+            "an interior `.` segment would need an allocation to normalise"
+        );
+        assert_eq!(parse_filename_field("Filename: ./\n"), None);
+        assert_eq!(parse_filename_field("Filename: .\n"), None);
     }
 
     #[test]
@@ -808,6 +874,19 @@ mod tests {
     }
 
     #[test]
+    fn registry_key_strips_leading_dot_slash() {
+        assert_eq!(
+            registry_key_from_filename_field("./foo_1.0_amd64.deb", IndexFormat::Flat),
+            Some("foo_1.0_amd64.deb".to_string()),
+            "the flat key must match the cache path relative to the mirror root"
+        );
+        assert_eq!(
+            registry_key_from_filename_field("./foo_1.0_amd64.deb", IndexFormat::Structured),
+            Some("foo_1.0_amd64.deb".to_string())
+        );
+    }
+
+    #[test]
     fn registry_key_rejects_unsafe_relpath() {
         assert_eq!(
             registry_key_from_filename_field("../etc/passwd", IndexFormat::Structured),
@@ -866,6 +945,21 @@ SHA256:
  1111111111111111111111111111111111111111111111111111111111111111 1 ../../etc/passwd
 ";
         assert!(parse_release_checksums(release).next().is_none());
+    }
+
+    #[test]
+    fn parse_release_strips_leading_dot_slash() {
+        // Flat-repo `Release` files from the same generator prefix their
+        // entries the same way; the key must match the request's URI path.
+        let release = "\
+SHA256:
+ 1111111111111111111111111111111111111111111111111111111111111111 10 ./Packages
+ 2222222222222222222222222222222222222222222222222222222222222222 10 ../evil
+";
+        let entries: Vec<_> = parse_release_checksums(release).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Packages");
+        assert_eq!(entries[0].1, [0x11u8; 32]);
     }
 
     #[test]
