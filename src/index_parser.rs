@@ -554,6 +554,95 @@ pub(crate) fn parse_release_byhash_digests(content: &str) -> impl Iterator<Item 
     })
 }
 
+/// What a `StreamHasher` (splice-only, below) computed, as handed to
+/// `integrity::verify_temp_file`.
+///
+/// The algorithm and the byte count travel with the digest because the
+/// verifier trusts it only after re-deriving both: the algorithm must be the
+/// one the expected digest uses, and `bytes` must equal the size of the
+/// finished file on disk. Either check failing means the digest covers
+/// something other than what is about to be renamed into the cache, and the
+/// verifier falls back to re-reading the file.
+///
+/// Not gated on the `splice` feature even though only that backend produces
+/// one: `integrity::VerifyInput` carries the `Option` in every build.
+#[derive(Clone)]
+pub(crate) struct StreamedDigest {
+    pub(crate) algo: HashAlgo,
+    pub(crate) digest: Vec<u8>,
+    /// Bytes fed through `StreamHasher::update`. Every one of them was also
+    /// written to the cache file (both update sites hash exactly what they
+    /// write), so this is the size the finished file must have.
+    pub(crate) bytes: u64,
+}
+
+/// A [`HashAlgo`]-dispatched incremental digest, for hashing a download's
+/// bytes as they are written instead of re-reading the finished file.
+///
+/// The two `sha2` types are distinct, so the algorithm has to be chosen up
+/// front (`integrity::stream_hash_algo`) and carried. [`Self::finalize`]
+/// returns it alongside the digest and the byte count, which lets the verifier
+/// confirm the digest it is handed was computed with the algorithm it actually
+/// expects, over exactly the file it is about to commit, and fall back to a
+/// re-read when it was not.
+///
+/// Splice-only: the other backends have no single site every cache byte passes
+/// through, so they re-read and hash the finished file at commit time.
+///
+/// Both digests are boxed: a `Sha512` carries a 128-byte block buffer plus its
+/// chaining state inline, and this type is held in `splice::CacheTarget` across
+/// every await of a download, where that much dead weight pushed
+/// `try_sendfile_request`'s future over `clippy::large_futures`.
+#[cfg(feature = "splice")]
+pub(crate) struct StreamHasher {
+    state: StreamHasherState,
+    /// Bytes seen by [`Self::update`], carried into [`StreamedDigest::bytes`].
+    bytes: u64,
+}
+
+#[cfg(feature = "splice")]
+enum StreamHasherState {
+    Sha256(Box<sha2::Sha256>),
+    Sha512(Box<sha2::Sha512>),
+}
+
+#[cfg(feature = "splice")]
+impl StreamHasher {
+    #[must_use]
+    pub(crate) fn new(algo: HashAlgo) -> Self {
+        use sha2::Digest as _;
+        let state = match algo {
+            HashAlgo::Sha256 => StreamHasherState::Sha256(Box::new(sha2::Sha256::new())),
+            HashAlgo::Sha512 => StreamHasherState::Sha512(Box::new(sha2::Sha512::new())),
+        };
+        Self { state, bytes: 0 }
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest as _;
+        match &mut self.state {
+            StreamHasherState::Sha256(h) => h.update(bytes),
+            StreamHasherState::Sha512(h) => h.update(bytes),
+        }
+        self.bytes += bytes.len() as u64;
+    }
+
+    #[must_use]
+    pub(crate) fn finalize(self) -> StreamedDigest {
+        use sha2::Digest as _;
+        let Self { state, bytes } = self;
+        let (algo, digest) = match state {
+            StreamHasherState::Sha256(h) => (HashAlgo::Sha256, h.finalize().to_vec()),
+            StreamHasherState::Sha512(h) => (HashAlgo::Sha512, h.finalize().to_vec()),
+        };
+        StreamedDigest {
+            algo,
+            digest,
+            bytes,
+        }
+    }
+}
+
 /// Hash the contents of an open file. Synchronous; blocks the current thread.
 pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> io::Result<Vec<u8>> {
     use std::io::Read as _;

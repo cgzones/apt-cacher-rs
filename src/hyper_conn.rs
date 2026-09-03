@@ -38,7 +38,7 @@ use crate::{
     AppState, Never, Scheme,
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
-        AbortReason, ActiveDownloadStatus, InsertOutcome, Serveable, await_serveable,
+        AbortReason, ActiveDownloadStatus, InsertOutcome, Origination, Serveable, await_serveable,
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
@@ -1169,7 +1169,7 @@ async fn serve_cache_miss(
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
     match appstate.active_downloads.insert(conn_details.key()) {
-        InsertOutcome::Originator { init_tx, status } => {
+        InsertOutcome::Originator(origination) => {
             let cfstate = match miss {
                 CacheMiss::NotFound => {
                     trace!(
@@ -1189,7 +1189,7 @@ async fn serve_cache_miss(
                     prev_size: size,
                 },
             };
-            serve_new_file(conn_details, status, init_tx, req, cfstate, appstate).await
+            serve_new_file(conn_details, origination, req, cfstate, appstate).await
         }
         InsertOutcome::Joined { status } => {
             match miss {
@@ -1409,8 +1409,11 @@ async fn download_file(
             }
         }
 
+        // No streamed digest: this path writes through a `BufWriter` whose
+        // bytes are not funnelled through a single hashable site, so the
+        // commit re-reads and hashes the finished file as before.
         if rbarrier
-            .commit(outpath, dest_file_path, total_bytes)
+            .commit(outpath, dest_file_path, total_bytes, None)
             .await
             .is_err()
         {
@@ -1526,8 +1529,7 @@ fn upstream_cap_rejection(
 #[must_use]
 async fn serve_new_file(
     conn_details: ConnectionDetails,
-    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    init_tx: tokio::sync::watch::Sender<()>,
+    origination: Origination,
     req: Request<Empty<()>>,
     cfstate: CacheFileStat,
     appstate: AppState,
@@ -1648,9 +1650,11 @@ async fn serve_new_file(
 
     let config = global_config();
 
+    // The late-joiner serve below reads the status through its own handle;
+    // the barrier owns the origination itself.
+    let status = Arc::clone(&origination.status);
     let ibarrier = InitBarrier::new(
-        init_tx,
-        &status,
+        origination,
         &appstate.active_downloads,
         &conn_details,
         req.uri().path(),
@@ -2230,7 +2234,7 @@ async fn serve_new_file(
     if should_nudge(
         config,
         conn_details.cached_flavor(),
-        || appstate.active_downloads.len(),
+        || appstate.active_downloads.upstream_slots(),
         total_content_length.upper(),
         &mut rand::rng(),
     ) {

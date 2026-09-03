@@ -15,6 +15,12 @@
 //! `BodyTransferError::log_detached` because there is no connection left whose
 //! outer arm could report it.
 //!
+//! The very end is not a mirror but the same code: `CacheTarget::begin_rename`
+//! ends the download, and the commit and the completion line are
+//! `super::commit::CommitTail`, which `splice_proxy_drive` spawns onto a
+//! fresh task and this module -- already off the connection -- simply awaits
+//! in place.
+//!
 //! Feature coverage falls out of the ownership: the task holds whichever
 //! `UpstreamConn` variant the exchange produced, so hyper-less builds are
 //! covered without a second code path.
@@ -26,11 +32,12 @@ use bytes::BytesMut;
 use crate::cache_layout::ConnectionDetails;
 use crate::precise_instant::PreciseInstant;
 
+use super::body::{BodyClient, ClientEnd};
+use super::commit::{CommitTail, CompletionBytes, CompletionClient};
 use super::upstream::{ConnLabel, PoolGuard, UnconsumedBodyGuard};
 use super::{
-    BodyTransferFailure, BodyTransferred, CacheTarget, CompletionClient, RateTimestamps,
-    commit_and_record, log_download_start, log_splice_completion, transfer_body,
-    write_body_prefix_to_cache,
+    BodyTransferFailure, BodyTransferred, CacheTarget, RateTimestamps, log_download_start,
+    transfer_body, write_body_prefix_to_cache,
 };
 use crate::cache_conditional::ServeParams;
 
@@ -47,8 +54,6 @@ pub(super) struct DetachedDownload {
     /// barrier (registry entry plus quota reservation).
     pub(super) target: CacheTarget,
     pub(super) conn_details: ConnectionDetails,
-    /// The pre-redirect client request path, for the `Origin` row.
-    pub(super) original_uri_path: String,
     pub(super) conn_label: ConnLabel,
     pub(super) total_content_length: NonZero<u64>,
     pub(super) body_content_length: NonZero<u64>,
@@ -78,7 +83,6 @@ impl DetachedDownload {
             header_end,
             mut target,
             conn_details,
-            original_uri_path,
             conn_label,
             total_content_length,
             body_content_length,
@@ -123,7 +127,7 @@ impl DetachedDownload {
 
         let target = match transfer_body(
             &mut upstream_guard,
-            None,
+            BodyClient::Absent,
             target,
             resume_offset,
             body_content_length,
@@ -133,14 +137,10 @@ impl DetachedDownload {
         )
         .await
         {
-            Ok(BodyTransferred {
-                target,
-                demoted_handle,
-                client_disconnected: _,
-            }) => {
+            Ok(BodyTransferred { target, client }) => {
                 debug_assert!(
-                    demoted_handle.is_none(),
-                    "a client-less transfer has no client to demote"
+                    matches!(client, ClientEnd::Absent),
+                    "a client-less transfer has no client to demote or lose"
                 );
                 target
             }
@@ -156,28 +156,24 @@ impl DetachedDownload {
         drop(upstream_guard);
         drop(upstream);
 
-        // A commit failure already logged its cause and dropped the barrier;
-        // nothing is cached, so no DB rows and no completion line.
-        if commit_and_record(
-            target,
+        // The same tail `splice_proxy_drive` spawns, run in place: this task
+        // *is* the off-connection context that one has to create. A commit
+        // failure already logged its cause and dropped the barrier; nothing is
+        // cached, so no DB rows and no completion line. Upstream side only:
+        // no client was ever served, so there is no `SERVED_*` /
+        // `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
+        CommitTail::new(
+            target.begin_rename().await,
             &conn_details,
-            &original_uri_path,
-            total_content_length,
+            conn_label,
+            CompletionBytes {
+                total: total_content_length,
+                upstream: body_content_length.get(),
+                resume_offset,
+            },
             start,
         )
-        .await
-        .is_some()
-        {
-            // Upstream side only: no client was served, so there is no
-            // `SERVED_*` / `BYTES_SERVED_SPLICE` bump and no `Delivery` row.
-            log_splice_completion(
-                &conn_details,
-                conn_label,
-                &rates,
-                body_content_length.get(),
-                resume_offset,
-                CompletionClient::Nudged,
-            );
-        }
+        .finish(rates, CompletionClient::Nudged)
+        .await;
     }
 }

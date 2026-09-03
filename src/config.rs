@@ -410,6 +410,14 @@ impl ClientHost {
         Ok(Self(DomainName::new(host)?))
     }
 
+    /// The host name as a string slice: what `Display` renders, without the
+    /// allocation.
+    #[must_use]
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
     /// Convert this client host to a [`CacheHost`] identity, without
     /// allocating.
     #[must_use]

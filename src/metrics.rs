@@ -263,6 +263,10 @@ pub(crate) static REQUEST_READ_PROTOCOL_ERROR: Counter = Counter::new();
 /// Peak concurrency: connected clients, in-flight upstream downloads,
 /// in-flight client-side downloads.
 pub(crate) static CONNECTED_CLIENTS_PEAK: Peak = Peak::new();
+/// Peaks the `active_downloads::UpstreamSlot` count -- downloads with an
+/// upstream connection open, the unit `max_upstream_downloads` caps -- not
+/// the registry's entry count: a download past `begin_rename` (verifying,
+/// renaming) holds no slot and does not count.
 pub(crate) static ACTIVE_UPSTREAM_DOWNLOADS_PEAK: Peak = Peak::new();
 pub(crate) static ACTIVE_CLIENT_DOWNLOADS_PEAK: Peak = Peak::new();
 

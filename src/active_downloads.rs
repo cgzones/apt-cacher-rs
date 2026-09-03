@@ -18,6 +18,16 @@
 //!   module-private [`AT_CAP`] latch so each saturation episode counts once.
 //! - Cap rejections ([`metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP`]) — bumped
 //!   for every refused origination.
+//!
+//! The cap counts [`UpstreamSlot`]s, not entries. A slot is minted with the
+//! origination and released by dropping it, so the count is exactly the
+//! number of alive tokens: no derived subtraction, no flag to remember to
+//! set. An entry outlives its slot on purpose -- it stays mapped through
+//! verification and rename so a joiner arriving in that window finds it
+//! rather than missing both the entry and the cache file -- which is why
+//! [`ActiveDownloads::len`] (the shutdown summary, the dashboard: "what
+//! would be dropped now") and [`ActiveDownloads::upstream_slots`] (the cap,
+//! the parallel-hack probability) are two different numbers.
 
 use std::num::NonZero;
 use std::path::PathBuf;
@@ -338,17 +348,98 @@ struct ActiveDownloadEntry {
     late_joiners: usize,
 }
 
+/// The locked state: the entries, and the number of [`UpstreamSlot`]s alive.
+///
+/// The two are deliberately independent counts rather than one derived from
+/// the other. An entry outlives its upstream connection (it stays mapped
+/// through verification and rename so a joiner in that window still finds
+/// it), and the slot is what `max_upstream_downloads` caps -- so the cap
+/// reads `upstream_slots`, never `entries.len()`, and neither count is ever
+/// computed by subtracting the other.
+#[derive(Debug)]
+struct Registry {
+    entries: HashMap<CacheEntryKey, ActiveDownloadEntry>,
+    /// Alive [`UpstreamSlot`] tokens. Written only by [`UpstreamSlot::mint`]
+    /// and [`UpstreamSlot`]'s `Drop`, which are also the only places that
+    /// move the saturation latch: a count that can only change through those
+    /// two cannot change without the latch seeing it.
+    upstream_slots: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct ActiveDownloads {
-    inner: Arc<parking_lot::RwLock<HashMap<CacheEntryKey, ActiveDownloadEntry>>>,
+    inner: Arc<parking_lot::RwLock<Registry>>,
 }
 
 impl std::fmt::Debug for ActiveDownloads {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self.inner.read();
         f.debug_struct("ActiveDownloads")
-            .field("entries", &*self.inner.read())
+            .field("entries", &guard.entries)
+            .field("upstream_slots", &guard.upstream_slots)
             .finish()
     }
+}
+
+/// The unit `max_upstream_downloads` counts: one upstream connection opened
+/// on behalf of a download. Minted by the origination that opens it
+/// ([`LookupResult::Originator`]) and released by drop, so it can neither
+/// be forgotten nor released twice -- whoever holds it holds the slot.
+///
+/// The barrier chain in `guards.rs` carries it from `InitBarrier::new` and
+/// drops it in `DownloadBarrier::begin_rename`, which is where every backend
+/// has necessarily finished reading the upstream body and which comes before
+/// the `fsync`, verify and rename that follow. The entry stays mapped until
+/// that commit ends, because joiners still need to find it: a released slot
+/// says "no upstream connection", not "no download".
+#[must_use = "dropping the slot is what frees it; hold it for as long as the upstream connection is open"]
+pub(crate) struct UpstreamSlot {
+    registry: ActiveDownloads,
+}
+
+impl std::fmt::Debug for UpstreamSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamSlot").finish_non_exhaustive()
+    }
+}
+
+impl UpstreamSlot {
+    /// Mint the slot for a new origination, under the registry's write lock
+    /// (`upstream_slots` is the locked count). The caller has already refused
+    /// the origination if the count is at `max`.
+    fn mint(
+        upstream_slots: &mut usize,
+        registry: &ActiveDownloads,
+        max: Option<NonZero<usize>>,
+    ) -> Self {
+        *upstream_slots += 1;
+        record_cap_saturation(*upstream_slots, max);
+        Self {
+            registry: registry.clone(),
+        }
+    }
+}
+
+impl Drop for UpstreamSlot {
+    fn drop(&mut self) {
+        let mut guard = self.registry.inner.write();
+        guard.upstream_slots = guard
+            .upstream_slots
+            .checked_sub(1)
+            .expect("every released slot was minted");
+        record_cap_drain(guard.upstream_slots);
+    }
+}
+
+/// What a successful origination hands its backend: the `Init` ping sender
+/// the barrier drops when it leaves `Init`, the status handle, and the
+/// [`UpstreamSlot`] the download counts against `max_upstream_downloads`
+/// with. Consumed whole by `InitBarrier::new`, so no backend can register a
+/// download without also taking custody of its slot.
+pub(crate) struct Origination {
+    pub(crate) init_tx: tokio::sync::watch::Sender<()>,
+    pub(crate) status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    pub(crate) slot: UpstreamSlot,
 }
 
 /// Outcome of `ActiveDownloads::insert`: either this caller originates the
@@ -357,15 +448,14 @@ impl std::fmt::Debug for ActiveDownloads {
 /// inside `insert()` itself — callers do not need any follow-up helper.
 #[cfg(feature = "hyper")]
 pub(crate) enum InsertOutcome {
-    Originator {
-        init_tx: tokio::sync::watch::Sender<()>,
-        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    },
+    Originator(Origination),
     Joined {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
     /// See [`LookupResult::AtCapacity`].
-    AtCapacity { max: NonZero<usize> },
+    AtCapacity {
+        max: NonZero<usize>,
+    },
 }
 
 /// Outcome of `ActiveDownloads::originate`: either this caller originates
@@ -375,15 +465,14 @@ pub(crate) enum InsertOutcome {
 /// — the `Arc<RwLock<…>>` outlives any subsequent `remove()` of the entry.
 #[cfg(feature = "splice")]
 pub(crate) enum OriginateOutcome {
-    Originator {
-        init_tx: tokio::sync::watch::Sender<()>,
-        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    },
+    Originator(Origination),
     Concurrent {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
     /// See [`LookupResult::AtCapacity`].
-    AtCapacity { max: NonZero<usize> },
+    AtCapacity {
+        max: NonZero<usize>,
+    },
 }
 
 /// Neutral result of [`ActiveDownloads::lookup_or_insert`], the shared
@@ -394,10 +483,9 @@ pub(crate) enum OriginateOutcome {
 /// have already been bumped inside `lookup_or_insert` when this returns
 /// `LateJoiner`; the public adapters do not need to bump them.
 enum LookupResult {
-    Originator {
-        init_tx: tokio::sync::watch::Sender<()>,
-        status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    },
+    /// A new entry, and with it the [`UpstreamSlot`] it counts against
+    /// `max_upstream_downloads` with.
+    Originator(Origination),
     LateJoiner {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
@@ -410,37 +498,40 @@ enum LookupResult {
 }
 
 /// Saturation-transition latch for `max_upstream_downloads`, used exclusively
-/// by [`record_cap_saturation`] and [`record_cap_drain`].
+/// by [`record_cap_saturation`] and [`record_cap_drain`] -- which in turn are
+/// called only by [`UpstreamSlot::mint`] and [`UpstreamSlot`]'s `Drop`, under
+/// the registry's write lock, so the latch moves in lockstep with the slot
+/// count it describes.
 static AT_CAP: AtomicBool = AtomicBool::new(false);
 
-/// Insert/originate-side cap tracking: latch `AT_CAP` and bump the
-/// transition counter the first time the active-download set hits
-/// `max_upstream_downloads`. `max_upstream_downloads` is read per-call so
-/// config reloads take effect. `AcqRel` pairs with `Release` in
-/// [`record_cap_drain`] so two threads racing the saturation cannot
-/// both observe `false` and double-increment the transition counter.
-fn record_cap_saturation(current_len: usize, max: Option<NonZero<usize>>) {
+/// Mint-side cap tracking: latch `AT_CAP` and bump the transition counter
+/// the first time the slot count hits `max_upstream_downloads`.
+/// `max_upstream_downloads` is read per-call so config reloads take effect.
+/// `AcqRel` pairs with `Release` in [`record_cap_drain`] so two threads
+/// racing the saturation cannot both observe `false` and double-increment
+/// the transition counter.
+fn record_cap_saturation(upstream_slots: usize, max: Option<NonZero<usize>>) {
     let Some(max) = max else {
         return;
     };
-    if current_len >= max.get() && !AT_CAP.swap(true, Ordering::AcqRel) {
+    if upstream_slots >= max.get() && !AT_CAP.swap(true, Ordering::AcqRel) {
         metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS.increment();
     }
 }
 
-/// Remove-side cap tracking: clear the latch when the active-download set
-/// drains to zero so the next saturation episode can be counted. A remove
-/// can only decrease `current_len`, so the latch-set branch is
-/// unreachable from here and is omitted.
+/// Release-side cap tracking: clear the latch when the last slot is given
+/// back so the next saturation episode can be counted. A release can only
+/// decrease the count, so the latch-set branch is unreachable from here and
+/// is omitted.
 ///
 /// `max_upstream_downloads` is deliberately not consulted: with no cap
 /// configured [`record_cap_saturation`] never sets the latch, so the store
 /// is a no-op — and clearing unconditionally also releases a latch left
 /// armed by a config reload that dropped the cap. Keeping the read out of
-/// here is what makes [`ActiveDownloads::remove`] global-free (and so
+/// here is what makes [`UpstreamSlot`]'s drop global-free (and so
 /// unit-testable).
-fn record_cap_drain(current_len: usize) {
-    if current_len == 0 {
+fn record_cap_drain(upstream_slots: usize) {
+    if upstream_slots == 0 {
         AT_CAP.store(false, Ordering::Release);
     }
 }
@@ -449,21 +540,29 @@ impl ActiveDownloads {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            inner: Arc::new(parking_lot::RwLock::new(Registry {
+                entries: HashMap::new(),
+                upstream_slots: 0,
+            })),
         }
     }
 
+    /// Every mapped entry, whether or not its upstream connection is still
+    /// open: "downloads this process would drop if it stopped now", which is
+    /// what the shutdown summary and the dashboard mean. The cap and the
+    /// parallel-hack probability want [`Self::upstream_slots`] instead.
     #[must_use]
-    /// Downloads currently registered.
-    ///
-    /// Every terminal status transition (`Finished`/`Aborted`) in `guards.rs`
-    /// is immediately followed by `remove()`, so a mapped entry is in a
-    /// pre-terminal state apart from a transition-to-removal window a few
-    /// statements wide. The map length therefore matches a per-entry status
-    /// scan up to that transient — fine for the parallel-hack probability
-    /// and for the web display, the two consumers that care.
     pub(crate) fn len(&self) -> usize {
-        self.inner.read().len()
+        self.inner.read().entries.len()
+    }
+
+    /// Downloads with an upstream connection open right now: the number of
+    /// alive [`UpstreamSlot`]s, i.e. what `max_upstream_downloads` is
+    /// compared against. Smaller than [`Self::len`] by the entries that are
+    /// past their body and only verifying, renaming or being retired.
+    #[must_use]
+    pub(crate) fn upstream_slots(&self) -> usize {
+        self.inner.read().upstream_slots
     }
 
     /// Common locked-region body shared by `Self::insert` and
@@ -472,19 +571,20 @@ impl ActiveDownloads {
     /// peak + late-joiner accounting, return the neutral [`LookupResult`].
     ///
     /// This is also the single enforcement site for
-    /// `max_upstream_downloads`: a new origination while the set is at the
-    /// cap returns [`LookupResult::AtCapacity`] without inserting. Late
-    /// joiners are exempt by construction (an occupied entry opens no new
-    /// upstream connection), and the check happens under the same write
-    /// lock as the insert, so the cap is exact — no check-then-insert race
-    /// can overshoot it. Both backends inherit the cap through their public
-    /// adapters and must map `AtCapacity` to the canonical 503.
+    /// `max_upstream_downloads`: a new origination while `upstream_slots` is
+    /// at the cap returns [`LookupResult::AtCapacity`] without inserting.
+    /// Late joiners are exempt by construction (an occupied entry opens no
+    /// new upstream connection), and the check happens under the same write
+    /// lock as the insert and the slot mint, so the cap is exact — no
+    /// check-then-insert race can overshoot it. Both backends inherit the
+    /// cap through their public adapters and must map `AtCapacity` to the
+    /// canonical 503.
     ///
     /// `max_upstream_downloads` is threaded in by the public callers
     /// (which read it from `global_config()`) so this helper can be
     /// driven from unit tests without standing up a full configuration.
-    /// The helper is not side-effect-free: it still latches the
-    /// module-private [`AT_CAP`] flag via [`record_cap_saturation`] and
+    /// The helper is not side-effect-free: minting the slot latches the
+    /// module-private [`AT_CAP`] flag via [`record_cap_saturation`], and it
     /// bumps the `ACTIVE_UPSTREAM_DOWNLOADS_PEAK`, `LATE_JOINERS_TOTAL`,
     /// `LATE_JOINER_PEAK_PER_DOWNLOAD`, and (on a refused origination)
     /// `UPSTREAM_DOWNLOAD_REJECTED_CAP` global metrics.
@@ -497,15 +597,12 @@ impl ActiveDownloads {
         // allocates nothing (no owned key, no channel, no status Arc).
         {
             let mut guard = self.inner.write();
-            if let Some(entry) = guard.get_mut(&keyref) {
+            if let Some(entry) = guard.entries.get_mut(&keyref) {
                 entry.late_joiners += 1;
                 let peak = entry.late_joiners;
                 let status = Arc::clone(&entry.status);
-                let current_len = guard.len();
-                record_cap_saturation(current_len, max_upstream_downloads);
                 drop(guard);
 
-                metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(current_len as u64);
                 metrics::LATE_JOINERS_TOTAL.increment();
                 metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
                 return LookupResult::LateJoiner { status };
@@ -523,10 +620,16 @@ impl ActiveDownloads {
         // download between the two lock acquisitions — then we join late
         // after all and the pre-allocations are discarded (rare race).
         let mut guard = self.inner.write();
-        // Sampled before `entry()` (which borrows the map exclusively); only
-        // the Vacant arm consults it — joins are exempt from the cap.
-        let at_capacity = max_upstream_downloads.filter(|max| guard.len() >= max.get());
-        let (outcome, late_joiner_peak) = match guard.entry(key) {
+        let Registry {
+            entries,
+            upstream_slots,
+        } = &mut *guard;
+        // Only the Vacant arm consults it — joins are exempt from the cap.
+        // The slot count, not the map length: an entry whose upstream
+        // connection is already back in the pool holds nothing the cap
+        // protects.
+        let at_capacity = max_upstream_downloads.filter(|max| *upstream_slots >= max.get());
+        let (outcome, late_joiner_peak) = match entries.entry(key) {
             Entry::Occupied(mut oentry) => {
                 let entry = oentry.get_mut();
                 entry.late_joiners += 1;
@@ -551,20 +654,22 @@ impl ActiveDownloads {
                         late_joiners: 0,
                     });
                     (
-                        LookupResult::Originator {
+                        LookupResult::Originator(Origination {
                             init_tx: tx,
                             status,
-                        },
+                            // Under the same lock as the insert and the
+                            // capacity check above, so the cap is exact.
+                            slot: UpstreamSlot::mint(upstream_slots, self, max_upstream_downloads),
+                        }),
                         None,
                     )
                 }
             }
         };
-        let current_len = guard.len();
-        record_cap_saturation(current_len, max_upstream_downloads);
+        let upstream_slots = *upstream_slots;
         drop(guard);
 
-        metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(current_len as u64);
+        metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.update(upstream_slots as u64);
         if matches!(outcome, LookupResult::AtCapacity { max: _ }) {
             metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.increment();
         }
@@ -586,9 +691,7 @@ impl ActiveDownloads {
     pub(crate) fn insert(&self, key: CacheEntryKeyRef<'_>) -> InsertOutcome {
         let max = global_config().max_upstream_downloads;
         match self.lookup_or_insert(key, max) {
-            LookupResult::Originator { init_tx, status } => {
-                InsertOutcome::Originator { init_tx, status }
-            }
+            LookupResult::Originator(origination) => InsertOutcome::Originator(origination),
             LookupResult::LateJoiner { status } => InsertOutcome::Joined { status },
             LookupResult::AtCapacity { max } => InsertOutcome::AtCapacity { max },
         }
@@ -598,14 +701,19 @@ impl ActiveDownloads {
     /// `max_upstream_downloads` gate that makes [`Self::insert`] read the
     /// config globals. Exists so tests elsewhere in the crate can build a
     /// barrier over a *real* registry entry - `Drop` asserts the entry it
-    /// retires was registered.
+    /// retires was registered. The slot is dropped on the spot: those
+    /// barriers are built by hand and never carry one.
     #[cfg(test)]
     pub(crate) fn insert_uncapped(
         &self,
         key: CacheEntryKeyRef<'_>,
     ) -> Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
         match self.lookup_or_insert(key, None) {
-            LookupResult::Originator { init_tx: _, status }
+            LookupResult::Originator(Origination {
+                init_tx: _,
+                status,
+                slot: _,
+            })
             | LookupResult::LateJoiner { status } => Some(status),
             LookupResult::AtCapacity { max: _ } => None,
         }
@@ -625,27 +733,18 @@ impl ActiveDownloads {
     pub(crate) fn originate(&self, key: CacheEntryKeyRef<'_>) -> OriginateOutcome {
         let max = global_config().max_upstream_downloads;
         match self.lookup_or_insert(key, max) {
-            LookupResult::Originator { init_tx, status } => {
-                OriginateOutcome::Originator { init_tx, status }
-            }
+            LookupResult::Originator(origination) => OriginateOutcome::Originator(origination),
             LookupResult::LateJoiner { status } => OriginateOutcome::Concurrent { status },
             LookupResult::AtCapacity { max } => OriginateOutcome::AtCapacity { max },
         }
     }
 
+    /// Retire `key`'s entry. Touches the entries only: the cap and its
+    /// latch follow the [`UpstreamSlot`], which the owning barrier drops on
+    /// its own schedule (and which every barrier has dropped by the time it
+    /// removes its entry).
     pub(crate) fn remove(&self, key: CacheEntryKeyRef<'_>) {
-        let mut guard = self.inner.write();
-        let was_present = guard.remove(&key);
-        // Sample the post-remove length AND clear the cap-transition latch
-        // under the same write lock as the length transition. Releasing the
-        // lock first would let a new originator reach `max_upstream_downloads`
-        // and observe the stale `AT_CAP = true` (skipping its counter)
-        // before this clear runs, then we would clear the latch while the
-        // set is at cap. A remove can only decrease the length, so the
-        // saturation set-edge is unreachable here; only the drain reset is
-        // meaningful.
-        record_cap_drain(guard.len());
-        drop(guard);
+        let was_present = self.inner.write().entries.remove(&key);
         assert!(
             was_present.is_some(),
             "callers must own active downloads they are removing"
@@ -670,14 +769,14 @@ impl ActiveDownloads {
         // Fast path under the shared lock: this runs on every cacheable
         // sendfile request and almost always misses (nothing in flight for
         // the key), so don't pay the exclusive lock for a pure lookup.
-        if !self.inner.read().contains_key(&key) {
+        if !self.inner.read().entries.contains_key(&key) {
             return None;
         }
 
         // Re-check under the write lock — the entry may have been removed
         // between the two acquisitions.
         let mut guard = self.inner.write();
-        let entry = guard.get_mut(&key)?;
+        let entry = guard.entries.get_mut(&key)?;
         entry.late_joiners += 1;
         let peak = entry.late_joiners;
         let status = Arc::clone(&entry.status);
@@ -708,7 +807,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
             None,
         );
-        assert!(matches!(result, LookupResult::Originator { .. }));
+        assert!(matches!(result, LookupResult::Originator(_)));
     }
 
     #[test]
@@ -720,7 +819,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
             None,
         );
-        assert!(matches!(first, LookupResult::Originator { .. }));
+        assert!(matches!(first, LookupResult::Originator(_)));
         // Second call on the same key: late joiner.
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
@@ -751,6 +850,7 @@ mod tests {
         let late_joiners = ad
             .inner
             .read()
+            .entries
             .get(&key)
             .expect("entry exists")
             .late_joiners;
@@ -766,7 +866,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(first, LookupResult::Originator { .. }));
+        assert!(matches!(first, LookupResult::Originator(_)));
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),
@@ -774,6 +874,11 @@ mod tests {
         assert!(matches!(second, LookupResult::AtCapacity { max: m } if m == max));
         // The refused origination must not have registered anything.
         assert_eq!(ad.len(), 1, "rejected origination must not insert");
+        assert_eq!(
+            ad.upstream_slots(),
+            1,
+            "rejected origination must not mint a slot"
+        );
     }
 
     #[test]
@@ -785,7 +890,7 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(first, LookupResult::Originator { .. }));
+        assert!(matches!(first, LookupResult::Originator(_)));
         // Same key at cap: joins the in-flight download, no new upstream
         // connection — exempt from the cap.
         let join = ad.lookup_or_insert(
@@ -793,6 +898,7 @@ mod tests {
             Some(max),
         );
         assert!(matches!(join, LookupResult::LateJoiner { .. }));
+        assert_eq!(ad.upstream_slots(), 1, "a join mints no slot");
     }
 
     #[test]
@@ -804,12 +910,12 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(first, LookupResult::Originator { .. }));
+        assert!(matches!(first, LookupResult::Originator(_)));
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(second, LookupResult::Originator { .. }));
+        assert!(matches!(second, LookupResult::Originator(_)));
         let third = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "c.deb", CacheLayout::StructuredPool),
             Some(max),
@@ -817,27 +923,58 @@ mod tests {
         assert!(matches!(third, LookupResult::AtCapacity { max: _ }));
     }
 
+    /// The cap follows the slot, not the entry: an entry whose slot is gone
+    /// (its upstream connection is back in the pool, the commit still
+    /// running) admits a new origination, and an entry retired with its slot
+    /// still held does not.
     #[test]
-    fn lookup_or_insert_cap_frees_after_removal() {
+    fn cap_frees_when_the_slot_drops_not_when_the_entry_goes() {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(1).expect("nonzero");
-        let first = ad.lookup_or_insert(
+        let LookupResult::Originator(Origination {
+            init_tx: _,
+            status: _,
+            slot,
+        }) = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
             Some(max),
-        );
-        assert!(matches!(first, LookupResult::Originator { .. }));
-        ad.remove(CacheEntryKeyRef::new(
-            &mirror,
-            "a.deb",
-            CacheLayout::StructuredPool,
-        ));
-        assert_eq!(ad.len(), 0, "remove must retire the entry");
+        )
+        else {
+            unreachable!("an empty registry originates");
+        };
+
+        // Slot released, entry still mapped: the download is committing.
+        drop(slot);
+        assert_eq!(ad.len(), 1, "the entry outlives its slot");
+        assert_eq!(ad.upstream_slots(), 0, "dropping the slot frees it");
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        assert!(matches!(second, LookupResult::Originator { .. }));
+        let LookupResult::Originator(Origination {
+            init_tx: _,
+            status: _,
+            slot: second_slot,
+        }) = second
+        else {
+            unreachable!("a committing entry holds no slot, so the cap admits the origination");
+        };
+
+        // Entry retired, slot still held: nothing the cap counts changed.
+        ad.remove(CacheEntryKeyRef::new(
+            &mirror,
+            "b.deb",
+            CacheLayout::StructuredPool,
+        ));
+        assert_eq!(ad.upstream_slots(), 1, "remove() does not touch the slot");
+        let third = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "c.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
+        assert!(matches!(third, LookupResult::AtCapacity { max: _ }));
+        drop(second_slot);
+        assert_eq!(ad.upstream_slots(), 0);
     }
 
     #[test]
@@ -849,7 +986,7 @@ mod tests {
                 CacheEntryKeyRef::new(&mirror, name, CacheLayout::StructuredPool),
                 None,
             );
-            assert!(matches!(result, LookupResult::Originator { .. }));
+            assert!(matches!(result, LookupResult::Originator(_)));
         }
     }
 }

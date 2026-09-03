@@ -333,7 +333,11 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         }
     };
 
-    let active_mirror_downloads = appstate.active_downloads.len();
+    // Slots, not entries: the row shows this beside the cap and the peak,
+    // which both count `UpstreamSlot`s, so the three share a unit. A download
+    // whose upstream connection is back in the pool but whose commit is still
+    // running counts in `len()` (the shutdown summary), not here.
+    let active_mirror_downloads = appstate.active_downloads.upstream_slots();
     let memory_stats = memory_stats::memory_stats();
 
     // Sample utilization so the peak metric reflects long idle stretches.

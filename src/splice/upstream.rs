@@ -284,6 +284,27 @@ impl PoolGuard {
     pub(super) fn unset_poolable(&mut self) {
         self.poolable = false;
     }
+
+    /// Hand the connection back now instead of at drop, for a caller that
+    /// only borrows the guard and is done with the upstream before its owner
+    /// is (`UpstreamExchange::drain_and_release`). An owner simply drops the
+    /// guard.
+    ///
+    /// Leaves the guard inert: `Drop` finds nothing left to do, and any
+    /// `Deref` afterwards panics, so call it once the upstream is finished
+    /// with.
+    pub(super) fn release(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        if !self.poolable {
+            return;
+        }
+        // Derive from the connection itself rather than caching it in a
+        // field that could drift from `conn`'s actual scheme.
+        let is_tls = conn.is_tls();
+        pool_return(&self.host, self.port, is_tls, conn);
+    }
 }
 
 impl std::ops::Deref for PoolGuard {
@@ -301,13 +322,9 @@ impl std::ops::DerefMut for PoolGuard {
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        if self.poolable
-            && let Some(conn) = self.conn.take()
-        {
-            // Derive from the connection itself rather than caching it in a
-            // field that could drift from `conn`'s actual scheme.
-            pool_return(&self.host, self.port, conn.is_tls(), conn);
-        }
+        // The whole of it: a guard that was already `release`d finds no
+        // connection left and does nothing.
+        self.release();
     }
 }
 

@@ -4,7 +4,7 @@
 //! read and deliver steps while every shared piece lives on [`BodyTransfer`]
 //! and comes back as [`BodyOutcome`]. Also owns client demotion to file
 //! serving ([`write_client_or_demote`], [`spawn_file_serve_task`],
-//! [`DemotedClientHandle`]), the [`SpliceRangeFilter`] applied to the client
+//! [`ClientEnd::Demoted`]), the [`SpliceRangeFilter`] applied to the client
 //! stream, [`BodyTransferError`]/[`BodyFailureSide`] attribution, and the
 //! pipe and `/dev/null` helpers ([`create_pipe`], [`drain_pipe`],
 //! [`drain_pipe_to_file`], [`range_slice`]). [`CacheBatch`] is the zero-copy
@@ -42,6 +42,7 @@ use crate::error::{ErrorReport, errno_to_io_error, is_peer_disconnect};
 use crate::fs_open::{hint_sequential_read, nofollow_options};
 use crate::guards::DownloadBarrier;
 use crate::humanfmt::HumanFmt;
+use crate::index_parser::StreamHasher;
 use crate::log_once::Logged;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::sendfile_conn::{
@@ -295,11 +296,59 @@ impl BodyTransferError {
     }
 }
 
-/// The caller must `.await` the join handle after the download barrier has
-/// been consumed (so the spawned task can observe a terminal
-/// `ActiveDownloadStatus` -- `Verifying` while integrity hashing is in
-/// flight, then `Finished` once `RenameBarrier::commit` flips the variant).
-pub(super) type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
+/// The client a body transfer starts with, as `transfer_body` sees it.
+///
+/// Only `Attached` arms the client-side accounting (`BodyTransfer::counter`,
+/// `client_rate_checker`) and puts a socket where
+/// [`ClientStatus::client_to_write`] can find it; the other two run the loop
+/// cache-only from the first chunk and differ only in what they mean at the
+/// end ([`ClientEnd`]).
+#[derive(Clone, Copy)]
+pub(super) enum BodyClient<'a> {
+    /// The connection's client, still receiving.
+    Attached(&'a TcpStream),
+    /// There never was one: the parallel-hack nudge answered the request
+    /// and the download runs detached.
+    Absent,
+    /// There was one, but the body-prefix write to it already failed
+    /// (`write_body_prefix`): its response is short and nothing more may be
+    /// written to it, so the loop starts in [`ClientStatus::Disconnected`]
+    /// and the transfer ends as [`ClientEnd::Disconnected`].
+    Lost,
+}
+
+impl BodyClient<'_> {
+    /// How the transfer ends when no body loop runs at all (the whole body
+    /// was in the prefix): whatever this client was, it still is.
+    pub(super) fn settled(self) -> ClientEnd {
+        match self {
+            Self::Attached(_) => ClientEnd::Served,
+            Self::Absent => ClientEnd::Absent,
+            Self::Lost => ClientEnd::Disconnected,
+        }
+    }
+}
+
+/// How the client came out of a body transfer: the one thing the drive still
+/// has to resolve before it can reuse the connection, and the only form the
+/// demoted file-serve task's handle travels in.
+///
+/// The handle is awaited in exactly one place, `commit::ClientSettlement::settle`,
+/// which exists only after `DownloadBarrier::begin_rename` dropped the watch
+/// sender the task may be parked on; awaiting it anywhere a `DownloadBarrier`
+/// is still owned would wait for a wake-up that cannot come.
+pub(super) enum ClientEnd {
+    /// Every byte the response promised went out on the connection itself.
+    Served,
+    /// There never was a client ([`BodyClient::Absent`]).
+    Absent,
+    /// The client is gone, or was never written to again after its prefix
+    /// failed ([`BodyClient::Lost`]); the response is short.
+    Disconnected,
+    /// The client was handed to a file-serve task that is still writing the
+    /// response through a `dup(2)` of the connection's socket.
+    Demoted(tokio::task::JoinHandle<DeliveryResult>),
+}
 
 /// Per-body bookkeeping shared by the two body loops.
 ///
@@ -310,11 +359,11 @@ pub(super) type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
 /// checkers, the upstream-rate gate, the byte cursors, the client state
 /// machine and the demotion hand-off -- lives here so it exists once.
 ///
-/// A `None` client starts the state machine in [`ClientStatus::Absent`] and
-/// leaves the client-side accounting (`counter`, `client_rate_checker`)
-/// unarmed; the socket itself is reachable only through
-/// [`ClientStatus::client_to_write`], so the client-less form needs no arms
-/// of its own.
+/// A client-less transfer ([`BodyClient::Absent`], [`BodyClient::Lost`])
+/// starts the state machine in the matching [`ClientStatus`] with the
+/// client-side accounting (`counter`, `client_rate_checker`) unarmed; the
+/// socket itself is reachable only through [`ClientStatus::client_to_write`],
+/// so the client-less form needs no arms of its own.
 ///
 /// Built by the caller (`transfer_body` in `mod.rs`) from the body's
 /// geometry and handed to one of the two loops by value; it comes back as
@@ -348,7 +397,16 @@ pub(super) struct BodyTransfer<'a> {
     client_file_pos: u64,
     /// Bytes still owed to the client.
     client_remaining: u64,
-    demoted_handle: Option<DemotedClientHandle>,
+    /// `Some` from [`Self::maybe_demote`] on, paired with
+    /// [`ClientStatus::Demoted`]; [`Self::finish`] folds both into
+    /// [`ClientEnd::Demoted`].
+    demoted_handle: Option<tokio::task::JoinHandle<DeliveryResult>>,
+    /// The download's incremental digest, borrowed from `CacheTarget::hasher`
+    /// so it advances in place over every cache byte this loop writes.
+    /// Always `None` in the zero-copy loop (see [`Self::drain_pipe_to_cache`]);
+    /// `Some` in the userspace-TLS loop only when the download will be
+    /// verified and started from offset 0.
+    hasher: &'a mut Option<StreamHasher>,
     range_filter: &'a SpliceRangeFilter,
     cache_path: &'a Path,
 }
@@ -357,11 +415,8 @@ pub(super) struct BodyTransfer<'a> {
 pub(super) struct BodyOutcome {
     /// Returned for the rename step.
     pub(super) dbarrier: DownloadBarrier,
-    /// Set when the client was demoted to a file-serve task; the caller
-    /// awaits it after consuming `dbarrier`.
-    pub(super) demoted_handle: Option<DemotedClientHandle>,
-    /// The client went away mid-body (as opposed to being demoted).
-    pub(super) client_disconnected: bool,
+    /// How the client came out of the loop.
+    pub(super) client: ClientEnd,
     /// Bytes this loop delivered to the client.
     pub(super) client_bytes: u64,
 }
@@ -371,23 +426,31 @@ impl<'a> BodyTransfer<'a> {
     /// upstream; `file_start_offset` where the first of them lands in the
     /// cache file.
     pub(super) fn new(
-        client: Option<&'a TcpStream>,
+        client: BodyClient<'a>,
         dbarrier: DownloadBarrier,
         range_filter: &'a SpliceRangeFilter,
         cache_path: &'a Path,
         content_length: u64,
         file_start_offset: i64,
+        hasher: &'a mut Option<StreamHasher>,
     ) -> Self {
+        let config = global_config();
+        let rate_checker = RateChecker::from_config(config);
         // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
         // response-headers emission (next to `record_client_status`), since
         // the body loops are skipped when the entire response fits in the
-        // body prefix and we still need to count it. A client-less transfer
-        // has no response of its own to count and no client to account for.
-        let counter = client.map(|_stream| client_counter::ClientDownload::new());
-
-        let config = global_config();
-        let rate_checker = RateChecker::from_config(config);
-        let client_rate_checker = client.and_then(|_stream| RateChecker::from_config(config));
+        // body prefix and we still need to count it. A transfer that ships
+        // no bytes to any client has nothing to account for and must not
+        // bump `ACTIVE_CLIENT_DOWNLOADS`.
+        let (counter, client_rate_checker, client_status) = match client {
+            BodyClient::Attached(stream) => (
+                Some(client_counter::ClientDownload::new()),
+                RateChecker::from_config(config),
+                ClientStatus::Active(stream),
+            ),
+            BodyClient::Absent => (None, None, ClientStatus::Absent),
+            BodyClient::Lost => (None, None, ClientStatus::Disconnected),
+        };
 
         Self {
             counter,
@@ -396,13 +459,14 @@ impl<'a> BodyTransfer<'a> {
             client_rate_checker,
             remaining: content_length,
             file_offset: file_start_offset,
-            client_status: client.map_or(ClientStatus::Absent, ClientStatus::Active),
+            client_status,
             bytes_done: 0,
             client_file_pos: u64::try_from(file_start_offset)
                 .expect("file_start_offset is non-negative by construction")
                 + range_filter.skip,
             client_remaining: range_filter.send,
             demoted_handle: None,
+            hasher,
             range_filter,
             cache_path,
         }
@@ -465,12 +529,24 @@ impl<'a> BodyTransfer<'a> {
     /// `pwrite` a userspace chunk to the cache file at the current offset
     /// and notify concurrent clients. Always done before the client send so
     /// late joiners are not gated on this client's send speed.
+    ///
+    /// This is one of the two sites that write into the cache file, so it is
+    /// one of the two that feed [`Self::hasher`] (the other is
+    /// `write_body_prefix_to_cache`). The digest update runs here on the async
+    /// worker rather than inside `pwrite_buf_to_file`'s `spawn_blocking`: this
+    /// path is the userspace-TLS loop, whose `read_buf` already decrypts the
+    /// same chunk on this worker at a comparable cost per byte, so one more
+    /// pass over a buffer that is already hot is proportionate -- and it keeps
+    /// the buffer-swap invariants of the pwrite retry loop untouched.
     async fn write_cache_chunk(
         &mut self,
         cache_file: &tokio::fs::File,
         buf: &mut Vec<u8>,
         got: usize,
     ) -> Result<(), BodyTransferError> {
+        if let Some(hasher) = self.hasher.as_mut() {
+            hasher.update(&buf[..got]);
+        }
         pwrite_buf_to_file(cache_file, buf, got, self.file_offset)
             .await
             .map_err(BodyTransferError::cache)?;
@@ -488,6 +564,15 @@ impl<'a> BodyTransfer<'a> {
         rx: &pipe::Receiver,
         cache_file: &tokio::fs::File,
     ) -> Result<(), BodyTransferError> {
+        // These bytes go pipe-to-file inside the kernel and are never in
+        // userspace, so they cannot feed an incremental digest. `transfer_body`
+        // drops the hasher before entering the zero-copy loop for exactly this
+        // reason; if one ever arrived here the committed digest would cover
+        // only the body prefix and wrongly fail verification.
+        debug_assert!(
+            self.hasher.is_none(),
+            "the zero-copy path cannot hash: its bytes never reach userspace"
+        );
         let landed = drain_pipe_to_file(rx, cache_file, &mut self.file_offset)
             .await
             .map_err(BodyTransferError::cache)?;
@@ -607,6 +692,7 @@ impl<'a> BodyTransfer<'a> {
             client_file_pos: _,
             client_remaining,
             demoted_handle,
+            hasher: _,
             range_filter,
             cache_path: _,
         } = self;
@@ -614,10 +700,26 @@ impl<'a> BodyTransfer<'a> {
             remaining, 0,
             "the body loop runs until the body is exhausted"
         );
+        let client = match client_status {
+            ClientStatus::Active(_) => ClientEnd::Served,
+            ClientStatus::Absent => ClientEnd::Absent,
+            // Every loop adjudicates a `DemoteRequested` on the iteration
+            // that raised it, so a body cannot end in it -- and if one ever
+            // did, the bytes it still owes would have no sender, which is a
+            // short response, not a served one.
+            ClientStatus::Disconnected
+            | ClientStatus::DemoteRequested {
+                client: _,
+                client_file_pos: _,
+                client_remaining: _,
+            } => ClientEnd::Disconnected,
+            ClientStatus::Demoted => ClientEnd::Demoted(
+                demoted_handle.expect("maybe_demote stores the handle of the task it spawns"),
+            ),
+        };
         BodyOutcome {
             dbarrier: dbarrier.expect("the barrier is only taken on the upstream-rate abort path"),
-            demoted_handle,
-            client_disconnected: matches!(client_status, ClientStatus::Disconnected),
+            client,
             client_bytes: range_filter.send - client_remaining,
         }
     }
@@ -1298,15 +1400,23 @@ async fn write_client_or_demote<'a>(
 }
 
 /// Duplicate the client socket fd and spawn a task that serves remaining bytes
-/// from the cache file.  Returns the `JoinHandle` so the caller can await it
-/// after the download barrier has been consumed.
+/// from the cache file.  Returns the `JoinHandle`, which leaves the loop as
+/// [`ClientEnd::Demoted`] and is awaited only by
+/// `commit::ClientSettlement::settle`.
+///
+/// The task parks in `receiver.changed()` with no timeout whenever it has
+/// drained the file but still owes the client bytes; its guaranteed wake-up
+/// is the watch sender's drop in `DownloadBarrier::begin_rename`. Awaiting
+/// the handle anywhere the barrier is still owned would therefore wait on a
+/// wake-up that cannot come. The settlement token is returned only after
+/// that drop and the commit spawn.
 fn spawn_file_serve_task(
     client: &TcpStream,
     cache_path: &Path,
     content_start: u64,
     content_length: u64,
     dbarrier: &DownloadBarrier,
-) -> std::io::Result<DemotedClientHandle> {
+) -> std::io::Result<tokio::task::JoinHandle<DeliveryResult>> {
     // Duplicate the client socket so the spawned task owns its own fd.
     // The original fd stays open in the connection handler but won't be
     // written to after demotion.
@@ -1656,8 +1766,8 @@ enum ClientStatus<'a> {
     Active(&'a TcpStream),
     /// No client was ever attached (parallel-hack nudge): cache-only from
     /// the first byte. Unlike [`Self::Disconnected`] there is no metric and
-    /// no log line -- nothing was lost -- and
-    /// [`BodyOutcome::client_disconnected`] stays false.
+    /// no log line -- nothing was lost -- and the transfer ends as
+    /// [`ClientEnd::Absent`], not [`ClientEnd::Disconnected`].
     Absent,
     /// Client disconnected mid-transfer.
     Disconnected,

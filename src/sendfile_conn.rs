@@ -2365,6 +2365,16 @@ pub(crate) async fn async_sendfile_unfinished(
             }
             // Wait for the sender to notify us of new data on disk.
             // The sender handles timeouts, so we *should* never stall here.
+            // The wait has no timeout of its own and needs none: it ends at
+            // the latest when the writer drops the sender, which
+            // `DownloadBarrier::begin_rename` and every barrier `Drop` do,
+            // and no holder of that barrier ever awaits this task first --
+            // the splice backend awaits its demoted file-serve only through
+            // `splice::commit::ClientSettlement::settle`, which exists only
+            // past that drop. That is also what bounds the failed-`fstat` case
+            // above: after the drop, `finished` is set and the next
+            // substituted "nothing available" ends the transfer as a short
+            // file instead of parking again.
             let _: Never = match receiver.changed().await {
                 Ok(()) => continue,
                 Err(_err @ tokio::sync::watch::error::RecvError { .. }) => {

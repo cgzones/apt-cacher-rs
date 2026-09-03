@@ -3,7 +3,9 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{error, info, warn};
 
 use crate::{
-    active_downloads::{AbortReason, ActiveDownloadStatus, ActiveDownloads},
+    active_downloads::{
+        AbortReason, ActiveDownloadStatus, ActiveDownloads, Origination, UpstreamSlot,
+    },
     cache_layout::{CacheEntryKey, CacheEntryKeyRef, CacheLayout, ConnectionDetails, ResourceKind},
     cache_metadata::{self, UpstreamMetadata},
     cache_paths::MirrorSite,
@@ -11,6 +13,7 @@ use crate::{
     error::ErrorReport,
     global_verify_throttle,
     humanfmt::HumanFmt,
+    index_parser::StreamedDigest,
     integrity::{self, CommitError, RenamePlan},
     metrics,
     partial_file::TempPath,
@@ -43,8 +46,12 @@ fn abort_on_drop(
 }
 
 struct InitBarrierData<'a> {
-    status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: &'a ActiveDownloads,
+    /// The download's `max_upstream_downloads` slot, travelling with the
+    /// barrier chain: `download` hands it to the `DownloadBarrier`, every
+    /// other sink drops it here with the rest.
+    slot: UpstreamSlot,
     key: CacheEntryKeyRef<'a>,
     resource_kind: ResourceKind,
     /// The raw client request URI path (pre-normalisation, pre-redirect),
@@ -63,21 +70,30 @@ impl<'a> InitBarrier<'a> {
     /// `raw_uri_path` is the client's request path exactly as received
     /// (pre-normalisation, and for the splice backend pre-redirect and
     /// query-stripped) - both backends must agree, or registry keys diverge.
+    ///
+    /// Takes the whole [`Origination`], slot included: the barrier chain is
+    /// what carries the slot from here on, and a backend that registered a
+    /// download cannot end up holding its slot loose.
     pub(crate) fn new(
-        tx: tokio::sync::watch::Sender<()>,
-        status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+        origination: Origination,
         active_downloads: &'a ActiveDownloads,
         conn_details: &'a ConnectionDetails,
         raw_uri_path: &'a str,
     ) -> Self {
+        let Origination {
+            init_tx,
+            status,
+            slot,
+        } = origination;
         Self {
             data: Some(InitBarrierData {
                 status,
                 active_downloads,
+                slot,
                 key: conn_details.key(),
                 resource_kind: conn_details.resource_kind,
                 raw_uri_path,
-                _tx: tx,
+                _tx: init_tx,
             }),
         }
     }
@@ -114,8 +130,9 @@ impl<'a> InitBarrier<'a> {
 
         DownloadBarrier {
             data: Some(DownloadBarrierData {
-                status: Arc::clone(data.status),
+                status: Arc::clone(&data.status),
                 active_downloads: data.active_downloads.clone(),
+                slot: data.slot,
                 key: data.key.to_owned(),
                 resource_kind: data.resource_kind,
                 raw_uri_path: data.raw_uri_path.to_owned(),
@@ -139,6 +156,19 @@ impl<'a> InitBarrier<'a> {
     #[must_use]
     pub(crate) fn debname(&self) -> &str {
         self.data().key.debname
+    }
+
+    /// The raw client request path this barrier will hand to `RenamePlan`.
+    /// Read before [`Self::download`] consumes the barrier, so a download can
+    /// decide up front which digest it will be verified against
+    /// (`integrity::stream_hash_algo`) using the very string the verifier
+    /// later reads its by-hash algorithm segment from.
+    ///
+    /// Splice-only: it is the sole backend that hashes as it writes.
+    #[cfg(feature = "splice")]
+    #[must_use]
+    pub(crate) fn raw_uri_path(&self) -> &str {
+        self.data().raw_uri_path
     }
 
     #[must_use]
@@ -167,14 +197,20 @@ impl<'a> InitBarrier<'a> {
 impl Drop for InitBarrier<'_> {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            abort_on_drop(data.status, data.active_downloads, data.key);
+            abort_on_drop(&data.status, data.active_downloads, data.key);
         }
+        // `data` (and with it the `UpstreamSlot`) drops with the struct.
     }
 }
 
 struct DownloadBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: ActiveDownloads,
+    /// The download's `max_upstream_downloads` slot, held until
+    /// [`DownloadBarrier::begin_rename`] -- where every backend has
+    /// necessarily finished reading the upstream body -- and dropped with the
+    /// rest on every other exit. Never reaches the `RenameBarrier`.
+    slot: UpstreamSlot,
     key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
@@ -258,6 +294,10 @@ impl DownloadBarrier {
         // take hundreds of ms for a large `.deb`). Late-joiner readers are
         // therefore not stalled during verification.
         data.flush_batched_ping();
+        // The upstream body is fully read by the time any backend gets here,
+        // so the slot is free now: this is the one release point, shared by
+        // every backend, and it comes before anything with I/O in it.
+        drop(data.slot);
         {
             let mut lock = data.status.write().await;
             let prev = std::mem::replace(
@@ -449,6 +489,7 @@ impl RenameBarrier {
         temp_path: TempPath,
         dest_path: PathBuf,
         declared_bytes: u64,
+        streamed_digest: Option<StreamedDigest>,
     ) -> Result<(), CommitError> {
         // Use the actual on-disk size rather than the declared length.
         // Earlier validation ensures these match today, but the defensive
@@ -476,9 +517,10 @@ impl RenameBarrier {
                 bytes_received,
                 resource_kind: data.resource_kind,
                 debname: data.key.debname.clone(),
-                host: data.key.mirror.host().to_string(),
+                host: data.key.mirror.host().as_str().to_owned(),
                 mirror_path: data.key.mirror.path().to_owned(),
                 raw_uri_path: data.raw_uri_path.clone(),
+                streamed_digest,
             }
         };
         let reservation = self

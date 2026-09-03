@@ -1,14 +1,18 @@
 //! Splice-based upstream proxy for the sendfile backend: connects to the
 //! mirror (HTTP or HTTPS), moves the response body to the client socket via
 //! tee+splice fan-out while caching it to disk, and commits the download
-//! through `RenameBarrier`.
+//! through `RenameBarrier` -- the `Download -> Verifying` flip on the
+//! connection task ([`commit::Committable`]), everything with I/O in it on a
+//! task of its own ([`commit::CommitTail`]), so the connection returns to its
+//! request loop with the client's last body byte rather than behind an
+//! `fsync`, a hash and three DB writes.
 //!
 //! This file owns the entry point the sendfile backend calls
 //! ([`splice_proxy`]) and the types it matches on ([`SpliceProxyOutcome`],
 //! [`SpliceProxyError`], [`UpstreamFailure`], [`AfterHeaderSide`]), the
 //! request drive ([`splice_proxy_drive`] and its phase functions) and the
-//! per-request state structs ([`ClientConn`],
-//! [`CacheTarget`], [`RateTimestamps`]). The mechanics live in submodules:
+//! per-request state structs ([`ClientConn`], [`CacheTarget`],
+//! [`RateTimestamps`]). The mechanics live in submodules:
 //!
 //! - [`upstream`]: the `UpstreamConn` enum, the idle pool and `PoolGuard`,
 //!   TCP/TLS connect and connect-error classification.
@@ -29,6 +33,7 @@ mod acquire;
 mod body;
 #[cfg(not(feature = "hyper"))]
 mod cleanup_bridge;
+mod commit;
 mod detached;
 mod http;
 mod simple_proxy;
@@ -57,8 +62,6 @@ use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_paths::CachePaths;
 use crate::cache_quota::QuotaExceeded;
-use crate::database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command};
-use crate::deb_mirror::Origin;
 use crate::error::{ErrorReport, is_peer_disconnect};
 use crate::fs_open::{
     CacheAccessFailure, regular_file_metadata, tokio_nofollow_options, touch_volatile_mtime,
@@ -70,12 +73,13 @@ use crate::http_helpers::{
 };
 use crate::http_range::{HttpDate, ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
+use crate::index_parser::StreamHasher;
+use crate::integrity;
 use crate::log_once::Logged;
 use crate::parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge};
 use crate::partial_file::{self, TempPath, tokio_tempfile};
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
-use crate::rate_log;
 use crate::response_head::WireBody;
 use crate::sendfile_conn::{
     SendfileResult, async_sendfile, serve_file_via_sendfile, write_all_to_stream_rated,
@@ -87,7 +91,7 @@ use crate::upstream_head::{
 };
 use crate::{
     AppState,
-    active_downloads::{ActiveDownloadStatus, OriginateOutcome},
+    active_downloads::{ActiveDownloadStatus, OriginateOutcome, Origination},
     build_info::APP_VIA,
     cache_metadata::{self, write_upstream_metadata},
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
@@ -100,9 +104,10 @@ use acquire::{
     warn_upstream_reject,
 };
 use body::{
-    BodyOutcome, BodyTransfer, BodyTransferError, DeliveryResult, DemotedClientHandle,
-    SpliceRangeFilter, range_slice, splice_proxy_body, splice_proxy_body_tls,
+    BodyClient, BodyOutcome, BodyTransfer, BodyTransferError, ClientEnd, SpliceRangeFilter,
+    range_slice, splice_proxy_body, splice_proxy_body_tls,
 };
+use commit::{CommitTail, CompletionBytes, CompletionClient, Served};
 use detached::DetachedDownload;
 use http::UpstreamResponse;
 use simple_proxy::rewrite_simple_proxy_headers;
@@ -182,8 +187,8 @@ pub(crate) async fn splice_proxy(
     // an alternate success — the caller retries as a sendfile late joiner
     // instead of falling all the way back to hyper. No late-joiner double
     // count, since `attach()` and `insert()` are mutually exclusive paths.
-    let (init_tx, status) = match appstate.active_downloads.originate(conn_details.key()) {
-        OriginateOutcome::Originator { init_tx, status } => (init_tx, status),
+    let origination = match appstate.active_downloads.originate(conn_details.key()) {
+        OriginateOutcome::Originator(origination) => origination,
         OriginateOutcome::Concurrent { status } => {
             return Ok(SpliceProxyOutcome::Concurrent { status });
         }
@@ -205,8 +210,7 @@ pub(crate) async fn splice_proxy(
         upstream_path,
         appstate,
         client_range,
-        init_tx,
-        status,
+        origination,
     )
     .await
 }
@@ -389,12 +393,28 @@ async fn write_splice_response_headers(
 /// Everything a download writes into: the open temp/partial file with its
 /// path guard, the final cache path, and the barrier the download reports
 /// progress on. Built by [`prepare_cache_target`], consumed by
-/// [`commit_and_record`].
+/// `CacheTarget::begin_rename` (in [`commit`]), which turns it into the
+/// [`commit::Committable`] the [`commit::CommitTail`] is built from.
 struct CacheTarget {
     tempfile: tokio::fs::File,
     temppath: TempPath,
     dest_path: PathBuf,
     dbarrier: DownloadBarrier,
+    /// Incremental digest over everything written here, so the commit can skip
+    /// re-reading the finished file.
+    ///
+    /// Fed by the two -- and only two -- sites that write into `tempfile`:
+    /// [`write_body_prefix_to_cache`] and
+    /// `body::BodyTransfer::write_cache_chunk`. Anything `Some` here that does
+    /// not route every byte through those two would be finalised over a
+    /// partial stream and fail verification, so the value is chosen by the
+    /// caller of [`prepare_cache_target`] rather than derived from the
+    /// download's identity: the streaming drive passes one when
+    /// `integrity::stream_hash_algo` names an algorithm and `resume_offset ==
+    /// 0`, [`volatile`] always passes `None`. `transfer_body` additionally
+    /// clears it before the zero-copy loops, whose bytes go kernel-to-kernel and
+    /// never reach userspace to be hashed.
+    hasher: Option<StreamHasher>,
 }
 
 /// Reserve the cache quota and open the file the body is written into: the
@@ -407,6 +427,15 @@ struct CacheTarget {
 /// `Ok(None)` means a rejection was already written to the client: the
 /// `503 Disk quota reached` (tagged `quota_phase`) or the 500 for a
 /// `Resumable` partial that does not hold exactly `resume_offset` bytes.
+///
+/// `hasher` is a parameter rather than something derived here on purpose:
+/// whether an incremental digest is *valid* depends on how the caller writes
+/// the body, not on the download's identity. Only the streaming drive funnels
+/// every cache byte through the two sites that feed it
+/// ([`write_body_prefix_to_cache`] and `body::BodyTransfer::write_cache_chunk`);
+/// [`volatile`] writes its buffered body straight to `tempfile` and so must
+/// pass `None`, or the commit would verify a digest of no input at all. Making
+/// each caller say which it is keeps that a compile-time decision.
 #[expect(
     clippy::too_many_arguments,
     reason = "one call per download path; the arguments are the download's identity"
@@ -420,6 +449,7 @@ async fn prepare_cache_target(
     total_content_length: NonZero<u64>,
     ibarrier: InitBarrier<'_>,
     quota_phase: &'static str,
+    hasher: Option<StreamHasher>,
 ) -> Result<Option<CacheTarget>, SpliceProxyError> {
     // Not created here: `integrity::rename_into_cache` creates it at commit
     // time, and only on `ENOENT`. Everything below tolerates its absence --
@@ -590,96 +620,13 @@ async fn prepare_cache_target(
         temppath,
         dest_path: dest_dir.join(filename),
         dbarrier,
+        hasher,
     }))
 }
 
-/// Sync and commit the fully written download into the cache, then record
-/// the `Download` transfer and the `Origin` row. Returns `Some(elapsed)` --
-/// the download duration from `start` to the commit, which the `Delivery`
-/// record shares -- when the file landed in the cache. `None` means
-/// `commit` failed: it logged the cause and dropped the barrier, the
-/// temp-file guard removed the partial, and nothing is cached (future
-/// requests re-download), so no DB row is written.
-///
-/// The `Origin` row uses `original_uri_path`, the pre-redirect client
-/// request path, so the recorded origin layout is stable across upstream
-/// redirects (the redirected `upstream_path` would otherwise poison the DB
-/// with a different origin row for the same logical download).
-async fn commit_and_record(
-    target: CacheTarget,
-    conn_details: &ConnectionDetails,
-    original_uri_path: &str,
-    total_content_length: NonZero<u64>,
-    start: PreciseInstant,
-) -> Option<Duration> {
-    let CacheTarget {
-        tempfile,
-        temppath,
-        dest_path,
-        dbarrier,
-    } = target;
-
-    // Sync cache file to ensure durability
-    if let Err(err) = tempfile.sync_all().await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
-            temppath.display(),
-            ErrorReport(&err)
-        );
-    }
-    drop(tempfile);
-
-    // Move temp file to final cache path.
-    // Lock to block all downloading tasks, since the file from the
-    // path of the downloading state is going to be moved.
-    let rbarrier = dbarrier.begin_rename().await;
-
-    let cache_committed = rbarrier
-        .commit(temppath, dest_path, total_content_length.get())
-        .await
-        .is_ok();
-
-    let elapsed = start.elapsed();
-
-    if !cache_committed {
-        return None;
-    }
-
-    // Record download in database (mirrors download_file() in hyper_conn.rs).
-    let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-        mirror: conn_details.mirror.clone(),
-        debname: conn_details.debname.clone(),
-        size: total_content_length.get(),
-        elapsed,
-        client_ip: conn_details.client.ip(),
-        kind: TransferKind::Download,
-    });
-    send_db_command(cmd).await;
-
-    // Record origin in database for this cached download.  This is an
-    // intentional asymmetry with the hyper backend: `Origin::from_path` is
-    // only called from the hyper simple-proxy passthrough in
-    // `hyper_conn.rs`; the hyper cache-download paths in
-    // `download_file`/`serve_new_file` never record an Origin row.  The
-    // splice path records Origins for cached downloads too, so it is doing
-    // strictly more origin-recording work than hyper.  Treat the splice
-    // origin write as the source of truth for cached-download origins for
-    // now.
-    if let Some(origin) = Origin::from_path(
-        original_uri_path,
-        conn_details.mirror.host().clone(),
-        conn_details.mirror.port(),
-    ) {
-        let cmd = DatabaseCommand::Origin(origin);
-        send_db_command(cmd).await;
-    }
-
-    Some(elapsed)
-}
-
 /// Per-request rate-logging timestamps for the completion line
-/// ([`log_splice_completion`]).
+/// (`commit::log_splice_completion`).
+#[derive(Clone, Copy)]
 struct RateTimestamps {
     /// Start of the upstream-rate window: the instant the upstream request
     /// was sent.
@@ -723,93 +670,6 @@ impl RateTimestamps {
     fn client_window(&self) -> Duration {
         self.t_client_done.duration_since(self.t_client_first)
     }
-}
-
-/// What became of the client a completed download was fetched for; selects
-/// the event wording and the client rate segment of
-/// [`log_splice_completion`].
-#[derive(Clone, Copy)]
-enum CompletionClient {
-    /// The client received the whole response body; `bytes` is what its
-    /// response promised.
-    Served { bytes: u64 },
-    /// The client was lost mid-body -- disconnect, stall, or a failed
-    /// demoted file-serve -- and that failure was logged at its source.
-    Lost,
-    /// No client was ever attached: the parallel-hack nudge answered the
-    /// request and the download ran detached ([`detached`]). Reports the
-    /// upstream side only, in hyper's "Finished download of ..." wording
-    /// plus the splice mechanism token -- there is no fused serve to name.
-    Nudged,
-}
-
-/// The completion line of a download that landed in the cache: "Served and
-/// cached ..." when the client got the whole response, "Cached ..." when the
-/// client was lost mid-body, "Finished download of ..." when there was no
-/// client. `upstream_bytes` is the wire body (the remainder on a resume).
-fn log_splice_completion(
-    conn_details: &ConnectionDetails,
-    conn_label: ConnLabel,
-    rates: &RateTimestamps,
-    upstream_bytes: u64,
-    resume_offset: u64,
-    client: CompletionClient,
-) {
-    let in_time = conn_details.request_received_at.elapsed();
-    let volatile = if conn_details.cached_flavor() == CachedFlavor::Volatile {
-        "volatile "
-    } else {
-        ""
-    };
-    let upstream = rate_log::upstream_segment(upstream_bytes, rates.upstream_window());
-    let (event, segments) = match client {
-        CompletionClient::Served { bytes } => (
-            "Served and cached",
-            format!(
-                "{upstream}, {}",
-                rate_log::client_segment(bytes, rates.client_window())
-            ),
-        ),
-        CompletionClient::Lost => (
-            "Cached",
-            format!(
-                "{upstream}, {}",
-                rate_log::client_disconnect_segment(rates.client_bytes_sent, rates.client_window())
-            ),
-        ),
-        CompletionClient::Nudged => ("Finished download of", upstream),
-    };
-    info!(
-        "{event} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({segments}){}",
-        conn_details.debname,
-        conn_details.mirror,
-        conn_details.client,
-        HumanFmt::Time(in_time),
-        if resume_offset > 0 {
-            format!(", resumed from {}", HumanFmt::Size(resume_offset))
-        } else {
-            String::new()
-        },
-    );
-}
-
-/// Record the `Delivery` transfer of a cached download the client received
-/// in full; `elapsed` is the download duration from [`commit_and_record`].
-async fn record_delivery(
-    conn_details: &ConnectionDetails,
-    total_content_length: NonZero<u64>,
-    elapsed: Duration,
-    partial: bool,
-) {
-    let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
-        mirror: conn_details.mirror.clone(),
-        debname: conn_details.debname.clone(),
-        size: total_content_length.get(),
-        elapsed,
-        kind: TransferKind::Delivery { partial },
-        client_ip: conn_details.client.ip(),
-    });
-    send_db_command(cmd).await;
 }
 
 /// The pre-upstream verify-throttle gate: answers `503 Recently failed
@@ -1280,6 +1140,12 @@ async fn write_body_prefix_to_cache(
             ))),
         })?;
 
+    // One of the two sites that write into `target.tempfile`, so one of the
+    // two that must feed the incremental digest.
+    if let Some(hasher) = target.hasher.as_mut() {
+        hasher.update(body_prefix);
+    }
+
     // Notify concurrent clients of progress.
     target.dbarrier.ping();
 
@@ -1304,11 +1170,10 @@ async fn write_all_flushed(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io:
 /// the head read, the prefix holds the full file.
 ///
 /// Returns whether the client write failed. That error is swallowed to keep
-/// caching the buffered prefix, but if the splice loop never runs (entire
-/// body is in the prefix; `splice_count == 0`) the caller must close the
-/// connection at the end so the handler does not keep-alive a socket whose
-/// write side just broke and does not claim success after sending fewer
-/// bytes than `Content-Length`.
+/// caching the buffered prefix, but the client is done: its response is
+/// already short, so the caller runs the body loop cache-only
+/// ([`BodyClient::Lost`]) and closes the connection at the end rather than
+/// keep-alive a socket whose response it cannot complete.
 async fn write_body_prefix(
     client_stream: &TcpStream,
     conn_details: &ConnectionDetails,
@@ -1328,9 +1193,8 @@ async fn write_body_prefix(
         return Ok(false);
     }
 
-    // If the client has disconnected, we log and keep filling the cache; if
-    // the splice loop later observes the broken client connection, it will
-    // continue via its disconnect/cache-only handling instead of dropping
+    // If the client has disconnected, we log and keep filling the cache: the
+    // splice loop runs cache-only from its first chunk instead of dropping
     // these prefix bytes from the cache entirely.
     let mut prefix_client_failed = false;
     // The prefix starts at the resume offset: it is the first body byte the
@@ -1358,6 +1222,12 @@ async fn write_body_prefix(
             // rate-check failure and the `http_timeout` write stall (which
             // bumps `HTTP_TIMEOUT_CLIENT_BODY`). Pre-branch it so a slow or
             // stalled client stays `info` like hyper's rate-timeout sibling.
+            // The body loop will not touch this client again, so the
+            // disconnect metric the loop would have bumped is bumped here;
+            // a timeout stays metric-free, as it does in the loop.
+            if is_peer_disconnect(&err) {
+                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+            }
             info_or_warn!(
                 err.kind() == ErrorKind::TimedOut || is_peer_disconnect(&err),
                 "splice proxy: failed to write body prefix to client {} for {} from mirror {}; continuing cache-only:  {}",
@@ -1395,12 +1265,9 @@ struct BodyTransferFailure {
 /// and the delivered byte count already added to the rate timestamps.
 struct BodyTransferred {
     target: CacheTarget,
-    /// Set when the first client was demoted to a file-serve task; the
-    /// caller awaits it after consuming the target's barrier.
-    demoted_handle: Option<DemotedClientHandle>,
-    /// The client went away mid-body (as opposed to being demoted, or never
-    /// having been attached).
-    client_disconnected: bool,
+    /// How the client came out of the body; a demoted one's handle rides in
+    /// here and is settled by `commit::ClientSettlement::settle`.
+    client: ClientEnd,
 }
 
 /// Transfer the remaining `splice_count` body bytes after the prefix:
@@ -1408,15 +1275,16 @@ struct BodyTransferred {
 /// plus tee+splice fan-out for userspace TLS. Both rate windows end here
 /// when the loop ran.
 ///
-/// `client_stream` is `None` for the client-less detached download, which
-/// also passes a zero-length `range_plan` so the loops run cache-only.
+/// `client` is [`BodyClient::Absent`] for the client-less detached download,
+/// which also passes a zero-length `range_plan` so the loops run cache-only,
+/// and [`BodyClient::Lost`] when the prefix write already failed.
 #[expect(
     clippy::too_many_arguments,
     reason = "two call sites; the arguments are the body's geometry and the transfer's state"
 )]
 async fn transfer_body(
     upstream_guard: &mut UnconsumedBodyGuard<'_>,
-    client_stream: Option<&TcpStream>,
+    client: BodyClient<'_>,
     mut target: CacheTarget,
     resume_offset: u64,
     body_content_length: NonZero<u64>,
@@ -1427,8 +1295,7 @@ async fn transfer_body(
     if splice_count == 0 {
         return Ok(BodyTransferred {
             target,
-            demoted_handle: None,
-            client_disconnected: false,
+            client: client.settled(),
         });
     }
 
@@ -1462,19 +1329,40 @@ async fn transfer_body(
     // rename step; on a structured rate-timeout it's already consumed into
     // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
     // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
-    let xfer = BodyTransfer::new(
-        client_stream,
-        target.dbarrier,
-        &range_filter,
-        &target.temppath,
-        splice_count,
-        body_offset,
-    );
+    // `target.hasher` is borrowed: only the userspace loop advances it, in
+    // place.
     let outcome = if let Some(tcp) = upstream_guard.zero_copy() {
-        // Zero-copy path for plain TCP
+        // Zero-copy path for plain TCP. The body goes socket->pipe->file
+        // inside the kernel, so no incremental digest is possible and the
+        // commit re-reads and hashes the finished file. `splice_proxy_drive`
+        // already declined to mint a hasher for a zero-copy upstream, so this
+        // is normally a `None` already; clearing it keeps the invariant local
+        // to the branch that depends on it rather than making it an
+        // assumption about a caller.
+        target.hasher = None;
+        let xfer = BodyTransfer::new(
+            client,
+            target.dbarrier,
+            &range_filter,
+            &target.temppath,
+            splice_count,
+            body_offset,
+            &mut target.hasher,
+        );
         splice_proxy_body(xfer, tcp, &target.tempfile).await
     } else {
-        // TLS: userspace read, then direct cache write and client write
+        // TLS: userspace read, then direct cache write and client write --
+        // the plaintext is in hand, so the digest can be advanced chunk by
+        // chunk.
+        let xfer = BodyTransfer::new(
+            client,
+            target.dbarrier,
+            &range_filter,
+            &target.temppath,
+            splice_count,
+            body_offset,
+            &mut target.hasher,
+        );
         splice_proxy_body_tls(xfer, upstream_guard, &target.tempfile).await
     };
     // Any body-transfer error leaves the upstream mid-message (fewer
@@ -1490,8 +1378,7 @@ async fn transfer_body(
     // can name the on-disk path.
     let BodyOutcome {
         dbarrier: returned_dbarrier,
-        demoted_handle,
-        client_disconnected,
+        client,
         client_bytes,
     } = match outcome {
         Ok(outcome) => outcome,
@@ -1503,52 +1390,17 @@ async fn transfer_body(
         }
     };
     target.dbarrier = returned_dbarrier;
+    // Every body byte is on disk now (the loops' final `cache.flush`); the
+    // readers learn that from `begin_rename`, which every caller reaches
+    // next: its flush of the last sub-`PING_BATCH_THRESHOLD` chunk and its
+    // drop of the watch sender.
     // The splice body block ran: the upstream-rate and client-rate windows
     // both end here. The demoted-client case reassigns `t_client_done`
     // again after the file-serve task completes.
     rates.t_upstream_done = PreciseInstant::now();
     rates.t_client_done = rates.t_upstream_done;
     rates.client_bytes_sent += client_bytes;
-    Ok(BodyTransferred {
-        target,
-        demoted_handle,
-        client_disconnected,
-    })
-}
-
-/// If the first client was demoted to file-serve, wait for the background
-/// task to finish sending before returning control to the connection
-/// handler (which may reuse the socket for keep-alive). No demotion means
-/// the splice loop served the client itself (or there was no body to
-/// splice) -- that's a success, not a failure.
-async fn await_demoted_client(
-    demoted_handle: Option<DemotedClientHandle>,
-    rates: &mut RateTimestamps,
-) -> bool {
-    let Some(handle) = demoted_handle else {
-        return true;
-    };
-    let succeeded = match handle.await {
-        Ok(DeliveryResult::Success(bytes)) => {
-            rates.client_bytes_sent += bytes;
-            true
-        }
-        Ok(DeliveryResult::Failure(bytes)) => {
-            rates.client_bytes_sent += bytes;
-            false
-        }
-        Err(err) => {
-            error!(
-                "splice proxy: demoted client file-serve task panicked; treating the delivery as failed and closing the connection:  {}",
-                ErrorReport(&err)
-            );
-            false
-        }
-    };
-    // The demoted file-serve task is the last thing to write to the
-    // client, so the client-rate window ends here.
-    rates.t_client_done = PreciseInstant::now();
-    succeeded
+    Ok(BodyTransferred { target, client })
 }
 
 /// Body of [`splice_proxy`] after the originate check has succeeded: the
@@ -1562,17 +1414,15 @@ async fn splice_proxy_drive(
     upstream_path: &str,
     appstate: &AppState,
     client_range: RangeRequestHeaders<'_>,
-    init_tx: tokio::sync::watch::Sender<()>,
-    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    origination: Origination,
 ) -> Result<SpliceProxyOutcome, SpliceProxyError> {
     // The dial target: the host the client named (an alias is a real
     // mirror), never the canonical mirror the caches key on.
     let host_authority = conn_details.upstream_authority();
     // Capture the original (pre-redirect) client request path. A 301 redirect
     // in `plan_upstream_response` shadows `upstream_path` to the redirected
-    // URL; the Origin row (`commit_and_record`) and
-    // `handle_volatile_buffered_download` must carry the original path so
-    // registry keys match across all backends (the hyper backend in
+    // URL; the registry key (`InitBarrier::new`) must carry the original
+    // path so it matches across all backends (the hyper backend in
     // hyper_conn.rs always uses the client-request URI).
     // Strip the query so cache identity (registry keys, Origin rows) stays
     // path-only; the query still rides on the upstream GET line via
@@ -1582,8 +1432,7 @@ async fn splice_proxy_drive(
         .map_or(upstream_path, |(path, _)| path);
 
     let ibarrier = InitBarrier::new(
-        init_tx,
-        &status,
+        origination,
         &appstate.active_downloads,
         conn_details,
         original_uri_path,
@@ -1708,10 +1557,9 @@ async fn splice_proxy_drive(
         // else is buffered.
         DownloadPlan::Download { .. } => {
             return handle_volatile_buffered_download(
-                &mut upstream,
+                upstream,
                 client,
                 conn_details,
-                original_uri_path,
                 &upstream_resp,
                 &header_buf[header_end..],
                 ibarrier,
@@ -1749,6 +1597,35 @@ async fn splice_proxy_drive(
         return Ok(SpliceProxyOutcome::Served);
     };
 
+    // The userspace-TLS body loop is the one that can hash as it writes: every
+    // cache byte goes through `write_body_prefix_to_cache` or
+    // `write_cache_chunk`. Two conditions, and minting a hasher without either
+    // is pure waste -- `transfer_body` drops it and the commit re-reads the
+    // file anyway, after this task has hashed the whole body prefix into it.
+    //
+    // A zero-copy upstream (plain TCP, and every kTLS connection) moves its
+    // body socket-to-file inside the kernel, so the digest could only ever
+    // cover the prefix. And a resume writes into a temp file that already
+    // holds bytes this connection never saw, so an incremental digest would
+    // cover the wrong range.
+    //
+    // Read `raw_uri_path` off the barrier before `prepare_cache_target`
+    // consumes it; it is the same string `RenamePlan` later verifies against.
+    let hasher = if resume_offset == 0 && upstream_guard.zero_copy().is_none() {
+        // Same rendering `RenamePlan.host` uses, so both registry lookups
+        // agree on the key.
+        integrity::stream_hash_algo_for_download(
+            conn_details.resource_kind,
+            ibarrier.raw_uri_path(),
+            &conn_details.debname,
+            conn_details.mirror.host().as_str(),
+            conn_details.mirror.path(),
+        )
+        .map(StreamHasher::new)
+    } else {
+        None
+    };
+
     let Some(mut target) = prepare_cache_target(
         client,
         conn_details,
@@ -1758,6 +1635,7 @@ async fn splice_proxy_drive(
         total_content_length,
         ibarrier,
         "quota 503",
+        hasher,
     )
     .await?
     else {
@@ -1790,7 +1668,7 @@ async fn splice_proxy_drive(
     if should_nudge(
         config,
         conn_details.cached_flavor(),
-        || appstate.active_downloads.len(),
+        || appstate.active_downloads.upstream_slots(),
         total_content_length,
         &mut rand::rng(),
     ) {
@@ -1809,7 +1687,6 @@ async fn splice_proxy_drive(
             header_end,
             target,
             conn_details: conn_details.clone(),
-            original_uri_path: original_uri_path.to_owned(),
             conn_label,
             total_content_length,
             body_content_length,
@@ -1877,13 +1754,20 @@ async fn splice_proxy_drive(
     // Reassigned after the splice body block and the demoted file-serve task.
     rates.t_client_done = PreciseInstant::now();
 
+    // A client whose prefix write failed is done: its response is already
+    // short, so the loop must not write to it again (it would only corrupt
+    // the stream further) and runs cache-only from the first chunk.
+    let body_client = if prefix_client_failed {
+        BodyClient::Lost
+    } else {
+        BodyClient::Attached(client.stream)
+    };
     let BodyTransferred {
         target,
-        demoted_handle,
-        client_disconnected: body_client_disconnected,
+        client: client_end,
     } = transfer_body(
         &mut upstream_guard,
-        Some(client.stream),
+        body_client,
         target,
         resume_offset,
         body_content_length,
@@ -1913,46 +1797,42 @@ async fn splice_proxy_drive(
     drop(upstream_guard);
 
     // PoolGuard::drop returns the connection to pool if still poolable.
-    // Drop it now before the sync+rename to free the upstream socket promptly.
+    // Drop it now, before the commit, to free the upstream socket promptly.
     drop(upstream);
 
-    // Commit the finished body to the cache. On failure the body was
-    // already fully delivered to the client; this only leaves the cache
-    // without the file, and we still finish the client-facing bookkeeping
-    // (await the demoted task, count the delivery) before returning.
-    let committed = commit_and_record(
-        target,
+    // End the download on this task: `begin_rename` gives the
+    // `max_upstream_downloads` slot back (where the hyper backend gives its
+    // own back), flips the entry to `Verifying` so a request arriving
+    // meanwhile still late-joins it, and drops the watch sender -- the
+    // wake-up a demoted file-serve task may be parked on. No I/O yet.
+    let tail = CommitTail::new(
+        target.begin_rename().await,
         conn_details,
-        original_uri_path,
-        total_content_length,
-        start,
-    )
-    .await;
-
-    let demoted_client_succeeded = await_demoted_client(demoted_handle, &mut rates).await;
-
-    let client_succeeded =
-        !prefix_client_failed && !body_client_disconnected && demoted_client_succeeded;
-
-    // Only log a completion "…cached…" line when the file actually landed in
-    // the cache; the commit-failure path already logged an ERROR (rename) or
-    // commit() logged the mismatch/verify failure internally.
-    if committed.is_some() {
-        log_splice_completion(
-            conn_details,
-            conn_label,
-            &rates,
-            body_content_length.get(),
+        conn_label,
+        CompletionBytes {
+            total: total_content_length,
+            upstream: body_content_length.get(),
             resume_offset,
-            if client_succeeded {
-                CompletionClient::Served {
-                    bytes: range_plan.content_length,
-                }
-            } else {
-                CompletionClient::Lost
+        },
+        start,
+    );
+
+    // Start the commit immediately, independently of the demoted writer.
+    // The returned settlement proves the watch sender is gone and the commit
+    // is spawned. It only waits for this socket's writer, so keep-alive never
+    // waits for the commit and slow clients never hold up verification/rename.
+    let client = tail
+        .spawn(
+            rates,
+            client_end,
+            Served {
+                bytes: range_plan.content_length,
+                partial: range_plan.is_partial(),
             },
-        );
-    }
+        )
+        .settle()
+        .await;
+    let client_succeeded = matches!(client, CompletionClient::Served(_));
 
     if !client_succeeded {
         // The actual failure (prefix-write, body splice, or demoted task)
@@ -1963,18 +1843,10 @@ async fn splice_proxy_drive(
         return Ok(SpliceProxyOutcome::ClientLost);
     }
 
+    // `SERVED_*` mean "body fully delivered", not "download committed": both
+    // bumps are gated on `client_succeeded` alone and stay on this task.
     metrics::SERVED_SPLICE.increment();
     metrics::SERVED_TOTAL.increment();
-
-    if let Some(elapsed) = committed {
-        record_delivery(
-            conn_details,
-            total_content_length,
-            elapsed,
-            range_plan.is_partial(),
-        )
-        .await;
-    }
 
     Ok(SpliceProxyOutcome::Served)
 }
