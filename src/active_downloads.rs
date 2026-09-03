@@ -667,7 +667,6 @@ impl ActiveDownloads {
         Some(status)
     }
 
-    #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn download_count(&self) -> usize {
         // Every terminal status transition (Finished/Aborted) in guards.rs

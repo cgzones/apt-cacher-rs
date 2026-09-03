@@ -29,9 +29,9 @@ use crate::{
 use super::http::{BodyFraming, UpstreamResponse};
 use super::upstream::{ConnLabel, PoolGuard};
 use super::{
-    AfterHeaderSide, ClientConn, RateTimestamps, SpliceProxyError, UpstreamFailure,
-    commit_and_record, log_splice_completion, prepare_cache_target, record_delivery,
-    resolve_client_range, write_splice_response_headers,
+    AfterHeaderSide, ClientConn, CompletionClient, RateTimestamps, SpliceProxyError,
+    UpstreamFailure, commit_and_record, log_splice_completion, prepare_cache_target,
+    record_delivery, resolve_client_range, write_splice_response_headers,
 };
 
 /// Handle the full lifecycle for volatile files whose upstream response has no
@@ -275,9 +275,10 @@ pub(super) async fn handle_volatile_buffered_download(
             conn_label,
             &rates,
             total_content_length.get(),
-            range_plan.len,
             0,
-            true,
+            CompletionClient::Served {
+                bytes: range_plan.len,
+            },
         );
 
         // Record delivery in database.

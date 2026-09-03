@@ -4,7 +4,7 @@
 //! rejection or error page, upstream-relay failure, throttle 503, CONNECT
 //! tunnel establishment) is described by a [`ResponseHead`] and rendered by
 //! exactly one of two functions: [`ResponseHead::into_hyper`] for the hyper
-//! backend and [`ResponseHead::write_to`] for the raw-socket sendfile/splice
+//! backend and `ResponseHead::write_to` for the raw-socket sendfile/splice
 //! backends.  Responses *relayed* from upstream (passthrough, streamed
 //! downloads carrying the origin's headers) are not built here; those paths
 //! only append `Via:` to the origin's header set.
@@ -366,6 +366,19 @@ impl ResponseHead<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parallel_hack::NUDGE_BODY;
+
+    /// A config with the parallel-download hack on its defaults (`429`,
+    /// `Retry-After: 5`), for the two nudge-head renderer tests. Built by
+    /// deserializing an empty document because `Config`'s `present` field is
+    /// private to `config.rs`.
+    #[cfg(any(feature = "hyper", feature = "sendfile"))]
+    fn nudge_config() -> crate::config::Config {
+        let mut config: crate::config::Config =
+            toml::from_str("").expect("built-in defaults must parse");
+        config.experimental_parallel_hack_enabled = true;
+        config
+    }
 
     #[cfg(feature = "hyper")]
     mod hyper {
@@ -467,6 +480,27 @@ mod tests {
             assert_eq!(headers.get(VIA).unwrap(), APP_VIA);
             assert!(headers.contains_key(DATE));
             assert!(!headers.contains_key(CONNECTION));
+        }
+
+        /// The parallel-hack nudge, which both backends render from the one
+        /// head in `parallel_hack::nudge_head`: a keep-alive `Success` head,
+        /// so no `Server:`, and exactly one `Content-Length` -- the head sets
+        /// it explicitly, so hyper must not derive a second one from the
+        /// body's size hint.
+        #[test]
+        fn parallel_hack_nudge_head_is_pinned() {
+            let response = crate::parallel_hack::nudge_head(&nudge_config())
+                .into_hyper(crate::proxy_body::full_body(NUDGE_BODY));
+            let headers = response.headers();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(headers.get(RETRY_AFTER).unwrap(), "5");
+            assert_eq!(headers.get(CONTENT_LENGTH).unwrap(), "20");
+            assert_eq!(headers.get_all(CONTENT_LENGTH).iter().count(), 1);
+            assert_eq!(headers.get(CONNECTION).unwrap(), "keep-alive");
+            assert_eq!(headers.get(VIA).unwrap(), APP_VIA);
+            assert!(headers.contains_key(DATE));
+            assert!(!headers.contains_key(SERVER), "a nudge is not an error");
+            assert!(!headers.contains_key(CONTENT_TYPE));
         }
     }
 
@@ -588,6 +622,29 @@ mod tests {
                 "{wire}"
             );
             assert!(!has_header(&lines, "Content-Type"), "{wire}");
+        }
+
+        /// The wire bytes of the parallel-hack nudge head, pinned in full:
+        /// the sendfile/splice backends write these plus the inline body.
+        #[test]
+        fn parallel_hack_nudge_head_is_pinned() {
+            let wire = render(&crate::parallel_hack::nudge_head(&nudge_config()));
+            assert!(
+                wire.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+                "{wire}"
+            );
+            let lines = header_lines(&wire);
+            assert!(!has_header(&lines, "Server"), "a nudge is not an error");
+            assert!(
+                lines.contains(&format!("Via: {APP_VIA}").as_str()),
+                "{wire}"
+            );
+            assert!(has_header(&lines, "Date"), "{wire}");
+            assert!(lines.contains(&"Connection: keep-alive"), "{wire}");
+            assert!(lines.contains(&"Content-Length: 20"), "{wire}");
+            assert!(lines.contains(&"Retry-After: 5"), "{wire}");
+            assert!(!has_header(&lines, "Content-Type"), "{wire}");
+            assert_eq!(NUDGE_BODY.len(), 20, "the pinned body length");
         }
 
         #[test]

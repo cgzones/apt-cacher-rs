@@ -9,8 +9,14 @@
 //! pipe and `/dev/null` helpers ([`create_pipe`], [`drain_pipe`],
 //! [`splice_pipe_to_file`], [`range_slice`]).
 //!
+//! Both loops also run client-less: a `None` client (the parallel-hack
+//! nudge's detached download, `super::detached`) starts the transfer in
+//! [`ClientStatus::Absent`], which every client-facing step already treats
+//! as cache-only.
+//!
 //! Consumers: the drive in `mod.rs` (body loops, `range_slice`, the outcome
-//! and handle types).
+//! and handle types) and `super::detached` (the client-less form plus
+//! [`BodyTransferError::log_detached`]).
 
 use std::{
     io::ErrorKind,
@@ -234,6 +240,49 @@ impl BodyTransferError {
         };
         SpliceProxyError::AfterHeader { phase, side }
     }
+
+    /// Attribute this failure for a detached, client-less download
+    /// ([`super::detached::DetachedDownload`]).
+    ///
+    /// The sibling of [`Self::into_after_header`] -- same `match` shape, so
+    /// the two attribution tables sit together -- for the one caller with no
+    /// connection to report to: nothing is handed upward, so every arm logs
+    /// here and the [`Logged`] proof is discarded on the spot. The outer
+    /// arm's "closing the connection" tail is replaced by "abandoning the
+    /// download": no client is waiting and the partial is removed by the
+    /// temp-file guard.
+    pub(super) fn log_detached(self, phase: &'static str, temppath: &Path) {
+        let Self { side, err } = self;
+        let _logged: Logged = match side {
+            // Same policy as the outer arm's upstream arm: no
+            // `is_peer_disconnect` demotion, and counter-backed by the
+            // dedicated counter the throw site already bumped.
+            BodyFailureSide::Upstream => Logged::warn(format_args!(
+                "splice proxy: upstream failed in {phase} for `{}`; abandoning the download:  {}",
+                temppath.display(),
+                ErrorReport(&err)
+            )),
+            BodyFailureSide::Cache => Logged::cache_io_failure(format_args!(
+                "splice proxy: failed to write the cache file `{}` in {phase}; abandoning the download:  {}",
+                temppath.display(),
+                ErrorReport(&err)
+            )),
+            BodyFailureSide::Proxy => Logged::error(format_args!(
+                "splice proxy: proxy-side I/O failure in {phase} for `{}`; abandoning the download:  {}",
+                temppath.display(),
+                ErrorReport(&err)
+            )),
+            // Unreachable by construction: a client-less transfer runs in
+            // `ClientStatus::Absent`, which no client-facing step enters.
+            // Reported rather than panicked so a future caller wiring a
+            // client into this path is a log line, not a crash.
+            BodyFailureSide::Client => Logged::error(format_args!(
+                "splice proxy: client-side failure in {phase} for `{}` without an attached client; abandoning the download:  {}",
+                temppath.display(),
+                ErrorReport(&err)
+            )),
+        };
+    }
 }
 
 /// The caller must `.await` the join handle after the download barrier has
@@ -250,11 +299,18 @@ pub(super) type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
 /// Everything around that -- the client-download accounting, the two rate
 /// checkers, the upstream-rate gate, the byte cursors, the client state
 /// machine and the demotion hand-off -- lives here so it exists once.
+///
+/// A `None` client starts the state machine in [`ClientStatus::Absent`] and
+/// leaves the client-side accounting (`counter`, `client_rate_checker`)
+/// unarmed; every client-facing step branches on [`ClientStatus::Active`],
+/// so the client-less form needs no arms of its own.
 struct BodyTransfer<'a> {
     /// Dropped at the demotion transition so the spawned
     /// `serve_remaining_from_file` task's own `ClientDownload` (in
     /// `async_sendfile_unfinished`) takes over the accounting cleanly; see
-    /// [`Self::maybe_demote`]. `Option` because it is taken exactly once.
+    /// [`Self::maybe_demote`]. `Option` because it is taken exactly once --
+    /// and `None` from the start for a client-less transfer, which ships no
+    /// bytes to any client and so must not bump `ACTIVE_CLIENT_DOWNLOADS`.
     counter: Option<client_counter::ClientDownload>,
     /// `None` only after [`Self::check_upstream_rate`] consumed it into
     /// `Aborted(MirrorDownloadRate)` on the error path, where the whole
@@ -280,7 +336,10 @@ struct BodyTransfer<'a> {
     demoted_handle: Option<DemotedClientHandle>,
     range_filter: &'a SpliceRangeFilter,
     pub(super) cache_path: &'a Path,
-    client: &'a TcpStream,
+    /// `None` for a client-less transfer; read only through
+    /// [`Self::active_client`], which the [`ClientStatus::Absent`] state
+    /// keeps unreachable.
+    client: Option<&'a TcpStream>,
 }
 
 /// What a body loop hands back to `splice_proxy_drive`.
@@ -298,7 +357,7 @@ pub(super) struct BodyOutcome {
 
 impl<'a> BodyTransfer<'a> {
     fn new(
-        client: &'a TcpStream,
+        client: Option<&'a TcpStream>,
         dbarrier: DownloadBarrier,
         range_filter: &'a SpliceRangeFilter,
         cache_path: &'a Path,
@@ -308,16 +367,19 @@ impl<'a> BodyTransfer<'a> {
         // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
         // response-headers emission (next to `record_client_status`), since
         // the body loops are skipped when the entire response fits in the
-        // body prefix and we still need to count it.
-        let counter = Some(client_counter::ClientDownload::new());
+        // body prefix and we still need to count it. A client-less transfer
+        // has no response of its own to count and no client to account for.
+        let counter = client.map(|_stream| client_counter::ClientDownload::new());
 
         let config = global_config();
         let rate_checker = config
             .min_download_rate
             .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-        let client_rate_checker = config
-            .min_download_rate
-            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+        let client_rate_checker = client.and_then(|_stream| {
+            config
+                .min_download_rate
+                .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe))
+        });
 
         Self {
             counter,
@@ -326,7 +388,11 @@ impl<'a> BodyTransfer<'a> {
             client_rate_checker,
             remaining: content_length,
             file_offset: file_start_offset,
-            client_status: ClientStatus::Active,
+            client_status: if client.is_some() {
+                ClientStatus::Active
+            } else {
+                ClientStatus::Absent
+            },
             bytes_done: 0,
             client_file_pos: u64::try_from(file_start_offset)
                 .expect("file_start_offset is non-negative by construction")
@@ -337,6 +403,13 @@ impl<'a> BodyTransfer<'a> {
             cache_path,
             client,
         }
+    }
+
+    /// The client socket, for a step that has established
+    /// [`ClientStatus::Active`].
+    fn active_client(&self) -> &'a TcpStream {
+        self.client
+            .expect("client I/O only happens in ClientStatus::Active, which requires a client")
     }
 
     fn barrier(&mut self) -> &mut DownloadBarrier {
@@ -494,7 +567,7 @@ impl<'a> BodyTransfer<'a> {
         drop(self.counter.take());
         self.demoted_handle = Some(
             spawn_file_serve_task(
-                self.client,
+                self.active_client(),
                 self.cache_path,
                 demote_pos,
                 demote_remaining,
@@ -553,7 +626,7 @@ impl<'a> BodyTransfer<'a> {
 #[expect(clippy::too_many_arguments, reason = "called from a single site")]
 pub(super) async fn splice_proxy_body(
     upstream: ZeroCopyUpstream<'_>,
-    client: &TcpStream,
+    client: Option<&TcpStream>,
     cache_file: &tokio::fs::File,
     content_length: u64,
     file_start_offset: i64,
@@ -730,7 +803,8 @@ pub(super) async fn splice_proxy_body(
             || chunk.end <= client_skip
             || chunk.start >= client_range_end
         {
-            // Chunk is entirely outside client range, or client is gone/demoted — cache only
+            // Chunk is entirely outside client range, or the client is
+            // absent/gone/demoted — cache only
             xfer.splice_cache_chunk(&upstream_pipe_receiver, cache_file, got)
                 .await?;
         } else if chunk.start >= client_skip && chunk.end <= client_range_end {
@@ -765,7 +839,9 @@ pub(super) async fn splice_proxy_body(
             // see progress without being gated on the first client's send speed.
             xfer.write_cache_chunk(cache_file, &mut buf, got).await?;
 
-            // Then send to client (may be slow)
+            // Then send to client (may be slow). `Active` is established
+            // above, so the client socket is there.
+            let client = xfer.active_client();
             let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
                 match write_all_to_stream_rated(
@@ -915,7 +991,7 @@ async fn pwrite_buf_to_file(
 #[expect(clippy::too_many_arguments, reason = "called from a single site")]
 pub(super) async fn splice_proxy_body_tls(
     upstream: &mut UpstreamConn,
-    client: &TcpStream,
+    client: Option<&TcpStream>,
     cache_file: &tokio::fs::File,
     content_length: u64,
     file_start_offset: i64,
@@ -1053,7 +1129,8 @@ pub(super) async fn splice_proxy_body_tls(
 /// continues cache-only. Only unexpected I/O errors are returned as
 /// `Err`.
 async fn write_client_or_demote(xfer: &mut BodyTransfer<'_>, slice: &[u8]) -> std::io::Result<()> {
-    let client = xfer.client;
+    // Only ever called with the client established as `Active`.
+    let client = xfer.active_client();
     let mut written = 0;
     while written < slice.len() {
         // `try_write` clears tokio's cached writability itself on
@@ -1244,6 +1321,12 @@ async fn serve_remaining_from_file(
 enum ClientStatus {
     /// Client is still connected and receiving data at acceptable speed.
     Active,
+    /// No client was ever attached (parallel-hack nudge): cache-only from
+    /// the first byte. Unlike [`Self::Disconnected`] there is no metric and
+    /// no log line -- nothing was lost -- and
+    /// [`BodyOutcome::client_disconnected`] stays false. Every client-facing
+    /// step branches on `Active`, so this needs no arms of its own.
+    Absent,
     /// Client disconnected mid-transfer.
     Disconnected,
     /// Client send rate dropped below the minimum threshold during the
@@ -1288,11 +1371,12 @@ async fn tee_and_splice(
     cache_file: &tokio::fs::File,
     got: usize,
 ) -> Result<(), BodyTransferError> {
-    let client = xfer.client;
     let mut remaining = got;
 
     while remaining > 0 {
         if matches!(xfer.client_status, ClientStatus::Active) {
+            // The client socket, which `Active` guarantees is there.
+            let client = xfer.active_client();
             // Tee pipe_A → pipe_B, then splice pipe_B → cache, then splice pipe_A → client.
             // Cache is written first so concurrent clients see progress immediately
             // without being gated on a potentially slow first client.
@@ -1458,7 +1542,8 @@ async fn tee_and_splice(
                 .checked_sub(teed)
                 .expect("splice should not return more than requested");
         } else {
-            // Client is gone or demoted — splice pipe_A directly to cache (no tee needed)
+            // Client is absent, gone or demoted — splice pipe_A directly to
+            // cache (no tee needed)
             xfer.splice_cache_chunk(upstream_pipe_rx, cache_file, remaining)
                 .await?;
             remaining = 0;

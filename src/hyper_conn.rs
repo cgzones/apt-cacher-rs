@@ -29,7 +29,6 @@ use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::tokio::TokioIo};
 #[cfg(feature = "mmap")]
 use memmap2::{Advice, MmapOptions};
-use rand::distr::{Bernoulli, Distribution as _};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tracing::{debug, error, info, trace, warn};
 
@@ -75,6 +74,7 @@ use crate::{
     humanfmt::HumanFmt,
     limits::VOLATILE_CACHE_MAX_AGE,
     metrics,
+    parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
     partial_file::{self, TempPath, tokio_tempfile},
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
@@ -2229,56 +2229,20 @@ async fn serve_new_file(
         });
     }
 
-    if conn_details.cached_flavor() != CachedFlavor::Volatile
-        && config.experimental_parallel_hack_enabled
-    {
-        let curr_downloads = appstate.active_downloads.download_count();
-
-        if config
-            .experimental_parallel_hack_maxparallel
-            .is_none_or(|max_parallel| curr_downloads <= max_parallel.get())
-            && config
-                .experimental_parallel_hack_minsize
-                .is_none_or(|size| total_content_length.upper() > size)
-        {
-            #[expect(clippy::cast_precision_loss, reason = "generate probability value")]
-            let p = (curr_downloads.saturating_sub(1) as f64)
-                .mul_add(-config.experimental_parallel_hack_factor, 1.0)
-                .max(0.0);
-            let d = Bernoulli::new(p).expect("p is valid");
-            let v = d.sample(&mut rand::rng());
-
-            if v {
-                debug!(
-                    "Trying parallel download hack for client {} and file {} with code {} and retry after value {}",
-                    conn_details.client,
-                    conn_details.debname,
-                    config.experimental_parallel_hack_statuscode,
-                    config.experimental_parallel_hack_retryafter
-                );
-
-                let head = ResponseHead {
-                    retry_after: (config.experimental_parallel_hack_retryafter != 0)
-                        .then_some(u32::from(config.experimental_parallel_hack_retryafter)),
-                    ..ResponseHead::bare(
-                        config.experimental_parallel_hack_statuscode,
-                        ResponseKind::Success,
-                    )
-                };
-
-                // apt only reaches its transient-error/`Retry-After` path for
-                // an error response that *has* a body: `Content-Length: 0`
-                // sets `haveContent = TRI_FALSE` and
-                // `basehttp.cc:ERROR_UNRECOVERABLE` fails the item
-                // permanently. A non-empty body is what makes the nudge a
-                // retry rather than a hard failure.
-                let response = head.into_hyper(full_body("Download in progress"));
-
-                trace!("Outgoing parallel download hack response: {response:?}");
-
-                return response;
-            }
-        }
+    // The parallel-download hack: hand the client a `Retry-After` nudge and
+    // let the spawned `download_file` above finish on its own; the retry
+    // late-joins it. `splice/mod.rs` gates on the same three functions.
+    if should_nudge(
+        config,
+        conn_details.cached_flavor(),
+        || appstate.active_downloads.download_count(),
+        total_content_length.upper(),
+        &mut rand::rng(),
+    ) {
+        log_nudge(&conn_details, config, "");
+        let response = nudge_head(config).into_hyper(full_body(NUDGE_BODY));
+        trace!("Outgoing parallel download hack response: {response:?}");
+        return response;
     }
 
     serve_downloading_file(conn_details, req, status, Some(&upstream_metadata)).await

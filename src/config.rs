@@ -1750,6 +1750,15 @@ impl Config {
             );
         }
 
+        if !self.experimental_parallel_hack_statuscode.is_client_error()
+            && !self.experimental_parallel_hack_statuscode.is_server_error()
+        {
+            invalid!(
+                "Invalid experimental_parallel_hack_statuscode of {}: must be a 4xx or 5xx status",
+                self.experimental_parallel_hack_statuscode
+            );
+        }
+
         if self.experimental_parallel_hack_enabled
             && let Some(minsize) = self.experimental_parallel_hack_minsize
             && let Some(quota) = self.disk_quota
@@ -2533,6 +2542,37 @@ mod test {
             assert!(
                 !warnings.iter().any(|w| w == NEEDLE),
                 "unexpected warning for `{toml_input}`: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_hack_statuscode_outside_4xx_5xx_is_invalid() {
+        for statuscode in [100, 200, 301] {
+            let mut cfg = Config::from_toml(&format!(
+                "experimental_parallel_hack_statuscode = {statuscode}"
+            ))
+            .expect("config parses");
+            let err = cfg.validate().expect_err(&format!(
+                "statuscode {statuscode} is neither 4xx nor 5xx and must be rejected"
+            ));
+            assert!(
+                err.to_string().contains(&format!(
+                    "Invalid experimental_parallel_hack_statuscode of {statuscode}"
+                )),
+                "unexpected error for statuscode {statuscode}: {err}"
+            );
+        }
+
+        for statuscode in [400, 429, 500, 599] {
+            let mut cfg = Config::from_toml(&format!(
+                "experimental_parallel_hack_statuscode = {statuscode}"
+            ))
+            .expect("config parses");
+            let result = cfg.validate();
+            assert!(
+                result.is_ok(),
+                "statuscode {statuscode} is a valid 4xx/5xx status: {result:?}"
             );
         }
     }
