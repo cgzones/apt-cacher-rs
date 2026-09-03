@@ -1301,19 +1301,10 @@ async fn download_file(
     }
     drop(writer);
 
+    // Not created here: `integrity::rename_into_cache` creates it at commit
+    // time, and only on `ENOENT`. The `warn_on_override` `try_exists` below
+    // reads a missing directory as "no file to overwrite", which is right.
     let dest_dir_path = conn_details.cache_dir_path();
-
-    if let Err(err) = tokio::fs::create_dir_all(&dest_dir_path).await
-        && err.kind() != tokio::io::ErrorKind::AlreadyExists
-    {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "Failed to create destination directory `{}`; leaving the download uncached:  {}",
-            dest_dir_path.display(),
-            ErrorReport(&err)
-        );
-        return;
-    }
 
     let dest_file_path = {
         let mut p = dest_dir_path;

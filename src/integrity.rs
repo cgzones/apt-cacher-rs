@@ -57,7 +57,9 @@ pub(crate) enum CommitError {
     /// that cannot be verified does not enter the cache.
     #[error("verification I/O error")]
     VerifyIo(#[source] std::io::Error),
-    /// `tokio::fs::rename` of the verified temp file failed.
+    /// [`rename_into_cache`] of the verified temp file failed — either the
+    /// `rename(2)` itself, or the `create_dir_all` it falls back to when the
+    /// destination directory turns out to be missing.
     #[error("rename failed")]
     Rename(#[source] std::io::Error),
 }
@@ -556,6 +558,34 @@ fn log_unsupported_packages_compression(leaf: &str, host: &str) {
     );
 }
 
+/// `rename(2)` the finished temp file into the cache, creating the
+/// destination directory only when it turns out to be missing.
+///
+/// Same shape as `partial_file::create_partial_file`'s parent handling, and
+/// for the same reason: the eager `create_dir_all` both download backends
+/// used to run per download was a blocking-pool round trip whose `mkdir` +
+/// `stat` answered `EEXIST` for every download after the first into a given
+/// directory. The steady state now costs no `mkdir` at all.
+///
+/// `rename(2)` reports `ENOENT` for a missing *source* too, so a lost temp
+/// file costs one wasted `mkdir` before failing with the same errno it would
+/// have failed with anyway. A `create_dir_all` failure is returned as-is and
+/// surfaces through `CommitError::Rename` — the caller's "Failed to rename
+/// temp file `…` to `…`" ERROR (`guards.rs`) carries its errno, which names
+/// the real cause; no separate error variant.
+fn rename_into_cache(temp_path: &Path, dest_path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(temp_path, dest_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        result => return result,
+    }
+
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::rename(temp_path, dest_path)
+}
+
 /// Verify the finished temp file and rename it into the cache.
 ///
 /// `reservation` is finalised inside the same blocking closure as the
@@ -646,7 +676,7 @@ pub(crate) async fn verify_and_rename(
     let dest_path = plan.dest_path.clone();
     let bytes_received = plan.bytes_received;
     match tokio::task::spawn_blocking(move || {
-        std::fs::rename(&temp_path, &dest_path).map(|()| reservation.finalize(bytes_received))
+        rename_into_cache(&temp_path, &dest_path).map(|()| reservation.finalize(bytes_received))
     })
     .await
     {
@@ -1627,5 +1657,60 @@ mod tests {
         );
         assert_eq!(reg.len(), 1, "map still holds exactly one live entry");
         assert!(reg.lookup("h", "m", "a").is_some());
+    }
+
+    #[test]
+    fn rename_into_cache_uses_an_existing_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let src = dir.path().join("src.partial");
+        std::fs::write(&src, b"payload").expect("write source");
+        let dest = dir.path().join("dest.deb");
+
+        rename_into_cache(&src, &dest).expect("rename into an existing directory");
+
+        assert!(!src.exists(), "the source must be gone after the rename");
+        assert_eq!(
+            std::fs::read(&dest).expect("read destination"),
+            b"payload",
+            "the destination must hold the source's bytes"
+        );
+    }
+
+    #[test]
+    fn rename_into_cache_creates_a_missing_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let src = dir.path().join("src.partial");
+        std::fs::write(&src, b"payload").expect("write source");
+        // Two missing levels: `entry_dir` can be several segments below the
+        // mirror anchor (`dists/<suite>/<component>/by-hash/SHA256`).
+        let dest = dir.path().join("dists/suite/by-hash/dest.deb");
+
+        rename_into_cache(&src, &dest).expect("rename into a missing directory");
+
+        assert!(!src.exists(), "the source must be gone after the rename");
+        assert_eq!(
+            std::fs::read(&dest).expect("read destination"),
+            b"payload",
+            "the destination must hold the source's bytes"
+        );
+    }
+
+    #[test]
+    fn rename_into_cache_reports_a_missing_source() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let src = dir.path().join("absent.partial");
+        let dest = dir.path().join("sub/dest.deb");
+
+        let err = rename_into_cache(&src, &dest)
+            .expect_err("a missing source cannot be renamed");
+
+        // `rename(2)` reports ENOENT for a missing source as well as a
+        // missing destination directory, so the fallback runs and fails
+        // again with the same errno rather than masking it.
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "a missing source must surface as NotFound, not as a directory error"
+        );
     }
 }

@@ -477,17 +477,11 @@ async fn prepare_cache_target(
     ibarrier: InitBarrier<'_>,
     quota_phase: &'static str,
 ) -> Result<Option<CacheTarget>, SpliceProxyError> {
-    // Create cache directory and temp file
+    // Not created here: `integrity::rename_into_cache` creates it at commit
+    // time, and only on `ENOENT`. Everything below tolerates its absence --
+    // the volatile `prev_path` stat treats `NotFound` as "nothing to free",
+    // and `dest_path` is pure path construction.
     let dest_dir = conn_details.cache_dir_path();
-    if let Err(err) = tokio::fs::create_dir_all(&dest_dir).await {
-        return Err(SpliceProxyError::Cache(Logged::cache_io_failure(
-            format_args!(
-                "splice proxy: failed to create cache directory `{}`; aborting the download:  {}",
-                dest_dir.display(),
-                ErrorReport(&err)
-            ),
-        )));
-    }
 
     let filename = Path::new(&conn_details.debname);
     assert!(
