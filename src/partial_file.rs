@@ -107,14 +107,14 @@ impl PartialResume {
 ///
 /// Returns `Ok` for both the resumable and fresh outcomes; the caller
 /// distinguishes via `partial`/`offset`.  The `Err` cases are the two ways the
-/// partial file could not be opened, see [`PartialOpenError`]; the partial
+/// partial file could not be opened, see [`PartialOpenFailure`]; the partial
 /// path is left untouched on the filesystem either way.
 pub(crate) async fn prepare_partial_resume(
     ibarrier: &InitBarrier<'_>,
     debname: &str,
     mirror: &deb_mirror::Mirror,
     log_prefix: &'static str,
-) -> Result<PartialResume, PartialOpenError> {
+) -> Result<PartialResume, PartialOpenFailure> {
     let path = partial_path_for_barrier(CachePaths::global(), ibarrier);
     prepare_partial_resume_at(path, debname, mirror, log_prefix).await
 }
@@ -127,7 +127,7 @@ async fn prepare_partial_resume_at(
     debname: &str,
     mirror: &deb_mirror::Mirror,
     log_prefix: &'static str,
-) -> Result<PartialResume, PartialOpenError> {
+) -> Result<PartialResume, PartialOpenFailure> {
     match open_partial_file(path, log_prefix).await {
         Ok((file, size, guard)) if size > 0 => {
             if let Some(if_range) = xattr_helpers::read::<ETag>(&file, &guard) {
@@ -166,41 +166,88 @@ async fn prepare_partial_resume_at(
             }
         }
         Ok((_file, _size, guard)) => Ok(PartialResume::fresh(guard)),
-        Err(err) => Err(err),
+        // Absence is the overwhelmingly common case and not a failure: start
+        // a fresh download on the guard rather than making both backends
+        // undo an `Err` identically.
+        Err(PartialOpenError::NotFound(guard)) => Ok(PartialResume::fresh(guard)),
+        Err(PartialOpenError::Failed { logged, guard }) => {
+            Err(PartialOpenFailure { logged, guard })
+        }
     }
 }
 
-/// Why [`prepare_partial_resume`] could not open the partial file. Both
-/// variants hand back the `TempPath` guard for the deterministic partial path
-/// (`keep_on_drop: true`, so dropping it touches nothing on disk).
+/// Why `open_partial_file` did not hand back a resumable file. Internal:
+/// `NotFound` never leaves this module, since [`prepare_partial_resume`]
+/// turns it into a fresh download.
 #[derive(Debug)]
-pub(crate) enum PartialOpenError {
+enum PartialOpenError {
     /// No partial file at the path: the normal fresh-download case, not
-    /// logged and not counted. The caller starts a fresh download on the guard.
+    /// logged and not counted.
     NotFound(TempPath),
     /// Any other open/stat/seek failure, logged inside `open_partial_file`
     /// with the path and the matching `CACHE_IO_FAILURE` / `CACHE_NON_REGULAR`
-    /// bump; the caller answers 500 without logging again.
+    /// bump.
     Failed { logged: Logged, guard: TempPath },
 }
 
-/// A temporary file-path guard that automatically deletes the underlying file when dropped.
+/// [`prepare_partial_resume`] could not open the deterministic partial path,
+/// and the failure was already logged with its path and metric. The caller
+/// answers 500 without logging again. Hands back the `TempPath` guard
+/// (`OnDrop::Keep`, so dropping it touches nothing on disk).
+#[derive(Debug)]
+pub(crate) struct PartialOpenFailure {
+    pub(crate) logged: Logged,
+    pub(crate) guard: TempPath,
+}
+
+/// What [`TempPath`]'s `Drop` does with the file it guards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OnDrop {
+    /// Leave it on disk: a `.partial` at its deterministic path, which a
+    /// retried download resumes from.
+    Keep,
+    /// Unlink it: a scratch file with a randomised name that nothing can
+    /// find again.
+    Remove,
+}
+
+/// A guard over a temporary file path.
 ///
-/// When `keep_on_drop` is set to `true`, the file is preserved on drop instead of being deleted.
-/// This is used for partial download files that should survive failures for later resumption.
+/// The two shapes are minted by [`TempPath::keeping`] and
+/// [`TempPath::scratch`]; which one a path is depends on whether anything can
+/// find it again, so the choice belongs to the constructor rather than to a
+/// flag a caller sets.
 #[derive(Debug)]
 pub(crate) struct TempPath {
     path: Option<PathBuf>,
-    keep_on_drop: bool,
+    on_drop: OnDrop,
 }
 
 impl TempPath {
+    /// Guard the deterministic `.partial` path: `Drop` leaves the file for a
+    /// later resume.
+    fn keeping(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            on_drop: OnDrop::Keep,
+        }
+    }
+
+    /// Guard a randomly-named scratch file: `Drop` unlinks it, since nothing
+    /// else knows the name.
+    fn scratch(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            on_drop: OnDrop::Remove,
+        }
+    }
+
     /// Defuse the temporary path guard, returning the underlying `PathBuf`.
     pub(crate) fn defuse(mut self) -> PathBuf {
         std::mem::take(&mut self.path).expect("path has not been taken yet")
     }
 
-    /// Force deletion of the underlying file regardless of `keep_on_drop`.
+    /// Force deletion of the underlying file regardless of [`OnDrop`].
     ///
     /// Used for a partial whose content is known to be bad (checksum
     /// mismatch): keeping it would only feed a resume of the same wrong
@@ -231,20 +278,18 @@ impl TempPath {
         path
     }
 
-    /// Remove the underlying file and return a fresh `TempPath` guarding the same path
-    /// with `keep_on_drop = true` so a retried download can still be resumed on failure.
+    /// Remove the underlying file and return a fresh guard over the same
+    /// path, still `OnDrop::Keep` so a retried download can be resumed on
+    /// failure.
     async fn renew(self) -> Self {
-        Self {
-            path: Some(self.remove().await),
-            keep_on_drop: true,
-        }
+        Self::keeping(self.remove().await)
     }
 }
 
 impl Drop for TempPath {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
-            if self.keep_on_drop {
+            if self.on_drop == OnDrop::Keep {
                 debug!(
                     "Keeping partial download file `{}` for future resumption",
                     path.display()
@@ -312,13 +357,7 @@ pub(crate) async fn tokio_tempfile(
             .await
         {
             Ok(file) => {
-                return Ok((
-                    file,
-                    TempPath {
-                        path: Some(buf),
-                        keep_on_drop: false,
-                    },
-                ));
+                return Ok((file, TempPath::scratch(buf)));
             }
             Err(err) if err.kind() == tokio::io::ErrorKind::AlreadyExists => {
                 tries += 1;
@@ -355,7 +394,7 @@ fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier<'_>) -
 }
 
 /// Open the existing partial file at `path` for writing at the end, returning the file,
-/// its current size, and a `TempPath` guard with `keep_on_drop: true`.
+/// its current size, and an `OnDrop::Keep` `TempPath` guard.
 ///
 /// Uses `write(true)` + seek instead of `append(true)` so that splice(2) can use explicit
 /// file offsets (`O_APPEND` is incompatible with splice's offset parameter).
@@ -425,10 +464,7 @@ async fn open_partial_file(
         Ok((file, size))
     }
 
-    let guard = TempPath {
-        path: Some(path),
-        keep_on_drop: true,
-    };
+    let guard = TempPath::keeping(path);
     match file_ops(&guard, log_prefix).await {
         Ok((file, size)) => Ok((file, size, guard)),
         Err(FileOpsError::NotFound) => Err(PartialOpenError::NotFound(guard)),
@@ -437,7 +473,7 @@ async fn open_partial_file(
 }
 
 /// Create a new file at the given deterministic partial path, returning the file and a
-/// `TempPath` guard with `keep_on_drop: true`.
+/// `OnDrop::Keep` `TempPath` guard.
 pub(crate) async fn create_partial_file(
     guard: TempPath,
     mode: u32,
@@ -479,13 +515,7 @@ pub(crate) async fn create_partial_file(
         Err(err) => return Err((err, path)),
     };
 
-    Ok((
-        file,
-        TempPath {
-            path: Some(path),
-            keep_on_drop: true,
-        },
-    ))
+    Ok((file, TempPath::keeping(path)))
 }
 
 #[cfg(test)]
@@ -568,7 +598,7 @@ mod tests {
 
         let returned = guard.remove().await;
         assert_eq!(returned, path);
-        assert!(!path.exists(), "remove unlinks regardless of keep_on_drop");
+        assert!(!path.exists(), "remove unlinks regardless of OnDrop");
     }
 
     #[tokio::test]

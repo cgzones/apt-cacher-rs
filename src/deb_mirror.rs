@@ -980,7 +980,10 @@ fn is_release_filename(name: &str) -> bool {
 /// can drift apart.
 #[must_use]
 fn is_packages_filename(name: &str) -> bool {
-    matches!(name, "Packages" | "Packages.gz" | "Packages.xz")
+    // `limits::PackagesCompression` is the enum of the compressions the
+    // decode ladder supports, i.e. exactly the `Packages*` leaves that exist.
+    // Adding `.zst` there must not need a second edit here.
+    crate::limits::PackagesCompression::from_filename(name).is_some()
 }
 
 /// The `Sources` index in every compression this proxy recognises.

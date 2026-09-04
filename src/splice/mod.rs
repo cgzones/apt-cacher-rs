@@ -490,7 +490,7 @@ async fn prepare_cache_target(
 
     // Create/open the output file: the partial path for permanent files, a
     // random temp file for volatile ones. The permanent arms take over the
-    // caller's path guard, whose `keep_on_drop: true` is what leaves a failed
+    // caller's path guard, whose `OnDrop::Keep` is what leaves a failed
     // download's partial on disk for a later resume; the volatile temp file is
     // removed on drop instead.
     let (tempfile, temppath) = match partial {
@@ -853,7 +853,7 @@ async fn reject_if_verify_throttled(
 /// Check for a partial download file to resume (permanent files only).
 /// Opens the file upfront (if it exists and is non-empty) to get size + mtime
 /// from the same file descriptor, avoiding TOCTOU races between `metadata()` and `open()`.
-/// The guard uses `keep_on_drop: true` so the partial file survives on fallback
+/// The guard is `OnDrop::Keep`, so the partial file survives on fallback
 /// (e.g., concurrent download → hyper path picks it up for resume).
 /// Explicit `guard.remove()` is used only when a stale partial must be discarded.
 async fn open_partial_resume(
@@ -872,10 +872,7 @@ async fn open_partial_resume(
     .await
     {
         Ok(resume) => Ok(resume),
-        Err(partial_file::PartialOpenError::NotFound(guard)) => {
-            Ok(partial_file::PartialResume::fresh(guard))
-        }
-        Err(partial_file::PartialOpenError::Failed { logged, guard }) => {
+        Err(partial_file::PartialOpenFailure { logged, guard }) => {
             // Error already logged in `open_partial_file()`.
             drop(guard);
             Err(SpliceProxyError::Cache(logged))

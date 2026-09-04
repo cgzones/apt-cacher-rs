@@ -18,6 +18,10 @@
 pub(crate) enum HumanFmt {
     Size(u64),
     Rate(u64, std::time::Duration),
+    /// An already-per-second rate. [`Self::Rate`] divides and delegates here,
+    /// so a configured `min_download_rate` on the dashboard and a measured
+    /// rate in the log share one unit ladder.
+    RatePerSec(u64),
     Time(std::time::Duration),
 }
 
@@ -36,6 +40,28 @@ impl std::fmt::Display for HumanFmt {
         }
 
         const NEXT_UNIT: f64 = 999.5;
+
+        /// The `B/s` unit ladder, shared by the two rate variants so a
+        /// measured rate and a configured one cannot render differently.
+        fn write_rate(f: &mut std::fmt::Formatter<'_>, rate: f64) -> std::fmt::Result {
+            if rate < NEXT_UNIT {
+                return write!(f, "{rate:.0$}B/s", precision(rate));
+            }
+            let rate = rate / 1000.0;
+            if rate < NEXT_UNIT {
+                return write!(f, "{rate:.0$}kB/s", precision(rate));
+            }
+            let rate = rate / 1000.0;
+            if rate < NEXT_UNIT {
+                return write!(f, "{rate:.0$}MB/s", precision(rate));
+            }
+            let rate = rate / 1000.0;
+            if rate < NEXT_UNIT {
+                return write!(f, "{rate:.0$}GB/s", precision(rate));
+            }
+            let rate = rate / 1000.0;
+            write!(f, "{rate:.0$}TB/s", precision(rate))
+        }
 
         #[expect(clippy::cast_precision_loss, reason = "only used for display purposes")]
         match *self {
@@ -63,25 +89,9 @@ impl std::fmt::Display for HumanFmt {
                 if time == 0.0 {
                     return write!(f, "???B/s");
                 }
-                let rate = bytes as f64 / time;
-                if rate < NEXT_UNIT {
-                    return write!(f, "{rate:.0$}B/s", precision(rate));
-                }
-                let rate = rate / 1000.0;
-                if rate < NEXT_UNIT {
-                    return write!(f, "{rate:.0$}kB/s", precision(rate));
-                }
-                let rate = rate / 1000.0;
-                if rate < NEXT_UNIT {
-                    return write!(f, "{rate:.0$}MB/s", precision(rate));
-                }
-                let rate = rate / 1000.0;
-                if rate < NEXT_UNIT {
-                    return write!(f, "{rate:.0$}GB/s", precision(rate));
-                }
-                let rate = rate / 1000.0;
-                write!(f, "{rate:.0$}TB/s", precision(rate))
+                write_rate(f, bytes as f64 / time)
             }
+            Self::RatePerSec(per_sec) => write_rate(f, per_sec as f64),
             Self::Time(time) => {
                 let time = time.as_nanos();
                 if time < 1000 {
@@ -160,6 +170,36 @@ mod tests {
     use std::time::Duration;
 
     use crate::humanfmt::HumanFmt;
+
+    /// `Rate` over a one-second window and `RatePerSec` of the same number
+    /// must render identically - that equality is the reason the dashboard's
+    /// configured `min_download_rate` can share the log's unit ladder.
+    #[test]
+    fn rate_per_sec_matches_rate_over_one_second() {
+        for bytes in [0_u64, 1, 999, 1000, 24_756, 1_500_000, 3_000_000_000] {
+            assert_eq!(
+                format!("{}", HumanFmt::RatePerSec(bytes)),
+                format!("{}", HumanFmt::Rate(bytes, Duration::from_secs(1))),
+                "{bytes} B/s"
+            );
+        }
+        assert_eq!(format!("{}", HumanFmt::RatePerSec(10_000)), "10.00kB/s");
+    }
+
+    /// Below 1 kB/s the rate ladder keeps `precision()`'s decimals, where
+    /// [`HumanFmt::Size`] prints a bare integer. The dashboard's configured
+    /// `min_download_rate` renders through the ladder, so a rate that low
+    /// reads `5.00B/s` there and not `5B/s` -- deliberate, so a configured
+    /// rate and a measured one in the log are comparable digit for digit.
+    #[test]
+    fn sub_kilobyte_rates_keep_the_ladder_decimals() {
+        assert_eq!(format!("{}", HumanFmt::RatePerSec(5)), "5.00B/s");
+        assert_eq!(format!("{}", HumanFmt::RatePerSec(50)), "50.0B/s");
+        assert_eq!(format!("{}", HumanFmt::RatePerSec(100)), "100.0B/s");
+        // Above 100 the ladder and `Size` agree again.
+        assert_eq!(format!("{}", HumanFmt::RatePerSec(500)), "500B/s");
+        assert_eq!(format!("{}", HumanFmt::Size(500)), "500B");
+    }
 
     #[test]
     fn size_test() {

@@ -1735,7 +1735,7 @@ async fn serve_new_file(
     // Check for a partial download file to resume (permanent files only).
     // Opens the file upfront (if it exists and is non-empty) to get size + mtime
     // from the same file descriptor, avoiding TOCTOU races between metadata() and open().
-    // The guard uses keep_on_drop: true so the partial file survives transient
+    // The guard is `OnDrop::Keep`, so the partial file survives transient
     // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
     // `partial.discard_resume()` is used only when a stale partial must be
     // discarded (200 fallback from unsupported Range, 416, invalid Content-Range).
@@ -1756,10 +1756,7 @@ async fn serve_new_file(
         .await
         {
             Ok(r) => r,
-            Err(partial_file::PartialOpenError::NotFound(guard)) => {
-                partial_file::PartialResume::fresh(guard)
-            }
-            Err(partial_file::PartialOpenError::Failed {
+            Err(partial_file::PartialOpenFailure {
                 logged: _logged,
                 guard,
             }) => {
@@ -2121,7 +2118,7 @@ async fn serve_new_file(
 
     // Create/open the output file: partial path for permanent files, random temp for volatile.
     // Defuse the guard once we take ownership of the partial path — from here on, the
-    // download's own TempPath (keep_on_drop: true) manages the file lifetime.
+    // download's own `OnDrop::Keep` TempPath manages the file lifetime.
     let (outfile, outpath) = match partial {
         partial_file::PartialDownload::Resumable { mut file, guard } => {
             // Resume: use the file already opened during the partial-file check.

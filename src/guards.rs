@@ -440,7 +440,7 @@ impl RenameBarrier {
     /// guard is defused (the file now lives at `dest_path`), on a checksum
     /// mismatch the file is unlinked (its bytes are known-bad, resuming them
     /// cannot succeed), on a transient verify/rename failure the guard's
-    /// `keep_on_drop` keeps it for resumption. `declared_bytes` is the fallback for
+    /// `OnDrop::Keep` keeps it for resumption. `declared_bytes` is the fallback for
     /// quota finalisation when the temp file cannot be stat'ed. Rename
     /// failures are logged here (with `CACHE_IO_FAILURE`); mismatch and
     /// verify-IO failures are logged by `verify_and_rename`.
@@ -544,7 +544,7 @@ impl RenameBarrier {
             // so unlink it now (attached readers keep their open fd and
             // drain to EOF). Transient VerifyIo/Rename failures keep the
             // partial for resumption via the `TempPath` guard's
-            // `keep_on_drop`.
+            // `OnDrop::Keep`.
             if checksum_mismatch {
                 temp_path.remove().await;
             }

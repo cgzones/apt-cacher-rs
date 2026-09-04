@@ -394,7 +394,7 @@ pub(super) struct MinRate(pub(super) Option<std::num::NonZero<usize>>);
 impl Display for MinRate {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Some(r) => write!(f, "{}/s", HumanFmt::Size(r.get() as u64)),
+            Some(r) => write!(f, "{}", HumanFmt::RatePerSec(r.get() as u64)),
             None => f.write_str("None"),
         }
     }
