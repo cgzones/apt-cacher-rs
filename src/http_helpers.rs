@@ -4,7 +4,9 @@ use http::{HeaderName, StatusCode};
 use tokio::net::TcpStream;
 
 use crate::{
-    Never, global_config,
+    Never,
+    cache_conditional::{CacheInfo, ServeParams},
+    global_config,
     humanfmt::HumanFmt,
     metrics,
     response_head::{ResponseHead, ResponseKind, WireBody, retry_after_secs},
@@ -124,17 +126,8 @@ pub(crate) async fn write_304_response(
     age: u32,
     etag: Option<&str>,
 ) -> std::io::Result<()> {
-    // No `Content-Length`: RFC 9110 section 8.6 allows it on a 304 only when
-    // it equals the 200 representation's length, which `0` never does.
-    // `Accept-Ranges` is advertised on the representation-bearing responses
-    // only, matching hyper's 304.
-    let head = ResponseHead {
-        last_modified: Some(last_modified_str),
-        etag,
-        age: Some(age),
-        ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
-    };
-    head.write_to(stream, conn_version, conn_action, WireBody::None)
+    ResponseHead::not_modified(last_modified_str, etag, age)
+        .write_to(stream, conn_version, conn_action, WireBody::None)
         .await
 }
 
@@ -147,13 +140,12 @@ pub(crate) async fn write_416_response(
     conn_action: ConnectionAction,
     file_size: u64,
 ) -> std::io::Result<()> {
-    // An `Error` head like hyper's 416 (proxy-generated rejection, carries
-    // `Server:`). `Content-Length: 0` frames the empty body for keep-alive;
-    // hyper emits the same automatically for its empty body.
+    // `Content-Length: 0` frames the empty body for keep-alive; hyper emits
+    // the same automatically for its empty body, so the constructor leaves it
+    // to the renderer that needs it.
     let head = ResponseHead {
         content_length: Some(0),
-        content_range: Some(ResponseHead::unsatisfied_range(file_size)),
-        ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
+        ..ResponseHead::range_not_satisfiable(file_size)
     };
     head.write_to(stream, conn_version, conn_action, WireBody::None)
         .await
@@ -179,46 +171,31 @@ pub(crate) async fn write_invalid_response(
         .await
 }
 
-pub(crate) struct ResponseHeaders<'a> {
-    pub(crate) conn_version: ConnectionVersion,
-    pub(crate) status: StatusCode,
-    pub(crate) conn_action: ConnectionAction,
-    pub(crate) content_length: u64,
-    pub(crate) content_type: &'static str,
-    pub(crate) last_modified_str: &'a str,
-    pub(crate) age: u32,
-    pub(crate) content_range: Option<&'a str>,
-    pub(crate) etag: Option<&'a str>,
-}
-
-/// Write HTTP response headers for a file response whose body follows via
-/// `sendfile(2)`/`splice(2)`.
+/// Write the head of a cache-hit file response whose body follows via
+/// `sendfile(2)`, from the two objects that describe it: the plan
+/// [`CacheInfo::plan`] returned and the cached representation's validators.
 ///
-/// Times out after the configured HTTP timeout.
+/// Uses `send(MSG_MORE)` so the kernel coalesces the head with the first
+/// `sendfile(2)` body bytes; the splice paths keep their `CorkGuard` instead
+/// (see `write_splice_response_headers`). Times out after the configured HTTP
+/// timeout.
 pub(crate) async fn write_response_headers(
     stream: &TcpStream,
-    headers: ResponseHeaders<'_>,
+    conn_version: ConnectionVersion,
+    conn_action: ConnectionAction,
+    params: &ServeParams,
+    content_type: &'static str,
+    cache_info: &CacheInfo,
 ) -> std::io::Result<()> {
-    let ResponseHeaders {
-        conn_version,
-        status,
-        conn_action,
-        content_length,
-        content_type,
-        last_modified_str,
-        age,
-        content_range,
-        etag,
-    } = headers;
     let head = ResponseHead {
-        content_length: Some(content_length),
+        content_length: Some(params.content_length),
         content_type: Some(content_type),
         accept_ranges: true,
-        last_modified: Some(last_modified_str),
-        etag,
-        age: Some(age),
-        content_range: content_range.map(Cow::Borrowed),
-        ..ResponseHead::bare(status, ResponseKind::Success)
+        last_modified: Some(&cache_info.last_modified_str),
+        etag: cache_info.file_etag.as_deref(),
+        age: Some(cache_info.age),
+        content_range: params.content_range.as_deref().map(Cow::Borrowed),
+        ..ResponseHead::bare(params.http_status(), ResponseKind::Success)
     };
     head.write_to(stream, conn_version, conn_action, WireBody::Follows)
         .await

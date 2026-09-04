@@ -124,9 +124,42 @@ impl<'a> ResponseHead<'a> {
         Self::bare(StatusCode::OK, ResponseKind::TunnelEstablished)
     }
 
+    /// The `304 Not Modified` head answering a satisfied conditional request.
+    ///
+    /// Carries the cached representation's validators and nothing else. No
+    /// `Content-Length`: RFC 9110 section 8.6 permits one on a 304 only when
+    /// it equals the 200 representation's length, which `0` never does. No
+    /// `Accept-Ranges` either — it is advertised on the
+    /// representation-bearing responses only. Both backends answer a 304
+    /// with this head, so the shape cannot drift between them.
+    #[must_use]
+    pub(crate) fn not_modified(last_modified: &'a str, etag: Option<&'a str>, age: u32) -> Self {
+        Self {
+            last_modified: Some(last_modified),
+            etag,
+            age: Some(age),
+            ..Self::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
+        }
+    }
+
+    /// The `416 Range Not Satisfiable` head for a request no byte of the
+    /// representation satisfies.
+    ///
+    /// An `Error` head, so it carries `Server:` like every other
+    /// proxy-generated rejection. The wire renderer adds
+    /// `content_length: Some(0)` to frame the empty body for keep-alive;
+    /// hyper emits that itself for an empty body.
+    #[must_use]
+    pub(crate) fn range_not_satisfiable(file_size: u64) -> Self {
+        Self {
+            content_range: Some(Self::unsatisfied_range(file_size)),
+            ..Self::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
+        }
+    }
+
     /// The `Content-Range: bytes */<size>` value of a `416`.
     #[must_use]
-    pub(crate) fn unsatisfied_range(file_size: u64) -> Cow<'a, str> {
+    fn unsatisfied_range(file_size: u64) -> Cow<'a, str> {
         Cow::Owned(format!("bytes */{file_size}"))
     }
 

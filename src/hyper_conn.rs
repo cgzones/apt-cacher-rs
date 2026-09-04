@@ -838,12 +838,11 @@ async fn serve_cached_file(
                 conn_details.debname, conn_details.mirror, aliased, conn_details.client
             );
 
-            let head = ResponseHead {
-                last_modified: Some(&cache_info.last_modified_str),
-                etag: cache_info.file_etag.as_deref(),
-                age: Some(cache_info.age),
-                ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
-            };
+            let head = ResponseHead::not_modified(
+                &cache_info.last_modified_str,
+                cache_info.file_etag.as_deref(),
+                cache_info.age,
+            );
             let response = head.into_hyper(empty_body());
 
             trace!("Outgoing response: {response:?}");
@@ -851,11 +850,7 @@ async fn serve_cached_file(
             return response;
         }
         ServePlan::NotSatisfiable => {
-            let head = ResponseHead {
-                content_range: Some(ResponseHead::unsatisfied_range(file_size)),
-                ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
-            };
-            return head.into_hyper(empty_body());
+            return ResponseHead::range_not_satisfiable(file_size).into_hyper(empty_body());
         }
     };
 

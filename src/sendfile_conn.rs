@@ -64,9 +64,9 @@ use crate::{
     },
     global_config,
     http_helpers::{
-        ConnectionAction, ConnectionVersion, ResponseHeaders, WritePhase, find_header,
-        find_header_end, write_304_response, write_416_response, write_all_to_stream,
-        write_invalid_response, write_response_headers,
+        ConnectionAction, ConnectionVersion, WritePhase, find_header, find_header_end,
+        write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
+        write_response_headers,
     },
     http_range::format_http_date,
     humanfmt::HumanFmt,
@@ -1545,12 +1545,8 @@ pub(crate) async fn serve_file_via_sendfile(
         Err(result) => return result,
     };
     let partial = params.is_partial();
-    let http_status = params.http_status();
-    let ServeParams {
-        content_start,
-        content_length,
-        content_range,
-    } = params;
+    let content_start = params.content_start;
+    let content_length = params.content_length;
 
     debug!(
         "Serving cached file {} from mirror {}{aliased} for client {} via sendfile...",
@@ -1566,18 +1562,16 @@ pub(crate) async fn serve_file_via_sendfile(
     // TCP_CORK setsockopt pair needed.
 
     // Write HTTP response headers
-    let headers = ResponseHeaders {
+    if let Err(err) = write_response_headers(
+        stream,
         conn_version,
-        status: http_status,
         conn_action,
-        content_length,
-        content_type: content_type_for_cached_file(&conn_details.debname),
-        last_modified_str: &cache_info.last_modified_str,
-        age: cache_info.age,
-        content_range: content_range.as_deref(),
-        etag: cache_info.file_etag.as_deref(),
-    };
-    if let Err(err) = write_response_headers(stream, headers).await {
+        &params,
+        content_type_for_cached_file(&conn_details.debname),
+        &cache_info,
+    )
+    .await
+    {
         log_client_write_failure(conn_details.client, "response headers", &err);
         return SendfileResult::ClientError;
     }
@@ -2600,12 +2594,8 @@ async fn serve_unfinished_sendfile(
         Err(result) => return result.into(),
     };
     let partial = params.is_partial();
-    let http_status = params.http_status();
-    let ServeParams {
-        content_start,
-        content_length,
-        content_range,
-    } = params;
+    let content_start = params.content_start;
+    let content_length = params.content_length;
 
     debug!(
         "Serving downloading file {} from mirror {}{aliased} for joining client {} via sendfile...",
@@ -2620,18 +2610,16 @@ async fn serve_unfinished_sendfile(
     // Headers go out with MSG_MORE (see write_response_headers); the first
     // sendfile body bytes complete the held segment — no TCP_CORK pair.
 
-    let headers = ResponseHeaders {
+    if let Err(err) = write_response_headers(
+        stream,
         conn_version,
-        status: http_status,
         conn_action,
-        content_length,
-        content_type: content_type_for_cached_file(&conn_details.debname),
-        last_modified_str: &cache_info.last_modified_str,
-        age: cache_info.age,
-        content_range: content_range.as_deref(),
-        etag: cache_info.file_etag.as_deref(),
-    };
-    if let Err(err) = write_response_headers(stream, headers).await {
+        &params,
+        content_type_for_cached_file(&conn_details.debname),
+        &cache_info,
+    )
+    .await
+    {
         if is_peer_disconnect(&err) {
             info!(
                 "Failed to write response headers to joining client {}; closing the connection:  {}",
