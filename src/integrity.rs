@@ -1701,8 +1701,7 @@ mod tests {
         let src = dir.path().join("absent.partial");
         let dest = dir.path().join("sub/dest.deb");
 
-        let err = rename_into_cache(&src, &dest)
-            .expect_err("a missing source cannot be renamed");
+        let err = rename_into_cache(&src, &dest).expect_err("a missing source cannot be renamed");
 
         // `rename(2)` reports ENOENT for a missing source as well as a
         // missing destination directory, so the fallback runs and fails
