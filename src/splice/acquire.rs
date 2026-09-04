@@ -23,15 +23,14 @@ use crate::cache_layout::ConnectionDetails;
 use crate::config::ClientHost;
 use crate::deb_mirror::{Mirror, MirrorKind};
 use crate::error::{ErrorReport, Transience};
-use crate::humanfmt::HumanFmt;
 use crate::partial_file;
 use crate::scheme_cache::SchemeDecision;
-use crate::upstream_head::RejectReason;
 #[cfg(feature = "ktls")]
 use crate::upstream_head::{DownloadPlan, plan_fresh_download};
+use crate::upstream_head::{RejectGates, RejectReason};
 use crate::{
-    Scheme, global_config, metrics, permitted_host_cache::is_host_allowed_cached, scheme_cache,
-    upstream_retry, warn_once_or_info, warn_once_or_info_logged,
+    Scheme, global_config, log_once, metrics, permitted_host_cache::is_host_allowed_cached,
+    scheme_cache, upstream_retry, warn_once_or_info, warn_once_or_info_logged,
 };
 
 use super::http::{UpstreamResponse, send_and_read_headers};
@@ -458,60 +457,29 @@ pub(super) async fn follow_redirect(
     }))
 }
 
-/// Log an upstream response the planner rejected (`DownloadPlan::Reject`).
+/// Log the planner's refusal of an upstream response.
 ///
-/// `origin` tags the kTLS one-shot attempt (`" (from kTLS attempt)"`) or is
-/// empty.  Wording mirrors `hyper_conn.rs::serve_new_file` modulo the
-/// subsystem prefix.
+/// The complaint itself lives on [`RejectReason::detail`], shared with the
+/// hyper backend; this owns the `splice proxy:` prefix, the `{origin}`
+/// context suffix (e.g. " (from kTLS attempt)") and the once-gates.
 pub(super) fn warn_upstream_reject(
     reason: RejectReason,
     conn_details: &ConnectionDetails,
     origin: &str,
 ) {
-    match reason {
-        RejectReason::Unsolicited206 => warn_once_or_info!(
-            "splice proxy: upstream returned 206 Partial Content without a Range request for {} from mirror {}{origin}; returning 502",
+    /// One gate per reason: a mirror tripping `max_object_size` must not
+    /// mute the first genuine protocol violation.
+    static GATES: RejectGates = RejectGates::new();
+
+    log_once::warn_once_or_info_gated(
+        GATES.for_reason(reason),
+        format_args!(
+            "splice proxy: upstream response rejected for {} from mirror {}{origin}: {}; returning 502",
             conn_details.debname,
-            conn_details.mirror
+            conn_details.mirror,
+            reason.detail()
         ),
-        RejectReason::InconsistentContentRange {
-            content_length,
-            span,
-        } => warn_once_or_info!(
-            "splice proxy: Content-Length {content_length} disagrees with Content-Range span {span} for {} from mirror {}{origin}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        ),
-        RejectReason::Oversize { total } => warn_once_or_info!(
-            "splice proxy: upstream declared total size {} for file {} from mirror {}{origin}, exceeding `max_object_size`; returning 502",
-            HumanFmt::Size(total),
-            conn_details.debname,
-            conn_details.mirror
-        ),
-        RejectReason::NoContentLength => warn_once_or_info!(
-            "splice proxy: upstream sent no usable Content-Length for file {} from mirror {}{origin}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        ),
-        RejectReason::ZeroContentLength => warn_once_or_info!(
-            "splice proxy: upstream declared Content-Length 0 for file {} from mirror {}{origin}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        ),
-        RejectReason::InconsistentBodyFraming {
-            content_length,
-            prefix_len,
-        } => warn_once_or_info!(
-            "splice proxy: body prefix ({prefix_len} bytes) exceeds body content length ({content_length} bytes) for {} from mirror {}{origin}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        ),
-        RejectReason::InterimResponse { status } => warn_once_or_info!(
-            "splice proxy: upstream sent interim response {status} for {} from mirror {}{origin}; returning 502",
-            conn_details.debname,
-            conn_details.mirror
-        ),
-    }
+    );
 }
 
 /// Discard a stale partial download file and retry the upstream request from scratch.

@@ -31,13 +31,18 @@
 //! generic `C` and comes back only inside [`DownloadPlan::NotModified`], so
 //! neither backend has to write a "304 without a cached copy" arm.
 
-use std::{fmt::Display, num::NonZero};
+use std::{
+    fmt::{self, Display, Formatter},
+    num::NonZero,
+    sync::atomic::AtomicBool,
+};
 
 use http::StatusCode;
 
 use crate::{
     cache_layout::CachedFlavor,
     http_range::ContentRange,
+    humanfmt::HumanFmt,
     limits::{self, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER},
     metrics,
 };
@@ -60,7 +65,7 @@ impl ContentLength {
 }
 
 impl Display for ContentLength {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Exact(size) => write!(f, "exact {size} bytes"),
             Self::Unknown(limit) => write!(f, "up to {limit} bytes"),
@@ -227,6 +232,21 @@ impl RejectReason {
         }
     }
 
+    /// The complaint itself, for the backends' rejection log line.
+    ///
+    /// Rendered mid-sentence, so it starts lowercase and carries neither the
+    /// subject (which file, which mirror) nor the `; returning 502`
+    /// consequence clause -- those belong to the backend's own sentence,
+    /// which also owns its subsystem prefix and its once-gate. This is the
+    /// half that used to be spelled out per variant in both
+    /// `hyper_conn.rs` and `splice/acquire.rs`, i.e. the half that could
+    /// drift; `docs/logging.md`'s cross-backend parity rule now holds by
+    /// construction for it.
+    #[must_use]
+    pub(crate) fn detail(self) -> RejectDetail {
+        RejectDetail(self)
+    }
+
     /// Bump the counters this rejection is accounted under.  Called once by
     /// the backend when it emits the 502.
     pub(crate) fn record_metrics(self) {
@@ -246,6 +266,105 @@ impl RejectReason {
             }
             Self::Oversize { .. } => {
                 metrics::DOWNLOAD_REJECTED_OVERSIZE.increment();
+            }
+        }
+    }
+}
+
+/// One flood-control gate per [`RejectReason`], owned by a backend's reject
+/// call site.
+///
+/// The gate has to be per reason, not per call site.  `Oversize` is a
+/// config-threshold refusal a well-behaved mirror can trigger, so a single
+/// shared gate would let it demote the *first* occurrence of every genuine
+/// protocol violation to INFO for the life of the process -- off the web
+/// interface's important-log page, which `docs/logging.md` makes the
+/// operator's evidence trail.
+pub(crate) struct RejectGates {
+    unsolicited_206: AtomicBool,
+    inconsistent_content_range: AtomicBool,
+    oversize: AtomicBool,
+    no_content_length: AtomicBool,
+    zero_content_length: AtomicBool,
+    #[cfg(feature = "splice")]
+    inconsistent_body_framing: AtomicBool,
+    #[cfg(feature = "splice")]
+    interim_response: AtomicBool,
+}
+
+impl RejectGates {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            unsolicited_206: AtomicBool::new(false),
+            inconsistent_content_range: AtomicBool::new(false),
+            oversize: AtomicBool::new(false),
+            no_content_length: AtomicBool::new(false),
+            zero_content_length: AtomicBool::new(false),
+            #[cfg(feature = "splice")]
+            inconsistent_body_framing: AtomicBool::new(false),
+            #[cfg(feature = "splice")]
+            interim_response: AtomicBool::new(false),
+        }
+    }
+
+    /// This table's gate for `reason`, for
+    /// [`log_once::warn_once_or_info_gated`](crate::log_once::warn_once_or_info_gated).
+    /// The exhaustive match makes a new [`RejectReason`] variant a compile
+    /// error here rather than a silently shared gate.
+    #[must_use]
+    pub(crate) const fn for_reason(&'static self, reason: RejectReason) -> &'static AtomicBool {
+        match reason {
+            RejectReason::Unsolicited206 => &self.unsolicited_206,
+            RejectReason::InconsistentContentRange { .. } => &self.inconsistent_content_range,
+            RejectReason::Oversize { .. } => &self.oversize,
+            RejectReason::NoContentLength => &self.no_content_length,
+            RejectReason::ZeroContentLength => &self.zero_content_length,
+            #[cfg(feature = "splice")]
+            RejectReason::InconsistentBodyFraming { .. } => &self.inconsistent_body_framing,
+            #[cfg(feature = "splice")]
+            RejectReason::InterimResponse { .. } => &self.interim_response,
+        }
+    }
+}
+
+/// [`RejectReason::detail`]'s renderer: a mid-sentence phrase naming what was
+/// wrong with the upstream response.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RejectDetail(RejectReason);
+
+impl Display for RejectDetail {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self(reason) = self;
+        match *reason {
+            RejectReason::Unsolicited206 => {
+                f.write_str("206 Partial Content without a Range request")
+            }
+            RejectReason::InconsistentContentRange {
+                content_length,
+                span,
+            } => write!(
+                f,
+                "Content-Length {content_length} disagrees with Content-Range span {span}"
+            ),
+            RejectReason::Oversize { total } => write!(
+                f,
+                "declared total size {} exceeds `max_object_size`",
+                HumanFmt::Size(total)
+            ),
+            RejectReason::NoContentLength => f.write_str("no usable Content-Length"),
+            RejectReason::ZeroContentLength => f.write_str("Content-Length 0"),
+            #[cfg(feature = "splice")]
+            RejectReason::InconsistentBodyFraming {
+                content_length,
+                prefix_len,
+            } => write!(
+                f,
+                "body prefix ({prefix_len} bytes) exceeds body content length ({content_length} bytes)"
+            ),
+            #[cfg(feature = "splice")]
+            RejectReason::InterimResponse { status } => {
+                write!(f, "interim response {status}")
             }
         }
     }
@@ -765,6 +884,55 @@ mod tests {
         );
     }
 
+    /// `detail()` is interpolated into each backend's own sentence, so it
+    /// must read as a mid-sentence clause: no subject, no `; returning 502`
+    /// consequence, and a lowercase lead where the word is not a proper noun.
+    fn assert_reads_mid_sentence(reason: RejectReason, expected: &str) {
+        let rendered = reason.detail().to_string();
+        assert_eq!(rendered, expected, "{reason:?}");
+        assert!(
+            !rendered.ends_with('.') && !rendered.contains("returning 502"),
+            "the consequence clause belongs to the caller's sentence: {rendered}"
+        );
+    }
+
+    #[test]
+    fn reject_details_read_mid_sentence() {
+        assert_reads_mid_sentence(
+            RejectReason::Unsolicited206,
+            "206 Partial Content without a Range request",
+        );
+        assert_reads_mid_sentence(
+            RejectReason::InconsistentContentRange {
+                content_length: 10,
+                span: 20,
+            },
+            "Content-Length 10 disagrees with Content-Range span 20",
+        );
+        assert_reads_mid_sentence(
+            RejectReason::Oversize { total: 2048 },
+            "declared total size 2.05kB exceeds `max_object_size`",
+        );
+        assert_reads_mid_sentence(RejectReason::NoContentLength, "no usable Content-Length");
+        assert_reads_mid_sentence(RejectReason::ZeroContentLength, "Content-Length 0");
+    }
+
+    #[cfg(feature = "splice")]
+    #[test]
+    fn splice_only_reject_details_read_mid_sentence() {
+        assert_reads_mid_sentence(
+            RejectReason::InconsistentBodyFraming {
+                content_length: 10,
+                prefix_len: 20,
+            },
+            "body prefix (20 bytes) exceeds body content length (10 bytes)",
+        );
+        assert_reads_mid_sentence(
+            RejectReason::InterimResponse { status: 100 },
+            "interim response 100",
+        );
+    }
+
     /// The two refusals only the splice relay can raise: hyper's client
     /// frames bodies itself and never yields either.
     #[cfg(feature = "splice")]
@@ -867,5 +1035,45 @@ mod tests {
             UpstreamHead::from_response(&response),
             head(200, None, None)
         );
+    }
+
+    /// Every [`RejectReason`] must own its gate. Sharing one would let a
+    /// `max_object_size` refusal -- a config threshold, not a protocol fault
+    /// -- permanently demote the first occurrence of every genuine violation
+    /// to INFO, keeping it off the web interface's important-log page.
+    #[test]
+    fn reject_gates_fire_once_per_reason() {
+        static GATES: RejectGates = RejectGates::new();
+
+        let reasons = [
+            RejectReason::Unsolicited206,
+            RejectReason::InconsistentContentRange {
+                content_length: 1,
+                span: 2,
+            },
+            RejectReason::Oversize { total: 3 },
+            RejectReason::NoContentLength,
+            RejectReason::ZeroContentLength,
+            #[cfg(feature = "splice")]
+            RejectReason::InconsistentBodyFraming {
+                content_length: 4,
+                prefix_len: 5,
+            },
+            #[cfg(feature = "splice")]
+            RejectReason::InterimResponse { status: 100 },
+        ];
+
+        for reason in reasons {
+            assert!(
+                crate::log_once::first_fire(GATES.for_reason(reason)),
+                "{reason:?} must still have an unspent gate after the earlier reasons fired"
+            );
+        }
+        for reason in reasons {
+            assert!(
+                !crate::log_once::first_fire(GATES.for_reason(reason)),
+                "{reason:?} must fire at warn level only once"
+            );
+        }
     }
 }

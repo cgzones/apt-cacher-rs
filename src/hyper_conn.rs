@@ -73,7 +73,7 @@ use crate::{
     http_range::HttpDate,
     humanfmt::HumanFmt,
     limits::VOLATILE_CACHE_MAX_AGE,
-    metrics,
+    log_once, metrics,
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
     partial_file::{self, TempPath, tokio_tempfile},
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
@@ -90,7 +90,7 @@ use crate::{
     scheme_cache::{self, SchemeDecision},
     static_assert, tunnel_limiter,
     upstream_head::{
-        ContentLength, DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead,
+        ContentLength, DownloadPlan, RejectGates, ResumeAnomaly, ResumeState, UpstreamHead,
         plan_download, plan_fresh_download,
     },
     upstream_retry, warn_once_or_debug, warn_once_or_info,
@@ -1997,56 +1997,20 @@ async fn serve_new_file(
             );
         }
         DownloadPlan::Reject(reason) => {
+            /// One gate per reason: a mirror tripping `max_object_size` must
+            /// not mute the first genuine protocol violation.
+            static GATES: RejectGates = RejectGates::new();
+
             reason.record_metrics();
-            match reason {
-                RejectReason::Unsolicited206 => warn_once_or_info!(
-                    "Upstream returned 206 Partial Content without a Range request for {} from mirror {}; returning 502",
+            log_once::warn_once_or_info_gated(
+                GATES.for_reason(reason),
+                format_args!(
+                    "Upstream response rejected for {} from mirror {}: {}; returning 502",
                     conn_details.debname,
-                    conn_details.mirror
+                    conn_details.mirror,
+                    reason.detail()
                 ),
-                RejectReason::InconsistentContentRange {
-                    content_length,
-                    span,
-                } => warn_once_or_info!(
-                    "Content-Length {content_length} disagrees with Content-Range span {span} for {} from mirror {}; returning 502",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                RejectReason::Oversize { total } => warn_once_or_info!(
-                    "Upstream declared total size {} for file {} from mirror {}, exceeding `max_object_size`; returning 502",
-                    HumanFmt::Size(total),
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                RejectReason::NoContentLength => warn_once_or_info!(
-                    "Upstream sent no usable Content-Length for file {} from mirror {}; returning 502",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                RejectReason::ZeroContentLength => warn_once_or_info!(
-                    "Upstream declared Content-Length 0 for file {} from mirror {}; returning 502",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                // hyper frames upstream bodies itself, so the planner never
-                // yields these two here; the splice relay is their only
-                // producer.  Listed for the exhaustive match.
-                #[cfg(feature = "splice")]
-                RejectReason::InconsistentBodyFraming {
-                    content_length,
-                    prefix_len,
-                } => warn_once_or_info!(
-                    "Body prefix ({prefix_len} bytes) exceeds body content length ({content_length} bytes) for {} from mirror {}; returning 502",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-                #[cfg(feature = "splice")]
-                RejectReason::InterimResponse { status } => warn_once_or_info!(
-                    "Upstream sent interim response {status} for {} from mirror {}; returning 502",
-                    conn_details.debname,
-                    conn_details.mirror
-                ),
-            }
+            );
             return quick_response(StatusCode::BAD_GATEWAY, reason.body());
         }
         DownloadPlan::Download {
