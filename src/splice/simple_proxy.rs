@@ -9,7 +9,7 @@ use http::StatusCode;
 use tokio::net::TcpStream;
 use tracing::{debug, info, trace};
 
-use crate::database_task::{DatabaseCommand, DbCmdOrigin, send_db_command};
+use crate::database_task::{DatabaseCommand, send_db_command};
 use crate::deb_mirror::{Mirror, Origin};
 use crate::error::ErrorReport;
 use crate::http_helpers::{
@@ -164,7 +164,7 @@ pub(crate) async fn splice_simple_proxy(
         header_buf: hdr_buf,
         header_end: hdr_end,
         reused: _,
-    } = standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
+    } = standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
         .await
         .map_err(SpliceProxyError::Upstream)?;
 
@@ -234,7 +234,7 @@ pub(crate) async fn splice_simple_proxy(
         && let Some(origin) =
             Origin::from_path(original_uri_path, mirror.host().clone(), mirror.port())
     {
-        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        let cmd = DatabaseCommand::Origin(origin);
         send_db_command(cmd).await;
     }
 

@@ -64,9 +64,7 @@ use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_paths::CachePaths;
 use crate::cache_quota::QuotaExceeded;
-use crate::database_task::{
-    DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command,
-};
+use crate::database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command};
 use crate::deb_mirror::Origin;
 use crate::error::{ErrorReport, is_peer_disconnect};
 use crate::fs_open::{
@@ -669,7 +667,7 @@ async fn commit_and_record(
         conn_details.mirror.host().clone(),
         conn_details.mirror.port(),
     ) {
-        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        let cmd = DatabaseCommand::Origin(origin);
         send_db_command(cmd).await;
     }
 
@@ -1879,7 +1877,7 @@ async fn splice_proxy_drive(
     if should_nudge(
         config,
         conn_details.cached_flavor(),
-        || appstate.active_downloads.download_count(),
+        || appstate.active_downloads.len(),
         total_content_length,
         &mut rand::rng(),
     ) {

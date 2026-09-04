@@ -57,7 +57,7 @@ use crate::{
         ConnectReject, copy_bidirectional_idle, report_tunnel_outcome, validate_connect_target,
     },
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
-    database_task::{DatabaseCommand, DbCmdOrigin, DbCmdTransfer, TransferKind, send_db_command},
+    database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::Origin,
     delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{
@@ -523,10 +523,14 @@ fn serve_cached_file_mmap(
         })
         .ok()?;
 
+        // `MmapBody` derives the body length from the mapping alone, while
+        // the head announces `content_length`: pin the two together, or a
+        // mapping longer than requested would stream past the announced
+        // length with no debug-build signal.
         debug_assert_eq!(
             memory_map.len(),
             content_length,
-            "actual mmap length must match requested length"
+            "MmapOptions::len must produce exactly the announced body length"
         );
 
         // close file, since mapping is independent
@@ -551,7 +555,7 @@ fn serve_cached_file_mmap(
     let client = conn_details.client;
 
     let memory_body = AccountedBody::new(
-        MmapBody::new(memory_map, content_length),
+        MmapBody::new(memory_map),
         Subject::Cached {
             conn_details,
             mechanism: Mechanism::Mmap,
@@ -2272,7 +2276,7 @@ async fn serve_new_file(
     if should_nudge(
         config,
         conn_details.cached_flavor(),
-        || appstate.active_downloads.download_count(),
+        || appstate.active_downloads.len(),
         total_content_length.upper(),
         &mut rand::rng(),
     ) {
@@ -2775,7 +2779,7 @@ async fn pre_process_client_request(
         debug!("Extracted origin: {origin:?}");
 
         // TODO: cache some of them?
-        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        let cmd = DatabaseCommand::Origin(origin);
         send_db_command(cmd).await;
     }
 

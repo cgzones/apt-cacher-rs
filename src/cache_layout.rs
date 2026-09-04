@@ -61,7 +61,7 @@ use crate::{
     cache_paths::{CachePaths, MirrorSite},
     client_info::ClientInfo,
     config::ClientHost,
-    database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
+    database_task::{DatabaseCommand, send_db_command_nonblocking},
     deb_mirror::{
         FlatKind, Mirror, MirrorKind, Origin, OriginFields, ResourceFile, is_deb_package,
         is_flat_deb_filename, is_pseudo_arch, valid_architecture, valid_component,
@@ -377,7 +377,7 @@ impl ConnectionDetails {
             mirror: self.mirror.clone(),
             fields: (**fields).clone(),
         };
-        send_db_command_nonblocking(DatabaseCommand::Origin(DbCmdOrigin { origin }));
+        send_db_command_nonblocking(DatabaseCommand::Origin(origin));
     }
 
     /// [`ResourceKind::cached_flavor`] of this request's resource.

@@ -554,16 +554,6 @@ pub(crate) fn parse_release_byhash_digests(content: &str) -> impl Iterator<Item 
     })
 }
 
-/// Map a `.deb` download's request to the same registry key.
-///
-/// `debname` is `ConnectionDetails::debname` (already the basename for a
-/// structured pool file). For structured pool the key is `debname` directly.
-/// Flat-pool download verification is not implemented,
-/// so this is currently only used for the structured-pool path.
-pub(crate) fn registry_key_for_download(debname: &str) -> String {
-    debname.to_owned()
-}
-
 /// Hash the contents of an open file. Synchronous; blocks the current thread.
 pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> io::Result<Vec<u8>> {
     use std::io::Read as _;

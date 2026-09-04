@@ -78,17 +78,17 @@ impl Mirror {
     }
 
     #[must_use]
-    pub(crate) fn format_authority(&self) -> Cow<'_, str> {
+    pub(crate) fn format_authority(&self) -> &str {
         // Fast path: no allocation needed for DNS/IPv4 hosts without a port.
         if self.port.is_none() && !self.host.is_ipv6() {
-            return Cow::Borrowed(self.host.as_str());
+            return self.host.as_str();
         }
-        Cow::Borrowed(self.cached_authority.get_or_init(|| {
+        self.cached_authority.get_or_init(|| {
             self.host
                 .format_authority(self.port)
                 .into_owned()
                 .into_boxed_str()
-        }))
+        })
     }
 
     #[must_use]
@@ -2295,8 +2295,8 @@ mod tests {
     /// that is the shape to pin.
     #[test]
     fn pseudo_architectures_mint_no_origin() {
-        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
         const DIGEST: &str = "84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83";
+        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
         for arch in ["dep11", "i18n", "source"] {
             let path = format!("/debian/dists/sid/main/{arch}/by-hash/SHA256/{DIGEST}");
             assert_eq!(

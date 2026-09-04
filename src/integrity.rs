@@ -248,9 +248,8 @@ pub(crate) struct RenamePlan {
     pub(crate) resource_kind: ResourceKind,
     /// On-disk leaf name. For a by-hash resource this is the hex digest, used
     /// by `verify_temp_file` to decode the expected hash; for `Pool` it is
-    /// the basename used as the registry-lookup key via
-    /// `registry_key_for_download`; for other kinds it is kept only for log
-    /// context.
+    /// the basename used directly as the registry-lookup key; for other
+    /// kinds it is kept only for log context.
     pub(crate) debname: String,
     /// Upstream host. Part of the registry key, alongside `mirror_path`.
     pub(crate) host: String,
@@ -634,9 +633,9 @@ pub(crate) async fn verify_and_rename(
             }
             ResourceKind::Pool => {
                 // Layer B: a pool .deb's key is its bare basename, the form
-                // `ingest_stanza_into_registry` inserted.
-                let key = index_parser::registry_key_for_download(&plan.debname);
-                registry_verify_kind(plan, &key)
+                // `ingest_stanza_into_registry` inserted. Flat-pool downloads
+                // are not verified this way, so no flat variant is needed.
+                registry_verify_kind(plan, &plan.debname)
             }
             ResourceKind::Packages => {
                 // Layer C: a Packages file's key is its full host-relative URI

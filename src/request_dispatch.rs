@@ -568,12 +568,7 @@ mod tests {
 
     use super::*;
     use crate::cache_layout::CacheLayout;
-    use crate::client_info::ClientInfo;
     use crate::test_support::local_client;
-
-    fn fake_client() -> ClientInfo {
-        local_client()
-    }
 
     const OPEN_ACLS: ClientAcls<'static> = ClientAcls {
         proxy_clients: &[],
@@ -593,17 +588,17 @@ mod tests {
     #[test]
     fn preflight_method_accepts_get_and_connect() {
         assert_eq!(
-            preflight_method("GET", &fake_client(), &OPEN_ACLS),
+            preflight_method("GET", &local_client(), &OPEN_ACLS),
             Ok(RequestKind::Get)
         );
         assert_eq!(
-            preflight_method("CONNECT", &fake_client(), &OPEN_ACLS),
+            preflight_method("CONNECT", &local_client(), &OPEN_ACLS),
             Ok(RequestKind::Connect)
         );
         // The proxy-client ACL only gates CONNECT here; GET is checked later
         // by authorize_cache_access.
         assert_eq!(
-            preflight_method("GET", &fake_client(), &OTHER_HOST_ACLS),
+            preflight_method("GET", &local_client(), &OTHER_HOST_ACLS),
             Ok(RequestKind::Get)
         );
     }
@@ -612,7 +607,7 @@ mod tests {
     fn preflight_method_rejects_other_methods() {
         for m in ["POST", "PUT", "HEAD", "get"] {
             assert_eq!(
-                preflight_method(m, &fake_client(), &OPEN_ACLS),
+                preflight_method(m, &local_client(), &OPEN_ACLS),
                 Err(RejectReason::UnsupportedMethod),
                 "{m}"
             );
@@ -622,7 +617,7 @@ mod tests {
     #[test]
     fn preflight_method_rejects_connect_from_unlisted_client() {
         assert_eq!(
-            preflight_method("CONNECT", &fake_client(), &OTHER_HOST_ACLS),
+            preflight_method("CONNECT", &local_client(), &OTHER_HOST_ACLS),
             Err(RejectReason::UnauthorizedClient)
         );
     }
@@ -633,7 +628,7 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(
-            preflight_target(&uri, true, || true, &fake_client(), &OPEN_ACLS).unwrap_err(),
+            preflight_target(&uri, true, || true, &local_client(), &OPEN_ACLS).unwrap_err(),
             RejectReason::UnsupportedScheme
         );
     }
@@ -642,15 +637,15 @@ mod tests {
     fn preflight_target_origin_form_requires_host_on_http11_only() {
         let uri: Uri = "/".parse().unwrap();
         assert_eq!(
-            preflight_target(&uri, true, || false, &fake_client(), &OPEN_ACLS).unwrap_err(),
+            preflight_target(&uri, true, || false, &local_client(), &OPEN_ACLS).unwrap_err(),
             RejectReason::MissingHost
         );
         assert!(matches!(
-            preflight_target(&uri, true, || true, &fake_client(), &OPEN_ACLS),
+            preflight_target(&uri, true, || true, &local_client(), &OPEN_ACLS),
             Ok(RequestTarget::WebUi)
         ));
         assert!(matches!(
-            preflight_target(&uri, false, || false, &fake_client(), &OPEN_ACLS),
+            preflight_target(&uri, false, || false, &local_client(), &OPEN_ACLS),
             Ok(RequestTarget::WebUi)
         ));
     }
@@ -659,7 +654,7 @@ mod tests {
     fn preflight_target_origin_form_enforces_webif_acl() {
         let uri: Uri = "/".parse().unwrap();
         assert_eq!(
-            preflight_target(&uri, true, || true, &fake_client(), &OTHER_HOST_ACLS).unwrap_err(),
+            preflight_target(&uri, true, || true, &local_client(), &OTHER_HOST_ACLS).unwrap_err(),
             RejectReason::UnauthorizedWebUi
         );
         // The proxy-client ACL is not consulted for the web interface once a
@@ -669,14 +664,14 @@ mod tests {
             webif_clients: &[],
         };
         assert!(matches!(
-            preflight_target(&uri, true, || true, &fake_client(), &webif_only),
+            preflight_target(&uri, true, || true, &local_client(), &webif_only),
             Ok(RequestTarget::WebUi)
         ));
     }
 
     #[test]
     fn preflight_target_absolute_form_yields_host_and_port() {
-        let client = fake_client();
+        let client = local_client();
         let uri: Uri = "http://deb.example.com/debian/dists/sid/Release"
             .parse()
             .unwrap();
@@ -713,7 +708,7 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(
-            preflight_target(&uri, true, || false, &fake_client(), &OPEN_ACLS).unwrap_err(),
+            preflight_target(&uri, true, || false, &local_client(), &OPEN_ACLS).unwrap_err(),
             RejectReason::InvalidPort
         );
     }
@@ -760,7 +755,7 @@ mod tests {
             "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,
@@ -780,7 +775,7 @@ mod tests {
             "/debian/dists/sid/main/binary-amd64/Packages.gz",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,
@@ -812,7 +807,7 @@ mod tests {
             "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb",
             alias.clone(),
             None,
-            &fake_client(),
+            &local_client(),
             &aliases,
             true,
             never_flat_blocked,
@@ -835,7 +830,7 @@ mod tests {
             "/foo/bar.txt",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,
@@ -859,7 +854,7 @@ mod tests {
             "/debian/pool/main/f/foo/README.txt",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,
@@ -883,7 +878,7 @@ mod tests {
             "/apt/Packages.gz",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             |_, _| true,
@@ -907,7 +902,7 @@ mod tests {
             "/apt/Packages.gz",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,
@@ -925,7 +920,7 @@ mod tests {
             "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,
@@ -943,7 +938,7 @@ mod tests {
             "/debian/dists/sid/main/binary-amd64/Packages.diff/T-12345",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             false,
             never_flat_blocked,
@@ -970,7 +965,7 @@ mod tests {
             "/foo/../etc/passwd",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,
@@ -992,7 +987,7 @@ mod tests {
             "/debian/dists/sid/main/binary-amd64/Packages.diff/T-../escape",
             fake_host(),
             None,
-            &fake_client(),
+            &local_client(),
             &[],
             true,
             never_flat_blocked,

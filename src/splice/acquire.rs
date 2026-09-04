@@ -430,7 +430,7 @@ pub(super) async fn follow_redirect(
 
     *exchange = standard_upstream_connect(
         &redirect_mirror,
-        &redirect_authority,
+        redirect_authority,
         moved_path,
         resume_offset,
         resume_if_range,
@@ -452,7 +452,7 @@ pub(super) async fn follow_redirect(
     })?;
 
     Ok(Some(RedirectTarget {
-        authority: redirect_authority.into_owned(),
+        authority: redirect_authority.to_owned(),
         path: moved_path.to_owned(),
         mirror: redirect_mirror,
     }))

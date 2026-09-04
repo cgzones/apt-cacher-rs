@@ -179,7 +179,7 @@ async fn cleanup_upstream_fetch(
         header_buf: hdr_buf,
         header_end: hdr_end,
         reused: _,
-    } = match standard_upstream_connect(mirror, &host_authority, upstream_path, 0, None, None, None)
+    } = match standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
         .await
     {
         Ok(v) => v,

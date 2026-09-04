@@ -11,27 +11,28 @@ const MMAP_FRAME_SIZE: usize = 2 * 1024 * 1024;
 pub(crate) struct MmapBody {
     mapping: Arc<Mmap>,
     position: usize,
-    length: usize,
 }
 
 impl MmapBody {
     #[must_use]
-    pub(crate) fn new(mapping: Mmap, length: usize) -> Self {
+    pub(crate) fn new(mapping: Mmap) -> Self {
         Self {
             mapping: Arc::new(mapping),
             position: 0,
-            length,
         }
     }
 
-    /// Bytes not handed out yet. `position <= length` holds by construction:
+    /// Bytes not handed out yet. The mapping's own length is the only body
+    /// length there is: the caller maps exactly the slice it wants to serve
+    /// (`MmapOptions::offset`/`len`), so a separately-carried length could
+    /// only disagree with it. `position <= len` holds by construction —
     /// [`Self::poll_frame`] advances it by at most this value.
     fn remaining(&self) -> usize {
         debug_assert!(
-            self.position <= self.length,
-            "position must not exceed length"
+            self.position <= self.mapping.len(),
+            "position must not exceed the mapping length"
         );
-        self.length - self.position
+        self.mapping.len() - self.position
     }
 }
 
@@ -142,7 +143,7 @@ mod tests {
 
     #[test]
     fn a_short_body_is_one_frame() {
-        let mut body = MmapBody::new(mapped(64), 64);
+        let mut body = MmapBody::new(mapped(64));
         assert!(!body.is_end_stream());
         assert_eq!(body.size_hint().exact(), Some(64));
 
@@ -161,7 +162,7 @@ mod tests {
     #[test]
     fn a_long_body_is_split_into_frame_sized_chunks() {
         let len = MMAP_FRAME_SIZE + 1000;
-        let mut body = MmapBody::new(mapped(len), len);
+        let mut body = MmapBody::new(mapped(len));
 
         let first = next_frame(&mut body).expect("first frame");
         assert_eq!(first.len(), MMAP_FRAME_SIZE, "frames are capped");

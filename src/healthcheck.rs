@@ -23,7 +23,7 @@ use tracing::{debug, info};
 
 use crate::{
     cache_quota::CacheQuota,
-    database_task::{DatabaseCommand, DbCmdPing, send_db_command},
+    database_task::{DatabaseCommand, send_db_command},
     error::ErrorReport,
     fs_open::tokio_nofollow_options,
     global_cache_quota, global_config, swrite, warn_once_or_debug, warn_once_or_info,
@@ -363,7 +363,7 @@ async fn probe_write(probe: &Path) -> std::io::Result<()> {
 async fn check_database() -> CheckResult {
     let round_trip = async {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        send_db_command(DatabaseCommand::Ping(DbCmdPing { reply: tx })).await;
+        send_db_command(DatabaseCommand::Ping(tx)).await;
         rx.await
     };
     match tokio::time::timeout(CHECK_TIMEOUT, round_trip).await {

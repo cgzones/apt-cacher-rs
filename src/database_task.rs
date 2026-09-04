@@ -43,18 +43,12 @@ pub(crate) struct DbCmdTransfer {
     pub(crate) kind: TransferKind,
 }
 
-pub(crate) struct DbCmdOrigin {
-    pub(crate) origin: Origin,
-}
-
-pub(crate) struct DbCmdPing {
-    pub(crate) reply: tokio::sync::oneshot::Sender<Result<(), sqlx::Error>>,
-}
-
 pub(crate) enum DatabaseCommand {
     Transfer(DbCmdTransfer),
-    Origin(DbCmdOrigin),
-    Ping(DbCmdPing),
+    Origin(Origin),
+    /// Round-trips the queue so the healthcheck learns the DB task is alive
+    /// and draining; the reply carries the probe query's own result.
+    Ping(tokio::sync::oneshot::Sender<Result<(), sqlx::Error>>),
 }
 
 pub(crate) static DB_TASK_QUEUE_SENDER: OnceLock<tokio::sync::mpsc::Sender<DatabaseCommand>> =
@@ -257,24 +251,24 @@ async fn stage(
                 }),
             }
         }
-        DatabaseCommand::Origin(c) => {
-            let mirror_id = match resolve_mirror_id(db, cache, &c.origin.mirror).await {
+        DatabaseCommand::Origin(origin) => {
+            let mirror_id = match resolve_mirror_id(db, cache, &origin.mirror).await {
                 Ok(id) => id,
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
                         "Failed to resolve the mirror id for an origin of mirror {mirror}; dropping the origin record:  {}",
                         ErrorReport(&err),
-                        mirror = c.origin.mirror
+                        mirror = origin.mirror
                     );
                     return;
                 }
             };
             let row = OriginRow {
                 mirror_id,
-                distribution: c.origin.fields.distribution,
-                component: c.origin.fields.component,
-                architecture: c.origin.fields.architecture,
+                distribution: origin.fields.distribution,
+                component: origin.fields.component,
+                architecture: origin.fields.architecture,
             };
             // Dedup within the batch: every Packages request for an origin
             // enqueues the same upsert, so a fleet refreshing one suite
@@ -285,7 +279,7 @@ async fn stage(
                 buf.origins.push(row);
             }
         }
-        DatabaseCommand::Ping(c) => {
+        DatabaseCommand::Ping(reply) => {
             let result = db.ping().await;
             if let Err(err) = &result {
                 metrics::DB_OPERATION_FAILED.increment();
@@ -296,7 +290,7 @@ async fn stage(
             }
             // Replied-to-nobody is fine: the healthcheck timed out and
             // stopped waiting.
-            if c.reply.send(result).is_err() {
+            if reply.send(result).is_err() {
                 debug!("Healthcheck ping requester vanished before reply");
             }
         }

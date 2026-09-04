@@ -460,6 +460,14 @@ impl ActiveDownloads {
     }
 
     #[must_use]
+    /// Downloads currently registered.
+    ///
+    /// Every terminal status transition (`Finished`/`Aborted`) in `guards.rs`
+    /// is immediately followed by `remove()`, so a mapped entry is in a
+    /// pre-terminal state apart from a transition-to-removal window a few
+    /// statements wide. The map length therefore matches a per-entry status
+    /// scan up to that transient — fine for the parallel-hack probability
+    /// and for the web display, the two consumers that care.
     pub(crate) fn len(&self) -> usize {
         self.inner.read().len()
     }
@@ -684,18 +692,6 @@ impl ActiveDownloads {
         metrics::LATE_JOINERS_TOTAL.increment();
         metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.update(peak as u64);
         Some(status)
-    }
-
-    #[must_use]
-    pub(crate) fn download_count(&self) -> usize {
-        // Every terminal status transition (Finished/Aborted) in guards.rs
-        // is immediately followed by `remove()`, so mapped entries are in a
-        // pre-terminal state apart from a transition-to-removal window a
-        // few statements wide. The map length therefore matches the old
-        // per-entry status scan (which took every entry's status lock
-        // inside block_in_place) up to that transient — fine for the
-        // parallel-hack probability and web display consumers.
-        self.inner.read().len()
     }
 }
 
