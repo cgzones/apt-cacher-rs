@@ -16,10 +16,6 @@ impl LogStoreImpl {
             buffer: Vec::with_capacity(1024),
         }
     }
-
-    fn iter(&self) -> impl Iterator<Item = &String> {
-        self.entries.iter()
-    }
 }
 
 impl std::io::Write for LogStoreImpl {
@@ -82,7 +78,7 @@ pub(crate) struct LogStoreEntryListGuard<'a> {
 
 impl LogStoreEntryListGuard<'_> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &String> {
-        self.guard.iter()
+        self.guard.entries.iter()
     }
 
     #[must_use]

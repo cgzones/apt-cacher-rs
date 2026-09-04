@@ -23,7 +23,7 @@
 //! - The 502 bodies are consts behind [`RejectReason::body`].
 //!
 //! Backend contract: call [`plan_download`] once with the resume state.
-//! `Err(`[`ResumeAnomaly`]`)` means "discard the partial file"; then either
+//! <code>Err([ResumeAnomaly])</code> means "discard the partial file"; then either
 //! re-plan the same head (a 200 that ignored `Range` is a usable fresh body)
 //! or re-fetch without `Range` and plan the new head, both through
 //! [`plan_fresh_download`], which cannot fail.  The stale cached copy a

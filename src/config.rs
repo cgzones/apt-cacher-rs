@@ -432,11 +432,10 @@ impl ClientHost {
                 && align_of::<ClientHost>() == align_of::<CacheHost>(),
             "ClientHost and CacheHost must share layout - one of them lost its #[repr(transparent)] or gained a second field",
         );
-        // `transmute` is well-typed only when both sides share an
-        // identical layout, so this additionally catches a regression
-        // that changes the inner field type of either wrapper to
-        // something that happens to be the same width as `DomainName`
-        // (size_of + align_of alone would not flag that).
+        // The assert above only relates the two wrappers to each other:
+        // if both grew the same extra field they would still match.
+        // `transmute` type-checks only between equal-sized types, so
+        // anchoring each wrapper to `DomainName` catches that.
         const _: fn() = || {
             let _ = std::mem::transmute::<ClientHost, DomainName>;
             let _ = std::mem::transmute::<CacheHost, DomainName>;

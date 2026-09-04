@@ -554,17 +554,12 @@ impl Database {
         tx.commit().await
     }
 
-    /// Run all pending `sqlx::migrate!` migrations against the pool.
-    async fn run_migrations(&self) -> Result<(), Error> {
-        trace!("Performing database migrations...");
-        sqlx::migrate!().run(&self.conn).await?;
-        Ok(())
-    }
-
     pub(crate) async fn init_tables(&self) -> Result<(), Error> {
         trace!("Initializing database tables...");
         self.create_legacy_tables().await?;
-        self.run_migrations().await
+        trace!("Performing database migrations...");
+        sqlx::migrate!().run(&self.conn).await?;
+        Ok(())
     }
 
     pub(crate) async fn get_mirrors(&self) -> Result<Vec<MirrorEntry>, Error> {
