@@ -191,14 +191,13 @@ impl Origin {
     ///   canonical per-architecture index path.
     /// * `dists/<dist>/<comp>/<arch>/by-hash/<ALGO>/<hex>` — the
     ///   content-addressed sibling.  The algorithm name and digest length
-    ///   are cross-checked via [`is_byhash_digest_shape`] +
-    ///   [`is_valid_byhash_pair`] so a junk pairing like `by-hash/MD5/...`
-    ///   or `by-hash/SHA256/notahex` does NOT mint an Origin row.
+    ///   are cross-checked via [`is_valid_byhash_pair`] so a junk pairing
+    ///   like `by-hash/MD5/...` or `by-hash/SHA256/notahex` does NOT mint an
+    ///   Origin row.
     ///
     /// **Trailing slash:** tolerated for the `Packages*` and `by-hash`
-    /// shapes — a
-    /// single trailing `/` (collapsed by [`normalize_uri_path`] from any
-    /// `/+` run) is permitted because callers derive URIs from
+    /// shapes — a single trailing `/` (collapsed by [`normalize_uri_path`]
+    /// from any `/+` run) is permitted because callers derive URIs from
     /// cleanup/database state where trailing slashes can arise from
     /// upstream `Location` headers or normalisation variants.  Any other
     /// trailing segment after the recognised filename causes rejection —
@@ -228,36 +227,28 @@ impl Origin {
         let architecture = parts.next()?;
 
         let filename = parts.next()?;
-        match filename {
-            "Packages" | "Packages.gz" | "Packages.xz" => {
-                // Trailing-slash tolerance: at most a single empty segment
-                // (e.g. `.../Packages/`).  Anything else — including a
-                // non-empty trailing segment like `Packages/Index` or
-                // `Packages/extra/garbage` — is rejected as unrecognised.
-                if let Some(extra) = parts.next()
-                    && (!extra.is_empty() || parts.next().is_some())
-                {
-                    return None;
-                }
+        if filename == "by-hash" {
+            // `by-hash/<ALGO>/<hex>` shape: both segments are required and
+            // must validate as a supported (algo, digest) pair.  The pair
+            // check subsumes the digest-shape check, which only tests the
+            // length and hex-ness the pair check already re-tests.
+            let algorithm = parts.next()?;
+            let digest = parts.next()?;
+            if !is_valid_byhash_pair(algorithm, digest) {
+                return None;
             }
-            "by-hash" => {
-                // `by-hash/<ALGO>/<hex>` shape: both segments are required
-                // and must validate as a supported (algo, digest) pair.
-                let algorithm = parts.next()?;
-                let digest = parts.next()?;
-                if !is_byhash_digest_shape(digest) || !is_valid_byhash_pair(algorithm, digest) {
-                    return None;
-                }
-                // No trailing segments past the digest are valid.  Tolerate
-                // a single empty trailing segment for parity with the
-                // `Packages*` arm, but nothing more.
-                if let Some(extra) = parts.next()
-                    && (!extra.is_empty() || parts.next().is_some())
-                {
-                    return None;
-                }
-            }
-            _ => return None,
+        } else if !is_packages_filename(filename) {
+            return None;
+        }
+
+        // Trailing-slash tolerance: at most a single empty segment (e.g.
+        // `.../Packages/`).  Anything else — a non-empty trailing segment
+        // like `Packages/Index` or `Packages/extra/garbage`, or any junk
+        // past a digest — is rejected as unrecognised.
+        if let Some(extra) = parts.next()
+            && (!extra.is_empty() || parts.next().is_some())
+        {
+            return None;
         }
 
         Some(Self {
@@ -407,7 +398,7 @@ pub(crate) enum ResourceFile<'a> {
 /// (8 KiB on the sendfile path, hyper's default header limits on the rustls
 /// path); this is belt-and-suspenders against any code path that could reach
 /// here without that bound.
-pub(crate) const MAX_NORMALIZED_PATH_LEN: usize = 16 * 1024;
+const MAX_NORMALIZED_PATH_LEN: usize = 16 * 1024;
 
 /// Collapse runs of consecutive ASCII forward-slashes in a URL path to a
 /// single `/`.
@@ -479,16 +470,25 @@ fn needs_normalization(path: &str) -> bool {
     path.split('/').any(|seg| seg == ".")
 }
 
+/// The `<dist>/<component>` pair a scoped `dists/` index sits under.  Named
+/// fields rather than a tuple: both segments are `&str`, so a swapped pair
+/// would parse every URL into a silently mislabelled cache entry.
+#[derive(Copy, Clone, Debug)]
+struct ScopedIndexPath<'a> {
+    distribution: &'a str,
+    component: &'a str,
+}
+
 /// Shared tail parse for the `dists/<dist>/<component>/<scope>/<file>` index
 /// families that differ only by their fixed scope segment (`source` for
 /// `Sources`, `i18n` for `Translation`, `dep11` for `Icon`).  `parts` is the
 /// `rsplit('/')` iterator positioned just after the filename; on success it has
 /// consumed the scope, component, and distribution segments and confirmed
-/// nothing precedes them.  Returns `(component, distribution)`.
+/// nothing precedes them.
 fn scoped_component_dist<'a>(
     parts: &mut impl Iterator<Item = &'a str>,
     scope: &str,
-) -> Option<(&'a str, &'a str)> {
+) -> Option<ScopedIndexPath<'a>> {
     if parts.next()? != scope {
         return None;
     }
@@ -497,7 +497,10 @@ fn scoped_component_dist<'a>(
     if parts.next().is_some() {
         return None;
     }
-    Some((component, distribution))
+    Some(ScopedIndexPath {
+        distribution,
+        component,
+    })
 }
 
 /// Parses a request path into the mirror path and the filename.
@@ -545,7 +548,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
         let mut parts = dists_path.rsplit('/');
 
         let filename = parts.next()?;
-        if filename == "Release" || filename == "InRelease" || filename == "Release.gpg" {
+        if is_release_filename(filename) {
             // `rsplit` walks segments right-to-left.  The first segment may
             // be either the distribution (top-level Release/InRelease/Release.gpg)
             // or the `binary-<arch>` / `source` scope of a per-component
@@ -586,7 +589,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                     });
                 }
             }
-        } else if filename == "Packages.gz" || filename == "Packages.xz" || filename == "Packages" {
+        } else if is_packages_filename(filename) {
             let architecture = parts.next()?;
             let component = parts.next()?;
             let distribution = parts.next()?;
@@ -602,8 +605,11 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 architecture,
                 filename,
             });
-        } else if filename == "Sources" || filename == "Sources.gz" || filename == "Sources.xz" {
-            let (component, distribution) = scoped_component_dist(&mut parts, "source")?;
+        } else if is_sources_filename(filename) {
+            let ScopedIndexPath {
+                distribution,
+                component,
+            } = scoped_component_dist(&mut parts, "source")?;
             return Some(ResourceFile::Sources {
                 mirror_path,
                 distribution,
@@ -611,7 +617,10 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if is_translation_filename(filename) {
-            let (component, distribution) = scoped_component_dist(&mut parts, "i18n")?;
+            let ScopedIndexPath {
+                distribution,
+                component,
+            } = scoped_component_dist(&mut parts, "i18n")?;
             return Some(ResourceFile::Translation {
                 mirror_path,
                 distribution,
@@ -619,7 +628,10 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if filename.starts_with("icons-") {
-            let (component, distribution) = scoped_component_dist(&mut parts, "dep11")?;
+            let ScopedIndexPath {
+                distribution,
+                component,
+            } = scoped_component_dist(&mut parts, "dep11")?;
             return Some(ResourceFile::Icon {
                 mirror_path,
                 distribution,
@@ -728,19 +740,12 @@ fn parse_flat_resource(path: &str) -> Option<ResourceFile<'_>> {
         return None;
     }
 
-    // Metadata: closed allowlist of canonical flat-repo filenames.
-    if matches!(
-        tail,
-        "InRelease"
-            | "Release"
-            | "Release.gpg"
-            | "Packages"
-            | "Packages.gz"
-            | "Packages.xz"
-            | "Sources"
-            | "Sources.gz"
-            | "Sources.xz"
-    ) || is_translation_filename(tail)
+    // Metadata: closed allowlist of canonical flat-repo filenames, the same
+    // index families the structured `dists/` arm recognises.
+    if is_release_filename(tail)
+        || is_packages_filename(tail)
+        || is_sources_filename(tail)
+        || is_translation_filename(tail)
     {
         return Some(ResourceFile::Flat {
             kind: FlatKind::Metadata,
@@ -761,6 +766,12 @@ fn parse_flat_resource(path: &str) -> Option<ResourceFile<'_>> {
     None
 }
 
+/// Whether `name` is acceptable as a cache-entry leaf (the `debname` a
+/// request resolves to): 4..=255 bytes, ASCII, no control characters, no
+/// path separator, and an alphanumeric first byte - so no dotfiles and no
+/// `-`-leading name that a tool could read as an option.  Applied to the
+/// *decoded* value, which is what makes a percent-encoded `/` a rejection
+/// rather than an extra directory level.
 #[must_use]
 pub(crate) fn valid_filename(name: &str) -> bool {
     name.len() >= 4
@@ -791,8 +802,9 @@ pub(crate) fn valid_filename(name: &str) -> bool {
 /// check and stays linear in the path length with no allocation.
 #[must_use]
 pub(crate) fn is_diff_request_path(uri_path: &str) -> bool {
-    const FIXED_MARKERS: &[&str] = &["/Packages.diff/T-", "/Sources.diff/T-"];
-    FIXED_MARKERS.iter().any(|m| uri_path.contains(m)) || contains_translation_diff(uri_path)
+    uri_path.contains("/Packages.diff/T-")
+        || uri_path.contains("/Sources.diff/T-")
+        || contains_translation_diff(uri_path)
 }
 
 /// Check whether the path contains a `Translation-XX.diff/T-` segment for any language.
@@ -838,28 +850,107 @@ pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
         .any(|seg| seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control()))
 }
 
-/// Whether `s` has the shape of a by-hash digest tail: a hex string of
-/// exactly 64 chars (SHA256) or 128 chars (SHA512). Used as the fast
-/// disambiguator in the parser; the algorithm cross-check lives in
-/// [`is_valid_byhash_pair`].
-#[must_use]
-pub(crate) fn is_byhash_digest_shape(s: &str) -> bool {
-    (s.len() == 64 || s.len() == 128) && s.bytes().all(|b| b.is_ascii_hexdigit())
+/// A digest algorithm the Debian repository format names as a
+/// `by-hash/<ALGO>/` directory.
+///
+/// The directory name and the digest length are two views of the same
+/// choice, so they live in one table: pairing `SHA256` with a 128-hex digest
+/// (or `SHA512` with a 64-hex one) fails [`Self::matches_digest`].  Spelt-out
+/// spec names only — non-spec or weaker algorithms (`MD5Sum`, `SHA1`,
+/// `SHA224`, `SHA384`, lowercase spellings) have no variant and so can never
+/// parse.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ByHashAlgorithm {
+    Sha256,
+    Sha512,
 }
 
-/// Whether `(algo, digest)` is a supported by-hash pair: `algo` is exactly
-/// `SHA256` or `SHA512`, and `digest` is a hex string of the matching length
-/// (64 hex chars for SHA256, 128 for SHA512). Spelt-out algorithm names per
-/// the Debian repository spec — non-spec or weaker algorithms (`MD5Sum`,
-/// `SHA1`, `SHA224`, `SHA384`, lowercase variants) all reject here.
+impl ByHashAlgorithm {
+    /// Every supported algorithm; both lookups below scan it, so adding one
+    /// is a single variant plus its two table rows.
+    const ALL: [Self; 2] = [Self::Sha256, Self::Sha512];
+
+    /// The `by-hash/<ALGO>/` directory segment naming this algorithm.
+    #[must_use]
+    const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Sha256 => "SHA256",
+            Self::Sha512 => "SHA512",
+        }
+    }
+
+    /// Length of this algorithm's digest, in hex characters.
+    #[must_use]
+    const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => 64,
+            Self::Sha512 => 128,
+        }
+    }
+
+    /// The algorithm a `by-hash/<ALGO>/` directory segment names, if any.
+    #[must_use]
+    fn from_dir_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|algo| algo.dir_name() == name)
+    }
+
+    /// Whether `digest` is a hex string of this algorithm's digest length.
+    #[must_use]
+    fn matches_digest(self, digest: &str) -> bool {
+        digest.len() == self.digest_len() && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// The algorithm `digest` could belong to, judged on shape alone (the
+    /// algorithm directory is not in hand yet).
+    #[must_use]
+    fn for_digest(digest: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|algo| algo.matches_digest(digest))
+    }
+}
+
+/// Whether `s` has the shape of a by-hash digest tail: a hex string of one
+/// of the supported digest lengths. Used as the fast disambiguator in the
+/// parser, where the algorithm directory has not been read yet; the
+/// cross-check against it lives in [`is_valid_byhash_pair`].
 #[must_use]
-pub(crate) fn is_valid_byhash_pair(algo: &str, digest: &str) -> bool {
-    let expected_len = match algo {
-        "SHA256" => 64,
-        "SHA512" => 128,
-        _ => return false,
-    };
-    digest.len() == expected_len && digest.bytes().all(|b| b.is_ascii_hexdigit())
+fn is_byhash_digest_shape(s: &str) -> bool {
+    ByHashAlgorithm::for_digest(s).is_some()
+}
+
+/// Whether `(algo, digest)` is a supported by-hash pair: `algo` names a
+/// [`ByHashAlgorithm`] and `digest` is a hex string of that algorithm's
+/// digest length.
+#[must_use]
+fn is_valid_byhash_pair(algo: &str, digest: &str) -> bool {
+    ByHashAlgorithm::from_dir_name(algo).is_some_and(|algo| algo.matches_digest(digest))
+}
+
+/// The `Release` family: the archive-level index and its two signature
+/// forms.  No compression variants exist for these.
+#[must_use]
+fn is_release_filename(name: &str) -> bool {
+    matches!(name, "InRelease" | "Release" | "Release.gpg")
+}
+
+/// The `Packages` index in every compression this proxy recognises.
+///
+/// One of the three index-family predicates ([`is_sources_filename`],
+/// [`is_translation_filename`]) that pin down which compression suffixes
+/// exist as far as the parser is concerned: the structured `dists/` arm,
+/// the flat-repository metadata allowlist and [`Origin::from_path`] all ask
+/// here, so a new suffix (e.g. `.zst`) is one edit rather than three that
+/// can drift apart.
+#[must_use]
+fn is_packages_filename(name: &str) -> bool {
+    matches!(name, "Packages" | "Packages.gz" | "Packages.xz")
+}
+
+/// The `Sources` index in every compression this proxy recognises.
+#[must_use]
+fn is_sources_filename(name: &str) -> bool {
+    matches!(name, "Sources" | "Sources.gz" | "Sources.xz")
 }
 
 /// Recognise any of: `Translation-LANG`, `Translation-LANG.bz2`,
@@ -868,7 +959,7 @@ pub(crate) fn is_valid_byhash_pair(algo: &str, digest: &str) -> bool {
 /// posture, and Debian language codes carry tags like `sr@Latn` that
 /// don't fit a simple alpha/underscore allowlist.
 #[must_use]
-pub(crate) fn is_translation_filename(name: &str) -> bool {
+fn is_translation_filename(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("Translation-") else {
         return false;
     };
@@ -882,7 +973,7 @@ pub(crate) fn is_translation_filename(name: &str) -> bool {
 }
 
 /// Valid Debian package extensions (`.deb`, `.udeb`, `.ddeb`).
-pub(crate) const VALID_DEB_EXTENSIONS: &[&str] = &["deb", "udeb", "ddeb"];
+const VALID_DEB_EXTENSIONS: &[&str] = &["deb", "udeb", "ddeb"];
 
 /// Whether the filename represents a Debian binary package (`.deb`, `.udeb`, `.ddeb`).
 #[must_use]
@@ -948,7 +1039,7 @@ pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash"];
 
 /// Whether `segment` is one of the [`RESERVED_MIRROR_PATH_SEGMENTS`].
 #[must_use]
-pub(crate) fn is_reserved_mirror_path_segment(segment: &str) -> bool {
+fn is_reserved_mirror_path_segment(segment: &str) -> bool {
     RESERVED_MIRROR_PATH_SEGMENTS.contains(&segment)
 }
 
@@ -968,7 +1059,7 @@ pub(crate) fn mirror_path_has_reserved_segment(path: &str) -> bool {
 /// Segment alignment matters: `apt-tools` is not a descendant of `apt`
 /// even though it shares the prefix byte-wise.
 #[must_use]
-pub(crate) fn is_strict_path_descendant(path: &str, ancestor: &str) -> bool {
+fn is_strict_path_descendant(path: &str, ancestor: &str) -> bool {
     path.len() > ancestor.len()
         && path.starts_with(ancestor)
         && path.as_bytes()[ancestor.len()] == b'/'
@@ -979,7 +1070,7 @@ pub(crate) fn is_strict_path_descendant(path: &str, ancestor: &str) -> bool {
 /// nested-mirror path as a *boundary* — either at the boundary itself
 /// or inside it.
 #[must_use]
-pub(crate) fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
+fn path_starts_with_segment(path: &str, prefix: &str) -> bool {
     path == prefix || is_strict_path_descendant(path, prefix)
 }
 
@@ -1092,6 +1183,11 @@ pub(crate) fn flat_pool_archive_root(mirror_path: &str) -> Option<(&str, String)
     Some((archive_root, prefix))
 }
 
+/// Whether `name` is acceptable as a mirror path: non-empty, at most
+/// [`MAX_SEGMENT_LEN`] bytes overall, at most [`MAX_MIRROR_PATH_SEGMENTS`]
+/// `/`-separated segments, every segment a [`valid_path_segment`] and none
+/// of them reserved by the cache layout
+/// ([`is_reserved_mirror_path_segment`]).
 #[must_use]
 pub(crate) fn valid_mirrorname(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_SEGMENT_LEN {
@@ -1113,6 +1209,10 @@ pub(crate) fn valid_mirrorname(name: &str) -> bool {
     true
 }
 
+/// Whether `name` is acceptable as one `/`-separated URL path segment:
+/// 1..=[`MAX_SEGMENT_LEN`] bytes of ASCII alphanumerics, plus `-`, `.` and
+/// `_` anywhere but the first byte.  The alphanumeric-first rule is what
+/// keeps `.` and `..` out of every field validated through here.
 #[must_use]
 fn valid_path_segment(name: &str) -> bool {
     !name.is_empty()
@@ -1121,6 +1221,11 @@ fn valid_path_segment(name: &str) -> bool {
             b.is_ascii_alphanumeric() || (i > 0 && (b == b'-' || b == b'.' || b == b'_'))
         })
 }
+
+// The three field validators below are [`valid_path_segment`] under
+// per-field names, so `cache_layout::ValidateKind` dispatches to a name that
+// says which URL field is being checked and one rule can diverge later
+// without touching any call site.
 
 #[must_use]
 pub(crate) fn valid_distribution(name: &str) -> bool {
@@ -1132,6 +1237,8 @@ pub(crate) fn valid_component(name: &str) -> bool {
     valid_path_segment(name)
 }
 
+/// Accepts both the `binary-<arch>` token and the `source` / `dep11` /
+/// `i18n` pseudo-architectures, which all reach it from the same URL slot.
 #[must_use]
 pub(crate) fn valid_architecture(name: &str) -> bool {
     valid_path_segment(name)
@@ -2744,5 +2851,78 @@ mod tests {
             nested_mirror_relation("apt", &[]),
             NestedMirrorRelation::Unrelated
         );
+    }
+
+    /// The whole `(directory name, digest length)` table as one literal, so a
+    /// new algorithm is decided here rather than defaulted.
+    #[test]
+    fn by_hash_algorithm_table() {
+        let sha256 = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        let sha512 = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba\
+                      4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        for (algo, name, digest) in [
+            (ByHashAlgorithm::Sha256, "SHA256", sha256),
+            (ByHashAlgorithm::Sha512, "SHA512", sha512),
+        ] {
+            assert_eq!(algo.dir_name(), name, "{algo:?} directory name");
+            assert_eq!(algo.digest_len(), digest.len(), "{algo:?} digest length");
+            assert_eq!(ByHashAlgorithm::from_dir_name(name), Some(algo));
+            assert_eq!(ByHashAlgorithm::for_digest(digest), Some(algo));
+            assert!(algo.matches_digest(digest), "{algo:?} accepts its digest");
+        }
+
+        // Cross-pairing is rejected in both directions.
+        assert!(!ByHashAlgorithm::Sha256.matches_digest(sha512));
+        assert!(!ByHashAlgorithm::Sha512.matches_digest(sha256));
+
+        // Unsupported / mis-spelt algorithm directories have no variant.
+        for name in [
+            "MD5Sum", "SHA1", "SHA224", "SHA384", "sha256", "", "SHA256 ",
+        ] {
+            assert_eq!(
+                ByHashAlgorithm::from_dir_name(name),
+                None,
+                "{name} must not name an algorithm"
+            );
+        }
+
+        // Non-hex, and lengths around the supported ones.
+        assert!(!is_byhash_digest_shape(&"ab".repeat(31)));
+        assert!(!is_byhash_digest_shape(&format!("{sha256}ab")));
+        assert!(!is_byhash_digest_shape(&sha256.replace('4', "z")));
+        assert!(is_byhash_digest_shape(sha256));
+        assert!(is_byhash_digest_shape(sha512));
+        assert!(is_valid_byhash_pair("SHA256", sha256));
+        assert!(!is_valid_byhash_pair("SHA512", sha256));
+    }
+
+    /// The recognised index leaves, i.e. exactly which compression suffixes
+    /// the parser knows about.
+    #[test]
+    fn index_family_predicates() {
+        for name in ["InRelease", "Release", "Release.gpg"] {
+            assert!(is_release_filename(name), "{name} is a Release leaf");
+            assert!(!is_packages_filename(name));
+            assert!(!is_sources_filename(name));
+        }
+        for name in ["Packages", "Packages.gz", "Packages.xz"] {
+            assert!(is_packages_filename(name), "{name} is a Packages leaf");
+        }
+        for name in ["Sources", "Sources.gz", "Sources.xz"] {
+            assert!(is_sources_filename(name), "{name} is a Sources leaf");
+        }
+        // Compressions we do not serve, and the pdiff siblings.
+        for name in [
+            "Packages.bz2",
+            "Packages.zst",
+            "Packages.diff",
+            "Sources.bz2",
+            "packages",
+            "Release.asc",
+        ] {
+            assert!(!is_release_filename(name), "{name} is not a Release leaf");
+            assert!(!is_packages_filename(name), "{name} is not a Packages leaf");
+            assert!(!is_sources_filename(name), "{name} is not a Sources leaf");
+        }
     }
 }

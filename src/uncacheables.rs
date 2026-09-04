@@ -1,3 +1,12 @@
+//! The most recently seen uncacheable requests, for the web interface's
+//! uncacheable table.
+//!
+//! A bounded ring of `(requested host, requested path)` pairs: re-recording
+//! a pair moves it to the most-recent end, and only a *fresh* pair bumps
+//! [`metrics::UNCACHEABLE`], so that counter tracks distinct uncacheable
+//! resources rather than request volume - which is what lets the dashboard
+//! derive the ring's eviction count from it.
+
 use std::{num::NonZero, sync::LazyLock};
 
 use crate::{config::ClientHost, metrics, nonzero, ringbuffer::RingBuffer};

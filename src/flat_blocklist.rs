@@ -162,6 +162,35 @@ pub(crate) fn is_blocked(host: &CacheHost, port: Option<Port>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientHost;
+
+    /// The borrowed lookup key must hash and compare exactly like the owned
+    /// one it stands in for; a mismatch would make every `is_blocked` query
+    /// miss silently instead of failing loudly.
+    #[test]
+    fn borrowed_key_matches_owned_entry() {
+        let host = ClientHost::new("apt.example.org".to_owned())
+            .expect("valid host")
+            .into_cache_host();
+        let other = ClientHost::new("apt.example.net".to_owned())
+            .expect("valid host")
+            .into_cache_host();
+        let port = NonZero::new(8080);
+
+        let mut set: HashSet<BlocklistKey> = HashSet::new();
+        set.insert(BlocklistKey {
+            host: host.clone(),
+            port,
+        });
+
+        assert!(set.contains(&BlocklistKeyRef { host: &host, port }));
+        // Both halves of the key take part in the match.
+        assert!(!set.contains(&BlocklistKeyRef {
+            host: &host,
+            port: None
+        }));
+        assert!(!set.contains(&BlocklistKeyRef { host: &other, port }));
+    }
 
     #[test]
     fn path_collision_predicate() {

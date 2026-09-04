@@ -477,6 +477,22 @@ pub(crate) enum ValidateKind {
     Filename,
 }
 
+impl ValidateKind {
+    /// Whether the decoded value passes this field's `valid_*` rule.  Lives
+    /// next to the `Display` label so the two per-variant tables are read
+    /// (and extended) together.
+    #[must_use]
+    fn accepts(self, decoded: &str) -> bool {
+        match self {
+            Self::MirrorPath => valid_mirrorname(decoded),
+            Self::Distribution => valid_distribution(decoded),
+            Self::Component => valid_component(decoded),
+            Self::Architecture => valid_architecture(decoded),
+            Self::Filename => valid_filename(decoded),
+        }
+    }
+}
+
 impl std::fmt::Display for ValidateKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -746,21 +762,25 @@ pub(crate) fn classify_request<'a>(
                 "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded architecture: `{architecture}`; Decoded filename: `{filename}` (client {client})"
             );
 
+            let debname = dists_debname(&distribution, &component, &architecture, &filename);
+
             // dep11 / i18n / source aren't real architectures and don't map
             // to per-binary origins.
             let origin_fields = if is_pseudo_arch(&architecture) {
                 None
             } else {
+                // The debname is built, so the decoded fields can be moved
+                // into the record instead of re-formatted out of the `Cow`s.
                 Some(OriginFields {
-                    distribution: distribution.to_string(),
-                    component: component.to_string(),
-                    architecture: architecture.to_string(),
+                    distribution: distribution.into_owned(),
+                    component: component.into_owned(),
+                    architecture: architecture.into_owned(),
                 })
             };
 
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
-                debname: dists_debname(&distribution, &component, &architecture, &filename),
+                debname,
                 resource_kind: ResourceKind::Packages,
                 origin_fields,
             })
@@ -847,15 +867,7 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
         }
     };
 
-    let ok = match kind {
-        ValidateKind::MirrorPath => valid_mirrorname(&decoded),
-        ValidateKind::Distribution => valid_distribution(&decoded),
-        ValidateKind::Component => valid_component(&decoded),
-        ValidateKind::Architecture => valid_architecture(&decoded),
-        ValidateKind::Filename => valid_filename(&decoded),
-    };
-
-    if !ok {
+    if !kind.accepts(&decoded) {
         return Err(ClassifyError::InvalidValue { kind, decoded });
     }
 
@@ -865,13 +877,7 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_info::ClientInfo;
-    use crate::deb_mirror::{FlatKind, ResourceFile};
     use crate::test_support::local_client;
-
-    fn fake_client() -> ClientInfo {
-        local_client()
-    }
 
     #[test]
     fn classify_pool() {
@@ -879,7 +885,7 @@ mod tests {
             mirror_path: "debian",
             filename: "firefox-esr_115.9.1esr-1_amd64.deb",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.mirror_path, "debian");
         assert_eq!(class.debname, "firefox-esr_115.9.1esr-1_amd64.deb");
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
@@ -894,7 +900,7 @@ mod tests {
             filename: "README.txt",
         };
         assert!(matches!(
-            classify_request(&res, &fake_client()),
+            classify_request(&res, &local_client()),
             Err(ClassifyError::NonDebPool { filename }) if filename == "README.txt"
         ));
     }
@@ -906,7 +912,7 @@ mod tests {
             distribution: "sid",
             filename: "InRelease",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_InRelease");
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
         assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
@@ -922,7 +928,7 @@ mod tests {
             architecture: "binary-amd64",
             filename: "Packages.gz",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_main_binary-amd64_Packages.gz");
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
         assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
@@ -944,7 +950,7 @@ mod tests {
                 architecture: arch,
                 filename: "Packages.gz",
             };
-            let class = classify_request(&res, &fake_client()).unwrap();
+            let class = classify_request(&res, &local_client()).unwrap();
             assert!(
                 class.origin_fields.is_none(),
                 "{arch} must not record an origin"
@@ -958,7 +964,7 @@ mod tests {
             mirror_path: "debian",
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(
             class.debname,
             "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
@@ -975,7 +981,7 @@ mod tests {
             component: "main",
             filename: "icons-128x128.tar.gz",
         };
-        let class = classify_request(&icon, &fake_client()).unwrap();
+        let class = classify_request(&icon, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_main_icons-128x128.tar.gz");
         assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
 
@@ -985,7 +991,7 @@ mod tests {
             component: "main",
             filename: "Sources.gz",
         };
-        let class = classify_request(&sources, &fake_client()).unwrap();
+        let class = classify_request(&sources, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_main_Sources.gz");
 
         let translation = ResourceFile::Translation {
@@ -994,7 +1000,7 @@ mod tests {
             component: "main",
             filename: "Translation-en.bz2",
         };
-        let class = classify_request(&translation, &fake_client()).unwrap();
+        let class = classify_request(&translation, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_main_Translation-en.bz2");
     }
 
@@ -1005,7 +1011,7 @@ mod tests {
             mirror_path: "apt",
             filename: "InRelease",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "InRelease");
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
         assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
@@ -1018,7 +1024,7 @@ mod tests {
             mirror_path: "apt",
             filename: "twilio-cli_5.0.0_amd64.deb",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "twilio-cli_5.0.0_amd64.deb");
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
         assert_eq!(class.resource_kind.layout(), CacheLayout::Flat);
@@ -1035,7 +1041,7 @@ mod tests {
             filename: "foo%5fbar_1.0_amd64.deb",
         };
         assert!(matches!(
-            classify_request(&res, &fake_client()),
+            classify_request(&res, &local_client()),
             Err(ClassifyError::NonDebPool { filename }) if filename == "foo_bar_1.0_amd64.deb"
         ));
     }
@@ -1049,7 +1055,7 @@ mod tests {
             mirror_path: "api/packages/85/debian/pool/php-zts/main",
             filename: "php-zts-cli_8.5.7-1_amd64.deb",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(
             class.mirror_path,
             "api/packages/85/debian/pool/php-zts/main"
@@ -1067,7 +1073,7 @@ mod tests {
             mirror_path: "apt",
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         };
-        let class = classify_request(&res, &fake_client()).unwrap();
+        let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.resource_kind.layout(), CacheLayout::FlatByHash);
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
     }
@@ -1081,7 +1087,7 @@ mod tests {
             filename: "%ff%fe",
         };
         assert!(matches!(
-            classify_request(&res, &fake_client()),
+            classify_request(&res, &local_client()),
             Err(ClassifyError::BadEncoding {
                 kind: ValidateKind::Filename,
                 raw,
@@ -1098,7 +1104,7 @@ mod tests {
             filename: "_foo.deb",
         };
         assert!(matches!(
-            classify_request(&res, &fake_client()),
+            classify_request(&res, &local_client()),
             Err(ClassifyError::InvalidValue {
                 kind: ValidateKind::Filename,
                 decoded,
@@ -1115,7 +1121,7 @@ mod tests {
             filename: "foo_1.0_amd64.deb",
         };
         assert!(matches!(
-            classify_request(&res, &fake_client()),
+            classify_request(&res, &local_client()),
             Err(ClassifyError::InvalidValue {
                 kind: ValidateKind::MirrorPath,
                 decoded,
@@ -1154,7 +1160,7 @@ mod tests {
             filename: "foo_1.0_amd64.deb",
         };
         assert_eq!(
-            classify_request(&pool, &fake_client())
+            classify_request(&pool, &local_client())
                 .unwrap()
                 .resource_kind,
             ResourceKind::Pool
@@ -1168,7 +1174,7 @@ mod tests {
             filename: "Packages.xz",
         };
         assert_eq!(
-            classify_request(&pkgs, &fake_client())
+            classify_request(&pkgs, &local_client())
                 .unwrap()
                 .resource_kind,
             ResourceKind::Packages
@@ -1179,7 +1185,7 @@ mod tests {
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         };
         assert_eq!(
-            classify_request(&byhash, &fake_client())
+            classify_request(&byhash, &local_client())
                 .unwrap()
                 .resource_kind,
             ResourceKind::ByHash
@@ -1191,10 +1197,80 @@ mod tests {
             filename: "Release",
         };
         assert_eq!(
-            classify_request(&rel, &fake_client())
+            classify_request(&rel, &local_client())
                 .unwrap()
                 .resource_kind,
             ResourceKind::Release
         );
+    }
+
+    #[test]
+    fn classify_component_release() {
+        let res = ResourceFile::ComponentRelease {
+            mirror_path: "debian",
+            distribution: "trixie",
+            component: "main",
+            architecture: "binary-amd64",
+            filename: "Release",
+        };
+        let class = classify_request(&res, &local_client()).unwrap();
+        assert_eq!(class.debname, "trixie_main_binary-amd64_Release");
+        assert_eq!(class.resource_kind, ResourceKind::ComponentRelease);
+        assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
+        assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
+        // A per-component Release is metadata about the indices, never a
+        // per-binary origin - not even for a real architecture.
+        assert!(class.origin_fields.is_none());
+    }
+
+    #[test]
+    fn classify_decodes_each_field_separately() {
+        // `%69` decodes to `i`; the decoded values are what reach the mirror
+        // path and the debname.
+        let res = ResourceFile::Release {
+            mirror_path: "deb%69an",
+            distribution: "s%69d",
+            filename: "InRelease",
+        };
+        let class = classify_request(&res, &local_client()).unwrap();
+        assert_eq!(class.mirror_path, "debian");
+        assert_eq!(class.debname, "sid_InRelease");
+    }
+
+    #[test]
+    fn classify_rejects_encoded_separator_in_filename() {
+        // Decoding happens per field, after `parse_request_path` assigned the
+        // segments their roles: `%2F` therefore stays inside the filename
+        // field, where the validator sees the decoded `/` and rejects it.  It
+        // can never carve an extra directory level out of a leaf name.
+        let res = ResourceFile::Pool {
+            mirror_path: "debian",
+            filename: "foo%2Fbar_1.0_amd64.deb",
+        };
+        assert!(matches!(
+            classify_request(&res, &local_client()),
+            Err(ClassifyError::InvalidValue {
+                kind: ValidateKind::Filename,
+                decoded,
+            }) if decoded == "foo/bar_1.0_amd64.deb"
+        ));
+    }
+
+    /// [`ValidateKind`] carries both a label and the validator to apply; this
+    /// pins the per-field rules against each other so a mis-routed arm shows
+    /// up here rather than as a mis-cached request.
+    #[test]
+    fn validate_kind_dispatches_to_its_own_rule() {
+        // `/` separates mirror-path segments but is never legal in a leaf.
+        assert!(ValidateKind::MirrorPath.accepts("debian/updates"));
+        assert!(!ValidateKind::Filename.accepts("debian/updates"));
+        // A reserved layout segment is a mirror-path rule only.
+        assert!(!ValidateKind::MirrorPath.accepts("tmp"));
+        assert!(ValidateKind::Distribution.accepts("tmp"));
+        // Segment rules: leading `.` is out, inner `-` is in.
+        assert!(!ValidateKind::Distribution.accepts("../escape"));
+        assert!(ValidateKind::Distribution.accepts("bookworm-security"));
+        assert!(ValidateKind::Architecture.accepts("binary-amd64"));
+        assert!(ValidateKind::Component.accepts("non-free-firmware"));
     }
 }

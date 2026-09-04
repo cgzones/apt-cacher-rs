@@ -133,3 +133,36 @@ fn finalize_host_result(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The soft cap is enforced by clearing, and only a *new* key past the
+    /// cap trips it: re-recording a host already in the map must not throw
+    /// away the whole cache.
+    #[test]
+    fn entry_cap_clears_only_for_a_new_key() {
+        let cache = PermittedHostCache::default();
+        for i in 0..PERMITTED_HOST_CACHE_MAX_ENTRIES {
+            cache.insert(format!("h{i}.invalid").into(), Err(HostReject::Forbidden));
+        }
+        assert_eq!(cache.entries.read().len(), PERMITTED_HOST_CACHE_MAX_ENTRIES);
+
+        cache.insert("h0.invalid".into(), Err(HostReject::Unsupported));
+        assert_eq!(cache.entries.read().len(), PERMITTED_HOST_CACHE_MAX_ENTRIES);
+        assert_eq!(
+            cache.lookup("h0.invalid"),
+            Some(Err(HostReject::Unsupported)),
+            "an existing key is overwritten in place"
+        );
+
+        cache.insert("overflow.invalid".into(), Err(HostReject::Forbidden));
+        assert_eq!(cache.entries.read().len(), 1, "cap clears and starts over");
+        assert!(cache.lookup("h0.invalid").is_none());
+        assert_eq!(
+            cache.lookup("overflow.invalid"),
+            Some(Err(HostReject::Forbidden))
+        );
+    }
+}

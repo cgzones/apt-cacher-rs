@@ -98,6 +98,36 @@ pub(crate) const SUBDIR_TMP: &str = "tmp";
 /// by `cleanup_tmp_dir` rather than tallied.
 pub(crate) const KNOWN_MIRROR_SUBDIRS: &[&str] = &[SUBDIR_DISTS];
 
+/// The host-level anchor a path hangs off: the mirror directory itself, or
+/// the host's `flat/` sibling.  Names what a bare `bool` argument could not
+/// at the two call sites that have no [`CacheLayout`] in hand.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Anchor {
+    /// `{root}/{host}/{mirror_path}/`
+    Structured,
+    /// `{root}/{host}/flat/{mirror_path}/`
+    Flat,
+}
+
+impl Anchor {
+    /// The anchor a layout's entries live under.
+    const fn for_layout(layout: CacheLayout) -> Self {
+        if layout.is_flat() {
+            Self::Flat
+        } else {
+            Self::Structured
+        }
+    }
+
+    /// The host-level segment this anchor inserts before the mirror path.
+    const fn subdir(self) -> Option<&'static str> {
+        match self {
+            Self::Structured => None,
+            Self::Flat => Some(SUBDIR_FLAT),
+        }
+    }
+}
+
 /// On-disk subdirectory below the layout's anchor for this variant, or
 /// `None` when the file lives directly under the anchor (structured pool,
 /// flat metadata / flat pool).  The `by-hash` segment is the only suffix
@@ -197,7 +227,7 @@ impl<'a> CachePaths<'a> {
     /// mirror - where its pool lives and what `dists/` and `tmp/` hang off.
     #[must_use]
     pub(crate) fn mirror_dir(self, site: MirrorSite<'_>) -> PathBuf {
-        self.below_anchor(false, site, None, None)
+        self.below_anchor(Anchor::Structured, site, None, None)
     }
 
     /// `{root}/{host[:port]}/{mirror_path}/flat/`: where the pre-fix layout
@@ -205,7 +235,9 @@ impl<'a> CachePaths<'a> {
     /// it any more; startup probes it to warn about reclaimable space.
     #[must_use]
     pub(crate) fn legacy_flat_dir(self, site: MirrorSite<'_>) -> PathBuf {
-        self.below_anchor(false, site, Some(Path::new(SUBDIR_FLAT)), None)
+        // The legacy `flat/` sits *below* the mirror path, not at the host
+        // level, so the anchor stays structured.
+        self.below_anchor(Anchor::Structured, site, Some(Path::new(SUBDIR_FLAT)), None)
     }
 
     /// The directory a `layout`'s cache entries live in directly:
@@ -216,7 +248,7 @@ impl<'a> CachePaths<'a> {
     #[must_use]
     pub(crate) fn entry_dir(self, layout: CacheLayout, site: MirrorSite<'_>) -> PathBuf {
         self.below_anchor(
-            layout.is_flat(),
+            Anchor::for_layout(layout),
             site,
             layout_subdir(layout).map(Path::new),
             None,
@@ -233,7 +265,7 @@ impl<'a> CachePaths<'a> {
         leaf: &Path,
     ) -> PathBuf {
         self.below_anchor(
-            layout.is_flat(),
+            Anchor::for_layout(layout),
             site,
             layout_subdir(layout).map(Path::new),
             Some(leaf),
@@ -246,7 +278,12 @@ impl<'a> CachePaths<'a> {
     /// anchor's `tmp/`; flat layouts share the flat anchor's.
     #[must_use]
     pub(crate) fn tmp_dir(self, layout: CacheLayout, site: MirrorSite<'_>) -> PathBuf {
-        self.below_anchor(layout.is_flat(), site, Some(Path::new(SUBDIR_TMP)), None)
+        self.below_anchor(
+            Anchor::for_layout(layout),
+            site,
+            Some(Path::new(SUBDIR_TMP)),
+            None,
+        )
     }
 
     /// [`Self::tmp_dir`] plus the `leaf` file name (`{debname}.partial`).
@@ -258,7 +295,7 @@ impl<'a> CachePaths<'a> {
         leaf: &Path,
     ) -> PathBuf {
         self.below_anchor(
-            layout.is_flat(),
+            Anchor::for_layout(layout),
             site,
             Some(Path::new(SUBDIR_TMP)),
             Some(leaf),
@@ -268,7 +305,7 @@ impl<'a> CachePaths<'a> {
     /// `{root}/{host}/{flat/?}{mirror_path}/{tail?}/{leaf?}`.
     fn below_anchor(
         self,
-        flat: bool,
+        anchor: Anchor,
         site: MirrorSite<'_>,
         tail: Option<&Path>,
         leaf: Option<&Path>,
@@ -277,7 +314,7 @@ impl<'a> CachePaths<'a> {
         let host_dir = host.format_cache_dir(port);
         self.assemble([
             Some(Path::new(host_dir.as_ref())),
-            flat.then_some(Path::new(SUBDIR_FLAT)),
+            anchor.subdir().map(Path::new),
             Some(Path::new(path)),
             tail,
             leaf,
