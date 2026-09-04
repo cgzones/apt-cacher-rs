@@ -651,7 +651,9 @@ pub(crate) static DB_BATCH_FLUSHES_BY_SIZE: Counter = Counter::new();
 pub(crate) static DB_BATCH_FLUSHES_BY_TIME: Counter = Counter::new();
 /// Batch flushes performed during graceful shutdown drain.
 pub(crate) static DB_BATCH_FLUSHES_ON_SHUTDOWN: Counter = Counter::new();
-/// Peak number of buffered commands attempted in a single batch flush (includes partial failures; pair with `DB_OPERATION_FAILED` to distinguish).
+/// Peak number of buffered commands attempted in a single batch flush.
+/// Counts attempts, including partially-failed ones; pair with
+/// `DB_OPERATION_FAILED` to tell the two apart.
 pub(crate) static DB_BATCH_SIZE_PEAK: Peak = Peak::new();
 /// Mirror-id cache hits: the `(host, port, path)` lookup found an existing id
 /// without touching the database.
@@ -717,7 +719,8 @@ pub(crate) fn record_client_status(status: StatusCode) {
 }
 
 /// Record an upstream response status code. Tracks status-class buckets and
-/// the individually-tracked codes (200/301/302/304/307/308) independently from the client-side `record_client_status`.
+/// the individually-tracked codes (200/301/302/304/307/308) independently
+/// from the client-side `record_client_status`.
 pub(crate) fn record_upstream_status(status: StatusCode) {
     match status.as_u16() {
         200..=299 => UPSTREAM_STATUS_2XX.increment(),

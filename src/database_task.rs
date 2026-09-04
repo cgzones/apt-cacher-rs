@@ -73,7 +73,6 @@ pub(crate) async fn send_db_command(cmd: DatabaseCommand) {
     let tx = DB_TASK_QUEUE_SENDER
         .get()
         .expect("Sender initialized in main_loop()");
-    let max_capacity = tx.max_capacity();
     metrics::DB_COMMANDS_SENT.increment();
     // `capacity() == 0` means every slot is in flight, so this send must wait
     // for the DB task to drain one. Track it so operators can see how often
@@ -85,10 +84,16 @@ pub(crate) async fn send_db_command(cmd: DatabaseCommand) {
         metrics::DB_COMMANDS_DROPPED_SHUTDOWN.increment();
         return;
     }
-    // Depth peaks are reached the instant a send completes — the consumer
-    // can only decrease depth, never increase it — so one post-send sample
-    // here captures every spike without needing a consumer-side sample.
-    metrics::DB_QUEUE_DEPTH_PEAK.update(max_capacity.saturating_sub(tx.capacity()) as u64);
+    record_queue_depth(tx);
+}
+
+/// Sample the channel depth into `DB_QUEUE_DEPTH_PEAK`.
+///
+/// Depth peaks are reached the instant a send completes — the consumer can
+/// only decrease depth, never increase it — so one post-send sample here
+/// captures every spike without needing a consumer-side sample.
+fn record_queue_depth(tx: &tokio::sync::mpsc::Sender<DatabaseCommand>) {
+    metrics::DB_QUEUE_DEPTH_PEAK.update(tx.max_capacity().saturating_sub(tx.capacity()) as u64);
 }
 
 /// Synchronous variant of [`send_db_command`] for `Drop` impls and
@@ -102,13 +107,9 @@ pub(crate) fn send_db_command_nonblocking(cmd: DatabaseCommand) {
     let tx = DB_TASK_QUEUE_SENDER
         .get()
         .expect("Sender initialized in main_loop()");
-    let max_capacity = tx.max_capacity();
     metrics::DB_COMMANDS_SENT.increment();
     match tx.try_send(cmd) {
-        Ok(()) => {
-            // See send_db_command for the peak-sampling rationale.
-            metrics::DB_QUEUE_DEPTH_PEAK.update(max_capacity.saturating_sub(tx.capacity()) as u64);
-        }
+        Ok(()) => record_queue_depth(tx),
         Err(TrySendError::Full(cmd)) => {
             metrics::DB_QUEUE_FULL_WAITS.increment();
             let tx = tx.clone();
@@ -148,10 +149,6 @@ impl BatchBuffers {
     fn len(&self) -> usize {
         self.deliveries.len() + self.downloads.len() + self.origins.len()
     }
-
-    fn is_empty(&self) -> bool {
-        self.deliveries.is_empty() && self.downloads.is_empty() && self.origins.is_empty()
-    }
 }
 
 fn now_unix() -> i64 {
@@ -172,7 +169,7 @@ fn convert_size_duration(size: u64, elapsed: StdDuration) -> Option<(i64, i64)> 
 }
 
 /// Resolve a mirror to its `mirrors_v2.id`, hitting the database only on a
-/// cache miss. Always bumps the cached `last_seen_observed` to `now`.
+/// cache miss. Always bumps the cached `last_seen_observed` to now.
 ///
 /// Hot path: the lookup borrows `mirror` directly so per-event cache hits
 /// allocate nothing. Only on a miss do we clone into the map.
@@ -180,8 +177,8 @@ async fn resolve_mirror_id(
     db: &Database,
     cache: &mut HashMap<Mirror, CachedMirror>,
     mirror: &Mirror,
-    now: i64,
 ) -> Result<i64, sqlx::Error> {
+    let now = now_unix();
     if let Some(entry) = cache.get_mut(mirror) {
         metrics::DB_MIRROR_CACHE_HITS.increment();
         if now > entry.last_seen_observed {
@@ -216,7 +213,6 @@ async fn stage(
     cache: &mut HashMap<Mirror, CachedMirror>,
     buf: &mut BatchBuffers,
     cmd: DatabaseCommand,
-    now: i64,
 ) {
     match cmd {
         DatabaseCommand::Transfer(c) => {
@@ -229,7 +225,7 @@ async fn stage(
                 );
                 return;
             };
-            let mirror_id = match resolve_mirror_id(db, cache, &c.mirror, now).await {
+            let mirror_id = match resolve_mirror_id(db, cache, &c.mirror).await {
                 Ok(id) => id,
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
@@ -262,7 +258,7 @@ async fn stage(
             }
         }
         DatabaseCommand::Origin(c) => {
-            let mirror_id = match resolve_mirror_id(db, cache, &c.origin.mirror, now).await {
+            let mirror_id = match resolve_mirror_id(db, cache, &c.origin.mirror).await {
                 Ok(id) => id,
                 Err(err) => {
                     metrics::DB_OPERATION_FAILED.increment();
@@ -448,8 +444,7 @@ pub(crate) async fn db_loop(
                     // never drain.
                     db_thread_rx.close();
                     while let Ok(cmd) = db_thread_rx.try_recv() {
-                        let now = now_unix();
-                        stage(&database, &mut cache, &mut buf, cmd, now).await;
+                        stage(&database, &mut cache, &mut buf, cmd).await;
                     }
                     flush_batches(&database, &mut buf, FlushReason::OnShutdown).await;
                     flush_last_seen(&database, &mut cache).await;
@@ -457,9 +452,7 @@ pub(crate) async fn db_loop(
                 }
             }
             _ = interval.tick() => {
-                if !buf.is_empty() {
-                    flush_batches(&database, &mut buf, FlushReason::ByTime).await;
-                }
+                flush_batches(&database, &mut buf, FlushReason::ByTime).await;
                 flush_last_seen(&database, &mut cache).await;
                 // Sync point for `wait_for_next_db_flush`; keep the wording stable.
                 debug!("Periodic database batch flush cycle complete");
@@ -472,25 +465,21 @@ pub(crate) async fn db_loop(
                     break;
                 };
 
-                let now = now_unix();
-                stage(&database, &mut cache, &mut buf, cmd, now).await;
+                stage(&database, &mut cache, &mut buf, cmd).await;
 
                 if buf.len() >= flush_max_count {
                     flush_batches(&database, &mut buf, FlushReason::BySize).await;
                 }
 
                 let curr_capacity = db_thread_rx.capacity();
-                if curr_capacity == 0 {
-                    if !at_cap {
-                        let depth = max_capacity - curr_capacity;
-                        // `send_db_command` awaits on a full queue, so request
-                        // paths now block on database writes.
-                        warn!(
-                            "Database command channel full ({depth}/{max_capacity}); request paths now block on database writes; consider raising `db_channel_capacity`"
-                        );
-                        metrics::DB_QUEUE_FULL_TRANSITIONS.increment();
-                        at_cap = true;
-                    }
+                if curr_capacity == 0 && !at_cap {
+                    // `send_db_command` awaits on a full queue, so request
+                    // paths now block on database writes.
+                    warn!(
+                        "Database command channel full ({max_capacity}/{max_capacity}); request paths now block on database writes; consider raising `db_channel_capacity`"
+                    );
+                    metrics::DB_QUEUE_FULL_TRANSITIONS.increment();
+                    at_cap = true;
                 } else if at_cap && curr_capacity == max_capacity {
                     info!("Database command channel empty (0/{max_capacity})");
                     at_cap = false;

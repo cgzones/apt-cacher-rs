@@ -46,6 +46,15 @@ fn decode_mirror_kind(kind: i64, path: &str) -> MirrorKind {
     }
 }
 
+/// Whole seconds of `d` as the `i64` `SQLite` stores timestamps and intervals
+/// in. Fails only for a duration beyond year 292'277'026'596, which no
+/// configuration or clock can produce; reported as an argument error rather
+/// than truncated so the caller's query never runs on a wrong cutoff.
+fn duration_as_secs_i64(d: Duration) -> Result<i64, Error> {
+    i64::try_from(d.as_secs())
+        .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))
+}
+
 /// Conservative upper bound on the number of bind parameters allowed in a
 /// single `SQLite` statement.
 ///
@@ -66,11 +75,8 @@ pub(crate) struct MirrorEntry {
     /// Raw port from database. `0` means no explicit port; use `port()` to get `Option<NonZero<u16>>`.
     port: u16,
     pub(crate) path: String,
-    /// Raw `mirrors_v2.kind` (INTEGER) value.  `cleanup_invalid_rows`
-    /// purges rows whose encoding falls outside the [`MirrorKind`]
-    /// invariant before any code reads `MirrorEntry`s, so the
-    /// `From<MirrorEntry> for Mirror` conversion's `unwrap_or` fallback
-    /// is pure defense-in-depth.
+    /// Raw `mirrors_v2.kind` (INTEGER) value; decoded on demand by
+    /// [`decode_mirror_kind`].
     kind: i64,
 }
 
@@ -80,10 +86,6 @@ impl MirrorEntry {
         NonZero::new(self.port)
     }
 
-    /// Decoded layout kind. `cleanup_invalid_rows` purges out-of-range
-    /// encodings before any reader observes them, so the `unwrap_or`
-    /// fallback to `Structured` is purely defensive — mirrors the same
-    /// fallback used by `From<MirrorEntry> for Mirror`.
     #[must_use]
     pub(crate) fn kind(&self) -> MirrorKind {
         decode_mirror_kind(self.kind, &self.path)
@@ -133,15 +135,29 @@ impl MirrorEntry {
 
 impl From<MirrorEntry> for Mirror {
     fn from(entry: MirrorEntry) -> Self {
-        let port = entry.port();
         let MirrorEntry {
             host,
-            port: _,
+            port,
             path,
             kind,
         } = entry;
         let kind = decode_mirror_kind(kind, &path);
-        Self::new(host, port, path, kind)
+        Self::new(host, NonZero::new(port), path, kind)
+    }
+}
+
+/// `host[:port]/path` rendered straight into a `Formatter`, so a dashboard
+/// row costs no intermediate `String`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MirrorUri<'a> {
+    host: &'a ClientHost,
+    port: Option<NonZero<u16>>,
+    path: &'a str,
+}
+
+impl std::fmt::Display for MirrorUri<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.host.format_authority(self.port), self.path)
     }
 }
 
@@ -166,21 +182,9 @@ impl MirrorStatEntry {
         NonZero::new(self.port)
     }
 
-    /// Render `host[:port]/path` directly into a `Formatter` without
-    /// allocating an intermediate `String`.
     #[must_use]
-    pub(crate) fn uri(&self) -> impl std::fmt::Display + '_ {
-        struct W<'a> {
-            host: &'a ClientHost,
-            port: Option<NonZero<u16>>,
-            path: &'a str,
-        }
-        impl std::fmt::Display for W<'_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}/{}", self.host.format_authority(self.port), self.path)
-            }
-        }
-        W {
+    pub(crate) fn uri(&self) -> MirrorUri<'_> {
+        MirrorUri {
             host: &self.host,
             port: self.port(),
             path: &self.path,
@@ -220,37 +224,26 @@ impl OriginEntry {
     /// Whether this origin was seen within [`RETENTION_TIME`] of `now` (seconds
     /// since the epoch). Cleanup reconciles only against active origins: a stale
     /// one's `Packages` index no longer describes what the mirror still serves.
+    ///
+    /// Only a hand-edited row can carry a pre-epoch or overflowing
+    /// `last_seen`; those read as stale / active respectively rather than
+    /// aborting the cleanup task.
     #[must_use]
     pub(crate) fn is_active(&self, now: Duration) -> bool {
-        Duration::from_secs(
-            u64::try_from(self.last_seen).expect("Database should never store negative timestamp"),
-        ) + RETENTION_TIME
-            > now
+        let Ok(last_seen) = u64::try_from(self.last_seen) else {
+            return false;
+        };
+        Duration::from_secs(last_seen)
+            .checked_add(RETENTION_TIME)
+            .is_none_or(|deadline| deadline > now)
     }
 
-    /// Render `host[:port]/mirror_path` directly into a `Formatter` without
-    /// allocating an intermediate `String`.
     #[must_use]
-    pub(crate) fn mirror_uri(&self) -> impl std::fmt::Display + '_ {
-        struct W<'a> {
-            host: &'a ClientHost,
-            port: Option<NonZero<u16>>,
-            mirror_path: &'a str,
-        }
-        impl std::fmt::Display for W<'_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(
-                    f,
-                    "{}/{}",
-                    self.host.format_authority(self.port),
-                    self.mirror_path
-                )
-            }
-        }
-        W {
+    pub(crate) fn mirror_uri(&self) -> MirrorUri<'_> {
+        MirrorUri {
             host: &self.host,
             port: self.port(),
-            mirror_path: &self.mirror_path,
+            path: &self.mirror_path,
         }
     }
 }
@@ -342,10 +335,6 @@ pub(crate) struct DownloadRow {
     pub(crate) client_ip: [u8; 16],
 }
 
-/// Pre-converted SQL-ready row for an `origins` upsert.
-///
-/// `PartialEq` supports batch-level dedup in the DB task: every Packages
-/// request for an origin enqueues the same upsert.
 /// A mirror row without origins, as returned by
 /// [`Database::get_mirrors_without_origins`].
 #[derive(Debug)]
@@ -354,6 +343,10 @@ pub(crate) struct OrphanMirror {
     pub(crate) entry: MirrorEntry,
 }
 
+/// Pre-converted SQL-ready row for an `origins` upsert.
+///
+/// `PartialEq` supports batch-level dedup in the DB task: every Packages
+/// request for an origin enqueues the same upsert.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OriginRow {
     pub(crate) mirror_id: i64,
@@ -580,10 +573,7 @@ impl Database {
         &self,
         active: Duration,
     ) -> Result<Vec<MirrorEntry>, Error> {
-        let max_age_secs: i64 = active
-            .as_secs()
-            .try_into()
-            .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))?;
+        let max_age_secs = duration_as_secs_i64(active)?;
 
         query_as!(
             MirrorEntry,
@@ -781,17 +771,17 @@ impl Database {
                         return None;
                     }
                 };
-                let ip: Ipv6Addr = octets.into();
+                let ip = Ipv6Addr::from(octets).to_canonical();
                 // The cleanup-synthetic sentinel has download rows but never
                 // delivery rows, so its entry would render as "0 requests
                 // with bytes downloaded". Cleanup is excluded from
                 // client-facing metrics; keep the per-client table
                 // consistent with that.
-                if ip.to_canonical() == CLEANUP_CLIENT_ADDR.ip() {
+                if ip == CLEANUP_CLIENT_ADDR.ip() {
                     return None;
                 }
                 Some(ClientStatEntry {
-                    client_ip: ip.to_canonical(),
+                    client_ip: ip,
                     last_seen: r.last_seen,
                     total_downloaded: r.total_downloaded,
                     total_delivered: r.total_delivered,
@@ -1084,8 +1074,7 @@ impl Database {
             });
             qb.build().execute(&mut *tx).await?;
         }
-        tx.commit().await?;
-        Ok(())
+        tx.commit().await
     }
 
     /// Insert a batch of download rows in a single transaction.
@@ -1115,8 +1104,7 @@ impl Database {
             });
             qb.build().execute(&mut *tx).await?;
         }
-        tx.commit().await?;
-        Ok(())
+        tx.commit().await
     }
 
     /// UPSERT a batch of origin rows in a single transaction. The per-row
@@ -1146,8 +1134,7 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
-        tx.commit().await?;
-        Ok(())
+        tx.commit().await
     }
 
     /// Repair usage rows an older version or a manual edit could have left
@@ -1200,64 +1187,60 @@ impl Database {
     /// cheap, and `flat_blocklist::init` needs the invariant it guarantees
     /// to hold continuously, not just after a restart.
     pub(crate) async fn cleanup_invalid_rows(&self) -> Result<(), Error> {
-        {
-            struct MirrorRow {
-                id: i64,
-                host: String,
-                kind: i64,
-            }
-
-            let mut tx = self.conn.begin().await?;
-
-            let mirrors = query_as!(
-                MirrorRow,
-                r#"SELECT id AS "id!: i64", host, kind AS "kind!: i64" FROM mirrors_v2;"#
-            )
-            .fetch_all(&mut *tx)
-            .await?;
-
-            for mirror in mirrors {
-                let bad_host = DomainName::new(mirror.host.clone()).is_err();
-                let bad_kind = MirrorKind::from_db_int(mirror.kind).is_none();
-
-                if !bad_host && !bad_kind {
-                    continue;
-                }
-
-                if bad_host {
-                    warn!(
-                        "Removing mirror id={} with invalid host `{}`",
-                        mirror.id,
-                        mirror.host.escape_debug()
-                    );
-                }
-                if bad_kind {
-                    warn!(
-                        "Removing mirror id={} (host `{}`) with out-of-range kind={}",
-                        mirror.id,
-                        mirror.host.escape_debug(),
-                        mirror.kind
-                    );
-                }
-
-                query!(r"DELETE FROM origins WHERE mirror_id = ?;", mirror.id)
-                    .execute(&mut *tx)
-                    .await?;
-                query!(r"DELETE FROM downloads WHERE mirror_id = ?;", mirror.id)
-                    .execute(&mut *tx)
-                    .await?;
-                query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", mirror.id)
-                    .execute(&mut *tx)
-                    .await?;
-                query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", mirror.id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-
-            tx.commit().await?;
+        struct MirrorRow {
+            id: i64,
+            host: String,
+            kind: i64,
         }
 
-        Ok(())
+        let mut tx = self.conn.begin().await?;
+
+        let mirrors = query_as!(
+            MirrorRow,
+            r#"SELECT id AS "id!: i64", host, kind AS "kind!: i64" FROM mirrors_v2;"#
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for mirror in mirrors {
+            let bad_host = DomainName::new(mirror.host.clone()).is_err();
+            let bad_kind = MirrorKind::from_db_int(mirror.kind).is_none();
+
+            if !bad_host && !bad_kind {
+                continue;
+            }
+
+            if bad_host {
+                warn!(
+                    "Removing mirror id={} with invalid host `{}`",
+                    mirror.id,
+                    mirror.host.escape_debug()
+                );
+            }
+            if bad_kind {
+                warn!(
+                    "Removing mirror id={} (host `{}`) with out-of-range kind={}",
+                    mirror.id,
+                    mirror.host.escape_debug(),
+                    mirror.kind
+                );
+            }
+
+            query!(r"DELETE FROM origins WHERE mirror_id = ?;", mirror.id)
+                .execute(&mut *tx)
+                .await?;
+            query!(r"DELETE FROM downloads WHERE mirror_id = ?;", mirror.id)
+                .execute(&mut *tx)
+                .await?;
+            query!(r"DELETE FROM deliveries WHERE mirror_id = ?;", mirror.id)
+                .execute(&mut *tx)
+                .await?;
+            query!(r"DELETE FROM mirrors_v2 WHERE id = ?;", mirror.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await
     }
 
     /// Fold mirror rows written under a configured alias host into the row of
@@ -1353,8 +1336,7 @@ impl Database {
     /// would otherwise cost a `Packages` fetch cascade on every cleanup run
     /// and a dashboard row forever.
     pub(crate) async fn delete_stale_origins(&self, cutoff: Duration) -> Result<u64, Error> {
-        let cutoff_epoch = i64::try_from(cutoff.as_secs())
-            .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))?;
+        let cutoff_epoch = duration_as_secs_i64(cutoff)?;
 
         let result = query!(r"DELETE FROM origins WHERE last_seen < ?;", cutoff_epoch)
             .execute(&self.conn)
@@ -1419,14 +1401,11 @@ impl Database {
                 .await?;
         }
 
-        tx.commit().await?;
-
-        Ok(())
+        tx.commit().await
     }
 
     pub(crate) async fn delete_usage_logs(&self, keep_date: Duration) -> Result<(), Error> {
-        let keep_epoch = i64::try_from(keep_date.as_secs())
-            .map_err(|err: TryFromIntError| Error::InvalidArgument(err.to_string()))?;
+        let keep_epoch = duration_as_secs_i64(keep_date)?;
 
         let mut tx = self.conn.begin().await?;
 
@@ -1450,9 +1429,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
-        tx.commit().await?;
-
-        Ok(())
+        tx.commit().await
     }
 }
 
@@ -1469,7 +1446,7 @@ mod retention_tests {
         (dir, db)
     }
 
-    async fn count(db: &Database) -> i64 {
+    async fn count_downloads(db: &Database) -> i64 {
         let row = query("SELECT COUNT(*) FROM downloads")
             .fetch_one(&db.conn)
             .await
@@ -1479,10 +1456,11 @@ mod retention_tests {
 
     /// Insert a mirror row directly: `upsert_mirror_id` resolves aliases
     /// through `global_config()`, which no unit test can initialise.
-    async fn insert_mirror(db: &Database, path: &str) -> i64 {
+    async fn insert_mirror_host(db: &Database, host: &str, path: &str) -> i64 {
         let row = query(
-            "INSERT INTO mirrors_v2 (host, port, path, kind) VALUES ('deb.example.org', 0, ?, 0) RETURNING id",
+            "INSERT INTO mirrors_v2 (host, port, path, kind) VALUES (?, 0, ?, 0) RETURNING id",
         )
+        .bind(host)
         .bind(path)
         .fetch_one(&db.conn)
         .await
@@ -1490,18 +1468,58 @@ mod retention_tests {
         sqlx::Row::get(&row, 0)
     }
 
+    async fn insert_mirror(db: &Database, path: &str) -> i64 {
+        insert_mirror_host(db, "deb.example.org", path).await
+    }
+
+    fn origin(mirror_id: i64, distribution: &str) -> OriginRow {
+        OriginRow {
+            mirror_id,
+            distribution: distribution.to_owned(),
+            component: "main".to_owned(),
+            architecture: "amd64".to_owned(),
+        }
+    }
+
+    /// `last_seen` comes straight from the database, so a hand-edited row can
+    /// carry a pre-epoch value. It must read as stale instead of aborting the
+    /// cleanup task that calls this for every origin.
+    #[test]
+    fn origin_activity_tolerates_an_out_of_range_last_seen() {
+        let entry = |last_seen| {
+            OriginEntry::new_for_test(
+                ClientHost::new("deb.example.org".to_owned()).expect("valid host"),
+                "debian".to_owned(),
+                "sid".to_owned(),
+                last_seen,
+            )
+        };
+        let now = RETENTION_TIME + Duration::from_secs(1_000);
+
+        assert!(
+            !entry(-1).is_active(now),
+            "a pre-epoch last_seen must read as stale"
+        );
+        assert!(
+            !entry(999).is_active(now),
+            "a last_seen older than the retention window must read as stale"
+        );
+        assert!(
+            entry(1_001).is_active(now),
+            "a last_seen inside the retention window must read as active"
+        );
+        assert!(
+            entry(i64::MAX).is_active(now),
+            "a far-future last_seen must read as active, not overflow"
+        );
+    }
+
     #[tokio::test]
     async fn delete_stale_origins_keeps_recent_rows() {
         let (_dir, db) = temp_db().await;
         let fresh_id = insert_mirror(&db, "fresh").await;
         let stale_id = insert_mirror(&db, "stale").await;
-        let row = |mirror_id| OriginRow {
-            mirror_id,
-            distribution: "sid".to_owned(),
-            component: "main".to_owned(),
-            architecture: "amd64".to_owned(),
-        };
-        db.batch_upsert_origins(&[row(fresh_id), row(stale_id)])
+        db.batch_upsert_origins(&[origin(fresh_id, "sid"), origin(stale_id, "sid")])
             .await
             .expect("upsert origins");
         query("UPDATE origins SET last_seen = 1000 WHERE mirror_id = ?")
@@ -1517,27 +1535,6 @@ mod retention_tests {
         let left = db.get_origins().await.expect("get origins");
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].mirror_path, "fresh");
-    }
-
-    async fn insert_mirror_host(db: &Database, host: &str, path: &str) -> i64 {
-        let row = query(
-            "INSERT INTO mirrors_v2 (host, port, path, kind) VALUES (?, 0, ?, 0) RETURNING id",
-        )
-        .bind(host)
-        .bind(path)
-        .fetch_one(&db.conn)
-        .await
-        .expect("insert mirror");
-        sqlx::Row::get(&row, 0)
-    }
-
-    fn origin(mirror_id: i64, distribution: &str) -> OriginRow {
-        OriginRow {
-            mirror_id,
-            distribution: distribution.to_owned(),
-            component: "main".to_owned(),
-            architecture: "amd64".to_owned(),
-        }
     }
 
     #[tokio::test]
@@ -1604,14 +1601,9 @@ mod retention_tests {
         let (_dir, db) = temp_db().await;
         let with_id = insert_mirror(&db, "with").await;
         let without_id = insert_mirror(&db, "without").await;
-        db.batch_upsert_origins(&[OriginRow {
-            mirror_id: with_id,
-            distribution: "sid".to_owned(),
-            component: "main".to_owned(),
-            architecture: "amd64".to_owned(),
-        }])
-        .await
-        .expect("upsert origins");
+        db.batch_upsert_origins(&[origin(with_id, "sid")])
+            .await
+            .expect("upsert origins");
 
         let orphans = db.get_mirrors_without_origins().await.expect("query");
         assert_eq!(orphans.len(), 1);
@@ -1647,7 +1639,7 @@ mod retention_tests {
         // The periodic path must not scan the usage tables.
         db.cleanup_invalid_rows().await.expect("periodic cleanup");
         assert_eq!(
-            count(&db).await,
+            count_downloads(&db).await,
             1,
             "the daily cycle must not scan the usage tables"
         );
@@ -1656,7 +1648,11 @@ mod retention_tests {
         db.cleanup_invalid_usage_rows()
             .await
             .expect("startup scrub");
-        assert_eq!(count(&db).await, 0, "startup must still repair legacy rows");
+        assert_eq!(
+            count_downloads(&db).await,
+            0,
+            "startup must still repair legacy rows"
+        );
     }
 
     /// Insert a `deliveries` row for the dashboard aggregate tests.
