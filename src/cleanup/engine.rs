@@ -178,14 +178,22 @@ pub(super) enum ReduceOutcome {
 /// (decompression bomb, malformed or zero-byte compressed index, local read
 /// failure) propagates as `Err`, unlogged - [`map_reduce`] logs it once with
 /// the resolver's consequence; every caller treats it conservatively too.
-pub(super) async fn reduce_against(
+async fn reduce_against(
     plan: &FetchPlan<'_>,
-    root: &Path,
+    ctx: &ReconcileCtx<'_>,
     candidates: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
-    appstate: &AppState,
-    config: &Config,
 ) -> Result<ReduceOutcome, ReduceError> {
+    let &ReconcileCtx {
+        policy: _,
+        self_origins: _,
+        tree_root,
+        mirror: _,
+        entry: _,
+        appstate,
+        config,
+    } = ctx;
+
     let (mut response, pkgfmt) = match try_fetch_packages_file(
         &plan.mirror,
         &plan.base_uri,
@@ -230,14 +238,22 @@ pub(super) async fn reduce_against(
         }));
     }
 
-    let mut ctx = ReduceContext {
-        root,
+    let mut reduce_ctx = ReduceContext {
+        root: tree_root,
         mirror: &plan.owner_mirror,
         layout: plan.cache_layout,
         tally,
         keymap: &plan.keymap,
     };
-    reduce_file_list(pkgfmt, file, &memfdname, candidates, &mut ctx, config).await?;
+    reduce_file_list(
+        pkgfmt,
+        file,
+        &memfdname,
+        candidates,
+        &mut reduce_ctx,
+        config,
+    )
+    .await?;
 
     Ok(if candidates.is_empty() {
         ReduceOutcome::Exhausted
@@ -1063,15 +1079,7 @@ async fn resolve_origin_packages_archive_root(
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    let &ReconcileCtx {
-        policy: _,
-        self_origins: _,
-        tree_root,
-        mirror,
-        entry: _,
-        appstate,
-        config,
-    } = ctx;
+    let (mirror, appstate) = (ctx.mirror, ctx.appstate);
 
     // No candidates to reconcile: skip the DB gate + fetch entirely (a fetch
     // against an empty map would also trip `reduce_file_list`'s non-empty
@@ -1129,7 +1137,7 @@ async fn resolve_origin_packages_archive_root(
             keymapper_for(keymap),
         );
         let step = map_reduce(
-            reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+            reduce_against(&plan, ctx, cached_files, tally).await,
             mirror,
             format_args!("the archive-root Packages index `{root}`"),
             "continuing with the mirror's remaining index sources",
@@ -1166,15 +1174,7 @@ async fn resolve_flat_root_segment(
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    let &ReconcileCtx {
-        policy: _,
-        self_origins: _,
-        tree_root,
-        mirror,
-        entry: _,
-        appstate,
-        config,
-    } = ctx;
+    let mirror = ctx.mirror;
 
     // Skip the DB gate + fetch when there is nothing to reconcile (see the
     // hybrid resolver's guard for the debug-assert rationale).
@@ -1190,7 +1190,7 @@ async fn resolve_flat_root_segment(
     // A fetch failure is silent here: the tail's age-fallback warn reports
     // the root status next to the co-located one.
     match map_reduce(
-        reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+        reduce_against(&plan, ctx, cached_files, tally).await,
         mirror,
         format_args!("the flat-root Packages index `{seg}`"),
         "falling back to time-based retention",
@@ -1211,15 +1211,7 @@ async fn resolve_flat_colocated(
     cached_files: &mut HashMap<OsString, SpanClass>,
     tally: &mut UnitStats,
 ) -> GroupResolution {
-    let &ReconcileCtx {
-        policy: _,
-        self_origins: _,
-        tree_root,
-        mirror,
-        entry: _,
-        appstate,
-        config,
-    } = ctx;
+    let mirror = ctx.mirror;
 
     // Skip the co-located fetch when there is nothing to reconcile (see the
     // hybrid resolver's guard for the debug-assert rationale).
@@ -1243,7 +1235,7 @@ async fn resolve_flat_colocated(
     // A fetch failure is silent here: the tail's age-fallback warn reports
     // the co-located status.
     match map_reduce(
-        reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+        reduce_against(&plan, ctx, cached_files, tally).await,
         mirror,
         format_args!("the co-located flat Packages index"),
         "falling back to time-based retention",
@@ -1270,11 +1262,11 @@ async fn resolve_origin_packages_self(
     let &ReconcileCtx {
         policy,
         self_origins,
-        tree_root,
+        tree_root: _,
         mirror,
         entry,
-        appstate,
-        config,
+        appstate: _,
+        config: _,
     } = ctx;
 
     // The grace window is used only for the diagnostics below; the tail derives
@@ -1367,7 +1359,7 @@ async fn resolve_origin_packages_self(
         // (malformed/decompression-bomb index, local read failure) leaves the
         // reference set incomplete just like a fetch miss, so it bails too.
         let step = map_reduce(
-            reduce_against(&plan, tree_root, cached_files, tally, appstate, config).await,
+            reduce_against(&plan, ctx, cached_files, tally).await,
             mirror,
             format_args!("the Packages index"),
             "skipping cleanup for this mirror",
