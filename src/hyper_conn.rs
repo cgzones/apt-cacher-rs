@@ -87,7 +87,8 @@ use crate::{
         dispatch_request, preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
-    scheme_cache, static_assert, tunnel_limiter,
+    scheme_cache::{self, SchemeDecision},
+    static_assert, tunnel_limiter,
     upstream_head::{
         ContentLength, DownloadPlan, RejectReason, ResumeAnomaly, ResumeState, UpstreamHead,
         plan_download, plan_fresh_download,
@@ -124,10 +125,10 @@ pub(crate) async fn request_with_retry(
     // retry without reverting the scheme.
     const HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS: u32 = 2;
     // The Always-mode terminal-failure HTTPS_UPGRADE_FAILED bump below
-    // (gated on an exhausted retry budget with `https_upgrade_test` still
-    // set) relies on the Auto-mode revert firing first. If MAX_ATTEMPTS
-    // were ever <= HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS, Auto mode would
-    // also fall through here with the flag set and bump HTTPS_UPGRADE_FAILED
+    // (gated on an exhausted retry budget while still probing) relies on the
+    // Auto-mode revert firing first. If MAX_ATTEMPTS were ever
+    // <= HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS, Auto mode would also fall
+    // through there still probing and bump HTTPS_UPGRADE_FAILED
     // instead of HTTPS_UPGRADE_REVERTED. (A wall-clock `upstream_retry_budget`
     // spent before the third attempt has the same effect; the
     // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity holds either way.)
@@ -143,8 +144,7 @@ pub(crate) async fn request_with_retry(
 
     let orig_scheme = parts.uri.scheme().cloned();
 
-    let mut https_upgrade_test = false;
-    let mut revertible = false;
+    let mut probe = UpgradeProbe::NotProbing;
 
     if let Some(os) = &orig_scheme
         && *os != http::uri::Scheme::HTTP
@@ -154,12 +154,11 @@ pub(crate) async fn request_with_retry(
         debug!("Not altering {os} scheme for request {}", parts.uri);
     } else if let Some(auth) = parts.uri.authority() {
         let decision = scheme_cache::resolve(auth.into(), global_config());
-        let scheme = if decision.is_upgrade_attempt() {
+        probe = UpgradeProbe::of(decision);
+        let scheme = if probe.is_probing() {
             debug!(
                 "No cached scheme for host {auth}, trying https upgrade from original scheme {orig_scheme:?}..."
             );
-            https_upgrade_test = true;
-            revertible = decision.revertible();
             metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
             http::uri::Scheme::HTTPS
         } else {
@@ -183,8 +182,7 @@ pub(crate) async fn request_with_retry(
         client: &HttpClient,
         mut parts: http::request::Parts,
         orig_scheme: Option<http::uri::Scheme>,
-        revertible: bool,
-        mut https_upgrade_test: bool,
+        mut probe: UpgradeProbe,
     ) -> Result<
         (Response<Incoming>, http::request::Parts),
         Box<(hyper_util::client::legacy::Error, Uri)>,
@@ -199,7 +197,7 @@ pub(crate) async fn request_with_retry(
 
             let _: Never = match client.request(req_clone).await {
                 Ok(response) => {
-                    if https_upgrade_test {
+                    if probe.is_probing() {
                         metrics::HTTPS_UPGRADE_SUCCEEDED.increment();
                     }
                     if let Some(auth) = parts.uri.authority() {
@@ -224,7 +222,7 @@ pub(crate) async fn request_with_retry(
                         metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
                     }
                     metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
-                    if https_upgrade_test {
+                    if probe.is_probing() {
                         // Non-connect transport error (e.g. read timeout,
                         // request framing) terminates the request without
                         // retry. Count the upgrade attempt as failed so the
@@ -245,13 +243,8 @@ pub(crate) async fn request_with_retry(
                     }
                     let attempt = backoff.attempt();
                     if attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
-                        && https_upgrade_test
-                        && revertible
+                        && probe == UpgradeProbe::Revertible
                     {
-                        // `revertible` is set only for an uncached Auto-mode upgrade
-                        // (see scheme_cache::decide): no cached scheme exists to
-                        // preserve and the mode is necessarily Auto.
-
                         debug!(
                             "Https upgrade failed for host {} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
                             parts
@@ -265,7 +258,7 @@ pub(crate) async fn request_with_retry(
                         let mut uri_parts = parts.uri.into_parts();
                         uri_parts.scheme.clone_from(&orig_scheme);
                         parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
-                        https_upgrade_test = false;
+                        probe = UpgradeProbe::NotProbing;
                         backoff.reset_delay();
                         // The revert iteration is another upstream attempt
                         // even though the retry budget is not consumed for it.
@@ -276,11 +269,11 @@ pub(crate) async fn request_with_retry(
 
                     let Some(delay) = backoff.next_retry(coarsetime::Instant::now()) else {
                         metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
-                        if https_upgrade_test {
-                            // Terminal connect failure with the upgrade flag
-                            // still set: in Always mode the revert branch
-                            // above is gated off, so the only outcome of an
-                            // attempted upgrade is failure here. Keep the
+                        if probe.is_probing() {
+                            // Terminal connect failure while still probing:
+                            // in Always mode the revert branch above is gated
+                            // off, so the only outcome of an attempted upgrade
+                            // is failure here. Keep the
                             // ATTEMPTED == SUCCEEDED + REVERTED + FAILED
                             // identity.
                             metrics::HTTPS_UPGRADE_FAILED.increment();
@@ -327,13 +320,13 @@ pub(crate) async fn request_with_retry(
         }
     }
 
-    if https_upgrade_test {
+    if probe.is_probing() {
         let client = client.clone();
 
         // Spawn a new task such that even if the client disconnects,
         // the task will continue to run and initialize the scheme cache.
         tokio::task::spawn(async move {
-            let result = inner_loop(&client, parts, orig_scheme, revertible, true).await;
+            let result = inner_loop(&client, parts, orig_scheme, probe).await;
             if let Err(ref err) = result {
                 // inner_loop already logged the transport error at WARN; keep this
                 // background-task framing at DEBUG so request_with_retry stays the
@@ -351,7 +344,7 @@ pub(crate) async fn request_with_retry(
         .await
         .expect("task should not panic")
     } else {
-        inner_loop(client, parts, orig_scheme, false, false)
+        inner_loop(client, parts, orig_scheme, UpgradeProbe::NotProbing)
             .await
             .map_err(|err| err.0)
     }
@@ -369,6 +362,42 @@ fn upstream_error_response(err: &hyper_util::client::legacy::Error) -> Response<
         reason: ErrorReport(err).to_string(),
     });
     response
+}
+
+/// Whether an upstream request is an HTTPS-upgrade probe, and whether it may
+/// fall back to the original scheme.  "Revertible" is only meaningful for a
+/// probe, so the two live in one value instead of two booleans that can
+/// disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpgradeProbe {
+    /// Not an upgrade attempt: the scheme is fixed (cached, configured, or
+    /// the one the client asked for).
+    NotProbing,
+    /// `Auto` mode with no cached scheme: revert to the original scheme once
+    /// the connect attempts cross `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS`.
+    /// `scheme_cache::decide` only reaches it when no cached scheme exists,
+    /// so nothing is lost by reverting.
+    Revertible,
+    /// `Always` mode: an upgrade attempt with no fallback.
+    Committed,
+}
+
+impl UpgradeProbe {
+    /// The probe a resolved scheme decision starts its request with.
+    const fn of(decision: SchemeDecision) -> Self {
+        match decision {
+            SchemeDecision::Http | SchemeDecision::Https => Self::NotProbing,
+            SchemeDecision::AutoUpgrade => Self::Revertible,
+            SchemeDecision::AlwaysUpgrade => Self::Committed,
+        }
+    }
+
+    const fn is_probing(self) -> bool {
+        match self {
+            Self::NotProbing => false,
+            Self::Revertible | Self::Committed => true,
+        }
+    }
 }
 
 /// Wrap a client-facing body in the configured client-rate check and box it
@@ -2942,7 +2971,35 @@ pub(crate) async fn handle_hyper_connection<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Uri, host_header_from_uri};
+    use super::{SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+
+    /// Only an uncached `Auto` decision may fall back to the original
+    /// scheme; `Always` probes without a fallback, and a fixed scheme is no
+    /// probe at all. The metrics identity
+    /// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` rests on this mapping.
+    #[test]
+    fn upgrade_probe_of_decision() {
+        assert_eq!(
+            UpgradeProbe::of(SchemeDecision::Http),
+            UpgradeProbe::NotProbing
+        );
+        assert_eq!(
+            UpgradeProbe::of(SchemeDecision::Https),
+            UpgradeProbe::NotProbing
+        );
+        assert_eq!(
+            UpgradeProbe::of(SchemeDecision::AutoUpgrade),
+            UpgradeProbe::Revertible
+        );
+        assert_eq!(
+            UpgradeProbe::of(SchemeDecision::AlwaysUpgrade),
+            UpgradeProbe::Committed
+        );
+
+        assert!(!UpgradeProbe::NotProbing.is_probing());
+        assert!(UpgradeProbe::Revertible.is_probing());
+        assert!(UpgradeProbe::Committed.is_probing());
+    }
 
     #[test]
     fn host_header_from_uri_plain_host() {

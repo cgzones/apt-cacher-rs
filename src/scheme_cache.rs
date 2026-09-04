@@ -116,9 +116,10 @@ pub(crate) fn debug_contents() -> String {
 }
 
 /// The scheme decision for one upstream request, richer than a bare `Scheme` so
-/// hyper can tell an HTTPS *upgrade attempt* (which sets `https_upgrade_test`
-/// and bumps `HTTPS_UPGRADE_ATTEMPTED`) apart from a fixed HTTPS scheme, while
-/// splice collapses it back to its `Option<Scheme>` view via [`fixed_scheme`].
+/// a backend can tell an HTTPS *upgrade attempt* (which bumps
+/// `HTTPS_UPGRADE_ATTEMPTED` and may revert) apart from a fixed HTTPS scheme,
+/// while splice collapses it back to its `Option<Scheme>` view via
+/// [`fixed_scheme`].
 ///
 /// [`fixed_scheme`]: SchemeDecision::fixed_scheme
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -145,16 +146,12 @@ impl SchemeDecision {
         }
     }
 
-    /// hyper: is this an HTTPS-upgrade attempt (set `https_upgrade_test`, bump
-    /// `HTTPS_UPGRADE_ATTEMPTED`)? splice reads it for its own upgrade accounting.
+    /// Is this an HTTPS-upgrade attempt rather than a fixed scheme?  splice
+    /// reads it for its upgrade accounting; hyper folds the same distinction
+    /// into its own `UpgradeProbe`.
+    #[cfg(any(test, feature = "splice"))]
     pub(crate) fn is_upgrade_attempt(self) -> bool {
         matches!(self, Self::AlwaysUpgrade | Self::AutoUpgrade)
-    }
-
-    /// hyper: may the upgrade revert to the original scheme on failure? (`Auto` only.)
-    #[cfg(any(test, feature = "hyper"))]
-    pub(crate) fn revertible(self) -> bool {
-        matches!(self, Self::AutoUpgrade)
     }
 }
 
@@ -347,13 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_attempt_and_revertible_flags() {
+    fn upgrade_attempt_flag() {
         assert!(!SchemeDecision::Http.is_upgrade_attempt());
         assert!(!SchemeDecision::Https.is_upgrade_attempt());
         assert!(SchemeDecision::AlwaysUpgrade.is_upgrade_attempt());
         assert!(SchemeDecision::AutoUpgrade.is_upgrade_attempt());
-
-        assert!(!SchemeDecision::AlwaysUpgrade.revertible());
-        assert!(SchemeDecision::AutoUpgrade.revertible());
     }
 }
