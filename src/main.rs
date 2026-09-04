@@ -186,10 +186,10 @@ struct Cli {
     bind: Option<config::BindOverride>,
     /// Skip timestamp in log messages (e.g. under systemd/journald, which
     /// prepends its own)
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     skip_log_timestamp: bool,
     /// Permit daemon running as root user (potentially dangerous)
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     permit_running_daemon_as_root: bool,
 }
 
@@ -386,7 +386,6 @@ type RootStoreError = std::convert::Infallible;
 )]
 fn build_rustls_client_config() -> Result<rustls::ClientConfig, RootStoreError> {
     /* Set a process wide default crypto provider. */
-    //let _ = rustls::crypto::ring::default_provider().install_default();
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("first and sole call should succeed");
@@ -492,7 +491,11 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
 
     tracing_log::LogTracer::init()?;
 
-    let (config, cfg_fallback, config_warnings) = config::Config::new(
+    let config::LoadedConfig {
+        config,
+        defaults_used,
+        warnings: config_warnings,
+    } = config::Config::load(
         &args.config_file,
         args.cache_path.take(),
         args.database_path.take(),
@@ -649,7 +652,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         eprintln!("{info}");
     }));
 
-    if cfg_fallback {
+    if defaults_used {
         info!(
             "Default configuration file `{}` not found, using defaults",
             args.config_file.display()

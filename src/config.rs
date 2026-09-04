@@ -14,7 +14,7 @@
 //! still gets the warning. Feature-gated options mirror `mmap_threshold`.
 //!
 //! A CLI flag that *overrides* a config field instead: a `Cli` field in
-//! `main.rs` + a `Config::new` parameter applied on top of the parsed TOML
+//! `main.rs` + a `Config::load` parameter applied on top of the parsed TOML
 //! **before** `validate()` + man page + README, and no
 //! `debian/apt-cacher-rs.conf` entry. Fallible flag values parse via
 //! `FromStr<Err = String>` on a type in this module (see `BindOverride`);
@@ -80,7 +80,7 @@ pub(crate) enum HttpsUpgradeMode {
     Never,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq)]
 enum ConfigDomainNameInner {
     Dns(String),
     Ipv4(String, Ipv4Addr),
@@ -88,7 +88,10 @@ enum ConfigDomainNameInner {
     Wildcard(String),
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// An allow-list *pattern*, which may be a wildcard and so has no useful
+/// ordering: the lists it populates (`allowed_mirrors`, `http_only_mirrors`)
+/// are always scanned with [`Self::permits`], never sorted or searched.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ConfigDomainName(ConfigDomainNameInner);
 
 impl ConfigDomainName {
@@ -583,7 +586,7 @@ pub(crate) struct Alias {
 /// blocklist) must resolve through this so multiple aliases pointing
 /// at the same `main` share keys.
 ///
-/// `aliases[].aliases` is sorted at config load (see `Config::new`),
+/// `aliases[].aliases` is sorted at config load (see `Config::load`),
 /// so the inner lookup is a binary search.
 #[must_use]
 pub(crate) fn resolve_alias<'a>(aliases: &'a [Alias], host: &ClientHost) -> Option<&'a CacheHost> {
@@ -944,18 +947,32 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_secs_f64")]
     pub(crate) verify_checksums_throttle_cap: Duration,
 
+    /// Whether to answer a cache miss for a large permanent file with a
+    /// short error response while the download keeps running, so apt moves
+    /// on and late-joins it on its retry.  Undocumented in the shipped
+    /// configuration file on purpose; see `parallel_hack` for the
+    /// mechanism.  Every option below is inert while this is false.
     pub(crate) experimental_parallel_hack_enabled: bool,
 
+    /// Above this many upstream downloads in flight proxy-wide, no client
+    /// is nudged any more.  `None` means no ceiling.
     #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) experimental_parallel_hack_maxparallel: Option<NonZero<usize>>,
 
-    #[serde(deserialize_with = "statuscode_from_u32")]
+    /// Status of the nudge response; must be a 4xx or 5xx.
+    #[serde(deserialize_with = "statuscode_from_u16")]
     pub(crate) experimental_parallel_hack_statuscode: StatusCode,
 
+    /// `Retry-After` (in seconds) of the nudge response, 1 to 300.
     pub(crate) experimental_parallel_hack_retryafter: u16,
 
+    /// Per-in-flight-download decay of the nudge probability, in `(0, 1]`:
+    /// the first download is nudged for certain, each further one less
+    /// likely.
     pub(crate) experimental_parallel_hack_factor: f64,
 
+    /// Responses at or below this size are served normally rather than
+    /// nudged.  `None` (config value `0`) nudges any size.
     #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) experimental_parallel_hack_minsize: Option<NonZero<u64>>,
 
@@ -1060,8 +1077,6 @@ where
 /// `Display`.
 #[derive(Debug, thiserror::Error)]
 enum MagnitudeError {
-    #[error("Could not split input")]
-    NoSplit,
     #[error("Invalid number:  {0}")]
     Number(#[from] std::num::ParseIntError),
     #[error("Multiplication overflow")]
@@ -1075,12 +1090,16 @@ macro_rules! impl_parse_with_magnitude {
         fn $name(s: &str) -> Result<$T, MagnitudeError> {
             let s = s.trim();
 
-            if let Ok(val) = s.parse::<$T>() {
-                return Ok(val);
-            }
+            let bare_err = match s.parse::<$T>() {
+                Ok(val) => return Ok(val),
+                Err(err) => err,
+            };
 
+            // Nothing to split on: the value is empty or overflows the
+            // target type, so report why the plain number failed rather
+            // than blaming a magnitude suffix that was never written.
             let Some(x) = s.find(|c| !char::is_ascii_digit(&c)) else {
-                return Err(MagnitudeError::NoSplit);
+                return Err(MagnitudeError::Number(bare_err));
             };
 
             let (val, mag) = s.split_at(x);
@@ -1134,12 +1153,12 @@ where
         .map_err(D::Error::custom)
 }
 
-fn statuscode_from_u32<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
+fn statuscode_from_u16<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
 where
     D: Deserializer<'de>,
 {
     use serde::de::Error as _;
-    let v = Deserialize::deserialize(deserializer)?;
+    let v: u16 = Deserialize::deserialize(deserializer)?;
 
     StatusCode::from_u16(v).map_err(D::Error::custom)
 }
@@ -1236,12 +1255,20 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
     true
 }
 
+/// Validator for an allow-list entry: a bare IPv6 address, a DNS name (or
+/// IPv4 address, which is a valid label string), or a name carrying a
+/// leading `*.` wildcard label.
+///
+/// A wildcard must cover at least two further labels — `*.org` would hand
+/// a whole TLD to the proxy — and must not look like a partial IPv4
+/// address (`*.1.1`), which no `Ipv4Addr`-normalised lookup could ever
+/// match.  Everything past the wildcard is the plain DNS label rule, so it
+/// is checked by [`is_valid_dns_label_string`].
 #[must_use]
 fn is_valid_config_domain(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
-    let len = domain.len();
-    if len == 0 || len > 253 {
+    if domain.is_empty() || domain.len() > 253 {
         return false;
     }
 
@@ -1250,52 +1277,42 @@ fn is_valid_config_domain(domain: &str) -> bool {
         return domain.parse::<Ipv6Addr>().is_ok();
     }
 
-    let mut is_wildcard = false;
-    let mut part_count: u32 = 0;
+    let Some(suffix) = domain.strip_prefix("*.") else {
+        return is_valid_dns_label_string(domain);
+    };
 
-    for (pos, part) in domain.split('.').enumerate() {
-        if part.is_empty() || part.len() > 63 {
-            return false;
-        }
+    suffix.contains('.')
+        && is_valid_dns_label_string(suffix)
+        && !suffix.split('.').all(|part| part.parse::<u8>().is_ok())
+}
 
-        part_count += 1;
-
-        if pos == 0 && part == "*" {
-            is_wildcard = true;
-            continue;
-        }
-
-        for (pos, byte) in part.bytes().enumerate() {
-            if byte == b'-' {
-                if pos == 0 || pos == part.len() - 1 {
-                    return false;
-                }
-            } else if !byte.is_ascii_alphanumeric() {
-                return false;
-            }
-        }
+/// Warn about a path option that is not absolute.  Such a path still
+/// resolves, but against the daemon's working directory (`/` under
+/// systemd) rather than where the operator was looking.
+fn warn_if_relative(warnings: &mut Vec<String>, key: &str, path: &Path) {
+    if !path.is_absolute() {
+        warnings.push(format!(
+            "{key} `{}` is not an absolute path; it resolves against the daemon working directory (`/` under systemd) - use an absolute path",
+            path.display()
+        ));
     }
+}
 
-    if is_wildcard && part_count < 3 {
-        return false;
-    }
-
-    // Reject wildcards that look like partial IPv4 addresses (e.g. "*.1.1")
-    if is_wildcard {
-        let suffix = domain.strip_prefix("*.").unwrap_or(domain);
-        if suffix.split('.').all(|p| p.parse::<u8>().is_ok()) {
-            return false;
-        }
-    }
-
-    true
+/// Outcome of [`Config::load`]: the loaded configuration plus what the
+/// caller has to report about how it came about.
+#[derive(Debug)]
+pub(crate) struct LoadedConfig {
+    pub(crate) config: Config,
+    /// The default configuration file was absent and the built-in defaults
+    /// were used instead.  Never set for an explicitly named file, whose
+    /// absence is an error.
+    pub(crate) defaults_used: bool,
+    /// Non-fatal findings of [`Config::validate`], one log line each.
+    pub(crate) warnings: Vec<String>,
 }
 
 impl Config {
     /// Load the configuration from the given file.
-    /// Return the loaded configuration, a flag indicating whether the default
-    /// configuration file was not found and the built-in defaults were used
-    /// instead, and a list of validation warnings.
     ///
     /// When supplied, `cache_directory` overrides [`Self::cache_directory`],
     /// `database_path` overrides [`Self::database_path`] and `bind` overrides
@@ -1303,13 +1320,13 @@ impl Config {
     /// values from the configuration file (or the built-in defaults when no
     /// file is loaded). A non-default `file` that does not exist is always an
     /// error, even when the overrides are supplied.
-    pub(crate) fn new(
+    pub(crate) fn load(
         file: &Path,
         cache_directory: Option<PathBuf>,
         database_path: Option<PathBuf>,
         bind: Option<BindOverride>,
-    ) -> Result<(Self, bool, Vec<String>), ConfigError> {
-        let (mut config, fallback) = match std::fs::read_to_string(file) {
+    ) -> Result<LoadedConfig, ConfigError> {
+        let (mut config, defaults_used) = match std::fs::read_to_string(file) {
             Ok(content) => (
                 Self::from_toml(&content).map_err(ConfigError::Parse)?,
                 false,
@@ -1340,7 +1357,11 @@ impl Config {
 
         let warnings = config.validate()?;
 
-        Ok((config, fallback, warnings))
+        Ok(LoadedConfig {
+            config,
+            defaults_used,
+            warnings,
+        })
     }
 
     /// Parse a TOML document, recording which top-level keys it spells out
@@ -1387,47 +1408,42 @@ impl Config {
                 invalid!("Invalid log_file value: must not be empty");
             }
 
-            if !path.is_absolute() {
-                warnings.push(format!(
-                    "log_file `{}` is not an absolute path; it resolves against the daemon working directory (`/` under systemd) - use an absolute path",
-                    path.display()
-                ));
+            warn_if_relative(&mut warnings, "log_file", path);
+        }
+
+        // Every timeout shares the same floor and only differs in its
+        // ceiling, so they are one table: another timeout is a row here,
+        // not a fifth copy of the comparison and the message.
+        {
+            const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+            for (key, value, max) in [
+                (
+                    "database_slow_timeout",
+                    self.database_slow_timeout,
+                    Duration::from_mins(1),
+                ),
+                ("http_timeout", self.http_timeout, Duration::from_mins(6)),
+                (
+                    "client_idle_timeout",
+                    self.client_idle_timeout,
+                    Duration::from_hours(1),
+                ),
+                (
+                    "upstream_retry_budget",
+                    self.upstream_retry_budget,
+                    Duration::from_mins(10),
+                ),
+            ] {
+                if value < MIN_TIMEOUT || value > max {
+                    invalid!(
+                        "Invalid {key} value of {}s: must be between {}s and {}s",
+                        value.as_secs_f32(),
+                        MIN_TIMEOUT.as_secs_f32(),
+                        max.as_secs_f32()
+                    );
+                }
             }
-        }
-
-        if self.database_slow_timeout < Duration::from_secs(1)
-            || self.database_slow_timeout > Duration::from_mins(1)
-        {
-            invalid!(
-                "Invalid database_slow_timeout value of {}s: must be between 1s and 60s",
-                self.database_slow_timeout.as_secs_f32()
-            );
-        }
-
-        if self.http_timeout < Duration::from_secs(1) || self.http_timeout > Duration::from_mins(6)
-        {
-            invalid!(
-                "Invalid http_timeout value of {}s: must be between 1s and 360s",
-                self.http_timeout.as_secs_f32()
-            );
-        }
-
-        if self.client_idle_timeout < Duration::from_secs(1)
-            || self.client_idle_timeout > Duration::from_hours(1)
-        {
-            invalid!(
-                "Invalid client_idle_timeout value of {}s: must be between 1s and 3600s",
-                self.client_idle_timeout.as_secs_f32()
-            );
-        }
-
-        if self.upstream_retry_budget < Duration::from_secs(1)
-            || self.upstream_retry_budget > Duration::from_mins(10)
-        {
-            invalid!(
-                "Invalid upstream_retry_budget value of {}s: must be between 1s and 600s",
-                self.upstream_retry_budget.as_secs_f32()
-            );
         }
 
         if self.client_idle_timeout < self.http_timeout {
@@ -1807,24 +1823,12 @@ impl Config {
         if self.cache_directory.as_os_str().is_empty() {
             invalid!("Invalid cache_directory value: must not be empty");
         }
-
-        if !self.cache_directory.is_absolute() {
-            warnings.push(format!(
-                "cache_directory `{}` is not an absolute path; it resolves against the daemon working directory (`/` under systemd) - use an absolute path",
-                self.cache_directory.display()
-            ));
-        }
+        warn_if_relative(&mut warnings, "cache_directory", &self.cache_directory);
 
         if self.database_path.as_os_str().is_empty() {
             invalid!("Invalid database_path value: must not be empty");
         }
-
-        if !self.database_path.is_absolute() {
-            warnings.push(format!(
-                "database_path `{}` is not an absolute path; it resolves against the daemon working directory (`/` under systemd) - use an absolute path",
-                self.database_path.display()
-            ));
-        }
+        warn_if_relative(&mut warnings, "database_path", &self.database_path);
 
         Ok(warnings)
     }
@@ -2032,6 +2036,20 @@ mod test {
     }
 
     #[test]
+    fn test_magnitude_without_a_suffix_reports_the_number_error() {
+        // An empty value and an all-digit value that overflows share the
+        // "nothing to split on" branch; the diagnostic must name the
+        // number, not a magnitude suffix that was never written.
+        for input in ["", "   ", "99999999999999999999999999"] {
+            let err = parse_u64_with_magnitude(input).expect_err("must not parse");
+            assert!(
+                err.to_string().starts_with("Invalid number:"),
+                "input `{input}`: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_domain_name_new() {
         // Mirrors the accept/reject set that `DomainName::new` enforces,
         // which is the same set `cleanup_invalid_rows` uses to purge bad
@@ -2162,6 +2180,13 @@ mod test {
         assert!(!is_valid_config_domain("*.com"));
         assert!(is_valid_config_domain("*.debian.org"));
         assert!(is_valid_config_domain("*.ftp.debian.org"));
+
+        // a wildcard is the whole first label and nothing else
+        assert!(!is_valid_config_domain("*"));
+        assert!(!is_valid_config_domain("*."));
+        assert!(!is_valid_config_domain("**.debian.org"));
+        assert!(!is_valid_config_domain("*-.debian.org"));
+        assert!(!is_valid_config_domain("*.debian.org."));
 
         // IPv4 addresses
         assert!(is_valid_config_domain("192.168.1.1"));
@@ -2445,7 +2470,7 @@ mod test {
     #[test]
     fn default_equals_empty_document() {
         // Struct-level `#[serde(default)]` makes the empty document and
-        // `Default` the same value; the built-in fallback in `Config::new`
+        // `Default` the same value; the built-in fallback in `Config::load`
         // relies on that.
         let parsed = Config::from_toml("").expect("empty config parses");
         assert_eq!(parsed, Config::default());
@@ -2614,5 +2639,193 @@ mod test {
                 .any(|w| w.contains("ktls feature is not enabled")),
             "unset ktls_memory_lock must not warn"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Range and path validation
+    // -----------------------------------------------------------------
+
+    fn error_for(toml_input: &str) -> String {
+        let mut cfg = Config::from_toml(toml_input).expect("config parses");
+        cfg.validate()
+            .expect_err("configuration must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn timeouts_outside_their_range_are_rejected() {
+        for (key, above) in [
+            ("database_slow_timeout", "61"),
+            ("http_timeout", "361"),
+            ("client_idle_timeout", "3601"),
+            ("upstream_retry_budget", "601"),
+        ] {
+            for value in ["0.5", above] {
+                let err = error_for(&format!("{key} = {value}"));
+                assert!(
+                    err.starts_with(&format!("Invalid {key} value of")),
+                    "unexpected error for `{key} = {value}`: {err}"
+                );
+            }
+        }
+
+        // Pin the exact wording once; the four checks share one message.
+        assert_eq!(
+            error_for("http_timeout = 361"),
+            "Invalid http_timeout value of 361s: must be between 1s and 360s"
+        );
+    }
+
+    #[test]
+    fn timeouts_at_their_bounds_are_accepted() {
+        let mut cfg = Config::from_toml(
+            "database_slow_timeout = 60\n\
+             http_timeout = 360\n\
+             client_idle_timeout = 3600\n\
+             upstream_retry_budget = 600",
+        )
+        .expect("config parses");
+        cfg.validate().expect("boundary values are valid");
+    }
+
+    #[test]
+    fn empty_path_options_are_rejected() {
+        for (input, expected) in [
+            ("log_file = ''", "Invalid log_file value: must not be empty"),
+            (
+                "cache_directory = ''",
+                "Invalid cache_directory value: must not be empty",
+            ),
+            (
+                "database_path = ''",
+                "Invalid database_path value: must not be empty",
+            ),
+        ] {
+            assert_eq!(error_for(input), expected, "input `{input}`");
+        }
+    }
+
+    #[test]
+    fn relative_path_options_warn_but_load() {
+        let warnings = warnings_for(
+            "log_file = 'relative.log'\n\
+             cache_directory = 'cache'\n\
+             database_path = 'db.sqlite'",
+        );
+        for key in ["log_file", "cache_directory", "database_path"] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("{key} `"))
+                        && w.contains("is not an absolute path")),
+                "expected relative-path warning for {key}, got: {warnings:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Alias-group conflicts
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn overlapping_alias_groups_are_rejected() {
+        // Two groups that share any host would give one cache identity two
+        // owners, so `validate` refuses the whole configuration.
+        for (case, input) in [
+            (
+                "the same main twice",
+                "aliases = [ ['deb.debian.org', ['a.debian.org']], ['deb.debian.org', ['b.debian.org']] ]",
+            ),
+            (
+                "a later group aliases an earlier main",
+                "aliases = [ ['deb.debian.org', ['a.debian.org']], ['b.debian.org', ['deb.debian.org']] ]",
+            ),
+            (
+                "an earlier group aliases a later main",
+                "aliases = [ ['deb.debian.org', ['b.debian.org']], ['b.debian.org', ['c.debian.org']] ]",
+            ),
+            (
+                "both groups claim the same alias",
+                "aliases = [ ['deb.debian.org', ['x.debian.org']], ['other.debian.org', ['x.debian.org']] ]",
+            ),
+        ] {
+            let err = error_for(input);
+            assert!(
+                err.contains("conflicts with alias"),
+                "{case} must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn disjoint_alias_groups_are_accepted_and_sorted() {
+        let mut cfg = Config::from_toml(
+            "aliases = [ ['deb.debian.org', ['ftp.us.debian.org', 'ftp.de.debian.org']], \
+             ['archive.ubuntu.com', ['de.archive.ubuntu.com']] ]",
+        )
+        .expect("config parses");
+        cfg.validate().expect("disjoint groups are valid");
+        // `resolve_alias` binary-searches this list, so validation must
+        // leave it sorted whatever order the operator wrote.
+        let first = cfg.aliases.first().expect("two groups were configured");
+        assert!(first.aliases.is_sorted(), "{:?}", first.aliases);
+        let resolved =
+            resolve_alias(&cfg.aliases, &clh("ftp.us.debian.org")).expect("alias resolves");
+        assert_eq!(resolved.as_str(), "deb.debian.org");
+    }
+
+    // -----------------------------------------------------------------
+    // Loading and CLI overrides
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn new_rejects_a_named_file_that_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = Config::load(&dir.path().join("absent.conf"), None, None, None)
+            .expect_err("an explicitly named file must exist");
+        assert!(
+            matches!(err, ConfigError::Read { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn new_applies_cli_overrides_on_top_of_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("apt-cacher-rs.conf");
+        std::fs::write(
+            &file,
+            "bind_port = 3143\ncache_directory = '/srv/from-file'\n",
+        )
+        .expect("write config");
+
+        let loaded = Config::load(&file, None, None, None).expect("config loads");
+        assert!(
+            !loaded.defaults_used,
+            "a file that exists is not the built-in fallback"
+        );
+        assert_eq!(loaded.config.bind_port, nonzero!(3143_u16));
+        assert_eq!(
+            loaded.config.cache_directory,
+            PathBuf::from("/srv/from-file")
+        );
+
+        let loaded = Config::load(
+            &file,
+            Some(PathBuf::from("/srv/from-cli")),
+            Some(PathBuf::from("/srv/from-cli.db")),
+            Some(bind("127.0.0.1:3199")),
+        )
+        .expect("config loads");
+        assert_eq!(
+            loaded.config.cache_directory,
+            PathBuf::from("/srv/from-cli")
+        );
+        assert_eq!(
+            loaded.config.database_path,
+            PathBuf::from("/srv/from-cli.db")
+        );
+        assert_eq!(loaded.config.bind_addr, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(loaded.config.bind_port, nonzero!(3199_u16));
     }
 }

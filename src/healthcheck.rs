@@ -66,7 +66,7 @@ impl InodeSpace {
     /// Whether fewer than `1/divisor` of all inodes are still available.
     /// Integer math: no rounding surprises near the boundary.
     #[must_use]
-    pub(crate) fn free_below_fraction(self, divisor: u64) -> bool {
+    fn free_below_fraction(self, divisor: u64) -> bool {
         self.free.saturating_mul(divisor) < self.total.get()
     }
 }
@@ -120,6 +120,12 @@ enum CheckResult {
 impl CheckResult {
     const fn ok(&self) -> bool {
         matches!(self, Self::Pass)
+    }
+
+    /// The verdict every check reports when it outran [`CHECK_TIMEOUT`];
+    /// shared so the three probes cannot drift apart in wording.
+    fn timed_out() -> Self {
+        Self::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs()))
     }
 
     fn write_json(&self, out: &mut String) {
@@ -296,9 +302,7 @@ async fn probe_filesystem(
         Ok(space) => space,
         Err(_elapsed) => {
             let disk_free = match min_free {
-                Some(_) => {
-                    CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs()))
-                }
+                Some(_) => CheckResult::timed_out(),
                 None => CheckResult::Pass,
             };
             return (disk_free, CheckResult::Pass);
@@ -322,7 +326,7 @@ async fn check_cache_write(cache_dir: &Path) -> CheckResult {
     match tokio::time::timeout(CHECK_TIMEOUT, probe_write(&probe)).await {
         Ok(Ok(())) => CheckResult::Pass,
         Ok(Err(err)) => CheckResult::Fail(format!("{}", ErrorReport(&err))),
-        Err(_elapsed) => CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
+        Err(_elapsed) => CheckResult::timed_out(),
     }
 }
 
@@ -366,7 +370,7 @@ async fn check_database() -> CheckResult {
         Ok(Ok(Ok(()))) => CheckResult::Pass,
         Ok(Ok(Err(err))) => CheckResult::Fail(format!("query failed: {err}")),
         Ok(Err(_recv_err)) => CheckResult::Fail(String::from("database task unavailable")),
-        Err(_elapsed) => CheckResult::Fail(format!("timed out after {}s", CHECK_TIMEOUT.as_secs())),
+        Err(_elapsed) => CheckResult::timed_out(),
     }
 }
 

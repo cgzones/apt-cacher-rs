@@ -1,3 +1,14 @@
+//! One-time cache-directory preparation, run from `main` before the tokio
+//! runtime starts: create the directory, take the single-instance
+//! `flock(2)`, probe for the timestamp and extended-attribute support the
+//! cache relies on, and purge the scratch directory an unclean shutdown
+//! left behind.
+//!
+//! The returned lock is held for the process lifetime; dropping it early
+//! would admit a second instance onto the same cache. [`task_setup`] is the
+//! thin wrapper that reads the global configuration, [`prepare_cache_dir`]
+//! the testable body.
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -124,16 +135,19 @@ fn remove_dir_contents(path: &Path) -> Result<usize, SetupError> {
     Ok(removed)
 }
 
+/// Prepare the configured cache directory; see the module documentation.
 pub(crate) fn task_setup() -> Result<Flock<std::fs::File>, SetupError> {
-    let cache_path = &global_config().cache_directory;
+    prepare_cache_dir(&global_config().cache_directory)
+}
 
+fn prepare_cache_dir(cache_path: &Path) -> Result<Flock<std::fs::File>, SetupError> {
     std::fs::create_dir_all(cache_path).map_err(SetupError::io("create directory", cache_path))?;
 
     // Check for creation and modification timestamp support
     let mdata =
         std::fs::metadata(cache_path).map_err(SetupError::io("inspect directory", cache_path))?;
     if !mdata.file_type().is_dir() {
-        return Err(SetupError::NotADirectory(cache_path.clone()));
+        return Err(SetupError::NotADirectory(cache_path.to_path_buf()));
     }
 
     // Locked before anything below mutates the cache (the xattr probe write,
@@ -241,6 +255,37 @@ mod tests {
         );
         drop(first);
         let _relock = lock_cache_dir(tmp.path()).expect("relock after release");
+    }
+
+    #[test]
+    fn remove_dir_contents_clears_every_entry_kind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("file"), b"x").expect("write file");
+        std::fs::create_dir_all(root.join("dir/nested")).expect("create nested dir");
+        std::fs::write(root.join("dir/nested/file"), b"x").expect("write nested file");
+        std::os::unix::fs::symlink(root.join("file"), root.join("link")).expect("symlink");
+        // Unlinked, never followed - and it stays removable after the
+        // target above is gone, whatever order `read_dir` yields.
+        std::os::unix::fs::symlink(root.join("absent"), root.join("dangling")).expect("symlink");
+
+        assert_eq!(remove_dir_contents(root).expect("purge"), 4);
+        assert_eq!(
+            std::fs::read_dir(root).expect("read dir").count(),
+            0,
+            "the scratch directory itself is kept, its contents are not"
+        );
+    }
+
+    #[test]
+    fn remove_dir_contents_reports_a_missing_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = remove_dir_contents(&tmp.path().join("absent"))
+            .expect_err("a missing directory must be reported, not silently skipped");
+        assert!(
+            err.to_string().contains("read directory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

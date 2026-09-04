@@ -12,88 +12,80 @@ pub(crate) const APP_VIA: &str = concat!("1.1 ", env!("CARGO_PKG_NAME"));
 /// carries when the request already passed through this proxy.
 pub(crate) const APP_VIA_PSEUDONYM: &str = env!("CARGO_PKG_NAME");
 
+#[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
+macro_rules! feature_tls {
+    () => {
+        "hyper"
+    };
+}
+
+#[cfg(feature = "tls_rustls")]
+macro_rules! feature_tls {
+    () => {
+        "rustls"
+    };
+}
+
+// Expand to the literal "true" when `feature` is enabled, "false" otherwise.
+macro_rules! feature_bool {
+    ($name:ident, $feature:literal) => {
+        #[cfg(feature = $feature)]
+        macro_rules! $name {
+            () => {
+                "true"
+            };
+        }
+        #[cfg(not(feature = $feature))]
+        macro_rules! $name {
+            () => {
+                "false"
+            };
+        }
+    };
+}
+
+feature_bool!(feature_hyper, "hyper");
+feature_bool!(feature_mmap, "mmap");
+feature_bool!(feature_sendfile, "sendfile");
+feature_bool!(feature_splice, "splice");
+feature_bool!(feature_ktls, "ktls");
+
+macro_rules! feature_summary {
+    () => {
+        concat!(
+            "TLS=",
+            feature_tls!(),
+            "\n",
+            "hyper=",
+            feature_hyper!(),
+            "\n",
+            "mmap=",
+            feature_mmap!(),
+            "\n",
+            "sendfile=",
+            feature_sendfile!(),
+            "\n",
+            "splice=",
+            feature_splice!(),
+            "\n",
+            "ktls=",
+            feature_ktls!(),
+        )
+    };
+}
+
+/// Newline-separated `key=value` summary of the build's feature flags.
+const FEATURES: &str = feature_summary!();
+
+/// [`FEATURES`] prefixed by the crate version; what `--version` prints.
+const VERSION_AND_FEATURES: &str = concat!(env!("CARGO_PKG_VERSION"), "\n", feature_summary!());
+
 #[must_use]
 #[inline]
 pub(crate) const fn get_features(version: bool) -> &'static str {
-    #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-    macro_rules! feature_tls {
-        () => {
-            "hyper"
-        };
-    }
-
-    #[cfg(feature = "tls_rustls")]
-    macro_rules! feature_tls {
-        () => {
-            "rustls"
-        };
-    }
-
-    // Expand to the literal "true" when `feature` is enabled, "false" otherwise.
-    macro_rules! feature_bool {
-        ($name:ident, $feature:literal) => {
-            #[cfg(feature = $feature)]
-            macro_rules! $name {
-                () => {
-                    "true"
-                };
-            }
-            #[cfg(not(feature = $feature))]
-            macro_rules! $name {
-                () => {
-                    "false"
-                };
-            }
-        };
-    }
-
-    feature_bool!(feature_hyper, "hyper");
-    feature_bool!(feature_mmap, "mmap");
-    feature_bool!(feature_sendfile, "sendfile");
-    feature_bool!(feature_splice, "splice");
-    feature_bool!(feature_ktls, "ktls");
-
     if version {
-        concat!(
-            env!("CARGO_PKG_VERSION"),
-            "\n",
-            "TLS=",
-            feature_tls!(),
-            "\n",
-            "hyper=",
-            feature_hyper!(),
-            "\n",
-            "mmap=",
-            feature_mmap!(),
-            "\n",
-            "sendfile=",
-            feature_sendfile!(),
-            "\n",
-            "splice=",
-            feature_splice!(),
-            "\n",
-            "ktls=",
-            feature_ktls!(),
-        )
+        VERSION_AND_FEATURES
     } else {
-        concat!(
-            "TLS=",
-            feature_tls!(),
-            "\n",
-            "hyper=",
-            feature_hyper!(),
-            "\n",
-            "mmap=",
-            feature_mmap!(),
-            "\n",
-            "sendfile=",
-            feature_sendfile!(),
-            "\n",
-            "splice=",
-            feature_splice!(),
-            "\n",
-            "ktls=",
-            feature_ktls!(),
-        )
+        FEATURES
     }
 }

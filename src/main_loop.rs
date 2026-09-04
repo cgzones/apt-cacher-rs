@@ -1,3 +1,14 @@
+//! The daemon proper, once `main` has parsed the configuration and started
+//! the tokio runtime: database open plus its startup migrations, the
+//! initial cache scan, the accept loop, and the signal handling that drives
+//! cleanup runs, log-file reopen and shutdown.
+//!
+//! Startup order is load-bearing rather than incidental. `flat_blocklist`
+//! has to be seeded before any request can pick a cache layout, and the
+//! cache scan is awaited *before* the listener binds so the disk quota is
+//! enforced against a complete total (see `cache_quota`) instead of an
+//! empty one.
+
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZero,
@@ -79,6 +90,20 @@ fn log_shutdown_summary(signal: &str, active_downloads: &ActiveDownloads) {
         active_downloads.len(),
     );
 }
+
+/// Push the displayed "Next Cleanup" epoch one interval out and run a
+/// cleanup now, detached so the accept loop keeps serving while it works.
+fn spawn_cleanup(appstate: &AppState) {
+    set_next_cleanup_epoch(
+        time::OffsetDateTime::now_utc().unix_timestamp()
+            + i64::try_from(CLEANUP_INTERVAL_SECS).expect("CLEANUP_INTERVAL_SECS fits in i64"),
+    );
+    let appstate = appstate.clone();
+    tokio::task::spawn(async move {
+        task_cleanup(&appstate).await;
+    });
+}
+
 /// Why [`main_loop`] gave up.  Every throw site has already logged the cause
 /// with its context, so `Display` only re-renders the wrapped error (through
 /// [`ErrorReport`], with no `source()`) for `main`'s final
@@ -520,14 +545,7 @@ pub(crate) async fn main_loop(
             },
             _ = cleanup_interval.tick() => {
                 info!("Daily cleanup issued...");
-                set_next_cleanup_epoch(
-                    time::OffsetDateTime::now_utc().unix_timestamp()
-                        + i64::try_from(CLEANUP_INTERVAL_SECS).expect("CLEANUP_INTERVAL_SECS fits in i64"),
-                );
-                let appstate = appstate.clone();
-                tokio::task::spawn(async move {
-                    task_cleanup(&appstate).await;
-                });
+                spawn_cleanup(&appstate);
                 continue;
             },
             _ = usr1_signal.recv() => {
@@ -542,14 +560,7 @@ pub(crate) async fn main_loop(
             _ = usr2_signal.recv() => {
                 info!("SIGUSR2 received, issuing cleanup...");
                 cleanup_interval.reset();
-                set_next_cleanup_epoch(
-                    time::OffsetDateTime::now_utc().unix_timestamp()
-                        + i64::try_from(CLEANUP_INTERVAL_SECS).expect("CLEANUP_INTERVAL_SECS fits in i64"),
-                );
-                let appstate = appstate.clone();
-                tokio::task::spawn(async move {
-                    task_cleanup(&appstate).await;
-                });
+                spawn_cleanup(&appstate);
                 continue;
             },
             n = listener.accept() => n
