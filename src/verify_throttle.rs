@@ -46,8 +46,11 @@ pub(crate) struct Throttled {
 #[derive(Debug)]
 pub(crate) struct VerifyThrottle {
     map: parking_lot::RwLock<HashMap<CacheEntryKey, ThrottleEntry>>,
-    /// Window after the first failure; zero disables the whole feature.
-    base: Duration,
+    /// Window after the first failure. `None` (a configured zero) disables
+    /// the whole feature; modelling it as an absent window rather than a
+    /// zero one makes a zero-length backoff -- an entry that is inserted but
+    /// never throttles anything -- unrepresentable.
+    base: Option<Duration>,
     /// Upper bound on the window. Doubles as the streak-reset TTL: a
     /// failure arriving more than `cap` after the previous window ended
     /// starts a fresh streak at `base`.
@@ -58,16 +61,11 @@ impl VerifyThrottle {
     #[must_use]
     pub(crate) fn new(base: std::time::Duration, cap: std::time::Duration) -> Self {
         let base = Duration::from(base);
-        let cap = Duration::from(cap);
         Self {
             map: parking_lot::RwLock::new(HashMap::new()),
-            base,
-            cap: cap.max(base),
+            base: (base.as_ticks() != 0).then_some(base),
+            cap: Duration::from(cap).max(base),
         }
-    }
-
-    fn is_disabled(&self) -> bool {
-        self.base.as_ticks() == 0
     }
 
     /// Whether the resource is inside its backoff window.
@@ -77,9 +75,10 @@ impl VerifyThrottle {
     }
 
     fn check_at(&self, key: CacheEntryKeyRef<'_>, now: Instant) -> Option<Throttled> {
-        if self.is_disabled() {
-            return None;
-        }
+        // A disabled throttle never records, so the map stays empty and the
+        // lookup below would miss anyway; this short-circuit keeps the
+        // per-request gate free of a lock acquisition and a hash.
+        self.base?;
         let (failures, until) = self
             .map
             .read()
@@ -106,18 +105,17 @@ impl VerifyThrottle {
         key: CacheEntryKeyRef<'_>,
         now: Instant,
     ) -> Option<(std::time::Duration, u32)> {
-        if self.is_disabled() {
-            return None;
-        }
+        let base = self.base?;
         let mut map = self.map.write();
 
-        let failures = match map.get(&key) {
+        let previous = map.get(&key).map(|entry| (entry.failures, entry.until));
+        let failures = match previous {
             // A failure within the streak-reset TTL of the previous
             // window continues the streak; a later one starts over.
-            Some(entry) if now <= entry.until + self.cap => entry.failures.saturating_add(1),
+            Some((failures, until)) if now <= until + self.cap => failures.saturating_add(1),
             _ => 1,
         };
-        if !map.contains_key(&key) && map.len() >= MAX_THROTTLE_ENTRIES {
+        if previous.is_none() && map.len() >= MAX_THROTTLE_ENTRIES {
             // Best-effort cap: purge entries whose streak already reset,
             // then clear outright rather than implement proper LRU.
             let cap = self.cap;
@@ -134,8 +132,7 @@ impl VerifyThrottle {
             }
         }
 
-        let window = self
-            .base
+        let window = base
             .saturating_mul(2u32.saturating_pow(failures - 1))
             .min(self.cap);
         map.insert(

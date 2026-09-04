@@ -38,7 +38,20 @@ pub(crate) struct CleanupMarker {
 }
 
 impl CleanupMarker {
+    /// `expected` must be the digest `algo` produces: [`Self::parse`] decodes
+    /// through `byhash_digest_for_algo`, which cross-checks the length, so a
+    /// marker built from a mismatched pair renders a value that never parses
+    /// back and silently disables the memo. Both writers pass the digest they
+    /// just compared against, so the pairing is structural today.
     pub(crate) fn new(ino: u64, size: u64, algo: HashAlgo, expected: &[u8]) -> Self {
+        debug_assert_eq!(
+            expected.len(),
+            match algo {
+                HashAlgo::Sha256 => 32,
+                HashAlgo::Sha512 => 64,
+            },
+            "a marker's digest length must match its algorithm, or `parse` rejects what `render` wrote"
+        );
         Self {
             ino,
             size,
@@ -167,6 +180,25 @@ mod tests {
         // Digest length must match the algorithm.
         assert!(CleanupMarker::parse(&format!("42:1234:SHA512:{hex}")).is_none());
         assert!(CleanupMarker::parse(&format!("42:1234:SHA256:{hex}:extra")).is_none());
+    }
+
+    #[test]
+    fn cleanup_marker_round_trips_every_algorithm() {
+        // `render` -> `parse` must be lossless for both algorithms, or a
+        // stamped marker is scrubbed on the next read and every cleanup cycle
+        // re-hashes the file it was supposed to memoize.
+        for (algo, digest) in [
+            (HashAlgo::Sha256, vec![0x5au8; 32]),
+            (HashAlgo::Sha512, vec![0xa5u8; 64]),
+        ] {
+            let marker = CleanupMarker::new(9, 4096, algo, &digest);
+            assert_eq!(
+                CleanupMarker::parse(&marker.render()).as_ref(),
+                Some(&marker),
+                "{} marker must survive a render/parse round trip",
+                algo.as_str()
+            );
+        }
     }
 
     #[test]

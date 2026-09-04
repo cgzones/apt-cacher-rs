@@ -182,10 +182,6 @@ pub(crate) async fn await_serveable(
     status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     conn_details: &ConnectionDetails,
 ) -> Result<Serveable, JoinFailure> {
-    fn aliased(conn_details: &ConnectionDetails) -> String {
-        conn_details.alias_suffix()
-    }
-
     async fn open(
         what: &str,
         path: &std::path::Path,
@@ -225,7 +221,7 @@ pub(crate) async fn await_serveable(
                         "Download state still Init after waiting for download of {} from mirror {}{}; returning 500",
                         conn_details.debname,
                         conn_details.mirror,
-                        aliased(conn_details)
+                        conn_details.alias_suffix()
                     );
                     return Err(JoinFailure::StateCorrupted);
                 }
@@ -323,7 +319,7 @@ pub(crate) async fn await_serveable(
                     "Download of {} from mirror {}{} was aborted; returning {} to joining client {}",
                     conn_details.debname,
                     conn_details.mirror,
-                    aliased(conn_details),
+                    conn_details.alias_suffix(),
                     failure.response_parts().0.as_u16(),
                     conn_details.client
                 );
@@ -333,7 +329,7 @@ pub(crate) async fn await_serveable(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ActiveDownloadEntry {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     /// Number of late joiners that have attached to this download. Updated
@@ -442,8 +438,15 @@ fn record_cap_saturation(current_len: usize, max: Option<NonZero<usize>>) {
 /// drains to zero so the next saturation episode can be counted. A remove
 /// can only decrease `current_len`, so the latch-set branch is
 /// unreachable from here and is omitted.
-fn record_cap_drain(current_len: usize, max: Option<NonZero<usize>>) {
-    if current_len == 0 && max.is_some() {
+///
+/// `max_upstream_downloads` is deliberately not consulted: with no cap
+/// configured [`record_cap_saturation`] never sets the latch, so the store
+/// is a no-op — and clearing unconditionally also releases a latch left
+/// armed by a config reload that dropped the cap. Keeping the read out of
+/// here is what makes [`ActiveDownloads::remove`] global-free (and so
+/// unit-testable).
+fn record_cap_drain(current_len: usize) {
+    if current_len == 0 {
         AT_CAP.store(false, Ordering::Release);
     }
 }
@@ -611,7 +614,6 @@ impl ActiveDownloads {
     }
 
     pub(crate) fn remove(&self, key: CacheEntryKeyRef<'_>) {
-        let max = global_config().max_upstream_downloads;
         let mut guard = self.inner.write();
         let was_present = guard.remove(&key);
         // Sample the post-remove length AND clear the cap-transition latch
@@ -622,8 +624,7 @@ impl ActiveDownloads {
         // set is at cap. A remove can only decrease the length, so the
         // saturation set-edge is unreachable here; only the drain reset is
         // meaningful.
-        let current_len = guard.len();
-        record_cap_drain(current_len, max);
+        record_cap_drain(guard.len());
         drop(guard);
         assert!(
             was_present.is_some(),
@@ -818,10 +819,12 @@ mod tests {
             Some(max),
         );
         assert!(matches!(first, LookupResult::Originator { .. }));
-        // Remove via the inner map directly: `remove()` reads
-        // `global_config()`, which is unavailable in unit tests.
-        let key = CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool);
-        assert!(ad.inner.write().remove(&key).is_some());
+        ad.remove(CacheEntryKeyRef::new(
+            &mirror,
+            "a.deb",
+            CacheLayout::StructuredPool,
+        ));
+        assert_eq!(ad.len(), 0, "remove must retire the entry");
         let second = ad.lookup_or_insert(
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),

@@ -43,9 +43,12 @@ use crate::{
     global_checksum_registry, global_config, info_once, warn_once_or_debug, warn_once_or_info,
 };
 
-/// Why a download could not be committed to the cache. All three variants are
-/// handled by callers exactly as a pre-existing rename failure is handled
-/// today (log, drop the barrier, skip DB records).
+/// Why a download could not be committed to the cache. Every variant retires
+/// the active-downloads entry and skips the DB records;
+/// [`Self::ChecksumMismatch`] additionally arms the verify throttle and
+/// unlinks the temp file (`guards::RenameBarrier::commit`), while the two
+/// transient variants keep it for a later resume.
+///
 /// `Display` carries the message only; the `io::Error` hangs off `source()`,
 /// so report it through [`ErrorReport`].
 #[derive(Debug, thiserror::Error)]
@@ -69,39 +72,63 @@ pub(crate) enum CommitError {
 /// process-wide registry) and therefore unit-testable. Note: `verify_temp_file`
 /// performs file I/O (it reads and hashes `temp_path`) - it is not a pure
 /// function, but it is free of process-global state.
-pub(crate) struct VerifyInput<'a> {
+struct VerifyInput<'a> {
     /// `config.verify_checksums`.
-    pub(crate) verify_enabled: bool,
-    pub(crate) kind: VerifyKind,
-    pub(crate) temp_path: &'a Path,
+    verify_enabled: bool,
+    kind: VerifyKind,
+    temp_path: &'a Path,
 }
 
-/// What the downloaded temp file is verified against. Construction (in
-/// `verify_and_rename`) encodes the resource-kind -> expected-digest mapping,
-/// so the pure decision never has to re-derive it - and the old "`ByHash`
-/// always carries a filename" invariant (previously a runtime `.expect()`) is
-/// no longer representable as a mismatched field combination.
-pub(crate) enum VerifyKind {
-    /// By-hash (`ResourceKind::ByHash` / `FlatByHash`): the URL filename is the
-    /// expected hex digest and `algo` is the authoritative algorithm taken from
-    /// the `<algo>` URL path segment (`SHA256`/`SHA512`), NOT inferred from the
-    /// digest length. Self-verifying - the digest is embedded in the request.
-    /// `algo` is `None` when the by-hash URL carried no recognised algorithm
-    /// segment (then treated as unverifiable).
-    ByHash {
-        algo: Option<HashAlgo>,
-        filename: String,
-    },
-    /// Registry-backed (`Pool` .deb / `Packages`): expected SHA256 from the
-    /// in-memory registry, if known. `None` -> cached unverified (best effort).
-    Registry { digest: Option<[u8; 32]> },
-    /// Not verifiable by this module today (other metadata, flat-pool .debs).
+/// What the downloaded temp file is verified against. The resource-kind ->
+/// expected-digest mapping is resolved at construction (in
+/// `verify_and_rename`), so the pure decision never re-derives it and no
+/// half-resolved combination - a by-hash algorithm whose digest did not
+/// decode, a registry-backed kind carrying no digest - is representable.
+enum VerifyKind {
+    /// The expected digest is known: hash `temp_path` with `algo` and
+    /// compare. For a by-hash resource `algo` is the authoritative algorithm
+    /// from the `<algo>` URL path segment (`SHA256`/`SHA512`), never inferred
+    /// from the digest length; for a registry-backed one it is always SHA256.
+    Expected { algo: HashAlgo, digest: Vec<u8> },
+    /// The resource *could* have been verified but no expected digest is
+    /// known - a registry miss, or a by-hash URL whose algorithm segment and
+    /// digest did not agree. Cached unverified and counted as a coverage gap
+    /// (`CHECKSUM_UNVERIFIED`).
+    Unknown,
+    /// Not verifiable by this module today (other metadata, flat-pool .debs
+    /// with Layer-B path-alignment deferred): cached unverified *without*
+    /// counting a coverage gap.
     Unverifiable,
+}
+
+/// Resolve a by-hash URL's `(algo, leaf)` pair into a [`VerifyKind`].
+///
+/// `algo` is the authoritative algorithm from the URL's `<algo>` segment and
+/// the digest length is cross-checked against it inside
+/// [`index_parser::byhash_digest_for_algo`], so a pair that disagrees
+/// degrades to [`VerifyKind::Unknown`] instead of hashing with a guessed
+/// algorithm.
+fn byhash_verify_kind(algo: Option<HashAlgo>, filename: &str) -> VerifyKind {
+    let Some((algo, digest)) =
+        algo.and_then(|a| index_parser::byhash_digest_for_algo(a, filename).map(|d| (a, d)))
+    else {
+        // Defence in depth: the URL parser already rejects anything other
+        // than `SHA256/<64-hex>` or `SHA512/<128-hex>` with the algorithm
+        // segment cross-checked against the digest length, so reaching this
+        // branch indicates a future divergence between the parser and the
+        // digest decoder. Keep the warning visible.
+        warn_once_or_info!(
+            "By-hash digest did not decode for its URL algorithm; caching `{}` unverified",
+            filename.escape_debug()
+        );
+        return VerifyKind::Unknown;
+    };
+    VerifyKind::Expected { algo, digest }
 }
 
 /// Result of the pure verification decision.
 #[derive(Debug)]
-pub(crate) enum VerifyOutcome {
+enum VerifyOutcome {
     /// Verification passed, or was skipped (disabled / non-verifiable / unknown
     /// digest). The caller proceeds with the `rename`.
     Proceed,
@@ -116,44 +143,25 @@ pub(crate) enum VerifyOutcome {
 /// [`VerifyInput`], making this unit-testable. It does perform file I/O
 /// (reads and hashes `temp_path`); callers on an async worker must wrap this
 /// in `spawn_blocking` (see `verify_and_rename`).
-pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
+fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     if !input.verify_enabled {
         return VerifyOutcome::Proceed;
     }
 
-    // Determine the expected (algo, digest), if any.
-    let expected: Option<(HashAlgo, Vec<u8>)> = match &input.kind {
-        VerifyKind::ByHash { algo, filename } => {
-            let decoded = algo
-                .and_then(|a| index_parser::byhash_digest_for_algo(a, filename).map(|d| (a, d)));
-            if decoded.is_none() {
-                // Defence in depth: the URL parser already rejects anything
-                // other than `SHA256/<64-hex>` or `SHA512/<128-hex>` with the
-                // algorithm segment cross-checked against the digest length, so
-                // reaching this branch indicates a future divergence between
-                // the parser and the digest decoder. Keep the warning visible.
-                warn_once_or_info!(
-                    "By-hash digest did not decode for its URL algorithm; caching `{}` unverified",
-                    filename.escape_debug()
-                );
-            }
-            decoded
-        }
-        VerifyKind::Registry { digest } => digest.map(|d| (HashAlgo::Sha256, d.to_vec())),
-        // Flat-pool .debs (Layer-B path-alignment deferred) and other metadata
-        // resources have no registry-backed digest today.
-        VerifyKind::Unverifiable => None,
-    };
-
-    let Some((algo, expected)) = expected else {
-        // Best-effort: no known digest -> cache unverified. Only count it for
+    let VerifyKind::Expected {
+        algo,
+        digest: expected,
+    } = &input.kind
+    else {
+        // Best-effort: no known digest -> cache unverified. Only count the
         // kinds that *could* have been verified, so the metric reflects a real
         // coverage gap rather than every metadata / flat-pool file.
-        if !matches!(input.kind, VerifyKind::Unverifiable) {
+        if matches!(input.kind, VerifyKind::Unknown) {
             metrics::CHECKSUM_UNVERIFIED.increment();
         }
         return VerifyOutcome::Proceed;
     };
+    let algo = *algo;
 
     let (computed, hashed_file) = match hash_file(input.temp_path, algo) {
         Ok(c) => c,
@@ -169,9 +177,9 @@ pub(crate) fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
         }
     };
 
-    if computed == expected {
+    if computed == *expected {
         metrics::CHECKSUM_VERIFIED.increment();
-        stamp_verified(&hashed_file, input.temp_path, algo, &expected);
+        stamp_verified(&hashed_file, input.temp_path, algo, expected);
         VerifyOutcome::Proceed
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
@@ -316,6 +324,12 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 /// strings ~100k times per Debian-main `Packages` ingest (tens of MB at the
 /// default 500k cap). The scope is allocated once per mirror; entries only
 /// own their relpath.
+///
+/// `insert` and `lookup` are module-private on purpose: the only writer is
+/// the post-commit ingest below and the only reader is `verify_and_rename`,
+/// so nothing outside this module can seed or consult expected digests.
+/// `new` (from `main`) and `len` (the dashboard gauge) are the whole
+/// crate-visible surface.
 #[derive(Debug)]
 pub(crate) struct ChecksumRegistry {
     inner: Mutex<RegistryInner>,
@@ -376,7 +390,7 @@ impl ChecksumRegistry {
     /// one oversized (or hostile) index cannot drain the digests of every
     /// other mirror. Re-inserting an existing key refreshes its
     /// eviction-order position to most-recent.
-    pub(crate) fn insert(&self, host: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
+    fn insert(&self, host: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
         let mut inner = self.inner.lock();
         let generation = inner.next_gen;
         inner.next_gen += 1;
@@ -430,7 +444,7 @@ impl ChecksumRegistry {
     /// Look up an expected digest by `(host, mirror_path, relpath)`.
     /// Allocation-free via `hashbrown::Equivalent` and `Arc<str>:
     /// Borrow<str>`.
-    pub(crate) fn lookup(&self, host: &str, mirror_path: &str, relpath: &str) -> Option<[u8; 32]> {
+    fn lookup(&self, host: &str, mirror_path: &str, relpath: &str) -> Option<[u8; 32]> {
         let inner = self.inner.lock();
         inner
             .map
@@ -445,7 +459,7 @@ impl ChecksumRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn order_len(&self) -> usize {
+    fn order_len(&self) -> usize {
         self.inner.lock().map.values().map(|s| s.order.len()).sum()
     }
 }
@@ -495,13 +509,11 @@ fn evict(inner: &mut RegistryInner, cap: usize) {
 /// The scope holding the most live entries, if any.
 fn largest_scope(inner: &RegistryInner) -> Option<Arc<RegistryScope>> {
     // A maximum is order-independent; ties pick an arbitrary scope.
-    let mut best: Option<(&Arc<RegistryScope>, usize)> = None;
-    for (scope, state) in &inner.map {
-        if best.is_none_or(|(_, len)| state.entries.len() > len) {
-            best = Some((scope, state.entries.len()));
-        }
-    }
-    best.map(|(scope, _)| Arc::clone(scope))
+    inner
+        .map
+        .iter()
+        .max_by_key(|(_, state)| state.entries.len())
+        .map(|(scope, _)| Arc::clone(scope))
 }
 
 /// Rebuild a scope's `order` keeping only entries whose generation matches
@@ -519,13 +531,7 @@ fn compact_order(state: &mut ScopeState) {
     state.order = compacted;
 }
 
-/// Verify the finished temp file and, on success, rename it into place.
-///
-/// Returns `Ok(())` when the file is verified (or verification was
-/// skipped/best-effort) and the rename succeeded. Returns `Err(CommitError)`
-/// on mismatch, verification I/O failure, or rename failure -- in every case
-/// the temp file is left for its `TempPath` drop guard to unlink.
-/// A registry lookup that came up empty means this download is cached
+/// Report a registry lookup that came up empty: this download is cached
 /// unverified. Expected while the registry is still cold (the first
 /// `apt install` after startup), but a *persistent* miss means the key
 /// derived here disagrees with the key ingest inserted, and the only symptom
@@ -538,6 +544,24 @@ fn log_registry_miss(plan: &RenamePlan, key: &str) {
         key.escape_debug(),
         plan.debname
     );
+}
+
+/// Look the resource's expected SHA-256 up in the checksum registry,
+/// degrading to [`VerifyKind::Unknown`] (and logging the miss) when it holds
+/// no digest for `key`.
+fn registry_verify_kind(plan: &RenamePlan, key: &str) -> VerifyKind {
+    global_checksum_registry()
+        .lookup(&plan.host, &plan.mirror_path, key)
+        .map_or_else(
+            || {
+                log_registry_miss(plan, key);
+                VerifyKind::Unknown
+            },
+            |digest| VerifyKind::Expected {
+                algo: HashAlgo::Sha256,
+                digest: digest.to_vec(),
+            },
+        )
 }
 
 /// A `Packages` index cached in a compression the ingest ladder does not
@@ -605,27 +629,19 @@ pub(crate) async fn verify_and_rename(
     // global-free. Skipped entirely when verification is disabled.
     let kind = if verify_enabled {
         match plan.resource_kind {
-            ResourceKind::ByHash | ResourceKind::FlatByHash => VerifyKind::ByHash {
-                algo: byhash_algo_from_uri_path(&plan.raw_uri_path),
-                filename: plan.debname.clone(),
-            },
+            ResourceKind::ByHash | ResourceKind::FlatByHash => {
+                byhash_verify_kind(byhash_algo_from_uri_path(&plan.raw_uri_path), &plan.debname)
+            }
             ResourceKind::Pool => {
+                // Layer B: a pool .deb's key is its bare basename, the form
+                // `ingest_stanza_into_registry` inserted.
                 let key = index_parser::registry_key_for_download(&plan.debname);
-                let digest = global_checksum_registry().lookup(&plan.host, &plan.mirror_path, &key);
-                if digest.is_none() {
-                    log_registry_miss(plan, &key);
-                }
-                VerifyKind::Registry { digest }
+                registry_verify_kind(plan, &key)
             }
             ResourceKind::Packages => {
                 // Layer C: a Packages file's key is its full host-relative URI
                 // path (what ingest_release_file inserted: "<release_dir>/<rel>").
-                let key = plan.raw_uri_path.trim_start_matches('/');
-                let digest = global_checksum_registry().lookup(&plan.host, &plan.mirror_path, key);
-                if digest.is_none() {
-                    log_registry_miss(plan, key);
-                }
-                VerifyKind::Registry { digest }
+                registry_verify_kind(plan, plan.raw_uri_path.trim_start_matches('/'))
             }
             ResourceKind::Release
             | ResourceKind::ComponentRelease
@@ -735,32 +751,27 @@ fn spawn_ingest(plan: &RenamePlan) {
         .next()
         .expect("rsplit yields at least one element");
 
+    // The structured and flat `Packages` arms are the same ingest, differing
+    // only in how a `Filename:` field maps onto a registry key.
+    let packages_kind = |format: IndexFormat| {
+        let compression = PackagesCompression::from_filename(leaf);
+        if compression.is_none() {
+            log_unsupported_packages_compression(leaf, &plan.host);
+        }
+        compression.map(|compression| IngestKind::Packages {
+            compression,
+            format,
+        })
+    };
+
     #[expect(clippy::match_same_arms, reason = "prefer clarity")]
     let kind = match plan.resource_kind {
-        ResourceKind::Packages => {
-            let compression = PackagesCompression::from_filename(leaf);
-            if compression.is_none() {
-                log_unsupported_packages_compression(leaf, &plan.host);
-            }
-            compression.map(|c| IngestKind::Packages {
-                compression: c,
-                format: IndexFormat::Structured,
-            })
-        }
+        ResourceKind::Packages => packages_kind(IndexFormat::Structured),
         // Flat Packages files are ingested into the registry (layer-B deb
         // verification).  Flat-layer-C (verifying a flat Packages file against
         // a flat Release) is not implemented - consistent with flat-pool layer-B
         // also being deferred.
-        ResourceKind::FlatMetadata => {
-            let compression = PackagesCompression::from_filename(leaf);
-            if compression.is_none() {
-                log_unsupported_packages_compression(leaf, &plan.host);
-            }
-            compression.map(|c| IngestKind::Packages {
-                compression: c,
-                format: IndexFormat::Flat,
-            })
-        }
+        ResourceKind::FlatMetadata => packages_kind(IndexFormat::Flat),
         ResourceKind::Release => release_dir_from_uri_path(&plan.raw_uri_path)
             .map(|d| IngestKind::Release { release_dir: d }),
         // A per-component Release (`binary-<arch>/Release`) carries no SHA256:
@@ -954,7 +965,7 @@ async fn sniff_packages_compression(path: &Path) -> std::io::Result<PackagesComp
 /// Per-line length is capped at [`crate::limits::MAX_METADATA_LINE_LEN`].
 /// Hitting either cap stops ingestion gracefully (the registry is just
 /// less-populated).
-pub(crate) async fn ingest_packages_file(
+async fn ingest_packages_file(
     registry: &ChecksumRegistry,
     host: &str,
     mirror_path: &str,
@@ -1032,7 +1043,7 @@ pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<Strin
 /// Only entries whose leaf matches a `Packages` file are inserted - those are
 /// the only `Release`-listed resources the proxy verifies (layer C). Other
 /// entries (`Contents-*`, `Translation-*`, ...) are skipped.
-pub(crate) async fn ingest_release_file(
+async fn ingest_release_file(
     registry: &ChecksumRegistry,
     host: &str,
     mirror_path: &str,
@@ -1093,15 +1104,30 @@ mod tests {
     // b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
     const HELLO_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
+    /// A registry-style expectation: SHA256 over the 64-hex `digest`.
+    fn expect_sha256(digest: &str) -> VerifyKind {
+        VerifyKind::Expected {
+            algo: HashAlgo::Sha256,
+            digest: index_parser::hex_decode_exact::<32>(digest)
+                .expect("test digest must be 64 hex chars")
+                .to_vec(),
+        }
+    }
+
+    /// An expectation nothing can match: 32 zero bytes.
+    fn expect_zero_sha256() -> VerifyKind {
+        VerifyKind::Expected {
+            algo: HashAlgo::Sha256,
+            digest: vec![0u8; 32],
+        }
+    }
+
     #[test]
     fn byhash_match_returns_proceed() {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::ByHash {
-                algo: Some(HashAlgo::Sha256),
-                filename: HELLO_SHA256.to_string(),
-            },
+            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
             temp_path: f.path(),
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
@@ -1112,10 +1138,7 @@ mod tests {
         let f = temp_file_with(b"tampered");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::ByHash {
-                algo: Some(HashAlgo::Sha256),
-                filename: HELLO_SHA256.to_string(),
-            },
+            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
             temp_path: f.path(),
         };
         assert!(matches!(
@@ -1129,10 +1152,7 @@ mod tests {
         let f = temp_file_with(b"tampered");
         let plan = VerifyInput {
             verify_enabled: false,
-            kind: VerifyKind::ByHash {
-                algo: Some(HashAlgo::Sha256),
-                filename: HELLO_SHA256.to_string(),
-            },
+            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
             temp_path: f.path(),
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
@@ -1153,10 +1173,7 @@ mod tests {
     fn unreadable_temp_file_returns_reject_verifyio() {
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::ByHash {
-                algo: Some(HashAlgo::Sha256),
-                filename: HELLO_SHA256.to_string(),
-            },
+            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
             temp_path: Path::new("/nonexistent/apt-cacher-rs/x"),
         };
         assert!(matches!(
@@ -1170,9 +1187,7 @@ mod tests {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::Registry {
-                digest: Some(index_parser::hex_decode_exact::<32>(HELLO_SHA256).unwrap()),
-            },
+            kind: expect_sha256(HELLO_SHA256),
             temp_path: f.path(),
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
@@ -1183,9 +1198,7 @@ mod tests {
         let f = temp_file_with(b"tampered deb");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::Registry {
-                digest: Some([0u8; 32]),
-            },
+            kind: expect_zero_sha256(),
             temp_path: f.path(),
         };
         assert!(matches!(
@@ -1199,9 +1212,7 @@ mod tests {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::Registry {
-                digest: Some(index_parser::hex_decode_exact::<32>(HELLO_SHA256).unwrap()),
-            },
+            kind: expect_sha256(HELLO_SHA256),
             temp_path: f.path(),
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
@@ -1212,9 +1223,7 @@ mod tests {
         let f = temp_file_with(b"tampered packages");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::Registry {
-                digest: Some([0u8; 32]),
-            },
+            kind: expect_zero_sha256(),
             temp_path: f.path(),
         };
         assert!(matches!(
@@ -1228,7 +1237,7 @@ mod tests {
         let f = temp_file_with(b"some deb");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::Registry { digest: None },
+            kind: VerifyKind::Unknown,
             temp_path: f.path(),
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
@@ -1390,15 +1399,18 @@ mod tests {
     #[test]
     fn byhash_length_algo_mismatch_caches_unverified() {
         // A SHA512 URL segment carrying a 64-hex (SHA256-length) digest is a
-        // length/algo mismatch: it must NOT be hashed as SHA256. It decodes to
-        // None -> Proceed (cached unverified), never a spurious mismatch.
+        // length/algo mismatch: it must NOT be hashed as SHA256. It resolves
+        // to `Unknown` -> Proceed (cached unverified), never a spurious
+        // mismatch.
+        let kind = byhash_verify_kind(Some(HashAlgo::Sha512), HELLO_SHA256);
+        assert!(
+            matches!(kind, VerifyKind::Unknown),
+            "a digest whose length contradicts its URL algorithm must not become an expectation"
+        );
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::ByHash {
-                algo: Some(HashAlgo::Sha512),
-                filename: HELLO_SHA256.to_string(), // 64 hex chars
-            },
+            kind,
             temp_path: f.path(),
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
@@ -1408,16 +1420,29 @@ mod tests {
     fn byhash_missing_algo_caches_unverified() {
         // No algorithm from the URL -> unverifiable, even if the filename would
         // decode as some digest.
+        let kind = byhash_verify_kind(None, HELLO_SHA256);
+        assert!(
+            matches!(kind, VerifyKind::Unknown),
+            "a by-hash URL with no recognised algorithm segment must not become an expectation"
+        );
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::ByHash {
-                algo: None,
-                filename: HELLO_SHA256.to_string(),
-            },
+            kind,
             temp_path: f.path(),
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
+    }
+
+    #[test]
+    fn byhash_well_formed_pair_becomes_an_expectation() {
+        let resolved = match byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256) {
+            VerifyKind::Expected { algo, digest } => Some((algo, digest)),
+            VerifyKind::Unknown | VerifyKind::Unverifiable => None,
+        };
+        let (algo, digest) = resolved.expect("a matching algorithm/digest pair must be verifiable");
+        assert_eq!(algo, HashAlgo::Sha256);
+        assert_eq!(index_parser::hex_encode(&digest), HELLO_SHA256);
     }
 
     #[test]
@@ -1572,8 +1597,8 @@ mod tests {
         reg.insert("h", "m", "c", d);
         reg.insert("h", "m", "d", d);
         // Refresh A 100 times. Each re-insert leaves a stale order entry
-        // (until compaction fires at order.len() > 2*cap=8) but moves A to
-        // the logical back of FIFO.
+        // (until compaction fires at order.len() > 2 * entries.len() + 16)
+        // but moves A to the logical back of FIFO.
         for _ in 0..100 {
             reg.insert("h", "m", "a", d);
         }
@@ -1614,8 +1639,9 @@ mod tests {
 
         let outcome = verify_temp_file(&VerifyInput {
             verify_enabled: true,
-            kind: VerifyKind::Registry {
-                digest: Some(digest),
+            kind: VerifyKind::Expected {
+                algo: HashAlgo::Sha256,
+                digest: digest.to_vec(),
             },
             temp_path: &temp_path,
         });
@@ -1642,17 +1668,17 @@ mod tests {
         let reg = ChecksumRegistry::new(NonZero::new(4).unwrap());
         let d = [0u8; 32];
         reg.insert("h", "m", "a", d);
-        // 20 re-inserts of the same key (well past the 2*cap=8 trigger).
-        // Compaction must fire at least twice during this loop.
+        // Every re-insert of a live key appends a stale order record. The
+        // compaction trigger is `order.len() > 2 * entries.len() + 16` -- 18
+        // for this one-entry scope -- so 20 further inserts must cross it and
+        // rebuild the log down to the single live entry. Without compaction
+        // the log would hold all 21 records and this assert would fail.
         for _ in 0..20 {
             reg.insert("h", "m", "a", d);
         }
-        // After every insert, the compaction trigger (order.len() > 8) is
-        // either inert (<=8) or fires and drops order back to map.len()=1.
-        // So order_len observed from outside is always <= 8.
         assert!(
-            reg.order_len() <= 2 * 4,
-            "order_len={} should be bounded by 2*cap=8 after compaction",
+            reg.order_len() <= 2 * reg.len() + 16,
+            "order_len={} must stay within the compaction trigger",
             reg.order_len()
         );
         assert_eq!(reg.len(), 1, "map still holds exactly one live entry");

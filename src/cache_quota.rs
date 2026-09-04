@@ -132,6 +132,26 @@ pub(crate) struct Reconciled {
     pub(crate) difference: u64,
 }
 
+/// The accounted cache size that reserving `reserved` bytes in place of
+/// `prev_file_size` existing bytes would produce:
+/// `current - prev_file_size + reserved`, saturating.
+///
+/// Accounting for `prev_file_size` *before* adding `reserved` lets a
+/// smaller-replacement download proceed while the cache is over quota -- the
+/// net size decreases by `prev_file_size - reserved`, so rejecting it would
+/// prevent self-heal via volatile re-fetches. Saturation on the add yields
+/// `u64::MAX` only when the sum would overflow, which then rejects via
+/// `> quota`.
+///
+/// This is the single definition of the formula: both admission checks and
+/// [`CacheQuota::reserve_locked`] (which applies it to `size`) call it, so an
+/// admitted check can never disagree with the reservation it admits.
+const fn projected_size(current: u64, prev_file_size: u64, reserved: NonZero<u64>) -> u64 {
+    current
+        .saturating_sub(prev_file_size)
+        .saturating_add(reserved.get())
+}
+
 impl CacheQuota {
     #[must_use]
     /// Create a new `CacheQuota` with the given initial size and quota configuration.
@@ -163,33 +183,21 @@ impl CacheQuota {
         let mg = self.accounting.lock();
         let curr = mg.size;
 
-        if let Some(quota) = self.quota_config {
-            // Compute the prospective post-reservation cache size as
-            // `curr - prev_file_size + reserved`. Using saturating arithmetic
-            // and accounting for `prev_file_size` *before* adding `reserved`
-            // lets a smaller-replacement download proceed when the cache is
-            // currently over quota — net cache size decreases by
-            // `prev_file_size - reserved`, so rejecting would prevent
-            // self-heal via volatile re-fetches. Saturation on add yields
-            // `u64::MAX` only if `curr - prev + reserved` would overflow,
-            // which rejects via `> quota.get()`.
-            let new_size = curr
-                .saturating_sub(prev_file_size)
-                .saturating_add(reserved.get());
-            if new_size > quota.get() {
-                drop(mg);
-                // A cache sitting at its quota rejects on *every* cacheable
-                // miss until cleanup runs, so only the first rejection is a
-                // warning -- the rest stay visible at info.
-                warn_once_or_info!(
-                    "Disk quota reached while reserving space for {debname} (cache size {}, reserving {}, quota {}); rejecting the download with 503",
-                    HumanFmt::Size(curr),
-                    HumanFmt::Size(reserved.get()),
-                    HumanFmt::Size(quota.get()),
-                );
-                metrics::DOWNLOAD_REJECTED_QUOTA.increment();
-                return Err(QuotaExceeded);
-            }
+        if let Some(quota) = self.quota_config
+            && projected_size(curr, prev_file_size, reserved) > quota.get()
+        {
+            drop(mg);
+            // A cache sitting at its quota rejects on *every* cacheable
+            // miss until cleanup runs, so only the first rejection is a
+            // warning -- the rest stay visible at info.
+            warn_once_or_info!(
+                "Disk quota reached while reserving space for {debname} (cache size {}, reserving {}, quota {}); rejecting the download with 503",
+                HumanFmt::Size(curr),
+                HumanFmt::Size(reserved.get()),
+                HumanFmt::Size(quota.get()),
+            );
+            metrics::DOWNLOAD_REJECTED_QUOTA.increment();
+            return Err(QuotaExceeded);
         }
 
         Ok(self.reserve_locked(mg, reserved, prev_file_size, debname))
@@ -216,18 +224,15 @@ impl CacheQuota {
         let reserved = content_length.upper();
         let mg = self.accounting.lock();
         let curr = mg.size;
-        if let Some(quota) = self.quota_config {
-            let new_size = curr
-                .saturating_sub(prev_file_size)
-                .saturating_add(reserved.get());
-            if new_size > quota.get() {
-                info!(
-                    "Disk quota reached while reserving space for cleanup index fetch {debname} (cache size {}, reserving {}, quota {}); admitting it over quota so cleanup can reconcile and free space",
-                    HumanFmt::Size(curr),
-                    HumanFmt::Size(reserved.get()),
-                    HumanFmt::Size(quota.get()),
-                );
-            }
+        if let Some(quota) = self.quota_config
+            && projected_size(curr, prev_file_size, reserved) > quota.get()
+        {
+            info!(
+                "Disk quota reached while reserving space for cleanup index fetch {debname} (cache size {}, reserving {}, quota {}); admitting it over quota so cleanup can reconcile and free space",
+                HumanFmt::Size(curr),
+                HumanFmt::Size(reserved.get()),
+                HumanFmt::Size(quota.get()),
+            );
         }
         self.reserve_locked(mg, reserved, prev_file_size, debname)
     }
@@ -246,13 +251,9 @@ impl CacheQuota {
             "Adjusting cache size for file {debname} to be downloaded by {reserved} minus previous file size {prev_file_size}"
         );
 
-        // Same formula as the quota check; reconcile catches any residual
-        // drift from `prev_file_size > curr` caller bugs and emits `Repaired
-        // cache size discrepancy`.
-        mg.size = mg
-            .size
-            .saturating_sub(prev_file_size)
-            .saturating_add(reserved.get());
+        // Reconcile catches any residual drift from `prev_file_size > curr`
+        // caller bugs and emits `Repaired cache size discrepancy`.
+        mg.size = projected_size(mg.size, prev_file_size, reserved);
         mg.inflight_reserved = mg.inflight_reserved.saturating_add(reserved.get());
         mg.inflight_replaced = mg.inflight_replaced.saturating_add(prev_file_size);
         let new_size = mg.size;
@@ -586,6 +587,41 @@ mod tests {
         // must be reclaimed.
         reservation.finalize(12);
         assert_eq!(quota.current_size(), 62);
+    }
+
+    #[test]
+    fn release_round_trip_finalize_over_delivers() {
+        let quota = CacheQuota::new(50, Some(nz(100)));
+        let reservation = quota
+            .try_acquire(exact(20), 0, "over-deliver")
+            .ok()
+            .expect("must accept");
+        assert_eq!(quota.current_size(), 70);
+        // Upstream sent 25 bytes despite announcing 20; the accounted size
+        // must follow the bytes that actually landed on disk, not the
+        // reservation, or the quota under-counts the cache forever.
+        reservation.finalize(25);
+        assert_eq!(quota.current_size(), 75);
+    }
+
+    #[test]
+    fn reconcile_window_ignores_an_abandoned_reservation() {
+        // A download that never commits must widen no reconcile interval:
+        // only `finalize` records an on-disk delta, so a scan taken after the
+        // abort sees the truth and the accounted size needs no repair.
+        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let window = quota.begin_reconcile_window();
+        let reservation = quota
+            .try_acquire(exact(30), 0, "abandoned")
+            .ok()
+            .expect("must accept");
+        assert_eq!(quota.current_size(), 80);
+        drop(reservation);
+        let r = quota.subtract_and_reconcile(0, 50, window);
+        assert_eq!(r.grown_during_scan, 0, "an abort commits nothing");
+        assert_eq!(r.shrunk_during_scan, 0);
+        assert_eq!(r.difference, 0);
+        assert_eq!(quota.current_size(), 50);
     }
 
     #[test]

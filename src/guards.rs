@@ -22,6 +22,26 @@ use crate::{
     rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
 };
 
+/// The abort every barrier performs when its owner is dropped without
+/// reaching a sink: publish `Aborted`, count it, retire the registry entry.
+/// Shared so the three `Drop` impls cannot drift apart.
+///
+/// Synchronous by necessity: `Drop` cannot await and the status handle is an
+/// `Arc<RwLock<...>>` (not an owned write guard), so the write lock is taken
+/// under `block_in_place`.
+fn abort_on_drop(
+    status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    active_downloads: &ActiveDownloads,
+    key: CacheEntryKeyRef<'_>,
+) {
+    tokio::task::block_in_place(|| {
+        *status.blocking_write() =
+            ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
+        metrics::DOWNLOADS_ABORTED.increment();
+        active_downloads.remove(key);
+    });
+}
+
 struct InitBarrierData<'a> {
     status: &'a Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     active_downloads: &'a ActiveDownloads,
@@ -107,22 +127,23 @@ impl<'a> InitBarrier<'a> {
         }
     }
 
-    #[must_use]
-    pub(crate) fn debname(&self) -> &str {
+    /// The live barrier state. `finished`, `download` and `Drop` are the only
+    /// sinks and each takes it, so it is `Some` for the barrier's whole
+    /// observable lifetime.
+    fn data(&self) -> &InitBarrierData<'a> {
         self.data
             .as_ref()
             .expect("every sink consumes the instance")
-            .key
-            .debname
+    }
+
+    #[must_use]
+    pub(crate) fn debname(&self) -> &str {
+        self.data().key.debname
     }
 
     #[must_use]
     pub(crate) fn layout(&self) -> CacheLayout {
-        self.data
-            .as_ref()
-            .expect("every sink consumes the instance")
-            .key
-            .layout
+        self.data().key.layout
     }
 
     /// The alias-resolved on-disk identity of the download's mirror - the
@@ -132,13 +153,9 @@ impl<'a> InitBarrier<'a> {
     /// as the eventual rename target.
     #[must_use]
     pub(crate) fn site(&self) -> MirrorSite<'_> {
-        let data = self
-            .data
-            .as_ref()
-            .expect("every sink consumes the instance");
         // `key.mirror` is the canonical (alias-resolved) mirror, so this is
         // the same projection as `ConnectionDetails::site`.
-        let mirror = data.key.mirror;
+        let mirror = self.data().key.mirror;
         MirrorSite {
             host: mirror.host().as_cache_host(),
             port: mirror.port(),
@@ -150,12 +167,7 @@ impl<'a> InitBarrier<'a> {
 impl Drop for InitBarrier<'_> {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            tokio::task::block_in_place(|| {
-                *data.status.blocking_write() =
-                    ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
-                metrics::DOWNLOADS_ABORTED.increment();
-                data.active_downloads.remove(data.key);
-            });
+            abort_on_drop(data.status, data.active_downloads, data.key);
         }
     }
 }
@@ -360,12 +372,7 @@ impl DownloadBarrier {
 impl Drop for DownloadBarrier {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            tokio::task::block_in_place(|| {
-                *data.status.blocking_write() =
-                    ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
-                metrics::DOWNLOADS_ABORTED.increment();
-                data.active_downloads.remove(data.key.as_ref());
-            });
+            abort_on_drop(&data.status, &data.active_downloads, data.key.as_ref());
         }
     }
 }
@@ -579,16 +586,10 @@ impl RenameBarrier {
 
 impl Drop for RenameBarrier {
     fn drop(&mut self) {
-        if let Some(data) = self.data.take() {
-            // Mirrors `Drop for DownloadBarrier`: the status handle is now an
-            // `Arc<RwLock<...>>` (not an `OwnedRwLockWriteGuard`), so the
-            // write lock has to be acquired synchronously here.
-            tokio::task::block_in_place(|| {
-                *data.status.blocking_write() =
-                    ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
-                metrics::DOWNLOADS_ABORTED.increment();
-                data.active_downloads.remove(data.key.as_ref());
-            });
+        if let Some(data) = &self.data {
+            abort_on_drop(&data.status, &data.active_downloads, data.key.as_ref());
         }
+        // `data` (and with it any still-held `QuotaReservation`) drops with
+        // the struct right after this, reverting the reservation.
     }
 }
