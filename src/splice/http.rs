@@ -554,6 +554,20 @@ pub(super) async fn send_and_read_headers(
     Ok((resp, hdr_buf, hdr_end))
 }
 
+/// The `TimedOut` error every upstream body read in this module returns:
+/// bumps `HTTP_TIMEOUT_UPSTREAM_READ` and names the phase alongside the
+/// budget that ran out.
+fn upstream_read_timeout(phase: &str, timeout: Duration) -> std::io::Error {
+    metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+    std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!(
+            "upstream read timed out during {phase} after {}",
+            HumanFmt::Time(timeout)
+        ),
+    )
+}
+
 /// Forward remaining body bytes from upstream to client (no caching).
 /// Used for relaying bodies verbatim: non-200 responses on the cache path
 /// and any status via `splice_simple_proxy`.
@@ -595,14 +609,7 @@ async fn forward_upstream_body(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
             Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!(
-                        "upstream read timed out during body forward after {}",
-                        HumanFmt::Time(config.http_timeout)
-                    ),
-                ));
+                return Err(upstream_read_timeout("body forward", config.http_timeout));
             }
         };
 
@@ -653,14 +660,7 @@ async fn forward_upstream_body_until_eof(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
             Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!(
-                        "upstream read timed out during body forward after {}",
-                        HumanFmt::Time(config.http_timeout)
-                    ),
-                ));
+                return Err(upstream_read_timeout("body forward", config.http_timeout));
             }
         };
 
@@ -1006,13 +1006,9 @@ async fn forward_upstream_chunked_body(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
             Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!(
-                        "upstream read timed out during chunked body forward after {}",
-                        HumanFmt::Time(config.http_timeout)
-                    ),
+                return Err(upstream_read_timeout(
+                    "chunked body forward",
+                    config.http_timeout,
                 ));
             }
         };
@@ -1084,13 +1080,9 @@ async fn read_body_to_vec_until_eof(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
             Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    format!(
-                        "upstream read timed out during volatile body buffering after {}",
-                        HumanFmt::Time(config.http_timeout)
-                    ),
+                return Err(upstream_read_timeout(
+                    "volatile body buffering",
+                    config.http_timeout,
                 ));
             }
         };
@@ -1159,10 +1151,9 @@ async fn read_body_to_vec_with_content_length(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
             Err(tokio::time::error::Elapsed { .. }) => {
-                metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                return Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "upstream read timed out during cleanup body buffering",
+                return Err(upstream_read_timeout(
+                    "cleanup body buffering",
+                    config.http_timeout,
                 ));
             }
         };
@@ -1220,13 +1211,9 @@ async fn read_dechunk_body_to_vec(
                     Ok(Ok(n)) => n,
                     Ok(Err(err)) => return Err(err),
                     Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                        metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                        return Err(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!(
-                                "upstream read timed out during chunked body buffering after {}",
-                                HumanFmt::Time(config.http_timeout)
-                            ),
+                        return Err(upstream_read_timeout(
+                            "chunked body buffering",
+                            config.http_timeout,
                         ));
                     }
                 };
