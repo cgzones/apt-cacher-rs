@@ -105,10 +105,16 @@ const INITIAL_HEADER_SIZE: usize = 2048;
 const MAX_HEADERS: usize = 100;
 
 /// Represents the result of a sendfile operation.
+//
 // Only the `CacheMiss` handoff plan (carrying the stale copy) pushes the
-// variant-size gap over clippy's threshold.
+// variant-size gap over clippy's 200-byte threshold, and that variant is
+// itself `cfg(not(splice))` — with splice, sendfile fetches misses itself and
+// `HandoffPlan` keeps only `JoinDownload` (measured: 392 bytes vs 248, against
+// a ~48-byte `Tunnel`). So the expectation is gated on exactly the condition
+// that creates the large variant; `expect` is an error when unfulfilled, and
+// a looser gate breaks a feature combination the CI powerset covers.
 #[cfg_attr(
-    feature = "hyper",
+    all(feature = "hyper", not(feature = "splice")),
     expect(
         clippy::large_enum_variant,
         reason = "transient value: returned by try_sendfile_request and matched once by the \

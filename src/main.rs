@@ -67,6 +67,7 @@ mod metrics;
 mod mmap_body;
 mod parallel_hack;
 mod partial_file;
+mod per_ip_counter;
 mod permitted_host_cache;
 mod precise_instant;
 mod proxy_body;

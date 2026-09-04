@@ -7,12 +7,16 @@ use std::net::IpAddr;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hashbrown::HashMap;
+use crate::{
+    metrics,
+    per_ip_counter::{PerIpCounter, PerIpPermit},
+};
 
-use crate::metrics;
-
-static TUNNEL_CONNECTIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+/// No per-IP peak gauge: the dashboard's tunnel peak is the *global*
+/// [`metrics::CONNECT_TUNNEL_ACTIVE_PEAK`], maintained by
+/// [`ActiveTunnelGuard`] whether or not the per-IP cap is configured.
+static TUNNEL_CONNECTIONS: std::sync::LazyLock<PerIpCounter> =
+    std::sync::LazyLock::new(|| PerIpCounter::new(None));
 
 /// Total active tunnels across all source IPs. Updated by
 /// [`ActiveTunnelGuard`] on every CONNECT regardless of whether the
@@ -56,32 +60,11 @@ impl Drop for ActiveTunnelGuard {
 /// Does *not* update the active-tunnel counter — that's
 /// [`ActiveTunnelGuard`]'s job, and the caller composes both guards.
 pub(crate) fn try_acquire(client_ip: IpAddr, max: NonZero<usize>) -> Option<TunnelGuard> {
-    let mut map = TUNNEL_CONNECTIONS.lock();
-    let count = map.entry(client_ip).or_insert(0);
-    if *count >= max.get() {
-        return None;
-    }
-    *count += 1;
-    drop(map);
-    Some(TunnelGuard { client_ip })
+    TUNNEL_CONNECTIONS.try_acquire(client_ip, max)
 }
 
-pub(crate) struct TunnelGuard {
-    client_ip: IpAddr,
-}
-
-impl Drop for TunnelGuard {
-    fn drop(&mut self) {
-        let mut map = TUNNEL_CONNECTIONS.lock();
-        if let hashbrown::hash_map::Entry::Occupied(mut entry) = map.entry(self.client_ip) {
-            let count = entry.get_mut();
-            *count -= 1;
-            if *count == 0 {
-                entry.remove();
-            }
-        }
-    }
-}
+/// A held per-IP tunnel slot; released on drop.
+pub(crate) type TunnelGuard = PerIpPermit;
 
 #[cfg(test)]
 mod tests {
@@ -107,9 +90,8 @@ mod tests {
 
         drop(first);
         drop(third);
-        let still_tracked = TUNNEL_CONNECTIONS.lock().contains_key(&ip);
         assert!(
-            !still_tracked,
+            !TUNNEL_CONNECTIONS.tracks(ip),
             "the last guard's drop must remove the map entry"
         );
     }

@@ -4,15 +4,16 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use hashbrown::HashMap;
-
-use crate::metrics;
+use crate::{
+    metrics,
+    per_ip_counter::{PerIpCounter, PerIpPermit},
+};
 
 static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static CLIENT_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
 
-static CONNECTIONS_PER_IP: std::sync::LazyLock<parking_lot::Mutex<HashMap<IpAddr, usize>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+static CONNECTIONS_PER_IP: std::sync::LazyLock<PerIpCounter> =
+    std::sync::LazyLock::new(|| PerIpCounter::new(Some(&metrics::PER_CLIENT_IP_PEAK)));
 
 #[must_use]
 pub(crate) fn connected_clients() -> usize {
@@ -57,12 +58,11 @@ pub(crate) enum ConnectionCap {
 }
 
 pub(crate) struct ClientCounter {
-    client_ip: IpAddr,
-    /// `true` iff `try_new` inserted/incremented an entry in
-    /// `CONNECTIONS_PER_IP`. When `false`, `Drop` skips the mutex
-    /// acquire entirely — the no-cap deployment path is then a single
-    /// atomic decrement.
-    tracked_per_ip: bool,
+    /// `Some` iff `max_connections_per_client_ip` is configured and this
+    /// connection was admitted against it. `None` - the no-cap deployment
+    /// path - releases with a single atomic decrement and never touches the
+    /// per-IP mutex.
+    per_ip: Option<PerIpPermit>,
 }
 
 impl ClientCounter {
@@ -87,44 +87,28 @@ impl ClientCounter {
         }
         metrics::CONNECTED_CLIENTS_PEAK.update(current as u64);
 
-        let tracked_per_ip = if let Some(max) = max_per_ip {
-            let mut map = CONNECTIONS_PER_IP.lock();
-            let count = map.entry(client_ip).or_insert(0);
-            if *count >= max.get() {
-                drop(map);
-                CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
-                metrics::CONNECTION_REJECTED_PER_IP_CAP.increment();
-                return Err(ConnectionCap::PerIp(max));
+        let per_ip = match max_per_ip {
+            Some(max) => {
+                let Some(permit) = CONNECTIONS_PER_IP.try_acquire(client_ip, max) else {
+                    CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                    metrics::CONNECTION_REJECTED_PER_IP_CAP.increment();
+                    return Err(ConnectionCap::PerIp(max));
+                };
+                Some(permit)
             }
-            *count += 1;
-            let observed = *count as u64;
-            drop(map);
-            metrics::PER_CLIENT_IP_PEAK.update(observed);
-            true
-        } else {
-            false
+            None => None,
         };
-        Ok(Self {
-            client_ip,
-            tracked_per_ip,
-        })
+        Ok(Self { per_ip })
     }
 }
 
 impl Drop for ClientCounter {
     fn drop(&mut self) {
+        // Release in the reverse of the acquire order (global, then per-IP),
+        // so the invariant `per-IP count <= global count` holds at every
+        // instant a racing `try_new` could observe the two.
+        drop(self.per_ip.take());
         CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
-        if !self.tracked_per_ip {
-            return;
-        }
-        let mut map = CONNECTIONS_PER_IP.lock();
-        if let hashbrown::hash_map::Entry::Occupied(mut entry) = map.entry(self.client_ip) {
-            let count = entry.get_mut();
-            *count -= 1;
-            if *count == 0 {
-                entry.remove();
-            }
-        }
     }
 }
 
@@ -179,9 +163,33 @@ mod tests {
             "a refused connection must not keep its global slot"
         );
 
+        assert!(
+            metrics::PER_CLIENT_IP_PEAK.get() >= 1,
+            "admitting under the per-IP cap samples the peak gauge"
+        );
+
         drop(admitted);
         let again = ClientCounter::try_new(ip, Some(nonzero!(1)), None).expect("slot released");
         drop(again);
+        assert_eq!(connected_clients(), before);
+    }
+
+    /// Without `max_connections_per_client_ip` the per-IP map is never
+    /// touched, so an unconfigured deployment pays one atomic per connection
+    /// and keeps no per-IP state at all.
+    #[test]
+    fn no_per_ip_cap_keeps_no_per_ip_state() {
+        let ip: IpAddr = "192.0.2.24".parse().expect("test address");
+        let before = connected_clients();
+
+        let admitted = ClientCounter::try_new(ip, None, None).expect("admitted");
+        assert_eq!(connected_clients(), before + 1);
+        assert!(
+            !CONNECTIONS_PER_IP.tracks(ip),
+            "an unconfigured per-IP cap must not populate the map"
+        );
+
+        drop(admitted);
         assert_eq!(connected_clients(), before);
     }
 
