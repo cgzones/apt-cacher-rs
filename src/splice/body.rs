@@ -302,8 +302,9 @@ pub(super) type DemotedClientHandle = tokio::task::JoinHandle<DeliveryResult>;
 ///
 /// A `None` client starts the state machine in [`ClientStatus::Absent`] and
 /// leaves the client-side accounting (`counter`, `client_rate_checker`)
-/// unarmed; every client-facing step branches on [`ClientStatus::Active`],
-/// so the client-less form needs no arms of its own.
+/// unarmed; the socket itself is reachable only through
+/// [`ClientStatus::client_to_write`], so the client-less form needs no arms
+/// of its own.
 struct BodyTransfer<'a> {
     /// Dropped at the demotion transition so the spawned
     /// `serve_remaining_from_file` task's own `ClientDownload` (in
@@ -322,7 +323,7 @@ struct BodyTransfer<'a> {
     remaining: u64,
     /// Cache-file offset of the next byte to write.
     file_offset: i64,
-    client_status: ClientStatus,
+    client_status: ClientStatus<'a>,
     /// Body bytes pulled from upstream so far (the next chunk starts here).
     bytes_done: u64,
     /// Absolute cache-file offset of the next byte the client expects.
@@ -336,10 +337,6 @@ struct BodyTransfer<'a> {
     demoted_handle: Option<DemotedClientHandle>,
     range_filter: &'a SpliceRangeFilter,
     pub(super) cache_path: &'a Path,
-    /// `None` for a client-less transfer; read only through
-    /// [`Self::active_client`], which the [`ClientStatus::Absent`] state
-    /// keeps unreachable.
-    client: Option<&'a TcpStream>,
 }
 
 /// What a body loop hands back to `splice_proxy_drive`.
@@ -382,11 +379,7 @@ impl<'a> BodyTransfer<'a> {
             client_rate_checker,
             remaining: content_length,
             file_offset: file_start_offset,
-            client_status: if client.is_some() {
-                ClientStatus::Active
-            } else {
-                ClientStatus::Absent
-            },
+            client_status: client.map_or(ClientStatus::Absent, ClientStatus::Active),
             bytes_done: 0,
             client_file_pos: u64::try_from(file_start_offset)
                 .expect("file_start_offset is non-negative by construction")
@@ -395,15 +388,7 @@ impl<'a> BodyTransfer<'a> {
             demoted_handle: None,
             range_filter,
             cache_path,
-            client,
         }
-    }
-
-    /// The client socket, for a step that has established
-    /// [`ClientStatus::Active`].
-    fn active_client(&self) -> &'a TcpStream {
-        self.client
-            .expect("client I/O only happens in ClientStatus::Active, which requires a client")
     }
 
     fn barrier(&mut self) -> &mut DownloadBarrier {
@@ -503,8 +488,9 @@ impl<'a> BodyTransfer<'a> {
 
     /// The client RC tripped after progress: the cache already has the
     /// bytes, so hand off to [`Self::maybe_demote`] for adjudication.
-    fn request_demote(&mut self) {
+    fn request_demote(&mut self, client: &'a TcpStream) {
         self.client_status = ClientStatus::DemoteRequested {
+            client,
             client_file_pos: self.client_file_pos,
             client_remaining: self.client_remaining,
         };
@@ -538,6 +524,7 @@ impl<'a> BodyTransfer<'a> {
     /// `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition).
     async fn maybe_demote(&mut self) -> Result<(), BodyTransferError> {
         let ClientStatus::DemoteRequested {
+            client,
             client_file_pos: demote_pos,
             client_remaining: demote_remaining,
         } = self.client_status
@@ -561,7 +548,7 @@ impl<'a> BodyTransfer<'a> {
         drop(self.counter.take());
         self.demoted_handle = Some(
             spawn_file_serve_task(
-                self.active_client(),
+                client,
                 self.cache_path,
                 demote_pos,
                 demote_remaining,
@@ -588,7 +575,6 @@ impl<'a> BodyTransfer<'a> {
             demoted_handle,
             range_filter,
             cache_path: _,
-            client: _,
         } = self;
         debug_assert_eq!(
             remaining, 0,
@@ -793,49 +779,37 @@ pub(super) async fn splice_proxy_body(
         // Determine how this chunk overlaps with the client range.
         let chunk = xfer.note_chunk(got);
 
-        if !matches!(xfer.client_status, ClientStatus::Active)
-            || chunk.end <= client_skip
-            || chunk.start >= client_range_end
+        if let Some(client) = xfer.client_status.client_to_write()
+            && chunk.end > client_skip
+            && chunk.start < client_range_end
         {
-            // Chunk is entirely outside client range, or the client is
-            // absent/gone/demoted — cache only
-            xfer.splice_cache_chunk(&upstream_pipe_receiver, cache_file, got)
+            if chunk.start >= client_skip && chunk.end <= client_range_end {
+                // Chunk is entirely inside client range — normal tee
+                tee_and_splice(
+                    &mut xfer,
+                    &upstream_pipe_receiver,
+                    &cache_pipe_receiver,
+                    &cache_pipe_sender,
+                    cache_file,
+                    got,
+                )
                 .await?;
-        } else if chunk.start >= client_skip && chunk.end <= client_range_end {
-            // Chunk is entirely inside client range — normal tee
-            tee_and_splice(
-                &mut xfer,
-                &upstream_pipe_receiver,
-                &cache_pipe_receiver,
-                &cache_pipe_sender,
-                cache_file,
-                got,
-            )
-            .await?;
-            xfer.maybe_demote().await?;
-        } else {
+                xfer.maybe_demote().await?;
+                continue;
+            }
+
             // Boundary chunk — read into userspace, slice for client, pwrite for cache
             let mut buf = read_pipe_to_buf(&mut upstream_pipe_receiver, got)
                 .await
                 .map_err(BodyTransferError::proxy)?;
 
-            debug_assert!(
-                matches!(xfer.client_status, ClientStatus::Active),
-                "outer condition excludes non-active"
-            );
-            debug_assert!(
-                client_range_end > chunk.start,
-                "boundary chunk must overlap client range"
-            );
             debug_assert_eq!(buf.len(), got, "read_pipe_to_buf reads exactly `got` bytes");
 
             // Write full chunk to cache via pwrite first, so concurrent clients
             // see progress without being gated on the first client's send speed.
             xfer.write_cache_chunk(cache_file, &mut buf, got).await?;
 
-            // Then send to client (may be slow). `Active` is established
-            // above, so the client socket is there.
-            let client = xfer.active_client();
+            // Then send to client (may be slow).
             let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
                 match write_all_to_stream_rated(
@@ -868,6 +842,11 @@ pub(super) async fn splice_proxy_body(
                     Err(err) => return Err(BodyTransferError::client(err)),
                 }
             }
+        } else {
+            // Chunk is entirely outside the client range, or the client is
+            // absent/gone/demoted — cache only.
+            xfer.splice_cache_chunk(&upstream_pipe_receiver, cache_file, got)
+                .await?;
         }
     }
 
@@ -1098,8 +1077,10 @@ pub(super) async fn splice_proxy_body_tls(
             range_filter.skip,
             range_filter.send,
         );
-        if matches!(xfer.client_status, ClientStatus::Active) && !client_slice.is_empty() {
-            write_client_or_demote(&mut xfer, client_slice)
+        if let Some(client) = xfer.client_status.client_to_write()
+            && !client_slice.is_empty()
+        {
+            write_client_or_demote(&mut xfer, client, client_slice)
                 .await
                 .map_err(BodyTransferError::client)?;
             xfer.maybe_demote().await?;
@@ -1122,9 +1103,11 @@ pub(super) async fn splice_proxy_body_tls(
 /// timeout counters were already bumped at rejection) so the download
 /// continues cache-only. Only unexpected I/O errors are returned as
 /// `Err`.
-async fn write_client_or_demote(xfer: &mut BodyTransfer<'_>, slice: &[u8]) -> std::io::Result<()> {
-    // Only ever called with the client established as `Active`.
-    let client = xfer.active_client();
+async fn write_client_or_demote<'a>(
+    xfer: &mut BodyTransfer<'a>,
+    client: &'a TcpStream,
+    slice: &[u8],
+) -> std::io::Result<()> {
     let mut written = 0;
     while written < slice.len() {
         // `try_write` clears tokio's cached writability itself on
@@ -1139,7 +1122,7 @@ async fn write_client_or_demote(xfer: &mut BodyTransfer<'_>, slice: &[u8]) -> st
                         // Client RC tripped — the cache already has the
                         // bytes, hand off to the caller for demote
                         // adjudication.
-                        xfer.request_demote();
+                        xfer.request_demote(client);
                         return Ok(());
                     }
                 }
@@ -1312,14 +1295,18 @@ async fn serve_remaining_from_file(
 }
 
 /// Status of the first (splice) client after a tee+splice iteration.
-enum ClientStatus {
+///
+/// The socket lives in the two variants that still own one, so "is there a
+/// client to write to" and "where is it" are one question -- answered by
+/// [`Self::client_to_write`], the only way to reach the socket at all.
+#[derive(Clone, Copy)]
+enum ClientStatus<'a> {
     /// Client is still connected and receiving data at acceptable speed.
-    Active,
+    Active(&'a TcpStream),
     /// No client was ever attached (parallel-hack nudge): cache-only from
     /// the first byte. Unlike [`Self::Disconnected`] there is no metric and
     /// no log line -- nothing was lost -- and
-    /// [`BodyOutcome::client_disconnected`] stays false. Every client-facing
-    /// step branches on `Active`, so this needs no arms of its own.
+    /// [`BodyOutcome::client_disconnected`] stays false.
     Absent,
     /// Client disconnected mid-transfer.
     Disconnected,
@@ -1332,6 +1319,8 @@ enum ClientStatus {
     /// the upstream bottleneck, so the caller surfaces the upstream
     /// failure instead of spawning a doomed file-serve task.
     DemoteRequested {
+        /// The socket the spawned file-serve task takes over.
+        client: &'a TcpStream,
         /// Absolute cache file offset of the next byte the client expects.
         client_file_pos: u64,
         /// Bytes still owed to the client (matches the response Content-Length
@@ -1344,6 +1333,23 @@ enum ClientStatus {
     /// path), and the byte counts the spawned task needs were already
     /// passed in via the preceding `DemoteRequested`.
     Demoted,
+}
+
+impl<'a> ClientStatus<'a> {
+    /// The socket this transfer may still write body bytes to.  `None`
+    /// once the client is absent, gone, or owned by a file-serve task --
+    /// all of which mean "carry on cache-only".
+    const fn client_to_write(self) -> Option<&'a TcpStream> {
+        // `DemoteRequested` still holds the socket, but the bytes it owes are
+        // the file-serve task's to send once `maybe_demote` hands it over;
+        // every other non-`Active` state has nothing attached at all.
+        match self {
+            Self::Active(client) => Some(client),
+            Self::Absent | Self::Disconnected | Self::DemoteRequested { .. } | Self::Demoted => {
+                None
+            }
+        }
+    }
 }
 
 /// Shared tee+splice fan-out: consume `got` bytes from `pipe_A`, duplicate to `pipe_B`,
@@ -1368,9 +1374,7 @@ async fn tee_and_splice(
     let mut remaining = got;
 
     while remaining > 0 {
-        if matches!(xfer.client_status, ClientStatus::Active) {
-            // The client socket, which `Active` guarantees is there.
-            let client = xfer.active_client();
+        if let Some(client) = xfer.client_status.client_to_write() {
             // Tee pipe_A → pipe_B, then splice pipe_B → cache, then splice pipe_A → client.
             // Cache is written first so concurrent clients see progress immediately
             // without being gated on a potentially slow first client.
@@ -1476,7 +1480,7 @@ async fn tee_and_splice(
                                     .await
                                     .map_err(BodyTransferError::proxy)?;
 
-                                xfer.request_demote();
+                                xfer.request_demote(client);
                                 break;
                             }
                         }
