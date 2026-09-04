@@ -103,6 +103,8 @@ pub(crate) fn validate_connect_target(
         });
     };
 
+    // Fail-open, unlike the mirror ACL below: an empty list narrows nothing.
+    // `Config::validate` warns when tunneling is on and the list is empty.
     if !config.https_tunnel_allowed_ports.is_empty()
         && config
             .https_tunnel_allowed_ports

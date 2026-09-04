@@ -278,7 +278,20 @@ pub(crate) async fn main_loop(
                     legacy_flat.display(),
                 );
             }
-            Ok(_) | Err(_) => {}
+            // A non-directory there is a stray the cache walk reports; only
+            // the probe's own failure is this loop's business.
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                metrics::CACHE_IO_FAILURE.increment();
+                // Once-gated: an unreadable cache root would otherwise emit
+                // one line per registered mirror, all naming the same cause.
+                warn_once_or_debug!(
+                    "Failed to probe the legacy flat cache directory `{}`; cannot tell whether it holds reclaimable files:  {}",
+                    legacy_flat.display(),
+                    ErrorReport(&err)
+                );
+            }
         }
     }
 

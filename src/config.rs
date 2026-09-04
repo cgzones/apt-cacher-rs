@@ -847,7 +847,12 @@ pub(crate) struct Config {
     /// with that list.
     pub(crate) https_tunnel_enabled: bool,
 
-    /// Allowed ports for https tunneling.
+    /// Allowed ports for https tunneling.  Unlike
+    /// [`Self::https_tunnel_allowed_mirrors`] this list is **fail-open**: an
+    /// empty list permits every port on an already-permitted host.  The
+    /// asymmetry is deliberate (a port list is a narrowing of the host list,
+    /// not a second gate), but it is surprising enough that `validate` warns
+    /// about it.
     pub(crate) https_tunnel_allowed_ports: Vec<NonZero<u16>>,
 
     /// Allowed mirrors for https tunneling.  Fail-closed like
@@ -1674,6 +1679,15 @@ impl Config {
             );
         }
 
+        // The sibling mirror list is fail-closed, so an operator who clears
+        // this one is likely expecting "no ports" rather than "every port".
+        if self.https_tunnel_enabled && self.https_tunnel_allowed_ports.is_empty() {
+            warnings.push(
+                "https_tunnel_allowed_ports is empty, which permits CONNECT to every port on a permitted mirror (unlike https_tunnel_allowed_mirrors, where empty permits nothing); list the ports to restrict them"
+                    .to_string(),
+            );
+        }
+
         if self.https_tunnel_enabled {
             const TYPICAL_TLS_PORTS: &[u16] = &[443, 8443];
 
@@ -2465,6 +2479,39 @@ mod test {
     fn warnings_for(toml_input: &str) -> Vec<String> {
         let mut cfg = Config::from_toml(toml_input).expect("config parses");
         cfg.validate().expect("config validates")
+    }
+
+    /// The two tunnel ACLs have opposite empty-list semantics: an empty
+    /// mirror list refuses every CONNECT, an empty port list permits every
+    /// port. Both cases must be called out, or clearing the port list reads
+    /// as "no ports" and silently widens the relay.
+    #[test]
+    fn both_empty_tunnel_acls_warn() {
+        let warnings = warnings_for(
+            "https_tunnel_enabled = true\nhttps_tunnel_allowed_ports = []\nhttps_tunnel_allowed_mirrors = []\n",
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("https_tunnel_allowed_ports is empty")),
+            "an empty port list is fail-open and must warn: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("https_tunnel_allowed_mirrors is empty")),
+            "an empty mirror list is fail-closed and must warn: {warnings:?}"
+        );
+
+        let restricted = warnings_for(
+            "https_tunnel_enabled = true\nhttps_tunnel_allowed_ports = [443]\nhttps_tunnel_allowed_mirrors = ['deb.debian.org']\nallowed_mirrors = ['deb.debian.org']\n",
+        );
+        assert!(
+            !restricted
+                .iter()
+                .any(|w| w.contains("https_tunnel_allowed")),
+            "a fully specified tunnel config must not warn: {restricted:?}"
+        );
     }
 
     #[test]
