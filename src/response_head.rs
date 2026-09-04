@@ -3,7 +3,7 @@
 //! Every response the proxy *originates* (cache hit, conditional 304/416,
 //! rejection or error page, upstream-relay failure, throttle 503, CONNECT
 //! tunnel establishment) is described by a [`ResponseHead`] and rendered by
-//! exactly one of two functions: [`ResponseHead::into_hyper`] for the hyper
+//! exactly one of two functions: `ResponseHead::into_hyper` for the hyper
 //! backend and `ResponseHead::write_to` for the raw-socket sendfile/splice
 //! backends.  Responses *relayed* from upstream (passthrough, streamed
 //! downloads carrying the origin's headers) are not built here; those paths

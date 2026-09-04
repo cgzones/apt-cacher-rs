@@ -11,7 +11,7 @@
 //! - [`UpstreamHead`] is the projection of a response head the table reads:
 //!   status, the length-delimited `Content-Length` (already resolved against
 //!   chunked framing, RFC 9112 section 6.1) and the parsed `Content-Range`.
-//!   Constructors: [`UpstreamHead::from_response`] for hyper's
+//!   Constructors: `UpstreamHead::from_response` for hyper's
 //!   `http::Response` and `splice::http::UpstreamResponse::head` for splice's
 //!   httparse-based parser.  Validator and metadata headers (`ETag`,
 //!   `Last-Modified`, `Content-Type`) are deliberately absent: no shared

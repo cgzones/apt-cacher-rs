@@ -17,7 +17,7 @@
 //! - [`acquire`]: standard connect with retry/backoff, redirect and
 //!   partial-discard reconnects, folded into `UpstreamExchange` by
 //!   `acquire_upstream`.
-//! - [`ktls_path`] (`ktls` feature): the unbuffered rustls handshake that
+//! - `ktls_path` (`ktls` feature): the unbuffered rustls handshake that
 //!   hands traffic secrets to the kernel, plus the kTLS host block-list.
 //! - [`body`]: the zero-copy and userspace-TLS body loops on `BodyTransfer`,
 //!   client demotion to file serving, pipe helpers.
@@ -25,7 +25,7 @@
 //!   nudge leaves running after the 429 went out.
 //! - [`volatile`]: the buffered download path for volatile responses without
 //!   `Content-Length`.
-//! - [`cleanup_bridge`] (hyper-less builds): cleanup's index fetch entry.
+//! - `cleanup_bridge` (hyper-less builds): cleanup's index fetch entry.
 //! - [`simple_proxy`]: the cache-less pass-through relay.
 
 mod acquire;

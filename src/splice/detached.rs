@@ -9,7 +9,7 @@
 //! connection, exactly like any other concurrent request for an in-flight
 //! download.
 //!
-//! [`Self::run`] mirrors the tail of `splice_proxy_drive` from the body-prefix
+//! `DetachedDownload::run` mirrors the tail of `splice_proxy_drive` from the body-prefix
 //! step on, minus every client write: the body loops run in
 //! `ClientStatus::Absent` (see `super::body`), and a failure is attributed by
 //! `BodyTransferError::log_detached` because there is no connection left whose

@@ -2553,7 +2553,7 @@ fn strip_request_body(client: ClientInfo, req: Request<Incoming>) -> Request<Emp
 
 /// A request the cache pipeline declined, on its way to the simple proxy.
 /// Carries what the forwarding tail needs, whichever verdict produced it:
-/// the sendfile backend's [`HandoffPlan::Passthrough`] or this backend's own
+/// the sendfile backend's `HandoffPlan::Passthrough` or this backend's own
 /// [`dispatch_request`].
 struct PassthroughRequest {
     reason: PassthroughReason,

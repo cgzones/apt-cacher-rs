@@ -1,6 +1,6 @@
 //! [`ProxyCacheBody`], the response body every hyper-served response (and
 //! the hyper-less cleanup bridge) is built from: a memory-mapped cached file
-//! or a boxed dynamic body. [`full_body`] and [`quick_response`] wrap small,
+//! or a boxed dynamic body. [`full_body`] and `quick_response` wrap small,
 //! fully buffered payloads.
 
 use std::{fmt::Debug, pin::Pin};

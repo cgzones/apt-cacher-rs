@@ -59,7 +59,7 @@ fn fmt_client_download_rate(
 /// `Display` and are deliberately **not** exposed via `source()`.  Log sites
 /// report this type through [`ErrorReport`] too, which walks `source()`, so
 /// re-exposing the transport error there would print it twice; and
-/// [`is_io_timed_out_in_chain`] walks `source()` looking for a
+/// `is_io_timed_out_in_chain` walks `source()` looking for a
 /// `TimedOut` `io::Error`, which re-exposure would silently reclassify.  The
 /// cause therefore has to be part of `Display`.  Hence the hand-written `From`
 /// impls below rather than `#[from]`, which would imply `#[source]`.
