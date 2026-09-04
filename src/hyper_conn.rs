@@ -59,7 +59,7 @@ use crate::{
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::Origin,
-    delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
+    delivery::{DeliveryEnd, Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{
         ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError,
         is_io_timed_out_in_chain, is_peer_disconnect,
@@ -734,10 +734,15 @@ async fn serve_unfinished_file(
         let outcome = ServeOutcome {
             size: bytes,
             transferred: bytes,
-            complete: !client_disconnected,
             partial: false,
             elapsed,
-            abort: None,
+            // A late joiner that vanished leaves no transport error behind:
+            // the feeder task notices the closed channel, not an I/O failure.
+            end: if client_disconnected {
+                DeliveryEnd::Aborted(None)
+            } else {
+                DeliveryEnd::Complete
+            },
         };
         if let Some(cmd) =
             finish_cached_serve(&conn_details, Mechanism::Channel, Role::LateJoiner, outcome)

@@ -61,7 +61,7 @@ use crate::{
     },
     content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
-    delivery::{AbortCause, Mechanism, Role, ServeOutcome, finish_cached_serve},
+    delivery::{AbortCause, DeliveryEnd, Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{ErrorReport, errno_to_io_error, is_peer_disconnect},
     fs_open::{
         CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
@@ -1609,10 +1609,9 @@ async fn finish_sendfile_serve(
     elapsed: std::time::Duration,
     transfer_result: Result<u64, (u64, std::io::Error)>,
 ) -> bool {
-    let (complete, transferred, failure) = match &transfer_result {
-        Ok(transferred) => (true, *transferred, None),
+    let (transferred, failure) = match &transfer_result {
+        Ok(transferred) => (*transferred, None),
         Err((transferred, err)) => (
-            false,
             *transferred,
             Some((ErrorReport(err), is_peer_disconnect(err))),
         ),
@@ -1620,20 +1619,20 @@ async fn finish_sendfile_serve(
     let outcome = ServeOutcome {
         size,
         transferred,
-        complete,
         partial,
         elapsed,
-        abort: failure
-            .as_ref()
-            .map(|(reason, peer_disconnect)| AbortCause {
+        end: match &failure {
+            None => DeliveryEnd::Complete,
+            Some((reason, peer_disconnect)) => DeliveryEnd::Aborted(Some(AbortCause {
                 reason,
                 peer_disconnect: *peer_disconnect,
-            }),
+            })),
+        },
     };
     if let Some(cmd) = finish_cached_serve(conn_details, Mechanism::Sendfile, role, outcome) {
         send_db_command(DatabaseCommand::Transfer(cmd)).await;
     }
-    complete
+    failure.is_none()
 }
 
 /// Format an `InsufficientRate` into a timeout `std::io::Error`, tagging

@@ -13,12 +13,13 @@
 use std::fmt::Display;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     cache_layout::{CachedFlavor, ConnectionDetails},
     database_task::{DbCmdTransfer, TransferKind},
     humanfmt::HumanFmt,
+    info_or_warn,
     metrics::{self, Counter},
     rate_log,
 };
@@ -135,15 +136,23 @@ pub(crate) struct ServeOutcome<'a> {
     pub(crate) size: u64,
     /// Bytes actually shipped.
     pub(crate) transferred: u64,
-    /// The body reached its end: `SERVED_*` credit and a DB row.
-    pub(crate) complete: bool,
     /// A 206 delivery (recorded on the `deliveries` row).
     pub(crate) partial: bool,
     /// Client-side transfer window (from the first body byte).
     pub(crate) elapsed: Duration,
-    /// Set when the transport surfaced an error; `None` for a silent
-    /// client hang-up, which is logged at INFO without a reason.
-    pub(crate) abort: Option<AbortCause<'a>>,
+    /// How the delivery ended.
+    pub(crate) end: DeliveryEnd<'a>,
+}
+
+/// How a delivery ended. A complete delivery has no abort cause to carry,
+/// which the previous `complete: bool` + `abort: Option<_>` pair could not
+/// say.
+pub(crate) enum DeliveryEnd<'a> {
+    /// The body reached its end: `SERVED_*` credit and a `deliveries` row.
+    Complete,
+    /// The body stopped short. `Some` when the transport surfaced an error;
+    /// `None` for a silent client hang-up, which is logged without a reason.
+    Aborted(Option<AbortCause<'a>>),
 }
 
 /// Finish one cached-file delivery: metrics, the completion/abort log line,
@@ -160,10 +169,9 @@ pub(crate) fn finish_cached_serve(
     let ServeOutcome {
         size,
         transferred,
-        complete,
         partial,
         elapsed,
-        abort,
+        end,
     } = outcome;
     let (what, who) = role.words();
     let via = mechanism.via();
@@ -175,7 +183,7 @@ pub(crate) fn finish_cached_serve(
         ""
     };
 
-    if complete {
+    let DeliveryEnd::Aborted(abort) = end else {
         mechanism.served().increment();
         metrics::SERVED_TOTAL.increment();
         info!(
@@ -194,28 +202,19 @@ pub(crate) fn finish_cached_serve(
             client_ip: cd.client.ip(),
             kind: TransferKind::Delivery { partial },
         });
-    }
+    };
 
     let segment = rate_log::client_disconnect_segment(transferred, elapsed);
     match abort {
         Some(AbortCause {
             reason,
-            peer_disconnect: true,
+            peer_disconnect,
         }) => {
-            metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-            info!(
-                "Aborted serving {what} {volatile}file {} from mirror {}{aliased} for {who} {} in {} via {via} ({segment}):  {reason}",
-                cd.debname,
-                cd.mirror,
-                cd.client,
-                HumanFmt::Time(in_time),
-            );
-        }
-        Some(AbortCause {
-            reason,
-            peer_disconnect: false,
-        }) => {
-            warn!(
+            if peer_disconnect {
+                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+            }
+            info_or_warn!(
+                peer_disconnect,
                 "Aborted serving {what} {volatile}file {} from mirror {}{aliased} for {who} {} in {} via {via} ({segment}):  {reason}",
                 cd.debname,
                 cd.mirror,

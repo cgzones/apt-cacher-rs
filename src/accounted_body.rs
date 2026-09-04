@@ -22,7 +22,7 @@ use crate::{
     client_counter::ClientDownload,
     client_info::ClientInfo,
     database_task::{DatabaseCommand, send_db_command_nonblocking},
-    delivery::{AbortCause, Mechanism, Role, ServeOutcome, finish_cached_serve},
+    delivery::{AbortCause, DeliveryEnd, Mechanism, Role, ServeOutcome, finish_cached_serve},
     humanfmt::HumanFmt,
     metrics,
     precise_instant::PreciseInstant,
@@ -175,20 +175,23 @@ impl<B: Body> PinnedDrop for AccountedBody<B> {
                 partial,
             } => {
                 mechanism.bytes_served().increment_by(transferred);
-                let abort = error.as_ref().map(|failure| AbortCause {
-                    reason: &failure.reason,
-                    peer_disconnect: failure.peer_disconnect,
-                });
                 // hyper stops polling once the promised Content-Length is
                 // out, so `end_of_stream` is not a reliable signal here; the
                 // promised byte count is.
+                let end = if transferred == size && error.is_none() {
+                    DeliveryEnd::Complete
+                } else {
+                    DeliveryEnd::Aborted(error.as_ref().map(|failure| AbortCause {
+                        reason: &failure.reason,
+                        peer_disconnect: failure.peer_disconnect,
+                    }))
+                };
                 let outcome = ServeOutcome {
                     size,
                     transferred,
-                    complete: transferred == size && error.is_none(),
                     partial,
                     elapsed,
-                    abort,
+                    end,
                 };
                 if let Some(cmd) =
                     finish_cached_serve(&conn_details, mechanism, Role::Cached, outcome)
