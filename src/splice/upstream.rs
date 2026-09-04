@@ -759,10 +759,6 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
     Ok(tls_stream)
 }
 
-// ---------------------------------------------------------------------------
-// Unbuffered kTLS: TLS handshake + HTTP request using rustls UnbufferedClientConnection
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use crate::config::ClientHost;

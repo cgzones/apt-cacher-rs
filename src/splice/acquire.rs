@@ -300,15 +300,6 @@ pub(super) async fn standard_upstream_connect(
     })
 }
 
-/// Follow a 3xx redirect if the Location target is valid and allowed.
-///
-/// On success, replaces `exchange` (connection, response, header buffer and
-/// TLS label) with the redirected request's exchange, and returns
-/// `Some(redirected_path)`. If the redirect is not followable (invalid URI,
-/// disallowed host), logs and returns `None` so the caller falls through to the
-/// non-200 forwarding path.
-///
-/// Times out after the configured HTTP timeout.
 /// Where a followed redirect landed: the mirror the retry/resume logic must
 /// keep talking to, its `Host` authority and the redirected path.
 pub(super) struct RedirectTarget {
@@ -318,6 +309,15 @@ pub(super) struct RedirectTarget {
     pub(super) path: String,
 }
 
+/// Follow a 3xx redirect if the Location target is valid and allowed.
+///
+/// On success, replaces `exchange` (connection, response, header buffer and
+/// TLS label) with the redirected request's exchange, and returns the
+/// [`RedirectTarget`] it landed on. If the redirect is not followable
+/// (invalid URI, disallowed host), logs and returns `None` so the caller
+/// falls through to the non-200 forwarding path.
+///
+/// Times out after the configured HTTP timeout.
 pub(super) async fn follow_redirect(
     exchange: &mut UpstreamExchange,
     conn_details: &ConnectionDetails,
@@ -427,12 +427,11 @@ pub(super) async fn follow_redirect(
         MirrorKind::Structured,
     );
     let redirect_authority = redirect_mirror.format_authority();
-    let redirect_path = moved_path;
 
     *exchange = standard_upstream_connect(
         &redirect_mirror,
         &redirect_authority,
-        redirect_path,
+        moved_path,
         resume_offset,
         resume_if_range,
         volatile_cond,
@@ -454,7 +453,7 @@ pub(super) async fn follow_redirect(
 
     Ok(Some(RedirectTarget {
         authority: redirect_authority.into_owned(),
-        path: redirect_path.to_owned(),
+        path: moved_path.to_owned(),
         mirror: redirect_mirror,
     }))
 }

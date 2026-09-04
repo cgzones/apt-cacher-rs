@@ -28,8 +28,6 @@ use crate::{
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
 use super::{AfterHeaderSide, SpliceProxyError, UpstreamFailure, VOLATILE_BODY_MAX};
 
-/// Simple (uncached) splice proxy for unrecognized resource paths.
-///
 /// Hop-by-hop headers per RFC 9110 §7.6.1 — must not be forwarded to the client.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -76,17 +74,14 @@ pub(super) fn rewrite_simple_proxy_headers(
 
     // RFC 9110 §7.6.1: the Connection header nominates further connection-specific
     // field names that an intermediary must remove before forwarding.
-    let mut connection_nominated: Vec<String> = Vec::new();
+    // Borrowed from `raw_headers`, and compared case-insensitively below, so
+    // no owned lowercase copy of each token is needed.
+    let mut connection_nominated: Vec<&str> = Vec::new();
     for h in parsed.headers.iter() {
         if h.name.eq_ignore_ascii_case("connection")
             && let Ok(v) = std::str::from_utf8(h.value)
         {
-            for tok in v.split(',') {
-                let tok = tok.trim();
-                if !tok.is_empty() {
-                    connection_nominated.push(tok.to_ascii_lowercase());
-                }
-            }
+            connection_nominated.extend(v.split(',').map(str::trim).filter(|tok| !tok.is_empty()));
         }
     }
 

@@ -93,10 +93,6 @@ fn block_ktls_host(key: &SchemeKeyRef<'_>) {
     blocked.insert(key, now);
 }
 
-// ---------------------------------------------------------------------------
-// UpstreamConn: TCP, TLS or kTLS wrapper
-// ---------------------------------------------------------------------------
-
 /// Result of a successful unbuffered kTLS connection: the TCP stream is ready
 /// for kTLS RX, response headers are parsed, and any extra body bytes are saved.
 pub(super) struct KtlsReadyState {
@@ -1054,21 +1050,15 @@ impl<'a> KtlsHandshake<'a> {
 
             let per_read_timeout = Duration::from_secs(5);
 
-            // Log how many bytes the current partial TLS record needs.
-            // TLS record header is 5 bytes: [content_type, version_hi, version_lo, length_hi, length_lo].
-            // We skip the first 3 bytes and read the 2-byte big-endian length.
-            if let Some(&[_, _, _, hi, lo, ..]) = self.incoming.get(..self.incoming_used) {
-                let record_len = u16::from_be_bytes([hi, lo]) as usize;
-                debug!(
-                    "kTLS: draining with {} bytes buffered, \
-                     current record needs {} bytes total",
-                    self.incoming_used,
-                    5 + record_len
-                );
-            }
+            debug!(
+                "kTLS: draining with {} bytes buffered, \
+                 current record still short by {} bytes",
+                self.incoming_used,
+                record_framed_read_len(&self.incoming, self.incoming_used)
+            );
 
             let mut drain_stop_reason = "";
-            'drain: while self.incoming_used > 0 {
+            while self.incoming_used > 0 {
                 grow_incoming(&mut self.incoming, self.incoming_used, "drain")
                     .map_err(KtlsError::setup_permanent)?;
 
@@ -1125,9 +1115,8 @@ impl<'a> KtlsHandshake<'a> {
                         extra_body.len()
                     ))));
                 }
-                if self.incoming_used == 0 {
-                    break 'drain;
-                }
+                // The loop condition is the alignment check: it exits as soon
+                // as the last buffered record has been decrypted.
             }
 
             if self.incoming_used > 0 {
@@ -1161,17 +1150,12 @@ impl<'a> KtlsHandshake<'a> {
             outgoing_used: _,
         } = self;
 
-        // The incoming buffer must be fully drained before extracting secrets.
-        // Any unprocessed bytes would mean the RX sequence number from rustls is
-        // behind the actual TLS record count on the wire, causing kTLS decryption
-        // failures (wrong nonce/sequence).
-        // Hard check (not debug_assert): a non-zero incoming_used would mean the rustls
-        // RX sequence number is behind the actual TLS record count on the wire.
-        // Proceeding would configure kTLS with a stale rx_seq, silently producing
-        // garbage on decryption. Fail closed instead.
-        //
-        // The debug_assert catches regressions loudly in tests; the runtime branch
-        // below is the real guard in release builds.
+        // The incoming buffer must be fully drained before extracting secrets:
+        // unprocessed bytes mean rustls' RX sequence number is behind the TLS
+        // record count on the wire, so the kernel would decrypt with a stale
+        // nonce and silently produce garbage. Fail closed rather than hand the
+        // kernel a stale `rx_seq`; the debug_assert additionally makes a
+        // regression loud in tests.
         debug_assert_eq!(
             incoming_used, 0,
             "incoming buffer must be fully drained before kTLS secret extraction"

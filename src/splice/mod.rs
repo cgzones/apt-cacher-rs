@@ -368,10 +368,10 @@ fn render_splice_response_head(
     content_type: &str,
     date: &str,
 ) -> String {
-    // Fresh response streamed straight from origin → Age is 0 per RFC 9111 §4.2.3.
-    let age: u32 = 0;
     let status_line = range.status_line();
     let response_content_length = range.len;
+    // `Age: 0` is a constant here: a fresh response streamed straight from
+    // the origin has spent no time in a cache (RFC 9111 section 4.2.3).
     format!(
         "{conn_version} {status_line}\r\n\
          Date: {date}\r\n\
@@ -382,7 +382,7 @@ fn render_splice_response_head(
          {last_modified_header}\
          {etag_header}\
          Accept-Ranges: bytes\r\n\
-         Age: {age}\r\n\
+         Age: 0\r\n\
          {content_range_header}\
          \r\n",
         last_modified_header = OptHeader("Last-Modified", upstream_resp.last_modified.as_deref()),
@@ -560,9 +560,11 @@ async fn prepare_cache_target(
         }
     };
 
-    // Create/open the output file: partial path for permanent files, random temp for volatile.
-    // Defuse the guard once we take ownership of the partial path — from here on, the
-    // download's own TempPath (keep_on_drop: true) manages the file lifetime.
+    // Create/open the output file: the partial path for permanent files, a
+    // random temp file for volatile ones. The permanent arms take over the
+    // caller's path guard, whose `keep_on_drop: true` is what leaves a failed
+    // download's partial on disk for a later resume; the volatile temp file is
+    // removed on drop instead.
     let (tempfile, temppath) = match partial {
         partial_file::PartialDownload::Resumable { mut file, guard } => {
             // Resume: use the file already opened during the partial-file check.
@@ -1047,21 +1049,6 @@ async fn plan_upstream_response(
     } else {
         None
     };
-    // After a redirect every further upstream exchange -- including the
-    // discard-and-retry below -- talks to the redirect target, not to the
-    // original mirror with the redirected path.
-    let dial_mirror = conn_details.upstream_mirror();
-    let (upstream_mirror, host_authority, upstream_path) =
-        redirect
-            .as_ref()
-            .map_or((&dial_mirror, host_authority, upstream_path), |target| {
-                (
-                    &target.mirror,
-                    target.authority.as_str(),
-                    target.path.as_str(),
-                )
-            });
-
     exchange.response.discard_invalid_validators(conn_details);
 
     // Volatile stale-but-present revalidation that returned a fresh body
@@ -1103,6 +1090,20 @@ async fn plan_upstream_response(
                 ),
             }
             if anomaly.needs_refetch() {
+                // After a redirect the discard-and-retry talks to the
+                // redirect target, not to the original mirror with the
+                // redirected path.
+                let dial_mirror = conn_details.upstream_mirror();
+                let (upstream_mirror, host_authority, upstream_path) = redirect.as_ref().map_or(
+                    (&dial_mirror, host_authority, upstream_path),
+                    |target| {
+                        (
+                            &target.mirror,
+                            target.authority.as_str(),
+                            target.path.as_str(),
+                        )
+                    },
+                );
                 discard_partial_and_retry(
                     &mut resume.partial,
                     upstream_mirror,
@@ -1231,42 +1232,31 @@ async fn reject_upstream_response(
 
 /// The bytes the splice loop has to move once the body prefix that arrived
 /// with the headers is subtracted from the declared body length. `Ok(None)`
-/// means the prefix exceeds that length: a protocol violation answered with
-/// 502 (the caller's `UnconsumedBodyGuard` poisons the connection on drop).
+/// means the prefix exceeds that length -- the same condition
+/// [`UpstreamResponse::check_relayable`] refuses on the relay paths, so it
+/// takes the same [`RejectReason::InconsistentBodyFraming`] 502 rather than
+/// a wording and a body of its own.
 async fn splice_body_count(
+    upstream: &mut PoolGuard,
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     body_content_length: NonZero<u64>,
     body_prefix: &[u8],
 ) -> Result<Option<u64>, SpliceProxyError> {
-    if let Some(splice_count) = body_content_length
-        .get()
-        .checked_sub(body_prefix.len() as u64)
-    {
+    let prefix_len = body_prefix.len() as u64;
+    if let Some(splice_count) = body_content_length.get().checked_sub(prefix_len) {
         return Ok(Some(splice_count));
     }
-    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-    error!(
-        "splice proxy: body prefix ({} bytes) exceeds body content length ({} bytes) \
-         for {} from mirror {}; returning 502",
-        body_prefix.len(),
-        body_content_length,
-        conn_details.debname,
-        conn_details.mirror
-    );
-    write_invalid_response(
-        client.stream,
-        client.version,
-        client.action,
-        StatusCode::BAD_GATEWAY,
-        "body Content-Length mismatch",
-        None,
+    reject_upstream_response(
+        upstream,
+        client,
+        conn_details,
+        RejectReason::InconsistentBodyFraming {
+            content_length: body_content_length.get(),
+            prefix_len,
+        },
     )
-    .await
-    .map_err(|err| SpliceProxyError::Client {
-        phase: "body-CL mismatch 502",
-        err,
-    })?;
+    .await?;
     Ok(None)
 }
 
@@ -1424,20 +1414,14 @@ async fn write_body_prefix(
         return Ok(false);
     }
 
-    // File cursor for range-filtering the pre-loop buffer.
-    let pre_loop_file_pos: u64 = resume_offset;
-
     // If the client has disconnected, we log and keep filling the cache; if
     // the splice loop later observes the broken client connection, it will
     // continue via its disconnect/cache-only handling instead of dropping
     // these prefix bytes from the cache entirely.
     let mut prefix_client_failed = false;
-    let client_slice = range_slice(
-        body_prefix,
-        pre_loop_file_pos,
-        range_plan.start,
-        range_plan.len,
-    );
+    // The prefix starts at the resume offset: it is the first body byte the
+    // upstream sent, and everything before it is already in the partial file.
+    let client_slice = range_slice(body_prefix, resume_offset, range_plan.start, range_plan.len);
     if !client_slice.is_empty() {
         let config = global_config();
         let mut prefix_rc = RateChecker::from_config(config);
@@ -1496,12 +1480,23 @@ struct BodyTransferFailure {
     err: BodyTransferError,
 }
 
+/// A completed body transfer ([`transfer_body`]): [`body::BodyOutcome`] with
+/// the target folded back in (its barrier travelled through the body loop)
+/// and the delivered byte count already added to the rate timestamps.
+struct BodyTransferred {
+    target: CacheTarget,
+    /// Set when the first client was demoted to a file-serve task; the
+    /// caller awaits it after consuming the target's barrier.
+    demoted_handle: Option<DemotedClientHandle>,
+    /// The client went away mid-body (as opposed to being demoted, or never
+    /// having been attached).
+    client_disconnected: bool,
+}
+
 /// Transfer the remaining `splice_count` body bytes after the prefix:
 /// zero-copy `splice(2)` for a TCP (plain or kTLS) upstream, userspace read
-/// plus tee+splice fan-out for userspace TLS. Returns the target (its
-/// barrier travelled through the body loop), the handle of the file-serve
-/// task when the first client was demoted to it, and whether the client
-/// went away mid-body. Both rate windows end here when the loop ran.
+/// plus tee+splice fan-out for userspace TLS. Both rate windows end here
+/// when the loop ran.
 ///
 /// `client_stream` is `None` for the client-less detached download, which
 /// also passes a zero-length `range_plan` so the loops run cache-only.
@@ -1518,9 +1513,13 @@ async fn transfer_body(
     splice_count: u64,
     range_plan: &ClientRangePlan,
     rates: &mut RateTimestamps,
-) -> Result<(CacheTarget, Option<DemotedClientHandle>, bool), BodyTransferFailure> {
+) -> Result<BodyTransferred, BodyTransferFailure> {
     if splice_count == 0 {
-        return Ok((target, None, false));
+        return Ok(BodyTransferred {
+            target,
+            demoted_handle: None,
+            client_disconnected: false,
+        });
     }
 
     let body_offset: i64 = (resume_offset + body_content_length.get() - splice_count)
@@ -1595,8 +1594,8 @@ async fn transfer_body(
     let BodyOutcome {
         dbarrier: returned_dbarrier,
         demoted_handle,
-        client_disconnected: body_client_disconnected,
-        client_bytes: body_client_bytes,
+        client_disconnected,
+        client_bytes,
     } = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -1612,8 +1611,12 @@ async fn transfer_body(
     // again after the file-serve task completes.
     rates.t_upstream_done = PreciseInstant::now();
     rates.t_client_done = rates.t_upstream_done;
-    rates.client_bytes_sent += body_client_bytes;
-    Ok((target, demoted_handle, body_client_disconnected))
+    rates.client_bytes_sent += client_bytes;
+    Ok(BodyTransferred {
+        target,
+        demoted_handle,
+        client_disconnected,
+    })
 }
 
 /// If the first client was demoted to file-serve, wait for the background
@@ -1917,8 +1920,14 @@ async fn splice_proxy_drive(
     };
 
     let body_prefix = &header_buf[header_end..];
-    let Some(splice_count) =
-        splice_body_count(client, conn_details, body_content_length, body_prefix).await?
+    let Some(splice_count) = splice_body_count(
+        &mut upstream_guard,
+        client,
+        conn_details,
+        body_content_length,
+        body_prefix,
+    )
+    .await?
     else {
         return Ok(SpliceProxyOutcome::Served);
     };
@@ -2027,7 +2036,11 @@ async fn splice_proxy_drive(
     // Reassigned after the splice body block and the demoted file-serve task.
     rates.t_client_done = PreciseInstant::now();
 
-    let (target, demoted_handle, body_client_disconnected) = transfer_body(
+    let BodyTransferred {
+        target,
+        demoted_handle,
+        client_disconnected: body_client_disconnected,
+    } = transfer_body(
         &mut upstream_guard,
         Some(client.stream),
         target,

@@ -137,7 +137,7 @@ async fn serve_cached_cleanup_file(
 /// full re-download of every index each cleanup cycle, and a stale index errs
 /// toward *keeping* cached debs — the conservative direction for cleanup.
 #[must_use]
-pub(crate) async fn splice_cleanup_request(
+async fn splice_cleanup_request(
     conn_details: &ConnectionDetails,
     req: &http::Request<http_body_util::Empty<()>>,
 ) -> http::Response<ProxyCacheBody> {
@@ -250,7 +250,6 @@ async fn cleanup_upstream_fetch(
 }
 
 #[must_use]
-#[cfg(not(feature = "hyper"))]
 pub(crate) async fn process_cache_request(
     conn_details: ConnectionDetails,
     req: http::Request<http_body_util::Empty<()>>,

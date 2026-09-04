@@ -30,8 +30,9 @@ use crate::precise_instant::PreciseInstant;
 
 use super::upstream::{ConnLabel, PoolGuard, UnconsumedBodyGuard};
 use super::{
-    BodyTransferFailure, CacheTarget, ClientRangePlan, CompletionClient, RateTimestamps,
-    commit_and_record, log_splice_completion, transfer_body, write_body_prefix_to_cache,
+    BodyTransferFailure, BodyTransferred, CacheTarget, ClientRangePlan, CompletionClient,
+    RateTimestamps, commit_and_record, log_splice_completion, transfer_body,
+    write_body_prefix_to_cache,
 };
 
 /// A download whose client has been nudged away: everything
@@ -137,7 +138,11 @@ impl DetachedDownload {
         )
         .await
         {
-            Ok((target, demoted_handle, _client_disconnected)) => {
+            Ok(BodyTransferred {
+                target,
+                demoted_handle,
+                client_disconnected: _,
+            }) => {
                 debug_assert!(
                     demoted_handle.is_none(),
                     "a client-less transfer has no client to demote"

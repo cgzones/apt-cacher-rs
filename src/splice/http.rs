@@ -554,6 +554,27 @@ pub(super) async fn send_and_read_headers(
     Ok((resp, hdr_buf, hdr_end))
 }
 
+/// Feed `n` freshly read upstream bytes to the mirror-rate checker and fail
+/// with the shared `TimedOut` error once the mirror has fallen below
+/// `min_download_rate`. A `None` checker means the limit is disabled.
+///
+/// The one gate for every body reader below; the `BYTES_DOWNLOADED_UPSTREAM`
+/// bump stays at the call sites, which differ in what they check between the
+/// read and this gate.
+fn check_upstream_read_rate(
+    rate_checker: &mut Option<RateChecker>,
+    n: usize,
+) -> std::io::Result<()> {
+    let Some(rate_checker) = rate_checker.as_mut() else {
+        return Ok(());
+    };
+    rate_checker.add(n);
+    match rate_checker.check_fail(RateCheckDirection::Upstream) {
+        Some(rate) => Err(rate.to_timeout_io_error(format_args!(" for upstream"))),
+        None => Ok(()),
+    }
+}
+
 /// The `TimedOut` error every upstream body read in this module returns:
 /// bumps `HTTP_TIMEOUT_UPSTREAM_READ` and names the phase alongside the
 /// budget that ran out.
@@ -615,12 +636,7 @@ async fn forward_upstream_body(
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
-        if let Some(ref mut rc) = rate_checker {
-            rc.add(n);
-            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
-            }
-        }
+        check_upstream_read_rate(&mut rate_checker, n)?;
 
         write_all_to_stream_rated(
             client,
@@ -677,12 +693,7 @@ async fn forward_upstream_body_until_eof(
             ));
         }
 
-        if let Some(ref mut rc) = rate_checker {
-            rc.add(n);
-            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
-            }
-        }
+        check_upstream_read_rate(&mut rate_checker, n)?;
 
         write_all_to_stream_rated(
             client,
@@ -1015,12 +1026,7 @@ async fn forward_upstream_chunked_body(
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
-        if let Some(ref mut rc) = rate_checker {
-            rc.add(n);
-            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
-            }
-        }
+        check_upstream_read_rate(&mut rate_checker, n)?;
 
         if forward_chunked_buf(
             &mut decoder,
@@ -1089,12 +1095,7 @@ async fn read_body_to_vec_until_eof(
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
-        if let Some(ref mut rc) = rate_checker {
-            rc.add(n);
-            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
-            }
-        }
+        check_upstream_read_rate(&mut rate_checker, n)?;
     }
 
     Ok(body)
@@ -1115,7 +1116,7 @@ async fn read_body_to_vec_with_content_length(
     })?;
     if content_length > max_bytes {
         return Err(std::io::Error::other(
-            "content-length exceeds cleanup buffering cap",
+            "content-length exceeds the body buffering cap",
         ));
     }
     if prefix.len() > content_length {
@@ -1150,9 +1151,9 @@ async fn read_body_to_vec_with_content_length(
             }
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err),
-            Err(tokio::time::error::Elapsed { .. }) => {
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                 return Err(upstream_read_timeout(
-                    "cleanup body buffering",
+                    "length-delimited body buffering",
                     config.http_timeout,
                 ));
             }
@@ -1160,12 +1161,7 @@ async fn read_body_to_vec_with_content_length(
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
-        if let Some(ref mut rc) = rate_checker {
-            rc.add(n);
-            if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
-            }
-        }
+        check_upstream_read_rate(&mut rate_checker, n)?;
     }
 
     Ok(body)
@@ -1191,12 +1187,12 @@ async fn read_dechunk_body_to_vec(
     let mut decoder = ChunkDecoder::new(max_bytes);
     let mut read_buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
 
-    // Process the prefix first, then read from upstream.
-    let pending: &[u8] = prefix;
-    let mut need_read = prefix.is_empty();
+    // The bytes that arrived with the headers are decoded first; every later
+    // iteration reads from upstream (`take` leaves an empty slice behind).
+    let mut pending: &[u8] = prefix;
 
     loop {
-        let data = if need_read {
+        let data = if pending.is_empty() {
             read_buf.clear();
             let n =
                 match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut read_buf))
@@ -1218,16 +1214,10 @@ async fn read_dechunk_body_to_vec(
                     }
                 };
             metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
-            if let Some(ref mut rc) = rate_checker {
-                rc.add(n);
-                if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                    return Err(rate.to_timeout_io_error(format_args!(" for upstream")));
-                }
-            }
+            check_upstream_read_rate(&mut rate_checker, n)?;
             &read_buf[..n]
         } else {
-            need_read = true;
-            pending
+            std::mem::take(&mut pending)
         };
 
         let consumed = match decoder.feed(data, |payload| body.extend_from_slice(&data[payload])) {

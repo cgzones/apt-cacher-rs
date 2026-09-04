@@ -138,6 +138,16 @@ fn clear_pipe_writable_cache(sender: &pipe::Sender) {
     let _ignore = sender.try_io(|| -> std::io::Result<()> { Err(ErrorKind::WouldBlock.into()) });
 }
 
+/// The client's peer address for a log line. The three client-abandoned
+/// lines below name the client this way rather than through `ClientInfo`,
+/// which the body loops do not carry; a socket already torn down reports
+/// `<unknown>`.
+fn peer_addr_for_log(client: &TcpStream) -> String {
+    client
+        .peer_addr()
+        .map_or_else(|_err| String::from("<unknown>"), |addr| addr.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Socket-to-socket splice proxy
 // ---------------------------------------------------------------------------
@@ -336,7 +346,7 @@ struct BodyTransfer<'a> {
     client_remaining: u64,
     demoted_handle: Option<DemotedClientHandle>,
     range_filter: &'a SpliceRangeFilter,
-    pub(super) cache_path: &'a Path,
+    cache_path: &'a Path,
 }
 
 /// What a body loop hands back to `splice_proxy_drive`.
@@ -831,9 +841,7 @@ pub(super) async fn splice_proxy_body(
                     Err(err) if err.kind() == ErrorKind::TimedOut => {
                         info!(
                             "splice proxy: client {} timed out during boundary chunk; abandoning the client:  {}",
-                            client
-                                .peer_addr()
-                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                            peer_addr_for_log(client),
                             ErrorReport(&err)
                         );
                         xfer.client_status = ClientStatus::Disconnected;
@@ -868,6 +876,10 @@ async fn pwrite_buf_to_file(
 
     let file_fd = file.as_raw_fd();
 
+    // Set once by whichever arm ends the loop; the buffer is handed back to
+    // the caller after it, on every path.
+    let mut outcome: std::io::Result<()> = Ok(());
+
     while written < size {
         let (pwrite_result, temp_return) = tokio::task::spawn_blocking(move || {
             let avail = &temp[written..size];
@@ -884,21 +896,11 @@ async fn pwrite_buf_to_file(
 
         match pwrite_result {
             Ok(0) => {
-                std::mem::swap(&mut temp, buf);
-                debug_assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
-                debug_assert_eq!(
-                    buf.len(),
-                    buf_len,
-                    "buffer should have the same length as before"
-                );
-                debug_assert!(
-                    written < size,
-                    "should have written less than the requested number of bytes"
-                );
-                return Err(std::io::Error::new(
+                outcome = Err(std::io::Error::new(
                     ErrorKind::WriteZero,
                     "pwrite returned 0",
                 ));
+                break;
             }
             Ok(n) => {
                 written += n;
@@ -912,18 +914,8 @@ async fn pwrite_buf_to_file(
             }
             Err(nix::errno::Errno::EINTR) => {}
             Err(errno) => {
-                std::mem::swap(&mut temp, buf);
-                debug_assert!(temp.is_empty(), "temp buffer should be empty after re-swap");
-                debug_assert_eq!(
-                    buf.len(),
-                    buf_len,
-                    "buffer should have the same length as before"
-                );
-                debug_assert!(
-                    written < size,
-                    "should have written less than the requested number of bytes"
-                );
-                return Err(errno_to_io_error(errno, "pwrite(2) failed"));
+                outcome = Err(errno_to_io_error(errno, "pwrite(2) failed"));
+                break;
             }
         }
     }
@@ -935,12 +927,19 @@ async fn pwrite_buf_to_file(
         buf_len,
         "buffer should have the same length as before"
     );
-    debug_assert_eq!(
-        written, size,
-        "should have written the requested number of bytes"
-    );
+    if outcome.is_ok() {
+        debug_assert_eq!(
+            written, size,
+            "should have written the requested number of bytes"
+        );
+    } else {
+        debug_assert!(
+            written < size,
+            "should have written less than the requested number of bytes"
+        );
+    }
 
-    Ok(())
+    outcome
 }
 
 /// Transfer body from TLS upstream to client+cache in userspace.
@@ -1144,9 +1143,7 @@ async fn write_client_or_demote<'a>(
                     Err(err) if err.kind() == ErrorKind::TimedOut => {
                         info!(
                             "splice proxy: client {} timed out during TLS body; abandoning the client:  {}",
-                            client
-                                .peer_addr()
-                                .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                            peer_addr_for_log(client),
                             ErrorReport(&err)
                         );
                         xfer.client_status = ClientStatus::Disconnected;
@@ -1510,9 +1507,7 @@ async fn tee_and_splice(
                                 Err(err) if err.kind() == ErrorKind::TimedOut => {
                                     info!(
                                         "splice proxy: client {} timed out during zero-copy body; abandoning the client:  {}",
-                                        client
-                                            .peer_addr()
-                                            .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                                        peer_addr_for_log(client),
                                         ErrorReport(&err)
                                     );
                                     xfer.client_status = ClientStatus::Disconnected;
