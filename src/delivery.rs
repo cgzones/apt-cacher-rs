@@ -235,3 +235,27 @@ pub(crate) fn finish_cached_serve(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Mechanism, Role};
+
+    /// `docs/logging.md` fixes the completion-line wording: a late-joiner
+    /// serve says "joining client", never "client", and the mechanism token
+    /// is the `via <token>` an operator greps for.
+    #[test]
+    fn completion_line_wording_stays_the_documented_one() {
+        assert_eq!(Role::Cached.words(), ("cached", "client"));
+        assert_eq!(Role::LateJoiner.words(), ("downloading", "joining client"));
+
+        #[cfg(feature = "hyper")]
+        {
+            assert_eq!(Mechanism::Stream.via(), "stream");
+            assert_eq!(Mechanism::Channel.via(), "channel");
+        }
+        #[cfg(all(feature = "mmap", feature = "hyper"))]
+        assert_eq!(Mechanism::Mmap.via(), "mmap");
+        #[cfg(feature = "sendfile")]
+        assert_eq!(Mechanism::Sendfile.via(), "sendfile");
+    }
+}

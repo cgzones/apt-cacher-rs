@@ -112,6 +112,15 @@ fn empty_body() -> ProxyCacheBody {
     ProxyCacheBody::Boxed(BoxBody::new(body))
 }
 
+/// The canonical `500` for a cache-file access failure.  The failure itself
+/// is logged (and `CACHE_IO_FAILURE`/`CACHE_NON_REGULAR`-counted) at the site
+/// that detected it; this only fixes the one status/body pair every such site
+/// answers with.
+#[must_use]
+fn cache_access_failure() -> Response<ProxyCacheBody> {
+    quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure")
+}
+
 /// On success the request `Parts` are handed back alongside the response —
 /// they were consumed by the request anyway, and returning them lets the
 /// rare redirect-follow path rebuild a request without the caller cloning
@@ -424,6 +433,30 @@ where
     ProxyCacheBody::Boxed(BoxBody::new(rated))
 }
 
+/// Finish an uncached passthrough: account the upstream body, apply the
+/// client rate check and append our `Via`.  The three passthrough sites (a
+/// fetch the cache pipeline declined, and the simple proxy with and without a
+/// followed redirect) differ only in the [`Subject`].
+#[must_use]
+fn passthrough_response(
+    response: Response<Incoming>,
+    subject: Subject,
+    client: ClientInfo,
+) -> Response<ProxyCacheBody> {
+    let (parts, body) = response.into_parts();
+
+    let body = rated_client_body(AccountedBody::new(body, subject, |_| false), client);
+
+    let mut response = Response::from_parts(parts, body);
+    response
+        .headers_mut()
+        .append(VIA, HeaderValue::from_static(APP_VIA));
+
+    trace!("Outgoing response: {response:?}");
+
+    response
+}
+
 #[cfg(feature = "mmap")]
 #[expect(
     clippy::inline_always,
@@ -449,7 +482,7 @@ fn serve_cached_file_mmap(
                 conn_details.mirror,
                 conn_details.client
             );
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            return cache_access_failure();
         }
     };
 
@@ -510,7 +543,7 @@ fn serve_cached_file_mmap(
         Some(memory_map)
     }) else {
         metrics::CACHE_IO_FAILURE.increment();
-        return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+        return cache_access_failure();
     };
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
@@ -565,7 +598,7 @@ async fn serve_unfinished_file(
     let md = match regular_file_metadata(&file, &file_path) {
         Ok(data) => data,
         Err(CacheAccessFailure(_)) => {
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            return cache_access_failure();
         }
     };
 
@@ -772,7 +805,7 @@ async fn serve_cached_file(
         None => match regular_file_metadata(&file, &file_path) {
             Ok(m) => m,
             Err(CacheAccessFailure(_)) => {
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+                return cache_access_failure();
             }
         },
     };
@@ -901,7 +934,7 @@ async fn serve_cached_file_buf(
             file_path.display(),
             ErrorReport(&err)
         );
-        return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+        return cache_access_failure();
     }
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
@@ -1060,7 +1093,7 @@ async fn serve_volatile_file(
     let mdata = match regular_file_metadata(&file, &file_path) {
         Ok(data) => data,
         Err(CacheAccessFailure(_)) => {
-            return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+            return cache_access_failure();
         }
     };
     let modified_system_time = mdata
@@ -1182,8 +1215,8 @@ async fn serve_cache_miss(
 async fn download_file(
     conn_details: &ConnectionDetails,
     warn_on_override: bool,
-    input: (Incoming, ContentLength),
-    output: (tokio::fs::File, TempPath),
+    (body, content_length): (Incoming, ContentLength),
+    (outfile, outpath): (tokio::fs::File, TempPath),
     mut dbarrier: DownloadBarrier,
     resume_offset: u64,
     request_sent: PreciseInstant,
@@ -1197,14 +1230,10 @@ async fn download_file(
         conn_details.debname, conn_details.mirror, conn_details.client
     );
 
-    let body = input.0;
-    let content_length = input.1;
-
     let mut bytes = 0;
     let buf_size = config.buffer_size;
 
-    let mut writer = tokio::io::BufWriter::with_capacity(buf_size, output.0);
-    let outpath = output.1;
+    let mut writer = tokio::io::BufWriter::with_capacity(buf_size, outfile);
 
     let mut body = MaybeRated::new(
         body,
@@ -1420,19 +1449,14 @@ async fn download_file(
     send_db_command(cmd).await;
 }
 
-/// Log and build the canonical 503 for a download origination refused by the
-/// `max_upstream_downloads` cap (`InsertOutcome::AtCapacity`). The
-/// `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened inside
-/// `ActiveDownloads::lookup_or_insert`, the enforcement site shared with the
-/// splice backend.
-#[must_use]
 /// Parse a redirect response's `Location` into a URI.
 ///
 /// The other reasons a redirect is not followed (relative target, unsupported
-/// scheme, host not permitted) each log at the call site; a `Location` that
-/// does not parse -- or is missing entirely -- would otherwise leave nothing but a
-/// bare "failed with code 302" further down. `source` and `what` only name
-/// the mirror and resource for the log line.
+/// scheme, host not permitted) are named by [`log_unfollowed_redirect`]; a
+/// `Location` that does not parse -- or is missing entirely -- would otherwise
+/// leave nothing but a bare "failed with code 302" further down. `source` and
+/// `what` only name the mirror and resource for the log line.
+#[must_use]
 fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) -> Option<Uri> {
     let status = response.status();
     let Some(location) = response.headers().get(LOCATION) else {
@@ -1453,6 +1477,33 @@ fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) 
     parsed
 }
 
+/// Log why an upstream redirect was not followed, at the point where the
+/// follow conditions (absolute `http(s)` target naming a permitted host) have
+/// already failed.  Shared by the cache-fetch and the simple-proxy redirect
+/// handling so both name the same reason for the same `Location`.
+fn log_unfollowed_redirect(moved_uri: &Uri) {
+    if moved_uri.scheme().is_none() {
+        // A relative Location (`/pool/...`) is legal per RFC 9110, but this
+        // backend only follows absolute targets. Reported before the scheme
+        // branch below, which would otherwise call it an unsupported scheme.
+        debug!("Moved URI `{moved_uri}` is relative; not following the redirect");
+    } else if moved_uri.scheme().is_some_and(|scheme| {
+        *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
+    }) {
+        debug!("Scheme of moved URI `{moved_uri}` not supported");
+    } else if let Some(moved_host) = moved_uri.host() {
+        debug!("Host `{moved_host}` of moved URI not permitted");
+    } else {
+        debug!("Moved URI has no host; not following the redirect");
+    }
+}
+
+/// Log and build the canonical 503 for a download origination refused by the
+/// `max_upstream_downloads` cap (`InsertOutcome::AtCapacity`). The
+/// `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened inside
+/// `ActiveDownloads::lookup_or_insert`, the enforcement site shared with the
+/// splice backend.
+#[must_use]
 fn upstream_cap_rejection(
     conn_details: &ConnectionDetails,
     max: NonZero<usize>,
@@ -1710,7 +1761,7 @@ async fn serve_new_file(
             }) => {
                 // Error already logged in `open_partial_file()`.
                 drop(guard);
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+                return cache_access_failure();
             }
         }
     } else {
@@ -1780,19 +1831,8 @@ async fn serve_new_file(
             trace!("Forwarded redirected response: {redirected_response:?}");
 
             fwd_response = redirected_response;
-        } else if moved_uri.scheme().is_none() {
-            // A relative Location (`/pool/...`) is legal per RFC 9110, but this
-            // backend only follows absolute targets. Reported before the scheme
-            // branch below, which would otherwise call it an unsupported scheme.
-            debug!("Moved URI `{moved_uri}` is relative; not following the redirect");
-        } else if moved_uri.scheme().is_none_or(|scheme| {
-            *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
-        }) {
-            debug!("Scheme of moved URI `{moved_uri:?}` not supported");
-        } else if let Some(moved_host) = moved_uri.host() {
-            debug!("Host `{moved_host}` of moved URI not permitted");
         } else {
-            debug!("Moved URI has no host; not following the redirect");
+            log_unfollowed_redirect(&moved_uri);
         }
     }
 
@@ -1945,31 +1985,17 @@ async fn serve_new_file(
                 return quick_response(fwd_response.status(), "");
             }
 
-            let (parts, body) = fwd_response.into_parts();
-
-            let body = rated_client_body(
-                AccountedBody::new(
-                    body,
-                    Subject::Passthrough {
-                        host: conn_details.mirror.format_authority().to_string(),
-                        path: req_uri.path().to_owned(),
-                        client: conn_details.client,
-                        request_received_at: conn_details.request_received_at,
-                        request_sent: upstream_request_sent,
-                    },
-                    |_| false,
-                ),
+            return passthrough_response(
+                fwd_response,
+                Subject::Passthrough {
+                    host: conn_details.mirror.format_authority().to_string(),
+                    path: req_uri.path().to_owned(),
+                    client: conn_details.client,
+                    request_received_at: conn_details.request_received_at,
+                    request_sent: upstream_request_sent,
+                },
                 conn_details.client,
             );
-
-            let mut response = Response::from_parts(parts, body);
-            response
-                .headers_mut()
-                .append(VIA, HeaderValue::from_static(APP_VIA));
-
-            trace!("Outgoing response: {response:?}");
-
-            return response;
         }
         DownloadPlan::Reject(reason) => {
             reason.record_metrics();
@@ -2143,10 +2169,7 @@ async fn serve_new_file(
                         conn_details.debname,
                         ErrorReport(&err)
                     );
-                    return quick_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Cache Access Failure",
-                    );
+                    return cache_access_failure();
                 }
             };
             if current_size != resume_offset {
@@ -2154,7 +2177,7 @@ async fn serve_new_file(
                     "Partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd; aborting the resume and returning 500",
                     conn_details.debname, conn_details.mirror
                 );
-                return quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure");
+                return cache_access_failure();
             }
             (file, guard)
         }
@@ -2169,10 +2192,7 @@ async fn serve_new_file(
                         path.display(),
                         ErrorReport(&err)
                     );
-                    return quick_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Cache Access Failure",
-                    );
+                    return cache_access_failure();
                 }
             }
         }
@@ -2188,10 +2208,7 @@ async fn serve_new_file(
                         tmppath.display(),
                         ErrorReport(&err)
                     );
-                    return quick_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Cache Access Failure",
-                    );
+                    return cache_access_failure();
                 }
             }
         }
@@ -2388,14 +2405,14 @@ pub(crate) async fn process_cache_request(
                 cache_path.display(),
                 ErrorReport(&err)
             );
-            quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure")
+            cache_access_failure()
         }
     }
 }
 
-#[must_use]
 /// Answer a `CONNECT` whose client already passed the proxy-client ACL in
 /// `preflight_method`.
+#[must_use]
 fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<ProxyCacheBody> {
     let config = global_config();
 
@@ -2569,6 +2586,17 @@ fn strip_request_body(client: ClientInfo, req: Request<Incoming>) -> Request<Emp
     Request::from_parts(parts, Empty::new())
 }
 
+/// A request the cache pipeline declined, on its way to the simple proxy.
+/// Carries what the forwarding tail needs, whichever verdict produced it:
+/// the sendfile backend's [`HandoffPlan::Passthrough`] or this backend's own
+/// [`dispatch_request`].
+struct PassthroughRequest {
+    reason: PassthroughReason,
+    requested_host: ClientHost,
+    requested_port: Option<NonZero<u16>>,
+    request_received_at: PreciseInstant,
+}
+
 /// Entry point for every request hyper serves.  With a [`HandoffPlan`] the
 /// request was already pre-flighted and dispatched by the sendfile backend
 /// (which also bumped `REQUESTS_TOTAL` for it); without one this is the
@@ -2582,12 +2610,7 @@ async fn pre_process_client_request(
 ) -> Response<ProxyCacheBody> {
     trace!("Incoming request: {req:?}");
 
-    let passthrough: Option<(
-        PassthroughReason,
-        ClientHost,
-        Option<NonZero<u16>>,
-        PreciseInstant,
-    )> = match handoff {
+    let handoff_passthrough: Option<PassthroughRequest> = match handoff {
         #[cfg(not(feature = "splice"))]
         Some(HandoffPlan::CacheMiss {
             conn_details,
@@ -2614,91 +2637,97 @@ async fn pre_process_client_request(
             requested_host,
             requested_port,
             request_received_at,
-        }) => Some((reason, requested_host, requested_port, request_received_at)),
+        }) => Some(PassthroughRequest {
+            reason,
+            requested_host,
+            requested_port,
+            request_received_at,
+        }),
         None => None,
     };
 
-    let (req, passthrough_reason, requested_host, requested_port, passthrough_request_received_at) =
-        if let Some((reason, requested_host, requested_port, request_received_at)) = passthrough {
-            (
-                strip_request_body(client, req),
-                reason,
-                requested_host,
-                requested_port,
-                request_received_at,
-            )
-        } else {
-            metrics::REQUESTS_TOTAL.increment();
+    let (req, passthrough) = if let Some(passthrough) = handoff_passthrough {
+        (strip_request_body(client, req), passthrough)
+    } else {
+        metrics::REQUESTS_TOTAL.increment();
 
-            let acls = ClientAcls::from(global_config());
+        let acls = ClientAcls::from(global_config());
 
-            match preflight_method(req.method().as_str(), &client, &acls) {
-                Ok(RequestKind::Connect) => return connect_response(client, req),
-                Ok(RequestKind::Get) => {}
-                Err(reason) => {
-                    let (status, msg) = reason.response_parts();
-                    return quick_response(status, msg);
-                }
-            }
-
-            let via_values = req
-                .headers()
-                .get_all(VIA)
-                .iter()
-                .filter_map(|v| v.to_str().ok());
-            if let Err(reason) = preflight_via(via_values, &client) {
+        match preflight_method(req.method().as_str(), &client, &acls) {
+            Ok(RequestKind::Connect) => return connect_response(client, req),
+            Ok(RequestKind::Get) => {}
+            Err(reason) => {
                 let (status, msg) = reason.response_parts();
                 return quick_response(status, msg);
             }
+        }
 
-            let (requested_host, requested_port) = match preflight_target(
-                req.uri(),
-                req.version() == http::Version::HTTP_11,
-                || req.headers().contains_key(HOST),
-                &client,
-                &acls,
-            ) {
-                Ok(RequestTarget::Proxy { host, port }) => (host, port),
-                Ok(RequestTarget::WebUi) => {
-                    return serve_web_interface(req.uri(), &appstate)
-                        .await
-                        .into_hyper_response();
-                }
-                Err(reason) => {
-                    let (status, msg) = reason.response_parts();
-                    return quick_response(status, msg);
-                }
-            };
+        let via_values = req
+            .headers()
+            .get_all(VIA)
+            .iter()
+            .filter_map(|v| v.to_str().ok());
+        if let Err(reason) = preflight_via(via_values, &client) {
+            let (status, msg) = reason.response_parts();
+            return quick_response(status, msg);
+        }
 
-            let requested_host = match authorize_cache_access(&client, requested_host) {
-                Ok(rh) => rh,
-                Err((status, msg)) => return quick_response(status, msg),
-            };
+        let (requested_host, requested_port) = match preflight_target(
+            req.uri(),
+            req.version() == http::Version::HTTP_11,
+            || req.headers().contains_key(HOST),
+            &client,
+            &acls,
+        ) {
+            Ok(RequestTarget::Proxy { host, port }) => (host, port),
+            Ok(RequestTarget::WebUi) => {
+                return serve_web_interface(req.uri(), &appstate)
+                    .await
+                    .into_hyper_response();
+            }
+            Err(reason) => {
+                let (status, msg) = reason.response_parts();
+                return quick_response(status, msg);
+            }
+        };
 
-            let req = strip_request_body(client, req);
+        let requested_host = match authorize_cache_access(&client, requested_host) {
+            Ok(rh) => rh,
+            Err((status, msg)) => return quick_response(status, msg),
+        };
 
-            match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await
-            {
-                DispatchOutcome::Cache(conn_details) => {
-                    return process_cache_request(conn_details, req, appstate).await;
-                }
-                DispatchOutcome::Reject(reason) => {
-                    let (status, msg) = reason.response_parts();
-                    return quick_response(status, msg);
-                }
-                DispatchOutcome::Passthrough {
-                    reason,
-                    requested_host,
-                    request_received_at,
-                } => (
-                    req,
+        let req = strip_request_body(client, req);
+
+        match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await {
+            DispatchOutcome::Cache(conn_details) => {
+                return process_cache_request(conn_details, req, appstate).await;
+            }
+            DispatchOutcome::Reject(reason) => {
+                let (status, msg) = reason.response_parts();
+                return quick_response(status, msg);
+            }
+            DispatchOutcome::Passthrough {
+                reason,
+                requested_host,
+                request_received_at,
+            } => (
+                req,
+                PassthroughRequest {
                     reason,
                     requested_host,
                     requested_port,
                     request_received_at,
-                ),
-            }
-        };
+                },
+            ),
+        }
+    };
+
+    let PassthroughRequest {
+        reason: passthrough_reason,
+        requested_host,
+        requested_port,
+        request_received_at: passthrough_request_received_at,
+    } = passthrough;
 
     assert_eq!(req.method(), Method::GET, "Filtered at function start");
 
@@ -2787,73 +2816,33 @@ async fn pre_process_client_request(
 
             trace!("Redirected response: {redirected_response:?}");
 
-            let (parts, body) = redirected_response.into_parts();
-
-            let body = rated_client_body(
-                AccountedBody::new(
-                    body,
-                    Subject::Passthrough {
-                        host: requested_host.to_string(),
-                        path: request_path.clone(),
-                        client,
-                        request_received_at: passthrough_request_received_at,
-                        request_sent: redirected_request_sent,
-                    },
-                    |_| false,
-                ),
+            return passthrough_response(
+                redirected_response,
+                Subject::Passthrough {
+                    host: requested_host.to_string(),
+                    path: request_path,
+                    client,
+                    request_received_at: passthrough_request_received_at,
+                    request_sent: redirected_request_sent,
+                },
                 client,
             );
-
-            let mut response = Response::from_parts(parts, body);
-            response
-                .headers_mut()
-                .append(VIA, HeaderValue::from_static(APP_VIA));
-
-            trace!("Outgoing response: {response:?}");
-
-            return response;
-        } else if moved_uri.scheme().is_none() {
-            // A relative Location (`/pool/...`) is legal per RFC 9110, but this
-            // backend only follows absolute targets. Reported before the scheme
-            // branch below, which would otherwise call it an unsupported scheme.
-            debug!("Moved URI `{moved_uri}` is relative; not following the redirect");
-        } else if moved_uri.scheme().is_none_or(|scheme| {
-            *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS
-        }) {
-            debug!("Scheme of moved URI `{moved_uri}` not supported");
-        } else if let Some(moved_host) = moved_uri.host() {
-            debug!("Host `{moved_host}` of moved URI not permitted");
-        } else {
-            debug!("Moved URI has no host; not following the redirect");
         }
+
+        log_unfollowed_redirect(&moved_uri);
     }
 
-    let (parts, body) = fwd_response.into_parts();
-
-    let body = rated_client_body(
-        AccountedBody::new(
-            body,
-            Subject::Passthrough {
-                host: requested_host.to_string(),
-                path: request_path,
-                client,
-                request_received_at: passthrough_request_received_at,
-                request_sent: fwd_request_sent,
-            },
-            |_| false,
-        ),
+    passthrough_response(
+        fwd_response,
+        Subject::Passthrough {
+            host: requested_host.to_string(),
+            path: request_path,
+            client,
+            request_received_at: passthrough_request_received_at,
+            request_sent: fwd_request_sent,
+        },
         client,
-    );
-
-    let mut response = Response::from_parts(parts, body);
-
-    response
-        .headers_mut()
-        .append(VIA, HeaderValue::from_static(APP_VIA));
-
-    trace!("Outgoing response: {response:?}");
-
-    response
+    )
 }
 
 /// Build a `Host` header value matching the given authority.
@@ -2899,9 +2888,10 @@ pub(crate) async fn handle_hyper_connection<T>(
     fn is_rate_timeout(err: &hyper::Error) -> Option<&ProxyCacheError> {
         let pe = err.source()?.downcast_ref::<ProxyCacheError>()?;
 
-        if matches!(pe, ProxyCacheError::ClientDownloadRate { .. })
-            || matches!(pe, ProxyCacheError::MirrorDownloadRate(_))
-        {
+        if matches!(
+            pe,
+            ProxyCacheError::ClientDownloadRate { .. } | ProxyCacheError::MirrorDownloadRate(_)
+        ) {
             Some(pe)
         } else {
             None

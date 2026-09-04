@@ -480,10 +480,7 @@ fn decide_request(
             Ok(class) => {
                 let aliased_host = resolve_alias(aliases, &requested_host);
 
-                let cache_id: &CacheHost = match aliased_host {
-                    Some(cache) => cache,
-                    None => requested_host.as_cache_host(),
-                };
+                let cache_id = aliased_host.unwrap_or_else(|| requested_host.as_cache_host());
                 let layout = class.resource_kind.layout();
                 if layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
                     warn_once_or_info!(

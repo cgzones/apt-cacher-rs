@@ -263,7 +263,6 @@ pub(crate) async fn handle_sendfile_connection(
         // above.
         metrics::REQUESTS_TOTAL.increment();
 
-        // Parse the request and try to handle it with sendfile
         #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
         let _: Never = match result {
             ZeroCopyResult::Served(ConnectionAction::KeepAlive) => {
@@ -322,17 +321,7 @@ pub(crate) async fn handle_sendfile_connection(
                 )
                 .await
                 {
-                    if is_peer_disconnect(&err) {
-                        info!(
-                            "Failed to write error response to client {client}; closing the connection:  {}",
-                            ErrorReport(&err)
-                        );
-                    } else {
-                        warn!(
-                            "Failed to write error response to client {client}; closing the connection:  {}",
-                            ErrorReport(&err)
-                        );
-                    }
+                    log_client_write_failure(client, "error response", &err);
                 }
 
                 graceful_close(&stream).await;
@@ -347,17 +336,7 @@ pub(crate) async fn handle_sendfile_connection(
                     write_invalid_response(&stream, conn_version, conn_action, status, msg, None)
                         .await
                 {
-                    if is_peer_disconnect(&err) {
-                        info!(
-                            "Failed to write rejection response to client {client}; closing the connection:  {}",
-                            ErrorReport(&err)
-                        );
-                    } else {
-                        warn!(
-                            "Failed to write rejection response to client {client}; closing the connection:  {}",
-                            ErrorReport(&err)
-                        );
-                    }
+                    log_client_write_failure(client, "rejection response", &err);
                     return;
                 }
 
@@ -474,6 +453,24 @@ async fn read_request_headers(
     }
 }
 
+/// Log a failed write of a proxy-generated response to the client, taking the
+/// mandatory delivery split (`docs/logging.md`): a peer that hung up logs at
+/// INFO, every other I/O error at WARN.  `what` names the response the write
+/// belonged to, e.g. `"304 response"`.
+fn log_client_write_failure(client: ClientInfo, what: &str, err: &std::io::Error) {
+    if is_peer_disconnect(err) {
+        info!(
+            "Failed to write {what} to client {client}; closing the connection:  {}",
+            ErrorReport(err)
+        );
+    } else {
+        warn!(
+            "Failed to write {what} to client {client}; closing the connection:  {}",
+            ErrorReport(err)
+        );
+    }
+}
+
 /// Best-effort graceful close after writing an error/rejection response on a
 /// connection we are about to drop.  Half-closes the write side (FIN, which
 /// flushes the queued response) then briefly drains pending client input, so
@@ -540,17 +537,7 @@ async fn serve_webui(
     let response = serve_web_interface(uri, appstate).await;
 
     if let Err(err) = write_webui_response(stream, conn_version, conn_action, response).await {
-        if is_peer_disconnect(&err) {
-            info!(
-                "Failed to write web-interface response to client {client}; closing the connection:  {}",
-                ErrorReport(&err)
-            );
-        } else {
-            warn!(
-                "Failed to write web-interface response to client {client}; closing the connection:  {}",
-                ErrorReport(&err)
-            );
-        }
+        log_client_write_failure(*client, "web-interface response", &err);
         return ZeroCopyResult::AfterHeaderError;
     }
     // `SERVED_*` means "fully delivered": bump only after the synchronous
@@ -769,17 +756,7 @@ async fn write_tunnel_upstream_error(
     )
     .await
     {
-        if is_peer_disconnect(&err) {
-            info!(
-                "Failed to write tunnel 502 response to client {client}; closing the connection:  {}",
-                ErrorReport(&err)
-            );
-        } else {
-            warn!(
-                "Failed to write tunnel 502 response to client {client}; closing the connection:  {}",
-                ErrorReport(&err)
-            );
-        }
+        log_client_write_failure(client, "tunnel 502 response", &err);
         return;
     }
     graceful_close(stream).await;
@@ -1471,17 +1448,7 @@ async fn evaluate_conditional_and_range(
             )
             .await
             {
-                if is_peer_disconnect(&err) {
-                    info!(
-                        "Failed to write 304 response to client {client}; closing the connection:  {}",
-                        ErrorReport(&err)
-                    );
-                } else {
-                    warn!(
-                        "Failed to write 304 response to client {client}; closing the connection:  {}",
-                        ErrorReport(&err)
-                    );
-                }
+                log_client_write_failure(*client, "304 response", &err);
                 return Err(SendfileResult::ClientError);
             }
 
@@ -1490,17 +1457,7 @@ async fn evaluate_conditional_and_range(
         ServePlan::NotSatisfiable => {
             if let Err(err) = write_416_response(stream, conn_version, conn_action, file_size).await
             {
-                if is_peer_disconnect(&err) {
-                    info!(
-                        "Failed to write 416 response to client {client}; closing the connection:  {}",
-                        ErrorReport(&err)
-                    );
-                } else {
-                    warn!(
-                        "Failed to write 416 response to client {client}; closing the connection:  {}",
-                        ErrorReport(&err)
-                    );
-                }
+                log_client_write_failure(*client, "416 response", &err);
                 return Err(SendfileResult::ClientError);
             }
 
@@ -1621,19 +1578,7 @@ pub(crate) async fn serve_file_via_sendfile(
         etag: cache_info.file_etag.as_deref(),
     };
     if let Err(err) = write_response_headers(stream, headers).await {
-        if is_peer_disconnect(&err) {
-            info!(
-                "Failed to write response headers to client {}; closing the connection:  {}",
-                conn_details.client,
-                ErrorReport(&err)
-            );
-        } else {
-            warn!(
-                "Failed to write response headers to client {}; closing the connection:  {}",
-                conn_details.client,
-                ErrorReport(&err)
-            );
-        }
+        log_client_write_failure(conn_details.client, "response headers", &err);
         return SendfileResult::ClientError;
     }
 
@@ -1643,7 +1588,34 @@ pub(crate) async fn serve_file_via_sendfile(
     metrics::REQUESTS_SENDFILE.increment();
     let transfer_result = async_sendfile(stream, &file, content_start, content_length).await;
 
-    let elapsed = start.elapsed();
+    if finish_sendfile_serve(
+        conn_details,
+        Role::Cached,
+        content_length,
+        partial,
+        start.elapsed(),
+        transfer_result,
+    )
+    .await
+    {
+        SendfileResult::Served(conn_action)
+    } else {
+        SendfileResult::AfterHeaderError
+    }
+}
+
+/// Completion bookkeeping shared by the two sendfile serve loops: turn the
+/// transfer result into a [`ServeOutcome`], run [`finish_cached_serve`] and
+/// enqueue the `deliveries` row it asks for.  Returns whether the body was
+/// fully delivered.
+async fn finish_sendfile_serve(
+    conn_details: &ConnectionDetails,
+    role: Role,
+    size: u64,
+    partial: bool,
+    elapsed: std::time::Duration,
+    transfer_result: Result<u64, (u64, std::io::Error)>,
+) -> bool {
     let (complete, transferred, failure) = match &transfer_result {
         Ok(transferred) => (true, *transferred, None),
         Err((transferred, err)) => (
@@ -1653,7 +1625,7 @@ pub(crate) async fn serve_file_via_sendfile(
         ),
     };
     let outcome = ServeOutcome {
-        size: content_length,
+        size,
         transferred,
         complete,
         partial,
@@ -1665,15 +1637,10 @@ pub(crate) async fn serve_file_via_sendfile(
                 peer_disconnect: *peer_disconnect,
             }),
     };
-    if let Some(cmd) = finish_cached_serve(conn_details, Mechanism::Sendfile, Role::Cached, outcome)
-    {
+    if let Some(cmd) = finish_cached_serve(conn_details, Mechanism::Sendfile, role, outcome) {
         send_db_command(DatabaseCommand::Transfer(cmd)).await;
     }
-    if complete {
-        SendfileResult::Served(conn_action)
-    } else {
-        SendfileResult::AfterHeaderError
-    }
+    complete
 }
 
 /// Format an `InsufficientRate` into a timeout `std::io::Error`, tagging
@@ -1955,13 +1922,13 @@ struct SendfileBatch {
 /// `TcpStream`/`File` Drop.  One dup pair per transfer amortises across
 /// many EAGAIN cycles and, for unfinished-file serves, across many
 /// availability windows.
-pub(crate) struct SendfileFds {
+struct SendfileFds {
     socket: std::os::fd::OwnedFd,
     file: std::os::fd::OwnedFd,
 }
 
 impl SendfileFds {
-    pub(crate) fn dup(socket: &TcpStream, file: &tokio::fs::File) -> std::io::Result<Self> {
+    fn dup(socket: &TcpStream, file: &tokio::fs::File) -> std::io::Result<Self> {
         Ok(Self {
             socket: nix::unistd::dup(socket.as_fd())
                 .map_err(|errno| errno_to_io_error(errno, "dup of socket fd failed"))?,
@@ -2193,7 +2160,7 @@ pub(crate) async fn async_sendfile(
     // batched loop below.  The dup-based cancellation-safety argument
     // doesn't apply here: the syscall runs synchronously on this task
     // while `socket`/`file` are borrowed.
-    if count > 0 && count <= SMALL_SERVE_INLINE_MAX {
+    if count <= SMALL_SERVE_INLINE_MAX {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "count is bounded by SMALL_SERVE_INLINE_MAX which fits in usize"
@@ -2696,37 +2663,16 @@ async fn serve_unfinished_sendfile(
     )
     .await;
 
-    let elapsed = start.elapsed();
-    let (complete, transferred, failure) = match &transfer_result {
-        Ok(transferred) => (true, *transferred, None),
-        Err((transferred, err)) => (
-            false,
-            *transferred,
-            Some((ErrorReport(err), is_peer_disconnect(err))),
-        ),
-    };
-    let outcome = ServeOutcome {
-        size: content_length,
-        transferred,
-        complete,
-        partial,
-        elapsed,
-        abort: failure
-            .as_ref()
-            .map(|(reason, peer_disconnect)| AbortCause {
-                reason,
-                peer_disconnect: *peer_disconnect,
-            }),
-    };
-    if let Some(cmd) = finish_cached_serve(
+    if finish_sendfile_serve(
         &conn_details,
-        Mechanism::Sendfile,
         Role::LateJoiner,
-        outcome,
-    ) {
-        send_db_command(DatabaseCommand::Transfer(cmd)).await;
-    }
-    if complete {
+        content_length,
+        partial,
+        start.elapsed(),
+        transfer_result,
+    )
+    .await
+    {
         ZeroCopyResult::Served(conn_action)
     } else {
         ZeroCopyResult::AfterHeaderError
