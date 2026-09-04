@@ -85,17 +85,20 @@ pub(super) struct CleanupDone {
 }
 
 impl CleanupDone {
-    pub(super) fn tally(
-        mirror: Mirror,
-        total: u64,
-        files_removed: u64,
-        bytes_removed: u64,
-        removed_unreferenced: u64,
-    ) -> Self {
+    /// Close out a mirror from the sum of its units' [`UnitStats`]:
+    /// `files_retained` is derived (scanned minus removed) rather than tallied,
+    /// so the two can never disagree.
+    fn tally(mirror: Mirror, stats: UnitStats) -> Self {
+        let UnitStats {
+            scanned,
+            removed,
+            bytes_removed,
+            removed_unreferenced,
+        } = stats;
         Self {
             mirror,
-            files_retained: total.saturating_sub(files_removed),
-            files_removed,
+            files_retained: scanned.saturating_sub(removed),
+            files_removed: removed,
             bytes_removed,
             removed_unreferenced,
         }
@@ -109,7 +112,7 @@ impl CleanupDone {
 /// deletions performed before a mid-cascade group failure stay accounted (an
 /// unaccounted deletion surfaces later as a spurious `Repaired cache size
 /// discrepancy` warn).
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct UnitStats {
     pub scanned: u64,
     pub removed: u64,
@@ -125,10 +128,26 @@ impl UnitStats {
     /// (`StructuredPool`/`FlatTree`) only sweep `Deb`-class candidates, so
     /// `removed_unreferenced` stays zero there; the by-hash facets thread it
     /// through their own path.
-    pub(super) fn fold(&mut self, swept: SweepResult) {
+    fn fold(&mut self, swept: SweepResult) {
         self.removed += swept.files_removed;
         self.bytes_removed += swept.bytes_removed;
         self.removed_unreferenced += swept.removed_unreferenced;
+    }
+
+    /// Accumulate one finished unit into the per-mirror running total. The
+    /// destructure makes a new counter a compile error here rather than a
+    /// silently unsummed field.
+    fn accumulate(&mut self, unit: Self) {
+        let Self {
+            scanned,
+            removed,
+            bytes_removed,
+            removed_unreferenced,
+        } = unit;
+        self.scanned += scanned;
+        self.removed += removed;
+        self.bytes_removed += bytes_removed;
+        self.removed_unreferenced += removed_unreferenced;
     }
 
     /// Account one checksum-mismatch eviction performed during a reduce.
@@ -262,15 +281,23 @@ async fn reduce_against(
     })
 }
 
+/// Base URI of a flat repository's `Packages` index; the fetch cascade appends
+/// each compression extension in turn. Built for the mirror itself by the
+/// co-located source and for the truncated flat-repo root by
+/// [`flat_root_fetch_plan`].
+fn flat_packages_base_uri(mirror: &Mirror) -> String {
+    format!(
+        "http://{}/{}/Packages",
+        mirror.format_authority(),
+        mirror.path()
+    )
+}
+
 /// Build the `FetchPlan` for a flat-repo *root* `Packages` index, stripping the
 /// in-mirror `prefix` (trailing `/`) from `Filename:` values so a root index
 /// reconciles a sub-path mirror's cached debs. Shared by the root-first fast
 /// path and the co-located cascade's Step 2 fallback.
-pub(super) fn flat_root_fetch_plan<'a>(
-    mirror: &Mirror,
-    seg: &str,
-    prefix: &'a str,
-) -> FetchPlan<'a> {
+fn flat_root_fetch_plan<'a>(mirror: &Mirror, seg: &str, prefix: &'a str) -> FetchPlan<'a> {
     let root_mirror = Mirror::new(
         mirror.host().clone(),
         mirror.port(),
@@ -278,11 +305,7 @@ pub(super) fn flat_root_fetch_plan<'a>(
         MirrorKind::Flat,
     );
     FetchPlan {
-        base_uri: format!(
-            "http://{}/{}/Packages",
-            root_mirror.format_authority(),
-            root_mirror.path()
-        ),
+        base_uri: flat_packages_base_uri(&root_mirror),
         mirror: root_mirror,
         // The debs live under the original sub-path `mirror`, not the flat-repo
         // root, so metadata invalidation must key by `mirror`, not `root_mirror`.
@@ -327,19 +350,11 @@ pub(super) async fn run_mirror_units(
         now,
     };
 
-    let mut scanned = 0u64;
-    let mut removed = 0u64;
-    let mut bytes_removed = 0u64;
-    let mut removed_unreferenced = 0u64;
+    let mut totals = UnitStats::default();
 
     for unit in &units {
         match run_unit(unit, &ctx).await {
-            Ok(unit_stats) => {
-                scanned += unit_stats.scanned;
-                removed += unit_stats.removed;
-                bytes_removed += unit_stats.bytes_removed;
-                removed_unreferenced += unit_stats.removed_unreferenced;
-            }
+            Ok(unit_stats) => totals.accumulate(unit_stats),
             Err(CleanupUnitError(_logged @ Logged { .. })) => {
                 debug!(
                     "Abandoned a cleanup unit for mirror {mirror}; continuing with the mirror's remaining units"
@@ -348,13 +363,7 @@ pub(super) async fn run_mirror_units(
         }
     }
 
-    CleanupDone::tally(
-        mirror,
-        scanned,
-        removed,
-        bytes_removed,
-        removed_unreferenced,
-    )
+    CleanupDone::tally(mirror, totals)
 }
 
 /// Everything a unit needs that is fixed for the whole mirror: its identity, the
@@ -451,13 +460,10 @@ async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, 
 /// Reap one [`PartialsUnit`]'s `tmp/` directory (the classifier emits one for
 /// the structured tree, one for the flat tree — see `model::classify_mirror`).
 ///
-/// Delegates to [`cleanup_tmp_dir`] for the actual sweep and logs
-/// the same summary line `cleanup_stale_partials` used to emit (formerly
-/// aggregated across every mirror in one pre-pass; now per-unit). The count is
-/// deliberately NOT returned in `UnitStats` — partial-download
+/// Delegates to [`cleanup_tmp_dir`] for the actual sweep and logs its count.
+/// That count is deliberately NOT returned in [`UnitStats`] — partial-download
 /// scratch files are not cached content, so they must not inflate
-/// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED` or the quota reconcile, exactly
-/// matching the old pre-pass, which only ever logged its total.
+/// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED` or the quota reconcile.
 async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
 
@@ -510,9 +516,8 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
     }
 }
 
-/// Counters from a single [`sweep_byhash_dir`] pass, mirroring the fields the
-/// old `ByHashStats` carried so the summary + accounting stay identical.
-#[derive(Default)]
+/// Counters from a single [`sweep_byhash_dir`] pass; [`run_byhash_unit`] turns
+/// them into both its summary line and the unit's [`UnitStats`].
 struct ByHashOutcome {
     /// By-hash files kept: referenced digests (dropped from the candidate map
     /// before the sweep) plus candidates too young for their span.
@@ -596,9 +601,15 @@ async fn run_byhash_unit(
     })
 }
 
+static BYHASH_WALK: WalkContext = WalkContext {
+    what: "a by-hash directory",
+    dir_failure: DirFailure::Abort("abandoning its cleanup this cycle"),
+    entry_failure: "retaining it",
+    non_regular: "removing it",
+};
+
 /// Walk one by-hash directory, classify each regular entry against `reference`,
-/// and sweep the leftovers on a per-class span — the map-classify + sweep
-/// equivalent of the old `cleanup_byhash_dir`.
+/// and sweep the leftovers on a per-class span.
 ///
 /// Referenced digests are removed from the candidate map (kept forever);
 /// unreferenced-but-covered candidates become `ByHashCovered` (swept past
@@ -611,13 +622,6 @@ async fn run_byhash_unit(
 ///
 /// `NotFound` is treated as "nothing to do" (TOCTOU: the caller pre-probes with
 /// `byhash_dir_present`, but the tree may vanish in between).
-static BYHASH_WALK: WalkContext = WalkContext {
-    what: "a by-hash directory",
-    dir_failure: DirFailure::Abort("abandoning its cleanup this cycle"),
-    entry_failure: "retaining it",
-    non_regular: "removing it",
-};
-
 async fn sweep_byhash_dir(
     byhash_path: &Path,
     reference: Option<&ByHashReferenceSet>,
@@ -656,16 +660,17 @@ async fn sweep_byhash_dir(
         // algorithm, an unclassifiable name, or age mode (`reference` is `None`)
         // gets the backstop, exactly as the old walk treated them.
         let name = entry.name();
-        let classified = reference
-            .zip(name.to_str())
-            .and_then(|(refset, digest)| refset.classify(digest).map(|c| (refset, c)));
-        let class = match classified {
-            Some((_refset, (_algo, true))) => {
-                referenced_kept += 1;
-                continue;
-            }
-            Some((refset, (algo, false))) if refset.covers(algo) => SpanClass::ByHashCovered,
-            Some(_) | None => SpanClass::ByHashUncovered,
+        let class = match reference.zip(name.to_str()) {
+            Some((refset, digest)) => match refset.classify(digest) {
+                Some((_algo, true)) => {
+                    referenced_kept += 1;
+                    continue;
+                }
+                Some((algo, false)) if refset.covers(algo) => SpanClass::ByHashCovered,
+                Some(_) | None => SpanClass::ByHashUncovered,
+            },
+            // Age mode, or a name no `Release` digest could ever equal.
+            None => SpanClass::ByHashUncovered,
         };
 
         candidates.insert(name.to_owned(), class);
@@ -759,8 +764,7 @@ async fn run_reconcile_unit(
     let mut results: Vec<GroupResult> = Vec::with_capacity(unit.groups.len());
     // Set when an owning group (the hybrid archive-root reconcile) Completes:
     // its archive-root segment, for the strict-reconcile summary. Its presence
-    // short-circuits the remaining root/colocated groups (parity with the old
-    // `try_strict_flat_pool_cleanup` returning `Some(done)` on full success).
+    // short-circuits the remaining root/colocated groups.
     let mut owning_root: Option<&str> = None;
     for group in &unit.groups {
         match resolve_group(&ctx, group, &mut cached_files, &mut tally).await {
@@ -1057,20 +1061,19 @@ fn map_reduce(
 }
 
 /// Hybrid flat-pool source resolver (`OriginPackages { ArchiveRoot }`, issue
-/// #162, e.g. Gitea/Forgejo `.../pool/<dist>/<comp>`): a faithful port of the
-/// deleted `try_strict_flat_pool_cleanup`. The referencing `Packages` index
-/// lives in the structured `dists/` tree of the flat repo's *archive root*, so
-/// this reconciles the sub-path mirror's cached debs against the archive-root
-/// row's active origins, stripping the in-mirror `prefix` from `Filename:`
-/// values. Gated on an existing archive-root row so a fetch never mints a
-/// cleanup-synthesised mirror row. This is the unit's `owning` group:
-/// on full success (`GroupOutcome::Complete`) the tail short-circuits the
-/// remaining root/colocated groups and grace-sweeps. Conservative on any fetch/
-/// parse failure — the group resolves to `NotApplicable`/`FetchFailed`/
-/// `ParseError` and the cascade continues. Metadata invalidation
-/// keys by `owner_mirror = mirror` (the original sub-path mirror, NOT the
-/// truncated archive-root fetch mirror); any checksum-mismatch
-/// deletions performed before a mid-loop bail stay in the shared `tally`.
+/// #162, e.g. Gitea/Forgejo `.../pool/<dist>/<comp>`). The referencing
+/// `Packages` index lives in the structured `dists/` tree of the flat repo's
+/// *archive root*, so this reconciles the sub-path mirror's cached debs against
+/// the archive-root row's active origins, stripping the in-mirror `prefix` from
+/// `Filename:` values. Gated on an existing archive-root row so a fetch never
+/// mints a cleanup-synthesised mirror row. This is the unit's `owning` group: on
+/// full success (`GroupOutcome::Complete`) the tail short-circuits the remaining
+/// root/colocated groups and grace-sweeps. Conservative on any fetch/parse
+/// failure — the group resolves to `NotApplicable`/`FetchFailed`/`ParseError`
+/// and the cascade continues. Metadata invalidation keys by
+/// `owner_mirror = mirror` (the original sub-path mirror, NOT the truncated
+/// archive-root fetch mirror); any checksum-mismatch deletions performed before
+/// a mid-loop bail stay in the shared `tally`.
 async fn resolve_origin_packages_archive_root(
     ctx: &ReconcileCtx<'_>,
     root: &str,
@@ -1222,11 +1225,7 @@ async fn resolve_flat_colocated(
     let plan = FetchPlan {
         mirror: mirror.clone(),
         owner_mirror: mirror.clone(),
-        base_uri: format!(
-            "http://{}/{}/Packages",
-            mirror.format_authority(),
-            mirror.path()
-        ),
+        base_uri: flat_packages_base_uri(mirror),
         layout: PackagesLayout::Flat,
         cache_layout: CacheLayout::Flat,
         debname: DebnameKind::Flat,
@@ -1246,8 +1245,7 @@ async fn resolve_flat_colocated(
     }
 }
 
-/// Structured-pool source resolver (`OriginPackages { SelfRow }`): a faithful
-/// port of the previous `cleanup_mirror_deb_files` reconcile body. Looks up the
+/// Structured-pool source resolver (`OriginPackages { SelfRow }`). Looks up the
 /// mirror's own origins, filters to the active ones, logs the enumeration + the
 /// no-origin / stale diagnostics, then reduces the candidate map against each
 /// active origin's `dists/.../Packages*`. Returns a [`GroupResult`] the tail's
@@ -1285,12 +1283,7 @@ async fn resolve_origin_packages_self(
 
     let now: Duration = Clock::now_since_epoch().into();
 
-    trace!("Now: {now:?}");
-
     let origins_count = origins.len();
-    // Most-recent last_seen across all origin rows (in epoch seconds).
-    // Used purely for the diagnostic log below when every row is stale.
-    let most_recent_origin: i64 = origins.iter().map(|o| o.last_seen).max().unwrap_or(0);
 
     let active_origins = origins
         .iter()
@@ -1316,6 +1309,9 @@ async fn resolve_origin_packages_self(
                 HumanFmt::Time(grace),
             );
         } else {
+            // Most-recent `last_seen` (epoch seconds) across the rows: how long
+            // ago the freshest of them was requested.
+            let most_recent_origin: i64 = origins.iter().map(|o| o.last_seen).max().unwrap_or(0);
             let now_secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
             let age_secs = u64::try_from(now_secs.saturating_sub(most_recent_origin)).unwrap_or(0);
             let most_recent_age = Duration::from_secs(age_secs);
@@ -1478,12 +1474,11 @@ mod tests {
         assert_eq!(km.map("pool/other-pkg/main/x_1.0_amd64.deb"), None);
     }
 
-    // --- by-hash sweep (ported from the deleted `byhash::cleanup_byhash_dir`
-    //     walk tests). These exercise the deletion behaviour at the sweep level
-    //     with an injected `now` (birthtime is not backdatable on Linux) and an
-    //     explicitly-built reference set; the DB-driven reference-set assembly
-    //     (`active_origin_distributions` / `build_byhash_reference_set`) is
-    //     covered by `refs.rs`'s unit tests, so isolating the sweep here keeps
+    // --- by-hash sweep. These exercise the deletion behaviour at the sweep
+    //     level with an injected `now` (birthtime is not backdatable on Linux)
+    //     and an explicitly-built reference set; the DB-driven reference-set
+    //     assembly (`active_origin_distributions` / `build_byhash_reference_set`)
+    //     is covered by `refs.rs`'s unit tests, so isolating the sweep here keeps
     //     these tests DB-free while still gating the keep/remove verdicts.
 
     use hashbrown::HashSet;

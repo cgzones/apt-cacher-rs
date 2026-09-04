@@ -9,11 +9,17 @@ use crate::metrics;
 
 use super::scan::{remove_non_regular, remove_stray_dir};
 
+/// Consequence clause of every foreign-entry report in `tmp/`, whether the
+/// walker raises it (symlink / FIFO / socket / device) or the loop below does
+/// (stray directory): both are reaped on the same `FOREIGN_MAX_AGE` schedule,
+/// which this sentence spells out.
+const FOREIGN_CONSEQUENCE: &str = "removing it once it is older than a week";
+
 static TMP_WALK: WalkContext = WalkContext {
     what: "a tmp directory",
     dir_failure: DirFailure::Continue("leaving its unread entries unreaped this cycle"),
     entry_failure: "retaining it this cycle",
-    non_regular: "removing it once it is older than a week",
+    non_regular: FOREIGN_CONSEQUENCE,
 };
 
 /// Remove stale entries from a single `tmp/` directory.
@@ -36,7 +42,7 @@ pub(super) async fn cleanup_tmp_dir(
     now: SystemTime,
     partial_max_age: Duration,
 ) -> u64 {
-    // `TMP_WALK.non_regular` spells this out as "a week"; keep them in step.
+    // `FOREIGN_CONSEQUENCE` spells this out as "a week"; keep them in step.
     const FOREIGN_MAX_AGE: Duration = Duration::from_hours(7 * 24);
 
     let partial_cutoff = now - partial_max_age;
@@ -67,7 +73,7 @@ pub(super) async fn cleanup_tmp_dir(
         // a directory here is anomalous however young it is; the walker
         // already reported a non-regular entry.
         if entry.kind() == EntryKind::Dir {
-            entry.report_unexpected("removing it once it is older than a week");
+            entry.report_unexpected(FOREIGN_CONSEQUENCE);
         }
         // Apply the per-suffix `.partial` policy only to regular files: a
         // symlink-to-dir or a stray directory named `*.partial` should not

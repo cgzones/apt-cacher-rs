@@ -27,7 +27,7 @@ pub(super) enum Verdict {
 
 /// Blocking digest-and-compare with an inode/size race check after hashing.
 /// Runs on the blocking pool via [`verify_cache_file`].
-pub(super) fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
+fn verify_file_sync(path: &Path, algo: HashAlgo, expected: &[u8]) -> Verdict {
     use std::os::unix::fs::MetadataExt as _;
 
     let mut file = match nofollow_nonblock_options().read(true).open(path) {

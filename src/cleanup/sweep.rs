@@ -79,7 +79,7 @@ impl SpanTable {
 /// unavailable (e.g. on filesystems without birthtime support), logging once at
 /// INFO. If both fail, bumps `CACHE_IO_FAILURE`, logs at ERROR, and returns
 /// `None` so the caller can skip the entry.
-pub(super) fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTime> {
+fn age_reference_time(meta: &std::fs::Metadata, path: &Path) -> Option<SystemTime> {
     match meta.created() {
         Ok(t) => Some(t),
         Err(created_err) => {
@@ -226,6 +226,13 @@ pub(super) async fn sweep_candidates(
     }
 }
 
+static METADATA_WALK: WalkContext = WalkContext {
+    what: "a metadata directory",
+    dir_failure: DirFailure::Continue("leaving its unread entries unswept this cycle"),
+    entry_failure: "retaining it",
+    non_regular: "removing it",
+};
+
 /// Age out stale top-level index files in a metadata directory, dropping any
 /// matching `cache_metadata` entries on success.
 ///
@@ -248,13 +255,6 @@ pub(super) async fn sweep_candidates(
 ///
 /// `now` is injected for testability, matching [`sweep_candidates`]: birthtime is
 /// not backdatable on Linux, so removal cannot be exercised via mtime alone.
-static METADATA_WALK: WalkContext = WalkContext {
-    what: "a metadata directory",
-    dir_failure: DirFailure::Continue("leaving its unread entries unswept this cycle"),
-    entry_failure: "retaining it",
-    non_regular: "removing it",
-};
-
 pub(super) async fn sweep_aged_metadata(
     dir: &Path,
     keep_span: Duration,

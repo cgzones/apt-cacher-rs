@@ -40,8 +40,7 @@ use super::sweep::invalidate_metadata_for;
 use super::verify::{Verdict, verify_cache_file};
 
 /// How a `Filename:` value from a Packages stanza maps to a key in the
-/// scanned candidate map. Replaces the old `flat_lookup_prefix` string +
-/// `layout.is_flat()` branch in `process_stanza`.
+/// scanned candidate map.
 pub(super) enum KeyMapper<'a> {
     /// Structured pool: the cache flattens to basename.
     Basename,
@@ -180,8 +179,7 @@ pub(super) struct ReduceContext<'a> {
     /// straight into it, so deletions performed before a mid-cascade group
     /// failure are never lost.
     pub(super) tally: &'a mut UnitStats,
-    /// Derives the lookup key from a `Filename:` relpath. Replaces the old
-    /// `flat_lookup_prefix` + `layout.is_flat()` branch.
+    /// Derives the lookup key from a `Filename:` relpath.
     pub(super) keymap: &'a KeyMapper<'a>,
 }
 
@@ -213,65 +211,63 @@ async fn process_stanza(
     if file_list.remove(OsStr::new(lookup_key)).is_none() {
         return;
     }
-    let path = ctx.root.join(lookup_key);
-
-    match stanza.chosen() {
+    let Some((algo, expected)) = stanza.chosen() else {
         // Retained without verification; `StanzaStream` already warned about
         // the digest-less stanza.
-        None => {}
-        Some((algo, expected)) => {
-            // No pre-verify stat: `verify_file_sync` opens the file `O_NOFOLLOW
-            // | O_NONBLOCK` and `fstat`s the descriptor it actually hashed, so
-            // it detects a concurrent type swap without a second syscall (and
-            // without the lstat-then-open race an extra stat would only narrow).
-            match verify_cache_file(path.clone(), algo, expected.to_vec()).await {
-                Verdict::Match => {}
-                Verdict::NonRegular => {
-                    warn!(
-                        "Cache file `{}` changed to non-regular between cleanup-collect and verify (concurrent swap); retaining without verification",
-                        path.display(),
-                    );
-                }
-                Verdict::Mismatch {
-                    computed,
-                    size: pre_size,
-                } => {
-                    warn!(
-                        "Cache file `{}` failed {} verification (expected {}, computed {}); removing it",
-                        path.display(),
-                        algo.as_str(),
-                        hex_encode(expected),
-                        hex_encode(&computed),
-                    );
-                    if let Err(err) = tokio::fs::remove_file(&path).await {
-                        metrics::CACHE_IO_FAILURE.increment();
-                        error!(
-                            "Failed to remove checksum-mismatched cache file `{}`; retaining it:  {}",
-                            path.display(),
-                            ErrorReport(&err)
-                        );
-                    } else {
-                        invalidate_metadata_for(&path, ctx.mirror, ctx.layout);
-                        metrics::CLEANUP_CHECKSUM_MISMATCHES.increment();
-                        ctx.tally.record_mismatch(pre_size);
-                    }
-                }
-                Verdict::Raced => {
-                    warn!(
-                        "Cache file `{}` changed during {} verification; retaining (concurrent re-cache)",
-                        path.display(),
-                        algo.as_str(),
-                    );
-                }
-                Verdict::IoError(err) => {
-                    error!(
-                        "Failed to verify cache file `{}` against its {} digest; retaining it:  {}",
-                        path.display(),
-                        algo.as_str(),
-                        ErrorReport(&err),
-                    );
-                }
+        return;
+    };
+    let path = ctx.root.join(lookup_key);
+
+    // No pre-verify stat: `verify_file_sync` opens the file `O_NOFOLLOW |
+    // O_NONBLOCK` and `fstat`s the descriptor it actually hashed, so it detects
+    // a concurrent type swap without a second syscall (and without the
+    // lstat-then-open race an extra stat would only narrow).
+    match verify_cache_file(path.clone(), algo, expected.to_vec()).await {
+        Verdict::Match => {}
+        Verdict::NonRegular => {
+            warn!(
+                "Cache file `{}` changed to non-regular between cleanup-collect and verify (concurrent swap); retaining without verification",
+                path.display(),
+            );
+        }
+        Verdict::Mismatch {
+            computed,
+            size: pre_size,
+        } => {
+            warn!(
+                "Cache file `{}` failed {} verification (expected {}, computed {}); removing it",
+                path.display(),
+                algo.as_str(),
+                hex_encode(expected),
+                hex_encode(&computed),
+            );
+            if let Err(err) = tokio::fs::remove_file(&path).await {
+                metrics::CACHE_IO_FAILURE.increment();
+                error!(
+                    "Failed to remove checksum-mismatched cache file `{}`; retaining it:  {}",
+                    path.display(),
+                    ErrorReport(&err)
+                );
+            } else {
+                invalidate_metadata_for(&path, ctx.mirror, ctx.layout);
+                metrics::CLEANUP_CHECKSUM_MISMATCHES.increment();
+                ctx.tally.record_mismatch(pre_size);
             }
+        }
+        Verdict::Raced => {
+            warn!(
+                "Cache file `{}` changed during {} verification; retaining (concurrent re-cache)",
+                path.display(),
+                algo.as_str(),
+            );
+        }
+        Verdict::IoError(err) => {
+            error!(
+                "Failed to verify cache file `{}` against its {} digest; retaining it:  {}",
+                path.display(),
+                algo.as_str(),
+                ErrorReport(&err),
+            );
         }
     }
 }
@@ -470,6 +466,20 @@ impl std::fmt::Display for FetchFailure {
     }
 }
 
+/// Fold one "missing-ish" status (404/403/410) into the best-known one the
+/// fetch reports once every format has failed: a specific 403/410 promotes over
+/// the generic 404, and among non-404 statuses the first one seen wins.
+fn prefer_missing_status(best: Option<StatusCode>, seen: StatusCode) -> StatusCode {
+    let Some(prev) = best else {
+        return seen;
+    };
+    if prev == StatusCode::NOT_FOUND && seen != StatusCode::NOT_FOUND {
+        seen
+    } else {
+        prev
+    }
+}
+
 /// Try each of `.xz`, `.gz`, raw in turn — first format that returns 200 wins.
 /// Each request is a self-issued `process_cache_request` against `base_uri` +
 /// extension; `debname` names the cache entry each format lands in and `layout`
@@ -489,8 +499,7 @@ pub(super) async fn try_fetch_packages_file(
     // the requester lacks `s3:ListBucket`, so we must not abort the
     // fallback chain on the first non-200 response — but the caller's
     // diagnostic log should still see the most informative upstream status
-    // rather than a synthetic 404. Preference order: 403/410 (specific)
-    // beat 404 (generic); among non-404 statuses, the first one seen wins.
+    // rather than a synthetic 404 (see `prefer_missing_status`).
     let mut last_missing: Option<StatusCode> = None;
 
     for pkgfmt in [
@@ -548,14 +557,7 @@ pub(super) async fn try_fetch_packages_file(
         let _: Never = match status {
             StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE => {
                 debug!("Cleanup request {uri} unavailable ({status})");
-                // Promote 404 to a more specific status (403/410) when one
-                // shows up later in the chain; otherwise stick with the
-                // first non-404 we saw.
-                if last_missing.is_none_or(|prev| {
-                    prev == StatusCode::NOT_FOUND && status != StatusCode::NOT_FOUND
-                }) {
-                    last_missing = Some(status);
-                }
+                last_missing = Some(prefer_missing_status(last_missing, status));
                 continue;
             }
             _ => {
@@ -582,7 +584,6 @@ pub(super) async fn try_fetch_packages_file(
 mod tests {
     use super::*;
 
-    use crate::cleanup::engine::SpanClass;
     use crate::{
         config::ClientHost,
         deb_mirror::MirrorKind,
@@ -1157,6 +1158,30 @@ mod tests {
         assert!(
             file_list.contains_key(OsStr::new("keep-me.deb")),
             "empty Packages must leave the candidate list untouched"
+        );
+    }
+
+    #[test]
+    fn prefer_missing_status_promotes_specific_over_generic_404() {
+        use http::StatusCode as S;
+        // Nothing seen yet: whatever arrived.
+        assert_eq!(prefer_missing_status(None, S::NOT_FOUND), S::NOT_FOUND);
+        // 403 (S3's "missing object without ListBucket") and 410 are more
+        // informative than the generic 404 and promote over it.
+        assert_eq!(
+            prefer_missing_status(Some(S::NOT_FOUND), S::FORBIDDEN),
+            S::FORBIDDEN
+        );
+        assert_eq!(prefer_missing_status(Some(S::NOT_FOUND), S::GONE), S::GONE);
+        // A 404 never demotes an already-specific status ...
+        assert_eq!(
+            prefer_missing_status(Some(S::FORBIDDEN), S::NOT_FOUND),
+            S::FORBIDDEN
+        );
+        // ... and among non-404 statuses the first one seen wins.
+        assert_eq!(
+            prefer_missing_status(Some(S::FORBIDDEN), S::GONE),
+            S::FORBIDDEN
         );
     }
 

@@ -11,6 +11,8 @@ use engine::run_mirror_units;
 use model::classify_mirror;
 
 use std::{
+    num::NonZero,
+    path::Path,
     sync::{
         LazyLock,
         atomic::{AtomicI64, Ordering},
@@ -35,8 +37,32 @@ use crate::{
     limits::RETENTION_TIME,
     metrics,
     task_cache_scan::task_cache_scan,
-    xattr_helpers,
+    warn_once_or_debug, xattr_helpers,
 };
+
+/// Whether one cache tree of an origin-less mirror row still exists.
+///
+/// An I/O failure other than "absent" is logged, counted and answered `true`:
+/// the row is the only record of where those files live, so dropping it because
+/// the directory could not be read would orphan the whole tree -- no unit walk
+/// would ever visit it again.
+fn cache_tree_exists(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(exists) => exists,
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            // Once-gated like `main_loop`'s sibling probe: one unreadable
+            // cache root would otherwise emit two lines per origin-less
+            // mirror row per cleanup run, all naming the same cause.
+            warn_once_or_debug!(
+                "Failed to check whether the cache directory `{}` exists; retaining its mirror row:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            true
+        }
+    }
+}
 
 /// Drop `origins` rows unseen for [`RETENTION_TIME`] and mirror rows that
 /// have neither an origin left nor a cache tree on disk.  Both are minted by
@@ -76,8 +102,8 @@ async fn prune_stale_rows(database: &Database, config: &Config) {
     let mut gone = Vec::new();
     for orphan in orphans {
         let site = orphan.entry.site();
-        let has_tree =
-            paths.mirror_dir(site).exists() || paths.flat_root(site.host, site.port).exists();
+        let has_tree = cache_tree_exists(&paths.mirror_dir(site))
+            || cache_tree_exists(&paths.flat_root(site.host, site.port));
         if !has_tree {
             info!(
                 "Removing mirror row {} without origins or cached files",
@@ -224,33 +250,25 @@ async fn task_cleanup_impl(appstate: &AppState) {
     trace!("Mirrors ({}): {mirrors:?}", mirrors.len());
     info!("Found {} mirrors for cleanup", mirrors.len());
 
-    // Create a stream of futures, one per mirror, each running that
-    // mirror's full ordered cleanup-unit list.
+    // Nested-mirror boundaries: for each mirror, the paths of the other mirrors
+    // registered under the same alias-resolved (cache_host, port) whose path
+    // lives *inside* this mirror's path (segment-aligned).  The flat cleanup
+    // walks the on-disk flat subtree recursively, and these nested mirror roots
+    // bound that walk so a parent mirror's cleanup does not age-evict files
+    // belonging to a nested mirror (which has its own Packages index and its own
+    // cleanup run).
     //
-    // For each mirror, collect the paths of any other mirrors registered
-    // under the same alias-resolved (cache_host, port) whose path lives
-    // *inside* this mirror's path (segment-aligned).  The flat-cleanup
-    // walks the on-disk flat subtree recursively, and these nested mirror
-    // roots must be treated as boundaries so a parent mirror's cleanup
-    // does not age-evict files that belong to a nested mirror (which has
-    // its own Packages index and its own cleanup run).
-
-    // Group mirror paths by (cache_host, port) and sort each group once so
-    // each mirror's nested-paths derivation is O(k) over its host's siblings
-    // instead of O(n) over every mirror.  Rows are canonical (alias-resolved
-    // at dispatch, legacy rows folded at startup), so the row host *is* the
-    // `<cache>/<host>/…` tree the nesting bucket must follow.
-    let host_keys: Vec<(&CacheHost, u16)> = mirrors
+    // Paths are bucketed by (cache_host, port) and each bucket sorted once, so a
+    // mirror's derivation is O(k) over its host's siblings instead of O(n) over
+    // every mirror.  Rows are canonical (alias-resolved at dispatch, legacy rows
+    // folded at startup), so the row host *is* the `<cache>/<host>/…` tree the
+    // nesting bucket must follow.
+    let host_keys: Vec<(&CacheHost, Option<NonZero<u16>>)> = mirrors
         .iter()
-        .map(|entry| {
-            (
-                entry.host.as_cache_host(),
-                entry.port().map_or(0, std::num::NonZero::get),
-            )
-        })
+        .map(|entry| (entry.host.as_cache_host(), entry.port()))
         .collect();
 
-    let mut paths_by_host: HashMap<(&CacheHost, u16), Vec<&str>> = HashMap::new();
+    let mut paths_by_host: HashMap<(&CacheHost, Option<NonZero<u16>>), Vec<&str>> = HashMap::new();
     for (entry, &key) in mirrors.iter().zip(&host_keys) {
         paths_by_host
             .entry(key)
@@ -282,12 +300,9 @@ async fn task_cleanup_impl(appstate: &AppState) {
         .zip(nested_per_mirror)
         .map(|(mirror, nested)| {
             // Every facet (partials, structured pool, flat, metadata, by-hash)
-            // runs on the engine as one ordered per-mirror unit list; the
-            // classifier's emission order guarantees the two Partials units run
-            // first (a stale temp file from an interrupted download shouldn't
-            // linger) and each mirror's metadata sweep precedes its by-hash
-            // units. `nested` feeds the FlatTree unit's walk
-            // boundaries.
+            // runs on the engine as one ordered per-mirror unit list, in the
+            // order `classify_mirror` documents and emits; `nested` becomes the
+            // FlatTree unit's walk boundaries.
             let units = classify_mirror(&mirror, nested, config);
             tokio::task::spawn(run_mirror_units(mirror, units, appstate.clone(), config))
         });

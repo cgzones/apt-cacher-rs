@@ -69,6 +69,13 @@ fn is_release_filename(name: &str, layout: CacheLayout) -> bool {
     }
 }
 
+static RELEASE_WALK: WalkContext = WalkContext {
+    what: "a Release directory",
+    dir_failure: DirFailure::Abort("falling back to age-based retention for its by-hash tree"),
+    entry_failure: "ignoring it for by-hash reconciliation",
+    non_regular: "ignoring it for by-hash reconciliation",
+};
+
 /// Build the union by-hash digest set for one by-hash directory from every
 /// current `Release`/`InRelease` file in `release_dir`.
 ///
@@ -88,13 +95,6 @@ fn is_release_filename(name: &str, layout: CacheLayout) -> bool {
 /// orphaned; if any expected dist is missing we bail to age mode. Pass an empty
 /// slice for the flat tree, which has a single root `{In,}Release` and no
 /// per-dist union.
-static RELEASE_WALK: WalkContext = WalkContext {
-    what: "a Release directory",
-    dir_failure: DirFailure::Abort("falling back to age-based retention for its by-hash tree"),
-    entry_failure: "ignoring it for by-hash reconciliation",
-    non_regular: "ignoring it for by-hash reconciliation",
-};
-
 pub(super) async fn build_byhash_reference_set(
     release_dir: &Path,
     layout: CacheLayout,
@@ -194,8 +194,9 @@ pub(super) async fn build_byhash_reference_set(
             "No Release files in `{}` for by-hash reconciliation; falling back to age-based retention",
             release_dir.display()
         );
+        return None;
     }
-    found.then_some(set)
+    Some(set)
 }
 
 /// Distinct distributions of the mirror's *active* origins (seen within

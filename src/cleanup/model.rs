@@ -376,23 +376,17 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
                 },
             };
 
-            // An owning group that completed ended reconciliation (the engine
-            // stops early), so its presence as the last result means Grace.
-            if let Some(last) = groups.last()
-                && last.owning
-                && matches!(last.outcome, GroupOutcome::Complete)
-            {
-                return grace_sweep();
-            }
-            // Otherwise the last group is the always-present co-located probe.
+            // The engine stops resolving at an owning group that completed, so
+            // the last result is either that group -- which then owns the whole
+            // reconciliation, hence Grace -- or the always-present co-located
+            // probe.
             let Some(colocated) = groups.last() else {
                 return grace_sweep();
             };
-            let root = groups
-                .iter()
-                .rev()
-                .skip(1)
-                .find(|g| g.root_seg.is_some() && !g.owning);
+            if colocated.owning && matches!(colocated.outcome, GroupOutcome::Complete) {
+                return grace_sweep();
+            }
+
             match &colocated.outcome {
                 GroupOutcome::Complete | GroupOutcome::NotApplicable(_) => grace_sweep(),
                 // A parse error falls back to age retention even when the
@@ -405,14 +399,24 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
                     },
                     None,
                 ),
-                GroupOutcome::FetchFailed(primary) => match root.map(|g| (&g.outcome, g)) {
-                    Some((GroupOutcome::Complete, _)) => grace_sweep(),
-                    Some((GroupOutcome::FetchFailed(rf), g)) => age_sweep(
-                        primary.clone(),
-                        g.root_seg.clone().map(|seg| (seg, rf.clone())),
-                    ),
-                    _ => age_sweep(primary.clone(), None),
-                },
+                GroupOutcome::FetchFailed(primary) => {
+                    // The root-segment group, when one ran ahead of the
+                    // co-located probe: its segment names the flat-repo root in
+                    // the fallback warn suffix.
+                    let root = groups.iter().rev().skip(1).find_map(|g| match &g.root_seg {
+                        Some(seg) if !g.owning => Some((seg.as_str(), &g.outcome)),
+                        Some(_) | None => None,
+                    });
+                    match root {
+                        Some((_, GroupOutcome::Complete)) => grace_sweep(),
+                        Some((seg, GroupOutcome::FetchFailed(root_failure))) => age_sweep(
+                            primary.clone(),
+                            Some((seg.to_owned(), root_failure.clone())),
+                        ),
+                        Some((_, GroupOutcome::NotApplicable(_) | GroupOutcome::ParseError))
+                        | None => age_sweep(primary.clone(), None),
+                    }
+                }
             }
         }
     }
@@ -423,22 +427,17 @@ pub(super) fn decide_sweep(policy: ReconcilePolicy, groups: &[GroupResult]) -> S
 /// `Packages` index's `Filename:` values before matching cached debs.
 ///
 /// Returns `None` when the path has no ancestor segment distinct from itself
-/// (single-segment, or trailing-slash-only like `"apt/"`), so no flat-root
-/// fallback applies.
-pub(super) fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
+/// (single-segment, or trailing-slash-only like `"apt/"`) or starts with `/`,
+/// so no flat-root fallback applies.
+fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
     let trimmed = mirror_path.trim_end_matches('/');
-    let (head, _) = trimmed.split_once('/')?;
+    let (head, rest) = trimmed.split_once('/')?;
     if head.is_empty() {
         return None;
     }
-    let mut prefix = trimmed
-        .strip_prefix(head)
-        .unwrap_or("")
-        .trim_matches('/')
-        .to_owned();
-    if prefix.is_empty() {
-        return None; // path was exactly the head segment
-    }
+    // `trimmed` cannot end in `/`, so `rest` holds at least one non-slash
+    // character and the trimmed prefix is never empty.
+    let mut prefix = rest.trim_matches('/').to_owned();
     prefix.push('/');
     Some((head, prefix))
 }
@@ -456,7 +455,7 @@ pub(super) fn flat_root_split(mirror_path: &str) -> Option<(&str, String)> {
 /// have no structured pool tree, dists tree, or dists by-hash tree on disk.
 ///
 /// `nested` is the caller's pre-computed list of sibling mirror paths nested
-/// under `entry.path` (`scan::derive_nested_paths`); it becomes the
+/// under `entry.path` (`deb_mirror::derive_nested_paths`); it becomes the
 /// [`ReconcileFacet::FlatTree`] unit's walk boundaries.
 ///
 /// Every unit root is a [`CachePaths::entry_dir`] / [`CachePaths::tmp_dir`]
@@ -1075,20 +1074,39 @@ mod tests {
         let units = classify_mirror(&entry, Vec::new(), &config);
         let flat_tree = flat_tree_unit(&units);
 
+        // The full cascade: the owning hybrid group first, then the flat-root
+        // fallback, then the always-last co-located probe `decide_sweep` reads.
         assert_eq!(
-            flat_tree.groups[0],
-            SourceGroup {
-                source: IndexSource::OriginPackages {
-                    origin_rows_of: OriginOwner::ArchiveRoot {
-                        root: "api/packages/85/debian".to_owned(),
+            flat_tree.groups,
+            vec![
+                SourceGroup {
+                    source: IndexSource::OriginPackages {
+                        origin_rows_of: OriginOwner::ArchiveRoot {
+                            root: "api/packages/85/debian".to_owned(),
+                        },
+                        keymap: KeymapSpec::RelpathUnderPrefix {
+                            prefix: "pool/php-zts/main/".to_owned(),
+                        },
+                        cache_layout: CacheLayout::Flat,
                     },
-                    keymap: KeymapSpec::RelpathUnderPrefix {
-                        prefix: "pool/php-zts/main/".to_owned(),
-                    },
-                    cache_layout: CacheLayout::Flat,
+                    owning: true,
                 },
-                owning: true,
-            }
+                SourceGroup {
+                    source: IndexSource::FlatPackages {
+                        fetch: FlatFetch::RootSegment {
+                            seg: "api".to_owned(),
+                            prefix: "packages/85/debian/pool/php-zts/main/".to_owned(),
+                        },
+                    },
+                    owning: false,
+                },
+                SourceGroup {
+                    source: IndexSource::FlatPackages {
+                        fetch: FlatFetch::Colocated,
+                    },
+                    owning: false,
+                },
+            ]
         );
     }
 
@@ -1169,9 +1187,23 @@ mod tests {
         );
         assert_eq!(flat_root_split("apt/"), None); // single segment after trim, no ancestor
         assert_eq!(flat_root_split("apt"), None); // single segment, no ancestor
+        assert_eq!(flat_root_split(""), None);
         assert_eq!(
             flat_root_split("repo/dists/amd64/sub"),
             Some(("repo", "dists/amd64/sub/".to_owned()))
         );
+    }
+
+    #[test]
+    fn flat_root_split_normalises_stray_slashes_and_rejects_a_leading_one() {
+        // Repeated separators collapse into the same segment/prefix pair, and
+        // the prefix always ends in exactly one `/` (it is stripped from
+        // `Filename:` values, so a doubled or missing slash would match nothing).
+        assert_eq!(
+            flat_root_split("apt//amd64//"),
+            Some(("apt", "amd64/".to_owned()))
+        );
+        // A leading `/` would make the flat-repo root segment empty.
+        assert_eq!(flat_root_split("/apt/amd64"), None);
     }
 }
