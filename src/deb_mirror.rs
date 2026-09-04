@@ -177,9 +177,34 @@ impl std::fmt::Display for Mirror {
 #[derive(Debug, PartialEq)]
 pub(crate) struct Origin {
     pub(crate) mirror: Mirror,
+    pub(crate) fields: OriginFields,
+}
+
+/// The `(distribution, component, architecture)` triple that, together with a
+/// [`Mirror`], names an `origins` row.  Carried on its own by `RequestClass`
+/// and `ConnectionDetails`, which already hold the mirror; `None` there for
+/// every request that mints no origin row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OriginFields {
     pub(crate) distribution: String,
     pub(crate) component: String,
     pub(crate) architecture: String,
+}
+
+/// Returns `true` for Debian-archive "pseudo-architectures" — values that
+/// appear in the `architecture` position of a `dists/` URL but do not
+/// describe a real binary architecture and therefore are never recorded as
+/// per-binary origins.
+///
+/// The current pseudo-arches are `dep11` (`AppStream` component metadata),
+/// `i18n` (Translation indices), and `source` (source-package indices).
+///
+/// Single source of truth for the list, and applied in the two places that
+/// can mint the triple: the `origin_fields` arm of
+/// `cache_layout::classify_request` and [`Origin::from_path`].
+#[must_use]
+pub(crate) fn is_pseudo_arch(arch: &str) -> bool {
+    matches!(arch, "dep11" | "i18n" | "source")
 }
 
 impl Origin {
@@ -251,13 +276,24 @@ impl Origin {
             return None;
         }
 
+        // A pseudo-architecture mints no row. Only the `by-hash` shape can
+        // reach here carrying one (`dists/<d>/<c>/dep11/by-hash/SHA256/<hex>`)
+        // — `dep11`/`i18n`/`source` have no `Packages*` file of their own.
+        // The rejection lives here rather than at the three recording
+        // backends, each of which used to repeat it after the call.
+        if is_pseudo_arch(architecture) {
+            return None;
+        }
+
         Some(Self {
             // Origin URLs always parse from `<path>/dists/...` paths, which
             // are exclusively a structured-layout shape.
             mirror: Mirror::new(host, port, mirror_path.to_owned(), MirrorKind::Structured),
-            distribution: distribution.to_owned(),
-            component: component.to_owned(),
-            architecture: architecture.to_owned(),
+            fields: OriginFields {
+                distribution: distribution.to_owned(),
+                component: component.to_owned(),
+                architecture: architecture.to_owned(),
+            },
         })
     }
 }
@@ -288,9 +324,9 @@ impl UriFormat for Origin {
             &self.mirror.host,
             self.mirror.port,
             &self.mirror.path,
-            &self.distribution,
-            &self.component,
-            &self.architecture,
+            &self.fields.distribution,
+            &self.fields.component,
+            &self.fields.architecture,
         )
     }
 }
@@ -1267,9 +1303,11 @@ mod tests {
                     "debian".to_string(),
                     MirrorKind::Structured,
                 ),
-                distribution: "sid".to_string(),
-                component: "main".to_string(),
-                architecture: "binary-amd64".to_string()
+                fields: OriginFields {
+                    distribution: "sid".to_string(),
+                    component: "main".to_string(),
+                    architecture: "binary-amd64".to_string(),
+                },
             }
         );
         assert_eq!(
@@ -1296,9 +1334,11 @@ mod tests {
                     "private/debian".to_string(),
                     MirrorKind::Structured,
                 ),
-                distribution: "sid".to_string(),
-                component: "main".to_string(),
-                architecture: "binary-amd64".to_string()
+                fields: OriginFields {
+                    distribution: "sid".to_string(),
+                    component: "main".to_string(),
+                    architecture: "binary-amd64".to_string(),
+                },
             }
         );
         assert_eq!(
@@ -1324,9 +1364,11 @@ mod tests {
                     "unstable".to_string(),
                     MirrorKind::Structured,
                 ),
-                distribution: "llvm-toolchain-19".to_string(),
-                component: "main".to_string(),
-                architecture: "binary-amd64".to_string()
+                fields: OriginFields {
+                    distribution: "llvm-toolchain-19".to_string(),
+                    component: "main".to_string(),
+                    architecture: "binary-amd64".to_string(),
+                },
             }
         );
         assert_eq!(
@@ -1352,9 +1394,11 @@ mod tests {
                     "debian".to_string(),
                     MirrorKind::Structured,
                 ),
-                distribution: "sid".to_string(),
-                component: "main".to_string(),
-                architecture: "binary-amd64".to_string()
+                fields: OriginFields {
+                    distribution: "sid".to_string(),
+                    component: "main".to_string(),
+                    architecture: "binary-amd64".to_string(),
+                },
             }
         );
         assert_eq!(
@@ -2232,9 +2276,7 @@ mod tests {
             None,
         )
         .expect("`//` in mirror path should still parse after normalisation");
-        assert_eq!(raw.distribution, doubled.distribution);
-        assert_eq!(raw.component, doubled.component);
-        assert_eq!(raw.architecture, doubled.architecture);
+        assert_eq!(raw.fields, doubled.fields);
 
         // Triple slash is collapsed too.
         let tripled = Origin::from_path(
@@ -2243,7 +2285,31 @@ mod tests {
             None,
         )
         .expect("`///` in mirror path should still parse after normalisation");
-        assert_eq!(raw.architecture, tripled.architecture);
+        assert_eq!(raw.fields, tripled.fields);
+    }
+
+    /// The pseudo-architectures mint no `origins` row: cleanup would treat
+    /// one as a per-architecture index and fetch a `Packages` file that does
+    /// not exist. Only the `by-hash` shape can carry one this far, since
+    /// `dep11`/`i18n`/`source` have no `Packages*` file of their own -- so
+    /// that is the shape to pin.
+    #[test]
+    fn pseudo_architectures_mint_no_origin() {
+        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+        const DIGEST: &str = "84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83";
+        for arch in ["dep11", "i18n", "source"] {
+            let path = format!("/debian/dists/sid/main/{arch}/by-hash/SHA256/{DIGEST}");
+            assert_eq!(
+                Origin::from_path(&path, host(), None),
+                None,
+                "{arch} is a pseudo-architecture"
+            );
+        }
+        let real = format!("/debian/dists/sid/main/binary-amd64/by-hash/SHA256/{DIGEST}");
+        assert!(
+            Origin::from_path(&real, host(), None).is_some(),
+            "a real architecture still parses"
+        );
     }
 
     #[test]
@@ -2260,11 +2326,11 @@ mod tests {
             None,
         )
         .expect("valid by-hash URL must parse");
-        assert_eq!(parsed.distribution, "sid");
-        assert_eq!(parsed.component, "main");
+        assert_eq!(parsed.fields.distribution, "sid");
+        assert_eq!(parsed.fields.component, "main");
         // The architecture must be `binary-amd64`, never `"by-hash"`.
-        assert_eq!(parsed.architecture, "binary-amd64");
-        assert_ne!(parsed.architecture, "by-hash");
+        assert_eq!(parsed.fields.architecture, "binary-amd64");
+        assert_ne!(parsed.fields.architecture, "by-hash");
     }
 
     #[test]

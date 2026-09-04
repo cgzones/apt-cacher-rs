@@ -61,7 +61,6 @@ use tokio::{io::AsyncWriteExt as _, net::TcpStream};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
-use crate::cache_layout;
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_paths::CachePaths;
 use crate::cache_quota::QuotaExceeded;
@@ -669,8 +668,7 @@ async fn commit_and_record(
         original_uri_path,
         conn_details.mirror.host().clone(),
         conn_details.mirror.port(),
-    ) && !cache_layout::is_pseudo_arch(&origin.architecture)
-    {
+    ) {
         let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
         send_db_command(cmd).await;
     }

@@ -42,7 +42,7 @@ use crate::{
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{self, CacheMiss, CachedFlavor, ConnectionDetails},
+    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
     cache_metadata::{
         self, InvalidValidator, UpstreamMetadata, check_upstream_validators,
         write_upstream_metadata,
@@ -2775,10 +2775,8 @@ async fn pre_process_client_request(
         debug!("Extracted origin: {origin:?}");
 
         // TODO: cache some of them?
-        if !cache_layout::is_pseudo_arch(&origin.architecture) {
-            let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
-            send_db_command(cmd).await;
-        }
+        let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
+        send_db_command(cmd).await;
     }
 
     if matches!(

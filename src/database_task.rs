@@ -272,9 +272,9 @@ async fn stage(
             };
             let row = OriginRow {
                 mirror_id,
-                distribution: c.origin.distribution,
-                component: c.origin.component,
-                architecture: c.origin.architecture,
+                distribution: c.origin.fields.distribution,
+                component: c.origin.fields.component,
+                architecture: c.origin.fields.architecture,
             };
             // Dedup within the batch: every Packages request for an origin
             // enqueues the same upsert, so a fleet refreshing one suite

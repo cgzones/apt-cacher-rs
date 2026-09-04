@@ -9,7 +9,6 @@ use http::StatusCode;
 use tokio::net::TcpStream;
 use tracing::{debug, info, trace};
 
-use crate::cache_layout;
 use crate::database_task::{DatabaseCommand, DbCmdOrigin, send_db_command};
 use crate::deb_mirror::{Mirror, Origin};
 use crate::error::ErrorReport;
@@ -234,7 +233,6 @@ pub(crate) async fn splice_simple_proxy(
     if (resp.status_code.is_success() || resp.status_code.is_redirection())
         && let Some(origin) =
             Origin::from_path(original_uri_path, mirror.host().clone(), mirror.port())
-        && !cache_layout::is_pseudo_arch(&origin.architecture)
     {
         let cmd = DatabaseCommand::Origin(DbCmdOrigin { origin });
         send_db_command(cmd).await;

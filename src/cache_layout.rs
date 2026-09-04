@@ -63,8 +63,9 @@ use crate::{
     config::ClientHost,
     database_task::{DatabaseCommand, DbCmdOrigin, send_db_command_nonblocking},
     deb_mirror::{
-        FlatKind, Mirror, MirrorKind, Origin, ResourceFile, is_deb_package, is_flat_deb_filename,
-        valid_architecture, valid_component, valid_distribution, valid_filename, valid_mirrorname,
+        FlatKind, Mirror, MirrorKind, Origin, OriginFields, ResourceFile, is_deb_package,
+        is_flat_deb_filename, is_pseudo_arch, valid_architecture, valid_component,
+        valid_distribution, valid_filename, valid_mirrorname,
     },
     precise_instant::PreciseInstant,
 };
@@ -374,9 +375,7 @@ impl ConnectionDetails {
         }
         let origin = Origin {
             mirror: self.mirror.clone(),
-            distribution: fields.distribution.clone(),
-            component: fields.component.clone(),
-            architecture: fields.architecture.clone(),
+            fields: (**fields).clone(),
         };
         send_db_command_nonblocking(DatabaseCommand::Origin(DbCmdOrigin { origin }));
     }
@@ -503,34 +502,6 @@ impl std::fmt::Display for ValidateKind {
             Self::Filename => "filename",
         })
     }
-}
-
-/// The deferred `Origin` payload populated for `Packages` requests with a
-/// non-special architecture; `None` for every other variant (and for the
-/// `dep11`/`i18n`/`source` pseudo-architectures, which are never recorded as
-/// origins).
-#[derive(Clone, Debug)]
-pub(crate) struct OriginFields {
-    pub(crate) distribution: String,
-    pub(crate) component: String,
-    pub(crate) architecture: String,
-}
-
-/// Returns `true` for Debian-archive "pseudo-architectures" — values that
-/// appear in the `architecture` position of a `Packages` URL but do not
-/// describe a real binary architecture and therefore are never recorded as
-/// per-binary origins.
-///
-/// The current pseudo-arches are `dep11` (`AppStream` component metadata),
-/// `i18n` (Translation indices), and `source` (source-package indices).
-///
-/// This helper is the single source of truth for the list; adding a future
-/// pseudo-arch (e.g. `signed-by`) is a one-line change here. Call sites:
-/// the `origin_fields` arm in [`classify_request`] and the deferred-`Origin`
-/// DB-emission filters in `hyper_conn.rs`, `splice/mod.rs` and `splice/simple_proxy.rs`.
-#[must_use]
-pub(crate) fn is_pseudo_arch(arch: &str) -> bool {
-    matches!(arch, "dep11" | "i18n" | "source")
 }
 
 /// Flatten an architecture-scoped `dists/` index into its cache debname.
