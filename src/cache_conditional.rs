@@ -279,7 +279,7 @@ impl CacheInfo {
     /// stored `Last-Modified`. Header values come pre-decoded as strings;
     /// unparsable values are treated as absent.
     #[must_use]
-    pub(crate) fn decide_serve_304(
+    fn decide_serve_304(
         &self,
         if_none_match_header: Option<&str>,
         if_modified_since_header: Option<&str>,
