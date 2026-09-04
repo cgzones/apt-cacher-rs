@@ -5,7 +5,6 @@
 //! from [`super::metrics_page`].
 
 use std::{
-    borrow::Cow,
     fmt::{self, Display, Formatter},
     sync::Arc,
 };
@@ -38,10 +37,7 @@ use super::{
         MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Utc, Window, YesNo, as_size,
     },
     metrics_page::build_metrics_html,
-    page::{
-        Page, PageTitle, QueryOptions, build_heading_html, build_nav_html, build_page,
-        build_setup_hint_html,
-    },
+    page::{Heading, Page, PageTitle, QueryOptions, SetupHint, build_nav_html, build_page},
     response::WebResponse,
     table::{DetailsList, write_collapsible_details, write_collapsible_section, write_section},
     tables::{
@@ -122,28 +118,6 @@ static AGGREGATE_CACHE: tokio::sync::Mutex<Option<(Instant, Arc<DashboardAggrega
 /// serve a stale page.
 const AGGREGATES_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(5);
 
-/// Run the five aggregate queries concurrently on one task.
-async fn fetch_aggregates(database: &Database, now_epoch: i64) -> AggregateResults {
-    let day_cutoff = now_epoch.saturating_sub(24 * 60 * 60);
-    let week_cutoff = now_epoch.saturating_sub(7 * 24 * 60 * 60);
-
-    let (mirrors, origins, clients, top_packages, bandwidth) = tokio::join!(
-        database.get_mirrors_with_stats(),
-        database.get_origins(),
-        database.get_clients_with_stats(),
-        database.get_top_packages(TOP_PACKAGES_LIMIT),
-        database.get_bandwidth_windows(day_cutoff, week_cutoff),
-    );
-
-    AggregateResults {
-        mirrors,
-        origins,
-        clients,
-        top_packages,
-        bandwidth,
-    }
-}
-
 /// Serve the memoized aggregates, refreshing them when older than
 /// [`AGGREGATES_TTL`].
 ///
@@ -162,15 +136,20 @@ async fn cached_aggregates(
         return Ok(Arc::clone(aggregates));
     }
 
-    let AggregateResults {
-        mirrors,
-        origins,
-        clients,
-        top_packages,
-        bandwidth,
-    } = fetch_aggregates(database, now_epoch).await;
+    let day_cutoff = now_epoch.saturating_sub(24 * 60 * 60);
+    let week_cutoff = now_epoch.saturating_sub(7 * 24 * 60 * 60);
 
-    match (mirrors, origins, clients, top_packages, bandwidth) {
+    // The five queries run concurrently on this one task; the lock is held
+    // across them so concurrent loads queue behind this single flight.
+    let results = tokio::join!(
+        database.get_mirrors_with_stats(),
+        database.get_origins(),
+        database.get_clients_with_stats(),
+        database.get_top_packages(TOP_PACKAGES_LIMIT),
+        database.get_bandwidth_windows(day_cutoff, week_cutoff),
+    );
+
+    match results {
         (Ok(mirrors), Ok(origins), Ok(clients), Ok(top_packages), Ok(bandwidth)) => {
             let aggregates = Arc::new(DashboardAggregates {
                 mirrors,
@@ -357,12 +336,6 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     let active_mirror_downloads = appstate.active_downloads.len();
     let memory_stats = memory_stats::memory_stats();
 
-    let https_mode = match rd.config.https_upgrade_mode {
-        HttpsUpgradeMode::Auto => "Auto",
-        HttpsUpgradeMode::Always => "Always",
-        HttpsUpgradeMode::Never => "Never",
-    };
-
     // Sample utilization so the peak metric reflects long idle stretches.
     let cache_size = global_cache_quota().current_size();
     global_cache_quota().sample_utilization_peak_with(cache_size);
@@ -377,7 +350,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         active_mirror_downloads,
     );
 
-    let configuration_html = build_configuration_html(rd, https_mode);
+    let configuration_html = build_configuration_html(rd);
     let maintenance_html = build_maintenance_html(mirror_rows, now_epoch, next_cleanup_epoch);
 
     let cache_stats_html = build_cache_stats_html(
@@ -529,24 +502,27 @@ fn build_daemon_status_html(
         ),
     );
     t.row("Current Time", now);
-    {
-        let phys = OptSize {
-            bytes: memory_stats.map(|m| m.physical_mem as u64),
-            fallback: "N/A",
-        };
-        let virt = OptSize {
-            bytes: memory_stats.map(|m| m.virtual_mem as u64),
-            fallback: "N/A",
-        };
-        t.row("Memory Usage", format_args!("{phys} ({virt} virtual)"));
-        t.row(
-            "Database Size",
+    t.row(
+        "Memory Usage",
+        format_args!(
+            "{} ({} virtual)",
             OptSize {
-                bytes: database_size,
+                bytes: memory_stats.map(|m| m.physical_mem as u64),
                 fallback: "N/A",
             },
-        );
-    }
+            OptSize {
+                bytes: memory_stats.map(|m| m.virtual_mem as u64),
+                fallback: "N/A",
+            },
+        ),
+    );
+    t.row(
+        "Database Size",
+        OptSize {
+            bytes: database_size,
+            fallback: "N/A",
+        },
+    );
     t.row(
         "Connected Clients",
         format_args!(
@@ -604,7 +580,25 @@ fn build_daemon_status_html(
     t.finish()
 }
 
-fn build_configuration_html(rd: &RuntimeDetails, https_mode: &'static str) -> String {
+/// A retention window in days, or `"forever"` when it is unlimited.
+struct Retention(Option<std::num::NonZero<u64>>);
+
+impl Display for Retention {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(days) => write!(f, "{days} days"),
+            None => f.write_str("forever"),
+        }
+    }
+}
+
+fn build_configuration_html(rd: &RuntimeDetails) -> String {
+    let https_mode = match rd.config.https_upgrade_mode {
+        HttpsUpgradeMode::Auto => "Auto",
+        HttpsUpgradeMode::Always => "Always",
+        HttpsUpgradeMode::Never => "Never",
+    };
+
     let mut t = DetailsList::new();
     t.row(
         "Bind Address + Port",
@@ -652,13 +646,7 @@ fn build_configuration_html(rd: &RuntimeDetails, https_mode: &'static str) -> St
         "Reject pdiff Requests",
         YesNo(rd.config.reject_pdiff_requests),
     );
-    t.row(
-        "Usage Retention",
-        match rd.config.usage_retention_days {
-            Some(d) => Cow::Owned(format!("{} days", d.get())),
-            None => Cow::Borrowed("forever"),
-        },
-    );
+    t.row("Usage Retention", Retention(rd.config.usage_retention_days));
     t.row(
         "ByHash Retention",
         format_args!("{} days", rd.config.byhash_retention_days),
@@ -684,50 +672,59 @@ fn build_maintenance_html(
     now_epoch: i64,
     next_cleanup_epoch: i64,
 ) -> String {
-    /// Renders `<timestamp> (<rel>)` if epoch > 0, otherwise just `FmtTimestamp` (= "N/A").
+    /// Which side of `now` the timestamp sits on, and so which way the
+    /// relative figure is subtracted.
+    #[derive(Clone, Copy)]
+    enum Rel {
+        Ago,
+        FromNow,
+    }
+
+    /// Renders `<timestamp> (<rel> ago|from now)`, or just `FmtTimestamp`
+    /// (= "N/A") for the `0` "never" sentinel. The relative figure is
+    /// derived here rather than passed in, so it cannot be computed against
+    /// a different epoch than the one printed beside it.
     struct EpochAndRel {
         epoch: i64,
-        rel: std::time::Duration,
-        rel_label: &'static str,
+        now_epoch: i64,
+        rel: Rel,
     }
     impl Display for EpochAndRel {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             Display::fmt(&FmtTimestamp(self.epoch), f)?;
-            if self.epoch != 0 {
-                write!(f, " ({} {})", HumanFmt::Time(self.rel), self.rel_label)?;
+            if self.epoch == 0 {
+                return Ok(());
             }
-            Ok(())
+            let (secs, label) = match self.rel {
+                Rel::Ago => (self.now_epoch.saturating_sub(self.epoch), "ago"),
+                Rel::FromNow => (self.epoch.saturating_sub(self.now_epoch), "from now"),
+            };
+            let elapsed = std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0));
+            write!(f, " ({} {label})", HumanFmt::Time(elapsed))
         }
     }
 
     let last_cleanup_epoch = mirrors.iter().map(|m| m.last_cleanup).max().unwrap_or(0);
-    let cleanup_interval = HumanFmt::Time(std::time::Duration::from_secs(CLEANUP_INTERVAL_SECS));
-    // Only meaningful when last_cleanup_epoch != 0; EpochAndRel ignores it otherwise,
-    // so don't fabricate a multi-decade duration from the 0 sentinel.
-    let last_rel = if last_cleanup_epoch == 0 {
-        std::time::Duration::ZERO
-    } else {
-        std::time::Duration::from_secs(as_size(now_epoch.saturating_sub(last_cleanup_epoch)))
-    };
-    let next_rel =
-        std::time::Duration::from_secs(as_size(next_cleanup_epoch.saturating_sub(now_epoch)));
 
     let mut t = DetailsList::new();
     t.row(
         "Last Cleanup",
         EpochAndRel {
             epoch: last_cleanup_epoch,
-            rel: last_rel,
-            rel_label: "ago",
+            now_epoch,
+            rel: Rel::Ago,
         },
     );
-    t.row("Cleanup Interval", cleanup_interval);
+    t.row(
+        "Cleanup Interval",
+        HumanFmt::Time(std::time::Duration::from_secs(CLEANUP_INTERVAL_SECS)),
+    );
     t.row(
         "Next Cleanup",
         EpochAndRel {
             epoch: next_cleanup_epoch,
-            rel: next_rel,
-            rel_label: "from now",
+            now_epoch,
+            rel: Rel::FromNow,
         },
     );
     t.finish()
@@ -782,16 +779,11 @@ fn build_cache_stats_html(
     );
     t.row("Oldest Cached File", FmtMTimeAge(aggregate.oldest_mtime));
     t.row("Newest Cached File", FmtMTimeAge(aggregate.newest_mtime));
-    t.row(
-        "Total Disk Usage",
-        DiskUsage {
-            cache_size,
-            quota: rd.config.disk_quota.map(std::num::NonZero::get),
-        },
-    );
+
+    let quota = rd.config.disk_quota.map(std::num::NonZero::get);
+    t.row("Total Disk Usage", DiskUsage { cache_size, quota });
 
     let free_disk_space = if let Some(free) = free_disk_bytes {
-        let quota = rd.config.disk_quota.map(std::num::NonZero::get);
         let remaining_quota = quota.map(|q| q.saturating_sub(cache_size));
         let class = match remaining_quota {
             Some(rq) if free < rq => RatioClass::Warn,
@@ -819,20 +811,17 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         .expect("initialized in main()")
         .entries()
         .len();
-    let nav = build_nav_html(Page::Dashboard { log_count }, options);
-
     let mut body = String::with_capacity(8 * 1024);
-    body.push_str(&nav);
-    body.push_str(&build_heading_html());
+    body.push_str(&build_nav_html(Page::Dashboard { log_count }, options));
+    swrite!(body, "{}", Heading);
 
     if !data.seen_traffic {
-        body.push_str(&build_setup_hint_html(
-            RUNTIMEDETAILS
-                .get()
-                .expect("initialized in main()")
-                .config
-                .bind_port,
-        ));
+        let bind_port = RUNTIMEDETAILS
+            .get()
+            .expect("initialized in main()")
+            .config
+            .bind_port;
+        swrite!(body, "{}", SetupHint(bind_port));
     }
 
     body.push_str(&data.hero_html);

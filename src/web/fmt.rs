@@ -500,10 +500,20 @@ impl Display for DiskUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::{HtmlEscape, RatioClass};
+    use std::fmt::Display;
+
+    use super::{CacheHitRatio, FmtTimestamp, Freshness, HtmlEscape, Meter, Pct, RatioClass};
+
+    /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
+    const NOW: i64 = 1_700_000_000;
+    const DAY: i64 = 24 * 60 * 60;
 
     fn escape(s: &str) -> String {
         format!("{}", HtmlEscape(s))
+    }
+
+    fn render(value: impl Display) -> String {
+        format!("{value}")
     }
 
     #[test]
@@ -593,5 +603,87 @@ mod tests {
         assert!(matches!(RatioClass::new(u64::MAX, 1), RatioClass::Alert));
         // Tiny value, huge limit: the multiplications do not overflow.
         assert!(matches!(RatioClass::new(1, u64::MAX), RatioClass::Normal));
+    }
+
+    #[test]
+    fn freshness_treats_non_positive_last_seen_as_unknown() {
+        // The DB writes 0 for "never seen"; a negative value is nonsense.
+        assert!(matches!(Freshness::of(0, NOW), Freshness::Unknown));
+        assert!(matches!(Freshness::of(-1, NOW), Freshness::Unknown));
+    }
+
+    #[test]
+    fn freshness_thresholds() {
+        assert!(matches!(Freshness::of(NOW, NOW), Freshness::Fresh));
+        // A week is still fresh; the eighth day is not.
+        assert!(matches!(
+            Freshness::of(NOW - 7 * DAY, NOW),
+            Freshness::Fresh
+        ));
+        assert!(matches!(
+            Freshness::of(NOW - 8 * DAY, NOW),
+            Freshness::Aging(8)
+        ));
+        // A month is still aging; the thirty-first day is stale.
+        assert!(matches!(
+            Freshness::of(NOW - 30 * DAY, NOW),
+            Freshness::Aging(30)
+        ));
+        assert!(matches!(
+            Freshness::of(NOW - 31 * DAY, NOW),
+            Freshness::Stale(31)
+        ));
+    }
+
+    #[test]
+    fn freshness_future_timestamp_is_fresh() {
+        // A clock-skewed future timestamp yields a negative age, which trips
+        // neither threshold instead of wrapping into "stale".
+        assert!(matches!(Freshness::of(NOW + DAY, NOW), Freshness::Fresh));
+    }
+
+    #[test]
+    fn freshness_row_class_marks_only_degraded_rows() {
+        assert_eq!(Freshness::Unknown.row_class(), "");
+        assert_eq!(Freshness::Fresh.row_class(), "");
+        assert_eq!(Freshness::Aging(8).row_class(), " class=\"row-aging\"");
+        assert_eq!(Freshness::Stale(31).row_class(), " class=\"row-stale\"");
+    }
+
+    #[test]
+    fn fmt_timestamp_renders_iso_and_human_halves() {
+        assert_eq!(
+            render(FmtTimestamp(NOW)),
+            "<time datetime=\"2023-11-14T22:13:20Z\">14 Nov 2023 22:13:20</time>",
+        );
+    }
+
+    #[test]
+    fn fmt_timestamp_zero_is_na() {
+        assert_eq!(render(FmtTimestamp(0)), "N/A");
+    }
+
+    #[test]
+    fn meter_without_scale_renders_nothing() {
+        assert_eq!(render(Meter { value: 5, max: 0 }), "");
+    }
+
+    #[test]
+    fn meter_clamps_value_to_max() {
+        // An over-quota cache must not emit value > max, which browsers
+        // render as a full bar anyway but flag as an invalid attribute pair.
+        assert_eq!(
+            render(Meter { value: 12, max: 10 }),
+            "<meter class=\"bar\" value=\"10\" max=\"10\"></meter>",
+        );
+    }
+
+    #[test]
+    fn percentages_guard_non_positive_denominators() {
+        assert_eq!(render(Pct { num: 1, den: 0 }), "N/A");
+        assert_eq!(render(Pct { num: 1, den: -5 }), "N/A");
+        assert_eq!(render(Pct { num: 1, den: 4 }), "25.0%");
+        assert_eq!(render(CacheHitRatio { hits: 1, total: 0 }), "N/A");
+        assert_eq!(render(CacheHitRatio { hits: 3, total: 4 }), "75.0% (3 / 4)");
     }
 }

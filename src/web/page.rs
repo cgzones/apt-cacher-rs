@@ -40,22 +40,33 @@ impl Display for PageTitle {
 /// First-run guidance. With nothing fetched yet the dashboard is a wall of
 /// zeroes, and the one thing its reader needs is the line that points apt at
 /// this daemon.
-pub(super) fn build_setup_hint_html(port: std::num::NonZero<u16>) -> String {
-    format!(
-        "<div class=\"section setup\"><h2>Getting Started</h2>\
-         <p>No mirror has been contacted yet. Point apt at this proxy by writing \
-         <code>Acquire::http::Proxy \"http://{}:{port}\";</code> into \
-         <code>/etc/apt/apt.conf.d/01proxy</code> on a client.</p></div>",
-        HtmlEscape(&HOSTNAME),
-    )
+pub(super) struct SetupHint(pub(super) std::num::NonZero<u16>);
+
+impl Display for SetupHint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "<div class=\"section setup\"><h2>Getting Started</h2>\
+             <p>No mirror has been contacted yet. Point apt at this proxy by writing \
+             <code>Acquire::http::Proxy \"http://{}:{}\";</code> into \
+             <code>/etc/apt/apt.conf.d/01proxy</code> on a client.</p></div>",
+            HtmlEscape(&HOSTNAME),
+            self.0,
+        )
+    }
 }
 
 /// The page heading, carrying the same identity as the `<title>`.
-pub(super) fn build_heading_html() -> String {
-    format!(
-        "<h1>apt-cacher-rs <span class=\"host\">on {}</span></h1>",
-        HtmlEscape(&HOSTNAME)
-    )
+pub(super) struct Heading;
+
+impl Display for Heading {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "<h1>apt-cacher-rs <span class=\"host\">on {}</span></h1>",
+            HtmlEscape(&HOSTNAME)
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +206,10 @@ impl Display for QueryUrl<'_> {
     }
 }
 
+/// Seconds the dashboard's auto-refresh link switches on. Shared by the link
+/// target and its label so the two cannot disagree.
+const AUTO_REFRESH_SECS: u32 = 30;
+
 #[derive(Clone, Copy)]
 pub(super) enum Page {
     Dashboard { log_count: usize },
@@ -202,7 +217,7 @@ pub(super) enum Page {
 }
 
 impl Page {
-    const fn path(&self) -> &'static str {
+    const fn path(self) -> &'static str {
         match self {
             Self::Dashboard { .. } => "/",
             Self::Logs => "/logs",
@@ -238,6 +253,8 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
             html.push_str("<span class=\"dim\">|</span>");
             html.push_str("<a href=\"/healthcheck\">Health JSON</a>");
             html.push_str("<span class=\"dim\">|</span>");
+            // The link toggles: it turns auto-refresh off while it is on,
+            // and on at `AUTO_REFRESH_SECS` while it is off.
             let target = QueryUrl {
                 path: "/",
                 options: QueryOptions {
@@ -245,14 +262,17 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
                     refresh_secs: if options.refresh_secs.is_some() {
                         None
                     } else {
-                        Some(30)
+                        Some(AUTO_REFRESH_SECS)
                     },
                 },
             };
             if let Some(secs) = options.refresh_secs {
                 swrite!(html, "<a href=\"{target}\">Stop auto-refresh ({secs}s)</a>");
             } else {
-                swrite!(html, "<a href=\"{target}\">Auto-refresh (30s)</a>");
+                swrite!(
+                    html,
+                    "<a href=\"{target}\">Auto-refresh ({AUTO_REFRESH_SECS}s)</a>"
+                );
             }
         }
         Page::Logs => {

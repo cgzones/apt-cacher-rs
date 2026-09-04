@@ -6,7 +6,7 @@ use std::fmt::Display;
 
 use crate::swrite;
 
-use super::fmt::HtmlEscape;
+use super::fmt::HtmlEscaped;
 
 // ---------------------------------------------------------------------------
 // Table builders — append rows directly via `swrite!`. `Table::cell` needs to
@@ -232,6 +232,117 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
     swrite!(
         out,
         "<p class=\"section-error\">Failed to query {what}: {}</p>",
-        HtmlEscape(&err.to_string()),
+        HtmlEscaped(err),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DetailsList, Table, write_collapsible_section};
+
+    #[test]
+    fn table_wraps_header_row() {
+        let html = Table::new(&["A", "B"]).finish();
+        assert_eq!(
+            html,
+            "<div class=\"tablewrap\"><table><thead><tr>\
+             <th scope=\"col\">A</th><th scope=\"col\">B</th>\
+             </tr></thead><tbody></tbody></table></div>",
+        );
+    }
+
+    #[test]
+    fn cell_titles_only_long_plain_values() {
+        let long = "a value well past the title threshold";
+        let mut table = Table::new(&["H"]);
+        table.start_row();
+        table.cell("short");
+        table.cell(long);
+        // Markup must not be repeated into the attribute: the browser would
+        // show the tags as text.
+        table.cell(format_args!("<span class=\"warn\">{long}</span>"));
+        table.end_row();
+        let html = table.finish();
+
+        assert!(html.contains("<td>short</td>"), "{html}");
+        assert!(
+            html.contains(&format!("<td title=\"{long}\">{long}</td>")),
+            "{html}"
+        );
+        assert!(!html.contains("title=\"<span"), "{html}");
+    }
+
+    #[test]
+    fn marked_row_carries_its_state_class() {
+        let mut table = Table::new(&["H"]);
+        table.start_row_marked(" class=\"row-stale\"");
+        table.cell("x");
+        table.end_row();
+        assert!(
+            table
+                .finish()
+                .contains("<tr class=\"row-stale\"><td>x</td></tr>"),
+            "marked row lost its class",
+        );
+    }
+
+    #[test]
+    fn details_list_pairs_label_and_value() {
+        let mut list = DetailsList::new();
+        list.row("Label", 7);
+        list.row_tip("Tipped", "why", "v");
+        assert_eq!(
+            list.finish(),
+            "<dl class=\"details\">\
+             <div><dt>Label</dt><dd>7</dd></div>\
+             <div><dt title=\"why\">Tipped</dt><dd>v</dd></div>\
+             </dl>",
+        );
+    }
+
+    #[test]
+    fn collapsible_section_notes_an_empty_body() {
+        let mut out = String::new();
+        write_collapsible_section(&mut out, "T", "t-head", 0, None, "nothing yet", "");
+        assert!(out.contains("<p class=\"empty\">nothing yet</p>"), "{out}");
+        // Nothing to read: the section starts collapsed, with a 0 count.
+        assert!(!out.contains("<details open>"), "{out}");
+        assert!(out.contains("<span class=\"count\">0</span>"), "{out}");
+    }
+
+    #[test]
+    fn collapsible_section_keeps_a_populated_body() {
+        let mut out = String::new();
+        write_collapsible_section(
+            &mut out,
+            "T",
+            "t-head",
+            2,
+            Some(5),
+            "nothing yet",
+            "<p>b</p>",
+        );
+        assert!(out.contains("<details open>"), "{out}");
+        assert!(out.contains("<span class=\"count\">2 / 5</span>"), "{out}");
+        assert!(out.contains("<p>b</p>"), "{out}");
+        assert!(!out.contains("nothing yet"), "{out}");
+    }
+
+    #[test]
+    fn collapsible_section_keeps_an_error_notice_with_zero_rows() {
+        // A section error reports 0 rows but must not be replaced by the
+        // empty-state note: the notice is the thing the reader needs.
+        let mut out = String::new();
+        write_collapsible_section(
+            &mut out,
+            "T",
+            "t-head",
+            0,
+            None,
+            "nothing yet",
+            "<p>boom</p>",
+        );
+        assert!(out.contains("<p>boom</p>"), "{out}");
+        assert!(!out.contains("nothing yet"), "{out}");
+    }
 }

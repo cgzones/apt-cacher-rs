@@ -32,7 +32,7 @@ use crate::{
 /// styles, it has to either move them into the stylesheet or extend the CSP —
 /// silent CSP rejections are easy to miss when only some users have devtools
 /// open.
-pub(crate) const HTML_CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self' data:; \
+const HTML_CSP: &str = "default-src 'none'; style-src 'self'; img-src 'self' data:; \
      base-uri 'none'; form-action 'none'";
 
 /// A response from the local web interface.
@@ -45,10 +45,10 @@ pub(crate) const HTML_CSP: &str = "default-src 'none'; style-src 'self'; img-src
 pub(crate) struct WebResponse {
     pub(crate) status: StatusCode,
     pub(crate) body: bytes::Bytes,
-    pub(crate) kind: WebResponseKind,
+    kind: WebResponseKind,
 }
 
-pub(crate) enum WebResponseKind {
+enum WebResponseKind {
     /// Dashboard or logs page; served with `no-store` cache and full
     /// security headers.
     Html,

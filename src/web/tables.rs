@@ -313,9 +313,13 @@ pub(super) async fn build_mirror_table(
         cache.retain(|k, _| mirror_paths.iter().any(|p| p == k));
     }
 
-    let total_cache_size: u64 = dir_stats.iter().map(|st| st.size).sum();
+    // Complete before the first row is rendered: the Disk Space cell shows
+    // each mirror's share of `aggregate.size`.
+    let mut aggregate = DirStats::default();
+    for stats in &dir_stats {
+        aggregate.merge(*stats);
+    }
 
-    // -- Build the table ------------------------------------------------------------------
     let mut table = Table::new(&[
         "Mirror",
         "Last Seen",
@@ -360,7 +364,7 @@ pub(super) async fn build_mirror_table(
             },
             DirSizeCell {
                 size: stats.size,
-                total: total_cache_size,
+                total: aggregate.size,
             },
             stats.files,
             AvgMaxCell {
@@ -370,11 +374,6 @@ pub(super) async fn build_mirror_table(
             },
             format_args!("{} / {}", stats.deb_files, stats.metadata_files),
         );
-    }
-
-    let mut aggregate = DirStats::default();
-    for stats in &dir_stats {
-        aggregate.merge(*stats);
     }
 
     let rows = sorted.len();

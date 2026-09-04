@@ -6,7 +6,7 @@ use crate::{LOGSTORE, error::ErrorReport, global_config, swrite};
 
 use super::{
     fmt::HtmlEscape,
-    page::{Page, PageTitle, QueryOptions, build_heading_html, build_nav_html, build_page},
+    page::{Heading, Page, PageTitle, QueryOptions, build_nav_html, build_page},
     response::WebResponse,
 };
 
@@ -47,7 +47,7 @@ pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
 
     let nav = build_nav_html(Page::Logs, options);
 
-    let heading = build_heading_html();
+    let heading = Heading;
     let capacity = global_config().logstore_capacity;
     let body_html = format_args!(
         "{nav}{heading}\
