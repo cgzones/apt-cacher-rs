@@ -130,14 +130,49 @@ pub(crate) struct ServeParams {
     pub(crate) content_range: Option<String>,
 }
 
+/// The client's `Range` is syntactically valid but no byte of the
+/// representation satisfies it ([`ServeParams::from_parsed`]); answer 416.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RangeNotSatisfiable;
+
 impl ServeParams {
     /// The whole representation as a 200.
     #[must_use]
-    fn full(file_size: u64) -> Self {
+    pub(crate) const fn full(file_size: u64) -> Self {
         Self {
             content_start: 0,
             content_length: file_size,
             content_range: None,
+        }
+    }
+
+    /// Resolve an already-parsed `Range` (`None` when the request carried
+    /// none) against the representation's `file_size`. A malformed `Range`
+    /// and a failed `If-Range` precondition both serve the whole
+    /// representation (RFC 9110 sections 14.2 and 13.1.5).
+    ///
+    /// The cached-serve planner ([`CacheInfo::plan`]) resolves the same three
+    /// outcomes inline because it also owns the malformed-`Range` warning and
+    /// the 304 precedence; every other serve path goes through here, so they
+    /// cannot drift.
+    pub(crate) fn from_parsed(
+        parsed: Option<ParsedRange>,
+        file_size: u64,
+    ) -> Result<Self, RangeNotSatisfiable> {
+        match parsed {
+            Some(ParsedRange::NotSatisfiable) => Err(RangeNotSatisfiable),
+            Some(ParsedRange::Satisfiable {
+                content_range,
+                start,
+                length,
+            }) => Ok(Self {
+                content_start: start,
+                content_length: length,
+                content_range: Some(content_range),
+            }),
+            Some(ParsedRange::Invalid | ParsedRange::IfRangeFailed) | None => {
+                Ok(Self::full(file_size))
+            }
         }
     }
 
@@ -147,12 +182,32 @@ impl ServeParams {
         self.content_range.is_some()
     }
 
+    /// One past the last representation byte to send. Only the splice
+    /// backend needs it: the others hand a start and a length to the kernel.
+    #[cfg(feature = "splice")]
+    #[must_use]
+    pub(crate) const fn content_end(&self) -> u64 {
+        self.content_start + self.content_length
+    }
+
     #[must_use]
     pub(crate) fn http_status(&self) -> StatusCode {
         if self.is_partial() {
             StatusCode::PARTIAL_CONTENT
         } else {
             StatusCode::OK
+        }
+    }
+
+    /// The status line of a hand-rendered response head. Only the splice
+    /// backend renders one; the others go through `ResponseHead`.
+    #[cfg(feature = "splice")]
+    #[must_use]
+    pub(crate) fn status_line(&self) -> &'static str {
+        if self.is_partial() {
+            "206 Partial Content"
+        } else {
+            "200 OK"
         }
     }
 }
@@ -264,34 +319,29 @@ impl CacheInfo {
         }
 
         if let Some(range) = headers.range {
-            match http_parse_range(
+            let parsed = http_parse_range(
                 range,
                 headers.if_range,
                 file_size,
                 self.last_modified_for_ims,
                 self.file_etag.as_deref(),
-            ) {
-                ParsedRange::Satisfiable(content_range, start, content_length) => {
-                    return ServePlan::Serve(ServeParams {
-                        content_start: start,
-                        content_length,
-                        content_range: Some(content_range),
-                    });
-                }
-                ParsedRange::NotSatisfiable => return ServePlan::NotSatisfiable,
-                ParsedRange::Invalid => {
-                    // RFC 9110 says to ignore a malformed Range and serve the
-                    // whole entity, which is what happens here -- but a client
-                    // that expected a resume silently receives the full object.
-                    warn_once_or_debug!(
-                        "Ignoring malformed Range header `{}` from client {client}; serving the full file",
-                        range.escape_debug()
-                    );
-                }
-                // An If-Range that did not match is an ordinary outcome: the
-                // client asked for the full entity if the validator moved on.
-                ParsedRange::IfRangeFailed => {}
+            );
+            if matches!(parsed, ParsedRange::Invalid) {
+                // RFC 9110 says to ignore a malformed Range and serve the
+                // whole entity, which is what `from_parsed` does -- but a
+                // client that expected a resume silently receives the full
+                // object, so say so. (An `If-Range` that did not match is an
+                // ordinary outcome and stays quiet: the client asked for the
+                // full entity if the validator moved on.)
+                warn_once_or_debug!(
+                    "Ignoring malformed Range header `{}` from client {client}; serving the full file",
+                    range.escape_debug()
+                );
             }
+            return match ServeParams::from_parsed(Some(parsed), file_size) {
+                Ok(params) => ServePlan::Serve(params),
+                Err(RangeNotSatisfiable) => ServePlan::NotSatisfiable,
+            };
         }
 
         ServePlan::Serve(ServeParams::full(file_size))

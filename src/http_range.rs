@@ -190,8 +190,15 @@ pub(crate) fn compute_age(metadata: &std::fs::Metadata) -> u32 {
 /// Result of parsing an HTTP Range request header.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ParsedRange {
-    /// Valid, satisfiable range: Content-Range header value, start byte, content length.
-    Satisfiable(String, u64, u64),
+    /// Valid, satisfiable range.
+    Satisfiable {
+        /// Ready-to-send `Content-Range` header value.
+        content_range: String,
+        /// First byte of the representation to send.
+        start: u64,
+        /// Number of bytes to send.
+        length: u64,
+    },
     /// The Range header is syntactically malformed. Per RFC 9110 §14.2, the recipient
     /// should ignore the header and serve the full entity (200).
     Invalid,
@@ -299,7 +306,11 @@ pub(crate) fn http_parse_range(
 
     let mut content_range = String::with_capacity(32);
     swrite!(content_range, "bytes {start}-{end}/{file_size}");
-    ParsedRange::Satisfiable(content_range, start, content_length)
+    ParsedRange::Satisfiable {
+        content_range,
+        start,
+        length: content_length,
+    }
 }
 
 /// Evaluate an `If-Range` precondition (RFC 9110 §13.1.5) against the
@@ -401,7 +412,11 @@ mod tests {
     /// Helper to unwrap a `ParsedRange::Satisfiable` for concise test assertions.
     fn satisfiable(r: ParsedRange) -> Option<(String, u64, u64)> {
         match r {
-            ParsedRange::Satisfiable(cr, s, l) => Some((cr, s, l)),
+            ParsedRange::Satisfiable {
+                content_range,
+                start,
+                length,
+            } => Some((content_range, start, length)),
             ParsedRange::Invalid | ParsedRange::NotSatisfiable | ParsedRange::IfRangeFailed => None,
         }
     }

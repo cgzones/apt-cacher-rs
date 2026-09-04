@@ -30,10 +30,10 @@ use crate::precise_instant::PreciseInstant;
 
 use super::upstream::{ConnLabel, PoolGuard, UnconsumedBodyGuard};
 use super::{
-    BodyTransferFailure, BodyTransferred, CacheTarget, ClientRangePlan, CompletionClient,
-    RateTimestamps, commit_and_record, log_splice_completion, transfer_body,
-    write_body_prefix_to_cache,
+    BodyTransferFailure, BodyTransferred, CacheTarget, CompletionClient, RateTimestamps,
+    commit_and_record, log_splice_completion, transfer_body, write_body_prefix_to_cache,
 };
+use crate::cache_conditional::ServeParams;
 
 /// A download whose client has been nudged away: everything
 /// `splice_proxy_drive` had in hand at the gate, owned rather than borrowed,
@@ -60,14 +60,10 @@ pub(super) struct DetachedDownload {
     pub(super) request_sent_at: PreciseInstant,
 }
 
-/// The range plan of a client-less transfer: `len == 0` makes
+/// The serve plan of a client-less transfer: a zero `content_length` makes
 /// `transfer_body`'s range arithmetic yield `send == 0`, so the body loops
 /// take their cache-only branch for every chunk.
-const NO_CLIENT_RANGE: ClientRangePlan = ClientRangePlan {
-    content_range: None,
-    start: 0,
-    len: 0,
-};
+const NO_CLIENT_RANGE: ServeParams = ServeParams::full(0);
 
 impl DetachedDownload {
     /// Fire-and-forget, like the hyper backend's `download_file` spawn: the

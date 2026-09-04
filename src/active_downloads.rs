@@ -581,6 +581,17 @@ impl ActiveDownloads {
     /// origination — the caller answers with the canonical 503.
     #[cfg(feature = "hyper")]
     #[must_use]
+    pub(crate) fn insert(&self, key: CacheEntryKeyRef<'_>) -> InsertOutcome {
+        let max = global_config().max_upstream_downloads;
+        match self.lookup_or_insert(key, max) {
+            LookupResult::Originator { init_tx, status } => {
+                InsertOutcome::Originator { init_tx, status }
+            }
+            LookupResult::LateJoiner { status } => InsertOutcome::Joined { status },
+            LookupResult::AtCapacity { max } => InsertOutcome::AtCapacity { max },
+        }
+    }
+
     /// Register `key` and hand back its status handle, skipping the
     /// `max_upstream_downloads` gate that makes [`Self::insert`] read the
     /// config globals. Exists so tests elsewhere in the crate can build a
@@ -597,17 +608,6 @@ impl ActiveDownloads {
             LookupResult::AtCapacity { max: _ } => None,
         }
         .expect("no cap was passed, so origination cannot be refused")
-    }
-
-    pub(crate) fn insert(&self, key: CacheEntryKeyRef<'_>) -> InsertOutcome {
-        let max = global_config().max_upstream_downloads;
-        match self.lookup_or_insert(key, max) {
-            LookupResult::Originator { init_tx, status } => {
-                InsertOutcome::Originator { init_tx, status }
-            }
-            LookupResult::LateJoiner { status } => InsertOutcome::Joined { status },
-            LookupResult::AtCapacity { max } => InsertOutcome::AtCapacity { max },
-        }
     }
 
     /// Originate-only variant of `Self::insert`: returns `Concurrent`

@@ -7,7 +7,7 @@
 //! ([`splice_proxy`]) and the types it matches on ([`SpliceProxyOutcome`],
 //! [`SpliceProxyError`], [`UpstreamFailure`], [`AfterHeaderSide`]), the
 //! request drive ([`splice_proxy_drive`] and its phase functions) and the
-//! per-request state structs ([`ClientConn`], [`ClientRangePlan`],
+//! per-request state structs ([`ClientConn`],
 //! [`CacheTarget`], [`RateTimestamps`]). The mechanics live in submodules:
 //!
 //! - [`upstream`]: the `UpstreamConn` enum, the idle pool and `PoolGuard`,
@@ -60,7 +60,7 @@ use ::http::StatusCode;
 use tokio::{io::AsyncWriteExt as _, net::TcpStream};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::cache_conditional::RangeRequestHeaders;
+use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout;
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_paths::CachePaths;
@@ -143,75 +143,6 @@ struct ClientConn<'a> {
     stream: &'a TcpStream,
     version: ConnectionVersion,
     action: ConnectionAction,
-}
-
-/// The slice of the object the client asked for, resolved against the total
-/// size once that is known: the whole object (`200 OK`) unless the client's
-/// `Range` was satisfiable (`206 Partial Content`, echoing `content_range`).
-/// The streaming drive and the buffered volatile path both derive it via
-/// [`ClientRangePlan::from_parsed`], so the two cannot drift.
-#[derive(Debug, PartialEq, Eq)]
-struct ClientRangePlan {
-    /// `Content-Range` value of a 206; `None` means the whole object.
-    content_range: Option<String>,
-    /// First object byte to send.
-    start: u64,
-    /// Bytes to send; the whole object when `content_range` is `None`.
-    len: u64,
-}
-
-/// The client's `Range` cannot be satisfied for this object size
-/// ([`ClientRangePlan::from_parsed`]); the response is a 416.
-#[derive(Debug, PartialEq, Eq)]
-struct RangeNotSatisfiable;
-
-impl ClientRangePlan {
-    /// Resolve the parsed `Range` (`None` when the request carried none)
-    /// against the object's `total` size. A malformed `Range` and a failed
-    /// `If-Range` precondition both serve the whole object (RFC 9110
-    /// sections 14.2 and 13.1.5).
-    fn from_parsed(parsed: Option<ParsedRange>, total: u64) -> Result<Self, RangeNotSatisfiable> {
-        match parsed {
-            Some(ParsedRange::NotSatisfiable) => Err(RangeNotSatisfiable),
-            Some(ParsedRange::Satisfiable(content_range, start, len)) => Ok(Self {
-                content_range: Some(content_range),
-                start,
-                len,
-            }),
-            Some(ParsedRange::Invalid | ParsedRange::IfRangeFailed) | None => Ok(Self {
-                content_range: None,
-                start: 0,
-                len: total,
-            }),
-        }
-    }
-
-    /// Whether the response is a `206 Partial Content`.
-    fn is_partial(&self) -> bool {
-        self.content_range.is_some()
-    }
-
-    /// One past the last object byte to send.
-    fn end(&self) -> u64 {
-        self.start + self.len
-    }
-
-    fn status(&self) -> StatusCode {
-        if self.is_partial() {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::OK
-        }
-    }
-
-    /// The status line of the response head.
-    fn status_line(&self) -> &'static str {
-        if self.is_partial() {
-            "206 Partial Content"
-        } else {
-            "200 OK"
-        }
-    }
 }
 
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
@@ -342,8 +273,8 @@ async fn resolve_client_range(
     parsed: Option<ParsedRange>,
     total: u64,
     phase_416: &'static str,
-) -> Result<Option<ClientRangePlan>, SpliceProxyError> {
-    if let Ok(plan) = ClientRangePlan::from_parsed(parsed, total) {
+) -> Result<Option<ServeParams>, SpliceProxyError> {
+    if let Ok(plan) = ServeParams::from_parsed(parsed, total) {
         return Ok(Some(plan));
     }
     write_416_response(client.stream, client.version, client.action, total)
@@ -364,12 +295,12 @@ fn render_splice_response_head(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     upstream_resp: &UpstreamResponse,
-    range: &ClientRangePlan,
+    range: &ServeParams,
     content_type: &str,
     date: &str,
 ) -> String {
     let status_line = range.status_line();
-    let response_content_length = range.len;
+    let response_content_length = range.content_length;
     // `Age: 0` is a constant here: a fresh response streamed straight from
     // the origin has spent no time in a cache (RFC 9111 section 4.2.3).
     format!(
@@ -401,7 +332,7 @@ async fn write_splice_response_headers(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
-    range: &ClientRangePlan,
+    range: &ServeParams,
     phase: &'static str,
 ) -> Result<PreciseInstant, SpliceProxyError> {
     let content_type = content_type_for_cached_file(&conn_details.debname);
@@ -425,7 +356,7 @@ async fn write_splice_response_headers(
         range.status_line()
     );
 
-    metrics::record_client_status(range.status());
+    metrics::record_client_status(range.http_status());
     // Bump once per splice-served response, regardless of whether the body
     // ends up flowing through `splice_proxy_body{,_tls}`, the body-prefix
     // direct write, or the buffered volatile write.
@@ -1294,14 +1225,14 @@ fn log_download_start(
 async fn send_resumed_prefix(
     client_stream: &TcpStream,
     temppath: &TempPath,
-    range_plan: &ClientRangePlan,
+    range_plan: &ServeParams,
     resume_offset: u64,
 ) -> Result<u64, SpliceProxyError> {
     if resume_offset == 0 {
         return Ok(0);
     }
-    let send_start = range_plan.start.min(resume_offset);
-    let send_end = range_plan.end().min(resume_offset);
+    let send_start = range_plan.content_start.min(resume_offset);
+    let send_end = range_plan.content_end().min(resume_offset);
     if send_end <= send_start {
         return Ok(0);
     }
@@ -1400,7 +1331,7 @@ async fn write_body_prefix(
     conn_details: &ConnectionDetails,
     target: &mut CacheTarget,
     body_prefix: &[u8],
-    range_plan: &ClientRangePlan,
+    range_plan: &ServeParams,
     resume_offset: u64,
     rates: &mut RateTimestamps,
 ) -> Result<bool, SpliceProxyError> {
@@ -1421,7 +1352,12 @@ async fn write_body_prefix(
     let mut prefix_client_failed = false;
     // The prefix starts at the resume offset: it is the first body byte the
     // upstream sent, and everything before it is already in the partial file.
-    let client_slice = range_slice(body_prefix, resume_offset, range_plan.start, range_plan.len);
+    let client_slice = range_slice(
+        body_prefix,
+        resume_offset,
+        range_plan.content_start,
+        range_plan.content_length,
+    );
     if !client_slice.is_empty() {
         let config = global_config();
         let mut prefix_rc = RateChecker::from_config(config);
@@ -1511,7 +1447,7 @@ async fn transfer_body(
     resume_offset: u64,
     body_content_length: NonZero<u64>,
     splice_count: u64,
-    range_plan: &ClientRangePlan,
+    range_plan: &ServeParams,
     rates: &mut RateTimestamps,
 ) -> Result<BodyTransferred, BodyTransferFailure> {
     if splice_count == 0 {
@@ -1529,7 +1465,7 @@ async fn transfer_body(
     // Compute client range relative to splice region for the body transfer.
     // splice_file_start is the file offset where the splice region begins.
     let splice_file_start = resume_offset + body_content_length.get() - splice_count;
-    let client_range_end = range_plan.end();
+    let client_range_end = range_plan.content_end();
     let splice_file_end = splice_file_start + splice_count;
     // How many bytes to skip at the start of the splice region before sending to client.
     // Worked example: total file = 1000, resume_offset = 0, splice_file_start = 0,
@@ -1539,7 +1475,7 @@ async fn transfer_body(
     //   client_send = min(500, 1000) - (0 + 200) = 300 (send exactly the range)
     // If the range ends past the splice region (e.g. due to a body prefix already
     // consumed), the min() clamps to splice_file_end and saturating_sub clamps at 0.
-    let client_skip = range_plan.start.saturating_sub(splice_file_start);
+    let client_skip = range_plan.content_start.saturating_sub(splice_file_start);
     // How many bytes to send to client from within the splice region.
     let client_send = client_range_end
         .min(splice_file_end)
@@ -2105,7 +2041,7 @@ async fn splice_proxy_drive(
             resume_offset,
             if client_succeeded {
                 CompletionClient::Served {
-                    bytes: range_plan.len,
+                    bytes: range_plan.content_length,
                 }
             } else {
                 CompletionClient::Lost
@@ -2258,52 +2194,53 @@ mod tests {
     use super::http::parse_upstream_response;
 
     use super::*;
+    use crate::cache_conditional::RangeNotSatisfiable;
 
     #[test]
     fn client_range_plan_resolves_every_parsed_range() {
-        let whole = || ClientRangePlan {
+        let whole = || ServeParams {
             content_range: None,
-            start: 0,
-            len: 1000,
+            content_start: 0,
+            content_length: 1000,
         };
-        assert_eq!(ClientRangePlan::from_parsed(None, 1000), Ok(whole()));
+        assert_eq!(ServeParams::from_parsed(None, 1000), Ok(whole()));
         assert_eq!(
-            ClientRangePlan::from_parsed(Some(ParsedRange::Invalid), 1000),
+            ServeParams::from_parsed(Some(ParsedRange::Invalid), 1000),
             Ok(whole())
         );
         assert_eq!(
-            ClientRangePlan::from_parsed(Some(ParsedRange::IfRangeFailed), 1000),
+            ServeParams::from_parsed(Some(ParsedRange::IfRangeFailed), 1000),
             Ok(whole())
         );
         assert_eq!(
-            ClientRangePlan::from_parsed(Some(ParsedRange::NotSatisfiable), 1000),
+            ServeParams::from_parsed(Some(ParsedRange::NotSatisfiable), 1000),
             Err(RangeNotSatisfiable)
         );
         assert!(!whole().is_partial());
-        assert_eq!(whole().end(), 1000);
-        assert_eq!(whole().status(), StatusCode::OK);
+        assert_eq!(whole().content_end(), 1000);
+        assert_eq!(whole().http_status(), StatusCode::OK);
         assert_eq!(whole().status_line(), "200 OK");
 
-        let partial = ClientRangePlan::from_parsed(
-            Some(ParsedRange::Satisfiable(
-                "bytes 200-499/1000".to_owned(),
-                200,
-                300,
-            )),
+        let partial = ServeParams::from_parsed(
+            Some(ParsedRange::Satisfiable {
+                content_range: "bytes 200-499/1000".to_owned(),
+                start: 200,
+                length: 300,
+            }),
             1000,
         )
         .expect("satisfiable");
         assert_eq!(
             partial,
-            ClientRangePlan {
+            ServeParams {
                 content_range: Some("bytes 200-499/1000".to_owned()),
-                start: 200,
-                len: 300,
+                content_start: 200,
+                content_length: 300,
             }
         );
         assert!(partial.is_partial());
-        assert_eq!(partial.end(), 500);
-        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.content_end(), 500);
+        assert_eq!(partial.http_status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(partial.status_line(), "206 Partial Content");
     }
 
@@ -2320,7 +2257,7 @@ mod tests {
                         \r\n";
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
-        let whole = ClientRangePlan::from_parsed(None, 1000).expect("no range");
+        let whole = ServeParams::from_parsed(None, 1000).expect("no range");
         let head = render_splice_response_head(
             ConnectionVersion::Http11,
             ConnectionAction::KeepAlive,
@@ -2349,12 +2286,12 @@ mod tests {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
         let resp =
             parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
-        let partial = ClientRangePlan::from_parsed(
-            Some(ParsedRange::Satisfiable(
-                "bytes 200-499/1000".to_owned(),
-                200,
-                300,
-            )),
+        let partial = ServeParams::from_parsed(
+            Some(ParsedRange::Satisfiable {
+                content_range: "bytes 200-499/1000".to_owned(),
+                start: 200,
+                length: 300,
+            }),
             1000,
         )
         .expect("satisfiable");

@@ -240,7 +240,7 @@ pub(super) async fn handle_volatile_buffered_download(
 
     // Send body (range-filtered if needed) to client.
     #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
-    let body_slice = &body[range_plan.start as usize..range_plan.end() as usize];
+    let body_slice = &body[range_plan.content_start as usize..range_plan.content_end() as usize];
     {
         let config = global_config();
         let mut volatile_rc = RateChecker::from_config(config);
@@ -275,7 +275,7 @@ pub(super) async fn handle_volatile_buffered_download(
             total_content_length.get(),
             0,
             CompletionClient::Served {
-                bytes: range_plan.len,
+                bytes: range_plan.content_length,
             },
         );
 
