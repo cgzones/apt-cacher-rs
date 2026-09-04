@@ -36,6 +36,11 @@ impl fmt::Display for RetryLimit {
     }
 }
 
+/// First delay of the schedule, in milliseconds, and the value
+/// `Backoff::reset_delay` restarts from: keeping both seeds in one place is
+/// what makes a reset provably identical to a fresh schedule.
+const INITIAL_DELAY_MS: u64 = 500;
+
 /// The retry budgets plus a Fibonacci-style connect backoff seeded at 500 ms:
 /// 500, 500, 1000, 1500, 2500, 4000, 6500, … ms. Reproduces the schedule the
 /// hyper retry loop has used inline.
@@ -54,7 +59,7 @@ impl Backoff {
     pub(crate) fn new(budget: Duration, now: Instant) -> Self {
         Self {
             prev: 0,
-            curr: 500,
+            curr: INITIAL_DELAY_MS,
             attempt: 1,
             deadline: now.saturating_add(budget.into()),
             budget_spent: false,
@@ -109,7 +114,7 @@ impl Backoff {
     #[cfg(any(test, feature = "hyper"))]
     pub(crate) fn reset_delay(&mut self) {
         self.prev = 0;
-        self.curr = 500;
+        self.curr = INITIAL_DELAY_MS;
     }
 }
 

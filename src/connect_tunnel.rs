@@ -11,7 +11,9 @@
 //! The mirror ACL is fail-closed like `allowed_mirrors`: an empty
 //! `https_tunnel_allowed_mirrors` permits no target.  A CONNECT relay is an
 //! open TCP forwarder to any host on the permitted ports, so "no list" must
-//! not mean "every host".
+//! not mean "every host".  The *port* ACL is the deliberate opposite: an
+//! empty `https_tunnel_allowed_ports` skips the port check entirely, because
+//! the host list has already bounded the reachable targets by then.
 //!
 //! Established tunnels relay through [`copy_bidirectional_idle`], which
 //! tears the tunnel down after `client_idle_timeout` without a byte in either
@@ -32,11 +34,14 @@ use std::{
 
 use http::{StatusCode, uri::Uri};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
-    client_info::ClientInfo, config::Config, error::ErrorReport, humanfmt::HumanFmt, limits,
-    metrics, warn_once_or_info,
+    client_info::ClientInfo,
+    config::Config,
+    error::{ErrorReport, is_peer_disconnect},
+    humanfmt::HumanFmt,
+    limits, metrics, warn_once_or_info,
 };
 
 /// A rejected CONNECT target: the status/body the backend should return to the
@@ -164,10 +169,7 @@ where
 
     let watchdog = async {
         loop {
-            let since = activity.since_last();
-            let Some(left) = idle_timeout.checked_sub(since) else {
-                return TunnelCopyError::Idle(idle_timeout);
-            };
+            let left = idle_timeout.saturating_sub(activity.since_last());
             if left.is_zero() {
                 return TunnelCopyError::Idle(idle_timeout);
             }
@@ -220,13 +222,13 @@ pub(crate) fn report_tunnel_outcome(
                     "Tunnel for client {client} to {host}:{port} timed out:  {}",
                     ErrorReport(err)
                 );
-            } else if crate::error::is_peer_disconnect(err) {
+            } else if is_peer_disconnect(err) {
                 info!(
                     "Tunnel for client {client} to {host}:{port} closed by peer:  {}",
                     ErrorReport(err)
                 );
             } else {
-                tracing::error!(
+                error!(
                     "Failed to tunnel the connection for client {client} to {host}:{port}; closing the tunnel:  {}",
                     ErrorReport(err)
                 );

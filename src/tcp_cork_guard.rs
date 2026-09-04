@@ -1,9 +1,28 @@
-use std::{io::ErrorKind, os::fd::AsRawFd as _};
+use std::{
+    fmt::{self, Display},
+    io::ErrorKind,
+    net::SocketAddr,
+    os::fd::AsRawFd as _,
+};
 
 use tokio::net::TcpStream;
 use tracing::warn;
 
 use crate::{error::ErrorReport, static_assert, warn_once_or_debug};
+
+/// One end of a socket as the log lines below render it: the address, or
+/// `<unknown>` when `getsockname`/`getpeername` failed. Formats straight into
+/// the `Formatter` instead of allocating a `String` per log site.
+struct Endpoint(std::io::Result<SocketAddr>);
+
+impl Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Ok(addr) => Display::fmt(addr, f),
+            Err(_err) => f.write_str("<unknown>"),
+        }
+    }
+}
 
 /// RAII guard that sets `TCP_CORK` on creation and clears it on drop.
 /// While corked, the kernel buffers small writes to coalesce them into
@@ -23,15 +42,14 @@ impl<'a> CorkGuard<'a> {
     pub(crate) fn new_optional(stream: &'a TcpStream) -> Option<Self> {
         match Self::new(stream) {
             Ok(guard) => Some(guard),
+            // A kernel/socket family without TCP_CORK is an environmental
+            // fact, not an operator-actionable fault: say it once, then
+            // demote. Any other errno keeps full severity every time.
             Err(err) if err.kind() == ErrorKind::Unsupported => {
                 warn_once_or_debug!(
                     "Failed to cork TCP socket from {} to {}; sending without corking:  {}",
-                    stream
-                        .local_addr()
-                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
-                    stream
-                        .peer_addr()
-                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                    Endpoint(stream.local_addr()),
+                    Endpoint(stream.peer_addr()),
                     ErrorReport(&err)
                 );
 
@@ -40,12 +58,8 @@ impl<'a> CorkGuard<'a> {
             Err(err) => {
                 warn!(
                     "Failed to cork TCP socket from {} to {}; sending without corking:  {}",
-                    stream
-                        .local_addr()
-                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
-                    stream
-                        .peer_addr()
-                        .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                    Endpoint(stream.local_addr()),
+                    Endpoint(stream.peer_addr()),
                     ErrorReport(&err)
                 );
 
@@ -90,12 +104,8 @@ impl Drop for CorkGuard<'_> {
         if let Err(err) = Self::set_tcp_cork(stream, false) {
             warn!(
                 "Failed to uncork TCP socket from {} to {}; leaving the socket corked:  {}",
-                stream
-                    .local_addr()
-                    .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
-                stream
-                    .peer_addr()
-                    .map_or_else(|_| String::from("<unknown>"), |a| a.to_string()),
+                Endpoint(stream.local_addr()),
+                Endpoint(stream.peer_addr()),
                 ErrorReport(&err)
             );
         }

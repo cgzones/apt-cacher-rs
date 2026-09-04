@@ -1,3 +1,19 @@
+//! SI-decimal `Display` adapters for the byte counts, transfer rates and
+//! durations that appear in log lines and the web interface.
+//!
+//! Three shapes, one set of rules. Units are decimal (kB = 1000 B, not 1024),
+//! matching what apt and the mirrors report. A unit is promoted at
+//! `NEXT_UNIT` (999.5) rather than at 1000, so the zero-decimal rendering can
+//! never read `1000kB`. The decimal count shrinks as the mantissa grows: two
+//! digits below 10, one below 100, none above.
+//!
+//! [`HumanFmt::Rate`] divides by its window and renders `???B/s` for a
+//! zero-length one - see `precise_instant` for why the std clock makes that
+//! nearly unreachable, and `docs/logging.md` for why it is the formatter's own
+//! output rather than the "unknown value" placeholder.
+//! [`HumanFmt::Time`] leaves the scaled-unit ladder at 600 s and switches to a
+//! `1d 2h 3m 4s` breakdown, omitting every zero component.
+
 #[must_use]
 pub(crate) enum HumanFmt {
     Size(u64),

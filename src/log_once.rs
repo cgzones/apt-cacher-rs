@@ -1,7 +1,9 @@
-// All four macros share the load-before-CAS shape: the relaxed load keeps
-// the steady state read-only — an unconditional compare_exchange is an RMW
-// on a shared static cache line even when it fails, and several call sites
-// sit on per-request reject paths an abusive client can hammer.
+//! Per-call-site once-gates for log flood control: the `*_once` macros, the
+//! gate they share, and the [`Logged`] proof token.
+//!
+//! Each macro plants its own `static` gate, so "once" means once per call
+//! site, not once per process. `docs/logging.md` is the binding policy for
+//! which level each variant carries.
 
 #[cfg(feature = "splice")]
 use tracing::info;
@@ -9,14 +11,29 @@ use tracing::{error, warn};
 
 use crate::metrics;
 
+/// The gate every `*_once` macro and gated helper below is built on: `true`
+/// exactly once per `fired`, `false` on every later call.
+///
+/// The relaxed load before the CAS keeps the steady state read-only — an
+/// unconditional `compare_exchange` is an RMW on a shared static cache line
+/// even when it fails, and several call sites sit on per-request reject paths
+/// an abusive client can hammer.
+#[inline]
+pub(crate) fn first_fire(fired: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    !fired.load(Relaxed)
+        && fired
+            .compare_exchange(false, true, Relaxed, Relaxed)
+            .is_ok()
+}
+
 #[macro_export]
 macro_rules! warn_once {
     ($($t:tt)*) => {{
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        if !FIRED.load(std::sync::atomic::Ordering::Relaxed)
-            && FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok()
-        {
+        if $crate::log_once::first_fire(&FIRED) {
             tracing::warn!($($t)*);
         }
     }};
@@ -27,9 +44,7 @@ macro_rules! warn_once_or_info {
     ($($t:tt)*) => {{
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        if !FIRED.load(std::sync::atomic::Ordering::Relaxed)
-            && FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok()
-        {
+        if $crate::log_once::first_fire(&FIRED) {
             tracing::warn!($($t)*);
         } else {
             tracing::info!($($t)*);
@@ -42,9 +57,7 @@ macro_rules! warn_once_or_debug {
     ($($t:tt)*) => {{
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        if !FIRED.load(std::sync::atomic::Ordering::Relaxed)
-            && FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok()
-        {
+        if $crate::log_once::first_fire(&FIRED) {
             tracing::warn!($($t)*);
         } else {
             tracing::debug!($($t)*);
@@ -57,9 +70,7 @@ macro_rules! info_once {
     ($($t:tt)*) => {{
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-        if !FIRED.load(std::sync::atomic::Ordering::Relaxed)
-            && FIRED.compare_exchange(false, true, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok()
-        {
+        if $crate::log_once::first_fire(&FIRED) {
             tracing::info!($($t)*);
         }
     }};
@@ -80,18 +91,12 @@ macro_rules! warn_once_or_info_logged {
 /// [`warn_once_or_info!`] with a caller-owned gate, for generic code: a
 /// `static` inside a generic function body is one gate shared by every
 /// instantiation, so a per-type site (see `xattr_helpers::XattrValue`) must
-/// hand its own in. Same load-before-CAS shape as the macros.
+/// hand its own in.
 pub(crate) fn warn_once_or_info_gated(
     fired: &'static std::sync::atomic::AtomicBool,
     args: std::fmt::Arguments<'_>,
 ) {
-    use std::sync::atomic::Ordering::Relaxed;
-
-    if !fired.load(Relaxed)
-        && fired
-            .compare_exchange(false, true, Relaxed, Relaxed)
-            .is_ok()
-    {
+    if first_fire(fired) {
         tracing::warn!("{args}");
     } else {
         tracing::info!("{args}");
@@ -146,13 +151,7 @@ impl Logged {
         fired: &'static std::sync::atomic::AtomicBool,
         args: std::fmt::Arguments<'_>,
     ) -> Self {
-        use std::sync::atomic::Ordering::Relaxed;
-
-        if !fired.load(Relaxed)
-            && fired
-                .compare_exchange(false, true, Relaxed, Relaxed)
-                .is_ok()
-        {
+        if first_fire(fired) {
             warn!("{args}");
         } else {
             info!("{args}");

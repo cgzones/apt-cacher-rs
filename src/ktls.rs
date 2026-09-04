@@ -195,8 +195,10 @@ fn combo_bit(tls_version: u16, cipher_type: u16) -> Option<u8> {
 }
 
 /// Map a rustls `ConnectionTrafficSecrets` variant to its kernel `cipher_type`
-/// constant, or `None` for a cipher kTLS does not support. Single source of the
-/// secrets->cipher mapping shared by [`rx_supported`].
+/// constant, or `None` for a cipher kTLS does not support. Feeds
+/// [`rx_supported`]'s lookup into the probe matrix; [`setup_rx`] repeats the
+/// constant inline because each of its arms must pair it with the one
+/// crypto-info struct layout the kernel expects for that cipher.
 fn kernel_cipher_type(secrets: &ConnectionTrafficSecrets) -> Option<u16> {
     match secrets {
         ConnectionTrafficSecrets::Aes128Gcm { .. } => Some(libc::TLS_CIPHER_AES_GCM_128),
@@ -298,6 +300,18 @@ pub(crate) fn is_available() -> bool {
         Error,
     }
 
+    /// One wording for every probe step that died on an errno: `step` names
+    /// what was attempted, the consequence is always the same. Emitting it
+    /// from a single place is what keeps the eight probe steps from drifting
+    /// apart.
+    fn probe_error(step: std::fmt::Arguments<'_>, err: nix::errno::Errno) -> TestResult {
+        warn!(
+            "kTLS: availability probe failed to {step}; kTLS stays disabled until a later probe succeeds:  {}",
+            ErrorReport(&err)
+        );
+        TestResult::Error
+    }
+
     fn inner() -> TestResult {
         use nix::sys::socket::{
             AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, accept4, bind, connect,
@@ -314,40 +328,24 @@ pub(crate) fn is_available() -> bool {
         ) {
             Ok(fd) => fd,
             Err(err) => {
-                warn!(
-                    "kTLS: availability probe failed to create the probe listener socket; kTLS stays disabled until a later probe succeeds:  {}",
-                    ErrorReport(&err)
-                );
-                return TestResult::Error;
+                return probe_error(format_args!("create the probe listener socket"), err);
             }
         };
 
         let addr = SockaddrIn::new(127, 0, 0, 1, 0);
         if let Err(err) = bind(listener.as_raw_fd(), &addr) {
-            warn!(
-                "kTLS: availability probe failed to bind the probe listener socket; kTLS stays disabled until a later probe succeeds:  {}",
-                ErrorReport(&err)
-            );
-            return TestResult::Error;
+            return probe_error(format_args!("bind the probe listener socket"), err);
         }
 
         if let Err(err) = listen(&listener, Backlog::new(1).expect("valid backlog value")) {
-            warn!(
-                "kTLS: availability probe failed to listen on the probe listener socket; kTLS stays disabled until a later probe succeeds:  {}",
-                ErrorReport(&err)
-            );
-            return TestResult::Error;
+            return probe_error(format_args!("listen on the probe listener socket"), err);
         }
 
         // Read back the assigned port
         let sockname: SockaddrIn = match getsockname(listener.as_raw_fd()) {
             Ok(s) => s,
             Err(err) => {
-                warn!(
-                    "kTLS: availability probe failed to read the probe listener address; kTLS stays disabled until a later probe succeeds:  {}",
-                    ErrorReport(&err)
-                );
-                return TestResult::Error;
+                return probe_error(format_args!("read the probe listener address"), err);
             }
         };
 
@@ -373,22 +371,14 @@ pub(crate) fn is_available() -> bool {
         let (probe_client, probe_server) = match make_pair() {
             Ok(pair) => pair,
             Err(err) => {
-                warn!(
-                    "kTLS: availability probe failed to create the loopback socket pair; kTLS stays disabled until a later probe succeeds:  {}",
-                    ErrorReport(&err)
-                );
-                return TestResult::Error;
+                return probe_error(format_args!("create the loopback socket pair"), err);
             }
         };
         match setsockopt(&probe_client, TcpUlp::default(), b"tls") {
             Ok(()) => {}
             Err(nix::errno::Errno::ENOENT) => return TestResult::Unavailable,
             Err(err) => {
-                warn!(
-                    "kTLS: availability probe failed to set TCP_ULP on the loopback socket; kTLS stays disabled until a later probe succeeds:  {}",
-                    ErrorReport(&err)
-                );
-                return TestResult::Error;
+                return probe_error(format_args!("set TCP_ULP on the loopback socket"), err);
             }
         }
         drop((probe_client, probe_server));
@@ -401,19 +391,14 @@ pub(crate) fn is_available() -> bool {
             let (client, _server) = match make_pair() {
                 Ok(pair) => pair,
                 Err(err) => {
-                    warn!(
-                        "kTLS: availability probe failed to create the loopback socket pair for {name}; kTLS stays disabled until a later probe succeeds:  {}",
-                        ErrorReport(&err)
+                    return probe_error(
+                        format_args!("create the loopback socket pair for {name}"),
+                        err,
                     );
-                    return TestResult::Error;
                 }
             };
             if let Err(err) = setsockopt(&client, TcpUlp::default(), b"tls") {
-                warn!(
-                    "kTLS: availability probe failed to attach the TLS ULP for {name}; kTLS stays disabled until a later probe succeeds:  {}",
-                    ErrorReport(&err)
-                );
-                return TestResult::Error;
+                return probe_error(format_args!("attach the TLS ULP for {name}"), err);
             }
             let (Some(bit), Some(crypto)) = (
                 combo_bit(version, cipher),
@@ -618,6 +603,12 @@ pub(crate) fn setup_rx<F: AsFd>(
     // moved into the crypto_info struct literal) and are explicitly
     // `zeroize_bytes`'d once the enum has been wrapped. The enum's own
     // payload is wiped by `ZeroizingCryptoInfo::drop` after setsockopt.
+    //
+    // The two AES-GCM arms are near-identical on purpose: factoring the
+    // nonce split and key copy into a shared helper would return the key
+    // material by value and so leave one more un-zeroized copy in the
+    // helper's frame. Every byte of key material stays in a frame that
+    // wipes it.
     let crypto = match secrets {
         ConnectionTrafficSecrets::Aes128Gcm { key, iv } => {
             // AES-GCM nonce layout: salt = iv[0..4], iv_field = iv[4..12]
@@ -855,9 +846,11 @@ pub(crate) fn secret_name(secrets: &ConnectionTrafficSecrets) -> &'static str {
         ConnectionTrafficSecrets::Aes128Gcm { .. } => "AES-128-GCM",
         ConnectionTrafficSecrets::Aes256Gcm { .. } => "AES-256-GCM",
         ConnectionTrafficSecrets::Chacha20Poly1305 { .. } => "ChaCha20-Poly1305",
-        // ConnectionTrafficSecrets is #[non_exhaustive], so new variants may be added
-        // by rustls in future versions. This will not cause a compile-time error, but
-        // setup_rx() will return Err for unsupported ciphers before we reach here.
+        // ConnectionTrafficSecrets is #[non_exhaustive], so rustls may add
+        // variants without a compile error here. This arm is genuinely
+        // reachable: `splice/ktls_path.rs` names the secret *before* gating on
+        // `rx_supported`/`setup_rx`, so an unsupported cipher is named here and
+        // then reported in the rejection line.
         _ => "unknown",
     }
 }
@@ -1008,16 +1001,16 @@ fn handshake_contains_key_update(payload: &[u8]) -> bool {
 /// check below additionally defends against kernel-side cmsg-buffer
 /// insufficiency rather than wire-level partial records.
 pub(crate) fn drain_control_messages(fd: BorrowedFd<'_>, expect: DrainExpect) -> io::Result<()> {
-    // Buffer for the record payload. 0x4001 (16385) holds the largest legal
-    // record payload (16384 bytes) plus slack, so a whole record is
-    // peeked/consumed in one recvmsg() call and the peek/consume pair stays
-    // symmetric.
     /// Cap on consumed control records per drain. Real servers send a small
     /// burst of post-handshake messages (rustls-facing servers emit at most
     /// ~4 `NewSessionTicket`s); a peer streaming control records without end
     /// would otherwise pin a worker in this loop at network rate.
     const MAX_DRAIN_RECORDS: u32 = 16;
 
+    // Buffer for the record payload. 0x4001 (16385) holds the largest legal
+    // record payload (16384 bytes) plus slack, so a whole record is
+    // peeked/consumed in one recvmsg() call and the peek/consume pair stays
+    // symmetric.
     #[expect(clippy::large_stack_arrays, reason = "must fit full TLS record")]
     let mut buf = [0u8; 0x4001];
 
@@ -1442,26 +1435,41 @@ mod tests {
         assert!(!handshake_contains_key_update(&[24, 0, 0]));
     }
 
+    /// Every `PROBE_COMBOS` entry owns a distinct bit, and the bits run in
+    /// array order. The probe writes `mask |= 1 << bit` per entry and
+    /// `describe_rx_support` reads the same mask back, so a collision or a gap
+    /// would silently mis-report which ciphers the kernel accepts. Asserting
+    /// the exact sequence covers count, range and distinctness at once.
     #[test]
-    fn combo_bit_maps_all_six_combos_to_distinct_bits() {
+    fn combo_bit_maps_probe_combos_to_their_array_index() {
         let bits: Vec<u8> = PROBE_COMBOS
             .iter()
             .map(|&(version, cipher, _)| {
                 combo_bit(version, cipher).expect("PROBE_COMBOS entry must map to a bit")
             })
             .collect();
-        assert_eq!(bits.len(), 6, "there must be six probe combos");
-        for &bit in &bits {
-            assert!(bit < 6, "bit {bit} out of the 0..6 range");
-        }
-        for i in 0..bits.len() {
-            for j in (i + 1)..bits.len() {
-                assert_ne!(
-                    bits[i], bits[j],
-                    "combos {i} and {j} collide on bit {}",
-                    bits[i]
-                );
-            }
+        assert_eq!(
+            bits,
+            vec![0_u8, 1, 2, 3, 4, 5],
+            "combo bits must be distinct and follow PROBE_COMBOS order"
+        );
+    }
+
+    /// The probe loop's `(Some(bit), Some(crypto))` let-else skips a combo it
+    /// cannot map, which would mark that cipher unsupported for the process
+    /// lifetime. Both halves must resolve for every `PROBE_COMBOS` entry, so
+    /// that skip is unreachable -- this is what makes it purely defensive.
+    #[test]
+    fn every_probe_combo_maps_to_a_bit_and_a_crypto_info() {
+        for &(version, cipher, name) in &PROBE_COMBOS {
+            assert!(
+                combo_bit(version, cipher).is_some(),
+                "{name} has no support-matrix bit"
+            );
+            assert!(
+                dummy_crypto_info(version, cipher).is_some(),
+                "{name} has no probe crypto-info"
+            );
         }
     }
 
@@ -1471,6 +1479,22 @@ mod tests {
         assert_eq!(combo_bit(libc::TLS_1_3_VERSION, 0), None);
         // 0 is not a valid kernel TLS version constant.
         assert_eq!(combo_bit(0, libc::TLS_CIPHER_AES_GCM_128), None);
+    }
+
+    #[test]
+    fn describe_rx_support_names_only_the_set_bits() {
+        assert_eq!(describe_rx_support(0), "", "an empty matrix names nothing");
+
+        let bit = |version, cipher| {
+            1u32 << combo_bit(version, cipher).expect("PROBE_COMBOS entry must map to a bit")
+        };
+        let mask = bit(libc::TLS_1_2_VERSION, libc::TLS_CIPHER_AES_GCM_128)
+            | bit(libc::TLS_1_3_VERSION, libc::TLS_CIPHER_CHACHA20_POLY1305);
+        assert_eq!(
+            describe_rx_support(mask),
+            "TLSv1.2+AES-128-GCM, TLSv1.3+ChaCha20-Poly1305",
+            "the summary must list the set combos in PROBE_COMBOS order"
+        );
     }
 
     /// Result of setting up a kTLS test: a client socket with kTLS RX configured,
@@ -1698,7 +1722,7 @@ mod tests {
     /// and verify decryption works with `read()`.
     #[expect(
         clippy::print_stderr,
-        reason = "matched against in integration test ktls_splice_proxy_downloads_over_https()"
+        reason = "skip message when the kernel lacks the tls module"
     )]
     fn run_ktls_read_test(tls_versions: &[&'static rustls::SupportedProtocolVersion]) {
         if !is_available() {

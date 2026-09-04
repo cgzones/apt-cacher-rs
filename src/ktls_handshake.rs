@@ -106,3 +106,41 @@ pub(crate) fn encode_tls_data(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grow_incoming_seeds_an_empty_buffer() {
+        let mut buf = SecureVec::new(0);
+        grow_incoming(&mut buf, 0, "test").expect("seeding an empty buffer must succeed");
+        assert_eq!(buf.len(), 1024, "an empty buffer starts at 1 KiB");
+    }
+
+    #[test]
+    fn grow_incoming_doubles_only_once_the_buffer_is_full() {
+        let mut buf = SecureVec::new(1024);
+        grow_incoming(&mut buf, 1023, "test").expect("a buffer with room must succeed");
+        assert_eq!(buf.len(), 1024, "a buffer with room must not grow");
+
+        grow_incoming(&mut buf, 1024, "test").expect("a full buffer must grow");
+        assert_eq!(buf.len(), 2048, "a full buffer doubles");
+    }
+
+    /// The growth cap is what stops a server that ships TLS records without
+    /// ever completing the handshake from growing this buffer without bound.
+    #[test]
+    fn grow_incoming_refuses_to_grow_past_two_mib() {
+        const MAX: usize = 2 * 1024 * 1024;
+
+        let mut buf = SecureVec::new(MAX);
+        let err = grow_incoming(&mut buf, MAX, "test").expect_err("the cap must be enforced");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            buf.len(),
+            MAX,
+            "a refused growth must leave the buffer as-is"
+        );
+    }
+}
