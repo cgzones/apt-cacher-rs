@@ -668,67 +668,40 @@ pub(crate) fn classify_request<'a>(
             distribution,
             component,
             filename,
-        } => {
-            let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
-            let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
-            let component = decode_validate(component, ValidateKind::Component)?;
-            let filename = decode_validate(filename, ValidateKind::Filename)?;
-
-            trace!(
-                "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded filename: `{filename}` (client {client})"
-            );
-
-            Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
-                debname: format!("{distribution}_{component}_{filename}"),
-                resource_kind: ResourceKind::Icon,
-                origin_fields: None,
-            })
-        }
+        } => classify_component_scoped(
+            mirror_path,
+            distribution,
+            component,
+            filename,
+            ResourceKind::Icon,
+            client,
+        ),
         ResourceFile::Sources {
             mirror_path,
             distribution,
             component,
             filename,
-        } => {
-            let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
-            let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
-            let component = decode_validate(component, ValidateKind::Component)?;
-            let filename = decode_validate(filename, ValidateKind::Filename)?;
-
-            trace!(
-                "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded filename: `{filename}` (client {client})"
-            );
-
-            Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
-                debname: format!("{distribution}_{component}_{filename}"),
-                resource_kind: ResourceKind::Sources,
-                origin_fields: None,
-            })
-        }
+        } => classify_component_scoped(
+            mirror_path,
+            distribution,
+            component,
+            filename,
+            ResourceKind::Sources,
+            client,
+        ),
         ResourceFile::Translation {
             mirror_path,
             distribution,
             component,
             filename,
-        } => {
-            let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
-            let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
-            let component = decode_validate(component, ValidateKind::Component)?;
-            let filename = decode_validate(filename, ValidateKind::Filename)?;
-
-            trace!(
-                "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded filename: `{filename}` (client {client})"
-            );
-
-            Ok(RequestClass {
-                mirror_path: mirror_path.into_owned(),
-                debname: format!("{distribution}_{component}_{filename}"),
-                resource_kind: ResourceKind::Translation,
-                origin_fields: None,
-            })
-        }
+        } => classify_component_scoped(
+            mirror_path,
+            distribution,
+            component,
+            filename,
+            ResourceKind::Translation,
+            client,
+        ),
         ResourceFile::ComponentRelease {
             mirror_path,
             distribution,
@@ -830,6 +803,34 @@ pub(crate) fn classify_request<'a>(
             })
         }
     }
+}
+
+/// Decode + validate a component-scoped `dists/` index.  `Icon`, `Sources`
+/// and `Translation` share the field set, the `{distribution}_{component}_{filename}`
+/// debname and the rule that such an index is never a per-binary origin.
+fn classify_component_scoped<'a>(
+    mirror_path: &'a str,
+    distribution: &'a str,
+    component: &'a str,
+    filename: &'a str,
+    resource_kind: ResourceKind,
+    client: &ClientInfo,
+) -> Result<RequestClass, ClassifyError<'a>> {
+    let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
+    let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
+    let component = decode_validate(component, ValidateKind::Component)?;
+    let filename = decode_validate(filename, ValidateKind::Filename)?;
+
+    trace!(
+        "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded filename: `{filename}` (client {client})"
+    );
+
+    Ok(RequestClass {
+        mirror_path: mirror_path.into_owned(),
+        debname: format!("{distribution}_{component}_{filename}"),
+        resource_kind,
+        origin_fields: None,
+    })
 }
 
 /// URL-decode `raw` and check the result with the validator selected by
