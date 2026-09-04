@@ -243,9 +243,7 @@ pub(super) async fn handle_volatile_buffered_download(
     let body_slice = &body[range_plan.start as usize..range_plan.end() as usize];
     {
         let config = global_config();
-        let mut volatile_rc = config
-            .min_download_rate
-            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+        let mut volatile_rc = RateChecker::from_config(config);
         write_all_to_stream_rated(
             client.stream,
             body_slice,

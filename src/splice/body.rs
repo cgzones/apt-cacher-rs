@@ -372,14 +372,8 @@ impl<'a> BodyTransfer<'a> {
         let counter = client.map(|_stream| client_counter::ClientDownload::new());
 
         let config = global_config();
-        let rate_checker = config
-            .min_download_rate
-            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-        let client_rate_checker = client.and_then(|_stream| {
-            config
-                .min_download_rate
-                .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe))
-        });
+        let rate_checker = RateChecker::from_config(config);
+        let client_rate_checker = client.and_then(|_stream| RateChecker::from_config(config));
 
         Self {
             counter,

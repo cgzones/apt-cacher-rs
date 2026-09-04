@@ -2181,9 +2181,7 @@ pub(crate) async fn async_sendfile(
 
     let config = global_config();
 
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
 
     let mut remaining = count;
 
@@ -2309,9 +2307,7 @@ pub(crate) async fn async_sendfile_unfinished(
 
     let config = global_config();
 
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
 
     let mut remaining = content_length;
     let mut finished = false;

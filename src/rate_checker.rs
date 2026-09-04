@@ -3,6 +3,8 @@ use std::num::NonZero;
 use coarsetime::{Duration, Instant};
 use tracing::debug;
 
+#[cfg(feature = "sendfile")]
+use crate::config::Config;
 use crate::{humanfmt::HumanFmt, metrics, ringbuffer::SumRingBuffer};
 
 /// A rate checker that tracks download speed over a sliding time window.
@@ -67,6 +69,17 @@ impl InsufficientRate {
 }
 
 impl RateChecker {
+    /// The rate checker `config` asks for, or `None` when `min_download_rate`
+    /// is disabled.  The one place the two config keys are paired, so every
+    /// rate-checked loop agrees on the averaging window.
+    #[cfg(feature = "sendfile")]
+    #[must_use]
+    pub(crate) fn from_config(config: &Config) -> Option<Self> {
+        config
+            .min_download_rate
+            .map(|rate| Self::with_timeframe(rate, config.rate_check_timeframe))
+    }
+
     /// Creates a new `RateChecker` with the given minimum download rate and timeframe.
     #[must_use]
     pub(crate) fn with_timeframe(

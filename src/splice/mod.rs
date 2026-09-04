@@ -1440,9 +1440,7 @@ async fn write_body_prefix(
     );
     if !client_slice.is_empty() {
         let config = global_config();
-        let mut prefix_rc = config
-            .min_download_rate
-            .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+        let mut prefix_rc = RateChecker::from_config(config);
         if let Err(err) = write_all_to_stream_rated(
             client_stream,
             client_slice,

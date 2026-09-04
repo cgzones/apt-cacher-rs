@@ -230,9 +230,7 @@ impl BodyFraming {
                 return Ok(());
             }
             let config = global_config();
-            let mut rate_checker = config
-                .min_download_rate
-                .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+            let mut rate_checker = RateChecker::from_config(config);
             write_all_to_stream_rated(
                 client_stream,
                 body_prefix,
@@ -571,12 +569,8 @@ async fn forward_upstream_body(
     // never zero-initialized before being overwritten by upstream data.
     let mut buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
     let mut remaining = count;
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-    let mut client_rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
+    let mut client_rate_checker = RateChecker::from_config(config);
 
     while remaining > 0 {
         debug_assert_eq!(
@@ -649,12 +643,8 @@ async fn forward_upstream_body_until_eof(
     let config = global_config();
     let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
     let mut total = 0;
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-    let mut client_rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
+    let mut client_rate_checker = RateChecker::from_config(config);
 
     loop {
         buf.clear();
@@ -982,12 +972,8 @@ async fn forward_upstream_chunked_body(
     max_bytes: usize,
 ) -> std::io::Result<u64> {
     let config = global_config();
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
-    let mut client_rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
+    let mut client_rate_checker = RateChecker::from_config(config);
 
     let mut decoder = ChunkDecoder::new(max_bytes);
     // Tracks raw bytes (framing + data) written to the client.
@@ -1066,9 +1052,7 @@ async fn read_body_to_vec_until_eof(
     let size = (prefix.len() + 4096).min(max_bytes.saturating_add(1));
     let mut body = Vec::with_capacity(size);
     body.extend_from_slice(prefix);
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
 
     loop {
         if body.len() > max_bytes {
@@ -1155,9 +1139,7 @@ async fn read_body_to_vec_with_content_length(
     // header and must not size an up-front allocation.
     let mut body = Vec::with_capacity((prefix.len() + 32 * 1024).min(content_length));
     body.extend_from_slice(prefix);
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
 
     while body.len() < content_length {
         let remaining = content_length - body.len();
@@ -1214,9 +1196,7 @@ async fn read_dechunk_body_to_vec(
 ) -> std::io::Result<Vec<u8>> {
     let config = global_config();
     let mut body = Vec::with_capacity(4096);
-    let mut rate_checker = config
-        .min_download_rate
-        .map(|rate| RateChecker::with_timeframe(rate, config.rate_check_timeframe));
+    let mut rate_checker = RateChecker::from_config(config);
     let mut decoder = ChunkDecoder::new(max_bytes);
     let mut read_buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
 
