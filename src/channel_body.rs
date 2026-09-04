@@ -11,40 +11,10 @@ pub(crate) enum ChannelBodyError {
     },
 }
 
-#[derive(Clone, Copy)]
-enum Remaining {
-    Exact(u64),
-    Upper(u64),
-}
-
-impl Remaining {
-    fn try_consume(self, n: u64) -> Option<Self> {
-        match self {
-            Self::Exact(v) => v.checked_sub(n).map(Self::Exact),
-            Self::Upper(v) => v.checked_sub(n).map(Self::Upper),
-        }
-    }
-
-    fn to_size_hint(self) -> SizeHint {
-        match self {
-            Self::Exact(n) => SizeHint::with_exact(n),
-            Self::Upper(n) => {
-                let mut sz = SizeHint::new();
-                sz.set_upper(n);
-                sz
-            }
-        }
-    }
-}
-
 pub(crate) struct ChannelBody {
     receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, MirrorDownloadRate>>,
     content_length: ContentLength,
-    remaining: Remaining,
     received: u64,
-    // For an `Exact` announced length: set when the announced total has been
-    // delivered (`Remaining::Exact(0)`). Never set for `Upper` (unknown).
-    delivered_announced: bool,
     // Set on the first `Ready(None)` observed from the channel.
     channel_closed: bool,
     // Sticky: set once `poll_frame` has yielded any `Err` (protocol violation
@@ -60,20 +30,23 @@ impl ChannelBody {
         receiver: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, MirrorDownloadRate>>,
         content_length: ContentLength,
     ) -> Self {
-        let remaining = match content_length {
-            ContentLength::Exact(size) => Remaining::Exact(size.get()),
-            ContentLength::Unknown(size) => Remaining::Upper(size.get()),
-        };
-
         Self {
             receiver,
             content_length,
-            remaining,
             received: 0,
-            delivered_announced: false,
             channel_closed: false,
             errored: false,
         }
+    }
+
+    fn remaining(&self) -> u64 {
+        self.content_length.upper().get() - self.received
+    }
+
+    /// Only an `Exact` announcement has a total to deliver; `Unknown` is an
+    /// upper bound that reaching says nothing about.
+    fn announced_total_delivered(&self) -> bool {
+        matches!(self.content_length, ContentLength::Exact(total) if self.received == total.get())
     }
 }
 
@@ -89,7 +62,7 @@ impl Drop for ChannelBody {
         // set. Preserves the parent/subset invariant from `metrics.rs`:
         // `SERVED_TOTAL` = sum of per-path `SERVED_*`.
         let terminal = match self.content_length {
-            ContentLength::Exact(_) => self.delivered_announced,
+            ContentLength::Exact(_) => self.announced_total_delivered(),
             ContentLength::Unknown(_) => self.channel_closed,
         };
         if terminal && !self.errored {
@@ -104,7 +77,14 @@ impl Body for ChannelBody {
     type Error = Box<ChannelBodyError>;
 
     fn size_hint(&self) -> SizeHint {
-        self.remaining.to_size_hint()
+        match self.content_length {
+            ContentLength::Exact(_) => SizeHint::with_exact(self.remaining()),
+            ContentLength::Unknown(_) => {
+                let mut sz = SizeHint::new();
+                sz.set_upper(self.remaining());
+                sz
+            }
+        }
     }
 
     fn is_end_stream(&self) -> bool {
@@ -113,7 +93,7 @@ impl Body for ChannelBody {
         // `poll_frame` - the announced total delivered, the channel closed,
         // or an error surfaced - so a consumer relying on the hint stops
         // instead of issuing a redundant poll after the body has terminated.
-        self.delivered_announced || self.channel_closed || self.errored
+        self.announced_total_delivered() || self.channel_closed || self.errored
     }
 
     fn poll_frame(
@@ -136,36 +116,18 @@ impl Body for ChannelBody {
             d.map(|b| match b {
                 Ok(data) => {
                     let datalen = data.len() as u64;
-                    // Any non-empty frame received after the announced total
-                    // has been delivered is a protocol violation. Empty frames
-                    // are tolerated as a no-op (they consume nothing).
-                    if self.delivered_announced && datalen > 0 {
+                    let received = self.received.saturating_add(datalen);
+                    if received > self.content_length.upper().get() {
                         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
                         self.errored = true;
                         return Err(Box::new(ChannelBodyError::ContentTooLarge {
                             announced: self.content_length,
-                            received: self.received + datalen,
+                            received,
                         }));
                     }
-                    match self.remaining.try_consume(datalen) {
-                        None => {
-                            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                            self.errored = true;
-                            Err(Box::new(ChannelBodyError::ContentTooLarge {
-                                announced: self.content_length,
-                                received: self.received + datalen,
-                            }))
-                        }
-                        Some(updated) => {
-                            self.received += datalen;
-                            self.remaining = updated;
-                            if matches!(updated, Remaining::Exact(0)) {
-                                self.delivered_announced = true;
-                            }
-                            metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
-                            Ok(Frame::data(data))
-                        }
-                    }
+                    self.received = received;
+                    metrics::BYTES_SERVED_CHANNEL.increment_by(datalen);
+                    Ok(Frame::data(data))
                 }
                 Err(err) => {
                     self.errored = true;
