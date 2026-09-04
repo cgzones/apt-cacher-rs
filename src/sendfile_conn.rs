@@ -2273,6 +2273,38 @@ pub(crate) async fn async_sendfile(
     }
 }
 
+/// What a file-serve loop should do with the download it is following.
+/// Both status checks in [`async_sendfile_unfinished`] read the same three
+/// outcomes, so the mapping from [`ActiveDownloadStatus`] lives here once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainState {
+    /// Every byte is on disk: `Finished`, `Verifying` (the writer is hashing
+    /// on a blocking thread and the open handle survives the rename), or
+    /// `Discarded` (written in full, then rejected — attached readers still
+    /// get the bytes they were promised).
+    Drainable,
+    /// The writer gave up before the last byte; the file is short.
+    Aborted,
+    /// Still downloading.
+    InFlight,
+}
+
+impl DrainState {
+    async fn read(status: &tokio::sync::RwLock<ActiveDownloadStatus>) -> Self {
+        match *status.read().await {
+            ActiveDownloadStatus::Finished { .. }
+            | ActiveDownloadStatus::Verifying { .. }
+            | ActiveDownloadStatus::Aborted(AbortReason::Discarded {
+                checksum_mismatch: _,
+            }) => Self::Drainable,
+            ActiveDownloadStatus::Aborted(
+                AbortReason::MirrorDownloadRate(_) | AbortReason::AlreadyLoggedJustFail,
+            ) => Self::Aborted,
+            ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => Self::InFlight,
+        }
+    }
+}
+
 /// Like [`async_sendfile`], but for a file that is still being written to by
 /// a concurrent download task.  Waits for `watch::Receiver` pings to learn
 /// about new data.  The sender batches notifications (see
@@ -2389,29 +2421,19 @@ pub(crate) async fn async_sendfile_unfinished(
                     // writer is hashing on a blocking thread; the open file
                     // handle stays valid across the upcoming rename, so drain
                     // like Finished.
-                    let st = status.read().await;
-                    match *st {
-                        ActiveDownloadStatus::Finished { .. }
-                        | ActiveDownloadStatus::Verifying { .. }
-                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded {
-                            checksum_mismatch: _,
-                        }) => {
-                            drop(st);
+                    match DrainState::read(&status).await {
+                        DrainState::Drainable => {
                             finished = true;
                             continue;
                         }
-                        ActiveDownloadStatus::Aborted(
-                            AbortReason::MirrorDownloadRate(_) | AbortReason::AlreadyLoggedJustFail,
-                        ) => {
-                            drop(st);
+                        DrainState::Aborted => {
                             let transferred = content_length - remaining;
                             return Err((
                                 transferred,
                                 std::io::Error::other("sendfile: upstream download aborted"),
                             ));
                         }
-                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
-                            drop(st);
+                        DrainState::InFlight => {
                             let transferred = content_length - remaining;
                             return Err((
                                 transferred,
@@ -2445,30 +2467,15 @@ pub(crate) async fn async_sendfile_unfinished(
                 // bytes as available.  Re-check the download status directly
                 // rather than relying on another fstat round-trip that could
                 // race with the writer task dropping the watch sender.
-                let (is_finished, is_aborted) = {
-                    let st = status.read().await;
-                    match *st {
-                        ActiveDownloadStatus::Finished { .. }
-                        | ActiveDownloadStatus::Verifying { .. }
-                        | ActiveDownloadStatus::Aborted(AbortReason::Discarded {
-                            checksum_mismatch: _,
-                        }) => (true, false),
-                        ActiveDownloadStatus::Aborted(
-                            AbortReason::MirrorDownloadRate(_) | AbortReason::AlreadyLoggedJustFail,
-                        ) => (false, true),
-                        ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
-                            (false, false)
-                        }
-                    }
-                };
-                if is_aborted {
+                let state = DrainState::read(&status).await;
+                if state == DrainState::Aborted {
                     let already_sent = content_length - remaining;
                     return Err((
                         already_sent + transferred,
                         std::io::Error::other("sendfile: upstream download aborted"),
                     ));
                 }
-                if is_finished {
+                if state == DrainState::Drainable {
                     finished = true;
                 } else if transferred < sendable {
                     // Neither finished nor aborted: the writer still claims
