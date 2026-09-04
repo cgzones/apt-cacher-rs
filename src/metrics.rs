@@ -631,7 +631,12 @@ pub(crate) static RATE_LIMIT_CLIENT: Counter = Counter::new();
 pub(crate) static DB_COMMANDS_SENT: Counter = Counter::new();
 /// Peak observed DB-command channel depth, sampled post-send by the producer.
 pub(crate) static DB_QUEUE_DEPTH_PEAK: Peak = Peak::new();
-/// Sends that observed a fully-saturated channel and had to wait for a slot.
+/// Sends that observed a fully-saturated channel. The two bump sites differ
+/// in what follows: the async `send_db_command` samples `capacity() == 0`
+/// *before* sending and may then complete without ever parking, while
+/// `send_db_command_nonblocking` bumps only when `try_send` actually returned
+/// `Full` and it had to spill the command onto a task. So this counts
+/// observations of saturation, not waits.
 pub(crate) static DB_QUEUE_FULL_WAITS: Counter = Counter::new();
 /// Debounced `DB_QUEUE_FULL_WAITS` — counts each saturation episode once
 /// (latched until the channel drains fully to empty).

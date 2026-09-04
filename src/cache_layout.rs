@@ -508,7 +508,7 @@ impl std::fmt::Display for ValidateKind {
 ///
 /// Single source of truth for the `{distribution}_{component}_{architecture}_
 /// {filename}` convention: [`classify_request`] mints the name for a client
-/// request, and `cleanup::engine::DebnameKind` mints the same name for the
+/// request, and `cleanup::packages::DebnameKind` mints the same name for the
 /// index fetches cleanup issues itself. If the two ever disagree, cleanup
 /// caches every index under a path the serve path never reads — an invisible
 /// shadow copy plus a re-download every cycle.

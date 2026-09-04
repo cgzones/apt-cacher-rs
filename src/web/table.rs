@@ -204,22 +204,22 @@ pub(super) fn write_collapsible_section(
         EmptyOr {
             body,
             note: empty_note,
-            rows: row_count,
         },
     );
 }
 
-/// Renders `body`, or the empty-state note in its place when there are no
-/// rows to show.
+/// Renders `body`, or the empty-state note in its place when the body is
+/// empty. The row count is not consulted: a section with rows always has a
+/// body, and one with a non-empty body (a per-section error notice, say)
+/// wants that body shown even at zero rows.
 struct EmptyOr<'a> {
     body: &'a str,
     note: &'static str,
-    rows: usize,
 }
 
 impl Display for EmptyOr<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.rows == 0 && self.body.is_empty() {
+        if self.body.is_empty() {
             write!(f, "<p class=\"empty\">{}</p>", self.note)
         } else {
             f.write_str(self.body)

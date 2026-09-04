@@ -14,7 +14,7 @@ use tracing::error;
 
 use crate::{
     AppState, LOGSTORE, RUNTIMEDETAILS, RuntimeDetails,
-    build_info::{APP_VERSION, get_features},
+    build_info::{APP_VERSION, FEATURES_ONE_LINE},
     cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
@@ -493,7 +493,7 @@ fn build_daemon_status_html(
 
     let mut t = DetailsList::new();
     t.row("Version", APP_VERSION);
-    t.row("Features", get_features(false).replace('\n', " "));
+    t.row("Features", FEATURES_ONE_LINE);
     t.row(
         "Start Time",
         format_args!(

@@ -113,7 +113,7 @@ use std::{
     time::Duration,
 };
 
-use build_info::{APP_VERSION, get_features};
+use build_info::{APP_VERSION, FEATURES_ONE_LINE, VERSION_AND_FEATURES};
 use clap::Parser;
 #[cfg(feature = "ktls")]
 use hashbrown::HashMap;
@@ -155,7 +155,7 @@ pub(crate) struct AppState {
 }
 
 #[derive(Parser)]
-#[command(author, version, long_version(get_features(true)), about)]
+#[command(author, version, long_version(VERSION_AND_FEATURES), about)]
 struct Cli {
     /// Log file path (log to file instead of console, the default)
     #[arg(long, value_name = "PATH")]
@@ -644,7 +644,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     // stack is used, so a log without them cannot be read confidently.
     info!(
         "apt-cacher-rs {APP_VERSION} ({}) starting...",
-        get_features(false).replace('\n', " ")
+        FEATURES_ONE_LINE
     );
 
     #[expect(clippy::print_stderr, reason = "print to stderr for panic hook")]

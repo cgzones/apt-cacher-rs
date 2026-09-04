@@ -50,42 +50,37 @@ feature_bool!(feature_sendfile, "sendfile");
 feature_bool!(feature_splice, "splice");
 feature_bool!(feature_ktls, "ktls");
 
+/// The `key=value` feature summary, joined by `$sep`.
 macro_rules! feature_summary {
-    () => {
+    ($sep:expr) => {
         concat!(
             "TLS=",
             feature_tls!(),
-            "\n",
+            $sep,
             "hyper=",
             feature_hyper!(),
-            "\n",
+            $sep,
             "mmap=",
             feature_mmap!(),
-            "\n",
+            $sep,
             "sendfile=",
             feature_sendfile!(),
-            "\n",
+            $sep,
             "splice=",
             feature_splice!(),
-            "\n",
+            $sep,
             "ktls=",
             feature_ktls!(),
         )
     };
 }
 
-/// Newline-separated `key=value` summary of the build's feature flags.
-const FEATURES: &str = feature_summary!();
+/// The crate version followed by the newline-separated feature summary; what
+/// `--version` prints.
+pub(crate) const VERSION_AND_FEATURES: &str =
+    concat!(env!("CARGO_PKG_VERSION"), "\n", feature_summary!("\n"));
 
-/// [`FEATURES`] prefixed by the crate version; what `--version` prints.
-const VERSION_AND_FEATURES: &str = concat!(env!("CARGO_PKG_VERSION"), "\n", feature_summary!());
-
-#[must_use]
-#[inline]
-pub(crate) const fn get_features(version: bool) -> &'static str {
-    if version {
-        VERSION_AND_FEATURES
-    } else {
-        FEATURES
-    }
-}
+/// The feature summary on one line, for the startup banner and the
+/// dashboard's "Features" row. A separate const rather than a runtime
+/// `.replace('\n', " ")` at each of them.
+pub(crate) const FEATURES_ONE_LINE: &str = feature_summary!(" ");
