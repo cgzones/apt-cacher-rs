@@ -160,10 +160,10 @@ pub(crate) fn xattr_supported() -> bool {
 pub(crate) struct XattrIoError;
 
 /// Remove `V`'s attribute from the file. Logs on failure but never
-/// propagates errors: the only caller is the malformed-value scrub, whose
-/// failure leaves the invalid value in place for the next read to discard
-/// again.
-pub(crate) fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) {
+/// propagates errors: the only caller is [`try_read`]'s malformed-value
+/// scrub, whose failure leaves the invalid value in place for the next read
+/// to discard again.
+fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) {
     if !xattr_supported() {
         return;
     }
@@ -343,6 +343,41 @@ pub(crate) mod tests {
 
         remove::<V>(&file, &path);
         assert!(matches!(try_read::<V>(&file, &path), Ok(None)));
+    }
+
+    /// Two values sharing one key would silently overwrite each other on
+    /// disk, and the shared prefix is what `task_setup`'s startup probe
+    /// tests for support - so both are asserted here rather than left to a
+    /// copy-paste review of four `impl` blocks in four modules.
+    #[test]
+    fn every_attribute_key_is_namespaced_and_distinct() {
+        use crate::{
+            http_etag::ETag, http_last_modified::LastModified, verified_marker::CleanupMarker,
+        };
+
+        const KEYS: [&str; 4] = [
+            ETag::KEY,
+            LastModified::KEY,
+            ExpectedSize::KEY,
+            CleanupMarker::KEY,
+        ];
+
+        for key in KEYS {
+            assert!(
+                key.starts_with("user.apt_cacher_rs."),
+                "`{key}` is outside the daemon's xattr namespace"
+            );
+        }
+
+        let mut sorted = KEYS;
+        sorted.sort_unstable();
+        let mut deduped = sorted.to_vec();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            KEYS.len(),
+            "every persisted value must own a distinct xattr key: {sorted:?}"
+        );
     }
 
     #[test]

@@ -561,6 +561,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn descend_carries_its_tag_and_relative_path_down_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("a/b")).expect("a/b");
+        std::fs::write(dir.path().join("a/shallow"), b"x").expect("shallow");
+        std::fs::write(dir.path().join("a/b/deep"), b"x").expect("deep");
+
+        let (events, outcome) = collect(dir.path(), &CONTINUE, OnMissing::Fail, &["a", "b"]).await;
+        assert!(matches!(outcome, WalkOutcome::Complete), "{outcome:?}");
+        assert_eq!(
+            events,
+            vec![
+                (PathBuf::from("a"), EntryKind::Dir, 0),
+                (PathBuf::from("a/b"), EntryKind::Dir, 1),
+                (PathBuf::from("a/b/deep"), EntryKind::File, 2),
+                (PathBuf::from("a/shallow"), EntryKind::File, 1),
+            ],
+            "each entry carries the tag of the directory holding it"
+        );
+    }
+
+    /// `metadata` is the walker's only per-entry syscall and runs after the
+    /// listing, so it has to absorb both races the listing cannot see.
+    #[tokio::test]
+    async fn metadata_skips_an_entry_that_vanished_or_changed_type() {
+        let gone_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(gone_dir.path().join("gone"), b"x").expect("gone");
+        {
+            let mut walker = Walker::new(gone_dir.path(), &CONTINUE, OnMissing::Fail, ());
+            let entry = walker.next().await.expect("one entry");
+            std::fs::remove_file(entry.path()).expect("unlink");
+            assert!(
+                entry.metadata().await.is_none(),
+                "an entry that vanished after the listing drops out of the walk"
+            );
+        }
+
+        let swapped_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(swapped_dir.path().join("swapped"), b"x").expect("swapped");
+        let mut walker = Walker::new(swapped_dir.path(), &CONTINUE, OnMissing::Fail, ());
+        let entry = walker.next().await.expect("one entry");
+        assert_eq!(entry.kind(), EntryKind::File);
+        std::fs::remove_file(entry.path()).expect("unlink");
+        std::fs::create_dir(entry.path()).expect("mkdir");
+        assert!(
+            entry.metadata().await.is_none(),
+            "an entry whose type changed after the listing drops out of the walk"
+        );
+    }
+
+    #[tokio::test]
     async fn non_regular_entries_are_yielded_and_counted_on_sight() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink("/nonexistent", dir.path().join("link")).expect("symlink");

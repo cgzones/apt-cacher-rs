@@ -109,12 +109,7 @@ pub(crate) async fn probe_dir(path: &Path, purpose: &'static str) -> std::io::Re
 #[derive(Debug)]
 pub(crate) struct CacheAccessFailure(pub(crate) Logged);
 
-/// `statx` an open cache file and require a regular file.
-///
-/// The single owner of the "stat failed -> `CACHE_IO_FAILURE`, non-regular ->
-/// `CACHE_NON_REGULAR`" policy for files about to be served: every serve path
-/// (hyper, sendfile, splice) goes through here so no path can silently skip
-/// the anomaly accounting.
+/// `statx` an already-open file without the blocking-pool round trip.
 ///
 /// Synchronous on purpose. `tokio::fs::File::metadata` is a `spawn_blocking`
 /// under the hood — a condvar wake of a pool thread, a wake back to the
@@ -124,25 +119,31 @@ pub(crate) struct CacheAccessFailure(pub(crate) Logged);
 ///
 /// It must stay a `statx`, not an `fstat`: `cache_file_http_date` reads
 /// `Metadata::created()` (btime) and only falls back to mtime, while
-/// `touch_volatile_mtime` repurposes mtime as "last revalidated". `fstat(2)`
+/// [`touch_volatile_mtime`] repurposes mtime as "last revalidated". `fstat(2)`
 /// carries no btime and nix 0.31 wraps no `statx`, so the fd is borrowed into
 /// a `std::fs::File` and std's own `statx` is used.
+fn borrowed_metadata(file: &tokio::fs::File) -> std::io::Result<std::fs::Metadata> {
+    use std::mem::ManuallyDrop;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    // SAFETY: `file` owns the descriptor and outlives this borrow, and
+    // `ManuallyDrop` keeps the wrapper from closing it on drop, so the
+    // borrowed `File` never takes ownership of the fd.
+    let borrowed = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) });
+    borrowed.metadata()
+}
+
+/// `statx` an open cache file and require a regular file.
+///
+/// The single owner of the "stat failed -> `CACHE_IO_FAILURE`, non-regular ->
+/// `CACHE_NON_REGULAR`" policy for files about to be served: every serve path
+/// (hyper, sendfile, splice) goes through here so no path can silently skip
+/// the anomaly accounting.
 pub(crate) fn regular_file_metadata(
     file: &tokio::fs::File,
     path: &Path,
 ) -> Result<std::fs::Metadata, CacheAccessFailure> {
-    use std::mem::ManuallyDrop;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
-    let result = {
-        // SAFETY: `file` owns the descriptor and outlives this borrow, and
-        // `ManuallyDrop` keeps the wrapper from closing it on drop, so the
-        // borrowed `File` never takes ownership of the fd.
-        let borrowed = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) });
-        borrowed.metadata()
-    };
-
-    match result {
+    match borrowed_metadata(file) {
         Ok(md) if md.file_type().is_file() => Ok(md),
         Ok(_) => {
             metrics::CACHE_NON_REGULAR.increment();
@@ -168,9 +169,10 @@ pub(crate) async fn touch_volatile_mtime(
     file: tokio::fs::File,
     display_path: &Path,
 ) -> tokio::fs::File {
-    let mdata = match file.metadata().await {
+    let mdata = match borrowed_metadata(&file) {
         Ok(m) => m,
         Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get metadata of cached file `{}`; leaving its volatile freshness window untouched:  {}",
                 display_path.display(),
@@ -264,6 +266,86 @@ pub(crate) fn release_page_cache(file: impl std::os::fd::AsFd, display_path: &Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Create `dir/target` and a `dir/link` symlink pointing at it.
+    fn planted_symlink(dir: &Path) -> std::path::PathBuf {
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").expect("write target");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        link
+    }
+
+    #[test]
+    fn nofollow_options_refuse_a_symlink_with_eloop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = planted_symlink(dir.path());
+
+        for mut options in [nofollow_options(), nofollow_nonblock_options()] {
+            let err = options
+                .read(true)
+                .open(&link)
+                .expect_err("O_NOFOLLOW must refuse a symlink at the final component");
+            // `ErrorKind::FilesystemLoop` is nightly-only, so every caller
+            // matching a refused symlink compares the raw errno instead.
+            assert_eq!(
+                err.raw_os_error(),
+                Some(nix::libc::ELOOP),
+                "a refused symlink is recognized by ELOOP"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tokio_nofollow_options_refuses_a_symlink_with_eloop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = planted_symlink(dir.path());
+
+        let err = tokio_nofollow_options()
+            .read(true)
+            .open(&link)
+            .await
+            .expect_err("O_NOFOLLOW must refuse a symlink at the final component");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(nix::libc::ELOOP),
+            "a refused symlink is recognized by ELOOP"
+        );
+    }
+
+    /// The nonblock variant exists so an open of a FIFO or character device
+    /// cannot strand a blocking-pool thread; `custom_flags` overwrites rather
+    /// than ORs, so a stray second call would silently drop `O_NONBLOCK`.
+    #[test]
+    fn only_the_nonblock_variant_sets_o_nonblock() {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        use std::os::fd::AsFd as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("regular");
+        std::fs::write(&path, b"x").expect("write");
+
+        let flags_of = |file: &std::fs::File| {
+            OFlag::from_bits_truncate(fcntl(file.as_fd(), FcntlArg::F_GETFL).expect("F_GETFL"))
+        };
+
+        let nonblock = nofollow_nonblock_options()
+            .read(true)
+            .open(&path)
+            .expect("open");
+        assert!(
+            flags_of(&nonblock).contains(OFlag::O_NONBLOCK),
+            "the nonblock variant must keep O_NONBLOCK, got {:?}",
+            flags_of(&nonblock)
+        );
+
+        let plain = nofollow_options().read(true).open(&path).expect("open");
+        assert!(
+            !flags_of(&plain).contains(OFlag::O_NONBLOCK),
+            "the plain variant sets only O_NOFOLLOW, got {:?}",
+            flags_of(&plain)
+        );
+    }
 
     #[tokio::test]
     async fn regular_file_metadata_reports_size_without_blocking_pool() {

@@ -658,6 +658,39 @@ mod tests {
         assert!(!path.exists(), "the stale partial is unlinked");
     }
 
+    // The xattr reads run through `block_in_place`, which needs the
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_partial_resume_reports_the_expected_total_from_xattr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"partial-bytes").expect("write");
+        let std_file = std::fs::File::open(&path).expect("open");
+        if !plant_raw::<ETag>(&std_file, b"\"strong\"") {
+            // Filesystem without user xattrs: the resume branch cannot be
+            // exercised here.
+            return;
+        }
+        assert!(
+            plant_raw::<xattr_helpers::ExpectedSize>(&std_file, b"4096"),
+            "the ETag planted, so the expected-size attribute must too"
+        );
+        drop(std_file);
+        let mirror = structured_mirror("deb.example.org", "debian");
+
+        let resume = prepare_partial_resume_at(path, "foo_1.0_amd64.deb", &mirror, "")
+            .await
+            .expect("the partial reopens");
+        assert_eq!(resume.offset, 13);
+        assert_eq!(
+            resume.expected_total,
+            Some(4096),
+            "the stored total is what lets a resume detect an upstream size change"
+        );
+        assert_eq!(resume.if_range.as_deref(), Some("\"strong\""));
+    }
+
     #[tokio::test]
     async fn prepare_partial_resume_treats_an_empty_partial_as_fresh() {
         let dir = tempfile::tempdir().expect("tempdir");

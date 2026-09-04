@@ -271,13 +271,31 @@ impl CacheMetadataStore {
             return Arc::clone(entry);
         }
 
-        // Cold path: fetch from xattrs.  If either read errors, surface
-        // a best-effort `Arc` containing whichever fields succeeded for
-        // this request but do not insert — see the "Negative caching
-        // and transient errors" section in the module docs.
-        let etag_res = xattr_helpers::try_read::<ETag>(file, path)
-            .map(|o| o.map(|etag| Arc::from(etag.into_string())));
-        let last_modified_res = xattr_helpers::try_read::<LastModified>(file, path).map(|o| {
+        // Cold path: fetch from xattrs.  One blocking section for both
+        // attributes — reading them through the `tokio::fs::File` target
+        // would demote the worker once per attribute, the same reason
+        // `write_upstream_metadata` batches its three writes.  Batching puts
+        // the section *above* `try_read`'s own support check, so repeat that
+        // check here: on a cache filesystem without xattrs the closure has
+        // nothing to do, and entering it would cost a worker->blocking
+        // transition (and a multi-thread runtime) per cold resolve.
+        let (etag_res, last_modified_res) = if xattr_helpers::xattr_supported() {
+            tokio::task::block_in_place(|| {
+                let file = &xattr_helpers::XattrFile(file);
+                (
+                    xattr_helpers::try_read::<ETag>(file, path),
+                    xattr_helpers::try_read::<LastModified>(file, path),
+                )
+            })
+        } else {
+            (Ok(None), Ok(None))
+        };
+
+        // If either read errors, surface a best-effort `Arc` containing
+        // whichever fields succeeded for this request but do not insert —
+        // see the "Negative caching and transient errors" module docs.
+        let etag_res = etag_res.map(|o| o.map(|etag| Arc::from(etag.into_string())));
+        let last_modified_res = last_modified_res.map(|o| {
             o.map(|lm| {
                 let (raw, time) = lm.into_parts();
                 (Arc::from(raw), time)
@@ -568,6 +586,71 @@ mod tests {
         assert_eq!(entry.etag.as_deref(), Some("\"new\""));
     }
 
+    /// `layout` is part of the key precisely so a flat-pool and a
+    /// structured-pool file of the same name under the same mirror do not
+    /// share one entry (see `CacheEntryKey`'s docs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn entries_of_the_same_debname_do_not_collide_across_layouts() {
+        let store = CacheMetadataStore::new();
+        let pool_key = fixture_key();
+        let flat_key = CacheEntryKey {
+            layout: CacheLayout::Flat,
+            ..fixture_key()
+        };
+        store.set(
+            pool_key.clone(),
+            Arc::new(UpstreamMetadata::from_upstream(
+                Some("\"pool\"".into()),
+                None,
+            )),
+        );
+        store.set(
+            flat_key.clone(),
+            Arc::new(UpstreamMetadata::from_upstream(
+                Some("\"flat\"".into()),
+                None,
+            )),
+        );
+        assert_eq!(store.len(), 2, "the layout discriminates the two entries");
+
+        let (_dir, file, path) = fixture_file().await;
+        assert_eq!(
+            store.resolve(&pool_key, &file, &path).etag.as_deref(),
+            Some("\"pool\"")
+        );
+        assert_eq!(
+            store.resolve(&flat_key, &file, &path).etag.as_deref(),
+            Some("\"flat\"")
+        );
+
+        store.invalidate(&flat_key);
+        assert_eq!(
+            store.resolve(&pool_key, &file, &path).etag.as_deref(),
+            Some("\"pool\""),
+            "invalidating one layout leaves the other entry alone"
+        );
+    }
+
+    /// The `Equivalent` bridge: a borrowed key must hash and compare to the
+    /// owned key its own cold path materialised, or every hot-path lookup
+    /// would miss and re-read the xattrs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_borrowed_key_populates_the_entry_an_owned_key_finds() {
+        let store = CacheMetadataStore::new();
+        let (_dir, file, path) = fixture_file().await;
+        let key = fixture_key();
+
+        let via_ref = store.resolve(&key.as_ref(), &file, &path);
+        assert_eq!(store.len(), 1, "the cold path materialises the owned key");
+
+        let via_owned = store.resolve(&key, &file, &path);
+        assert!(
+            Arc::ptr_eq(&via_ref, &via_owned),
+            "the owned key must hit the entry the borrowed key inserted"
+        );
+        assert_eq!(store.len(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn invalidate_drops_entry() {
         let store = CacheMetadataStore::new();
@@ -582,6 +665,44 @@ mod tests {
         assert_eq!(store.len(), 1);
         store.invalidate(&key);
         assert_eq!(store.len(), 0);
+    }
+
+    /// Invalidation is the only way back to the file as source of truth: a
+    /// published entry shadows the xattrs until it is dropped, which is what
+    /// every site that replaces a cached file without calling
+    /// [`CacheMetadataStore::set`] has to rely on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn invalidate_makes_resolve_re_read_the_xattrs() {
+        let store = CacheMetadataStore::new();
+        let (_dir, file, path) = fixture_file().await;
+        write_etag(&file, &path, "\"on-disk\"");
+        let key = fixture_key();
+
+        store.set(
+            key.clone(),
+            Arc::new(UpstreamMetadata::from_upstream(
+                Some("\"published\"".into()),
+                None,
+            )),
+        );
+        assert_eq!(
+            store.resolve(&key, &file, &path).etag.as_deref(),
+            Some("\"published\""),
+            "a published entry shadows the file's own xattrs"
+        );
+
+        store.invalidate(&key);
+        let reread = store.resolve(&key, &file, &path);
+        // Skip on filesystems that reject xattr writes (`write_etag` was a
+        // silent no-op there).
+        if reread.etag.is_none() {
+            return;
+        }
+        assert_eq!(
+            reread.etag.as_deref(),
+            Some("\"on-disk\""),
+            "after invalidation the cold path re-reads the file"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

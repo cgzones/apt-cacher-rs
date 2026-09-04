@@ -1,3 +1,17 @@
+//! The cache-size scan: one pass over the whole cache tree producing the byte
+//! and file totals `cache_quota` reconciles its running tally against.
+//!
+//! Runs at startup (awaited before the listener binds, so nothing is in
+//! flight) and after every cleanup cycle.  The traversal itself belongs to
+//! the shared [`Walker`]; this module supplies only the layout knowledge:
+//! what a directory means at each depth ([`Level`]), which subtrees belong to
+//! a *different* mirror row ([`derive_nested_paths`], shared with cleanup so
+//! both agree on where a mirror's tree ends) and which are partial-download
+//! scratch space (`tmp/`), reaped by cleanup rather than tallied here.
+//!
+//! The scan only counts.  Anything the layout does not allow is reported
+//! through `Entry::report_unexpected` and left on disk.
+
 use std::{borrow::Cow, num::NonZero, path::Path};
 
 use hashbrown::HashMap;
@@ -68,13 +82,15 @@ enum Level {
     ByHash,
 }
 
-/// The mirror rows sharing one `{host[:port]}` cache directory, keyed by
-/// that directory's name, plus the resolved host the name came from so the
-/// host-level `flat/` root can be derived once per bucket.
+/// The mirror rows sharing one `{host[:port]}` cache directory, keyed by that
+/// directory's name: the resolved host the name came from (so the host-level
+/// `flat/` root is derived once per bucket) and every row that lives under it.
 struct HostBucket<'a> {
     host: &'a CacheHost,
     port: Option<NonZero<u16>>,
     mirrors: Vec<&'a MirrorEntry>,
+    /// Every row's mirror path, sorted as [`derive_nested_paths`] requires.
+    paths: Vec<&'a str>,
 }
 
 static CACHE_ROOT_WALK: WalkContext = WalkContext {
@@ -120,34 +136,28 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
 
     trace!("Scanning directory `{}`...", cache_path.display());
 
-    // Group mirrors by alias-resolved host directory name once, so each
-    // cache entry is matched via an O(1) HashMap lookup instead of an inner
-    // O(m) scan.  `paths_by_host_dir` shares the same key — every mirror
-    // contributes both its `MirrorEntry` row and its `path` to the per-host
-    // bucket (sorted, as `derive_nested_paths` requires).  Keys are owned
-    // `String`s because the `Cow` from `format_cache_dir` may borrow from
-    // local data (the formatted port).
+    // Group mirrors by alias-resolved host directory name once, so each cache
+    // entry is matched via an O(1) HashMap lookup instead of an inner O(m)
+    // scan, and each row's nested-mirror set costs one sorted-prefix scan of
+    // its own bucket rather than an O(n) scan per directory entry.  Keys are
+    // owned `String`s because the `Cow` from `format_cache_dir` may borrow
+    // from local data (the formatted port).
     let mut mirrors_by_dir: HashMap<String, HostBucket<'_>> = HashMap::with_capacity(mirrors.len());
-    let mut paths_by_host_dir: HashMap<String, Vec<&str>> = HashMap::with_capacity(mirrors.len());
     for mirror in &mirrors {
         let site = mirror.site();
-        let dir_name = site.host.format_cache_dir(site.port).into_owned();
-        paths_by_host_dir
-            .entry(dir_name.clone())
-            .or_default()
-            .push(mirror.path.as_str());
-        mirrors_by_dir
-            .entry(dir_name)
+        let bucket = mirrors_by_dir
+            .entry(site.host.format_cache_dir(site.port).into_owned())
             .or_insert_with(|| HostBucket {
                 host: site.host,
                 port: site.port,
                 mirrors: Vec::new(),
-            })
-            .mirrors
-            .push(mirror);
+                paths: Vec::new(),
+            });
+        bucket.mirrors.push(mirror);
+        bucket.paths.push(mirror.path.as_str());
     }
-    for mirror_paths in paths_by_host_dir.values_mut() {
-        mirror_paths.sort_unstable();
+    for bucket in mirrors_by_dir.values_mut() {
+        bucket.paths.sort_unstable();
     }
 
     let mut totals = ScanTotals::default();
@@ -180,45 +190,32 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
             continue;
         }
 
-        // HashMap lookup needs a UTF-8 key.  A non-UTF-8 entry could never
-        // match a registered mirror dir (mirror hosts are validated as
+        // The HashMap lookup needs a UTF-8 key.  A non-UTF-8 entry could
+        // never match a registered mirror dir (mirror hosts are validated as
         // ASCII), so it is as unrecognized as an unknown host dir.
-        let Some(name_str) = entry.name().to_str() else {
+        let Some(bucket) = entry
+            .name()
+            .to_str()
+            .and_then(|name| mirrors_by_dir.get(name))
+        else {
             entry.report_unexpected(
                 "no registered mirror matches it, so not counting it or its contents towards the cache size",
             );
             continue;
         };
 
-        let Some(bucket) = mirrors_by_dir.get(name_str) else {
-            entry.report_unexpected(
-                "no registered mirror matches it, so not counting it or its contents towards the cache size",
-            );
-            continue;
-        };
-
-        // `name_str` is the alias-resolved host, so any mirror rows
-        // registered via alias names are silently consolidated under
-        // their `main` host directory — no per-row warning needed
-        // since this is the intended layout.
-        //
-        // Per-host mirror paths were precomputed above so each mirror row's
-        // nested-mirror set costs one sorted-prefix scan, not an inner O(n)
-        // scan per directory entry.
-        let host_paths = paths_by_host_dir
-            .get(name_str)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-
-        // The bucket key is the host directory's name, so the walker's entry
-        // and the derived host dir must be the same directory.
+        // The bucket is keyed by the alias-resolved host directory's name, so
+        // mirror rows registered under an alias are silently consolidated
+        // under their `main` host directory — the intended layout, not a
+        // per-row anomaly.  Both sides of the assert derive that name, so the
+        // walker's entry and the bucket must name the same directory.
         debug_assert_eq!(
             entry.path(),
             paths.host_dir(bucket.host, bucket.port),
             "the walked host directory must be the one CachePaths derives for its bucket"
         );
         for mirror in &bucket.mirrors {
-            let nested = derive_nested_paths(&mirror.path, host_paths);
+            let nested = derive_nested_paths(&mirror.path, &bucket.paths);
             let mirror_dir = paths.mirror_dir(mirror.site());
             totals += scan_mirror_dir(&mirror_dir, mirror, &nested).await;
         }
