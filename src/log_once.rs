@@ -1,9 +1,10 @@
-//! Per-call-site once-gates for log flood control: the `*_once` macros, the
-//! gate they share, and the [`Logged`] proof token.
+//! Log-level policy helpers: the per-call-site once-gates for flood control
+//! (the `*_once` macros, the gate they share and the [`Logged`] proof token),
+//! plus [`info_or_warn!`](crate::info_or_warn), which carries no gate at all.
 //!
-//! Each macro plants its own `static` gate, so "once" means once per call
-//! site, not once per process. `docs/logging.md` is the binding policy for
-//! which level each variant carries.
+//! Each `*_once` macro plants its own `static` gate, so "once" means once per
+//! call site, not once per process. `docs/logging.md` is the binding policy
+//! for which level each variant carries.
 
 #[cfg(feature = "splice")]
 use tracing::info;
@@ -26,6 +27,29 @@ pub(crate) fn first_fire(fired: &std::sync::atomic::AtomicBool) -> bool {
         && fired
             .compare_exchange(false, true, Relaxed, Relaxed)
             .is_ok()
+}
+
+/// Emit one message at INFO when `$expected` holds and at WARN otherwise.
+///
+/// For the delivery split `docs/logging.md` mandates: a client that hung up
+/// (or, on the writers whose stall paths surface as `TimedOut`, one that
+/// stalled) is an expected end to a transfer and logs at INFO, while any
+/// other I/O failure is the operator's business. Not gated — these lines are
+/// the per-request narrative, which `docs/logging.md`'s flood-control section
+/// exempts.
+///
+/// Exists so the message is written once: the hand-written form repeats the
+/// whole format string in both arms, where a rewording can silently reach
+/// only one of them.
+#[macro_export]
+macro_rules! info_or_warn {
+    ($expected:expr, $($arg:tt)*) => {{
+        if $expected {
+            ::tracing::info!($($arg)*);
+        } else {
+            ::tracing::warn!($($arg)*);
+        }
+    }};
 }
 
 #[macro_export]

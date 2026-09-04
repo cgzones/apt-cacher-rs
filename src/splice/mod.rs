@@ -58,7 +58,7 @@ use std::{
 
 use ::http::StatusCode;
 use tokio::{io::AsyncWriteExt as _, net::TcpStream};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
@@ -98,8 +98,8 @@ use crate::{
     build_info::APP_VIA,
     cache_metadata::{self, write_upstream_metadata},
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
-    global_cache_quota, global_config, global_verify_throttle, metrics, static_assert,
-    warn_once_or_info, warn_once_or_info_logged,
+    global_cache_quota, global_config, global_verify_throttle, info_or_warn, metrics,
+    static_assert, warn_once_or_info, warn_once_or_info_logged,
 };
 
 use acquire::{
@@ -1371,23 +1371,14 @@ async fn write_body_prefix(
             // rate-check failure and the `http_timeout` write stall (which
             // bumps `HTTP_TIMEOUT_CLIENT_BODY`). Pre-branch it so a slow or
             // stalled client stays `info` like hyper's rate-timeout sibling.
-            if err.kind() == ErrorKind::TimedOut || is_peer_disconnect(&err) {
-                info!(
-                    "splice proxy: failed to write body prefix to client {} for {} from mirror {}; continuing cache-only:  {}",
-                    conn_details.client,
-                    conn_details.debname,
-                    conn_details.mirror,
-                    ErrorReport(&err)
-                );
-            } else {
-                warn!(
-                    "splice proxy: failed to write body prefix to client {} for {} from mirror {}; continuing cache-only:  {}",
-                    conn_details.client,
-                    conn_details.debname,
-                    conn_details.mirror,
-                    ErrorReport(&err)
-                );
-            }
+            info_or_warn!(
+                err.kind() == ErrorKind::TimedOut || is_peer_disconnect(&err),
+                "splice proxy: failed to write body prefix to client {} for {} from mirror {}; continuing cache-only:  {}",
+                conn_details.client,
+                conn_details.debname,
+                conn_details.mirror,
+                ErrorReport(&err)
+            );
             prefix_client_failed = true;
         } else {
             metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);

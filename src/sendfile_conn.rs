@@ -35,7 +35,11 @@ use nix::sys::sendfile::sendfile;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::io::{AsyncWriteExt as _, Interest};
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
+// Only `splice_error_outcome`'s deliberately per-arm-worded sites still warn
+// directly; every same-string delivery split goes through `info_or_warn!`.
+#[cfg(feature = "splice")]
+use tracing::warn;
 
 #[cfg(feature = "hyper")]
 use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
@@ -70,6 +74,7 @@ use crate::{
     },
     http_range::format_http_date,
     humanfmt::HumanFmt,
+    info_or_warn,
     limits::VOLATILE_CACHE_MAX_AGE,
     metrics,
     permitted_host_cache::authorize_cache_access,
@@ -464,17 +469,11 @@ async fn read_request_headers(
 /// INFO, every other I/O error at WARN.  `what` names the response the write
 /// belonged to, e.g. `"304 response"`.
 fn log_client_write_failure(client: ClientInfo, what: &str, err: &std::io::Error) {
-    if is_peer_disconnect(err) {
-        info!(
-            "Failed to write {what} to client {client}; closing the connection:  {}",
-            ErrorReport(err)
-        );
-    } else {
-        warn!(
-            "Failed to write {what} to client {client}; closing the connection:  {}",
-            ErrorReport(err)
-        );
-    }
+    info_or_warn!(
+        is_peer_disconnect(err),
+        "Failed to write {what} to client {client}; closing the connection:  {}",
+        ErrorReport(err)
+    );
 }
 
 /// Best-effort graceful close after writing an error/rejection response on a
@@ -862,17 +861,11 @@ async fn run_connect_tunnel(
         )
         .await
     {
-        if is_peer_disconnect(&err) {
-            info!(
-                "Failed to send tunnel established response to client {client}; tearing down the tunnel:  {}",
-                ErrorReport(&err)
-            );
-        } else {
-            warn!(
-                "Failed to send tunnel established response to client {client}; tearing down the tunnel:  {}",
-                ErrorReport(&err)
-            );
-        }
+        info_or_warn!(
+            is_peer_disconnect(&err),
+            "Failed to send tunnel established response to client {client}; tearing down the tunnel:  {}",
+            ErrorReport(&err)
+        );
         return;
     }
 
@@ -2626,19 +2619,12 @@ async fn serve_unfinished_sendfile(
     )
     .await
     {
-        if is_peer_disconnect(&err) {
-            info!(
-                "Failed to write response headers to joining client {}; closing the connection:  {}",
-                conn_details.client,
-                ErrorReport(&err)
-            );
-        } else {
-            warn!(
-                "Failed to write response headers to joining client {}; closing the connection:  {}",
-                conn_details.client,
-                ErrorReport(&err)
-            );
-        }
+        info_or_warn!(
+            is_peer_disconnect(&err),
+            "Failed to write response headers to joining client {}; closing the connection:  {}",
+            conn_details.client,
+            ErrorReport(&err)
+        );
         return ZeroCopyResult::ClientError;
     }
 
