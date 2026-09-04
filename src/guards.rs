@@ -421,11 +421,20 @@ impl RenameBarrier {
     /// `Aborted` and removes the active-downloads entry. The quota stays
     /// right: the reservation is finalised inside the rename's blocking
     /// closure, which runs to completion regardless of the cancellation.
-    /// The xattr-backed metadata persists on disk regardless, so
-    /// post-flight readers lazy-load `ETag` / `Last-Modified` via
-    /// `cache_metadata::store().resolve(...)` instead of from the in-process
-    /// Arc -- benign for correctness, just slightly slower for the first
-    /// read after cancellation.
+    /// The metadata does *not* take care of itself: on a re-download the
+    /// store still holds the previous version's validators, and `resolve`'s
+    /// hot path answers from that map without ever stat'ing the file -- so
+    /// the daemon would serve a stale `ETag` / `Last-Modified` for the new
+    /// bytes, and honour an `If-None-Match` on the old tag with a 304, until
+    /// the process exits. The entry is therefore dropped the moment the
+    /// rename lands, before that window opens, so the next `resolve`
+    /// lazy-loads the renamed file's own xattrs.
+    ///
+    /// Aborts *before* the rename invalidate nothing: the cached file is
+    /// untouched and its memoized validators still describe it. On a
+    /// filesystem without xattrs the store is their only carrier, so
+    /// invalidating there would lose them for the life of the process
+    /// (`resolve` negatively caches the resulting `(None, None)`).
     ///
     /// `temp_path` is the finished `.partial` / temp file; on success its
     /// guard is defused (the file now lives at `dest_path`), on a checksum
@@ -548,11 +557,36 @@ impl RenameBarrier {
         // old name, so the guard must not try to remove it.
         TempPath::defuse(temp_path);
 
+        // The cached file under `key` is now the new version, but its
+        // metadata is not published until the `set` below. Drop the previous
+        // version's entry here, before the first `.await` past the rename:
+        // if the future is cancelled in that window, `resolve` lazy-loads the
+        // new file's own xattrs instead of answering from the old entry.
+        // Serving no validators is safe; serving the previous version's is
+        // the bug this closes.
+        cache_metadata::store().invalidate(
+            &self
+                .data
+                .as_ref()
+                .expect("every sink consumes the instance")
+                .key
+                .as_ref(),
+        );
+
         // The quota was finalised in the rename step. Take the write lock
         // briefly for the `Verifying -> Finished` status flip.
-        let data = self.data.take().expect("every sink consumes the instance");
-
+        //
+        // `self.data` stays populated across that `.await` so `Drop` really
+        // is the safety net the doc above promises: a future cancelled while
+        // waiting for the lock leaves the entry `Verifying` and unretired
+        // otherwise. It is taken only past the last await, where no
+        // cancellation can turn a `Finished` entry back into an `Aborted`
+        // one.
         let meta_for_status: Option<Arc<UpstreamMetadata>> = {
+            let data = self
+                .data
+                .as_ref()
+                .expect("every sink consumes the instance");
             let mut lock = data.status.write().await;
             let meta = match &*lock {
                 ActiveDownloadStatus::Verifying { path: _, meta } => Some(Arc::clone(meta)),
@@ -564,6 +598,8 @@ impl RenameBarrier {
                         "RenameBarrier::commit reached with non-Verifying status for {} from mirror {}; finishing the download without publishing cache metadata: {:?}",
                         data.key.debname, data.key.mirror, *lock
                     );
+                    // Nothing to publish; the invalidate above already
+                    // dropped the previous version's validators.
                     None
                 }
             };
@@ -574,6 +610,7 @@ impl RenameBarrier {
             meta
         };
 
+        let data = self.data.take().expect("every sink consumes the instance");
         if let Some(meta) = meta_for_status {
             cache_metadata::store().set(data.key.clone(), meta);
         }
@@ -587,9 +624,93 @@ impl RenameBarrier {
 impl Drop for RenameBarrier {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
+            // Reached before the rename only: `commit` takes `data` the
+            // moment the rename lands, so the post-rename window is its
+            // business (it invalidates there) and never this one. The cached
+            // file is therefore untouched and its memoized validators still
+            // describe it -- invalidating here would be wrong, not merely
+            // wasteful: on a filesystem without xattrs the store is their
+            // only carrier, and `resolve` would negatively cache the
+            // resulting `(None, None)` for the life of the process.
             abort_on_drop(&data.status, &data.active_downloads, data.key.as_ref());
         }
         // `data` (and with it any still-held `QuotaReservation`) drops with
         // the struct right after this, reverting the reservation.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::ClientHost, deb_mirror::MirrorKind};
+
+    fn key(debname: &str) -> CacheEntryKey {
+        CacheEntryKey {
+            mirror: crate::deb_mirror::Mirror::new(
+                ClientHost::new(String::from("guards.test")).expect("valid host"),
+                std::num::NonZero::new(80),
+                "/debian".into(),
+                MirrorKind::Structured,
+            ),
+            debname: debname.into(),
+            layout: CacheLayout::StructuredPool,
+        }
+    }
+
+    /// A barrier over a real registry entry, in the state a download
+    /// abandoned *before* the rename leaves behind: the entry is still
+    /// registered and joinable, and `Drop` must retire it.
+    fn abandoned_rename_barrier(key: &CacheEntryKey) -> RenameBarrier {
+        let active_downloads = ActiveDownloads::new();
+        let status = active_downloads.insert_uncapped(key.as_ref());
+        RenameBarrier {
+            data: Some(RenameBarrierData {
+                status,
+                active_downloads,
+                key: key.clone(),
+                resource_kind: ResourceKind::Pool,
+                raw_uri_path: String::from("/debian/pool/main/t/test/test.deb"),
+                // No reservation: the drop path under test never consults it.
+                quota_reservation: None,
+            }),
+        }
+    }
+
+    /// `Drop` is reached only before the rename -- `commit` takes `data` the
+    /// moment the rename lands. The cached file is therefore the one the
+    /// memoized validators already describe, and dropping them would be a
+    /// regression, not a safety measure: on a filesystem without xattrs the
+    /// store is their only carrier and `resolve` negatively caches the
+    /// resulting `(None, None)` for the life of the process, so every
+    /// `If-None-Match` on that file would miss and re-send the whole body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn dropping_a_rename_barrier_keeps_the_cached_validators() {
+        // The store is a process-global installed by `main`; install it here
+        // and tolerate another test in the same process having won the race.
+        match cache_metadata::init() {
+            Ok(()) | Err(_) => {}
+        }
+        let store = cache_metadata::store();
+        // Entry counts, not lookups: a `resolve` would lazy-load the entry
+        // back and hide a removal.
+        let before = store.len();
+
+        let key = key("kept-validators.deb");
+        store.set(
+            key.clone(),
+            Arc::new(UpstreamMetadata::from_upstream(
+                Some(String::from("\"current-version\"")),
+                None,
+            )),
+        );
+        assert_eq!(store.len(), before + 1, "the entry under test is present");
+
+        drop(abandoned_rename_barrier(&key));
+
+        assert_eq!(
+            store.len(),
+            before + 1,
+            "the cached file is unchanged, so its memoized validators must survive"
+        );
     }
 }

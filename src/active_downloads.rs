@@ -581,6 +581,24 @@ impl ActiveDownloads {
     /// origination — the caller answers with the canonical 503.
     #[cfg(feature = "hyper")]
     #[must_use]
+    /// Register `key` and hand back its status handle, skipping the
+    /// `max_upstream_downloads` gate that makes [`Self::insert`] read the
+    /// config globals. Exists so tests elsewhere in the crate can build a
+    /// barrier over a *real* registry entry - `Drop` asserts the entry it
+    /// retires was registered.
+    #[cfg(test)]
+    pub(crate) fn insert_uncapped(
+        &self,
+        key: CacheEntryKeyRef<'_>,
+    ) -> Arc<tokio::sync::RwLock<ActiveDownloadStatus>> {
+        match self.lookup_or_insert(key, None) {
+            LookupResult::Originator { init_tx: _, status }
+            | LookupResult::LateJoiner { status } => Some(status),
+            LookupResult::AtCapacity { max: _ } => None,
+        }
+        .expect("no cap was passed, so origination cannot be refused")
+    }
+
     pub(crate) fn insert(&self, key: CacheEntryKeyRef<'_>) -> InsertOutcome {
         let max = global_config().max_upstream_downloads;
         match self.lookup_or_insert(key, max) {
