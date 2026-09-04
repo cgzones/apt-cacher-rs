@@ -51,6 +51,15 @@ pub(crate) enum Subject {
     },
 }
 
+/// The first error the inner body surfaced, kept for the abort line.
+struct BodyFailure {
+    /// Rendered eagerly: the inner error does not outlive its poll.
+    reason: String,
+    /// [`AccountedBody::peer_disconnect_check`]'s verdict, which demotes the
+    /// abort line to INFO.
+    peer_disconnect: bool,
+}
+
 #[pin_project(PinnedDrop)]
 pub(crate) struct AccountedBody<B: Body> {
     #[pin]
@@ -58,10 +67,9 @@ pub(crate) struct AccountedBody<B: Body> {
     subject: Option<Subject>,
     transferred: u64,
     end_of_stream: bool,
-    /// Stringified error and peer-disconnect flag of the first error the
-    /// inner body surfaced. Sticky: vetoes the `SERVED_*` credit even if a
-    /// later poll reaches `Ready(None)`.
-    error: Option<(String, bool)>,
+    /// Sticky: vetoes the `SERVED_*` credit even if a later poll reaches
+    /// `Ready(None)`.
+    error: Option<BodyFailure>,
     peer_disconnect_check: fn(&B::Error) -> bool,
     start: PreciseInstant,
     _counter: ClientDownload,
@@ -117,8 +125,10 @@ where
             }
             Poll::Ready(Some(Err(err))) => {
                 if this.error.is_none() {
-                    let is_disconnect = (this.peer_disconnect_check)(err);
-                    *this.error = Some((err.to_string(), is_disconnect));
+                    *this.error = Some(BodyFailure {
+                        reason: err.to_string(),
+                        peer_disconnect: (this.peer_disconnect_check)(err),
+                    });
                 }
             }
             Poll::Ready(None) => *this.end_of_stream = true,
@@ -165,9 +175,9 @@ impl<B: Body> PinnedDrop for AccountedBody<B> {
                 partial,
             } => {
                 mechanism.bytes_served().increment_by(transferred);
-                let abort = error.as_ref().map(|(reason, peer_disconnect)| AbortCause {
-                    reason,
-                    peer_disconnect: *peer_disconnect,
+                let abort = error.as_ref().map(|failure| AbortCause {
+                    reason: &failure.reason,
+                    peer_disconnect: failure.peer_disconnect,
                 });
                 // hyper stops polling once the promised Content-Length is
                 // out, so `end_of_stream` is not a reliable signal here; the

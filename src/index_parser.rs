@@ -87,7 +87,7 @@ fn strip_leading_dot_segments(mut s: &str) -> &str {
 /// `true` iff `s` is a safe relative path: non-empty, no leading `/`, no
 /// backslash, no ASCII control character (`< 0x20`, plus `0x7f` DEL), and
 /// every `/`-separated segment is non-empty and not `.` or `..`.
-pub(crate) fn is_safe_filename_relpath(s: &str) -> bool {
+fn is_safe_filename_relpath(s: &str) -> bool {
     if s.is_empty() || s.starts_with('/') {
         return false;
     }
@@ -188,8 +188,8 @@ pub(crate) struct Stanza {
     want_sha512: bool,
     /// Which index these stanzas came from (`<host>/<mirror_path>/<file>`),
     /// used only to make a rejected `Filename:` value actionable. Set via
-    /// [`Self::with_source`]; empty in tests.
-    source: String,
+    /// [`Self::with_source`]; `None` in tests.
+    source: Option<String>,
 }
 
 impl Stanza {
@@ -199,7 +199,7 @@ impl Stanza {
             sha256: None,
             sha512: None,
             want_sha512: true,
-            source: String::new(),
+            source: None,
         }
     }
 
@@ -210,7 +210,7 @@ impl Stanza {
             sha256: None,
             sha512: None,
             want_sha512: false,
-            source: String::new(),
+            source: None,
         }
     }
 
@@ -218,16 +218,12 @@ impl Stanza {
     /// at the mirror that published it.
     #[must_use]
     pub(crate) fn with_source(mut self, source: String) -> Self {
-        self.source = source;
+        self.source = Some(source);
         self
     }
 
     fn source_label(&self) -> &str {
-        if self.source.is_empty() {
-            "<unknown index>"
-        } else {
-            &self.source
-        }
+        self.source.as_deref().unwrap_or("<unknown index>")
     }
 
     pub(crate) fn reset(&mut self) {
@@ -366,7 +362,7 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
                     return Ok(self.complete());
                 }
                 Ok(CappedLine::Skipped) => {}
-                Ok(CappedLine::Line { bytes: _ }) => {
+                Ok(CappedLine::Line) => {
                     if !self.line.trim().is_empty() {
                         self.stanza.ingest(&self.line);
                     } else if self.stanza.filename.is_some() {
@@ -736,6 +732,71 @@ mod tests {
         );
         let got = collect_stanzas(input.as_bytes(), Stanza::new()).await;
         assert_eq!(got, vec![("pool/a.deb".to_owned(), Some(HashAlgo::Sha256))]);
+    }
+
+    /// Debian indices are CRLF-tolerant in the wild; the trailing `\r` must
+    /// neither end up in the `Filename:` value nor stop a blank line from
+    /// flushing the stanza.
+    #[tokio::test]
+    async fn stanza_stream_handles_crlf_line_endings() {
+        let input = format!(
+            "Package: a\r\nFilename: pool/a.deb\r\nSHA256: {}\r\n\r\n\
+             Package: b\r\nFilename: pool/b.deb\r\n",
+            hex_encode(&[0x11; 32]),
+        );
+        let got = collect_stanzas(input.as_bytes(), Stanza::new()).await;
+        assert_eq!(
+            got,
+            vec![
+                ("pool/a.deb".to_owned(), Some(HashAlgo::Sha256)),
+                ("pool/b.deb".to_owned(), None),
+            ]
+        );
+    }
+
+    /// A line of only whitespace separates stanzas just like an empty one.
+    #[tokio::test]
+    async fn stanza_stream_flushes_on_a_whitespace_only_line() {
+        let input = b"Filename: pool/a.deb\n \t \nFilename: pool/b.deb\n";
+        let got = collect_stanzas(&input[..], Stanza::new()).await;
+        assert_eq!(
+            got,
+            vec![
+                ("pool/a.deb".to_owned(), None),
+                ("pool/b.deb".to_owned(), None),
+            ]
+        );
+    }
+
+    /// Repeated fields keep the first value: a later `Filename:`/`SHA256:`
+    /// line cannot re-point or re-digest a stanza that already has one.
+    #[tokio::test]
+    async fn stanza_stream_keeps_the_first_value_of_a_repeated_field() {
+        let input = format!(
+            "Filename: pool/first.deb\nSHA256: {}\nFilename: pool/second.deb\nSHA256: {}\n\n",
+            hex_encode(&[0x11; 32]),
+            hex_encode(&[0x22; 32]),
+        );
+        let mut stream = StanzaStream::new(input.as_bytes(), Stanza::new());
+        let stanza = stream.next().await.expect("readable").expect("one stanza");
+        assert_eq!(stanza.filename.as_deref(), Some("pool/first.deb"));
+        assert_eq!(
+            stanza.chosen(),
+            Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
+        );
+    }
+
+    /// A stanza whose `Filename:` fails the traversal gate has no usable
+    /// name, so it is dropped whole - it must not inherit the next stanza's
+    /// name or leak its digest into it.
+    #[tokio::test]
+    async fn stanza_stream_drops_a_stanza_with_an_unsafe_filename() {
+        let input = format!(
+            "Filename: ../../etc/passwd\nSHA256: {}\n\nFilename: pool/ok.deb\n\n",
+            hex_encode(&[0x33; 32]),
+        );
+        let got = collect_stanzas(input.as_bytes(), Stanza::new()).await;
+        assert_eq!(got, vec![("pool/ok.deb".to_owned(), None)]);
     }
 
     #[tokio::test]

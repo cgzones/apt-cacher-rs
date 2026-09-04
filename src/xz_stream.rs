@@ -27,7 +27,7 @@ use crate::limits::MAX_XZ_DICT_SIZE;
 /// of memory.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
-/// Async wrapper over a blocking `lzma_rust2::XzReader` decode.
+/// Async wrapper over a blocking [`XzStream`] decode.
 ///
 /// EOF on the inner pipe triggers a poll of `tail` to surface any terminal
 /// `io::Error` the decoder produced; a clean decode reports the EOF verbatim.
@@ -85,9 +85,8 @@ fn xz_mem_limit_kb() -> u32 {
     u32::try_from(dict_kib).expect("64 MiB in KiB fits u32")
 }
 
-/// Pump `input` through a memory-limited `XzStream` into `output` until the
-/// stream ends.  Multi-stream xz files are accepted (matches the `xz` CLI
-/// default and what `async_compression`'s `XzDecoder` did before).
+/// Pump `input` through a memory-limited [`XzStream`] into `output` until the
+/// stream ends.
 fn decode_stream(input: &mut impl io::Read, output: &mut impl io::Write) -> io::Result<()> {
     let mut stream =
         XzStream::new_mem_limit(/* allow_multiple_streams = */ true, xz_mem_limit_kb());

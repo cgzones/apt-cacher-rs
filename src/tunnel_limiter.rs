@@ -37,6 +37,7 @@ pub(crate) struct ActiveTunnelGuard {
 }
 
 impl ActiveTunnelGuard {
+    #[must_use]
     pub(crate) fn new() -> Self {
         let current = ACTIVE_TUNNELS.fetch_add(1, Ordering::Relaxed) + 1;
         metrics::CONNECT_TUNNEL_ACTIVE_PEAK.update(current as u64);
@@ -79,5 +80,59 @@ impl Drop for TunnelGuard {
                 entry.remove();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nonzero;
+
+    // `TUNNEL_CONNECTIONS` is process-wide, so every test below uses an IP
+    // address no other test touches.
+
+    #[test]
+    fn slots_are_capped_per_ip_and_released_on_drop() {
+        let ip: IpAddr = "192.0.2.11".parse().expect("test address");
+
+        let first = try_acquire(ip, nonzero!(2)).expect("first slot");
+        let second = try_acquire(ip, nonzero!(2)).expect("second slot");
+        assert!(
+            try_acquire(ip, nonzero!(2)).is_none(),
+            "the cap must refuse a third tunnel"
+        );
+
+        drop(second);
+        let third = try_acquire(ip, nonzero!(2)).expect("a released slot is handed out again");
+
+        drop(first);
+        drop(third);
+        let still_tracked = TUNNEL_CONNECTIONS.lock().contains_key(&ip);
+        assert!(
+            !still_tracked,
+            "the last guard's drop must remove the map entry"
+        );
+    }
+
+    #[test]
+    fn one_ip_at_its_cap_does_not_block_another() {
+        let busy: IpAddr = "192.0.2.12".parse().expect("test address");
+        let other: IpAddr = "192.0.2.13".parse().expect("test address");
+
+        let held = try_acquire(busy, nonzero!(1)).expect("first slot");
+        assert!(try_acquire(busy, nonzero!(1)).is_none(), "cap reached");
+        let unrelated = try_acquire(other, nonzero!(1)).expect("a different IP is unaffected");
+
+        drop(held);
+        drop(unrelated);
+    }
+
+    #[test]
+    fn the_active_count_follows_the_guard() {
+        let before = active_tunnels();
+        let guard = ActiveTunnelGuard::new();
+        assert_eq!(active_tunnels(), before + 1);
+        drop(guard);
+        assert_eq!(active_tunnels(), before);
     }
 }

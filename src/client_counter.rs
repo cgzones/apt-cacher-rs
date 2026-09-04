@@ -29,7 +29,7 @@ const MIN_DERIVED_MAX_CONNECTIONS: NonZero<usize> = NonZero::new(64).expect("non
 /// Pure so the formula is unit-testable; [`default_max_connections`] reads
 /// the live limit.
 #[must_use]
-pub(crate) fn derive_max_connections(soft_limit: u64) -> NonZero<usize> {
+fn derive_max_connections(soft_limit: u64) -> NonZero<usize> {
     let derived = usize::try_from(soft_limit / 4 * 3).unwrap_or(usize::MAX);
     NonZero::new(derived).map_or(MIN_DERIVED_MAX_CONNECTIONS, |n| {
         n.max(MIN_DERIVED_MAX_CONNECTIONS)
@@ -139,6 +139,9 @@ pub(crate) struct ClientDownload {
 }
 
 impl ClientDownload {
+    /// Count an active client download for the lifetime of the returned
+    /// guard; dropping it right away would leave the counter untouched.
+    #[must_use]
     pub(crate) fn new() -> Self {
         let current = CLIENT_DOWNLOADS.fetch_add(1, Ordering::Relaxed) + 1;
         metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.update(current as u64);
@@ -155,6 +158,48 @@ impl Drop for ClientDownload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nonzero;
+
+    #[test]
+    fn per_ip_cap_refuses_and_releases() {
+        // `CONNECTIONS_PER_IP` is process-wide: use an address no other test
+        // touches, and compare the global count against its starting value.
+        let ip: IpAddr = "192.0.2.21".parse().expect("test address");
+        let before = connected_clients();
+
+        let admitted = ClientCounter::try_new(ip, Some(nonzero!(1)), None).expect("first admitted");
+        assert_eq!(connected_clients(), before + 1);
+        assert_eq!(
+            ClientCounter::try_new(ip, Some(nonzero!(1)), None).err(),
+            Some(ConnectionCap::PerIp(nonzero!(1))),
+        );
+        assert_eq!(
+            connected_clients(),
+            before + 1,
+            "a refused connection must not keep its global slot"
+        );
+
+        drop(admitted);
+        let again = ClientCounter::try_new(ip, Some(nonzero!(1)), None).expect("slot released");
+        drop(again);
+        assert_eq!(connected_clients(), before);
+    }
+
+    #[test]
+    fn global_cap_refuses_the_connection_past_the_limit() {
+        let ip: IpAddr = "192.0.2.22".parse().expect("test address");
+        let before = connected_clients();
+        let max = NonZero::new(before + 1).expect("at least one slot");
+
+        let admitted = ClientCounter::try_new(ip, None, Some(max)).expect("under the cap");
+        assert_eq!(
+            ClientCounter::try_new(ip, None, Some(max)).err(),
+            Some(ConnectionCap::Global(max)),
+        );
+
+        drop(admitted);
+        assert_eq!(connected_clients(), before);
+    }
 
     #[test]
     fn derived_cap_leaves_a_quarter_of_the_fd_limit() {

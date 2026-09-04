@@ -143,10 +143,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
 pub(crate) enum CappedLine {
     /// End of stream reached with no data read.
     Eof,
-    /// A line was read and appended to the caller's buffer; `bytes` includes
-    /// any trailing newline.
-    #[cfg_attr(not(test), expect(unused, reason = "might be useful in the future"))]
-    Line { bytes: usize },
+    /// A line (including any trailing newline) was appended to the caller's
+    /// buffer.
+    Line,
     /// A line longer than `max_len` was drained (its trailing newline, if
     /// any, was consumed) without appending anything to the buffer. The
     /// `Packages` parser uses this to skip fields it does not care about
@@ -221,9 +220,7 @@ where
         )
     })?;
     buf.push_str(text);
-    Ok(CappedLine::Line {
-        bytes: line_buf.len(),
-    })
+    Ok(CappedLine::Line)
 }
 
 /// Compression of a `Packages` file.
@@ -436,6 +433,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn limited_reader_undoes_the_fill_on_overrun() {
+        // tokio's `read_to_end` asserts that an `Err` reports zero bytes
+        // read, so the overrun must roll the fill back.
+        let data = [7u8; 150];
+        let mut reader = LimitedReader::new(&data[..], nonzero!(100));
+        let mut storage = [0u8; 150];
+        let mut buf = ReadBuf::new(&mut storage);
+        let polled = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read(cx, &mut buf)).await;
+        let err = polled.expect_err("150 bytes exceed the 100-byte limit");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            buf.filled().is_empty(),
+            "the caller must see zero bytes read alongside the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_appends_and_keeps_blank_lines() {
+        let input = b"first\n\nsecond\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let mut buf = String::from("kept: ");
+        let mut line_buf = Vec::new();
+
+        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+            .await
+            .expect("ok");
+        assert!(matches!(result, CappedLine::Line));
+        assert_eq!(buf, "kept: first\n", "the line is appended, not assigned");
+
+        buf.clear();
+        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+            .await
+            .expect("ok");
+        // `StanzaStream` flushes its stanza on a blank line, so a blank line
+        // must arrive as a `Line` carrying "\n" - never as `Eof`.
+        assert!(matches!(result, CappedLine::Line));
+        assert_eq!(buf, "\n");
+    }
+
+    #[tokio::test]
     async fn read_line_capped_reads_short_line() {
         let input = b"short line\nnext";
         let mut reader = tokio::io::BufReader::new(&input[..]);
@@ -444,7 +481,7 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
             .await
             .expect("ok");
-        assert!(matches!(result, CappedLine::Line { bytes: 11 }));
+        assert!(matches!(result, CappedLine::Line));
         assert_eq!(buf, "short line\n");
     }
 
@@ -467,7 +504,7 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
             .await
             .expect("follow-on read");
-        assert!(matches!(result, CappedLine::Line { bytes: 5 }));
+        assert!(matches!(result, CappedLine::Line));
         assert_eq!(buf, "next\n");
     }
 
@@ -513,7 +550,7 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 5)
             .await
             .expect("exact limit must be accepted");
-        assert!(matches!(result, CappedLine::Line { bytes: 5 }));
+        assert!(matches!(result, CappedLine::Line));
         assert_eq!(buf, "abcd\n");
     }
 
@@ -538,7 +575,7 @@ mod tests {
         let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
             .await
             .expect("ok");
-        assert!(matches!(result, CappedLine::Line { bytes: 10 }));
+        assert!(matches!(result, CappedLine::Line));
         assert_eq!(buf, "no newline");
     }
 

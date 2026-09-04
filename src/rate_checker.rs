@@ -160,3 +160,99 @@ pub(crate) enum RateCheckDirection {
     Upstream,
     Client,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RateCheckDirection, RateChecker};
+    use crate::nonzero;
+
+    #[test]
+    fn rate_checker_triggers_when_slow() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Simulate 1 byte per second for 3 seconds.
+        // Use 1050ms to ensure coarsetime registers a full second.
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(1050));
+            rc.add(1);
+        }
+
+        // Buffer should now be full with 3 bytes over 3s = 1 B/s < 100 B/s.
+        let fail = rc.check_fail(RateCheckDirection::Client);
+        assert!(fail.is_some(), "rate check should fail for slow transfer");
+        let ir = fail.unwrap();
+        assert_eq!(ir.transferred, 3);
+        assert_eq!(ir.min_rate, nonzero!(100));
+    }
+
+    #[test]
+    fn rate_checker_passes_when_fast() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Simulate 500 bytes per second for 3 seconds.
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(1050));
+            rc.add(500);
+        }
+
+        // ~1500 bytes over 3s = 500 B/s > 100 B/s.
+        assert!(
+            rc.check_fail(RateCheckDirection::Client).is_none(),
+            "rate check should pass for fast transfer"
+        );
+    }
+
+    #[test]
+    fn rate_checker_not_full_yet() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Only 1 second elapsed — buffer not full.
+        std::thread::sleep(std::time::Duration::from_millis(1050));
+        rc.add(1);
+
+        assert!(
+            rc.check_fail(RateCheckDirection::Client).is_none(),
+            "should not fail before buffer is full"
+        );
+    }
+
+    #[test]
+    fn rate_checker_fills_zeros_for_gaps() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // Sleep slightly over 3 seconds to ensure at least 3 elapsed seconds
+        // are seen by coarsetime (which has ~1ms resolution but rounding can
+        // lose a tick).
+        std::thread::sleep(std::time::Duration::from_millis(3100));
+        rc.add(1);
+
+        // Buffer should be [0, 0, 1] — full with 1 byte over 3s = 0 B/s < 100 B/s.
+        let fail = rc.check_fail(RateCheckDirection::Client);
+        assert!(fail.is_some(), "rate check should fail after gap");
+    }
+
+    /// The window is "full" as soon as it holds `timeframe` samples, and the
+    /// sub-second path folds into the newest sample rather than pushing a
+    /// second one - so a one-second window is armed by the first `add`.
+    #[test]
+    fn one_second_window_is_armed_by_the_first_sample() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
+        assert!(
+            rc.check_fail(RateCheckDirection::Client).is_none(),
+            "an empty window cannot judge a rate"
+        );
+
+        rc.add(1);
+        let fail = rc
+            .check_fail(RateCheckDirection::Client)
+            .expect("1 B/s is below the 1000 B/s minimum");
+        assert_eq!(fail.transferred, 1);
+        assert_eq!(fail.timeframe, nonzero!(1));
+
+        rc.add(5000);
+        assert!(
+            rc.check_fail(RateCheckDirection::Client).is_none(),
+            "the second sample folds into the same window and clears the breach"
+        );
+    }
+}

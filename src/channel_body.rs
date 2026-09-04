@@ -1,3 +1,13 @@
+//! [`ChannelBody`], the hyper body a late joiner is served from while another
+//! request is still downloading the file: it forwards the frames the streaming
+//! task pushes into an mpsc channel, and enforces the announced
+//! `Content-Length` as defence in depth.
+//!
+//! It is also the canonical shape for the `SERVED_*` credit (see
+//! `metrics.rs`): a terminal state - the announced total delivered, or a clean
+//! channel close when the length is unknown - AND a sticky `errored` flag that
+//! vetoes the credit and makes the terminal `Err` idempotent.
+
 use http_body::{Body, Frame, SizeHint};
 
 use crate::{error::MirrorDownloadRate, metrics, upstream_head::ContentLength};
@@ -219,8 +229,8 @@ mod tests {
         assert!(next.is_none(), "expected Ready(None) on subsequent polls");
     }
 
-    /// Over-announce within a single frame still routes through the
-    /// `try_consume` arm.
+    /// A single frame carrying more than the announced total is caught by the
+    /// same check, before any of its bytes are handed out.
     #[tokio::test]
     async fn exact_over_announce_within_frame_is_caught() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -250,8 +260,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut body = ChannelBody::new(rx, ContentLength::Exact(nz(3)));
 
-        // Over-announce within a single frame: sets `errored` while
-        // `delivered_announced` and `channel_closed` both stay `false`.
+        // Over-announce within a single frame: sets `errored` while neither
+        // the announced total nor a channel close is reached.
         tx.send(Ok(bytes::Bytes::from_static(b"abcd")))
             .await
             .expect("send");
@@ -271,9 +281,8 @@ mod tests {
     }
 
     /// When the announced total is reached but the channel has not yet
-    /// closed, `delivered_announced` must be set so `is_end_stream()`
-    /// returns `true` and the Drop-time metric increment fires -
-    /// preserving the parent/subset invariant.
+    /// closed, `is_end_stream()` must already return `true` and the Drop-time
+    /// metric increment must fire - preserving the parent/subset invariant.
     #[tokio::test]
     async fn exact_pending_after_total_marks_end_of_stream() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -286,14 +295,15 @@ mod tests {
 
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let poll = Pin::new(&mut body).poll_frame(&mut cx);
-        let Poll::Ready(Some(Ok(frame))) = poll else {
-            unreachable!("expected Ready(Some(Ok(_))) for the last announced frame");
-        };
+        let frame = match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => Some(frame),
+            Poll::Ready(Some(Err(_)) | None) | Poll::Pending => None,
+        }
+        .expect("Ready(Some(Ok(_))) for the last announced frame");
         assert_eq!(frame.into_data().expect("data frame").as_ref(), b"abcd");
         assert!(
             body.is_end_stream(),
-            "delivered_announced must be set on Exact(0)"
+            "the announced total is delivered, so the body is terminal"
         );
 
         drop(tx);
