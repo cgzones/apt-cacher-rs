@@ -913,8 +913,8 @@ fn serve_cached_file_response(
     content_type: &'static str,
     body: ProxyCacheBody,
 ) -> Response<ProxyCacheBody> {
+    let http_status = params.http_status();
     let ServeParams {
-        http_status,
         content_start: _,
         content_length,
         content_range,

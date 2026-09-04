@@ -128,15 +128,15 @@ impl<'a> RangeRequestHeaders<'a> {
     }
 }
 
-/// Status and byte-range parameters for serving a cached representation.
-///
-/// "Partial" (a 206 delivery) is not stored separately: it is exactly
-/// `content_range.is_some()` (equivalently `http_status == 206`), so
-/// [`Self::is_partial`] keeps the flag from drifting out of sync with the
-/// Content-Range.
+/// Byte-range parameters for serving a cached representation.  A present
+/// `Content-Range` *is* the 206-ness of the delivery, so the status and the
+/// partial flag are derived rather than stored alongside it.
 #[derive(Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the fields are named after the response headers they render into"
+)]
 pub(crate) struct ServeParams {
-    pub(crate) http_status: StatusCode,
     pub(crate) content_start: u64,
     pub(crate) content_length: u64,
     pub(crate) content_range: Option<String>,
@@ -147,7 +147,6 @@ impl ServeParams {
     #[must_use]
     fn full(file_size: u64) -> Self {
         Self {
-            http_status: StatusCode::OK,
             content_start: 0,
             content_length: file_size,
             content_range: None,
@@ -158,6 +157,15 @@ impl ServeParams {
     #[must_use]
     pub(crate) fn is_partial(&self) -> bool {
         self.content_range.is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn http_status(&self) -> StatusCode {
+        if self.is_partial() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        }
     }
 }
 
@@ -277,7 +285,6 @@ impl CacheInfo {
             ) {
                 ParsedRange::Satisfiable(content_range, start, content_length) => {
                     return ServePlan::Serve(ServeParams {
-                        http_status: StatusCode::PARTIAL_CONTENT,
                         content_start: start,
                         content_length,
                         content_range: Some(content_range),
@@ -323,7 +330,6 @@ mod tests {
 
     fn full() -> ServePlan {
         ServePlan::Serve(ServeParams {
-            http_status: StatusCode::OK,
             content_start: 0,
             content_length: SIZE,
             content_range: None,
@@ -390,7 +396,7 @@ mod tests {
         let ServePlan::Serve(params) = plan else {
             unreachable!("expected Serve, got {plan:?}")
         };
-        assert_eq!(params.http_status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(params.http_status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(params.content_start, 100);
         assert_eq!(params.content_length, 100);
         assert_eq!(params.content_range.as_deref(), Some("bytes 100-199/1000"));
@@ -430,7 +436,6 @@ mod tests {
             matches!(
                 &plan,
                 ServePlan::Serve(ServeParams {
-                    http_status: StatusCode::PARTIAL_CONTENT,
                     content_start: 500,
                     content_length: 500,
                     content_range: Some(_),
@@ -465,7 +470,7 @@ mod tests {
         assert!(matches!(
             info(None).plan(SIZE, &exact, &local_client()),
             ServePlan::Serve(ServeParams {
-                http_status: StatusCode::PARTIAL_CONTENT,
+                content_range: Some(_),
                 ..
             })
         ));

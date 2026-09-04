@@ -1588,8 +1588,8 @@ pub(crate) async fn serve_file_via_sendfile(
         Err(result) => return result,
     };
     let partial = params.is_partial();
+    let http_status = params.http_status();
     let ServeParams {
-        http_status,
         content_start,
         content_length,
         content_range,
@@ -2630,8 +2630,8 @@ async fn serve_unfinished_sendfile(
         Err(result) => return result.into(),
     };
     let partial = params.is_partial();
+    let http_status = params.http_status();
     let ServeParams {
-        http_status,
         content_start,
         content_length,
         content_range,
