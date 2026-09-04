@@ -70,54 +70,42 @@ impl<'a> RangeRequestHeaders<'a> {
     #[cfg(feature = "hyper")]
     #[must_use]
     pub(crate) fn from_http(headers: &'a HeaderMap, client: &ClientInfo) -> Self {
-        use http::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE};
+        use http::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE, ToStrError};
 
         use crate::warn_once;
 
-        let if_none_match = match headers.get(IF_NONE_MATCH) {
-            Some(v) => {
-                if let Ok(s) = v.to_str() {
-                    Some(s)
-                } else {
-                    warn_once!(
-                        "Client {client} sent an invalid If-None-Match header {v:?}; ignoring the precondition"
-                    );
-                    None
-                }
+        let if_none_match = headers.get(IF_NONE_MATCH).and_then(|v| match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_err @ ToStrError { .. }) => {
+                warn_once!(
+                    "Client {client} sent an invalid If-None-Match header {v:?}; ignoring the precondition"
+                );
+                None
             }
-            None => None,
-        };
-        let if_modified_since = match headers.get(IF_MODIFIED_SINCE) {
-            Some(v) => {
-                if let Ok(s) = v.to_str() {
-                    Some(s)
-                } else {
-                    warn_once!(
-                        "Client {client} sent an invalid If-Modified-Since header {v:?}; ignoring the precondition"
-                    );
-                    None
-                }
+        });
+        let if_modified_since = headers.get(IF_MODIFIED_SINCE).and_then(|v| match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_err @ ToStrError { .. }) => {
+                warn_once!(
+                    "Client {client} sent an invalid If-Modified-Since header {v:?}; ignoring the precondition"
+                );
+                None
             }
-            None => None,
-        };
+        });
         let range = headers.get(RANGE).and_then(|v| v.to_str().ok());
         // A dropped If-Range is worse than a dropped Range: the parser
         // reads `None` as "no precondition sent" and answers an
         // unconditional 206, so a resuming client can staple bytes onto
         // a different revision.
-        let if_range = match range.and_then(|_| headers.get(IF_RANGE)) {
-            Some(v) => {
-                if let Ok(s) = v.to_str() {
-                    Some(s)
-                } else {
-                    warn_once!(
-                        "Client {client} sent an invalid If-Range header {v:?}; serving the range unconditionally"
-                    );
-                    None
-                }
+        let if_range = range.and_then(|_| headers.get(IF_RANGE)).and_then(|v| match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_err @ ToStrError { .. }) => {
+                warn_once!(
+                    "Client {client} sent an invalid If-Range header {v:?}; serving the range unconditionally"
+                );
+                None
             }
-            None => None,
-        };
+        });
 
         Self {
             range,
@@ -458,6 +446,101 @@ mod tests {
         );
         // Without a stored ETag no strong comparison can succeed either.
         assert_eq!(info(None).plan(SIZE, &headers, &local_client()), full());
+    }
+
+    #[test]
+    fn decide_serve_304_precedence_and_parse_failures() {
+        let tagged = info(Some(ETAG));
+
+        // An unparsable If-Modified-Since is treated as absent, not as a
+        // passing precondition.
+        assert!(!tagged.decide_serve_304(None, Some("garbage")));
+        // "not modified since" is `stored <= sent`, so a client timestamp
+        // newer than the stored validator still yields 304.
+        assert!(tagged.decide_serve_304(None, Some("Mon, 07 Nov 1994 08:49:37 GMT")));
+        // An older one does not.
+        assert!(!tagged.decide_serve_304(None, Some("Sat, 05 Nov 1994 08:49:37 GMT")));
+        // A present but non-matching If-None-Match ends the evaluation: the
+        // date is never consulted (RFC 9110 section 13.1.3).
+        assert!(!tagged.decide_serve_304(Some("\"other\""), Some(LAST_MODIFIED)));
+        // The `*` wildcard matches whenever an ETag is stored -- but *only*
+        // then.  RFC 9110 section 13.1.2 makes it match any stored
+        // representation; a cached file without an ETag xattr therefore gets
+        // a 200 where the RFC allows a 304.  Known deviation, harmless for
+        // APT clients, which do not send `If-None-Match: *`.
+        assert!(tagged.decide_serve_304(Some("*"), None));
+        assert!(!info(None).decide_serve_304(Some("*"), None));
+    }
+
+    #[cfg(feature = "sendfile")]
+    #[test]
+    fn extract_reads_all_four_headers_case_insensitively() {
+        let headers = [
+            httparse::Header {
+                name: "range",
+                value: b"bytes=0-9",
+            },
+            httparse::Header {
+                name: "If-Range",
+                value: ETAG.as_bytes(),
+            },
+            httparse::Header {
+                name: "IF-NONE-MATCH",
+                value: b"*",
+            },
+            httparse::Header {
+                name: "if-modified-since",
+                value: LAST_MODIFIED.as_bytes(),
+            },
+        ];
+        let extracted = RangeRequestHeaders::extract(&headers);
+        assert_eq!(extracted.range, Some("bytes=0-9"));
+        assert_eq!(extracted.if_range, Some(ETAG));
+        assert_eq!(extracted.if_none_match, Some("*"));
+        assert_eq!(extracted.if_modified_since, Some(LAST_MODIFIED));
+    }
+
+    /// A non-UTF-8 precondition must be dropped, not silently mistaken for a
+    /// value: dropping turns the request unconditional, which is safe, while
+    /// misreading it could answer a stale 304 or a mis-stitched 206.
+    #[cfg(feature = "hyper")]
+    #[test]
+    fn from_http_drops_non_utf8_headers() {
+        use http::HeaderValue;
+        use http::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE};
+
+        let invalid = HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid header value");
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, invalid.clone());
+        headers.insert(IF_MODIFIED_SINCE, invalid.clone());
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-9"));
+        headers.insert(IF_RANGE, invalid);
+
+        let extracted = RangeRequestHeaders::from_http(&headers, &local_client());
+        assert_eq!(extracted.range, Some("bytes=0-9"));
+        assert_eq!(extracted.if_range, None);
+        assert_eq!(extracted.if_none_match, None);
+        assert_eq!(extracted.if_modified_since, None);
+    }
+
+    /// `If-Range` is meaningless without a `Range`, so it is never read then
+    /// -- and a request carrying only `If-Range` gets the full entity.
+    #[cfg(feature = "hyper")]
+    #[test]
+    fn from_http_ignores_if_range_without_range() {
+        use http::HeaderValue;
+        use http::header::IF_RANGE;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_RANGE, HeaderValue::from_static(ETAG));
+
+        let extracted = RangeRequestHeaders::from_http(&headers, &local_client());
+        assert_eq!(extracted.range, None);
+        assert_eq!(extracted.if_range, None);
+        assert_eq!(
+            info(Some(ETAG)).plan(SIZE, &extracted, &local_client()),
+            full()
+        );
     }
 
     #[test]

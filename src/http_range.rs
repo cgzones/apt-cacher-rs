@@ -1,6 +1,9 @@
 use std::cmp::min;
+use std::num::NonZero;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, SystemTimeError};
 
+use parking_lot::RwLock;
 use time::format_description::FormatItem;
 use time::format_description::well_known::Rfc2822;
 use time::macros::format_description;
@@ -19,10 +22,11 @@ const HTTP_DATE_FORMAT: &[FormatItem<'_>] = format_description!(
 /// Unix epoch, so this is the natural precision for `Last-Modified`, `If-Range`,
 /// `If-Modified-Since`, and the `Date` header.
 ///
-/// All constructors clamp the stored value to [`Self::MAX_SECS`] (i.e. `i64::MAX`),
-/// so conversion to `i64` — required by `OffsetDateTime::from_unix_timestamp` — is
-/// guaranteed to be lossless. `i64::MAX` seconds is ~292 billion years, so this cap
-/// is not a practical limitation.
+/// All constructors clamp the stored value to [`Self::MAX_SECS`], the last instant
+/// `OffsetDateTime` can represent, which is what makes [`HttpDate::format`]
+/// total: a filesystem reporting an absurd `st_mtime`/`st_btime` (the values
+/// reaching [`cache_file_http_date`]) yields the clamped date instead of
+/// panicking inside the formatter.
 ///
 /// The current value is read via [`HttpDate::now`], which uses
 /// `coarsetime::Clock::now_since_epoch()` (`CLOCK_REALTIME_COARSE` on Linux — a
@@ -33,11 +37,13 @@ pub(crate) struct HttpDate(u64);
 impl HttpDate {
     pub(crate) const UNIX_EPOCH: Self = Self(0);
 
-    /// Inclusive upper bound on the stored seconds value.
-    ///
-    /// Equals `i64::MAX`. Written as `u64::MAX >> 1` (rather than `i64::MAX as u64`)
-    /// to avoid triggering `clippy::cast_sign_loss`.
-    const MAX_SECS: u64 = u64::MAX >> 1;
+    /// Inclusive upper bound on the stored seconds value: `9999-12-31
+    /// 23:59:59 UTC`, the largest instant `OffsetDateTime` accepts from
+    /// `from_unix_timestamp` (the `time` crate's `large-dates` feature, which
+    /// would widen it, is off).  Clamping every constructor here is what lets
+    /// [`HttpDate::format`] `expect` both the `i64` conversion and the
+    /// `OffsetDateTime` construction.
+    const MAX_SECS: u64 = 253_402_300_799;
 
     /// Construct a value, clamping at [`Self::MAX_SECS`].
     #[must_use]
@@ -53,17 +59,16 @@ impl HttpDate {
 
     /// Whole seconds elapsed from `self` to now, None for future dates.
     #[must_use]
-    pub(crate) fn elapsed_secs(self) -> Option<u64> {
+    fn elapsed_secs(self) -> Option<u64> {
         Self::now().0.checked_sub(self.0)
     }
 
     /// Format as an IMF-fixdate string (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`).
     #[must_use]
     pub(crate) fn format(self) -> String {
-        let secs_i64 =
-            i64::try_from(self.0).expect("HttpDate is clamped to i64::MAX by construction");
+        let secs_i64 = i64::try_from(self.0).expect("HttpDate is clamped to MAX_SECS");
         let odt = OffsetDateTime::from_unix_timestamp(secs_i64)
-            .expect("HttpDate should be representable as OffsetDateTime");
+            .expect("MAX_SECS is the last instant OffsetDateTime represents");
         debug_assert_eq!(odt.offset(), offset!(UTC), "offset should be UTC");
         odt.format(HTTP_DATE_FORMAT).expect("date should be valid")
     }
@@ -73,10 +78,7 @@ impl HttpDate {
     #[must_use]
     pub(crate) fn parse(s: &str) -> Option<Self> {
         let odt = OffsetDateTime::parse(s, &Rfc2822).ok()?;
-        // `unix_timestamp()` returns i64; non-negative values are therefore
-        // always `<= i64::MAX == Self::MAX_SECS`, so no further clamping is
-        // needed after the unsigned conversion.
-        u64::try_from(odt.unix_timestamp()).ok().map(Self)
+        u64::try_from(odt.unix_timestamp()).ok().map(Self::clamped)
     }
 }
 
@@ -121,27 +123,27 @@ impl From<SystemTime> for HttpDate {
 /// lock; only the once-per-second rollover takes the write lock and
 /// formats.
 #[must_use]
-pub(crate) fn format_http_date() -> std::sync::Arc<str> {
-    static CACHE: std::sync::LazyLock<parking_lot::RwLock<(HttpDate, std::sync::Arc<str>)>> =
-        std::sync::LazyLock::new(|| {
-            parking_lot::RwLock::new((HttpDate(u64::MAX), std::sync::Arc::from("")))
-        });
+pub(crate) fn format_http_date() -> Arc<str> {
+    static CACHE: LazyLock<RwLock<(HttpDate, Arc<str>)>> = LazyLock::new(|| {
+        let now = HttpDate::now();
+        RwLock::new((now, now.format().into()))
+    });
 
     let now = HttpDate::now();
 
     {
         let cached = CACHE.read();
         if cached.0 == now {
-            return std::sync::Arc::clone(&cached.1);
+            return Arc::clone(&cached.1);
         }
     }
 
-    let formatted: std::sync::Arc<str> = now.format().into();
+    let formatted: Arc<str> = now.format().into();
 
     let mut cached = CACHE.write();
     if cached.0 != now {
         cached.0 = now;
-        cached.1 = std::sync::Arc::clone(&formatted);
+        cached.1 = Arc::clone(&formatted);
     }
 
     formatted
@@ -151,7 +153,7 @@ pub(crate) fn format_http_date() -> std::sync::Arc<str> {
 /// receiving a value greater than the greatest integer it can represent, or
 /// overflowing an age calculation, must transmit an `Age` of 2147483648
 /// (2^31).
-pub(crate) const AGE_OVERFLOW_VALUE: u64 = 1u64 << 31;
+const AGE_OVERFLOW_VALUE: u64 = 1u64 << 31;
 
 /// Return the timestamp considered representative of when a cached file was last replaced.
 ///
@@ -186,6 +188,7 @@ pub(crate) fn compute_age(metadata: &std::fs::Metadata) -> u32 {
 }
 
 /// Result of parsing an HTTP Range request header.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ParsedRange {
     /// Valid, satisfiable range: Content-Range header value, start byte, content length.
     Satisfiable(String, u64, u64),
@@ -276,29 +279,10 @@ pub(crate) fn http_parse_range(
         }
     };
 
-    if let Some(if_range) = if_range {
-        let matched = if if_range.starts_with('"') {
-            // Strong ETag comparison
-            matches!(file_etag, Some(etag) if etag_strong_match(if_range, etag))
-        } else if if_range.starts_with("W/") {
-            // Weak ETags are not allowed in If-Range (RFC 9110 §13.1.5)
-            false
-        } else {
-            match HttpDate::parse(if_range) {
-                // RFC 9110 §13.1.5: an HTTP-date If-Range condition is true
-                // only on an *exact* match with the representation's
-                // Last-Modified. A client holding a validator we cannot
-                // reproduce (e.g. the file-birth-time fallback) fails the
-                // condition and gets a safe full 200 instead of risking a
-                // 206 stitched onto bytes from a different revision.
-                Some(if_time) => if_time == cache_time,
-                // Unparsable If-Range date: treat as failed precondition
-                None => false,
-            }
-        };
-        if !matched {
-            return ParsedRange::IfRangeFailed;
-        }
+    if let Some(if_range) = if_range
+        && !if_range_matches(if_range, cache_time, file_etag)
+    {
+        return ParsedRange::IfRangeFailed;
     }
 
     debug_assert!(start <= end, "start {start} must not exceed end {end}");
@@ -318,11 +302,72 @@ pub(crate) fn http_parse_range(
     ParsedRange::Satisfiable(content_range, start, content_length)
 }
 
+/// Evaluate an `If-Range` precondition (RFC 9110 §13.1.5) against the
+/// representation a `Range` would be cut from.
+///
+/// An entity-tag condition must be a *strong* comparison against the stored
+/// `ETag`; a weak tag on either side never matches, because a weak validator
+/// says nothing about byte-for-byte identity.  An HTTP-date condition must
+/// match `cache_time` *exactly*, not merely be no older: a client holding a
+/// validator we cannot reproduce (e.g. the file-birth-time fallback) fails
+/// the condition and gets a safe full 200 instead of risking a 206 stitched
+/// onto bytes from a different revision.  An unparsable date fails too.
+#[must_use]
+fn if_range_matches(if_range: &str, cache_time: HttpDate, file_etag: Option<&str>) -> bool {
+    if if_range.starts_with('"') {
+        return matches!(file_etag, Some(etag) if etag_strong_match(if_range, etag));
+    }
+    if if_range.starts_with("W/") {
+        return false;
+    }
+    HttpDate::parse(if_range).is_some_and(|if_time| if_time == cache_time)
+}
+
+/// A parsed `Content-Range: bytes <start>-<end>/<total>` response header.
+///
+/// [`parse_content_range`] is the only constructor and it rejects everything
+/// but `start <= end < total`.  Those bounds are what make [`Self::total`]
+/// and [`Self::span`] `NonZero` and [`Self::runs_to_end`] wrap-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContentRange {
+    start: u64,
+    end: u64,
+    total: NonZero<u64>,
+}
+
+impl ContentRange {
+    /// First byte of the range.
+    #[must_use]
+    pub(crate) const fn start(self) -> u64 {
+        self.start
+    }
+
+    /// Size of the whole representation the range was cut from.
+    #[must_use]
+    pub(crate) const fn total(self) -> NonZero<u64> {
+        self.total
+    }
+
+    /// Number of bytes the range covers (`end - start + 1`).
+    #[must_use]
+    pub(crate) fn span(self) -> NonZero<u64> {
+        NonZero::<u64>::MIN.saturating_add(self.end - self.start)
+    }
+
+    /// Whether the range ends on the representation's last byte.
+    #[must_use]
+    pub(crate) const fn runs_to_end(self) -> bool {
+        self.total.get() - self.end == 1
+    }
+}
+
 /// Parse an HTTP `Content-Range` response header value.
 ///
-/// Expects the format `bytes {start}-{end}/{total}` and returns `(start, end, total)`.
+/// Expects the complete `bytes {start}-{end}/{total}` form; the `*`
+/// unsatisfied-range and unknown-total spellings and any inconsistent
+/// bounds yield `None`.
 #[must_use]
-pub(crate) fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_content_range(value: &str) -> Option<ContentRange> {
     let rest = value.strip_prefix("bytes ")?;
     let (range_part, total_str) = rest.split_once('/')?;
     let (start_str, end_str) = range_part.split_once('-')?;
@@ -335,14 +380,23 @@ pub(crate) fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
 
-    Some((start, end, total))
+    Some(ContentRange {
+        start,
+        end,
+        // `end >= total` was rejected above, so `total` is at least 1.
+        total: NonZero::new(total)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::http_range::{HttpDate, ParsedRange, http_parse_range, parse_content_range};
+    use crate::http_range::{
+        ContentRange, HttpDate, ParsedRange, http_parse_range, if_range_matches,
+        parse_content_range,
+    };
 
     /// Helper to unwrap a `ParsedRange::Satisfiable` for concise test assertions.
     fn satisfiable(r: ParsedRange) -> Option<(String, u64, u64)> {
@@ -350,6 +404,15 @@ mod tests {
             ParsedRange::Satisfiable(cr, s, l) => Some((cr, s, l)),
             ParsedRange::Invalid | ParsedRange::NotSatisfiable | ParsedRange::IfRangeFailed => None,
         }
+    }
+
+    /// The expected `Some(ContentRange)` for a `bytes start-end/total` value.
+    fn content_range(start: u64, end: u64, total: u64) -> Option<ContentRange> {
+        Some(ContentRange {
+            start,
+            end,
+            total: NonZero::new(total).unwrap(),
+        })
     }
 
     #[test]
@@ -387,17 +450,37 @@ mod tests {
             HttpDate::parse("Tue, 21 Mar 2361 19:15:09 GMT"),
             Some(HttpDate::from_secs(12_345_678_909))
         );
+
+        // Pre-epoch dates parse as an HTTP-date but have no `HttpDate`.
+        assert_eq!(HttpDate::parse("Wed, 31 Dec 1969 23:59:59 GMT"), None);
+        // Trailing junk is not silently accepted.
+        assert_eq!(HttpDate::parse("Thu, 01 Jan 1970 00:00:00 GMT junk"), None);
+        // The two obsolete HTTP-date spellings RFC 9110 section 5.6.7 still
+        // requires *recipients* to accept are rejected here; see
+        // `http_last_modified::is_valid_http_date`.
+        assert_eq!(HttpDate::parse("Sunday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(HttpDate::parse("Sun Nov  6 08:49:37 1994"), None);
     }
 
     #[test]
-    fn clamps_to_i64_max() {
-        // An out-of-range seconds value must clamp so the stored seconds always
-        // fit in i64 — that's what makes the cast in `HttpDate::format` lossless.
-        assert!(i64::try_from(HttpDate::from_secs(u64::MAX).0).is_ok());
+    fn clamps_to_max_representable_date() {
+        // An out-of-range seconds value must clamp so that `format` is total:
+        // both the i64 cast and `OffsetDateTime::from_unix_timestamp` inside
+        // it are infallible only because of this.
         assert_eq!(
             HttpDate::from_secs(u64::MAX),
             HttpDate::from_secs(u64::MAX - 1),
-            "values above i64::MAX must saturate to the same clamped HttpDate"
+            "values above MAX_SECS must saturate to the same clamped HttpDate"
+        );
+        assert_eq!(
+            HttpDate::from_secs(u64::MAX).format(),
+            "Fri, 31 Dec 9999 23:59:59 GMT"
+        );
+        // A filesystem reporting an absurd birth/modification time reaches
+        // `format` through `cache_file_http_date`; it must clamp, not panic.
+        assert_eq!(
+            HttpDate::from(SystemTime::UNIX_EPOCH + Duration::from_secs(300_000_000_000)).format(),
+            "Fri, 31 Dec 9999 23:59:59 GMT"
         );
     }
 
@@ -710,6 +793,94 @@ mod tests {
             ),
             ParsedRange::Invalid
         ));
+        assert!(matches!(
+            http_parse_range("bytes=0-50,100-150", None, 8192, HttpDate::UNIX_EPOCH, None),
+            ParsedRange::Invalid
+        ));
+    }
+
+    #[test]
+    fn http_parse_range_numeric_edges() {
+        // Byte positions that do not fit in u64 are malformed, not
+        // unsatisfiable: ignore the header and serve the full entity.
+        for range in [
+            "bytes=18446744073709551616-",
+            "bytes=0-18446744073709551616",
+            "bytes=-18446744073709551616",
+            // A negative first-byte-pos splits into an empty start and a
+            // non-numeric suffix-length.
+            "bytes=-1-2",
+        ] {
+            assert_eq!(
+                http_parse_range(range, None, 100, HttpDate::UNIX_EPOCH, None),
+                ParsedRange::Invalid,
+                "range {range}"
+            );
+        }
+
+        // `u64::MAX` itself parses; a last-byte-pos past the end clamps to the
+        // final byte instead of failing.
+        assert_eq!(
+            satisfiable(http_parse_range(
+                "bytes=0-18446744073709551615",
+                None,
+                100,
+                HttpDate::UNIX_EPOCH,
+                None
+            )),
+            Some(("bytes 0-99/100".to_string(), 0, 100))
+        );
+        // A suffix-length longer than the file yields the whole file.
+        assert_eq!(
+            satisfiable(http_parse_range(
+                "bytes=-18446744073709551615",
+                None,
+                100,
+                HttpDate::UNIX_EPOCH,
+                None
+            )),
+            Some(("bytes 0-99/100".to_string(), 0, 100))
+        );
+        // A first-byte-pos past the end is unsatisfiable, however large.
+        assert_eq!(
+            http_parse_range(
+                "bytes=18446744073709551615-",
+                None,
+                100,
+                HttpDate::UNIX_EPOCH,
+                None
+            ),
+            ParsedRange::NotSatisfiable
+        );
+    }
+
+    #[test]
+    fn if_range_matches_table() {
+        let epoch = HttpDate::UNIX_EPOCH;
+
+        // A strong entity-tag on both sides, byte-identical: the only match.
+        assert!(if_range_matches("\"abc\"", epoch, Some("\"abc\"")));
+        assert!(!if_range_matches("\"abc\"", epoch, Some("\"other\"")));
+        assert!(!if_range_matches("\"abc\"", epoch, None));
+        // A weak tag on either side never matches (RFC 9110 section 13.1.5).
+        assert!(!if_range_matches("W/\"abc\"", epoch, Some("\"abc\"")));
+        assert!(!if_range_matches("\"abc\"", epoch, Some("W/\"abc\"")));
+
+        // Anything not spelled as an entity-tag is read as an HTTP-date and
+        // must match the representation's timestamp exactly; the stored ETag
+        // plays no part.
+        assert!(if_range_matches(
+            "Thu, 01 Jan 1970 00:00:00 GMT",
+            epoch,
+            Some("\"abc\"")
+        ));
+        assert!(!if_range_matches(
+            "Thu, 01 Jan 1970 00:00:01 GMT",
+            epoch,
+            None
+        ));
+        assert!(!if_range_matches("not-a-date", epoch, Some("\"abc\"")));
+        assert!(!if_range_matches("", epoch, Some("\"abc\"")));
     }
 
     #[test]
@@ -780,16 +951,16 @@ mod tests {
         // Valid ranges
         assert_eq!(
             parse_content_range("bytes 0-499/1000"),
-            Some((0, 499, 1000))
+            content_range(0, 499, 1000)
         );
         assert_eq!(
             parse_content_range("bytes 500-999/1000"),
-            Some((500, 999, 1000))
+            content_range(500, 999, 1000)
         );
-        assert_eq!(parse_content_range("bytes 0-0/1"), Some((0, 0, 1)));
+        assert_eq!(parse_content_range("bytes 0-0/1"), content_range(0, 0, 1));
         assert_eq!(
             parse_content_range("bytes 34744111-1071434819/1071434820"),
-            Some((34_744_111, 1_071_434_819, 1_071_434_820))
+            content_range(34_744_111, 1_071_434_819, 1_071_434_820)
         );
 
         // Invalid: missing prefix
@@ -815,8 +986,32 @@ mod tests {
         // The boundary case: start=0, end=u64::MAX-1, total=u64::MAX.
         // start <= end, end < total, end - start + 1 = u64::MAX (fits in u64).
         let s = format!("bytes 0-{}/{}", u64::MAX - 1, u64::MAX);
-        let parsed = parse_content_range(&s);
-        assert!(parsed.is_some());
+        let parsed = parse_content_range(&s).expect("consistent bounds");
+        assert_eq!(parsed.start(), 0);
+        assert_eq!(parsed.total().get(), u64::MAX);
+        assert_eq!(parsed.span().get(), u64::MAX);
+        assert!(parsed.runs_to_end());
+    }
+
+    #[test]
+    fn content_range_derives_span_and_tail() {
+        // A middle slice: the span is inclusive of both ends and the range
+        // stops short of the last byte.
+        let middle = parse_content_range("bytes 40-98/100").expect("consistent bounds");
+        assert_eq!(middle.start(), 40);
+        assert_eq!(middle.total().get(), 100);
+        assert_eq!(middle.span().get(), 59);
+        assert!(!middle.runs_to_end());
+
+        // The remainder of the object, as a resume answer delivers it.
+        let tail = parse_content_range("bytes 40-99/100").expect("consistent bounds");
+        assert_eq!(tail.span().get(), 60);
+        assert!(tail.runs_to_end());
+
+        // A single-byte tail is still a span of one.
+        let last = parse_content_range("bytes 99-99/100").expect("consistent bounds");
+        assert_eq!(last.span().get(), 1);
+        assert!(last.runs_to_end());
     }
 
     #[test]

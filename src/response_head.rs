@@ -65,7 +65,7 @@ pub(crate) enum ResponseKind {
 }
 
 /// Content type of every proxy-generated error body.
-pub(crate) const TEXT_PLAIN_UTF8: &str = "text/plain; charset=utf-8";
+const TEXT_PLAIN_UTF8: &str = "text/plain; charset=utf-8";
 
 /// A proxy-generated response head, independent of the serving backend.
 ///
@@ -271,11 +271,7 @@ impl ResponseHead<'_> {
     /// Render the status line and header block as wire bytes, terminated by
     /// the empty line.
     #[must_use]
-    pub(crate) fn render(
-        &self,
-        conn_version: ConnectionVersion,
-        conn_action: ConnectionAction,
-    ) -> String {
+    fn render(&self, conn_version: ConnectionVersion, conn_action: ConnectionAction) -> String {
         use crate::{
             build_info::{APP_NAME, APP_VIA},
             http_helpers::OptHeader,
@@ -459,6 +455,9 @@ mod tests {
             assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "42");
         }
 
+        /// The `416` head `hyper_conn.rs`'s `ServePlan::NotSatisfiable` arm
+        /// builds: an `Error` head naming the current representation length,
+        /// with `Content-Length` left to the empty body.
         #[test]
         fn unsatisfied_range_carries_content_range() {
             let response = render(ResponseHead {
@@ -466,9 +465,43 @@ mod tests {
                 ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
             });
             let headers = response.headers();
+            assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
             assert_eq!(headers.get(CONTENT_RANGE).unwrap(), "bytes */1234");
             assert!(headers.contains_key(SERVER));
             assert!(!headers.contains_key(CONTENT_TYPE));
+            assert!(!headers.contains_key(CONTENT_LENGTH));
+        }
+
+        /// The `304` head `hyper_conn.rs`'s `ServePlan::NotModified` arm
+        /// builds: validators and `Age` only.  No `Content-Length` (RFC 9110
+        /// §8.6 permits one only when it equals the `200` representation's
+        /// length), no `Accept-Ranges`, and no `Server:` — a 304 answers on
+        /// the origin's behalf.  `http_helpers::write_304_response` must
+        /// stay header-for-header identical; see the `wire` twin of this
+        /// test.
+        #[test]
+        fn not_modified_head_carries_validators_only() {
+            let response = render(ResponseHead {
+                last_modified: Some("Wed, 20 Dec 2023 04:45:32 GMT"),
+                etag: Some("\"abc\""),
+                age: Some(7),
+                ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
+            });
+            let headers = response.headers();
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                headers.get(LAST_MODIFIED).unwrap(),
+                "Wed, 20 Dec 2023 04:45:32 GMT"
+            );
+            assert_eq!(headers.get(ETAG).unwrap(), "\"abc\"");
+            assert_eq!(headers.get(AGE).unwrap(), "7");
+            assert_eq!(headers.get(CONNECTION).unwrap(), "keep-alive");
+            assert!(headers.contains_key(DATE));
+            assert_eq!(headers.get(VIA).unwrap(), APP_VIA);
+            assert!(!headers.contains_key(CONTENT_LENGTH));
+            assert!(!headers.contains_key(ACCEPT_RANGES));
+            assert!(!headers.contains_key(CONTENT_TYPE));
+            assert!(!headers.contains_key(SERVER));
         }
 
         #[test]
@@ -607,6 +640,9 @@ mod tests {
             assert!(header_lines(&wire).contains(&"Retry-After: 42"), "{wire}");
         }
 
+        /// `http_helpers::write_416_response` builds exactly this head: the
+        /// hyper `416` plus the explicit `Content-Length: 0` that frames the
+        /// empty body on a keep-alive raw socket.
         #[test]
         fn unsatisfied_range_carries_content_range() {
             let wire = render(&ResponseHead {
@@ -614,6 +650,10 @@ mod tests {
                 content_range: Some(ResponseHead::unsatisfied_range(1234)),
                 ..ResponseHead::bare(StatusCode::RANGE_NOT_SATISFIABLE, ResponseKind::Error)
             });
+            assert!(
+                wire.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+                "{wire}"
+            );
             let lines = header_lines(&wire);
             assert!(lines.contains(&"Content-Range: bytes */1234"), "{wire}");
             assert!(lines.contains(&"Content-Length: 0"), "{wire}");
@@ -622,6 +662,36 @@ mod tests {
                 "{wire}"
             );
             assert!(!has_header(&lines, "Content-Type"), "{wire}");
+        }
+
+        /// `http_helpers::write_304_response` builds exactly this head; it
+        /// must stay header-for-header the hyper backend's 304.
+        #[test]
+        fn not_modified_head_carries_validators_only() {
+            let wire = render(&ResponseHead {
+                last_modified: Some("Wed, 20 Dec 2023 04:45:32 GMT"),
+                etag: Some("\"abc\""),
+                age: Some(7),
+                ..ResponseHead::bare(StatusCode::NOT_MODIFIED, ResponseKind::Success)
+            });
+            assert!(wire.starts_with("HTTP/1.1 304 Not Modified\r\n"), "{wire}");
+            let lines = header_lines(&wire);
+            assert!(
+                lines.contains(&"Last-Modified: Wed, 20 Dec 2023 04:45:32 GMT"),
+                "{wire}"
+            );
+            assert!(lines.contains(&"ETag: \"abc\""), "{wire}");
+            assert!(lines.contains(&"Age: 7"), "{wire}");
+            assert!(lines.contains(&"Connection: keep-alive"), "{wire}");
+            assert!(has_header(&lines, "Date"), "{wire}");
+            assert!(
+                lines.contains(&format!("Via: {APP_VIA}").as_str()),
+                "{wire}"
+            );
+            assert!(!has_header(&lines, "Content-Length"), "{wire}");
+            assert!(!has_header(&lines, "Accept-Ranges"), "{wire}");
+            assert!(!has_header(&lines, "Content-Type"), "{wire}");
+            assert!(!has_header(&lines, "Server"), "{wire}");
         }
 
         /// The wire bytes of the parallel-hack nudge head, pinned in full:

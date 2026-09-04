@@ -3,10 +3,36 @@
 
 use crate::{deb_mirror, warn_once_or_info};
 
-/// Warn (once) if the upstream `Content-Type` differs from the type derived
-/// from the cached file's basename. The non-standard `binary/octet-stream`
-/// is widely advertised by Debian mirrors and is treated as a no-op rather
-/// than a mismatch to keep the log quiet.
+/// Whether an upstream `Content-Type` is acceptable for a file whose name
+/// implies `expected` (as [`content_type_for_cached_file`] derives it).
+///
+/// Comparison is case-insensitive, and three historical spellings Debian
+/// mirrors still emit count as equal rather than as a mismatch worth
+/// logging:
+///
+/// - `binary/octet-stream`, a non-standard spelling advertised for
+///   everything by many mirrors;
+/// - `application/x-deb`, the unregistered alias for the IANA-registered
+///   `application/vnd.debian.binary-package`;
+/// - `application/x-gzip`, the non-standard alias for the IANA-registered
+///   `application/gzip` (RFC 6713).
+#[must_use]
+fn content_type_matches(upstream: &str, expected: &str) -> bool {
+    if upstream.eq_ignore_ascii_case(expected)
+        || upstream.eq_ignore_ascii_case("binary/octet-stream")
+    {
+        return true;
+    }
+    let legacy_alias = match expected {
+        "application/vnd.debian.binary-package" => "application/x-deb",
+        "application/gzip" => "application/x-gzip",
+        _ => return false,
+    };
+    upstream.eq_ignore_ascii_case(legacy_alias)
+}
+
+/// Warn (once) if the upstream `Content-Type` is not one
+/// [`content_type_matches`] accepts for the cached file's name.
 pub(crate) fn warn_on_content_type_mismatch(
     upstream: Option<&str>,
     mirror: &deb_mirror::Mirror,
@@ -15,25 +41,8 @@ pub(crate) fn warn_on_content_type_mismatch(
     let Some(upstream_ct) = upstream else {
         return;
     };
-    if upstream_ct.eq_ignore_ascii_case("binary/octet-stream") {
-        return;
-    }
-
     let expected = content_type_for_cached_file(debname);
-    if upstream_ct.eq_ignore_ascii_case(expected) {
-        return;
-    }
-    // `application/x-deb` is the legacy unregistered alias for the
-    // IANA-registered `application/vnd.debian.binary-package`; treat them
-    // as equivalent.
-    if expected == "application/vnd.debian.binary-package"
-        && upstream_ct.eq_ignore_ascii_case("application/x-deb")
-    {
-        return;
-    }
-    // `application/x-gzip` is the legacy non-standard alias for the
-    // IANA-registered `application/gzip` (RFC 6713); treat them as equivalent.
-    if expected == "application/gzip" && upstream_ct.eq_ignore_ascii_case("application/x-gzip") {
+    if content_type_matches(upstream_ct, expected) {
         return;
     }
     warn_once_or_info!(
@@ -41,7 +50,8 @@ pub(crate) fn warn_on_content_type_mismatch(
     );
 }
 
-/// Derive the Content-Type for a cached file based on its filename extension.
+/// Derive the `Content-Type` for a cached file from its debname: the deb
+/// predicate first, then the manifest basenames, then the extension.
 #[must_use]
 pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
     if deb_mirror::is_deb_package(filename) {
@@ -70,7 +80,44 @@ pub(crate) fn content_type_for_cached_file(filename: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::content_type_for_cached_file;
+    use super::{content_type_for_cached_file, content_type_matches};
+
+    #[test]
+    fn content_type_matches_accepts_case_and_legacy_aliases() {
+        // Exact, and case-insensitively so (RFC 9110 section 8.3).
+        assert!(content_type_matches("text/plain", "text/plain"));
+        assert!(content_type_matches("TEXT/PLAIN", "text/plain"));
+
+        // The non-standard catch-all every Debian mirror emits.
+        assert!(content_type_matches("binary/octet-stream", "text/plain"));
+        assert!(content_type_matches(
+            "Binary/Octet-Stream",
+            "application/gzip"
+        ));
+
+        // Legacy aliases, each only for the type it aliases.
+        assert!(content_type_matches(
+            "application/x-deb",
+            "application/vnd.debian.binary-package"
+        ));
+        assert!(content_type_matches(
+            "application/x-gzip",
+            "application/gzip"
+        ));
+        assert!(!content_type_matches("application/x-gzip", "text/plain"));
+        assert!(!content_type_matches(
+            "application/x-deb",
+            "application/gzip"
+        ));
+
+        // Anything else is a mismatch worth the once-per-process warning.
+        assert!(!content_type_matches("text/html", "text/plain"));
+        assert!(!content_type_matches("", "text/plain"));
+        assert!(!content_type_matches(
+            "application/octet-stream",
+            "application/gzip"
+        ));
+    }
 
     #[test]
     fn content_type_for_text_manifests() {

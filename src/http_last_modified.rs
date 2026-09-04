@@ -67,6 +67,15 @@ mod tests {
         assert!(!is_valid_http_date(""));
         assert!(!is_valid_http_date("not a date"));
         assert!(!is_valid_http_date("Thu, 32 Jan 1970 00:00:00 GMT"));
+
+        // The two obsolete formats RFC 9110 section 5.6.7 lists alongside
+        // IMF-fixdate are rejected, as this module's doc states.
+        assert!(!is_valid_http_date("Sunday, 06-Nov-94 08:49:37 GMT"));
+        assert!(!is_valid_http_date("Sun Nov  6 08:49:37 1994"));
+
+        // Pre-epoch timestamps parse as dates but have no `HttpDate`, so they
+        // are not storable validators either.
+        assert!(!is_valid_http_date("Wed, 31 Dec 1969 23:59:59 GMT"));
     }
 
     #[test]

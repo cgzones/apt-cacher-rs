@@ -37,6 +37,7 @@ use http::StatusCode;
 
 use crate::{
     cache_layout::CachedFlavor,
+    http_range::ContentRange,
     limits::{self, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER},
     metrics,
 };
@@ -76,10 +77,8 @@ pub(crate) struct UpstreamHead {
     /// overrides it (RFC 9112 section 6.1; a `Content-Length` sent alongside
     /// chunked framing is a smuggling signal and must be ignored).
     pub(crate) content_length: Option<u64>,
-    /// Parsed `Content-Range` as `(start, end, total)` with
-    /// `start <= end < total` guaranteed by `http_range::parse_content_range`;
-    /// `None` when absent or malformed.
-    pub(crate) content_range: Option<(u64, u64, u64)>,
+    /// Parsed `Content-Range`; `None` when absent or malformed.
+    pub(crate) content_range: Option<ContentRange>,
 }
 
 #[cfg(feature = "hyper")]
@@ -332,20 +331,18 @@ fn plan_resumed_206<C>(
     resume: ResumeState,
     max_object_size: Option<NonZero<u64>>,
 ) -> Result<DownloadPlan<C>, ResumeAnomaly> {
-    let Some((start, end, _total)) = head.content_range.filter(|&(start, end, total)| {
-        start == resume.offset.get()
-            && end.checked_add(1) == Some(total)
+    let Some(range) = head.content_range.filter(|range| {
+        range.start() == resume.offset.get()
+            && range.runs_to_end()
             && resume
                 .expected_total
-                .is_none_or(|expected| expected == total)
+                .is_none_or(|expected| expected == range.total().get())
     }) else {
         return Err(ResumeAnomaly::ContentRangeMismatch);
     };
 
-    // `parse_content_range` guarantees `start <= end < total`, so both the
-    // total and the remaining span are at least 1.
-    let total = NonZero::<u64>::MIN.saturating_add(end);
-    let span = NonZero::<u64>::MIN.saturating_add(end - start);
+    let total = range.total();
+    let span = range.span();
 
     if let Some(content_length) = head.content_length
         && content_length != span.get()
@@ -367,7 +364,7 @@ fn plan_resumed_206<C>(
     Ok(DownloadPlan::Download {
         total: ContentLength::Exact(total),
         body: ContentLength::Exact(span),
-        resume_offset: start,
+        resume_offset: range.start(),
     })
 }
 
@@ -734,7 +731,10 @@ mod tests {
 
     #[test]
     fn resume_other_status_is_passthrough_keeping_the_partial() {
-        for status in [301, 404, 500, 503] {
+        // 304 belongs here too: a permanent resume sends no conditional
+        // headers, so there is no cached copy to serve and the head is
+        // relayed like any other non-2xx.
+        for status in [301, 304, 404, 500, 503] {
             assert_eq!(
                 resumed(&head(status, Some(5), None), 40, Some(100), NO_CAP),
                 Ok(DownloadPlan::Passthrough),
@@ -762,6 +762,69 @@ mod tests {
         assert_eq!(
             RejectReason::ZeroContentLength.body(),
             "Zero Content-Length"
+        );
+    }
+
+    /// The two refusals only the splice relay can raise: hyper's client
+    /// frames bodies itself and never yields either.
+    #[cfg(feature = "splice")]
+    #[test]
+    fn splice_only_reject_bodies_are_stable() {
+        assert_eq!(
+            RejectReason::InconsistentBodyFraming {
+                content_length: 1,
+                prefix_len: 2,
+            }
+            .body(),
+            "Inconsistent body framing"
+        );
+        assert_eq!(
+            RejectReason::InterimResponse { status: 100 }.body(),
+            "Unexpected interim response"
+        );
+    }
+
+    #[test]
+    fn is_answered_covers_content_bearing_plans_only() {
+        assert!(DownloadPlan::NotModified(Cached).is_answered());
+        assert!(exact_download(10, 10, 0).is_answered());
+        assert!(!DownloadPlan::<Cached>::Passthrough.is_answered());
+        assert!(!DownloadPlan::<Cached>::Reject(RejectReason::Unsolicited206).is_answered());
+    }
+
+    #[test]
+    fn content_length_upper_and_display() {
+        assert_eq!(ContentLength::Exact(nonzero!(42)).upper().get(), 42);
+        assert_eq!(ContentLength::Unknown(nonzero!(42)).upper().get(), 42);
+        assert_eq!(
+            ContentLength::Exact(nonzero!(42)).to_string(),
+            "exact 42 bytes"
+        );
+        assert_eq!(
+            ContentLength::Unknown(nonzero!(42)).to_string(),
+            "up to 42 bytes"
+        );
+    }
+
+    #[test]
+    fn volatile_200_without_content_length_ignores_the_size_cap() {
+        // There is no declared size to compare the cap against, so the
+        // planner cannot reject up front; the volatile upper bound becomes
+        // the limit and the body reader enforces it.  (`config.rs` refuses a
+        // `max_object_size` below that bound, so a cap this small never
+        // reaches the planner in production.)
+        assert_eq!(
+            fresh(
+                &head(200, None, None),
+                CachedFlavor::Volatile,
+                None,
+                Some(nonzero!(1024))
+            ),
+            DownloadPlan::Download {
+                total: ContentLength::Unknown(VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER),
+                body: ContentLength::Unknown(VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER),
+                resume_offset: 0,
+            }
         );
     }
 

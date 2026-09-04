@@ -20,12 +20,15 @@ fn etag_opaque_tag(s: &str) -> &str {
 #[must_use]
 pub(crate) fn is_valid_etag(s: &str) -> bool {
     let opaque = etag_opaque_tag(s).as_bytes();
-    opaque.len() >= 2
-        && opaque[0] == b'"'
-        && opaque[opaque.len() - 1] == b'"'
-        && opaque[1..opaque.len() - 1]
-            .iter()
-            .all(|&c| c == 0x21 || (0x23..=0x7E).contains(&c) || c >= 0x80)
+    let Some(etagc) = opaque
+        .strip_prefix(b"\"")
+        .and_then(|rest| rest.strip_suffix(b"\""))
+    else {
+        return false;
+    };
+    etagc
+        .iter()
+        .all(|&c| c == 0x21 || (0x23..=0x7E).contains(&c) || c >= 0x80)
 }
 
 /// A validated `ETag`, persisted on a cached file as
@@ -133,18 +136,12 @@ pub(crate) fn if_none_match(header: &str, etag: &str) -> bool {
     const MAX_IF_NONE_MATCH_ENTRIES: usize = 64;
 
     let stored = etag_opaque_tag(etag);
-    for (i, part) in split_if_none_match(header).enumerate() {
-        if i >= MAX_IF_NONE_MATCH_ENTRIES {
-            return false;
-        }
-        if part == "*" {
-            return true;
-        }
-        if etag_opaque_tag(part) == stored && stored.starts_with('"') {
-            return true;
-        }
-    }
-    false
+    // A stored value that is not a quoted opaque-tag can never be equivalent
+    // to a well-formed candidate; only the `*` wildcard still matches.
+    let stored_is_tag = stored.starts_with('"');
+    split_if_none_match(header)
+        .take(MAX_IF_NONE_MATCH_ENTRIES)
+        .any(|part| part == "*" || (stored_is_tag && etag_opaque_tag(part) == stored))
 }
 
 #[cfg(test)]
@@ -186,6 +183,10 @@ mod tests {
         assert!(!is_valid_etag("\"a\rb\""));
         // Invalid: single quote only
         assert!(!is_valid_etag("\""));
+        // Only a leading `W/` is the weak indicator; inside the opaque-tag it
+        // is ordinary etagc.
+        assert!(is_valid_etag("\"W/\""));
+        assert!(!is_valid_etag("W/W/\"abc\""));
     }
 
     #[test]
@@ -211,6 +212,27 @@ mod tests {
         assert!(if_none_match("\"abc\"", "W/\"abc\""));
         assert!(if_none_match("W/\"abc\"", "W/\"abc\""));
         assert!(!if_none_match("W/\"abc\"", "\"def\""));
+    }
+
+    #[test]
+    fn if_none_match_wildcard_and_degenerate_headers() {
+        // `*` matches wherever it appears in the list, and regardless of what
+        // is stored -- RFC 9110 section 13.1.2 makes it "any current
+        // representation".
+        assert!(if_none_match("\"x\", *", "\"abc\""));
+        assert!(if_none_match("*, \"x\"", "\"abc\""));
+        assert!(if_none_match("*", "not-a-tag"));
+
+        // A stored value that is not a quoted opaque-tag never matches a
+        // candidate; only `*` above can.
+        assert!(!if_none_match("\"abc\"", "abc"));
+        assert!(!if_none_match("abc", "abc"));
+
+        // Degenerate headers must be false, not a panic: the split still
+        // yields one (empty) token.
+        assert!(!if_none_match("", "\"abc\""));
+        assert!(!if_none_match("   ", "\"abc\""));
+        assert!(!if_none_match(",", "\"abc\""));
     }
 
     #[test]
