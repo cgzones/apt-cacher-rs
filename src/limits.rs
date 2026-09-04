@@ -139,7 +139,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
 }
 
 /// Outcome of a single [`read_line_capped`] call.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum CappedLine {
     /// End of stream reached with no data read.
     Eof,
@@ -255,14 +255,11 @@ impl PackagesCompression {
     /// `Packages` file at all.
     #[must_use]
     pub(crate) fn from_filename(name: &str) -> Option<Self> {
-        if name == "Packages" {
-            Some(Self::Raw)
-        } else if name == "Packages.gz" {
-            Some(Self::Gz)
-        } else if name == "Packages.xz" {
-            Some(Self::Xz)
-        } else {
-            None
+        match name {
+            "Packages" => Some(Self::Raw),
+            "Packages.gz" => Some(Self::Gz),
+            "Packages.xz" => Some(Self::Xz),
+            _ => None,
         }
     }
 }
