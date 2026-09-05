@@ -6,7 +6,7 @@
 //! serving ([`write_client_or_demote`], [`prepare_file_serve`],
 //! [`ClientEnd::Demoted`]), the [`SpliceRangeFilter`] applied to the client
 //! stream, [`BodyTransferError`]/[`BodyFailureSide`] attribution, and the
-//! pipe and `/dev/null` helpers ([`create_pipe`], [`drain_pipe`],
+//! pipe and `/dev/null` helpers ([`create_pipe`], [`SplicePipes::discard_duplicate`],
 //! [`drain_pipe_to_file`], [`range_slice`]). [`CacheBatch`] is the zero-copy
 //! loop's cache-file sink: `pipe_B` and the policy for when its teed bytes are
 //! drained to the file.
@@ -72,7 +72,7 @@ const PIPE_BUFFER_SIZE: i32 = 1024 * 1024;
 /// read loop.
 const RATE_TICK_PERIOD: Duration = Duration::from_secs(1);
 
-/// Process-wide write-only handle to `/dev/null` used by [`drain_pipe`] as the
+/// Process-wide write-only handle to `/dev/null` used by [`SplicePipes::discard_duplicate`] as the
 /// destination of `splice(2)` calls that discard pipe contents.
 ///
 /// Opened lazily on first use; held for the lifetime of the process. The fd is
@@ -362,14 +362,15 @@ struct CacheFile {
 /// publication barrier travel together. All direct writes flush earlier tee
 /// bytes internally; policy flushes retain the existing batching thresholds.
 pub(super) struct CacheWriter<'a> {
-    // Keep the exclusive source-file borrow through the raw-I/O phase.
+    // Keep the exclusive borrow from `prepare` alive through the raw-I/O phase.
     _file: &'a tokio::fs::File,
+    // Duplicate once per transfer. Blocking jobs retain their own Arc, so
+    // cancellation can drop the async owner without closing a job's file.
     file: Arc<CacheFile>,
-    upstream_pipe: Option<Arc<OwnedFd>>,
     file_offset: i64,
     hasher: &'a mut Option<StreamHasher>,
     dbarrier: Option<DownloadBarrier>,
-    batch: Option<CacheBatch>,
+    pipes: Option<SplicePipes>,
 }
 
 impl<'a> CacheWriter<'a> {
@@ -418,8 +419,7 @@ impl<'a> CacheWriter<'a> {
             file_offset,
             hasher,
             dbarrier: Some(dbarrier),
-            upstream_pipe: None,
-            batch: None,
+            pipes: None,
         })
     }
 
@@ -429,16 +429,24 @@ impl<'a> CacheWriter<'a> {
             .expect("the barrier is only taken on the upstream-rate abort path")
     }
 
-    fn batch(&self) -> &CacheBatch {
-        self.batch
+    fn pipes(&self) -> &SplicePipes {
+        self.pipes
             .as_ref()
-            .expect("the splice loop installed its batch")
+            .expect("the splice loop installed its pipes")
+    }
+
+    fn pipes_mut(&mut self) -> &mut SplicePipes {
+        self.pipes
+            .as_mut()
+            .expect("the splice loop installed its pipes")
+    }
+
+    fn batch(&self) -> &CacheBatch {
+        &self.pipes().cache
     }
 
     fn batch_mut(&mut self) -> &mut CacheBatch {
-        self.batch
-            .as_mut()
-            .expect("the splice loop installed its batch")
+        &mut self.pipes_mut().cache
     }
 
     /// `pwrite` a userspace chunk to the cache file at the current offset
@@ -484,11 +492,13 @@ impl<'a> CacheWriter<'a> {
             self.hasher.is_none(),
             "the zero-copy path cannot hash: its bytes never reach userspace"
         );
-        let rx = self
-            .upstream_pipe
-            .as_ref()
-            .expect("the splice loop installed pipe_A");
-        let landed = drain_pipe_to_file(rx, &self.file, &mut self.file_offset)
+        let pipes = self.pipes();
+        debug_assert!(
+            matches!(pipes.head, PipeHead::Unique),
+            "cache-only writes consume unique pipe bytes"
+        );
+        let rx = Arc::clone(&pipes.upstream_fd);
+        let landed = drain_pipe_to_file(&rx, &self.file, &mut self.file_offset)
             .await
             .map_err(BodyTransferError::cache)?;
         self.barrier().ping_batched(landed as u64);
@@ -499,7 +509,11 @@ impl<'a> CacheWriter<'a> {
     /// no-op while nothing is pending, so it is free to call at every point
     /// that needs the file current.
     async fn flush(&mut self) -> Result<(), BodyTransferError> {
-        if self.batch.as_ref().is_none_or(CacheBatch::is_empty) {
+        if self
+            .pipes
+            .as_ref()
+            .is_none_or(|pipes| pipes.cache.is_empty())
+        {
             return Ok(());
         }
         let batch = self.batch_mut();
@@ -511,7 +525,7 @@ impl<'a> CacheWriter<'a> {
             "tee bytes cannot feed an incremental digest"
         );
         let landed = drain_pipe_to_file(
-            &self.batch.as_ref().expect("tee batch").rx,
+            &self.pipes.as_ref().expect("splice pipes").cache.rx,
             &self.file,
             &mut self.file_offset,
         )
@@ -537,50 +551,15 @@ impl<'a> CacheWriter<'a> {
         self.drain_pipe_to_cache().await
     }
 
-    /// Land everything a failing transfer left in the pipes in the cache
-    /// file: the pending `pipe_B` bytes, then the batch still in `pipe_A` if
-    /// it is still [staged](CacheBatch::stage).
-    ///
-    /// All of it was consumed from the upstream socket, so nothing delivers
-    /// it again: dropping it would leave the `.partial` a later attempt
-    /// resumes from short of what was actually received. This runs once, at
-    /// the exit of `splice_proxy_body`, for every failure out of
-    /// `drive_batches` -- so no failure path inside the loop has to remember
-    /// the pipes, and neither does the accumulation loop, which reports an
-    /// error the moment it sees one.
-    ///
-    /// An unstaged `pipe_A` is left alone rather than drained: once a batch
-    /// has been teed, its head sits in `pipe_B` (or is on disk already) and
-    /// landing `pipe_A` too would write it twice -- a `.partial` a later
-    /// attempt resumes from at the wrong length. What is lost is the untee'd
-    /// tail of one batch, which the resume re-fetches. Failures inside a
-    /// fan-out are the rare case; a truncating upstream, the common one,
-    /// fails in the accumulation loop with the batch staged and keeps it.
-    ///
-    /// The barrier is not pinged: on the upstream-rate abort path it is
-    /// already consumed, and the joiners it would wake have been told the
-    /// download failed. Nothing is counted either: every byte was counted
-    /// as downloaded when it arrived, and `bytes_done` / `remaining`, which
-    /// describe the fanned-out body, are not read after a failure.
-    ///
-    /// A failed salvage is reported here, with the on-disk path, and does not
-    /// replace the transfer's own error: `file_offset` still describes what
-    /// landed, so a shorter `.partial` is the only consequence.
+    /// Preserve received bytes on failure. The pipe owner resolves duplicate
+    /// bytes before appending the remaining unique tail. The cache file keeps
+    /// its write lease even when the barrier has already published an abort.
     async fn salvage(&mut self, cache_path: &Path) {
-        let batch = self
-            .batch
+        let pipes = self
+            .pipes
             .take()
-            .expect("the splice loop installed its batch");
-        if let Err(err) = batch
-            .salvage_into(
-                self.upstream_pipe
-                    .as_ref()
-                    .expect("the splice loop installed pipe_A"),
-                &self.file,
-                &mut self.file_offset,
-            )
-            .await
-        {
+            .expect("the splice loop installed its pipes");
+        if let Err(err) = pipes.salvage_into(&self.file, &mut self.file_offset).await {
             let _logged = Logged::cache_io_failure(format_args!(
                 "splice proxy: failed to land the last received bytes of `{}` in the partial file; a later attempt resumes from a shorter partial:  {}",
                 cache_path.display(),
@@ -941,30 +920,10 @@ pub(super) async fn splice_proxy_body(
     mut xfer: BodyTransfer<'_>,
     upstream: &TcpStream,
 ) -> Result<BodyOutcome, BodyTransferError> {
-    let (upstream_pipe_sender, mut upstream_pipe_receiver) =
-        create_pipe().map_err(BodyTransferError::proxy)?;
-    let (cache_pipe_sender, cache_pipe_receiver) =
-        create_pipe().map_err(BodyTransferError::proxy)?;
-    xfer.cache.upstream_pipe = Some(Arc::new(
-        upstream_pipe_receiver
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(BodyTransferError::proxy)?,
-    ));
-    xfer.cache.batch = Some(
-        CacheBatch::new(cache_pipe_receiver, cache_pipe_sender)
-            .map_err(BodyTransferError::proxy)?,
-    );
+    xfer.cache.pipes = Some(SplicePipes::new().map_err(BodyTransferError::proxy)?);
 
-    // The one exit: whatever the loop leaves in either pipe reaches the cache
-    // file here, on success as the last flush and on failure as the salvage.
-    let driven = drive_batches(
-        &mut xfer,
-        upstream,
-        &upstream_pipe_sender,
-        &mut upstream_pipe_receiver,
-    )
-    .await;
+    // One owner settles both pipes on every exit.
+    let driven = drive_batches(&mut xfer, upstream).await;
     match driven {
         Ok(()) => xfer.cache.flush().await?,
         Err(err) => {
@@ -986,8 +945,6 @@ pub(super) async fn splice_proxy_body(
 async fn drive_batches(
     xfer: &mut BodyTransfer<'_>,
     upstream: &TcpStream,
-    upstream_pipe_sender: &pipe::Sender,
-    upstream_pipe_receiver: &mut pipe::Receiver,
 ) -> Result<(), BodyTransferError> {
     let config = global_config();
 
@@ -996,12 +953,6 @@ async fn drive_batches(
     let client_range_end = range_filter.skip + range_filter.send;
 
     while xfer.remaining > 0 {
-        // `pipe_A` is empty here -- every fan-out consumes its whole batch --
-        // so from now until the fan-out touches it, whatever the accumulation
-        // puts there belongs right after `pipe_B`'s pending bytes. Staging
-        // *before* the accumulation, not after, is what keeps a batch that
-        // ends in EOF or a splice error salvageable.
-        xfer.cache.batch_mut().stage();
         xfer.check_upstream_rate().await?;
 
         // Cap the batch at the next client-range edge so a batch is either
@@ -1061,14 +1012,7 @@ async fn drive_batches(
                 break;
             }
 
-            let res = splice(
-                upstream,
-                None,
-                upstream_pipe_sender,
-                None,
-                budget,
-                SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
-            );
+            let res = xfer.cache.pipes_mut().receive(upstream, budget);
 
             let _: Never = match res {
                 Ok(0) => {
@@ -1108,7 +1052,7 @@ async fn drive_batches(
                     // within `MAX_BATCH_AGE` of the park's start, which
                     // bounds the slack by the same constant.
                     clear_tcp_readable_cache(upstream);
-                    clear_pipe_writable_cache(upstream_pipe_sender);
+                    clear_pipe_writable_cache(&xfer.cache.pipes().upstream_tx);
                     let batch_is_stale = tokio::select! {
                         r = wait_readable_rated(
                             upstream,
@@ -1119,7 +1063,7 @@ async fn drive_batches(
                             r.map_err(BodyTransferError::upstream)?;
                             false
                         }
-                        w = upstream_pipe_sender.writable() => {
+                        w = xfer.cache.pipes().upstream_tx.writable() => {
                             w.map_err(BodyTransferError::proxy)?;
                             false
                         }
@@ -1158,7 +1102,7 @@ async fn drive_batches(
         {
             if chunk.start >= client_skip && chunk.end <= client_range_end {
                 // Chunk is entirely inside client range — normal tee
-                tee_and_splice(xfer, upstream_pipe_receiver, got).await?;
+                tee_and_splice(xfer, got).await?;
                 xfer.maybe_demote().await?;
                 continue;
             }
@@ -1170,8 +1114,10 @@ async fn drive_batches(
             // bytes straight to the client and corrupt a 206. Once the read
             // starts, whatever is left in `pipe_A` is a tail whose head lives
             // in `buf`, so the salvage must not land it.
-            xfer.cache.batch_mut().unstage();
-            let mut buf = read_pipe_to_buf(upstream_pipe_receiver, got)
+            let mut buf = xfer
+                .cache
+                .pipes_mut()
+                .read_boundary(got)
                 .await
                 .map_err(BodyTransferError::proxy)?;
 
@@ -1715,6 +1661,147 @@ async fn serve_remaining_from_file(
     }
 }
 
+/// The leading bytes of pipe A. Only pipe operations change this state, so
+/// callers cannot forget to account a tee or a partial client splice.
+enum PipeHead {
+    Unique,
+    Duplicated(std::num::NonZero<usize>),
+    /// A boundary read moved the head into a userspace buffer. Until the
+    /// next accumulation, a leftover tail cannot be salvaged on its own.
+    Extracted,
+}
+
+/// Owns both pipes and their fan-out state. Received bytes are unique until
+/// `duplicate` tees them; `send_to_client` and `discard_duplicate` retire only
+/// that duplicated head. Failure recovery first lands B, discards A's copies,
+/// then lands its unique tail, including a tail behind a partial tee.
+struct SplicePipes {
+    upstream_tx: pipe::Sender,
+    upstream_rx: pipe::Receiver,
+    upstream_fd: Arc<OwnedFd>,
+    cache: CacheBatch,
+    head: PipeHead,
+}
+
+impl SplicePipes {
+    fn new() -> std::io::Result<Self> {
+        let (upstream_tx, upstream_rx) = create_pipe()?;
+        let upstream_fd = Arc::new(upstream_rx.as_fd().try_clone_to_owned()?);
+        let (cache_tx, cache_rx) = create_pipe()?;
+        Ok(Self {
+            upstream_tx,
+            upstream_rx,
+            upstream_fd,
+            cache: CacheBatch::new(cache_rx, cache_tx)?,
+            head: PipeHead::Unique,
+        })
+    }
+
+    fn receive(&mut self, upstream: &impl std::os::fd::AsFd, budget: usize) -> nix::Result<usize> {
+        debug_assert!(
+            !self.has_duplicate(),
+            "the previous fan-out must consume its duplicated head before receiving"
+        );
+        // The previous fan-out consumed its whole batch. This transition is
+        // inside the receive operation, including when it ends in EOF/error.
+        self.head = PipeHead::Unique;
+        splice(
+            upstream,
+            None,
+            &self.upstream_tx,
+            None,
+            budget,
+            SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
+        )
+    }
+
+    fn duplicate(&mut self, count: usize) -> nix::Result<usize> {
+        debug_assert!(
+            matches!(self.head, PipeHead::Unique),
+            "tee must not duplicate a head already queued for the cache"
+        );
+        let teed = tee(
+            &self.upstream_rx,
+            &self.cache.tx,
+            count,
+            SpliceFFlags::empty(),
+        )?;
+        if let Some(count) = std::num::NonZero::new(teed) {
+            self.head = PipeHead::Duplicated(count);
+            self.cache.queue(teed);
+        }
+        Ok(teed)
+    }
+
+    const fn has_duplicate(&self) -> bool {
+        matches!(self.head, PipeHead::Duplicated(_))
+    }
+
+    fn send_to_client(
+        &mut self,
+        client: &impl std::os::fd::AsFd,
+        limit: usize,
+    ) -> nix::Result<usize> {
+        let PipeHead::Duplicated(remaining) = self.head else {
+            unreachable!("client splices only consume bytes already teed to the cache");
+        };
+        let sent = splice(
+            &self.upstream_rx,
+            None,
+            client,
+            None,
+            remaining.get().min(limit),
+            SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
+        )?;
+        self.head = std::num::NonZero::new(remaining.get() - sent)
+            .map_or(PipeHead::Unique, PipeHead::Duplicated);
+        Ok(sent)
+    }
+
+    async fn discard_duplicate(&mut self) -> std::io::Result<()> {
+        while self.has_duplicate() {
+            match self.send_to_client(dev_null()?, usize::MAX) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "pipe closed while discarding duplicated bytes",
+                    ));
+                }
+                Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                Err(nix::errno::Errno::EAGAIN) => {
+                    clear_pipe_readable_cache(&self.upstream_rx);
+                    self.upstream_rx.readable().await?;
+                }
+                Err(err) => return Err(errno_to_io_error(err, "discarding duplicated pipe bytes")),
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_boundary(&mut self, count: usize) -> std::io::Result<Vec<u8>> {
+        debug_assert!(
+            matches!(self.head, PipeHead::Unique),
+            "boundary extraction starts with unique bytes"
+        );
+        self.head = PipeHead::Extracted;
+        read_pipe_to_buf(&mut self.upstream_rx, count).await
+    }
+
+    async fn salvage_into(
+        mut self,
+        cache_file: &Arc<CacheFile>,
+        file_offset: &mut i64,
+    ) -> std::io::Result<()> {
+        drain_pipe_to_file(&self.cache.rx, cache_file, file_offset).await?;
+        if matches!(self.head, PipeHead::Extracted) {
+            return Ok(());
+        }
+        self.discard_duplicate().await?;
+        drain_pipe_to_file(&self.upstream_fd, cache_file, file_offset).await?;
+        Ok(())
+    }
+}
+
 /// The zero-copy loop's cache-file sink: `pipe_B` plus the policy for when
 /// the teed bytes sitting in it are drained to the file.
 ///
@@ -1755,16 +1842,9 @@ async fn serve_remaining_from_file(
 /// drains empty the pipe whatever it says, so a drift could only mis-time a
 /// flush, not wedge one.
 ///
-/// The one piece of `pipe_A` state kept here is [`Self::stage`]: whether
-/// `pipe_A` still holds exactly the bytes that belong at the cursor after
-/// the pending `pipe_B` ones, which is what makes it salvageable. That is
-/// true from the start of an accumulation until the fan-out touches the
-/// batch, and false as soon as a `tee` duplicates it into `pipe_B` (the
-/// untee'd tail is still unique, but the teed head is not) or the boundary
-/// path starts moving it into userspace (its head is then in a buffer that
-/// dies with the frame, so the tail alone would land at the wrong offset).
 struct CacheBatch {
-    // Only blocking drains read B; retain its nonblocking descriptor directly.
+    // Only blocking drains read pipe_B; release its reactor registration and
+    // retain the nonblocking descriptor directly for those jobs.
     rx: Arc<OwnedFd>,
     tx: pipe::Sender,
     /// Bytes teed into `pipe_B` since the last flush.
@@ -1773,8 +1853,6 @@ struct CacheBatch {
     /// batch is empty.
     queued_at: Option<coarsetime::Instant>,
     flushed_once: bool,
-    /// `pipe_A` holds an untouched batch that [`CacheWriter::salvage`] may land.
-    pipe_a_staged: bool,
 }
 
 impl CacheBatch {
@@ -1797,31 +1875,16 @@ impl CacheBatch {
             pending: 0,
             queued_at: None,
             flushed_once: false,
-            pipe_a_staged: false,
         })
-    }
-
-    /// `pipe_A` is empty and about to be filled by the accumulation loop;
-    /// until the fan-out touches the batch, everything in it is salvageable.
-    const fn stage(&mut self) {
-        self.pipe_a_staged = true;
-    }
-
-    /// The fan-out is about to move the batch out of `pipe_A` in a way that
-    /// leaves what remains there unsalvageable (see the type doc).
-    const fn unstage(&mut self) {
-        self.pipe_a_staged = false;
     }
 
     const fn is_empty(&self) -> bool {
         self.pending == 0
     }
 
-    /// Account `teed` bytes just duplicated into `pipe_B`. From here on
-    /// `pipe_A` holds copies of them until the client splice consumes them,
-    /// so it is no longer salvageable.
+    /// Track pending cache bytes for the flush policy. Duplication state
+    /// belongs to the pipe owner that performed the tee.
     fn queue(&mut self, teed: usize) {
-        self.unstage();
         self.pending += teed;
         self.queued_at.get_or_insert_with(coarsetime::Instant::now);
     }
@@ -1833,21 +1896,6 @@ impl CacheBatch {
             .queued_at
             .map_or(coarsetime::Duration::from_secs(0), |at| at.elapsed());
         tokio::time::sleep(Self::MAX_BATCH_AGE.saturating_sub(age).into())
-    }
-
-    /// The drains of [`CacheWriter::salvage`], without the reporting.
-    async fn salvage_into(
-        self,
-        upstream_pipe_rx: &Arc<OwnedFd>,
-        cache_file: &Arc<CacheFile>,
-        file_offset: &mut i64,
-    ) -> std::io::Result<()> {
-        drain_pipe_to_file(&self.rx, cache_file, file_offset).await?;
-        if !self.pipe_a_staged {
-            return Ok(());
-        }
-        drain_pipe_to_file(upstream_pipe_rx, cache_file, file_offset).await?;
-        Ok(())
     }
 }
 
@@ -1919,11 +1967,7 @@ impl<'a> ClientStatus<'a> {
 /// caller ([`BodyTransfer::maybe_demote`]) can either promote it to
 /// `ClientStatus::Demoted` (spawn a file-serve task) or abort the splice with
 /// an upstream-rate timeout when the upstream is the actual bottleneck.
-async fn tee_and_splice(
-    xfer: &mut BodyTransfer<'_>,
-    upstream_pipe_rx: &pipe::Receiver,
-    got: usize,
-) -> Result<(), BodyTransferError> {
+async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), BodyTransferError> {
     let mut remaining = got;
 
     while remaining > 0 {
@@ -1935,12 +1979,7 @@ async fn tee_and_splice(
             // Same optimistic-then-park pattern as Step 1: try tee first and
             // only `select!`-park on EAGAIN, after clearing both caches.
             let teed: usize = loop {
-                let res = tee(
-                    upstream_pipe_rx,
-                    &xfer.cache.batch().tx,
-                    remaining,
-                    SpliceFFlags::empty(),
-                );
+                let res = xfer.cache.pipes_mut().duplicate(remaining);
 
                 let _: Never = match res {
                     Ok(0) => {
@@ -1962,10 +2001,10 @@ async fn tee_and_splice(
                     }
                     // EAGAIN/EWOULDBLOCK: see module-level static_assert.
                     Err(nix::errno::Errno::EAGAIN) => {
-                        clear_pipe_readable_cache(upstream_pipe_rx);
+                        clear_pipe_readable_cache(&xfer.cache.pipes().upstream_rx);
                         clear_pipe_writable_cache(&xfer.cache.batch().tx);
                         tokio::select! {
-                            r = upstream_pipe_rx.readable() => r.map_err(BodyTransferError::proxy)?,
+                            r = xfer.cache.pipes().upstream_rx.readable() => r.map_err(BodyTransferError::proxy)?,
                             w = xfer.cache.batch().tx.writable() => w.map_err(BodyTransferError::proxy)?,
                         }
                         continue;
@@ -1984,7 +2023,6 @@ async fn tee_and_splice(
             // A due batch is written before the client splice below, so
             // concurrent clients still see progress without being gated on a
             // potentially slow first client.
-            xfer.cache.batch_mut().queue(teed);
             xfer.cache.flush_if_due().await?;
 
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
@@ -1994,19 +2032,10 @@ async fn tee_and_splice(
             // — they only run when the client is actually back-pressuring,
             // not on every busy iteration where pipe-readable would otherwise
             // win the `select!` race and cancel them mid-flight.
-            // Tracks how many of the just-teed bytes are still sitting in
-            // `pipe_A` waiting to be spliced to the client. Distinct from the
-            // transfer's `client_remaining` (response-level total).
-            let mut teed_remaining = teed;
-            while teed_remaining > 0 {
-                let result = splice(
-                    upstream_pipe_rx,
-                    None,
-                    client,
-                    None,
-                    teed_remaining,
-                    SpliceFFlags::SPLICE_F_MOVE | SpliceFFlags::SPLICE_F_MORE,
-                );
+            // The pipe owner tracks the duplicated head independently of
+            // the transfer's response-level client byte count.
+            while xfer.cache.pipes().has_duplicate() {
+                let result = xfer.cache.pipes_mut().send_to_client(client, usize::MAX);
 
                 let _: Never = match result {
                     Ok(0)
@@ -2019,13 +2048,14 @@ async fn tee_and_splice(
                         // Client disconnected — drain the remaining teed bytes from pipe_A
                         // by splicing them to /dev/null (discard)
                         xfer.client_disconnected();
-                        drain_pipe(upstream_pipe_rx, teed_remaining)
+                        xfer.cache
+                            .pipes_mut()
+                            .discard_duplicate()
                             .await
                             .map_err(BodyTransferError::proxy)?;
                         break;
                     }
                     Ok(n) => {
-                        teed_remaining -= n;
                         xfer.note_client_bytes(n);
                         if let Some(rc) = &mut xfer.client_rate_checker {
                             rc.add(n);
@@ -2036,11 +2066,11 @@ async fn tee_and_splice(
                                 // actually demote or to abort the splice on
                                 // upstream-rate failure (slow upstream is the
                                 // most common reason the client RC also trips).
-                                // `teed_remaining` has already been decremented by `n` (the bytes
-                                // just sent to the client), so it is exactly the count of teed
-                                // bytes still sitting in pipe_A that need to be drained before
-                                // we can stop servicing the client.
-                                drain_pipe(upstream_pipe_rx, teed_remaining)
+                                // The pipe owner already accounted the successful client splice,
+                                // so it discards only the remaining duplicated head.
+                                xfer.cache
+                                    .pipes_mut()
+                                    .discard_duplicate()
                                     .await
                                     .map_err(BodyTransferError::proxy)?;
 
@@ -2067,7 +2097,7 @@ async fn tee_and_splice(
                         // demoted. Parking on *upstream* is deliberately not a
                         // flush point -- see [`CacheBatch`].
                         xfer.cache.flush().await?;
-                        clear_pipe_readable_cache(upstream_pipe_rx);
+                        clear_pipe_readable_cache(&xfer.cache.pipes().upstream_rx);
                         clear_tcp_writable_cache(client);
                         tokio::select! {
                             w = wait_writable_rated(
@@ -2079,14 +2109,14 @@ async fn tee_and_splice(
                                 Ok(()) => {}
                                 Err(err) if err.kind() == ErrorKind::TimedOut => {
                                     xfer.abandon_stalled_client(client, "zero-copy body", &err);
-                                    drain_pipe(upstream_pipe_rx, teed_remaining)
+                                    xfer.cache.pipes_mut().discard_duplicate()
                                         .await
                                         .map_err(BodyTransferError::proxy)?;
                                     break;
                                 }
                                 Err(err) => return Err(BodyTransferError::client(err)),
                             },
-                            r = upstream_pipe_rx.readable() => r.map_err(BodyTransferError::proxy)?,
+                            r = xfer.cache.pipes().upstream_rx.readable() => r.map_err(BodyTransferError::proxy)?,
                         }
                         continue;
                     }
@@ -2171,71 +2201,6 @@ pub(super) fn range_slice(
     &buf[local_start..local_end]
 }
 
-/// Drain `count` bytes from a pipe by `splice(2)`ing them into `/dev/null`.
-///
-/// Zero-copy — no userspace buffer is allocated and the bytes never cross
-/// the kernel/userspace boundary. The destination fd is shared process-wide
-/// via [`dev_null`]; the receiver is the caller-owned pipe end.
-///
-/// Returns `UnexpectedEof` if the pipe's write end closes before `count` bytes
-/// have been moved.
-async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
-    if count == 0 {
-        return Ok(());
-    }
-    let devnull = dev_null()?;
-    let mut remaining = count;
-    while remaining > 0 {
-        // Optimistic-then-park: the bytes to drain are already sitting in
-        // the pipe (nothing else feeds it while a chunk is being fanned
-        // out), and the caller may have just cleared tokio's readiness
-        // cache for it. Parking on `readable()` first would then wait for
-        // an edge event no writer will ever produce; splice first and only
-        // park on a genuine EAGAIN.
-        let result = splice(
-            rx,
-            None,
-            devnull,
-            None,
-            remaining,
-            SpliceFFlags::SPLICE_F_MOVE,
-        );
-
-        let _: Never = match result {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "drain_pipe: pipe closed with bytes remaining",
-                ));
-            }
-            Ok(n) => {
-                remaining = remaining
-                    .checked_sub(n)
-                    .expect("splice should not return more than requested");
-                continue;
-            }
-            Err(nix::errno::Errno::EINTR) => continue,
-            // EAGAIN/EWOULDBLOCK: see module-level static_assert. Force Tokio
-            // to re-arm readiness so the next `readable().await` actually
-            // parks on a fresh epoll event instead of spinning on the cached
-            // ready bit.
-            Err(nix::errno::Errno::EAGAIN) => {
-                clear_pipe_readable_cache(rx);
-                rx.readable().await?;
-                continue;
-            }
-            Err(err) => {
-                return Err(errno_to_io_error(
-                    err,
-                    "drain_pipe: splice to /dev/null failed",
-                ));
-            }
-        };
-    }
-
-    Ok(())
-}
-
 /// Splice everything a pipe holds into the cache file at `file_offset`,
 /// advance the offset by what landed, and return that count.
 ///
@@ -2303,11 +2268,12 @@ async fn drain_pipe_to_file(
 
 #[cfg(test)]
 mod tests {
-    use nix::fcntl::{FcntlArg, fcntl};
     use std::{
         os::fd::AsRawFd as _,
         task::{Context, Waker},
     };
+
+    use nix::fcntl::{FcntlArg, fcntl};
 
     use super::*;
 
@@ -2609,11 +2575,9 @@ mod tests {
         let mut writer = CacheWriter::prepare(&mut scratch.file, 7, &mut hasher, barrier)
             .await
             .unwrap();
-        let (tx, rx) = create_pipe().unwrap();
-        writer.batch = Some(CacheBatch::new(rx, tx).unwrap());
+        writer.pipes = Some(SplicePipes::new().unwrap());
         // Model an earlier teed batch whose client bytes have been delivered.
-        nix::unistd::write(&writer.batch().tx, b"queued-").unwrap();
-        writer.batch_mut().queue(7);
+        queue_cache(writer.pipes_mut(), b"queued-").await;
         let mut boundary = b"boundary-".to_vec();
         writer.write_cache_chunk(&mut boundary, 9).await.unwrap();
         assert_eq!(writer.file_offset, 23);
@@ -2625,11 +2589,8 @@ mod tests {
         );
 
         // Switching to cache-only must also land the next queued bytes first.
-        nix::unistd::write(&writer.batch().tx, b"queued2-").unwrap();
-        writer.batch_mut().queue(8);
-        let (source_tx, source_rx) = create_pipe().unwrap();
-        nix::unistd::write(&source_tx, b"tail").unwrap();
-        writer.upstream_pipe = Some(owned_fd(&source_rx));
+        queue_cache(writer.pipes_mut(), b"queued2-").await;
+        accumulate(writer.pipes_mut(), b"tail");
         writer.write_through().await.unwrap();
         assert_eq!(writer.file_offset, 35);
         assert!(writer.batch().is_empty());
@@ -2645,14 +2606,11 @@ mod tests {
         let mut writer = CacheWriter::prepare(&mut scratch.file, 0, &mut hasher, barrier)
             .await
             .unwrap();
-        let (tx, rx) = create_pipe().unwrap();
-        writer.batch = Some(CacheBatch::new(rx, tx).unwrap());
-        nix::unistd::write(&writer.batch().tx, b"first").unwrap();
-        writer.batch_mut().queue(5);
+        writer.pipes = Some(SplicePipes::new().unwrap());
+        queue_cache(writer.pipes_mut(), b"first").await;
         writer.flush_if_due().await.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"first");
-        nix::unistd::write(&writer.batch().tx, b"second").unwrap();
-        writer.batch_mut().queue(6);
+        queue_cache(writer.pipes_mut(), b"second").await;
         writer.flush_if_due().await.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"first");
         assert_eq!(writer.batch().pending, 6);
@@ -2700,9 +2658,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let (tx, rx) = create_pipe().unwrap();
-        nix::unistd::write(&tx, b"tail").unwrap();
-        writer.upstream_pipe = Some(owned_fd(&rx));
+        writer.pipes = Some(SplicePipes::new().unwrap());
+        accumulate(writer.pipes_mut(), b"tail");
         writer.write_through().await.unwrap();
         drop(writer);
         let mut expected = prefix;
@@ -2710,110 +2667,83 @@ mod tests {
         assert_eq!(scratch.contents(), expected);
     }
 
-    /// Put `bytes` into `pipe_A` the way the accumulation loop does: stage,
-    /// then fill.
-    fn accumulate(pipe_a_tx: &pipe::Sender, cache: &mut CacheBatch, bytes: &[u8]) {
-        cache.stage();
-        // A raw write, like the splice(2) that fills it for real: tokio's
-        // `try_write` answers WouldBlock until the reactor has seen the pipe.
-        let written = nix::unistd::write(pipe_a_tx.as_fd(), bytes).expect("write into pipe_A");
-        assert_eq!(written, bytes.len(), "the batch fits in the pipe");
+    /// Feed the actual receive operation so salvageability does not rely on
+    /// test-only calls to stage or unstage a batch.
+    fn accumulate(pipes: &mut SplicePipes, bytes: &[u8]) {
+        let (tx, rx) = create_pipe().unwrap();
+        assert_eq!(nix::unistd::write(&tx, bytes).unwrap(), bytes.len());
+        assert_eq!(pipes.receive(&rx, bytes.len()).unwrap(), bytes.len());
     }
 
-    /// The reviewed P1: a batch that was teed into `pipe_B` and partly
-    /// delivered must not be landed from `pipe_A` a second time. With
-    /// `abcdefgh` teed and `abc` delivered, the salvage used to produce
-    /// `abcdefghdefgh`, and a later resume started from that length.
+    async fn queue_cache(pipes: &mut SplicePipes, bytes: &[u8]) {
+        accumulate(pipes, bytes);
+        assert_eq!(pipes.duplicate(bytes.len()).unwrap(), bytes.len());
+        pipes.discard_duplicate().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn salvage_does_not_land_a_batch_that_was_already_teed() {
-        let (pipe_a_tx, pipe_a_rx) = create_pipe().expect("pipe_A");
-        let (pipe_b_tx, pipe_b_rx) = create_pipe().expect("pipe_B");
         let scratch = ScratchFile::new();
-        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx).unwrap();
-
-        accumulate(&pipe_a_tx, &mut cache, b"abcdefgh");
-        // The fan-out: tee the whole batch, deliver three bytes to the
-        // "client" (drain them), then fail before the rest is delivered.
-        let teed = tee(&pipe_a_rx, &cache.tx, 8, SpliceFFlags::empty()).expect("tee");
-        assert_eq!(teed, 8);
-        cache.queue(teed);
-        drain_pipe(&pipe_a_rx, 3)
+        let mut pipes = SplicePipes::new().unwrap();
+        accumulate(&mut pipes, b"abcdefgh");
+        assert_eq!(pipes.duplicate(8).unwrap(), 8);
+        assert_eq!(pipes.send_to_client(dev_null().unwrap(), 3).unwrap(), 3);
+        let mut offset = 0;
+        pipes
+            .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
             .await
-            .expect("deliver three bytes");
-
-        let mut file_offset = 0;
-        cache
-            .salvage_into(
-                &owned_fd(&pipe_a_rx),
-                &owned_cache_file(&scratch).await,
-                &mut file_offset,
-            )
-            .await
-            .expect("salvage");
-
+            .unwrap();
         assert_eq!(scratch.contents(), b"abcdefgh");
-        assert_eq!(file_offset, 8);
+        assert_eq!(offset, 8);
     }
 
-    /// The case the salvage exists for: the accumulation loop fails with a
-    /// staged batch in `pipe_A`, behind bytes still pending in `pipe_B` from
-    /// the previous batch. Both land, in body order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn salvage_lands_a_staged_batch_after_the_pending_bytes() {
-        let (pipe_a_tx, pipe_a_rx) = create_pipe().expect("pipe_A");
-        let (pipe_b_tx, pipe_b_rx) = create_pipe().expect("pipe_B");
+    async fn salvage_keeps_unique_tail_after_partial_tee_and_client_write() {
         let scratch = ScratchFile::new();
-        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx).unwrap();
-
-        // Previous batch: teed, fully delivered, its cache write deferred.
-        accumulate(&pipe_a_tx, &mut cache, b"abc");
-        let teed = tee(&pipe_a_rx, &cache.tx, 3, SpliceFFlags::empty()).expect("tee");
-        cache.queue(teed);
-        drain_pipe(&pipe_a_rx, 3).await.expect("deliver the batch");
-        // Current batch: accumulated, then the upstream fails.
-        accumulate(&pipe_a_tx, &mut cache, b"defgh");
-
-        let mut file_offset = 0;
-        cache
-            .salvage_into(
-                &owned_fd(&pipe_a_rx),
-                &owned_cache_file(&scratch).await,
-                &mut file_offset,
-            )
+        let mut pipes = SplicePipes::new().unwrap();
+        accumulate(&mut pipes, b"abcdefgh");
+        assert_eq!(pipes.duplicate(3).unwrap(), 3);
+        assert_eq!(pipes.send_to_client(dev_null().unwrap(), 1).unwrap(), 1);
+        let mut offset = 0;
+        pipes
+            .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
             .await
-            .expect("salvage");
-
+            .unwrap();
         assert_eq!(scratch.contents(), b"abcdefgh");
-        assert_eq!(file_offset, 8);
+        assert_eq!(offset, 8);
     }
 
-    /// The boundary path moves the batch into userspace; a tail left in
-    /// `pipe_A` after that has no head to follow and must stay there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn salvage_leaves_an_unstaged_tail_alone() {
-        let (pipe_a_tx, pipe_a_rx) = create_pipe().expect("pipe_A");
-        let (pipe_b_tx, pipe_b_rx) = create_pipe().expect("pipe_B");
+    async fn salvage_lands_accumulated_bytes_after_the_pending_batch_on_eof() {
         let scratch = ScratchFile::new();
-        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx).unwrap();
-
-        accumulate(&pipe_a_tx, &mut cache, b"abcdefgh");
-        cache.unstage();
-        drain_pipe(&pipe_a_rx, 3)
+        let mut pipes = SplicePipes::new().unwrap();
+        queue_cache(&mut pipes, b"abc").await;
+        accumulate(&mut pipes, b"defgh");
+        let (tx, rx) = create_pipe().unwrap();
+        drop(tx);
+        assert_eq!(pipes.receive(&rx, 10).unwrap(), 0);
+        let mut offset = 0;
+        pipes
+            .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
             .await
-            .expect("the head went into a buffer");
+            .unwrap();
+        assert_eq!(scratch.contents(), b"abcdefgh");
+        assert_eq!(offset, 8);
+    }
 
-        let mut file_offset = 0;
-        cache
-            .salvage_into(
-                &owned_fd(&pipe_a_rx),
-                &owned_cache_file(&scratch).await,
-                &mut file_offset,
-            )
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn salvage_leaves_a_tail_without_its_extracted_head_alone() {
+        let scratch = ScratchFile::new();
+        let mut pipes = SplicePipes::new().unwrap();
+        accumulate(&mut pipes, b"abcdefgh");
+        assert_eq!(pipes.read_boundary(3).await.unwrap(), b"abc");
+        let mut offset = 0;
+        pipes
+            .salvage_into(&owned_cache_file(&scratch).await, &mut offset)
             .await
-            .expect("salvage");
-
+            .unwrap();
         assert!(scratch.contents().is_empty(), "the tail must not land");
-        assert_eq!(file_offset, 0);
+        assert_eq!(offset, 0);
     }
 
     #[test]
@@ -2927,92 +2857,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_pipe_discards_exact_count() {
-        use tokio::io::AsyncWriteExt as _;
-
-        let (mut tx, rx) = create_pipe().expect("create_pipe");
-        let payload = vec![0xABu8; 4096];
-        tx.write_all(&payload).await.expect("write payload");
-
-        drain_pipe(&rx, payload.len())
-            .await
-            .expect("drain should consume all bytes");
-
-        // After draining, no more bytes are readable without further writes.
-        // Drop the writer so a subsequent read sees EOF rather than hanging.
-        drop(tx);
-        let mut probe = [0u8; 16];
-        // try_read must return Ok(0) (EOF) — the pipe is empty and the writer closed.
-        // Loop past any spurious WouldBlock that can occur before the EOF is observed.
-        loop {
-            rx.readable().await.expect("readable");
-            match rx.try_read(&mut probe) {
-                Ok(0) => break,
-                Ok(n) => {
-                    assert_eq!(n, 0, "unexpected leftover bytes after drain");
-                    break;
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => unreachable!("unexpected read error: {e}"),
-            }
-        }
+    async fn discard_duplicate_preserves_the_unique_tail() {
+        let mut pipes = SplicePipes::new().unwrap();
+        accumulate(&mut pipes, b"abcdefgh");
+        assert_eq!(pipes.duplicate(3).unwrap(), 3);
+        pipes.discard_duplicate().await.unwrap();
+        assert!(!pipes.has_duplicate());
+        assert_eq!(pipes.read_boundary(5).await.unwrap(), b"defgh");
     }
 
     #[tokio::test]
-    async fn test_drain_pipe_zero_count_is_noop() {
-        let (_tx, rx) = create_pipe().expect("create_pipe");
-        // Must not touch the pipe and must not await readability (which would hang).
-        drain_pipe(&rx, 0)
-            .await
-            .expect("zero-count drain is a no-op");
-    }
-
-    #[tokio::test]
-    async fn test_drain_pipe_eof_mid_drain_returns_unexpected_eof() {
-        use tokio::io::AsyncWriteExt as _;
-
-        let (mut tx, rx) = create_pipe().expect("create_pipe");
-        // Write only half of what we'll ask to drain, then close the writer to
-        // force EOF on the next splice attempt.
-        tx.write_all(&[0u8; 1024]).await.expect("write half");
-        drop(tx);
-
-        let err = drain_pipe(&rx, 4096)
-            .await
-            .expect_err("drain must fail when pipe closes before count satisfied");
-        assert_eq!(
-            err.kind(),
-            ErrorKind::UnexpectedEof,
-            "expected UnexpectedEof, got {err:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn test_drain_pipe_crosses_multiple_readable_rounds() {
-        use tokio::io::AsyncWriteExt as _;
-
-        // Pick a total payload several pipe-buffers' worth so the kernel
-        // cannot deliver it all in one splice round regardless of writer
-        // scheduling: drain_pipe must loop, hitting `rx.readable().await`
-        // at least `total / pipe_size` times, with at least one round
-        // blocked until the writer task refills. The previous variant
-        // (8 KiB total, default 64 KiB pipe, `yield_now()` between batches)
-        // could pass even when drain consumed everything in a single
-        // splice — exactly the regression this test is meant to catch.
-        let (mut tx, rx) = create_pipe().expect("create_pipe");
-        let _ignore = fcntl(rx.as_fd(), FcntlArg::F_SETPIPE_SZ(4096));
-        let pipe_size = fcntl(rx.as_fd(), FcntlArg::F_GETPIPE_SZ).expect("pipe size");
-        let total: usize = (pipe_size * 4).try_into().expect("pipe_size fits usize");
-
-        let drain_handle = tokio::spawn(async move {
-            drain_pipe(&rx, total).await.expect("drain succeeds");
-            rx
-        });
-
-        let payload = vec![0xABu8; total];
-        tx.write_all(&payload).await.expect("write full payload");
-        drop(tx);
-
-        let _rx = drain_handle.await.expect("drain task completes");
+    async fn discard_without_a_duplicate_does_not_consume_unique_bytes() {
+        let mut pipes = SplicePipes::new().unwrap();
+        accumulate(&mut pipes, b"body");
+        pipes.discard_duplicate().await.unwrap();
+        assert_eq!(pipes.read_boundary(4).await.unwrap(), b"body");
     }
 }
