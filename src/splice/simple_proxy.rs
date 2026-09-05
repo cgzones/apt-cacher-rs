@@ -251,7 +251,12 @@ pub(crate) async fn splice_simple_proxy(
         .framing
         .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
         .await
-        .map_err(SpliceProxyError::after_header_client("simple-proxy body"))?;
+        .map_err(|err| {
+            err.into_after_header(
+                "simple-proxy body",
+                format_args!("{upstream_path} from {host_authority}"),
+            )
+        })?;
 
     let t_done = PreciseInstant::now();
     let in_time = request_received_at.elapsed();

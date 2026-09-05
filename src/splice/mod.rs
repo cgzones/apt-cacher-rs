@@ -963,7 +963,9 @@ async fn relay_passthrough(
         .framing
         .relay_to_client(upstream, client.stream, body_prefix, VOLATILE_BODY_MAX)
         .await
-        .map_err(SpliceProxyError::after_header_client("passthrough body"))?;
+        .map_err(|err| {
+            err.into_after_header("passthrough body", format_args!("{}", conn_details.debname))
+        })?;
 
     metrics::SERVED_PASSTHROUGH.increment();
     metrics::SERVED_TOTAL.increment();
@@ -1777,7 +1779,10 @@ async fn splice_proxy_drive(
     )
     .await
     .map_err(|BodyTransferFailure { temppath, err }| {
-        err.into_after_header("splice body transfer", &temppath)
+        err.into_after_header(
+            "splice body transfer",
+            format_args!("`{}`", temppath.display()),
+        )
     })?;
 
     // Uncork only now. The client splice in `body.rs::tee_and_splice` sets
@@ -1914,7 +1919,7 @@ pub(crate) enum SpliceProxyError {
     /// `500 Internal Server Error` / `"Cache Access Failure"` silently.
     Cache(Logged),
     /// An I/O failure after the response headers were written. The client
-    /// already holds a 200/206 header, so the outer arm closes the
+    /// already holds the response headers, so the outer arm closes the
     /// connection without a new status; `side` says which of the parties
     /// broke and carries what that party's logging policy needs.
     AfterHeader {
@@ -1960,12 +1965,11 @@ pub(crate) struct UpstreamFailure {
 /// to the outer arm, the proxy-local sides own the on-disk path and log at the
 /// throw site.
 pub(crate) enum AfterHeaderSide {
-    /// The mirror stalled, hung up, or fell below `min_download_rate`
-    /// mid-body. Logged at the outer arm at plain WARN: unlike a client
-    /// hang-up there is no benign case, and the throw sites already bumped
-    /// their dedicated counter (`HTTP_TIMEOUT_UPSTREAM_READ`,
-    /// `RATE_LIMIT_UPSTREAM`, `UPSTREAM_PROTOCOL_VIOLATION`), so the line is
-    /// counter-backed and bounded to one per connection.
+    /// The mirror stalled, hung up, fell below `min_download_rate`, or sent
+    /// a body whose framing or size we reject. Logged at plain WARN, bounded
+    /// to one per connection: this is never a routine client disconnect.
+    /// Timeouts, rate failures and framing violations also bump their
+    /// dedicated counters at the throw site.
     Upstream(std::io::Error),
     /// The client socket. Logged at the outer arm with the
     /// `is_peer_disconnect` split (INFO for a peer disconnect, WARN

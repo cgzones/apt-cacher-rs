@@ -1383,11 +1383,9 @@ fn splice_error_outcome(
                     }
                 }
                 // No peer-hung-up case to demote (see the variant doc): every
-                // way here means this mirror failed to deliver a body it had
-                // already promised, and the operator wants to see which
-                // mirror. Counter-backed and bounded to one line per
-                // connection, so it takes the same once-gating exemption as
-                // the delivery split.
+                // way here means the upstream body failed or was rejected.
+                // Bounded to one line per connection, so it takes the same
+                // once-gating exemption as the delivery split.
                 AfterHeaderSide::Upstream(err) => {
                     warn!(
                         "{prefix}: upstream failed in {phase} for {subject}; closing the connection:  {}",

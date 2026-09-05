@@ -169,7 +169,8 @@ pub(super) enum DeliveryResult {
 /// throw site now names its side so the outer arm can attribute it correctly.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BodyFailureSide {
-    /// Reading from (or rate-checking) the upstream connection.
+    /// Reading from or rate-checking upstream, or rejecting its body framing
+    /// or size. A size cap is a response-policy rejection, not a client failure.
     Upstream,
     /// Writing to the client socket.
     Client,
@@ -182,24 +183,25 @@ pub(crate) enum BodyFailureSide {
     Proxy,
 }
 
-/// An `io::Error` out of `splice_proxy_body{,_tls}` tagged with the side of
-/// the proxy that produced it.  Construct via [`BodyTransferError::upstream`]
+/// An `io::Error` from a cached body transfer or passthrough relay, tagged
+/// with the side of the proxy that produced it.  Construct via [`BodyTransferError::upstream`]
 /// / [`BodyTransferError::client`] / [`BodyTransferError::proxy`] so the
 /// tagging stays greppable at every throw site.
+#[derive(Debug)]
 pub(crate) struct BodyTransferError {
     side: BodyFailureSide,
     err: std::io::Error,
 }
 
 impl BodyTransferError {
-    fn upstream(err: std::io::Error) -> Self {
+    pub(super) fn upstream(err: std::io::Error) -> Self {
         Self {
             side: BodyFailureSide::Upstream,
             err,
         }
     }
 
-    fn client(err: std::io::Error) -> Self {
+    pub(super) fn client(err: std::io::Error) -> Self {
         Self {
             side: BodyFailureSide::Client,
             err,
@@ -222,13 +224,13 @@ impl BodyTransferError {
 
     /// Attribute this failure for the outer arm. The peer sides hand their
     /// error over unchanged; the proxy-local sides are logged here, where
-    /// `temppath` -- the cache file being written -- is in scope, and hand
-    /// over the proof instead. `phase` names the transfer for both the log
-    /// line and the outer arm's tag.
+    /// `subject` identifies the transfer (the quoted cache path for cached
+    /// transfers), and hand over the proof instead. `phase` names the transfer
+    /// for both the log line and the outer arm's tag.
     pub(super) fn into_after_header(
         self,
         phase: &'static str,
-        temppath: &Path,
+        subject: std::fmt::Arguments<'_>,
     ) -> SpliceProxyError {
         let Self { side, err } = self;
         let side = match side {
@@ -236,16 +238,14 @@ impl BodyTransferError {
             BodyFailureSide::Client => AfterHeaderSide::Client(err),
             BodyFailureSide::Cache => {
                 AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
-                    "splice proxy: failed to write the cache file `{}` in {phase}; aborting the transfer and closing the connection:  {}",
-                    temppath.display(),
+                    "splice proxy: failed to write the cache file {subject} in {phase}; aborting the transfer and closing the connection:  {}",
                     ErrorReport(&err)
                 )))
             }
             // Splice pipes / fd duplication -- not a cached-file syscall, so
             // `CACHE_IO_FAILURE` stays out of it.
             BodyFailureSide::Proxy => AfterHeaderSide::Proxy(Logged::error(format_args!(
-                "splice proxy: proxy-side I/O failure in {phase} for `{}`; aborting the transfer and closing the connection:  {}",
-                temppath.display(),
+                "splice proxy: proxy-side I/O failure in {phase} for {subject}; aborting the transfer and closing the connection:  {}",
                 ErrorReport(&err)
             ))),
         };
