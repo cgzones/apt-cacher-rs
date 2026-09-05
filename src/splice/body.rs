@@ -21,11 +21,13 @@
 //! [`BodyTransferError::log_detached`]).
 
 use std::{
+    future::Future as _,
     io::ErrorKind,
     ops::Range,
     os::fd::{AsFd as _, AsRawFd as _, BorrowedFd},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
+    task::Poll,
     time::Duration,
 };
 
@@ -1092,6 +1094,13 @@ async fn pwrite_buf_to_file(
 /// concurrent clients see progress without being gated on this client's
 /// send speed.
 ///
+/// Same exit shape as [`splice_proxy_body`]: the read loop returns the
+/// moment it sees an error, and the one exit here lands whatever the buffer
+/// still holds ([`salvage_read_buf`]). The buffer holds exactly the bytes
+/// not yet in the cache file -- [`drive_reads`] takes it away before the
+/// client delivery and hands it back empty -- so that salvage can never
+/// write a byte twice.
+///
 /// On error the upstream is left mid-message (fewer than `content_length`
 /// bytes consumed), so its socket still holds undelivered bytes -- the caller
 /// must mark the upstream non-poolable to keep the poisoned connection out of
@@ -1116,12 +1125,35 @@ pub(super) async fn splice_proxy_body_tls(
         file_start_offset,
     );
 
-    let config = global_config();
-
     // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
     // writes into the spare capacity via `BufMut` so the buffer never has
     // to be zero-initialized before being overwritten by upstream data.
     let mut read_buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
+
+    let driven = drive_reads(&mut xfer, upstream, &mut read_buf, cache_file).await;
+    if let Err(err) = driven {
+        salvage_read_buf(&mut xfer, &mut read_buf, cache_file).await;
+        return Err(err);
+    }
+
+    Ok(xfer.finish())
+}
+
+/// The read loop of [`splice_proxy_body_tls`]: accumulate a batch into
+/// `read_buf`, write it to the cache file, deliver it, repeat until the body
+/// is exhausted.
+///
+/// Every failure returns straight out, leaving the not-yet-written bytes in
+/// `read_buf` for the caller's [`salvage_read_buf`]; nothing in here has to
+/// remember them.
+async fn drive_reads(
+    xfer: &mut BodyTransfer<'_>,
+    upstream: &mut UpstreamConn,
+    read_buf: &mut Vec<u8>,
+    cache_file: &tokio::fs::File,
+) -> Result<(), BodyTransferError> {
+    let config = global_config();
+    let range_filter = xfer.range_filter;
 
     // One pinned re-armable sleep per body for the http_timeout deadline
     // and one for the 1 s rate-check tick — the previous version built two
@@ -1138,21 +1170,50 @@ pub(super) async fn splice_proxy_body_tls(
         // Step 1: async read from TLS stream into userspace buffer
         // The outer http_timeout ensures a fully stalled connection is killed even if
         // rate_check_timeframe > http_timeout.
-        debug_assert_eq!(
-            read_buf.capacity(),
-            TLS_READ_BUF_SIZE,
-            "buffer capacity should remain constant"
+        debug_assert!(
+            read_buf.is_empty() && read_buf.capacity() == TLS_READ_BUF_SIZE,
+            "the buffer is handed back empty, at its original capacity"
         );
-        read_buf.clear();
         let to_read = std::cmp::min(xfer.remaining, TLS_READ_BUF_SIZE as u64);
         outer
             .as_mut()
             .reset(tokio::time::Instant::now() + config.http_timeout);
-        let got = {
-            let mut taken = (&mut *upstream).take(to_read);
-            let read_fut = taken.read_buf(&mut read_buf);
+
+        loop {
+            let filled = read_buf.len();
+            let budget = to_read - filled as u64;
+            if budget == 0 {
+                // Buffer full, or the body is exhausted.
+                break;
+            }
+            let mut taken = (&mut *upstream).take(budget);
+            let read_fut = taken.read_buf(&mut *read_buf);
             tokio::pin!(read_fut);
-            loop {
+
+            if filled > 0 {
+                // Bytes in hand: probe the stream once and hand them on the
+                // moment it runs dry. One `poll_read` on a `TlsStream` yields
+                // about one 16 KiB TLS record however much capacity it is
+                // offered, so without this the loop paid a `pwrite` and a
+                // client write per record. Never *park* to fill the buffer,
+                // though -- that would turn a sub-buffer download into
+                // store-and-forward. (Dropping a `Pending` `read_buf` future
+                // loses nothing: it polls the stream once and any decrypted
+                // plaintext stays in the TLS session's own buffer.)
+                match std::future::poll_fn(|cx| Poll::Ready(read_fut.as_mut().poll(cx))).await {
+                    Poll::Pending => break,
+                    Poll::Ready(Ok(0)) => return Err(tls_premature_eof()),
+                    Poll::Ready(Ok(n)) => {
+                        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
+                        continue;
+                    }
+                    Poll::Ready(Err(err)) => return Err(BodyTransferError::upstream(err)),
+                }
+            }
+
+            // Empty buffer: this is the transfer's genuine stall point, so it
+            // keeps the rate tick and the `http_timeout` deadline.
+            let n = loop {
                 tokio::select! {
                     biased;
                     // The pinned future is re-polled (not re-created) after a
@@ -1186,16 +1247,14 @@ pub(super) async fn splice_proxy_body_tls(
                         )));
                     }
                 }
+            };
+            if n == 0 {
+                return Err(tls_premature_eof());
             }
-        };
-        if got == 0 {
-            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            return Err(BodyTransferError::upstream(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "splice proxy: TLS upstream closed prematurely",
-            )));
+            metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
         }
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(got as u64);
+        let got = read_buf.len();
+        debug_assert!(got > 0, "a batch only ends with bytes; every failure returns");
 
         // Determine how this chunk overlaps with the client range.
         let chunk = xfer.note_chunk(got);
@@ -1203,26 +1262,73 @@ pub(super) async fn splice_proxy_body_tls(
         // Write the full chunk to cache via pwrite first, so concurrent
         // clients see progress without being gated on this client's send
         // speed.
-        xfer.write_cache_chunk(cache_file, &mut read_buf, got)
-            .await?;
+        xfer.write_cache_chunk(cache_file, read_buf, got).await?;
 
-        let client_slice = range_slice(
-            &read_buf[..got],
-            chunk.start,
-            range_filter.skip,
-            range_filter.send,
-        );
+        // From here on the bytes are on disk: take them out of `read_buf` for
+        // the delivery, so a failure in it leaves the buffer empty and the
+        // exit salvage has nothing to write twice. The allocation comes back
+        // at the end of the iteration.
+        let landed = std::mem::take(read_buf);
+        let client_slice = range_slice(&landed[..got], chunk.start, range_filter.skip, range_filter.send);
         if let Some(client) = xfer.client_status.client_to_write()
             && !client_slice.is_empty()
         {
-            write_client_or_demote(&mut xfer, client, client_slice)
+            write_client_or_demote(xfer, client, client_slice)
                 .await
                 .map_err(BodyTransferError::client)?;
             xfer.maybe_demote().await?;
         }
+        *read_buf = landed;
+        read_buf.clear();
     }
 
-    Ok(xfer.finish())
+    Ok(())
+}
+
+/// The upstream closed before delivering `content_length` bytes.
+fn tls_premature_eof() -> BodyTransferError {
+    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+    BodyTransferError::upstream(std::io::Error::new(
+        ErrorKind::UnexpectedEof,
+        "splice proxy: TLS upstream closed prematurely",
+    ))
+}
+
+/// Land the bytes a failing transfer left in `read_buf` in the cache file:
+/// the userspace mirror of `CacheBatch::salvage`, for the one exit of
+/// [`splice_proxy_body_tls`].
+///
+/// They were consumed from the upstream socket, so nothing delivers them
+/// again; without this the `.partial` a later attempt resumes from would be
+/// short of what was received. `read_buf` holds only bytes not yet written
+/// (see [`drive_reads`]), so nothing lands twice. The barrier is not pinged:
+/// on the upstream-rate abort path it is already consumed, and the joiners
+/// it would wake have been told the download failed. Nothing is counted
+/// either: the bytes were counted as downloaded when they arrived, whether
+/// or not `note_chunk` got to run. A failed salvage is reported here and
+/// does not replace the transfer's own error.
+async fn salvage_read_buf(
+    xfer: &mut BodyTransfer<'_>,
+    read_buf: &mut Vec<u8>,
+    cache_file: &tokio::fs::File,
+) {
+    let got = read_buf.len();
+    if got == 0 {
+        return;
+    }
+    match pwrite_buf_to_file(cache_file, read_buf, got, xfer.file_offset).await {
+        Ok(()) => {
+            xfer.file_offset +=
+                i64::try_from(got).expect("a chunk is bounded by its read buffer, which fits in i64");
+        }
+        Err(err) => {
+            let _logged = Logged::cache_io_failure(format_args!(
+                "splice proxy: failed to land the last received bytes of `{}` in the partial file; a later attempt resumes from a shorter partial:  {}",
+                xfer.cache_path.display(),
+                ErrorReport(&err)
+            ));
+        }
+    }
 }
 
 /// Write `slice` to the client with rate checking, translating client
