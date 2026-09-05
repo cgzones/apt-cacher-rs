@@ -45,7 +45,7 @@ use crate::database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db
 use crate::error::ErrorReport;
 use crate::guards::RenameBarrier;
 use crate::humanfmt::HumanFmt;
-use crate::index_parser::StreamHasher;
+use crate::index_parser::StreamedDigest;
 use crate::partial_file::TempPath;
 use crate::precise_instant::PreciseInstant;
 use crate::{metrics, rate_log};
@@ -107,7 +107,7 @@ pub(super) struct Committable {
     dest_path: PathBuf,
     rbarrier: RenameBarrier,
     /// The incremental digest, if one was kept.
-    hasher: Option<StreamHasher>,
+    streamed_digest: Option<StreamedDigest>,
 }
 
 impl CacheTarget {
@@ -120,19 +120,18 @@ impl CacheTarget {
     /// sender is awake before anyone can await it.
     pub(super) async fn begin_rename(self) -> Committable {
         let Self {
-            tempfile,
+            writer,
             temppath,
             dest_path,
-            dbarrier,
-            hasher,
         } = self;
+        let (tempfile, dbarrier, streamed_digest) = writer.finish();
         let rbarrier = dbarrier.begin_rename().await;
         Committable {
             tempfile,
             temppath,
             dest_path,
             rbarrier,
-            hasher,
+            streamed_digest,
         }
     }
 }
@@ -385,14 +384,8 @@ async fn commit_target(
         temppath,
         dest_path,
         rbarrier,
-        hasher,
+        streamed_digest,
     } = target;
-
-    // `Some` only when every byte of the finished file went through the
-    // digest: the download started at offset 0 and its body took the
-    // userspace-TLS loop. `verify_temp_file` re-checks the algorithm and the
-    // byte count before trusting it and re-reads the file when it cannot.
-    let streamed_digest = hasher.map(StreamHasher::finalize);
 
     // Sync cache file to ensure durability
     if let Err(err) = tempfile.sync_all().await {

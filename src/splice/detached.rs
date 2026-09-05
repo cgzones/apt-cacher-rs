@@ -120,8 +120,6 @@ impl DetachedDownload {
             &mut upstream,
             BodyClient::Absent,
             target,
-            resume_offset,
-            body_content_length,
             splice_count,
             &NO_CLIENT_RANGE,
             &mut rates,

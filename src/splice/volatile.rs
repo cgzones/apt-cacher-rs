@@ -15,12 +15,8 @@
 //! the completion line and the `Delivery` row wait for the client write
 //! ([`Committed::report`]).
 //!
-//! It also passes `None` for `prepare_cache_target`'s `hasher`: the buffered
-//! body goes straight to the temp file, past the two sites that advance a
-//! `StreamHasher`, so any hasher handed to this path would be finalised over no
-//! input and fail verification for every registry-backed `Packages` fetch that
-//! arrives without a `Content-Length`. This path's commit re-reads and hashes
-//! the finished file instead.
+//! Buffered bodies use the same cache writer as the streaming path, with
+//! commit-time verification instead of an incremental digest.
 
 use std::num::NonZero;
 
@@ -47,7 +43,7 @@ use super::http::{BodyFraming, UpstreamResponse};
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
     ClientConn, RateTimestamps, SpliceProxyError, UpstreamFailure, prepare_cache_target,
-    resolve_client_range, write_all_flushed, write_splice_response_headers,
+    resolve_client_range, write_splice_response_headers,
 };
 
 /// Handle the full lifecycle for volatile files whose upstream response has no
@@ -147,12 +143,7 @@ pub(super) async fn handle_volatile_buffered_download(
         total_content_length,
         ibarrier,
         "volatile quota 503",
-        // No incremental digest: the buffered body below is written straight
-        // to `tempfile`, bypassing the two sites that feed a `StreamHasher`.
-        // A hasher here would be finalised over no input at all and fail
-        // verification for every registry-backed `Packages` fetch that lands
-        // on this path.
-        None,
+        super::body::CacheWriteMode::Userspace(None),
     )
     .await?
     else {
@@ -168,13 +159,7 @@ pub(super) async fn handle_volatile_buffered_download(
     // already-downloaded body (late joiners and future requests keep it).
 
     // Write the full body to the cache temp file (best-effort).
-    let cache_write_ok = match write_all_flushed(
-        &mut target.tempfile,
-        &body,
-        target.dbarrier.write_lease(),
-    )
-    .await
-    {
+    let cache_write_ok = match target.writer.write_prefix(&body).await {
         Ok(()) => true,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();

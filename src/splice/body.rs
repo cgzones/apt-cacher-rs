@@ -42,7 +42,7 @@ use crate::error::{ErrorReport, errno_to_io_error, is_peer_disconnect};
 use crate::fs_open::{hint_sequential_read, nofollow_options};
 use crate::guards::{DownloadBarrier, DownloadWriteLease};
 use crate::humanfmt::HumanFmt;
-use crate::index_parser::StreamHasher;
+use crate::index_parser::{HashAlgo, StreamHasher, StreamedDigest};
 use crate::log_once::Logged;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::sendfile_conn::{
@@ -361,59 +361,44 @@ struct CacheFile {
 /// The single append owner: the file cursor, pending tee bytes, digest and
 /// publication barrier travel together. All direct writes flush earlier tee
 /// bytes internally; policy flushes retain the existing batching thresholds.
-pub(super) struct CacheWriter<'a> {
-    // Keep the exclusive borrow from `prepare` alive through the raw-I/O phase.
-    _file: &'a tokio::fs::File,
-    // Duplicate once per transfer. Blocking jobs retain their own Arc, so
-    // cancellation can drop the async owner without closing a job's file.
+pub(super) struct CacheWriter {
+    tempfile: tokio::fs::File,
+    // Duplicate once, before the first write. Blocking jobs retain their own
+    // Arc so cancellation cannot close their file or release the write lease.
     file: Arc<CacheFile>,
     file_offset: i64,
-    hasher: &'a mut Option<StreamHasher>,
+    hasher: Option<StreamHasher>,
     dbarrier: Option<DownloadBarrier>,
     pipes: Option<SplicePipes>,
 }
 
-impl<'a> CacheWriter<'a> {
-    /// Prefix writes own their file descriptor and write lease on the blocking
-    /// pool; publish and hash only after the write has completed. `prepare`
-    /// consumes the subsequent exclusive file borrow for the raw-I/O phase.
-    pub(super) async fn write_prefix(
-        file: &mut tokio::fs::File,
-        bytes: &[u8],
-        hasher: &mut Option<StreamHasher>,
-        barrier: &mut DownloadBarrier,
-    ) -> std::io::Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        super::write_all_flushed(file, bytes, barrier.write_lease()).await?;
-        if let Some(hasher) = hasher.as_mut() {
-            hasher.update(bytes);
-        }
-        barrier.ping();
-        Ok(())
-    }
+/// Whether every new byte is available in userspace. Resumed downloads cannot
+/// supply a whole-file digest even in userspace mode.
+pub(super) enum CacheWriteMode {
+    Kernel,
+    Userspace(Option<HashAlgo>),
+}
 
-    /// Finish any prior buffered I/O before borrowing the file for raw
-    /// explicit-offset writes. Production prefix writes already await their
-    /// owned jobs; an idle flush issues no syscall or blocking task. The
-    /// exclusive borrow prevents buffered writes for this writer's lifetime.
-    pub(super) async fn prepare(
-        file: &'a mut tokio::fs::File,
+impl CacheWriter {
+    /// Take ownership before the first prefix/body write. Finish any previous
+    /// Tokio I/O once; all subsequent writes use this owner's explicit offset.
+    pub(super) async fn new(
+        mut tempfile: tokio::fs::File,
         file_offset: i64,
-        hasher: &'a mut Option<StreamHasher>,
+        mode: CacheWriteMode,
         dbarrier: DownloadBarrier,
-    ) -> Result<Self, BodyTransferError> {
+    ) -> std::io::Result<Self> {
         use tokio::io::AsyncWriteExt as _;
-        file.flush().await.map_err(BodyTransferError::cache)?;
-        let owned_file = file
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(BodyTransferError::cache)?;
+        tempfile.flush().await?;
+        let fd = tempfile.as_fd().try_clone_to_owned()?;
+        let hasher = match mode {
+            CacheWriteMode::Userspace(algo) if file_offset == 0 => algo.map(StreamHasher::new),
+            CacheWriteMode::Kernel | CacheWriteMode::Userspace(_) => None,
+        };
         Ok(Self {
-            _file: file,
+            tempfile,
             file: Arc::new(CacheFile {
-                fd: owned_file,
+                fd,
                 _write_lease: dbarrier.write_lease(),
             }),
             file_offset,
@@ -421,6 +406,39 @@ impl<'a> CacheWriter<'a> {
             dbarrier: Some(dbarrier),
             pipes: None,
         })
+    }
+
+    /// Prefixes and fully buffered bodies use the same append path as TLS
+    /// chunks. Publish only after the owned blocking write has completed.
+    pub(super) async fn write_prefix(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.write_cache_chunk(&mut bytes.to_vec(), bytes.len())
+            .await
+            .map_err(|err| err.err)
+    }
+
+    /// Only a drained writer can hand its file and whole-file digest to commit.
+    pub(super) fn finish(self) -> (tokio::fs::File, DownloadBarrier, Option<StreamedDigest>) {
+        assert!(
+            self.pipes
+                .as_ref()
+                .is_none_or(|pipes| pipes.cache.is_empty()),
+            "all queued cache bytes must land before commit"
+        );
+        (
+            self.tempfile,
+            self.dbarrier
+                .expect("a completed writer still owns its barrier"),
+            self.hasher.map(StreamHasher::finalize),
+        )
+    }
+
+    pub(super) fn position(&self) -> u64 {
+        self.file_offset
+            .try_into()
+            .expect("cache offsets are non-negative")
     }
 
     fn barrier(&mut self) -> &mut DownloadBarrier {
@@ -453,26 +471,20 @@ impl<'a> CacheWriter<'a> {
     /// and notify concurrent clients. Always done before the client send so
     /// late joiners are not gated on this client's send speed.
     ///
-    /// This is one of the two sites that write into the cache file, so it is
-    /// one of the two that feed [`Self::hasher`] (the other is
-    /// `write_body_prefix_to_cache`). The digest update runs here on the async
-    /// worker rather than inside `pwrite_buf_to_file`'s `spawn_blocking`: this
-    /// path is the userspace-TLS loop, whose `read_buf` already decrypts the
-    /// same chunk on this worker at a comparable cost per byte, so one more
-    /// pass over a buffer that is already hot is proportionate -- and it keeps
-    /// the buffer-swap invariants of the pwrite retry loop untouched.
+    /// The only digest update site, shared by prefixes, buffered bodies and
+    /// TLS chunks. Hash after a successful write, while the buffer is still hot.
     async fn write_cache_chunk(
         &mut self,
         buf: &mut Vec<u8>,
         got: usize,
     ) -> Result<(), BodyTransferError> {
         self.flush().await?;
-        if let Some(hasher) = self.hasher.as_mut() {
-            hasher.update(&buf[..got]);
-        }
         pwrite_buf_to_file(&self.file, buf, got, self.file_offset)
             .await
             .map_err(BodyTransferError::cache)?;
+        if let Some(hasher) = self.hasher.as_mut() {
+            hasher.update(&buf[..got]);
+        }
         self.file_offset +=
             i64::try_from(got).expect("a chunk is bounded by its read buffer, which fits in i64");
         self.barrier().ping_batched(got as u64);
@@ -484,10 +496,7 @@ impl<'a> CacheWriter<'a> {
     /// holds exactly the bytes to land.
     async fn drain_pipe_to_cache(&mut self) -> Result<(), BodyTransferError> {
         // These bytes go pipe-to-file inside the kernel and are never in
-        // userspace, so they cannot feed an incremental digest. `transfer_body`
-        // drops the hasher before entering the zero-copy loop for exactly this
-        // reason; if one ever arrived here the committed digest would cover
-        // only the body prefix and wrongly fail verification.
+        // userspace, so kernel mode never creates an incremental digest.
         debug_assert!(
             self.hasher.is_none(),
             "the zero-copy path cannot hash: its bytes never reach userspace"
@@ -627,7 +636,7 @@ pub(super) struct BodyTransfer<'a> {
     /// and `None` from the start for a client-less transfer, which ships no
     /// bytes to any client and so must not bump `ACTIVE_CLIENT_DOWNLOADS`.
     counter: Option<client_counter::ClientDownload>,
-    cache: CacheWriter<'a>,
+    cache: CacheWriter,
     rate_checker: Option<RateChecker>,
     client_rate_checker: Option<RateChecker>,
     /// Body bytes still to be pulled from upstream.
@@ -650,7 +659,7 @@ pub(super) struct BodyTransfer<'a> {
 /// What a body loop hands back to `splice_proxy_drive`.
 pub(super) struct BodyOutcome {
     /// Returned for the rename step.
-    pub(super) dbarrier: DownloadBarrier,
+    pub(super) cache: CacheWriter,
     /// How the client came out of the loop.
     pub(super) client: ClientEnd,
     /// Bytes this loop delivered to the client.
@@ -662,12 +671,12 @@ impl<'a> BodyTransfer<'a> {
     /// upstream; the cache writer supplies its starting file offset.
     pub(super) fn new(
         client: BodyClient<'a>,
-        cache: CacheWriter<'a>,
+        cache: CacheWriter,
         range_filter: &'a SpliceRangeFilter,
         cache_path: &'a Path,
         content_length: u64,
     ) -> Self {
-        let file_start_offset = cache.file_offset;
+        let file_start_offset = cache.position();
         let config = global_config();
         let rate_checker = RateChecker::from_config(config);
         // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
@@ -694,9 +703,7 @@ impl<'a> BodyTransfer<'a> {
             remaining: content_length,
             client_status,
             bytes_done: 0,
-            client_file_pos: u64::try_from(file_start_offset)
-                .expect("file_start_offset is non-negative by construction")
-                + range_filter.skip,
+            client_file_pos: file_start_offset + range_filter.skip,
             client_remaining: range_filter.send,
             range_filter,
             cache_path,
@@ -894,9 +901,7 @@ impl<'a> BodyTransfer<'a> {
             ClientStatus::Demoted(handle) => ClientEnd::Demoted(handle),
         };
         BodyOutcome {
-            dbarrier: cache
-                .dbarrier
-                .expect("the barrier is only taken on the upstream-rate abort path"),
+            cache,
             client,
             client_bytes: range_filter.send - client_remaining,
         }
@@ -2422,15 +2427,13 @@ mod tests {
     fn cancelled_prefix_keeps_its_write_lease_until_the_job_finishes() {
         let (runtime, resume) = paused_blocking_runtime();
         runtime.block_on(async {
-            let mut scratch = ScratchFile::new();
+            let scratch = ScratchFile::new();
             let barrier = cache_barrier(&scratch.path).await;
-            let lease = barrier.write_lease();
-            let lifetime = Arc::downgrade(&lease);
-            let mut write = Box::pin(super::super::write_all_flushed(
-                &mut scratch.file,
-                b"prefix",
-                lease,
-            ));
+            let lifetime = Arc::downgrade(&barrier.write_lease());
+            let mut writer = CacheWriter::new(scratch.file, 0, CacheWriteMode::Kernel, barrier)
+                .await
+                .unwrap();
+            let mut write = Box::pin(writer.write_prefix(b"prefix"));
             assert!(
                 write
                     .as_mut()
@@ -2438,8 +2441,7 @@ mod tests {
                     .is_pending()
             );
             drop(write);
-            drop(barrier);
-            drop(scratch.file);
+            drop(writer);
             assert!(
                 lifetime.upgrade().is_some(),
                 "the queued prefix retains the lease"
@@ -2567,12 +2569,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_writer_orders_pending_tee_before_direct_writes_at_resume_offset() {
-        let mut scratch = ScratchFile::new();
+        let scratch = ScratchFile::new();
         std::fs::write(&scratch.path, b"resume-").unwrap();
         let barrier = cache_barrier(&scratch.path).await;
         let mut receiver = barrier.subscribe();
-        let mut hasher = None;
-        let mut writer = CacheWriter::prepare(&mut scratch.file, 7, &mut hasher, barrier)
+        let mut writer = CacheWriter::new(scratch.file, 7, CacheWriteMode::Kernel, barrier)
             .await
             .unwrap();
         writer.pipes = Some(SplicePipes::new().unwrap());
@@ -2595,15 +2596,17 @@ mod tests {
         assert_eq!(writer.file_offset, 35);
         assert!(writer.batch().is_empty());
         drop(writer);
-        assert_eq!(scratch.contents(), b"resume-queued-boundary-queued2-tail");
+        assert_eq!(
+            std::fs::read(&scratch.path).unwrap(),
+            b"resume-queued-boundary-queued2-tail"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_writer_keeps_small_batches_after_the_first_flush() {
-        let mut scratch = ScratchFile::new();
+        let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut hasher = None;
-        let mut writer = CacheWriter::prepare(&mut scratch.file, 0, &mut hasher, barrier)
+        let mut writer = CacheWriter::new(scratch.file, 0, CacheWriteMode::Kernel, barrier)
             .await
             .unwrap();
         writer.pipes = Some(SplicePipes::new().unwrap());
@@ -2616,29 +2619,85 @@ mod tests {
         assert_eq!(writer.batch().pending, 6);
         writer.flush().await.unwrap();
         drop(writer);
-        assert_eq!(scratch.contents(), b"firstsecond");
+        assert_eq!(std::fs::read(&scratch.path).unwrap(), b"firstsecond");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_writer_hashes_prefix_and_userspace_body_once() {
         use crate::index_parser::HashAlgo;
         use sha2::Digest as _;
-        let mut scratch = ScratchFile::new();
-        let mut barrier = cache_barrier(&scratch.path).await;
-        let mut hasher = Some(StreamHasher::new(HashAlgo::Sha256));
-        CacheWriter::write_prefix(&mut scratch.file, b"prefix-", &mut hasher, &mut barrier)
-            .await
-            .unwrap();
-        let mut writer = CacheWriter::prepare(&mut scratch.file, 7, &mut hasher, barrier)
-            .await
-            .unwrap();
+        let scratch = ScratchFile::new();
+        let barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
+            barrier,
+        )
+        .await
+        .unwrap();
+        writer.write_prefix(b"prefix-").await.unwrap();
         let mut body = b"body".to_vec();
         writer.write_cache_chunk(&mut body, 4).await.unwrap();
-        drop(writer);
-        let digest = hasher.unwrap().finalize();
-        assert_eq!(scratch.contents(), b"prefix-body");
+        let (_file, _barrier, digest) = writer.finish();
+        let digest = digest.unwrap();
+        assert_eq!(std::fs::read(&scratch.path).unwrap(), b"prefix-body");
         assert_eq!(digest.bytes, 11);
         assert_eq!(digest.digest, sha2::Sha256::digest(b"prefix-body").to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_writer_prefix_uses_resume_offset_without_hashing_the_suffix() {
+        let scratch = ScratchFile::new();
+        std::fs::write(&scratch.path, b"resume-").unwrap();
+        // The open descriptor's cursor is still zero. Only the writer's
+        // explicit resume offset may determine where the prefix lands.
+        let barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            7,
+            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
+            barrier,
+        )
+        .await
+        .unwrap();
+        writer.write_prefix(b"prefix-").await.unwrap();
+        writer
+            .write_cache_chunk(&mut b"body".to_vec(), 4)
+            .await
+            .unwrap();
+        let (_file, _barrier, digest) = writer.finish();
+        assert!(digest.is_none(), "a suffix is not a whole-file digest");
+        assert_eq!(std::fs::read(&scratch.path).unwrap(), b"resume-prefix-body");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_writer_finishes_a_prefix_only_digest() {
+        use sha2::Digest as _;
+
+        let scratch = ScratchFile::new();
+        let barrier = cache_barrier(&scratch.path).await;
+        let mut receiver = barrier.subscribe();
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
+            barrier,
+        )
+        .await
+        .unwrap();
+        writer.write_prefix(b"whole body").await.unwrap();
+        assert!(
+            receiver.has_changed().unwrap(),
+            "the first write wakes readers"
+        );
+        receiver.borrow_and_update();
+        writer.write_prefix(b"").await.unwrap();
+        assert!(!receiver.has_changed().unwrap());
+        let (_file, _barrier, digest) = writer.finish();
+        let digest = digest.unwrap();
+        assert_eq!(digest.bytes, 10);
+        assert_eq!(digest.digest, sha2::Sha256::digest(b"whole body").to_vec());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2649,11 +2708,10 @@ mod tests {
         // Deliberately omit flush: entering the writer must wait for this write.
         scratch.file.write_all(&prefix).await.unwrap();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut hasher = None;
-        let mut writer = CacheWriter::prepare(
-            &mut scratch.file,
+        let mut writer = CacheWriter::new(
+            scratch.file,
             i64::try_from(prefix.len()).unwrap(),
-            &mut hasher,
+            CacheWriteMode::Kernel,
             barrier,
         )
         .await
@@ -2664,7 +2722,7 @@ mod tests {
         drop(writer);
         let mut expected = prefix;
         expected.extend_from_slice(b"tail");
-        assert_eq!(scratch.contents(), expected);
+        assert_eq!(std::fs::read(&scratch.path).unwrap(), expected);
     }
 
     /// Feed the actual receive operation so salvageability does not rely on

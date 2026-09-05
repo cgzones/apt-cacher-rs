@@ -390,15 +390,6 @@ impl DownloadBarrier {
         Arc::clone(&self.data.as_ref().expect("live download barrier").lease)
     }
 
-    /// Unconditional ping (e.g. startup prefix).
-    pub(crate) fn ping(&mut self) {
-        let data = self
-            .data
-            .as_mut()
-            .expect("every sink consumes the instance");
-        data.internal_ping();
-    }
-
     /// Subscribe a `watch::Receiver` for handoff to a spawned file-serve task.
     pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
         let data = self

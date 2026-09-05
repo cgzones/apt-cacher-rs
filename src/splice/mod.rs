@@ -56,7 +56,7 @@ use std::{
 };
 
 use ::http::StatusCode;
-use tokio::{io::AsyncWriteExt as _, net::TcpStream};
+use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace};
 
 use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
@@ -67,14 +67,13 @@ use crate::error::{ErrorReport, is_peer_disconnect};
 use crate::fs_open::{
     CacheAccessFailure, regular_file_metadata, tokio_nofollow_options, touch_volatile_mtime,
 };
-use crate::guards::{DownloadBarrier, InitBarrier};
+use crate::guards::InitBarrier;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, WritePhase, write_416_response,
     write_all_to_stream, write_invalid_response,
 };
 use crate::http_range::{HttpDate, ParsedRange, format_http_date, http_parse_range};
 use crate::humanfmt::HumanFmt;
-use crate::index_parser::StreamHasher;
 use crate::integrity;
 use crate::log_once::Logged;
 use crate::parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge};
@@ -105,8 +104,8 @@ use acquire::{
     warn_upstream_reject,
 };
 use body::{
-    BodyClient, BodyOutcome, BodyTransfer, BodyTransferError, CacheWriter, ClientEnd,
-    SpliceRangeFilter, range_slice, splice_proxy_body, splice_proxy_body_tls,
+    BodyClient, BodyOutcome, BodyTransfer, BodyTransferError, CacheWriteMode, CacheWriter,
+    ClientEnd, SpliceRangeFilter, range_slice, splice_proxy_body, splice_proxy_body_tls,
 };
 use commit::{CommitTail, CompletionBytes, CompletionClient, Served};
 use detached::DetachedDownload;
@@ -397,25 +396,9 @@ async fn write_splice_response_headers(
 /// `CacheTarget::begin_rename` (in [`commit`]), which turns it into the
 /// [`commit::Committable`] the [`commit::CommitTail`] is built from.
 struct CacheTarget {
-    tempfile: tokio::fs::File,
+    writer: CacheWriter,
     temppath: TempPath,
     dest_path: PathBuf,
-    dbarrier: DownloadBarrier,
-    /// Incremental digest over everything written here, so the commit can skip
-    /// re-reading the finished file.
-    ///
-    /// Fed by the two -- and only two -- sites that write into `tempfile`:
-    /// `body::CacheWriter::write_prefix` and
-    /// `body::CacheWriter::write_cache_chunk`. Anything `Some` here that does
-    /// not route every byte through those two would be finalised over a
-    /// partial stream and fail verification, so the value is chosen by the
-    /// caller of [`prepare_cache_target`] rather than derived from the
-    /// download's identity: the streaming drive passes one when
-    /// `integrity::stream_hash_algo` names an algorithm and `resume_offset ==
-    /// 0`, [`volatile`] always passes `None`. `transfer_body` additionally
-    /// clears it before the zero-copy loops, whose bytes go kernel-to-kernel and
-    /// never reach userspace to be hashed.
-    hasher: Option<StreamHasher>,
 }
 
 /// Reserve the cache quota and open the file the body is written into: the
@@ -429,14 +412,8 @@ struct CacheTarget {
 /// `503 Disk quota reached` (tagged `quota_phase`) or the 500 for a
 /// `Resumable` partial that does not hold exactly `resume_offset` bytes.
 ///
-/// `hasher` is a parameter rather than something derived here on purpose:
-/// whether an incremental digest is *valid* depends on how the caller writes
-/// the body, not on the download's identity. Only the streaming drive funnels
-/// every cache byte through the two sites that feed it
-/// (`body::CacheWriter::write_prefix` and `body::CacheWriter::write_cache_chunk`);
-/// [`volatile`] writes its buffered body straight to `tempfile` and so must
-/// pass `None`, or the commit would verify a digest of no input at all. Making
-/// each caller say which it is keeps that a compile-time decision.
+/// The caller selects the transport's write mode; the writer enables hashing
+/// only when it can cover the entire file, including the prefix.
 #[expect(
     clippy::too_many_arguments,
     reason = "one call per download path; the arguments are the download's identity"
@@ -450,7 +427,7 @@ async fn prepare_cache_target(
     total_content_length: NonZero<u64>,
     ibarrier: InitBarrier<'_>,
     quota_phase: &'static str,
-    hasher: Option<StreamHasher>,
+    mode: CacheWriteMode,
 ) -> Result<Option<CacheTarget>, SpliceProxyError> {
     // Not created here: `integrity::rename_into_cache` creates it at commit
     // time, and only on `ENOENT`. Everything below tolerates its absence --
@@ -616,12 +593,24 @@ async fn prepare_cache_target(
         )
         .await;
 
-    Ok(Some(CacheTarget {
+    let writer = CacheWriter::new(
         tempfile,
+        resume_offset.try_into().expect("download size fits in i64"),
+        mode,
+        dbarrier,
+    )
+    .await
+    .map_err(|err| {
+        SpliceProxyError::Cache(Logged::cache_io_failure(format_args!(
+            "splice proxy: failed to prepare cache writer for `{}`; aborting the download:  {}",
+            temppath.display(),
+            ErrorReport(&err)
+        )))
+    })?;
+    Ok(Some(CacheTarget {
+        writer,
         temppath,
         dest_path: dest_dir.join(filename),
-        dbarrier,
-        hasher,
     }))
 }
 
@@ -1146,49 +1135,20 @@ async fn write_body_prefix_to_cache(
     // truth that other clients read from; the caller only attempts its
     // client write after this returned. Waiting for the prefix's write job
     // also prevents it from racing the loop's raw `splice(2)` appends.
-    CacheWriter::write_prefix(
-        &mut target.tempfile,
-        body_prefix,
-        &mut target.hasher,
-        &mut target.dbarrier,
-    )
-    .await
-    .map_err(|err| SpliceProxyError::AfterHeader {
-        phase: "body prefix to cache",
-        side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
-            "splice proxy: failed to write body prefix to cache file `{}`; {consequence}:  {}",
-            target.temppath.display(),
-            ErrorReport(&err)
-        ))),
-    })?;
+    target
+        .writer
+        .write_prefix(body_prefix)
+        .await
+        .map_err(|err| SpliceProxyError::AfterHeader {
+            phase: "body prefix to cache",
+            side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
+                "splice proxy: failed to write body prefix to cache file `{}`; {consequence}:  {}",
+                target.temppath.display(),
+                ErrorReport(&err)
+            ))),
+        })?;
 
     Ok(())
-}
-
-/// Write a prefix or buffered body and wait for the actual write result.
-/// The blocking job owns its descriptor and write lease, so cancelling the
-/// caller cannot admit another writer while this one still modifies the file.
-/// Using the shared file cursor preserves the resume offset selected earlier;
-/// subsequent body writes use their explicit offsets.
-async fn write_all_flushed(
-    file: &mut tokio::fs::File,
-    bytes: &[u8],
-    lease: Arc<crate::guards::DownloadWriteLease>,
-) -> std::io::Result<()> {
-    use std::os::fd::AsFd as _;
-
-    file.flush().await?;
-    let fd = file.as_fd().try_clone_to_owned()?;
-    let bytes = bytes.to_vec();
-    tokio::task::spawn_blocking(move || {
-        use std::io::Write as _;
-
-        let _lease = lease;
-        let mut file = std::fs::File::from(fd);
-        file.write_all(&bytes)
-    })
-    .await
-    .expect("cache prefix writer should not panic")
 }
 
 /// Cache the new prefix even when an earlier client write failed. Only an
@@ -1273,16 +1233,10 @@ struct BodyTransferred {
 /// `client` is [`BodyClient::Absent`] for the client-less detached download,
 /// which also passes a zero-length `range_plan` so the loops run cache-only,
 /// and [`BodyClient::Lost`] when the prefix write already failed.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "two call sites; the arguments are the body's geometry and the transfer's state"
-)]
 async fn transfer_body(
     upstream: &mut ResponseBody,
     client: BodyClient<'_>,
     mut target: CacheTarget,
-    resume_offset: u64,
-    body_content_length: NonZero<u64>,
     splice_count: u64,
     range_plan: &ServeParams,
     rates: &mut RateTimestamps,
@@ -1294,12 +1248,8 @@ async fn transfer_body(
         });
     }
 
-    let body_offset: i64 = (resume_offset + body_content_length.get() - splice_count)
-        .try_into()
-        .expect("the body prefix + extra body is limited in size");
-
     // splice_file_start is the file offset where the splice region begins.
-    let splice_file_start = resume_offset + body_content_length.get() - splice_count;
+    let splice_file_start = target.writer.position();
     let client_range_end = range_plan.content_end();
     let splice_file_end = splice_file_start + splice_count;
     // How many bytes to skip at the start of the splice region before sending to client.
@@ -1320,26 +1270,10 @@ async fn transfer_body(
         send: client_send,
     };
 
-    // `target.dbarrier` is moved in by value: on success it's returned for the
-    // rename step; on a structured rate-timeout it's already consumed into
-    // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
-    // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
-    // `target.hasher` is borrowed: only the userspace loop advances it, in
-    // place.
+    // The writer moves through the loop as one owner, including on abort.
     let outcome = async {
         let zero_copy = upstream.zero_copy();
-        if zero_copy.is_some() {
-            // Kernel-only bytes cannot advance an incremental digest.
-            // Keep that invariant local to the choice of body loop.
-            target.hasher = None;
-        }
-        let cache = CacheWriter::prepare(
-            &mut target.tempfile,
-            body_offset,
-            &mut target.hasher,
-            target.dbarrier,
-        )
-        .await?;
+        let cache = target.writer;
         let xfer = BodyTransfer::new(client, cache, &range_filter, &target.temppath, splice_count);
         if let Some(tcp) = zero_copy {
             splice_proxy_body(xfer, tcp).await
@@ -1358,7 +1292,7 @@ async fn transfer_body(
     // partial-file guard travels with the error so both attribution sinks
     // can name the on-disk path.
     let BodyOutcome {
-        dbarrier: returned_dbarrier,
+        cache: returned_writer,
         client,
         client_bytes,
     } = match outcome {
@@ -1370,7 +1304,7 @@ async fn transfer_body(
             });
         }
     };
-    target.dbarrier = returned_dbarrier;
+    target.writer = returned_writer;
     // Every body byte is on disk now (the loops' final `cache.flush`); the
     // readers learn that from `begin_rename`, which every caller reaches
     // next: its flush of the last sub-`PING_BATCH_THRESHOLD` chunk and its
@@ -1584,33 +1518,18 @@ async fn splice_proxy_drive(
         return Ok(SpliceProxyOutcome::Served);
     };
 
-    // The userspace-TLS body loop is the one that can hash as it writes: every
-    // cache byte goes through `write_body_prefix_to_cache` or
-    // `write_cache_chunk`. Two conditions, and minting a hasher without either
-    // is pure waste -- `transfer_body` drops it and the commit re-reads the
-    // file anyway, after this task has hashed the whole body prefix into it.
-    //
-    // A zero-copy upstream (plain TCP) moves its
-    // body socket-to-file inside the kernel, so the digest could only ever
-    // cover the prefix. And a resume writes into a temp file that already
-    // holds bytes this connection never saw, so an incremental digest would
-    // cover the wrong range.
-    //
-    // Read `raw_uri_path` off the barrier before `prepare_cache_target`
-    // consumes it; it is the same string `RenamePlan` later verifies against.
-    let hasher = if resume_offset == 0 && upstream.zero_copy().is_none() {
-        // Same rendering `RenamePlan.host` uses, so both registry lookups
-        // agree on the key.
-        integrity::stream_hash_algo_for_download(
+    // Select the transport mode before creating the writer. The writer itself
+    // excludes resumed suffixes from whole-file hashing.
+    let mode = if upstream.zero_copy().is_some() {
+        CacheWriteMode::Kernel
+    } else {
+        CacheWriteMode::Userspace(integrity::stream_hash_algo_for_download(
             conn_details.resource_kind,
             ibarrier.raw_uri_path(),
             &conn_details.debname,
             conn_details.mirror.host().as_str(),
             conn_details.mirror.path(),
-        )
-        .map(StreamHasher::new)
-    } else {
-        None
+        ))
     };
 
     let Some(mut target) = prepare_cache_target(
@@ -1622,7 +1541,7 @@ async fn splice_proxy_drive(
         total_content_length,
         ibarrier,
         "quota 503",
-        hasher,
+        mode,
     )
     .await?
     else {
@@ -1748,8 +1667,6 @@ async fn splice_proxy_drive(
         &mut upstream,
         body_client,
         target,
-        resume_offset,
-        body_content_length,
         splice_count,
         &range_plan,
         &mut rates,
