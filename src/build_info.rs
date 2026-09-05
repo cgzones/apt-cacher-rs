@@ -48,7 +48,6 @@ feature_bool!(feature_hyper, "hyper");
 feature_bool!(feature_mmap, "mmap");
 feature_bool!(feature_sendfile, "sendfile");
 feature_bool!(feature_splice, "splice");
-feature_bool!(feature_ktls, "ktls");
 
 /// The `key=value` feature summary, joined by `$sep`.
 macro_rules! feature_summary {
@@ -68,9 +67,6 @@ macro_rules! feature_summary {
             $sep,
             "splice=",
             feature_splice!(),
-            $sep,
-            "ktls=",
-            feature_ktls!(),
         )
     };
 }

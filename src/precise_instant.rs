@@ -8,7 +8,7 @@
 //! measurements (request lifetime, client- and upstream-rate windows), each
 //! read only twice per request, where ns resolution matters and the ~15ns
 //! extra read cost is irrelevant. Hot per-frame paths (`rate_checker`,
-//! pool/kTLS GC) stay on `coarsetime::Instant`. The module-level `expect`
+//! pool GC) stay on `coarsetime::Instant`. The module-level `expect`
 //! below is that single, contained exception.
 #![expect(
     clippy::disallowed_types,

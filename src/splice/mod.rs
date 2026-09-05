@@ -17,8 +17,6 @@
 //! - [`acquire`]: standard connect with retry/backoff, redirect and
 //!   partial-discard reconnects, folded into `UpstreamExchange` by
 //!   `acquire_upstream`.
-//! - `ktls_path` (`ktls` feature): the unbuffered rustls handshake that
-//!   hands traffic secrets to the kernel, plus the kTLS host block-list.
 //! - [`body`]: the zero-copy and userspace-TLS body loops on `BodyTransfer`,
 //!   client demotion to file serving, pipe helpers.
 //! - [`detached`]: the client-less download the parallel-download hack's
@@ -34,16 +32,12 @@ mod body;
 mod cleanup_bridge;
 mod detached;
 mod http;
-#[cfg(feature = "ktls")]
-mod ktls_path;
 mod simple_proxy;
 mod upstream;
 mod volatile;
 
 #[cfg(not(feature = "hyper"))]
 pub(crate) use cleanup_bridge::process_cache_request;
-#[cfg(feature = "ktls")]
-pub(crate) use ktls_path::KTLS_CLIENT_CONFIG;
 pub(crate) use simple_proxy::splice_simple_proxy;
 #[cfg(feature = "tls_rustls")]
 pub(crate) use upstream::TLS_CLIENT_CONFIG;
@@ -103,7 +97,7 @@ use crate::{
 };
 
 use acquire::{
-    UpstreamAcquire, UpstreamExchange, acquire_upstream, discard_partial_and_retry,
+    UpstreamExchange, acquire_upstream, discard_partial_and_retry,
     follow_redirect, warn_upstream_reject,
 };
 use body::{
@@ -197,10 +191,9 @@ pub(crate) async fn splice_proxy(
 
 /// Serve a cached volatile file after an upstream `304 Not Modified`: refresh
 /// the freshness window via `touch_volatile_mtime`, release the init barrier,
-/// then deliver the file with `sendfile(2)`. Shared by the kTLS fast path and
-/// the standard upstream path in [`splice_proxy_drive`]; the per-path bits
-/// (status recording, upstream-connection pooling, `debug!` wording) stay at
-/// the call site, and `invalid_tag` carries the call-site location tag for
+/// then deliver the file with `sendfile(2)`. The per-path bits (status
+/// recording, upstream-connection pooling, `debug!` wording) stay at the
+/// call site, and `invalid_tag` carries the call-site location tag for
 /// `SpliceProxyError::Client`.
 async fn serve_volatile_304_via_sendfile(
     client: ClientConn<'_>,
@@ -1132,7 +1125,7 @@ async fn reject_upstream_response(
     reason: RejectReason,
 ) -> Result<(), SpliceProxyError> {
     reason.record_metrics();
-    warn_upstream_reject(reason, conn_details, "");
+    warn_upstream_reject(reason, conn_details);
     upstream.unset_poolable();
     write_invalid_response(
         client.stream,
@@ -1254,9 +1247,8 @@ async fn send_resumed_prefix(
     }
 }
 
-/// Write the body bytes upstream sent in the same read as the headers (or,
-/// on the kTLS path, decrypted in userspace before RX offload) to the cache
-/// file and notify the late joiners. The cache half of
+/// Write the body bytes upstream sent in the same read as the headers to the
+/// cache file and notify the late joiners. The cache half of
 /// [`write_body_prefix`], split out so the client-less detached download
 /// ([`detached::DetachedDownload`]) shares exactly these bytes and this one
 /// error line.
@@ -1305,9 +1297,8 @@ async fn write_body_prefix_to_cache(
 }
 
 /// Cache the body prefix ([`write_body_prefix_to_cache`]), then write the
-/// range-filtered part of it to the client. When the upstream is fast enough
-/// that the entire body lands inside the kTLS handshake drain, the prefix
-/// holds the full file.
+/// range-filtered part of it to the client. When the whole body arrived in
+/// the head read, the prefix holds the full file.
 ///
 /// Returns whether the client write failed. That error is swallowed to keep
 /// caching the buffered prefix, but if the splice loop never runs (entire
@@ -1410,7 +1401,7 @@ struct BodyTransferred {
 }
 
 /// Transfer the remaining `splice_count` body bytes after the prefix:
-/// zero-copy `splice(2)` for a TCP (plain or kTLS) upstream, userspace read
+/// zero-copy `splice(2)` for a plain-TCP upstream, userspace read
 /// plus tee+splice fan-out for userspace TLS. Both rate windows end here
 /// when the loop ran.
 ///
@@ -1469,7 +1460,7 @@ async fn transfer_body(
     // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
     // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
     let outcome = if let Some(zero_copy_upstream) = upstream_guard.zero_copy() {
-        // Zero-copy path for TCP (plain or kTLS)
+        // Zero-copy path for plain TCP
         splice_proxy_body(
             zero_copy_upstream,
             client_stream,
@@ -1613,68 +1604,19 @@ async fn splice_proxy_drive(
 
     let mut resume = open_partial_resume(&ibarrier, conn_details).await?;
 
-    #[cfg_attr(
-        not(feature = "ktls"),
-        expect(
-            unused_mut,
-            reason = "only the kTLS 304 fast path takes the cached path out"
-        )
-    )]
-    let (volatile_cond, mut volatile_cache_path) =
+    let (volatile_cond, volatile_cache_path) =
         read_volatile_validators(conn_details).await?.unzip();
 
     // --- Prepare upstream connection ---
-    #[cfg_attr(
-        not(feature = "ktls"),
-        expect(
-            clippy::infallible_destructuring_match,
-            reason = "the kTLS-only variants make the match refutable in ktls builds"
-        )
-    )]
-    let mut exchange = match acquire_upstream(
+    let mut exchange = acquire_upstream(
         conn_details,
         &host_authority,
         upstream_path,
         resume.offset,
         resume.if_range.as_deref(),
         volatile_cond.as_ref(),
-        #[cfg(feature = "ktls")]
-        &mut volatile_cache_path,
     )
-    .await?
-    {
-        UpstreamAcquire::Exchange(exchange) => exchange,
-        #[cfg(feature = "ktls")]
-        UpstreamAcquire::KtlsReject(reason) => {
-            write_invalid_response(
-                client.stream,
-                client.version,
-                client.action,
-                StatusCode::BAD_GATEWAY,
-                reason.body(),
-                None,
-            )
-            .await
-            .map_err(|err| SpliceProxyError::Client {
-                phase: "kTLS upstream reject 502",
-                err,
-            })?;
-            return Ok(SpliceProxyOutcome::Served);
-        }
-        #[cfg(feature = "ktls")]
-        UpstreamAcquire::KtlsNotModified(cache_path) => {
-            return serve_volatile_304_via_sendfile(
-                client,
-                conn_details,
-                &cache_path,
-                client_range,
-                ibarrier,
-                "kTLS post-304 invalid response",
-            )
-            .await
-            .map(|()| SpliceProxyOutcome::Served);
-        }
-    };
+    .await?;
 
     let plan = plan_upstream_response(
         &mut exchange,
@@ -1979,7 +1921,7 @@ async fn splice_proxy_drive(
 
     // The full upstream body is now drained: either the splice loop consumed
     // exactly `splice_count` bytes, or `splice_count` was 0 because the whole
-    // body arrived in the prefix / kTLS-extra-body. The client-write outcome is
+    // body arrived in the prefix. The client-write outcome is
     // irrelevant to poolability — the download always drains upstream fully.
     // Defuse the poison guard and release its borrow before dropping upstream.
     upstream_guard.consumed();

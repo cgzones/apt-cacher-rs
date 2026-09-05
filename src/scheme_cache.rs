@@ -56,7 +56,7 @@ impl Scheme {
     }
 }
 
-/// Owned `(host, port)` key for the scheme cache and the kTLS block-list.
+/// Owned `(host, port)` key for the scheme cache.
 #[derive(Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SchemeKey {
     pub(crate) host: String,

@@ -7,7 +7,7 @@
 //! [`forward_upstream_chunked_body`] and [`read_dechunk_body_to_vec`] are its
 //! I/O wrappers.
 //!
-//! Consumers: `acquire` and `ktls_path` (request/parse), the drive in
+//! Consumers: `acquire` (request/parse), the drive in
 //! `mod.rs` and `volatile`/`simple_proxy`/`cleanup_bridge` (framing relays).
 
 use std::{io::ErrorKind, num::Saturating, ops::Range, time::Duration};
@@ -134,8 +134,7 @@ async fn read_upstream_response_headers(
 
     // Incremental scan offset: bytes before this index were already checked for
     // the \r\n\r\n terminator on a prior iteration. Subtract 3 so a terminator
-    // that straddles the read boundary is still found. Mirrors the kTLS
-    // Phase-3 header-read loop (`header_search_offset` in `unbuffered_ktls_request`).
+    // that straddles the read boundary is still found.
     let mut search_offset = 0usize;
 
     loop {
@@ -403,9 +402,7 @@ impl UpstreamResponse {
 ///
 /// Does **not** record the upstream status metric — callers must call
 /// `metrics::record_upstream_status` themselves once the response is going
-/// to be honored. The kTLS path may parse a response that is then thrown
-/// away in favor of a standard-path reconnect (`ResponseNotSpliceable`); a
-/// metric bump here would double-count for that flow.
+/// to be honored.
 pub(super) fn parse_upstream_response(
     buf: &[u8],
     header_end: usize,

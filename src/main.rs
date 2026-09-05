@@ -53,10 +53,6 @@ mod humanfmt;
 mod hyper_conn;
 mod index_parser;
 mod integrity;
-#[cfg(feature = "ktls")]
-mod ktls;
-#[cfg(feature = "ktls")]
-mod ktls_handshake;
 mod limits;
 mod log_once;
 mod logstore;
@@ -79,8 +75,6 @@ mod request_dispatch;
 mod response_head;
 mod ringbuffer;
 mod scheme_cache;
-#[cfg(feature = "ktls")]
-mod secure_vec;
 #[cfg(feature = "sendfile")]
 mod sendfile_conn;
 #[cfg(feature = "splice")]
@@ -115,8 +109,6 @@ use std::{
 
 use build_info::{APP_VERSION, FEATURES_ONE_LINE, VERSION_AND_FEATURES};
 use clap::Parser;
-#[cfg(feature = "ktls")]
-use hashbrown::HashMap;
 use time::format_description::well_known::Rfc2822;
 use tokio::runtime::Builder;
 use tracing::{debug, error, info, trace, warn};
@@ -138,13 +130,6 @@ const _: () = assert!(
 const DB_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) use scheme_cache::Scheme;
-#[cfg(feature = "ktls")]
-pub(crate) use scheme_cache::{SchemeKey, SchemeKeyRef};
-
-#[cfg(feature = "ktls")]
-pub(crate) static KTLS_BLOCKED: OnceLock<
-    parking_lot::RwLock<HashMap<SchemeKey, coarsetime::Instant>>,
-> = OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -434,22 +419,6 @@ fn build_rustls_client_config() -> Result<rustls::ClientConfig, RootStoreError> 
 
 #[cfg(all(feature = "tls_rustls", feature = "splice"))]
 fn init_splice_tls_client_config(tls_config: rustls::ClientConfig) {
-    #[cfg(feature = "ktls")]
-    {
-        // Clone before moving the base config into the Arc below:
-        // `ClientConfig::clone` shares the `resumption` session store (an
-        // `Arc<ClientSessionMemoryCache>` internally), so session tickets
-        // learned via the kTLS config still benefit the plain splice
-        // fallback and vice versa. Secret extraction is confined to this
-        // kTLS-only clone — only the kTLS setup path hands raw traffic
-        // secrets to the kernel.
-        let mut ktls_config = tls_config.clone();
-        ktls_config.enable_secret_extraction = true;
-        splice::KTLS_CLIENT_CONFIG
-            .set(Arc::new(ktls_config))
-            .expect("function should only be called once");
-    }
-
     splice::TLS_CLIENT_CONFIG
         .set(Arc::new(tls_config))
         .expect("function should only be called once");
@@ -509,14 +478,6 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     LOGSTORE
         .set(logstore::LogStore::new(config.logstore_capacity))
         .expect("Initial set in main() should succeed");
-
-    #[cfg(feature = "ktls")]
-    KTLS_BLOCKED
-        .set(parking_lot::RwLock::new(HashMap::new()))
-        .expect("Initial set in main() should succeed");
-
-    #[cfg(feature = "ktls")]
-    secure_vec::set_lock_enabled(config.ktls_memory_lock);
 
     let logstore_handle = LOGSTORE.get().expect("initialized in main()").clone();
     let internal_layer = tracing_subscriber::fmt::layer()
@@ -736,12 +697,6 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
             .http1_max_headers(limits::MAX_UPSTREAM_HEADERS)
             .build(timeout_connector)
     };
-
-    // Warm the kTLS availability probe before the tokio runtime starts so the
-    // one-time socket(2)/bind(2)/listen(2)/connect(2)/accept(2)/setsockopt(2)
-    // round-trip never lands on a tokio worker thread.
-    #[cfg(feature = "ktls")]
-    let _ktls_available = ktls::is_available();
 
     let runtime = Builder::new_multi_thread()
         .enable_all()

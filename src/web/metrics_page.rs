@@ -444,7 +444,7 @@ fn build_delivery_group(g: &mut Groups) {
             t,
             "splice Requests \u{2192} Served",
             "splice Bytes",
-            "Responses streamed from upstream to client via Linux splice(2) zero-copy (small userspace-written tails such as header prefixes and kTLS handshake spill included).",
+            "Responses streamed from upstream to client via Linux splice(2) zero-copy (small userspace-written tails such as header prefixes included).",
             metrics::REQUESTS_SPLICE.get(),
             metrics::SERVED_SPLICE.get(),
             metrics::BYTES_SERVED_SPLICE.get(),
@@ -686,21 +686,6 @@ fn build_upstream_group(g: &mut Groups) {
             "hyper Failures (body)",
             "Hyper-backend post-response body-stream errors.",
             WarnNonzero(metrics::UPSTREAM_HYPER_BODY_ERR.get()),
-        );
-        t.row_tip(
-            "kTLS RX Enabled",
-            "Connections where kernel-TLS receive offload was enabled and successfully started splicing application data.",
-            metrics::KTLS_RX_ENABLED.get(),
-        );
-        t.row_tip(
-            "kTLS Fallbacks (permanent)",
-            "kTLS fallbacks that block the host from further kTLS retries until the cooldown expires.",
-            AlertNonzero(metrics::KTLS_FALLBACK_PERMANENT.get()),
-        );
-        t.row_tip(
-            "kTLS Fallbacks (transient)",
-            "Post-`setup_rx` drain races; the host is not blocked.",
-            WarnNonzero(metrics::KTLS_FALLBACK_TRANSIENT.get()),
         );
     });
 }

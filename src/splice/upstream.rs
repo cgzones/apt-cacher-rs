@@ -8,7 +8,7 @@
 //! `main.rs` initialises.
 //!
 //! Consumers: `acquire` (connect, pool checkout, labels), `http` and `body`
-//! (read/write through the connection), `ktls_path` (`tcp_connect`).
+//! (read/write through the connection).
 
 #[cfg(feature = "tls_rustls")]
 use std::sync::Arc;
@@ -68,11 +68,6 @@ pub(super) const TLS_READ_BUF_SIZE: usize = 256 * 1024;
 pub(super) enum UpstreamConn {
     Tcp(#[pin] TcpStream),
     Tls(#[pin] TlsStream),
-    /// TLS with kernel RX offload configured for one session: the socket
-    /// yields plaintext, but only for the request already on the wire.
-    /// `PoolGuard::drop` never returns this variant to the pool.
-    #[cfg(feature = "ktls")]
-    Ktls(#[pin] TcpStream),
 }
 
 /// How an [`UpstreamConn`] is encrypted. Derived from the variant on demand,
@@ -83,22 +78,14 @@ pub(super) enum TlsMode {
     Plain,
     /// TLS terminated in userspace by [`TlsStream`].
     Userspace,
-    /// TLS with kernel RX offload: the socket hands plaintext to `splice(2)`.
-    #[cfg(feature = "ktls")]
-    Kernel,
 }
 
 /// An upstream socket whose receive queue holds plaintext the kernel can
-/// `splice(2)` straight into a pipe: plain TCP, or TLS with kernel RX
-/// offload. Obtained via [`UpstreamConn::zero_copy`]; userspace TLS never
-/// yields one.
+/// `splice(2)` straight into a pipe: plain TCP. Obtained via
+/// [`UpstreamConn::zero_copy`]; userspace TLS never yields one.
 #[derive(Clone, Copy)]
 pub(super) struct ZeroCopyUpstream<'a> {
     pub(super) tcp: &'a TcpStream,
-    /// Whether kTLS RX is configured on `tcp`, i.e. whether TLS control
-    /// records can surface as `splice(2)` errors mid-stream.
-    #[cfg(feature = "ktls")]
-    pub(super) ktls: bool,
 }
 
 /// Log suffix naming an exchange's connection flavour -- [`TlsMode`] plus
@@ -115,8 +102,6 @@ impl std::fmt::Display for ConnLabel {
         let mode = match mode {
             TlsMode::Plain => None,
             TlsMode::Userspace => Some("TLS"),
-            #[cfg(feature = "ktls")]
-            TlsMode::Kernel => Some("kTLS"),
         };
         match (mode, reused) {
             (None, false) => Ok(()),
@@ -145,8 +130,6 @@ impl AsyncRead for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_read(cx, buf),
             UpstreamConnProj::Tls(s) => s.poll_read(cx, buf),
-            #[cfg(feature = "ktls")]
-            UpstreamConnProj::Ktls(s) => s.poll_read(cx, buf),
         }
     }
 }
@@ -161,8 +144,6 @@ impl AsyncWrite for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_write(cx, buf),
             UpstreamConnProj::Tls(s) => s.poll_write(cx, buf),
-            #[cfg(feature = "ktls")]
-            UpstreamConnProj::Ktls(s) => s.poll_write(cx, buf),
         }
     }
 
@@ -171,8 +152,6 @@ impl AsyncWrite for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_flush(cx),
             UpstreamConnProj::Tls(s) => s.poll_flush(cx),
-            #[cfg(feature = "ktls")]
-            UpstreamConnProj::Ktls(s) => s.poll_flush(cx),
         }
     }
 
@@ -181,8 +160,6 @@ impl AsyncWrite for UpstreamConn {
         match self.project() {
             UpstreamConnProj::Tcp(s) => s.poll_shutdown(cx),
             UpstreamConnProj::Tls(s) => s.poll_shutdown(cx),
-            #[cfg(feature = "ktls")]
-            UpstreamConnProj::Ktls(s) => s.poll_shutdown(cx),
         }
     }
 }
@@ -194,32 +171,24 @@ impl UpstreamConn {
         match self {
             Self::Tcp(_) => TlsMode::Plain,
             Self::Tls(_) => TlsMode::Userspace,
-            #[cfg(feature = "ktls")]
-            Self::Ktls(_) => TlsMode::Kernel,
         }
     }
 
-    /// Whether the connection is encrypted at all (userspace or kernel TLS):
-    /// decides the upstream port and the pool key.
+    /// Whether the connection is encrypted: decides the upstream port and
+    /// the pool key.
     #[must_use]
     pub(super) const fn is_tls(&self) -> bool {
         !matches!(self.tls_mode(), TlsMode::Plain)
     }
 
     /// The socket to `splice(2)` the response body from, when the kernel
-    /// hands out plaintext (plain TCP, or kTLS with RX offload). `None` for
-    /// userspace TLS, whose plaintext only ever exists in this process.
+    /// hands out plaintext (plain TCP). `None` for userspace TLS, whose
+    /// plaintext only ever exists in this process.
     #[must_use]
     pub(super) const fn zero_copy(&self) -> Option<ZeroCopyUpstream<'_>> {
         match self {
-            Self::Tcp(tcp) => Some(ZeroCopyUpstream {
-                tcp,
-                #[cfg(feature = "ktls")]
-                ktls: false,
-            }),
+            Self::Tcp(tcp) => Some(ZeroCopyUpstream { tcp }),
             Self::Tls(_) => None,
-            #[cfg(feature = "ktls")]
-            Self::Ktls(tcp) => Some(ZeroCopyUpstream { tcp, ktls: true }),
         }
     }
 }
@@ -372,22 +341,7 @@ impl Drop for PoolGuard {
         {
             // Derive from the connection itself rather than caching it in a
             // field that could drift from `conn`'s actual scheme.
-            let is_tls = match conn.tls_mode() {
-                TlsMode::Plain => false,
-                TlsMode::Userspace => true,
-                // kTLS connections must NOT be pooled: the socket has kernel TLS
-                // RX configured for this specific session's keys and sequence
-                // numbers. Reusing it for a new request would layer a new TLS
-                // handshake on top of the kTLS socket, corrupting the stream.
-                // Future optimization: kTLS sockets could be pooled as a separate
-                // "kTLS-ready" type that writes plaintext (kernel encrypts via TX)
-                // and splices responses (kernel decrypts via RX), skipping the TLS
-                // handshake entirely. This requires a distinct pool entry type,
-                // control-message draining between requests, and key-update handling.
-                #[cfg(feature = "ktls")]
-                TlsMode::Kernel => return,
-            };
-            pool_return(&self.host, self.port, is_tls, conn);
+            pool_return(&self.host, self.port, conn.is_tls(), conn);
         }
     }
 }
@@ -493,10 +447,6 @@ impl UpstreamConn {
         match self {
             Self::Tcp(tcp) => tcp_peek_alive(tcp.as_raw_fd(), host, port),
             Self::Tls(tls) => tls_peek_alive(tls, host, port),
-            // Never pooled (`PoolGuard::drop`), so never checked; the kernel
-            // session is spent after its one request anyway.
-            #[cfg(feature = "ktls")]
-            Self::Ktls(_) => false,
         }
     }
 }
@@ -780,8 +730,6 @@ mod tests {
         assert_eq!(label(TlsMode::Plain, true), " (reused)");
         assert_eq!(label(TlsMode::Userspace, false), " (TLS)");
         assert_eq!(label(TlsMode::Userspace, true), " (TLS, reused)");
-        #[cfg(feature = "ktls")]
-        assert_eq!(label(TlsMode::Kernel, false), " (kTLS)");
     }
 
     #[test]

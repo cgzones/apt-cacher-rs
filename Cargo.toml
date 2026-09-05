@@ -35,7 +35,6 @@ webpki-roots = ["tls_rustls", "dep:webpki-roots"]
 mmap = ["dep:memmap2"]
 sendfile = ["dep:httparse", "nix/zerocopy", "nix/socket"]
 splice = ["sendfile", "nix/socket"]
-ktls = ["splice", "tls_rustls", "nix/net"]
 tls_hyper = ["dep:hyper-tls", "dep:tokio-native-tls"]
 tls_rustls = ["dep:hyper-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
 

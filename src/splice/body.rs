@@ -42,16 +42,12 @@ use crate::error::{ErrorReport, errno_to_io_error, is_peer_disconnect};
 use crate::fs_open::{hint_sequential_read, nofollow_options};
 use crate::guards::DownloadBarrier;
 use crate::humanfmt::HumanFmt;
-#[cfg(feature = "ktls")]
-use crate::ktls;
 use crate::log_once::Logged;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
 use crate::sendfile_conn::{
     async_sendfile_unfinished, clear_tcp_readable_cache, clear_tcp_writable_cache,
     wait_readable_rated, wait_writable_rated, write_all_to_stream_rated,
 };
-#[cfg(feature = "ktls")]
-use crate::warn_once;
 use crate::{
     Never, active_downloads::ActiveDownloadStatus, client_counter, global_config, metrics,
     static_assert, warn_once_or_debug, warn_once_or_info,
@@ -684,23 +680,11 @@ async fn drive_batches(
     upstream_pipe_receiver: &mut pipe::Receiver,
     cache_file: &tokio::fs::File,
 ) -> Result<(), BodyTransferError> {
-    #[cfg(feature = "ktls")]
-    let upstream_is_ktls = upstream.ktls;
     let upstream = upstream.tcp;
 
     let config = global_config();
 
-    // Budget for draining kTLS control records that arrive mid-stream (e.g. a
-    // late NewSessionTicket) — see the drain-retry arm in the splice loop.
-    // Multiple bursts over a long download are plausible; each drain consumes
-    // a whole burst.
-    #[cfg(feature = "ktls")]
-    let mut ktls_drain_retries: u32 = 8;
-
     let range_filter = xfer.range_filter;
-    // Only the kTLS control-record arms name the path.
-    #[cfg(feature = "ktls")]
-    let cache_path = xfer.cache_path;
     let client_skip = range_filter.skip;
     let client_range_end = range_filter.skip + range_filter.send;
 
@@ -747,11 +731,11 @@ async fn drive_batches(
         // runs when we're actually about to park, instead of being cancelled
         // mid-flight by `select!` on every busy iteration.
         //
-        // Accumulating is what keeps the fan-out off the per-record treadmill:
-        // a kTLS upstream hands back exactly one TLS record (~1378 bytes) per
-        // splice(2) however much is queued, so one fan-out per splice would
-        // mean one tee, one blocking-pool splice-to-file and one client splice
-        // per record. Never park to fill the pipe, though -- the
+        // Accumulating is what keeps the fan-out off the per-read treadmill:
+        // a busy socket hands back one segment's worth per splice(2), so one
+        // fan-out per splice would mean one tee, one blocking-pool
+        // splice-to-file and one client splice per segment. Never park to
+        // fill the pipe, though -- the
         // EAGAIN-with-bytes break below is what keeps the loop streaming
         // instead of turning a sub-cap download into store-and-forward.
         //
@@ -838,72 +822,6 @@ async fn drive_batches(
                         cache.flush(xfer, cache_file).await?;
                     }
                     continue;
-                }
-                // A kTLS control record (e.g. a late NewSessionTicket) at the
-                // head of the receive queue fails splice(2) instead of
-                // delivering bytes; the errno varies by kernel version
-                // (EINVAL/EIO/EBADMSG). Drain the record(s) and retry. The
-                // budget keeps this bounded: drain_control_messages detects
-                // a KeyUpdate itself and aborts immediately (it cannot be
-                // rekeyed), so the budget only bounds genuine bursts of
-                // NewSessionTickets, not a stuck KeyUpdate loop.
-                #[cfg(feature = "ktls")]
-                Err(
-                    err @ (nix::errno::Errno::EINVAL
-                    | nix::errno::Errno::EIO
-                    | nix::errno::Errno::EBADMSG),
-                ) if upstream_is_ktls && ktls_drain_retries > 0 => {
-                    ktls_drain_retries -= 1;
-                    if let Err(drain_err) =
-                        ktls::drain_control_messages(upstream.as_fd(), ktls::DrainExpect::DataReady)
-                    {
-                        warn_once!(
-                            "splice proxy (kTLS): failed to drain mid-stream control records for `{}`; aborting the transfer:  {}",
-                            cache_path.display(),
-                            ErrorReport(&drain_err)
-                        );
-                        return Err(BodyTransferError::upstream(errno_to_io_error(
-                            err,
-                            "splice failed on kTLS record",
-                        )));
-                    }
-                    debug!("splice proxy: drained mid-stream kTLS control record(s), retrying");
-                    continue;
-                }
-                // Kernels >= 6.14 pause RX after delivering a KeyUpdate
-                // control record and fail subsequent reads with EKEYEXPIRED
-                // until a new key is installed. Rekey is impossible in this
-                // design (rustls has been consumed; the traffic secret
-                // needed to derive the next key was handed to the kernel),
-                // so there is nothing a drain-and-retry could fix -- abort
-                // immediately instead of burning the drain budget.
-                #[cfg(feature = "ktls")]
-                Err(err @ nix::errno::Errno::EKEYEXPIRED) if upstream_is_ktls => {
-                    return Err(BodyTransferError::upstream(errno_to_io_error(
-                        err,
-                        "upstream sent TLS KeyUpdate (kernel paused RX awaiting rekey); \
-                         kernel TLS cannot rekey",
-                    )));
-                }
-                // Budget spent: the same errno now falls through to the
-                // generic arm, which surfaces as a plain "splice failed:
-                // Invalid argument". Say that the kTLS drain budget is what
-                // ran out.
-                #[cfg(feature = "ktls")]
-                Err(
-                    err @ (nix::errno::Errno::EINVAL
-                    | nix::errno::Errno::EIO
-                    | nix::errno::Errno::EBADMSG),
-                ) if upstream_is_ktls => {
-                    warn_once!(
-                        "splice proxy (kTLS): mid-stream control-record drain budget exhausted for `{}`; aborting the transfer:  {}",
-                        cache_path.display(),
-                        ErrorReport(&err)
-                    );
-                    return Err(BodyTransferError::upstream(errno_to_io_error(
-                        err,
-                        "splice failed after kTLS drains",
-                    )));
                 }
                 Err(err) => {
                     return Err(BodyTransferError::upstream(errno_to_io_error(
@@ -1537,9 +1455,9 @@ async fn serve_remaining_from_file(
 /// the teed bytes sitting in it are drained to the file.
 ///
 /// Draining `pipe_B` after every `tee` costs one blocking-pool round trip per
-/// fan-out ([`drain_pipe_to_file`] runs on the pool), which on a kTLS
-/// upstream used to mean one per TLS record. Letting the bytes sit turns that
-/// into one per [`Self::FLUSH_THRESHOLD`]. The flush points, and why each
+/// fan-out ([`drain_pipe_to_file`] runs on the pool), which used to mean
+/// one per socket read. Letting the bytes sit turns that into one per
+/// [`Self::FLUSH_THRESHOLD`]. The flush points, and why each
 /// exists:
 ///
 /// - the threshold, and the very first bytes of the transfer -- eager,

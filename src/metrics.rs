@@ -273,8 +273,8 @@ pub(crate) static BYTES_SERVED_SENDFILE: Accumulator = Accumulator::new();
 /// Bytes delivered to the client by the splice proxy backend.  The bulk of
 /// these traverse Linux `splice(2)` zero-copy (`tee_and_splice`), but the
 /// counter also covers the small userspace-write tail that the splice path
-/// cannot avoid: the body prefix consumed by the header parser, kTLS
-/// handshake-spill plaintext, range-boundary chunks carved from a userspace
+/// cannot avoid: the body prefix consumed by the header parser,
+/// range-boundary chunks carved from a userspace
 /// drain buffer, and the volatile buffered re-fetch path that buffers the
 /// entire body in RAM before writing.  All of these sit within a request
 /// counted under `REQUESTS_SPLICE`.
@@ -462,7 +462,7 @@ pub(crate) static BYTES_TUNNELED_UPSTREAM_TO_CLIENT: Accumulator = Accumulator::
 ///
 /// Splice path: bumped when the per-read deadline fires anywhere in the
 /// upstream read flow — `read_upstream_response_headers`, the body
-/// splice loops (TCP and kTLS variants), the chunked / EOF / volatile
+/// splice loops (TCP and userspace-TLS variants), the chunked / EOF / volatile
 /// buffered-download readers, the error-response forwarder, and
 /// `read_body_to_vec_until_eof` / `read_dechunk_body_to_vec`. The name
 /// is historical; coverage is "upstream read deadline fired," whether
@@ -532,10 +532,7 @@ pub(crate) static CACHE_QUOTA_UTIL_PEAK_BPS: Peak = Peak::new();
 /// `HTTPS_UPGRADE_REVERTED`, or `HTTPS_UPGRADE_FAILED`, so the identity
 /// `ATTEMPTED == SUCCEEDED + REVERTED + FAILED` holds. Both the hyper and
 /// splice backends write these counters; the identity holds per-backend and
-/// in aggregate, though the mechanism differs (see each subset below). The
-/// splice kTLS fast path is an exception: a successful kTLS-served HTTPS
-/// upgrade caches the scheme and serves without bumping ATTEMPTED/SUCCEEDED,
-/// so on a healthy HTTPS mirror these can stay near zero in a `ktls` build.
+/// in aggregate, though the mechanism differs (see each subset below).
 pub(crate) static HTTPS_UPGRADE_ATTEMPTED: Counter = Counter::new();
 /// HTTPS upgrade succeeded. hyper: bumped on the first successful upstream
 /// response (any status) after the upgrade flag was set. The host's
@@ -594,20 +591,6 @@ pub(crate) static AUTHZ_REJECTED_TUNNEL_MIRROR: Counter = Counter::new();
 /// Authorization rejection: web-interface access denied by the webif-client
 /// allowlist (`allowed_webif_clients`, falling back to `allowed_proxy_clients`).
 pub(crate) static AUTHZ_REJECTED_WEBUI: Counter = Counter::new();
-
-/// kTLS receive offload was enabled and the connection successfully started
-/// splicing application data. Connections where the kernel-level setup
-/// succeeded but a subsequent step (e.g. the post-`setup_rx` drain) failed
-/// are not counted here — they fall under `KTLS_FALLBACK_TRANSIENT`.
-pub(crate) static KTLS_RX_ENABLED: Counter = Counter::new();
-/// kTLS setup failed permanently for this host: the host is added to the
-/// kTLS-blocklist for the configured cooldown and subsequent connections
-/// skip kTLS until it expires.
-pub(crate) static KTLS_FALLBACK_PERMANENT: Counter = Counter::new();
-/// kTLS setup failed for a transient reason (e.g. drain race after
-/// `setup_rx` already succeeded at the kernel level); the host is not
-/// blocked from kTLS retries on subsequent connections.
-pub(crate) static KTLS_FALLBACK_TRANSIENT: Counter = Counter::new();
 
 /// Transfers cancelled because the upstream min-rate threshold was not met.
 pub(crate) static RATE_LIMIT_UPSTREAM: Counter = Counter::new();

@@ -905,13 +905,6 @@ pub(crate) struct Config {
     /// Threshold (in bytes) for using memory-mapped files for large downloads.
     pub(crate) mmap_threshold: NonZero<u64>,
 
-    /// Whether to pin the kTLS handshake buffers (which hold TLS secrets and
-    /// decrypted handshake data) in RAM via `mlock(2)`, keeping them out of
-    /// swap. Disable in mlock-restricted environments (containers, tight
-    /// `RLIMIT_MEMLOCK`). Zeroize-on-drop and core-dump exclusion stay
-    /// active regardless.
-    pub(crate) ktls_memory_lock: bool,
-
     /// Whether to set `TCP_NODELAY` on upstream sockets (hyper, splice, and
     /// CONNECT tunnels).  Mirror requests are typically a small header
     /// followed by a long body read; disabling Nagle's algorithm avoids the
@@ -1028,7 +1021,6 @@ impl Default for Config {
             db_batch_flush_max_count: nonzero!(256),
             db_batch_flush_interval_secs: nonzero!(15),
             mmap_threshold: nonzero!(1024 * 1024), // 1 MiB
-            ktls_memory_lock: true,
             upstream_tcp_nodelay: true,
             reject_pdiff_requests: true,
             verify_checksums: true,
@@ -1737,11 +1729,6 @@ impl Config {
                 "mmap_threshold is set to {} but mmap feature is not enabled",
                 self.mmap_threshold
             ));
-        }
-
-        #[cfg(not(feature = "ktls"))]
-        if self.is_set("ktls_memory_lock") {
-            warnings.push("ktls_memory_lock is set but ktls feature is not enabled".to_owned());
         }
 
         if !self.experimental_parallel_hack_enabled
@@ -2664,27 +2651,6 @@ mod test {
                 .iter()
                 .any(|w| w.contains("mmap feature is not enabled")),
             "unset mmap_threshold must not warn"
-        );
-    }
-
-    #[test]
-    fn ktls_memory_lock_set_warns_only_without_ktls_feature() {
-        for line in ["ktls_memory_lock = true", "ktls_memory_lock = false"] {
-            let warnings = warnings_for(line);
-            let warned = warnings
-                .iter()
-                .any(|w| w == "ktls_memory_lock is set but ktls feature is not enabled");
-            assert_eq!(
-                warned,
-                !cfg!(feature = "ktls"),
-                "ktls_memory_lock warning must track the ktls feature for `{line}`: {warnings:?}"
-            );
-        }
-        assert!(
-            !warnings_for("")
-                .iter()
-                .any(|w| w.contains("ktls feature is not enabled")),
-            "unset ktls_memory_lock must not warn"
         );
     }
 

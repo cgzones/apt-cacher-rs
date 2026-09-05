@@ -300,7 +300,7 @@ impl DownloadBarrier {
 
 #[cfg(feature = "splice")]
 impl DownloadBarrier {
-    /// Unconditional ping (e.g. startup prefix, kTLS extra body).
+    /// Unconditional ping (e.g. startup prefix).
     pub(crate) fn ping(&mut self) {
         let data = self
             .data

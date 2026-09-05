@@ -16,9 +16,8 @@
 //! outer arm could report it.
 //!
 //! Feature coverage falls out of the ownership: the task holds whichever
-//! `UpstreamConn` variant the exchange produced, so hyper-less and kTLS builds
-//! are covered without a second code path (a kTLS socket is still refused by
-//! the pool on drop, as everywhere else).
+//! `UpstreamConn` variant the exchange produced, so hyper-less builds are
+//! covered without a second code path.
 
 use std::num::NonZero;
 
@@ -39,8 +38,7 @@ use crate::cache_conditional::ServeParams;
 /// `splice_proxy_drive` had in hand at the gate, owned rather than borrowed,
 /// so it can outlive the connection task.
 pub(super) struct DetachedDownload {
-    /// Owned upstream connection; the kTLS variant travels as-is and is
-    /// refused by `PoolGuard::drop` like everywhere else.
+    /// Owned upstream connection.
     pub(super) upstream: PoolGuard,
     /// The head-read buffer; the body prefix is `header_buf[header_end..]`.
     pub(super) header_buf: BytesMut,
