@@ -1059,37 +1059,49 @@ fn log_download_start(
     }
 }
 
-/// For resumed downloads, send the existing partial file content to the
-/// client first using sendfile(2) for zero-copy transfer from the cache file
-/// to the client socket. With a client Range, only send the overlap of
-/// `[0, resume_offset)` with the range. Returns the bytes sent.
-async fn send_resumed_prefix(
-    client_stream: &TcpStream,
+/// Client failures before the tee loop are logged where they occur. The
+/// returned state prevents every later phase from writing this socket again.
+fn lost_prefix_client(
+    conn_details: &ConnectionDetails,
+    phase: &'static str,
+    err: &std::io::Error,
+) -> BodyClient<'static> {
+    info_or_warn!(
+        err.kind() == ErrorKind::TimedOut || is_peer_disconnect(err),
+        "splice proxy: failed to write {phase} to client {} for {} from mirror {}; continuing cache-only:  {}",
+        conn_details.client,
+        conn_details.debname,
+        conn_details.mirror,
+        ErrorReport(err)
+    );
+    BodyClient::Lost
+}
+
+/// Send the overlap of the existing partial with the requested range. A
+/// failed client write preserves both its byte count and the shared download.
+async fn send_resumed_prefix<'a>(
+    client: BodyClient<'a>,
+    conn_details: &ConnectionDetails,
     temppath: &TempPath,
     range_plan: &ServeParams,
     resume_offset: u64,
-) -> Result<u64, SpliceProxyError> {
-    if resume_offset == 0 {
-        return Ok(0);
-    }
+) -> Result<(BodyClient<'a>, u64), SpliceProxyError> {
+    let BodyClient::Attached(client_stream) = client else {
+        return Ok((client, 0));
+    };
     let send_start = range_plan.content_start.min(resume_offset);
     let send_end = range_plan.content_end().min(resume_offset);
     if send_end <= send_start {
-        return Ok(0);
+        return Ok((client, 0));
     }
-    let partial_reader = tokio_nofollow_options()
-        .read(true)
-        .open(temppath.as_ref())
-        .await
+    let partial_reader = tokio_nofollow_options().read(true).open(temppath.as_ref()).await
         .map_err(|err| SpliceProxyError::AfterHeader {
             phase: "resume reopen",
             side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
                 "splice proxy: failed to reopen partial file `{}` for resume; aborting the transfer and closing the connection:  {}",
-                temppath.display(),
-                ErrorReport(&err)
+                temppath.display(), ErrorReport(&err)
             ))),
         })?;
-
     match async_sendfile(
         client_stream,
         &partial_reader,
@@ -1098,11 +1110,16 @@ async fn send_resumed_prefix(
     )
     .await
     {
-        Ok(sent) => Ok(sent),
-        Err((_sent, err)) => Err(SpliceProxyError::AfterHeader {
-            phase: "resume sendfile to client",
-            side: AfterHeaderSide::Client(err),
-        }),
+        Ok(sent) => Ok((client, sent)),
+        Err((sent, err)) => {
+            if is_peer_disconnect(&err) {
+                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+            }
+            Ok((
+                lost_prefix_client(conn_details, "resumed prefix", &err),
+                sent,
+            ))
+        }
     }
 }
 
@@ -1166,40 +1183,27 @@ async fn write_all_flushed(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io:
     file.flush().await
 }
 
-/// Cache the body prefix ([`write_body_prefix_to_cache`]), then write the
-/// range-filtered part of it to the client. When the whole body arrived in
-/// the head read, the prefix holds the full file.
-///
-/// Returns whether the client write failed. That error is swallowed to keep
-/// caching the buffered prefix, but the client is done: its response is
-/// already short, so the caller runs the body loop cache-only
-/// ([`BodyClient::Lost`]) and closes the connection at the end rather than
-/// keep-alive a socket whose response it cannot complete.
-async fn write_body_prefix(
-    client_stream: &TcpStream,
+/// Cache the new prefix even when an earlier client write failed. Only an
+/// attached client receives its range slice; the returned state flows directly
+/// into the tee loop, with no separate failure flag to keep in sync.
+async fn write_body_prefix<'a>(
+    client: BodyClient<'a>,
     conn_details: &ConnectionDetails,
     target: &mut CacheTarget,
     body_prefix: &[u8],
     range_plan: &ServeParams,
     resume_offset: u64,
     rates: &mut RateTimestamps,
-) -> Result<bool, SpliceProxyError> {
+) -> Result<BodyClient<'a>, SpliceProxyError> {
     write_body_prefix_to_cache(
         target,
         body_prefix,
         "aborting the download and closing the connection",
     )
     .await?;
-    if body_prefix.is_empty() {
-        return Ok(false);
-    }
-
-    // If the client has disconnected, we log and keep filling the cache: the
-    // splice loop runs cache-only from its first chunk instead of dropping
-    // these prefix bytes from the cache entirely.
-    let mut prefix_client_failed = false;
-    // The prefix starts at the resume offset: it is the first body byte the
-    // upstream sent, and everything before it is already in the partial file.
+    let BodyClient::Attached(client_stream) = client else {
+        return Ok(client);
+    };
     let client_slice = range_slice(
         body_prefix,
         resume_offset,
@@ -1218,33 +1222,15 @@ async fn write_body_prefix(
         )
         .await
         {
-            // Both of this writer's stall paths surface as `TimedOut`,
-            // which `is_peer_disconnect` deliberately excludes: the
-            // rate-check failure and the `http_timeout` write stall (which
-            // bumps `HTTP_TIMEOUT_CLIENT_BODY`). Pre-branch it so a slow or
-            // stalled client stays `info` like hyper's rate-timeout sibling.
-            // The body loop will not touch this client again, so the
-            // disconnect metric the loop would have bumped is bumped here;
-            // a timeout stays metric-free, as it does in the loop.
             if is_peer_disconnect(&err) {
                 metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
             }
-            info_or_warn!(
-                err.kind() == ErrorKind::TimedOut || is_peer_disconnect(&err),
-                "splice proxy: failed to write body prefix to client {} for {} from mirror {}; continuing cache-only:  {}",
-                conn_details.client,
-                conn_details.debname,
-                conn_details.mirror,
-                ErrorReport(&err)
-            );
-            prefix_client_failed = true;
-        } else {
-            metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
-            rates.client_bytes_sent += client_slice.len() as u64;
+            return Ok(lost_prefix_client(conn_details, "body prefix", &err));
         }
+        metrics::BYTES_SERVED_SPLICE.increment_by(client_slice.len() as u64);
+        rates.client_bytes_sent += client_slice.len() as u64;
     }
-
-    Ok(prefix_client_failed)
+    Ok(client)
 }
 
 /// A failed body transfer, with the partial file's path guard handed back.
@@ -1720,20 +1706,35 @@ async fn splice_proxy_drive(
     // Cork the socket to coalesce headers + body prefix into fewer TCP segments
     let cork = CorkGuard::new_optional(client.stream);
 
-    rates.t_client_first = write_splice_response_headers(
+    let body_client = match write_splice_response_headers(
         client,
         conn_details,
         &upstream_resp,
         &range_plan,
         "response headers",
     )
+    .await
+    {
+        Ok(first) => {
+            rates.t_client_first = first;
+            BodyClient::Attached(client.stream)
+        }
+        Err(SpliceProxyError::Client { phase, err }) => {
+            lost_prefix_client(conn_details, phase, &err)
+        }
+        Err(err) => return Err(err),
+    };
+    let (body_client, resumed_bytes) = send_resumed_prefix(
+        body_client,
+        conn_details,
+        &target.temppath,
+        &range_plan,
+        resume_offset,
+    )
     .await?;
-
-    rates.client_bytes_sent +=
-        send_resumed_prefix(client.stream, &target.temppath, &range_plan, resume_offset).await?;
-
-    let prefix_client_failed = write_body_prefix(
-        client.stream,
+    rates.client_bytes_sent += resumed_bytes;
+    let body_client = write_body_prefix(
+        body_client,
         conn_details,
         &mut target,
         body_prefix,
@@ -1742,20 +1743,8 @@ async fn splice_proxy_drive(
         &mut rates,
     )
     .await?;
-
-    // Client-rate-window end after the prefix write; covers
-    // the case where the splice loop never runs (whole body in the prefix).
-    // Reassigned after the splice body block and the demoted file-serve task.
     rates.t_client_done = PreciseInstant::now();
 
-    // A client whose prefix write failed is done: its response is already
-    // short, so the loop must not write to it again (it would only corrupt
-    // the stream further) and runs cache-only from the first chunk.
-    let body_client = if prefix_client_failed {
-        BodyClient::Lost
-    } else {
-        BodyClient::Attached(client.stream)
-    };
     let BodyTransferred {
         target,
         client: client_end,

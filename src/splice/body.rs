@@ -310,9 +310,9 @@ pub(super) enum BodyClient<'a> {
     /// There never was one: the parallel-hack nudge answered the request
     /// and the download runs detached.
     Absent,
-    /// There was one, but the body-prefix write to it already failed
-    /// (`write_body_prefix`): its response is short and nothing more may be
-    /// written to it, so the loop starts in [`ClientStatus::Disconnected`]
+    /// A header or prefix write already failed: its response is short and
+    /// nothing more may be written to it. The loop starts in
+    /// [`ClientStatus::Disconnected`]
     /// and the transfer ends as [`ClientEnd::Disconnected`].
     Lost,
 }

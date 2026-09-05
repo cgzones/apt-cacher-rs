@@ -2373,7 +2373,12 @@ pub(crate) async fn async_sendfile_unfinished(
             // above: after the drop, `finished` is set and the next
             // substituted "nothing available" ends the transfer as a short
             // file instead of parking again.
-            let _: Never = match receiver.changed().await {
+            // Time waiting for the download is not client backpressure.
+            // Reset the delivery-rate window after that wait, including for
+            // a tail-range reader that has not received its first byte yet.
+            let changed = receiver.changed().await;
+            rate_checker = RateChecker::from_config(config);
+            let _: Never = match changed {
                 Ok(()) => continue,
                 Err(_err @ tokio::sync::watch::error::RecvError { .. }) => {
                     // Sender dropped — download finished, verifying, or
