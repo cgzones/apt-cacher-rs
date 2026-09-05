@@ -819,7 +819,6 @@ pub(super) async fn splice_proxy_body(
             // see progress without being gated on the first client's send speed.
             xfer.write_cache_chunk(cache_file, &mut buf, got).await?;
 
-            // Then send to client (may be slow).
             let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
                 match write_all_to_stream_rated(
@@ -1069,7 +1068,6 @@ pub(super) async fn splice_proxy_body_tls(
         xfer.write_cache_chunk(cache_file, &mut read_buf, got)
             .await?;
 
-        // Then send the overlap with the client range (may be slow)
         let client_slice = range_slice(
             &read_buf[..got],
             chunk.start,

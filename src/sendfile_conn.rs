@@ -205,7 +205,6 @@ pub(crate) async fn handle_sendfile_connection(
     let mut conn_version = ConnectionVersion::Http11; // assume more recent version 1.1 if not yet parsed from any request
 
     loop {
-        // Try to peek and find the next request headers to determine if sendfile is applicable
         let next_header_index = match read_request_headers(&stream, &mut buf).await {
             Ok(None) if req_num == 0 => {
                 info!("Connection from client {client} closed before receiving any request");
@@ -277,12 +276,10 @@ pub(crate) async fn handle_sendfile_connection(
         #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
         let _: Never = match result {
             ZeroCopyResult::Served(ConnectionAction::KeepAlive) => {
-                // Request served via sendfile with keep-alive; continue to next request
                 buf.advance(next_header_index);
                 continue;
             }
             ZeroCopyResult::Served(ConnectionAction::Close) => {
-                // Request served via sendfile; close the connection as requested
                 return;
             }
             ZeroCopyResult::NotApplicable {
@@ -398,7 +395,6 @@ async fn read_request_headers(
     stream: &TcpStream,
     buf: &mut BytesMut,
 ) -> std::io::Result<Option<usize>> {
-    // Check if we already have the complete headers from the previous read
     if let Some(next_index) = find_header_end(buf) {
         return Ok(Some(next_index));
     }
@@ -962,7 +958,6 @@ async fn try_sendfile_request(
 
     let acls = ClientAcls::from(global_config());
 
-    // Only handle GET requests via sendfile
     match preflight_method(req.method.expect("complete header parsed"), &client, &acls) {
         Ok(RequestKind::Get) => {}
         Ok(RequestKind::Connect) => {
@@ -1101,7 +1096,6 @@ async fn try_sendfile_request(
 
     let aliased = conn_details.alias_suffix();
 
-    // Check if the file is currently being downloaded - if so, serve it via
     // sendfile from the growing partial file.  `attach()` atomically records
     // the late joiner under the same write lock as the lookup; should the
     // response turn out unframeable here (no Content-Length), the attached
@@ -1560,7 +1554,6 @@ pub(crate) async fn serve_file_via_sendfile(
     // kernel coalesces them with the first sendfile body bytes — no
     // TCP_CORK setsockopt pair needed.
 
-    // Write HTTP response headers
     if let Err(err) = write_response_headers(
         stream,
         conn_version,

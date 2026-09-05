@@ -341,7 +341,6 @@ pub(crate) fn is_available() -> bool {
             return probe_error(format_args!("listen on the probe listener socket"), err);
         }
 
-        // Read back the assigned port
         let sockname: SockaddrIn = match getsockname(listener.as_raw_fd()) {
             Ok(s) => s,
             Err(err) => {

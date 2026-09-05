@@ -495,10 +495,8 @@ async fn prepare_cache_target(
     // removed on drop instead.
     let (tempfile, temppath) = match partial {
         partial_file::PartialDownload::Resumable { mut file, guard } => {
-            // Resume: use the file already opened during the partial-file check.
-            // The file handle has been held open since the check, so no TOCTOU race.
-            // Verify the file size matches expectations (should always hold since
-            // we've held the fd open, but check as defense-in-depth).
+            // Defense in depth: the held-open fd makes this size re-check
+            // redundant, but a wrong offset here would corrupt the cache file.
             use tokio::io::AsyncSeekExt as _;
             let current_size = match file.seek(std::io::SeekFrom::End(0)).await {
                 Ok(size) => size,
@@ -851,11 +849,9 @@ async fn reject_if_verify_throttled(
 }
 
 /// Check for a partial download file to resume (permanent files only).
-/// Opens the file upfront (if it exists and is non-empty) to get size + mtime
-/// from the same file descriptor, avoiding TOCTOU races between `metadata()` and `open()`.
-/// The guard is `OnDrop::Keep`, so the partial file survives on fallback
-/// (e.g., concurrent download → hyper path picks it up for resume).
-/// Explicit `guard.remove()` is used only when a stale partial must be discarded.
+///
+/// See [`partial_file::PartialDownload`] for the open-once and keep-on-drop
+/// rules both backends resume under.
 async fn open_partial_resume(
     ibarrier: &InitBarrier<'_>,
     conn_details: &ConnectionDetails,
@@ -1446,7 +1442,6 @@ async fn transfer_body(
         .try_into()
         .expect("the body prefix + extra body is limited in size");
 
-    // Compute client range relative to splice region for the body transfer.
     // splice_file_start is the file offset where the splice region begins.
     let splice_file_start = resume_offset + body_content_length.get() - splice_count;
     let client_range_end = range_plan.content_end();
@@ -1798,7 +1793,6 @@ async fn splice_proxy_drive(
     // `consumed()` once the body is fully read.
     let mut upstream_guard = UnconsumedBodyGuard::new(&mut upstream);
 
-    // Parse client Range request now that we know the total file size.
     let client_range_result = client_range.range.map(|range| {
         let cache_time = upstream_resp
             .last_modified

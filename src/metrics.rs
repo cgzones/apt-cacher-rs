@@ -260,11 +260,10 @@ pub(crate) static UNHANDLED_REQUEST_HEADERS: Counter = Counter::new();
 pub(crate) static REQUEST_READ_PEER_DISCONNECT: Counter = Counter::new();
 pub(crate) static REQUEST_READ_PROTOCOL_ERROR: Counter = Counter::new();
 
-/// Peak concurrent connected clients.
+/// Peak concurrency: connected clients, in-flight upstream downloads,
+/// in-flight client-side downloads.
 pub(crate) static CONNECTED_CLIENTS_PEAK: Peak = Peak::new();
-/// Peak concurrent in-flight upstream downloads.
 pub(crate) static ACTIVE_UPSTREAM_DOWNLOADS_PEAK: Peak = Peak::new();
-/// Peak concurrent in-flight client-side downloads.
 pub(crate) static ACTIVE_CLIENT_DOWNLOADS_PEAK: Peak = Peak::new();
 
 /// Bytes delivered via memory-mapped file I/O.
@@ -295,15 +294,11 @@ pub(crate) static BYTES_SERVED_CHANNEL: Accumulator = Accumulator::new();
 /// hyper's body model) — slightly overcounts on aborted clients vs. the
 /// post-write splice/sendfile counters.
 pub(crate) static BYTES_SERVED_PASSTHROUGH: Accumulator = Accumulator::new();
-/// Passthrough requests served (companion to `BYTES_SERVED_PASSTHROUGH`).
 pub(crate) static REQUESTS_PASSTHROUGH: Counter = Counter::new();
-/// Passthrough responses fully relayed to the client (subset of
-/// `REQUESTS_PASSTHROUGH`).
 pub(crate) static SERVED_PASSTHROUGH: Counter = Counter::new();
 
-/// Splice-path upstream connect failures (TCP setup).
+/// Splice-path upstream setup failures, TCP and TLS handshake respectively.
 pub(crate) static UPSTREAM_CONNECT_FAILED: Counter = Counter::new();
-/// Splice-path upstream connect failures (TLS handshake).
 pub(crate) static UPSTREAM_TLS_FAILED: Counter = Counter::new();
 
 /// Splice clients demoted to ordinary cached-file delivery.
@@ -321,16 +316,15 @@ pub(crate) static LATE_JOINERS_TOTAL: Counter = Counter::new();
 /// Peak concurrent late joiners attached to a single in-flight download.
 pub(crate) static LATE_JOINER_PEAK_PER_DOWNLOAD: Peak = Peak::new();
 
-/// Splice upstream pool: pooled TCP/TLS connection reused.
+/// Splice upstream pool: connection reused / opened fresh.
 pub(crate) static POOL_REUSED: Counter = Counter::new();
-/// Splice upstream pool: fresh TCP/TLS connection opened.
 pub(crate) static POOL_NEW: Counter = Counter::new();
 
-/// Pool miss: no entry existed for this host (raise `POOL_MAX_IDLE_PER_HOST`).
+/// Why a checkout missed: no entry for this host (raise
+/// `POOL_MAX_IDLE_PER_HOST`), the entry was already closed (lower
+/// `POOL_IDLE_TIMEOUT`), or its previous request failed in flight.
 pub(crate) static POOL_MISS_EMPTY: Counter = Counter::new();
-/// Pool miss: pooled entry was already closed (lower `POOL_IDLE_TIMEOUT`).
 pub(crate) static POOL_MISS_DEAD: Counter = Counter::new();
-/// Pool miss: pooled entry's request failed in flight.
 pub(crate) static POOL_MISS_FAILED: Counter = Counter::new();
 /// Pool miss: no cached scheme for the mirror, so no `(host, port, is_tls)`
 /// key existed to look up by — the pool was bypassed entirely. Distinct
@@ -355,27 +349,20 @@ pub(crate) static CACHE_HITS: Counter = Counter::new();
 /// Permanent-file cache lookup needed a fetch (volatile cases use VOLATILE_*).
 pub(crate) static CACHE_MISSES: Counter = Counter::new();
 
-/// Cached responses served via mmap (companion to `BYTES_SERVED_MMAP`).
+/// Per-delivery-mechanism triples. For each mechanism `X`, `REQUESTS_X`
+/// counts responses that started down that path, `SERVED_X` the subset that
+/// completed, and `BYTES_SERVED_X` (above) their bytes. `SERVED_TOTAL` is the
+/// sum of the `SERVED_X` plus `SERVED_WEBUI`.
 pub(crate) static REQUESTS_MMAP: Counter = Counter::new();
-/// Cached responses fully delivered via mmap (subset of `REQUESTS_MMAP`).
 pub(crate) static SERVED_MMAP: Counter = Counter::new();
-/// Cached responses served via sendfile (companion to `BYTES_SERVED_SENDFILE`).
 pub(crate) static REQUESTS_SENDFILE: Counter = Counter::new();
-/// Cached responses fully delivered via sendfile (subset of `REQUESTS_SENDFILE`).
 pub(crate) static SERVED_SENDFILE: Counter = Counter::new();
-/// Responses served via splice (companion to `BYTES_SERVED_SPLICE`).
 pub(crate) static REQUESTS_SPLICE: Counter = Counter::new();
-/// Responses fully delivered via splice (subset of `REQUESTS_SPLICE`).
 pub(crate) static SERVED_SPLICE: Counter = Counter::new();
-/// Cached responses served via plain copy (companion to `BYTES_SERVED_COPY`).
 pub(crate) static REQUESTS_COPY: Counter = Counter::new();
-/// Cached responses fully delivered via plain copy (subset of `REQUESTS_COPY`).
 pub(crate) static SERVED_COPY: Counter = Counter::new();
-/// Late-joiner responses streamed via `ChannelBody` (companion to
-/// `BYTES_SERVED_CHANNEL`).
+/// `ChannelBody`, i.e. late joiners streamed from an in-flight download.
 pub(crate) static REQUESTS_CHANNEL: Counter = Counter::new();
-/// Late-joiner responses fully delivered via `ChannelBody` (subset of
-/// `REQUESTS_CHANNEL`).
 pub(crate) static SERVED_CHANNEL: Counter = Counter::new();
 
 /// Mirror responses that violated the HTTP contract: body exceeded or

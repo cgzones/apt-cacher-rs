@@ -780,6 +780,12 @@ impl Consumed {
 /// and the final `\r\n` are rejected as a framing sanity check rather than
 /// skipped, to catch truncation and smuggling. The declared payload total is
 /// checked against `max_bytes` at every chunk-size line.
+///
+/// Terminator policy, binding on both readers: on success the closing
+/// `\r\n` after the `0\r\n` has been fully consumed from the upstream socket
+/// buffer, so the connection can be returned to the pool. On error the
+/// connection state is indeterminate and the caller must mark the upstream
+/// non-poolable.
 struct ChunkDecoder {
     state: ChunkedState,
     size_buf: Vec<u8>,
@@ -970,12 +976,7 @@ async fn forward_chunked_buf(
 /// The [`ChunkDecoder`] only tracks framing to detect the terminating
 /// zero-length chunk, so the connection can be reused afterwards.
 ///
-/// On success the closing `\r\n` after the `0\r\n` terminator has been fully
-/// consumed from the upstream socket buffer, so the connection can be safely
-/// returned to the pool (the buffered variant [`read_dechunk_body_to_vec`]
-/// shares the decoder and therefore the terminator policy). On error the
-/// connection state is indeterminate -- callers must mark the upstream
-/// non-poolable.
+/// Terminator and pool-safety policy: [`ChunkDecoder`].
 async fn forward_upstream_chunked_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
@@ -1170,12 +1171,7 @@ async fn read_body_to_vec_with_content_length(
 /// Dechunk a chunked-encoded body from upstream into a `Vec<u8>`, up to `max_bytes`
 /// of decoded payload.
 ///
-/// On success the closing `\r\n` after the `0\r\n` terminator has been fully
-/// consumed from the upstream socket buffer, so the connection can be safely
-/// returned to the pool (the streaming variant
-/// [`forward_upstream_chunked_body`] shares the [`ChunkDecoder`] and
-/// therefore the terminator policy). On error the connection state is
-/// indeterminate -- callers must mark the upstream non-poolable.
+/// Terminator and pool-safety policy: [`ChunkDecoder`].
 async fn read_dechunk_body_to_vec(
     upstream: &mut UpstreamConn,
     prefix: &[u8],

@@ -1732,13 +1732,8 @@ async fn serve_new_file(
         .as_ref()
         .and_then(|m| m.etag.as_deref());
 
-    // Check for a partial download file to resume (permanent files only).
-    // Opens the file upfront (if it exists and is non-empty) to get size + mtime
-    // from the same file descriptor, avoiding TOCTOU races between metadata() and open().
-    // The guard is `OnDrop::Keep`, so the partial file survives transient
-    // errors (e.g., upstream 5xx) and can be resumed on the next attempt.
-    // `partial.discard_resume()` is used only when a stale partial must be
-    // discarded (200 fallback from unsupported Range, 416, invalid Content-Range).
+    // Permanent files only; see `partial_file::PartialDownload` for the
+    // open-once and keep-on-drop rules this relies on.
     let partial_file::PartialResume {
         offset: resume_offset,
         expected_total: resume_expected_total,
@@ -2121,10 +2116,8 @@ async fn serve_new_file(
     // download's own `OnDrop::Keep` TempPath manages the file lifetime.
     let (outfile, outpath) = match partial {
         partial_file::PartialDownload::Resumable { mut file, guard } => {
-            // Resume: use the file already opened during the partial-file check.
-            // The file handle has been held open since the check, so no TOCTOU race.
-            // Verify the file size matches expectations (should always hold since
-            // we've held the fd open, but check as defense-in-depth).
+            // Defense in depth: the held-open fd makes this size re-check
+            // redundant, but a wrong offset here would corrupt the cache file.
             let current_size = match file.seek(std::io::SeekFrom::End(0)).await {
                 Ok(size) => size,
                 Err(err) => {

@@ -32,6 +32,15 @@ use crate::{
 /// - `Resumable`: permanent cache flavor with an existing valid partial whose file handle
 ///   has been held open since the size/ETag check (avoiding TOCTOU); caller resumes from
 ///   `file`'s current offset.
+///
+/// The `Resumable` handle is opened once, up front, so size and mtime come
+/// from the same descriptor the download then writes through — there is no
+/// window between the check and the open for the file to be replaced in.
+/// Both guards are `OnDrop::Keep`: a partial survives a transient failure
+/// (upstream 5xx, a fallback to another backend) and is picked up by the next
+/// attempt. Discarding one is always explicit — [`Self::discard_resume`] for
+/// a stale partial (a 200 answering an unsupported `Range`, a 416, an invalid
+/// `Content-Range`), `TempPath::remove` for known-bad bytes.
 pub(crate) enum PartialDownload {
     Volatile,
     Fresh(TempPath),

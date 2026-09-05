@@ -23,7 +23,6 @@ static UNCACHEABLES: LazyLock<parking_lot::RwLock<RingBuffer<(ClientHost, String
 pub(crate) fn record_uncacheable(host: &ClientHost, path: &str) {
     let uncacheables = &mut *UNCACHEABLES.write();
 
-    // Remove and re-add existing entries to keep them recent.
     if let Some(idx) = uncacheables
         .iter()
         .position(|(h, p)| h == host && p == path)

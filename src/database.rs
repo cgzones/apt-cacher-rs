@@ -1077,11 +1077,8 @@ impl Database {
         tx.commit().await
     }
 
-    /// Insert a batch of download rows in a single transaction.
-    ///
-    /// Chunks the input so no single statement exceeds
-    /// [`SQLITE_MAX_BIND_PARAMETERS`]. All chunks share one transaction so the
-    /// flush remains atomic from the caller's perspective.
+    /// Insert a batch of download rows in a single transaction; chunked like
+    /// [`Self::batch_insert_deliveries`].
     pub(crate) async fn batch_insert_downloads(&self, rows: &[DownloadRow]) -> Result<(), Error> {
         const BINDS_PER_ROW: usize = 5;
         const CHUNK_SIZE: usize = SQLITE_MAX_BIND_PARAMETERS / BINDS_PER_ROW;

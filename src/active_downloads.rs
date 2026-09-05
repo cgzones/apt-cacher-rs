@@ -364,11 +364,7 @@ pub(crate) enum InsertOutcome {
     Joined {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
-    /// `max` originations were already in flight, so nothing was registered.
-    /// The caller must answer with the canonical 503
-    /// (`"Too many concurrent upstream downloads"`); the
-    /// `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened inside
-    /// [`ActiveDownloads::lookup_or_insert`].
+    /// See [`LookupResult::AtCapacity`].
     AtCapacity { max: NonZero<usize> },
 }
 
@@ -386,11 +382,7 @@ pub(crate) enum OriginateOutcome {
     Concurrent {
         status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     },
-    /// `max` originations were already in flight, so nothing was registered.
-    /// The caller must answer with the canonical 503
-    /// (`"Too many concurrent upstream downloads"`); the
-    /// `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened inside
-    /// [`ActiveDownloads::lookup_or_insert`].
+    /// See [`LookupResult::AtCapacity`].
     AtCapacity { max: NonZero<usize> },
 }
 
@@ -411,7 +403,9 @@ enum LookupResult {
     },
     /// A new origination was refused because `max` downloads were already in
     /// flight; nothing was inserted. Carries the enforced cap so callers can
-    /// log the actual value the decision was made against.
+    /// log the actual value the decision was made against. The caller answers
+    /// with the canonical 503 (`"Too many concurrent upstream downloads"`);
+    /// the `UPSTREAM_DOWNLOAD_REJECTED_CAP` bump already happened here.
     AtCapacity { max: NonZero<usize> },
 }
 

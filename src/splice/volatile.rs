@@ -125,7 +125,6 @@ pub(super) async fn handle_volatile_buffered_download(
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
 
-    // Parse client Range against the now-known total size.
     let cache_time = HttpDate::now();
     let client_range_result = client_range.range.map(|range| {
         let parsed = http_parse_range(
@@ -238,7 +237,6 @@ pub(super) async fn handle_volatile_buffered_download(
     )
     .await?;
 
-    // Send body (range-filtered if needed) to client.
     #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
     let body_slice = &body[range_plan.content_start as usize..range_plan.content_end() as usize];
     {
@@ -279,7 +277,6 @@ pub(super) async fn handle_volatile_buffered_download(
             },
         );
 
-        // Record delivery in database.
         record_delivery(
             conn_details,
             total_content_length,

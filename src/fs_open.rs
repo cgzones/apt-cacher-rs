@@ -52,12 +52,8 @@ pub(crate) fn nofollow_nonblock_options() -> std::fs::OpenOptions {
     options
 }
 
-/// [`tokio::fs::OpenOptions`] with `O_NOFOLLOW` pre-set: every open of a path
-/// under the cache directory must refuse a symlink at the final component.
-/// Callers chain the remaining flags on the returned options.
-///
-/// `custom_flags` overwrites rather than ORs, so callers must NOT call
-/// `.custom_flags()` again on the returned options.
+/// [`nofollow_options`] over [`tokio::fs::OpenOptions`], with the same
+/// `custom_flags` caveat.
 pub(crate) fn tokio_nofollow_options() -> tokio::fs::OpenOptions {
     #[expect(
         clippy::disallowed_methods,
