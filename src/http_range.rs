@@ -406,13 +406,13 @@ mod tests {
         }
     }
 
-    /// The expected `Some(ContentRange)` for a `bytes start-end/total` value.
-    fn content_range(start: u64, end: u64, total: u64) -> Option<ContentRange> {
-        Some(ContentRange {
+    /// The expected parse of a `bytes start-end/total` value.
+    fn content_range(start: u64, end: u64, total: u64) -> ContentRange {
+        ContentRange {
             start,
             end,
             total: NonZero::new(total).unwrap(),
-        })
+        }
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
         // A filesystem reporting an absurd birth/modification time reaches
         // `format` through `cache_file_http_date`; it must clamp, not panic.
         assert_eq!(
-            HttpDate::from(SystemTime::UNIX_EPOCH + Duration::from_secs(300_000_000_000)).format(),
+            HttpDate::from(SystemTime::UNIX_EPOCH + Duration::from_secs(300_000_000_001)).format(),
             "Fri, 31 Dec 9999 23:59:59 GMT"
         );
     }
@@ -951,16 +951,19 @@ mod tests {
         // Valid ranges
         assert_eq!(
             parse_content_range("bytes 0-499/1000"),
-            content_range(0, 499, 1000)
+            Some(content_range(0, 499, 1000))
         );
         assert_eq!(
             parse_content_range("bytes 500-999/1000"),
-            content_range(500, 999, 1000)
+            Some(content_range(500, 999, 1000))
         );
-        assert_eq!(parse_content_range("bytes 0-0/1"), content_range(0, 0, 1));
+        assert_eq!(
+            parse_content_range("bytes 0-0/1"),
+            Some(content_range(0, 0, 1))
+        );
         assert_eq!(
             parse_content_range("bytes 34744111-1071434819/1071434820"),
-            content_range(34_744_111, 1_071_434_819, 1_071_434_820)
+            Some(content_range(34_744_111, 1_071_434_819, 1_071_434_820))
         );
 
         // Invalid: missing prefix
