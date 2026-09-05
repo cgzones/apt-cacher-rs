@@ -320,8 +320,8 @@ pub(crate) struct RenamePlan {
     pub(crate) bytes_received: u64,
     /// The digest the download computed incrementally over the bytes it
     /// wrote, when it could; spares `verify_temp_file` the re-read. `None`
-    /// from every path that cannot produce one -- the zero-copy splice loops
-    /// (kTLS included: the plaintext never reaches userspace), a resumed
+    /// from every path that cannot produce one -- the zero-copy splice loop
+    /// (the plaintext never reaches userspace), a resumed
     /// download whose temp file already held a prefix, `volatile.rs`, and the
     /// hyper backend.
     pub(crate) streamed_digest: Option<StreamedDigest>,

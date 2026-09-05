@@ -1603,7 +1603,7 @@ async fn splice_proxy_drive(
     // is pure waste -- `transfer_body` drops it and the commit re-reads the
     // file anyway, after this task has hashed the whole body prefix into it.
     //
-    // A zero-copy upstream (plain TCP, and every kTLS connection) moves its
+    // A zero-copy upstream (plain TCP) moves its
     // body socket-to-file inside the kernel, so the digest could only ever
     // cover the prefix. And a resume writes into a temp file that already
     // holds bytes this connection never saw, so an incremental digest would
