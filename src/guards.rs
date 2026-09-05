@@ -388,20 +388,25 @@ impl DownloadBarrier {
         self,
         download_rate_err: InsufficientRate,
     ) -> std::io::Error {
-        let data = self
-            .data
-            .as_ref()
-            .expect("every sink consumes the instance");
-        let io_err = download_rate_err.to_timeout_io_error(format_args!(
-            " for mirror {} downloading file {}",
-            data.key.mirror, data.key.debname,
-        ));
+        // The `io::Error` only ever surfaces inside a splice log line that
+        // already names the file and mirror (`splice_error_outcome`'s
+        // subject, or the tmp path of a detached download), so its own
+        // context names just the side, like the sendfile and
+        // `splice/http.rs` rate-timeout sites.  The `AbortReason` below keeps
+        // the mirror and file: hyper joiners render it on their own.
+        let io_err = download_rate_err.to_timeout_io_error(format_args!(" for upstream"));
         #[cfg(feature = "hyper")]
-        let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {
-            download_rate_err,
-            mirror: data.key.mirror.clone(),
-            debname: data.key.debname.clone(),
-        });
+        let reason = {
+            let data = self
+                .data
+                .as_ref()
+                .expect("every sink consumes the instance");
+            AbortReason::MirrorDownloadRate(MirrorDownloadRate {
+                download_rate_err,
+                mirror: data.key.mirror.clone(),
+                debname: data.key.debname.clone(),
+            })
+        };
         #[cfg(not(feature = "hyper"))]
         let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {});
         self.abort_with_reason(reason).await;
