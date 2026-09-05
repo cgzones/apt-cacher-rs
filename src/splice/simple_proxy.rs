@@ -168,8 +168,6 @@ pub(crate) async fn splice_simple_proxy(
         .await
         .map_err(SpliceProxyError::Upstream)?;
 
-    let t_req_sent = resp.request_sent_at.unwrap_or_else(PreciseInstant::now);
-
     debug!(
         "simple proxy: upstream returned {} for {upstream_path} from {host_authority}",
         resp.status_code
@@ -260,7 +258,7 @@ pub(crate) async fn splice_simple_proxy(
     info!(
         "simple proxy: passed through {upstream_path} from host {host_authority} for client {client} in {} ({}, {})",
         HumanFmt::Time(in_time),
-        rate_log::upstream_segment(forwarded, t_done.duration_since(t_req_sent)),
+        rate_log::upstream_segment(forwarded, t_done.duration_since(resp.request_sent_at)),
         rate_log::client_segment(forwarded, t_done.duration_since(t_client_first)),
     );
 

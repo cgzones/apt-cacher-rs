@@ -58,12 +58,6 @@ pub(super) async fn handle_volatile_buffered_download(
         .try_into()
         .expect("constant fits"); // TODO: const conversion once stable
 
-    // Capture t_req_sent before buffering so the upstream-rate window is never
-    // inverted. The fallback is a pre-read now() so t_req_sent <= t_upstream_done.
-    let t_req_sent = upstream_resp
-        .request_sent_at
-        .unwrap_or_else(PreciseInstant::now);
-
     // Account this buffered serve under `ACTIVE_CLIENT_DOWNLOADS` for the
     // duration of the function (RAII drop on every return path).  Mirrors
     // the canonical `splice_proxy_body{,_tls}` holders; the buffered path
@@ -93,7 +87,7 @@ pub(super) async fn handle_volatile_buffered_download(
             SpliceProxyError::Upstream(UpstreamFailure { err, logged })
         })?;
 
-    let mut rates = RateTimestamps::new(t_req_sent);
+    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at);
 
     let Some(total_content_length) = NonZero::new(body.len() as u64) else {
         debug!(

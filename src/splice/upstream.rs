@@ -29,7 +29,7 @@ use tokio::{
 use tracing::debug;
 
 use crate::deb_mirror::Mirror;
-use crate::error::{ErrorReport, Transience};
+use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
 use crate::{Scheme, global_config, metrics, warn_once_or_debug, warn_once_or_info};
 
@@ -414,6 +414,17 @@ impl UpstreamConn {
             Self::Tls(tls) => tls_peek_alive(tls, host, port),
         }
     }
+}
+
+/// Whether a failed connect is worth retrying. `Permanent` means the failure
+/// is a deterministic function of its inputs (a rejected certificate, an
+/// unparsable server name) and a retry re-runs it identically, so the retry
+/// loop in `acquire` skips its budget; `Transient` means a transport hiccup
+/// that may clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Transience {
+    Transient,
+    Permanent,
 }
 
 /// An upstream connect failure, tagged with whether retrying it can plausibly

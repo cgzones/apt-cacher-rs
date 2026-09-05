@@ -682,8 +682,7 @@ async fn commit_and_record(
 /// ([`log_splice_completion`]).
 struct RateTimestamps {
     /// Start of the upstream-rate window: the instant the upstream request
-    /// was sent (falls back to a local instant only for bare-parser
-    /// responses, i.e. tests).
+    /// was sent.
     t_req_sent: PreciseInstant,
     /// End of the upstream-rate window. Initialised at construction so the
     /// case where the splice loop never runs (whole body arrived with the
@@ -1816,9 +1815,7 @@ async fn splice_proxy_drive(
             body_content_length,
             resume_offset,
             splice_count,
-            request_sent_at: upstream_resp
-                .request_sent_at
-                .unwrap_or_else(PreciseInstant::now),
+            request_sent_at: upstream_resp.request_sent_at,
         }
         .spawn();
         // `REQUESTS_SPLICE` stays unbumped -- no splice response was served;
@@ -1839,7 +1836,7 @@ async fn splice_proxy_drive(
 
     // Per-request rate-logging timestamps; the upstream-rate window ends
     // here in case the splice loop never runs.
-    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at.unwrap_or(start));
+    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at);
 
     log_download_start(
         conn_details,
@@ -2180,7 +2177,8 @@ mod tests {
                         ETag: \"abc\"\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         let whole = ServeParams::from_parsed(None, 1000).expect("no range");
         let head = render_splice_response_head(
             ConnectionVersion::Http11,
@@ -2209,7 +2207,8 @@ mod tests {
 
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         let partial = ServeParams::from_parsed(
             Some(ParsedRange::Satisfiable {
                 content_range: "bytes 200-499/1000".to_owned(),

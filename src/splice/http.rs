@@ -324,8 +324,8 @@ pub(super) struct UpstreamResponse {
     pub(super) location: Option<String>,
     pub(super) connection_close: bool,
     /// Instant the upstream request was sent - start of the upstream-rate
-    /// window. `None` only on responses built by the bare parser in tests.
-    pub(super) request_sent_at: Option<PreciseInstant>,
+    /// window.
+    pub(super) request_sent_at: PreciseInstant,
 }
 
 impl UpstreamResponse {
@@ -411,15 +411,18 @@ impl UpstreamResponse {
     }
 }
 
-/// Parse upstream HTTP response headers.
+/// Parse the upstream HTTP response head in `buf[..header_end]`, sent in
+/// answer to the request that went out at `request_sent_at`.
 ///
-/// Does **not** record the upstream status metric — callers must call
-/// `metrics::record_upstream_status` themselves once the response is going
-/// to be honored.
+/// On success the upstream status is recorded and the body bytes that
+/// arrived with the head (`buf[header_end..]`) are credited as downloaded;
+/// an unparsable response is neither. Later reads of the body credit
+/// themselves.
 pub(super) fn parse_upstream_response(
     buf: &[u8],
     header_end: usize,
     host_authority: &str,
+    request_sent_at: PreciseInstant,
 ) -> std::io::Result<UpstreamResponse> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
@@ -506,6 +509,12 @@ pub(super) fn parse_upstream_response(
         framing
     };
 
+    let body_prefix_len = (buf.len() - header_end) as u64;
+    if body_prefix_len > 0 {
+        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(body_prefix_len);
+    }
+    metrics::record_upstream_status(status_code);
+
     Ok(UpstreamResponse {
         status_code,
         framing,
@@ -515,7 +524,7 @@ pub(super) fn parse_upstream_response(
         content_range,
         location,
         connection_close,
-        request_sent_at: None,
+        request_sent_at,
     })
 }
 
@@ -543,24 +552,14 @@ pub(super) async fn send_and_read_headers(
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
-    let mut resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority).inspect_err(|err| {
-        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        warn_once_or_info!(
-            "splice proxy: upstream {host_authority} sent malformed HTTP; failing the upstream request:  {}",
-            ErrorReport(err)
-        );
-    })?;
-    // Credit body bytes that arrived bundled with the response headers
-    // in the same read (the body_prefix). Done after parse so an
-    // unparsable response is not credited as a successful download —
-    // mirrors `record_upstream_status` below. Subsequent reads of
-    // remaining body bytes credit themselves separately.
-    let body_prefix_len = (hdr_buf.len() - hdr_end) as u64;
-    if body_prefix_len > 0 {
-        metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(body_prefix_len);
-    }
-    metrics::record_upstream_status(resp.status_code);
-    resp.request_sent_at = Some(request_sent_at);
+    let resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority, request_sent_at)
+        .inspect_err(|err| {
+            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+            warn_once_or_info!(
+                "splice proxy: upstream {host_authority} sent malformed HTTP; failing the upstream request:  {}",
+                ErrorReport(err)
+            );
+        })?;
     Ok((resp, hdr_buf, hdr_end))
 }
 
@@ -1244,7 +1243,8 @@ mod tests {
                         Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), Some(12345));
         assert_eq!(
@@ -1261,7 +1261,8 @@ mod tests {
     fn test_parse_upstream_response_no_content_length() {
         let headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), None);
         assert_eq!(resp.framing, BodyFraming::Chunked);
@@ -1271,7 +1272,8 @@ mod tests {
     fn test_parse_upstream_response_not_chunked() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::ContentLength(42));
         assert_eq!(resp.content_length(), Some(42));
     }
@@ -1286,7 +1288,8 @@ mod tests {
                         Transfer-Encoding: chunked\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::Chunked);
         assert_eq!(resp.content_length(), None);
     }
@@ -1295,7 +1298,8 @@ mod tests {
     fn parse_upstream_response_close_delimited_without_framing_headers() {
         let headers = b"HTTP/1.1 200 OK\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::CloseDelimited);
         assert_eq!(resp.content_length(), None);
     }
@@ -1305,7 +1309,8 @@ mod tests {
         // RFC 9112 §6.3: a 304 never carries a body even with Content-Length.
         let headers = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 500\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::ContentLength(0));
         assert_eq!(resp.content_length(), Some(0));
     }
@@ -1315,7 +1320,8 @@ mod tests {
         // RFC 9112 §6.3: a 204 never carries a body even with chunked framing.
         let headers = b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::ContentLength(0));
     }
 
@@ -1323,7 +1329,8 @@ mod tests {
     fn test_parse_upstream_response_404() {
         let headers = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.status_code, 404);
     }
 
@@ -1334,7 +1341,8 @@ mod tests {
                         ETag: \"abc123\"\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.etag.as_deref(), Some("\"abc123\""));
     }
 
@@ -1348,7 +1356,8 @@ mod tests {
                         Last-Modified: not a date\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.etag.as_deref(), Some("not-a-valid-etag"));
         assert_eq!(resp.last_modified.as_deref(), Some("not a date"));
     }
@@ -1360,7 +1369,8 @@ mod tests {
                         Content-Range: bytes 100-599/1000\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.status_code, 206);
         assert_eq!(resp.content_range.as_deref(), Some("bytes 100-599/1000"));
     }
@@ -1372,7 +1382,8 @@ mod tests {
                         Connection: close\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert!(resp.connection_close);
     }
 
@@ -1383,7 +1394,8 @@ mod tests {
                         Connection: keep-alive\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert!(!resp.connection_close);
     }
 
@@ -1391,7 +1403,8 @@ mod tests {
     fn test_parse_upstream_response_no_connection_header() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert!(!resp.connection_close);
     }
 
@@ -1404,7 +1417,8 @@ mod tests {
                         etag: \"xyz\"\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.content_length(), Some(42));
         assert_eq!(resp.content_type.as_deref(), Some("text/plain"));
         assert_eq!(
@@ -1417,7 +1431,10 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_malformed() {
         let garbage = b"not an http response at all";
-        assert!(parse_upstream_response(garbage, garbage.len(), "test.mirror").is_err());
+        assert!(
+            parse_upstream_response(garbage, garbage.len(), "test.mirror", PreciseInstant::now())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1431,7 +1448,8 @@ mod tests {
                         Connection: close\r\n\
                         \r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), Some(999));
         assert_eq!(
@@ -1451,7 +1469,8 @@ mod tests {
     fn test_parse_upstream_response_no_optional_fields() {
         let headers = b"HTTP/1.1 200 OK\r\n\r\n";
         let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror").expect("should parse");
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), None);
         assert_eq!(resp.content_type, None);
@@ -1483,7 +1502,7 @@ mod tests {
         let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len();
         let buf = make_padded_response(pad_len);
         assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE);
-        let result = parse_upstream_response(&buf, buf.len(), "test.mirror");
+        let result = parse_upstream_response(&buf, buf.len(), "test.mirror", PreciseInstant::now());
         assert!(
             result.is_ok(),
             "expected Ok for response at exact cap, got Err"
@@ -1500,7 +1519,7 @@ mod tests {
         let buf = make_padded_response(pad_len);
         assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE + 1);
         // Must not panic; Ok or Err both acceptable.
-        match parse_upstream_response(&buf, buf.len(), "test.mirror") {
+        match parse_upstream_response(&buf, buf.len(), "test.mirror", PreciseInstant::now()) {
             Ok(_) | Err(_) => {}
         }
     }

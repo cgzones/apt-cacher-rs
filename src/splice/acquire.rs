@@ -17,7 +17,7 @@ use tracing::debug;
 use crate::cache_layout::ConnectionDetails;
 use crate::config::ClientHost;
 use crate::deb_mirror::{Mirror, MirrorKind};
-use crate::error::{ErrorReport, Transience};
+use crate::error::ErrorReport;
 use crate::partial_file;
 use crate::scheme_cache::SchemeDecision;
 use crate::upstream_head::{RejectGates, RejectReason};
@@ -28,7 +28,7 @@ use crate::{
 
 use super::http::{UpstreamResponse, send_and_read_headers};
 use super::upstream::{
-    ConnLabel, PoolGuard, UpstreamConn, connect_upstream, mirror_port, pool_checkout,
+    ConnLabel, PoolGuard, Transience, UpstreamConn, connect_upstream, mirror_port, pool_checkout,
 };
 use super::{SpliceProxyError, UpstreamFailure, VolatileCondHeaders};
 
