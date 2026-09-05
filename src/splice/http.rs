@@ -42,7 +42,7 @@ use crate::{
 
 use super::VolatileCondHeaders;
 use super::body::BodyTransferError;
-use super::upstream::{PoolGuard, TLS_READ_BUF_SIZE, UnconsumedBodyGuard, UpstreamConn};
+use super::upstream::{ResponseBody, TLS_READ_BUF_SIZE, UpstreamConn};
 
 /// Maximum body worth draining solely to reuse an upstream connection.
 pub(super) const MAX_ERROR_BODY_DRAIN: usize = 64 * 1024;
@@ -226,14 +226,11 @@ impl BodyFraming {
     /// Relay the response body to the client, framed per `self`, and return
     /// the number of body bytes sent (`body_prefix` included).
     ///
-    /// The single owner of the "half-read connection must not re-enter the
-    /// pool" rule for relayed bodies: an [`UnconsumedBodyGuard`] poisons the
-    /// upstream on every error path and is defused only when a
-    /// length-delimited or chunked body was consumed to its terminator. A
-    /// close-delimited body never defuses it - the upstream closes anyway.
+    /// Takes ownership so every error or cancellation closes the connection.
+    /// Only a complete length-delimited or chunked body returns it to the pool.
     pub(super) async fn relay_to_client(
         self,
-        upstream: &mut PoolGuard,
+        mut upstream: ResponseBody,
         client_stream: &TcpStream,
         body_prefix: &[u8],
         max_bytes: usize,
@@ -260,7 +257,6 @@ impl BodyFraming {
             Ok(())
         }
 
-        let mut guard = UnconsumedBodyGuard::new(upstream);
         let prefix_len = body_prefix.len() as u64;
         match self {
             Self::ContentLength(cl) => {
@@ -269,11 +265,11 @@ impl BodyFraming {
                     .map_err(BodyTransferError::client)?;
                 let remaining = cl.saturating_sub(prefix_len);
                 let forwarded = if remaining > 0 {
-                    forward_upstream_body(&mut guard, client_stream, remaining).await?
+                    forward_upstream_body(&mut upstream, client_stream, remaining).await?
                 } else {
                     0
                 };
-                guard.consumed();
+                upstream.complete();
                 Ok(prefix_len + forwarded)
             }
             Self::Chunked => {
@@ -281,13 +277,13 @@ impl BodyFraming {
                 // closing CRLF after the `0` chunk, so the connection stays
                 // reusable on success.
                 let forwarded = forward_upstream_chunked_body(
-                    &mut guard,
+                    &mut upstream,
                     client_stream,
                     body_prefix,
                     max_bytes,
                 )
                 .await?;
-                guard.consumed();
+                upstream.complete();
                 Ok(forwarded)
             }
             Self::CloseDelimited => {
@@ -295,7 +291,8 @@ impl BodyFraming {
                     .await
                     .map_err(BodyTransferError::client)?;
                 let forwarded =
-                    forward_upstream_body_until_eof(&mut guard, client_stream, max_bytes).await?;
+                    forward_upstream_body_until_eof(&mut upstream, client_stream, max_bytes)
+                        .await?;
                 Ok(prefix_len + forwarded)
             }
         }
@@ -305,31 +302,30 @@ impl BodyFraming {
     /// `max_bytes` of payload (`body_prefix` included).
     ///
     /// Same poolability contract as [`Self::relay_to_client`]: the upstream
-    /// is poisoned on every error and for close-delimited bodies, and stays
+    /// is closed on every error and for close-delimited bodies, and becomes
     /// reusable only after a length-delimited or chunked body was consumed
     /// to its terminator.
     pub(super) async fn read_to_vec(
         self,
-        upstream: &mut PoolGuard,
+        mut upstream: ResponseBody,
         body_prefix: &[u8],
         max_bytes: usize,
     ) -> std::io::Result<Vec<u8>> {
-        let mut guard = UnconsumedBodyGuard::new(upstream);
         match self {
             Self::Chunked => {
-                let body = read_dechunk_body_to_vec(&mut guard, body_prefix, max_bytes).await?;
-                guard.consumed();
+                let body = read_dechunk_body_to_vec(&mut upstream, body_prefix, max_bytes).await?;
+                upstream.complete();
                 Ok(body)
             }
             Self::ContentLength(cl) => {
                 let body =
-                    read_body_to_vec_with_content_length(&mut guard, body_prefix, cl, max_bytes)
+                    read_body_to_vec_with_content_length(&mut upstream, body_prefix, cl, max_bytes)
                         .await?;
-                guard.consumed();
+                upstream.complete();
                 Ok(body)
             }
             Self::CloseDelimited => {
-                read_body_to_vec_until_eof(&mut guard, body_prefix, max_bytes).await
+                read_body_to_vec_until_eof(&mut upstream, body_prefix, max_bytes).await
             }
         }
     }

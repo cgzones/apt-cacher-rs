@@ -173,7 +173,7 @@ async fn cleanup_upstream_fetch(
         .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_owned()));
     let upstream_path = upstream_path_buf.as_deref().unwrap_or(upstream_uri);
     let host_authority = mirror.format_authority();
-    let mut exchange =
+    let exchange =
         match standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
             .await
         {
@@ -214,10 +214,10 @@ async fn cleanup_upstream_fetch(
         header_buf: hdr_buf,
         header_end: hdr_end,
         reused: _,
-    } = &mut exchange;
+    } = exchange;
     let body = resp
         .framing
-        .read_to_vec(upstream, &hdr_buf[*hdr_end..], max_bytes)
+        .read_to_vec(upstream, &hdr_buf[hdr_end..], max_bytes)
         .await;
 
     match body {

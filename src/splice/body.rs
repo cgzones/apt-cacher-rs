@@ -737,8 +737,7 @@ impl<'a> BodyTransfer<'a> {
 ///
 /// On error the upstream is left mid-message (fewer than `content_length`
 /// bytes consumed), so its socket still holds undelivered bytes -- the caller
-/// must mark the upstream non-poolable to keep the poisoned connection out of
-/// the pool.
+/// drops the unfinished response, keeping the connection out of the pool.
 pub(super) async fn splice_proxy_body(
     mut xfer: BodyTransfer<'_>,
     upstream: &TcpStream,
@@ -1108,8 +1107,7 @@ async fn pwrite_buf_to_file(
 ///
 /// On error the upstream is left mid-message (fewer than `content_length`
 /// bytes consumed), so its socket still holds undelivered bytes -- the caller
-/// must mark the upstream non-poolable to keep the poisoned connection out of
-/// the pool.
+/// drops the unfinished response, keeping the connection out of the pool.
 pub(super) async fn splice_proxy_body_tls(
     mut xfer: BodyTransfer<'_>,
     upstream: &mut UpstreamConn,

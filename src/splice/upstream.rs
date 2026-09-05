@@ -1,6 +1,6 @@
 //! Upstream connection plumbing for the splice proxy: the [`UpstreamConn`]
-//! enum (plain TCP, userspace TLS) with its [`ConnLabel`] log rendering, the per-host idle pool behind [`PoolGuard`]
-//! and [`UnconsumedBodyGuard`], the TCP/TLS connect helpers
+//! enum (plain TCP, userspace TLS) with its [`ConnLabel`] log rendering, the per-host idle pool behind [`ResponseBody`]
+//! the TCP/TLS connect helpers
 //! ([`connect_upstream`], [`tcp_connect`], `tls_connect`) and the
 //! [`ConnectError`]/[`Transience`] classification consumed by the retry
 //! loop in `acquire`. Also hosts the process-wide `TLS_CLIENT_CONFIG` that
@@ -348,114 +348,57 @@ fn pool_return(host: &ClientHost, port: u16, is_tls: bool, conn: UpstreamConn) {
     debug!("splice proxy: returned connection to pool for {host}:{port} (tls={is_tls})");
 }
 
-/// Wraps an `UpstreamConn` and automatically returns it to the connection pool
-/// on drop if `poolable` is true. Prevents connection leaks on early-return paths.
-pub(super) struct PoolGuard {
-    conn: Option<UpstreamConn>,
+/// Owns an unfinished response. Dropping it closes the connection, including
+/// cancellation before a task is first polled. Only `complete` may pool it.
+/// The header's keep-alive permission is separate from body completion.
+pub(super) struct ResponseBody {
+    conn: UpstreamConn,
     host: ClientHost,
     port: u16,
-    poolable: bool,
+    keep_alive: bool,
 }
 
-impl PoolGuard {
-    /// Creates a new `PoolGuard` wrapping the given `UpstreamConn`.
-    pub(super) fn new(conn: UpstreamConn, host: ClientHost, port: u16, poolable: bool) -> Self {
+impl ResponseBody {
+    pub(super) fn new(conn: UpstreamConn, host: ClientHost, port: u16, keep_alive: bool) -> Self {
         Self {
-            conn: Some(conn),
+            conn,
             host,
             port,
-            poolable,
+            keep_alive,
         }
     }
 
-    /// Marks the connection as non-poolable, preventing it from being returned to the pool on drop.
-    pub(super) fn unset_poolable(&mut self) {
-        self.poolable = false;
+    #[must_use]
+    pub(super) const fn permits_reuse(&self) -> bool {
+        self.keep_alive
     }
 
-    /// Whether the connection goes back to the pool once released.
-    #[must_use]
-    pub(super) const fn poolable(&self) -> bool {
-        self.poolable
+    /// Consume a response after its framing terminator has been read and
+    /// validated. The unfinished owner cannot be accessed or moved again.
+    pub(super) fn complete(self) {
+        let Self {
+            conn,
+            host,
+            port,
+            keep_alive,
+        } = self;
+        if keep_alive {
+            let is_tls = conn.is_tls();
+            pool_return(&host, port, is_tls, conn);
+        }
     }
 }
 
-impl std::ops::Deref for PoolGuard {
+impl std::ops::Deref for ResponseBody {
     type Target = UpstreamConn;
     fn deref(&self) -> &UpstreamConn {
-        self.conn
-            .as_ref()
-            .expect("live PoolGuard contains a connection")
+        &self.conn
     }
 }
 
-impl std::ops::DerefMut for PoolGuard {
+impl std::ops::DerefMut for ResponseBody {
     fn deref_mut(&mut self) -> &mut UpstreamConn {
-        self.conn
-            .as_mut()
-            .expect("live PoolGuard contains a connection")
-    }
-}
-
-impl Drop for PoolGuard {
-    fn drop(&mut self) {
-        // Taking the connection is private to Drop: a live guard always
-        // contains its connection, including across replacement awaits.
-        let conn = self
-            .conn
-            .take()
-            .expect("live PoolGuard contains a connection");
-        if self.poolable {
-            let is_tls = conn.is_tls();
-            pool_return(&self.host, self.port, is_tls, conn);
-        }
-    }
-}
-
-/// RAII poison for a pooled upstream connection whose response body has not
-/// yet been fully drained from the socket. While this guard is alive, any
-/// drop (i.e. any early return in the download body) marks the wrapped
-/// `PoolGuard` non-poolable, so a half-read connection can never re-enter the
-/// pool. Call [`UnconsumedBodyGuard::consumed`] once the body has been fully
-/// read to defuse it.
-pub(super) struct UnconsumedBodyGuard<'g> {
-    upstream: &'g mut PoolGuard,
-    consumed: bool,
-}
-
-impl<'g> UnconsumedBodyGuard<'g> {
-    pub(super) fn new(upstream: &'g mut PoolGuard) -> Self {
-        Self {
-            upstream,
-            consumed: false,
-        }
-    }
-
-    /// Defuse: the response body has been fully drained, so the connection's
-    /// existing `poolable` decision (from `Connection:` keep-alive) stands.
-    pub(super) fn consumed(&mut self) {
-        self.consumed = true;
-    }
-}
-
-impl Drop for UnconsumedBodyGuard<'_> {
-    fn drop(&mut self) {
-        if !self.consumed {
-            self.upstream.unset_poolable();
-        }
-    }
-}
-
-impl std::ops::Deref for UnconsumedBodyGuard<'_> {
-    type Target = PoolGuard;
-    fn deref(&self) -> &PoolGuard {
-        self.upstream
-    }
-}
-
-impl std::ops::DerefMut for UnconsumedBodyGuard<'_> {
-    fn deref_mut(&mut self) -> &mut PoolGuard {
-        self.upstream
+        &mut self.conn
     }
 }
 
@@ -969,6 +912,63 @@ mod tests {
 
     fn test_host(name: &str) -> ClientHost {
         ClientHost::new(name.to_owned()).unwrap()
+    }
+
+    /// Dropping an unpolled future models cancellation of a detached download
+    /// before it has a chance to install any task-local protection.
+    #[tokio::test]
+    async fn unfinished_response_is_closed_even_before_first_poll() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (conn, mut peer, _) = tcp_pair(&listener).await;
+        let host = test_host("unfinished-response.invalid");
+        let response = ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, true);
+        let unpolled = async move {
+            std::future::pending::<()>().await;
+            response.complete();
+        };
+        drop(unpolled);
+        assert!(matches!(
+            pool_checkout(&host, 80, false),
+            PoolCheckout::Empty
+        ));
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_response_reuses_only_keep_alive_connections() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = test_host("completed-response.invalid");
+        let (conn, _peer, local) = tcp_pair(&listener).await;
+        ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, true).complete();
+        let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) else {
+            unreachable!("completed response should be reusable");
+        };
+        assert_eq!(conn.zero_copy().unwrap().local_addr().unwrap(), local);
+        drop(conn);
+
+        let (conn, mut peer, _) = tcp_pair(&listener).await;
+        ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, false).complete();
+        assert!(matches!(
+            pool_checkout(&host, 80, false),
+            PoolCheckout::Empty
+        ));
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
 
     /// The most recently returned connection is popped first; if the peer

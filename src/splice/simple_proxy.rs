@@ -159,7 +159,7 @@ pub(crate) async fn splice_simple_proxy(
     let _client_count = client_counter::ClientDownload::new();
 
     let UpstreamExchange {
-        conn: mut upstream,
+        conn: upstream,
         response: resp,
         header_buf: hdr_buf,
         header_end: hdr_end,
@@ -185,7 +185,6 @@ pub(crate) async fn splice_simple_proxy(
             resp.status_code,
             reason.body()
         );
-        upstream.unset_poolable();
         return write_invalid_response(
             client_stream,
             conn_version,
@@ -212,7 +211,6 @@ pub(crate) async fn splice_simple_proxy(
                 "simple proxy: failed to rewrite headers for {upstream_path} from {host_authority}; returning 502:  {}",
                 ErrorReport(&err)
             );
-            upstream.unset_poolable();
             return Err(SpliceProxyError::Upstream(UpstreamFailure { err, logged }));
         }
     };
@@ -249,7 +247,7 @@ pub(crate) async fn splice_simple_proxy(
     // Content-Length, so the headers and the body framing agree.
     let forwarded: u64 = resp
         .framing
-        .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
+        .relay_to_client(upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
         .await
         .map_err(|err| {
             err.into_after_header(
@@ -270,7 +268,6 @@ pub(crate) async fn splice_simple_proxy(
     metrics::SERVED_PASSTHROUGH.increment();
     metrics::SERVED_TOTAL.increment();
 
-    // PoolGuard::drop handles returning the connection to pool if poolable
     Ok(())
 }
 

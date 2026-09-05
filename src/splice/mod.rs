@@ -14,7 +14,7 @@
 //! per-request state structs ([`ClientConn`], [`CacheTarget`],
 //! [`RateTimestamps`]). The mechanics live in submodules:
 //!
-//! - [`upstream`]: the `UpstreamConn` enum, the idle pool and `PoolGuard`,
+//! - [`upstream`]: the `UpstreamConn` enum, the idle pool and `ResponseBody`,
 //!   TCP/TLS connect and connect-error classification.
 //! - [`http`]: request formatting, response-head parsing into
 //!   `UpstreamResponse`, the `BodyFraming` relays and the chunked decoder.
@@ -112,7 +112,7 @@ use commit::{CommitTail, CompletionBytes, CompletionClient, Served};
 use detached::DetachedDownload;
 use http::UpstreamResponse;
 use simple_proxy::rewrite_simple_proxy_headers;
-use upstream::{ConnLabel, PoolGuard, UnconsumedBodyGuard};
+use upstream::{ConnLabel, ResponseBody};
 use volatile::handle_volatile_buffered_download;
 
 // On Linux, EAGAIN and EWOULDBLOCK share the same numeric value, so matching
@@ -907,10 +907,10 @@ async fn plan_upstream_response(
 
 /// Forward a non-200/non-206 response directly to the client instead of
 /// falling back to hyper (which would open a redundant second connection).
-/// Nothing is cached, so the caller's `InitBarrier` fires on its return;
-/// `PoolGuard::drop` returns the connection to the pool if still poolable.
+/// Nothing is cached, so the caller's `InitBarrier` fires on its return.
+/// The body reader consumes the response and releases it only on success.
 async fn relay_passthrough(
-    upstream: &mut PoolGuard,
+    upstream: ResponseBody,
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
@@ -924,7 +924,7 @@ async fn relay_passthrough(
 
     let body_prefix = &header_buf[header_end..];
     if let Err(reason) = upstream_resp.check_relayable(body_prefix.len() as u64) {
-        return reject_upstream_response(upstream, client, conn_details, reason).await;
+        return reject_upstream_response(client, conn_details, reason).await;
     }
 
     metrics::REQUESTS_PASSTHROUGH.increment();
@@ -949,7 +949,6 @@ async fn relay_passthrough(
                 conn_details.mirror,
                 ErrorReport(&err)
             );
-            upstream.unset_poolable();
             return Err(SpliceProxyError::Upstream(UpstreamFailure { err, logged }));
         }
     };
@@ -980,14 +979,12 @@ async fn relay_passthrough(
 /// Body bytes in the `header_buf` tail or on the socket cannot be safely
 /// skipped, so the connection does not return to the pool.
 async fn reject_upstream_response(
-    upstream: &mut PoolGuard,
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     reason: RejectReason,
 ) -> Result<(), SpliceProxyError> {
     reason.record_metrics();
     warn_upstream_reject(reason, conn_details);
-    upstream.unset_poolable();
     client
         .write_invalid(
             StatusCode::BAD_GATEWAY,
@@ -1005,7 +1002,6 @@ async fn reject_upstream_response(
 /// takes the same [`RejectReason::InconsistentBodyFraming`] 502 rather than
 /// a wording and a body of its own.
 async fn splice_body_count(
-    upstream: &mut PoolGuard,
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     body_content_length: NonZero<u64>,
@@ -1016,7 +1012,6 @@ async fn splice_body_count(
         return Ok(Some(splice_count));
     }
     reject_upstream_response(
-        upstream,
         client,
         conn_details,
         RejectReason::InconsistentBodyFraming {
@@ -1289,7 +1284,7 @@ struct BodyTransferred {
     reason = "two call sites; the arguments are the body's geometry and the transfer's state"
 )]
 async fn transfer_body(
-    upstream_guard: &mut UnconsumedBodyGuard<'_>,
+    upstream: &mut ResponseBody,
     client: BodyClient<'_>,
     mut target: CacheTarget,
     resume_offset: u64,
@@ -1337,7 +1332,7 @@ async fn transfer_body(
     // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
     // `target.hasher` is borrowed: only the userspace loop advances it, in
     // place.
-    let outcome = if let Some(tcp) = upstream_guard.zero_copy() {
+    let outcome = if let Some(tcp) = upstream.zero_copy() {
         // Zero-copy path for plain TCP. The body goes socket->pipe->file
         // inside the kernel, so no incremental digest is possible and the
         // commit re-reads and hashes the finished file. `splice_proxy_drive`
@@ -1369,12 +1364,10 @@ async fn transfer_body(
             body_offset,
             &mut target.hasher,
         );
-        splice_proxy_body_tls(xfer, upstream_guard, &target.tempfile).await
+        splice_proxy_body_tls(xfer, upstream, &target.tempfile).await
     };
-    // Any body-transfer error leaves the upstream mid-message (fewer
-    // than content_length bytes consumed), so the socket still holds
-    // undelivered bytes. `upstream_guard` (still armed here) poisons
-    // the connection on the early return so PoolGuard::drop discards it
+    // A failed transfer leaves its response unfinished, so the owner closes
+    // the connection on return instead of making it available to another request
     // rather than re-pooling it -- the next checkout would otherwise log
     // "pooled connection to ... has unexpected data; connecting fresh".
     //
@@ -1519,9 +1512,9 @@ async fn splice_proxy_drive(
                     conn_details.debname,
                     reason.detail()
                 );
-                upstream.unset_poolable();
+            } else {
+                upstream.complete();
             }
-            drop(upstream);
 
             return serve_volatile_304_via_sendfile(
                 client,
@@ -1536,7 +1529,7 @@ async fn splice_proxy_drive(
         }
         DownloadPlan::Passthrough => {
             relay_passthrough(
-                &mut upstream,
+                upstream,
                 client,
                 conn_details,
                 &upstream_resp,
@@ -1547,7 +1540,7 @@ async fn splice_proxy_drive(
             return Ok(SpliceProxyOutcome::Served);
         }
         DownloadPlan::Reject(reason) => {
-            reject_upstream_response(&mut upstream, client, conn_details, reason).await?;
+            reject_upstream_response(client, conn_details, reason).await?;
             return Ok(SpliceProxyOutcome::Served);
         }
         DownloadPlan::Download {
@@ -1589,12 +1582,6 @@ async fn splice_proxy_drive(
         }
     };
 
-    // Committed to splicing a length-delimited body: keep the upstream out of
-    // the pool for the whole "body not yet drained" window, so no early return
-    // below can leave a half-read connection re-poolable. Defused via
-    // `consumed()` once the body is fully read.
-    let mut upstream_guard = UnconsumedBodyGuard::new(&mut upstream);
-
     // `If-Range` compares against the validators this response carries.
     let cache_time = upstream_resp
         .last_modified
@@ -1629,7 +1616,7 @@ async fn splice_proxy_drive(
     //
     // Read `raw_uri_path` off the barrier before `prepare_cache_target`
     // consumes it; it is the same string `RenamePlan` later verifies against.
-    let hasher = if resume_offset == 0 && upstream_guard.zero_copy().is_none() {
+    let hasher = if resume_offset == 0 && upstream.zero_copy().is_none() {
         // Same rendering `RenamePlan.host` uses, so both registry lookups
         // agree on the key.
         integrity::stream_hash_algo_for_download(
@@ -1661,14 +1648,8 @@ async fn splice_proxy_drive(
     };
 
     let body_prefix = &header_buf[header_end..];
-    let Some(splice_count) = splice_body_count(
-        &mut upstream_guard,
-        client,
-        conn_details,
-        body_content_length,
-        body_prefix,
-    )
-    .await?
+    let Some(splice_count) =
+        splice_body_count(client, conn_details, body_content_length, body_prefix).await?
     else {
         return Ok(SpliceProxyOutcome::Served);
     };
@@ -1691,11 +1672,6 @@ async fn splice_proxy_drive(
         &mut rand::rng(),
     ) {
         log_nudge(conn_details, config, "splice proxy: ");
-        // The upstream connection moves into the task, which re-arms its own
-        // `UnconsumedBodyGuard` as the very first thing it does once polled;
-        // defusing this one here just hands ownership across cleanly.
-        upstream_guard.consumed();
-        drop(upstream_guard);
         // Spawn before writing the nudge, as the hyper backend does: a
         // failed nudge write closes the connection, but the download still
         // lands in the cache.
@@ -1784,7 +1760,7 @@ async fn splice_proxy_drive(
         target,
         client: client_end,
     } = transfer_body(
-        &mut upstream_guard,
+        &mut upstream,
         body_client,
         target,
         resume_offset,
@@ -1809,17 +1785,8 @@ async fn splice_proxy_drive(
     // guard has to outlive the body — the same lifetime `volatile.rs` keeps.
     drop(cork);
 
-    // The full upstream body is now drained: either the splice loop consumed
-    // exactly `splice_count` bytes, or `splice_count` was 0 because the whole
-    // body arrived in the prefix. The client-write outcome is
-    // irrelevant to poolability — the download always drains upstream fully.
-    // Defuse the poison guard and release its borrow before dropping upstream.
-    upstream_guard.consumed();
-    drop(upstream_guard);
-
-    // PoolGuard::drop returns the connection to pool if still poolable.
-    // Drop it now, before the commit, to free the upstream socket promptly.
-    drop(upstream);
+    // Only successful body completion can return this connection to the pool.
+    upstream.complete();
 
     // End the download on this task: `begin_rename` gives the
     // `max_upstream_downloads` slot back (where the hyper backend gives its

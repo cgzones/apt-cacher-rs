@@ -34,7 +34,7 @@ use crate::precise_instant::PreciseInstant;
 
 use super::body::{BodyClient, ClientEnd};
 use super::commit::{CommitTail, CompletionBytes, CompletionClient};
-use super::upstream::{ConnLabel, PoolGuard, UnconsumedBodyGuard};
+use super::upstream::{ConnLabel, ResponseBody};
 use super::{
     BodyTransferFailure, BodyTransferred, CacheTarget, RateTimestamps, log_download_start,
     transfer_body, write_body_prefix_to_cache,
@@ -46,7 +46,7 @@ use crate::cache_conditional::ServeParams;
 /// so it can outlive the connection task.
 pub(super) struct DetachedDownload {
     /// Owned upstream connection.
-    pub(super) upstream: PoolGuard,
+    pub(super) upstream: ResponseBody,
     /// The head-read buffer; the body prefix is `header_buf[header_end..]`.
     pub(super) header_buf: BytesMut,
     pub(super) header_end: usize,
@@ -91,15 +91,6 @@ impl DetachedDownload {
             request_sent_at,
         } = self;
 
-        // Armed as the very first statement, before anything else in this
-        // task can run: the only gap left is the window before the spawned
-        // task is ever polled at all (e.g. a runtime shutdown racing the
-        // `spawn` call), where the upstream connection is guarded neither
-        // here nor by the caller, which already released its own guard.
-        // `UpstreamConn::check_alive`'s read probe on a pooled connection
-        // catches a half-read socket that slipped back in that way.
-        let mut upstream_guard = UnconsumedBodyGuard::new(&mut upstream);
-
         let start = PreciseInstant::now();
         let mut rates = RateTimestamps::new(request_sent_at);
 
@@ -126,7 +117,7 @@ impl DetachedDownload {
         }
 
         let target = match transfer_body(
-            &mut upstream_guard,
+            &mut upstream,
             BodyClient::Absent,
             target,
             resume_offset,
@@ -150,11 +141,7 @@ impl DetachedDownload {
             }
         };
 
-        // The full upstream body is drained: defuse the poison and release
-        // its borrow, then let `PoolGuard::drop` return the connection.
-        upstream_guard.consumed();
-        drop(upstream_guard);
-        drop(upstream);
+        upstream.complete();
 
         // The same tail `splice_proxy_drive` spawns, run in place: this task
         // *is* the off-connection context that one has to create. A commit

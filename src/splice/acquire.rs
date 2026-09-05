@@ -30,7 +30,7 @@ use super::http::{
     BodyFraming, HeadError, MAX_ERROR_BODY_DRAIN, UpstreamResponse, send_and_read_headers,
 };
 use super::upstream::{
-    ConnLabel, PoolCheckout, PoolGuard, Transience, UpstreamConn, connect_upstream, mirror_port,
+    ConnLabel, PoolCheckout, ResponseBody, Transience, UpstreamConn, connect_upstream, mirror_port,
     pool_checkout,
 };
 use super::{SpliceProxyError, UpstreamFailure, VolatileCondHeaders};
@@ -42,7 +42,7 @@ use super::{SpliceProxyError, UpstreamFailure, VolatileCondHeaders};
 /// ([`follow_redirect`], [`discard_partial_and_retry`]), so every field always
 /// describes the same connection.
 pub(super) struct UpstreamExchange {
-    pub(super) conn: PoolGuard,
+    pub(super) conn: ResponseBody,
     pub(super) response: UpstreamResponse,
     pub(super) header_buf: BytesMut,
     pub(super) header_end: usize,
@@ -52,8 +52,7 @@ pub(super) struct UpstreamExchange {
 
 impl UpstreamExchange {
     /// Wrap the head [`send_and_read_headers`] returned on `conn` into an
-    /// exchange; the connection is poolable unless the head said
-    /// `Connection: close`.
+    /// exchange; dropping it closes the connection until body completion.
     fn new(
         conn: UpstreamConn,
         mirror: &Mirror,
@@ -63,7 +62,7 @@ impl UpstreamExchange {
     ) -> Self {
         let poolable = !response.connection_close;
         Self {
-            conn: PoolGuard::new(conn, mirror.host().clone(), port, poolable),
+            conn: ResponseBody::new(conn, mirror.host().clone(), port, poolable),
             response,
             header_buf,
             header_end,
@@ -77,30 +76,27 @@ impl UpstreamExchange {
     /// containing an empty connection guard.
     ///
     /// Close-delimited and explicitly closing responses are dropped at once.
-    /// Timeout/error cancellation poisons the body guard, so a partial drain
+    /// Timeout/error cancellation drops the response owner, so a partial drain
     /// can never make the connection reusable.
     pub(super) async fn dispose(self, log_prefix: &str) {
         const MAX_DRAIN_TIME: Duration = Duration::from_millis(250);
 
         let Self {
-            mut conn,
+            conn,
             response,
             header_buf,
             header_end,
             reused: _,
         } = self;
-        if !conn.poolable() || response.framing == BodyFraming::CloseDelimited {
-            conn.unset_poolable();
+        if !conn.permits_reuse() || response.framing == BodyFraming::CloseDelimited {
             return;
         }
 
         let result = tokio::time::timeout(
             MAX_DRAIN_TIME,
-            response.framing.read_to_vec(
-                &mut conn,
-                &header_buf[header_end..],
-                MAX_ERROR_BODY_DRAIN,
-            ),
+            response
+                .framing
+                .read_to_vec(conn, &header_buf[header_end..], MAX_ERROR_BODY_DRAIN),
         )
         .await;
         match result {
@@ -111,7 +107,6 @@ impl UpstreamExchange {
                 ErrorReport(&err)
             ),
             Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                conn.unset_poolable();
                 debug!(
                     "{log_prefix} not reusing the upstream connection after a {} response, its body exceeded the {} ms drain budget",
                     response.status_code,
@@ -119,7 +114,7 @@ impl UpstreamExchange {
                 );
             }
         }
-        // Drop returns only a fully consumed, reusable connection.
+        // The body reader returns only a fully consumed, reusable connection.
     }
 
     /// Log suffix naming this exchange's connection flavour.

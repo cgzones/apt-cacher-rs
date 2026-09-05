@@ -44,7 +44,7 @@ use crate::{
 
 use super::commit::{CommitTail, Committed, CompletionBytes, CompletionClient, Served};
 use super::http::{BodyFraming, UpstreamResponse};
-use super::upstream::{ConnLabel, PoolGuard};
+use super::upstream::{ConnLabel, ResponseBody};
 use super::{
     ClientConn, RateTimestamps, SpliceProxyError, UpstreamFailure, prepare_cache_target,
     resolve_client_range, write_all_flushed, write_splice_response_headers,
@@ -58,7 +58,7 @@ use super::{
     reason = "lifecycle function threading full context"
 )]
 pub(super) async fn handle_volatile_buffered_download(
-    mut upstream: PoolGuard,
+    upstream: ResponseBody,
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
@@ -90,7 +90,7 @@ pub(super) async fn handle_volatile_buffered_download(
     }
     let body = upstream_resp
         .framing
-        .read_to_vec(&mut upstream, body_prefix, max_bytes)
+        .read_to_vec(upstream, body_prefix, max_bytes)
         .await
         .map_err(|err| {
             let logged = warn_once_or_info_logged!(
@@ -100,11 +100,6 @@ pub(super) async fn handle_volatile_buffered_download(
             );
             SpliceProxyError::Upstream(UpstreamFailure { err, logged })
         })?;
-    // The whole body is in hand, so the connection is done: `PoolGuard::drop`
-    // returns it to the pool (or discards it, for the close-delimited framing
-    // `read_to_vec` poisons) before the commit and the client write below.
-    drop(upstream);
-
     let mut rates = RateTimestamps::new(upstream_resp.request_sent_at);
 
     let Some(total_content_length) = NonZero::new(body.len() as u64) else {
