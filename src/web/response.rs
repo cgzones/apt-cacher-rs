@@ -22,7 +22,7 @@ use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 
 #[cfg(feature = "hyper")]
 use crate::{
-    build_info::APP_NAME, http_range::format_http_date, metrics, proxy_body::ProxyCacheBody,
+    build_info::APP_NAME, http_range::format_http_date, metrics, proxy_body::ProxyCacheBody, sticky,
 };
 
 /// Content-Security-Policy applied to every HTML page.
@@ -143,7 +143,7 @@ impl WebResponse {
         }
         let body = WebUiCountedBody {
             inner: Full::new(self.body),
-            delivered: false,
+            delivered: sticky::Bool::new(),
         };
         builder
             .body(ProxyCacheBody::Boxed(BoxBody::new(
@@ -162,13 +162,13 @@ impl WebResponse {
 #[cfg(feature = "hyper")]
 struct WebUiCountedBody {
     inner: Full<bytes::Bytes>,
-    delivered: bool,
+    delivered: sticky::Bool,
 }
 
 #[cfg(feature = "hyper")]
 impl Drop for WebUiCountedBody {
     fn drop(&mut self) {
-        if self.delivered {
+        if self.delivered.get() {
             metrics::SERVED_WEBUI.increment();
             metrics::SERVED_TOTAL.increment();
         }
@@ -190,10 +190,12 @@ impl Body for WebUiCountedBody {
             // final frame, so a `Ready(None)` poll cannot be relied upon.
             Poll::Ready(Some(Ok(_))) => {
                 if self.inner.is_end_stream() {
-                    self.delivered = true;
+                    self.delivered.set();
                 }
             }
-            Poll::Ready(None) => self.delivered = true,
+            Poll::Ready(None) => {
+                self.delivered.set();
+            }
             Poll::Ready(Some(Err(_))) | Poll::Pending => {}
         }
         result

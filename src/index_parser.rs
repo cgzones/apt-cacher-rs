@@ -12,7 +12,7 @@ use tokio::io::AsyncBufRead;
 
 use crate::{
     limits::{CappedLine, MAX_METADATA_LINE_LEN, read_line_capped},
-    warn_once, warn_once_or_debug,
+    sticky, warn_once, warn_once_or_debug,
 };
 
 /// Extract the `Filename:` field's relative-path value from a Debian
@@ -324,7 +324,7 @@ pub(crate) struct StanzaStream<R> {
     stanza: Stanza,
     line: String,
     line_buf: Vec<u8>,
-    done: bool,
+    done: sticky::Bool,
 }
 
 impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
@@ -334,7 +334,7 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
             stanza,
             line: String::with_capacity(128),
             line_buf: Vec::with_capacity(128),
-            done: false,
+            done: sticky::Bool::new(),
         }
     }
 
@@ -342,7 +342,7 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
     /// error (size/line limit, invalid UTF-8, I/O) ends the stream; the
     /// caller decides what an unreadable index means.
     pub(crate) async fn next(&mut self) -> io::Result<Option<&Stanza>> {
-        if self.done {
+        if self.done.get() {
             return Ok(None);
         }
         // The stanza handed out by the previous call is consumed.
@@ -358,7 +358,7 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
             .await;
             match read {
                 Ok(CappedLine::Eof) => {
-                    self.done = true;
+                    self.done.set();
                     return Ok(self.complete());
                 }
                 Ok(CappedLine::Skipped) => {}
@@ -374,7 +374,7 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
                     }
                 }
                 Err(err) => {
-                    self.done = true;
+                    self.done.set();
                     return Err(err);
                 }
             }
@@ -475,13 +475,13 @@ fn release_hash_entries(
     content: &str,
 ) -> impl Iterator<Item = (ReleaseHashSection, &str, &str)> + '_ {
     let mut section: Option<ReleaseHashSection> = None;
-    let mut terminated = false;
+    let mut terminated = sticky::Bool::new();
     content.lines().filter_map(move |line| {
-        if terminated {
+        if terminated.get() {
             return None;
         }
         if line.starts_with("-----BEGIN PGP SIGNATURE-----") {
-            terminated = true;
+            terminated.set();
             return None;
         }
         let indented = line.starts_with(' ') || line.starts_with('\t');

@@ -117,6 +117,34 @@ use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::Subscriber
 // TODO: replace usages with ! once stable
 enum Never {}
 
+mod sticky {
+    /// A boolean value that is sticky, i.e. once set to `true` it remains `true`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Bool(bool);
+
+    impl Bool {
+        /// Create a new `Bool` with the value `false`.
+        #[inline]
+        pub(crate) const fn new() -> Self {
+            Self(false)
+        }
+
+        /// Return the value of this `Bool`.
+        #[inline]
+        pub(crate) const fn get(self) -> bool {
+            self.0
+        }
+
+        /// Set the value of this `Bool` to `true` and return the old value.
+        #[inline]
+        pub(crate) const fn set(&mut self) -> bool {
+            let old = self.0;
+            self.0 = true;
+            old
+        }
+    }
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     reason = "on truncation the final comparison fails"

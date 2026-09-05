@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use coarsetime::Instant;
 
-use crate::metrics;
+use crate::{metrics, sticky};
 
 /// Maximum upstream connect attempts before giving up (both backends).
 /// Enforced by [`Backoff::next_retry`]; exposed only for the cross-module
@@ -49,7 +49,7 @@ pub(crate) struct Backoff {
     curr: u64,
     attempt: u32,
     deadline: Instant,
-    budget_spent: bool,
+    budget_spent: sticky::Bool,
 }
 
 impl Backoff {
@@ -62,7 +62,7 @@ impl Backoff {
             curr: INITIAL_DELAY_MS,
             attempt: 1,
             deadline: now.saturating_add(budget.into()),
-            budget_spent: false,
+            budget_spent: sticky::Bool::new(),
         }
     }
 
@@ -75,7 +75,7 @@ impl Backoff {
     /// The budget that ended the retry loop, for the terminal log line. Only
     /// meaningful once [`Backoff::next_retry`] has returned `None`.
     pub(crate) fn limit(&self) -> RetryLimit {
-        if self.budget_spent {
+        if self.budget_spent.get() {
             RetryLimit::Budget
         } else {
             RetryLimit::Attempts
@@ -98,7 +98,7 @@ impl Backoff {
         }
         let delay = Duration::from_millis(self.curr);
         if now.saturating_add(delay.into()) > self.deadline {
-            self.budget_spent = true;
+            self.budget_spent.set();
             return None;
         }
         (self.curr, self.prev) = (self.curr + self.prev, self.curr);

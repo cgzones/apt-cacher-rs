@@ -4,7 +4,10 @@ use bytes::Buf as _;
 use http_body::{Body, Frame, SizeHint};
 use pin_project::pin_project;
 
-use crate::rate_checker::{InsufficientRate, RateCheckDirection, RateChecker};
+use crate::{
+    rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
+    sticky,
+};
 
 /// Error type for `RateCheckedBody` operations.
 pub(crate) enum RateCheckedBodyErr<E> {
@@ -24,12 +27,12 @@ where
     inner: B,
     rchecker: RateChecker,
     direction: RateCheckDirection,
-    /// Sticky: set once the rate breach has been surfaced. Both consumers
+    /// Set once the rate breach has been surfaced. Both consumers
     /// (hyper's `download_file`, the client-facing `ProxyCacheBody`) drop the
     /// body at that error, so this only guards a consumer that polls on -
     /// keeping the terminal `Err` from re-bumping `RATE_LIMIT_*` per poll,
     /// the same idempotency `channel_body`'s `errored` flag provides.
-    rate_failed: bool,
+    rate_failed: sticky::Bool,
 }
 
 impl<B> RateCheckedBody<B>
@@ -48,7 +51,7 @@ where
             inner: body,
             rchecker: RateChecker::with_timeframe(min_download_rate, timeframe),
             direction,
-            rate_failed: false,
+            rate_failed: sticky::Bool::new(),
         }
     }
 }
@@ -69,7 +72,7 @@ where
     fn is_end_stream(&self) -> bool {
         // Mirrors the `poll_frame` short-circuit below, per the `Body`
         // contract that `true` implies only `Ready(None)` follows.
-        self.rate_failed || self.inner.is_end_stream()
+        self.rate_failed.get() || self.inner.is_end_stream()
     }
 
     fn poll_frame(
@@ -77,11 +80,11 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let self_mut = self.project();
-        if *self_mut.rate_failed {
+        if self_mut.rate_failed.get() {
             return std::task::Poll::Ready(None);
         }
         if let Some(download_rate_err) = self_mut.rchecker.check_fail(*self_mut.direction) {
-            *self_mut.rate_failed = true;
+            self_mut.rate_failed.set();
             return std::task::Poll::Ready(Some(Err(Box::new(RateCheckedBodyErr::RateTimeout(
                 download_rate_err,
             )))));

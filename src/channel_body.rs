@@ -10,7 +10,7 @@
 
 use http_body::{Body, Frame, SizeHint};
 
-use crate::{error::MirrorDownloadRate, metrics, upstream_head::ContentLength};
+use crate::{error::MirrorDownloadRate, metrics, sticky, upstream_head::ContentLength};
 
 #[derive(Debug)]
 pub(crate) enum ChannelBodyError {
@@ -26,12 +26,12 @@ pub(crate) struct ChannelBody {
     content_length: ContentLength,
     received: u64,
     // Set on the first `Ready(None)` observed from the channel.
-    channel_closed: bool,
-    // Sticky: set once `poll_frame` has yielded any `Err` (protocol violation
+    channel_closed: sticky::Bool,
+    // Set once `poll_frame` has yielded any `Err` (protocol violation
     // or upstream rate error). Vetoes the Drop-time `SERVED_*` credit and
     // short-circuits subsequent polls so the violation counter is not bumped
     // again for the same body.
-    errored: bool,
+    errored: sticky::Bool,
 }
 
 impl ChannelBody {
@@ -44,8 +44,8 @@ impl ChannelBody {
             receiver,
             content_length,
             received: 0,
-            channel_closed: false,
-            errored: false,
+            channel_closed: sticky::Bool::new(),
+            errored: sticky::Bool::new(),
         }
     }
 
@@ -73,9 +73,9 @@ impl Drop for ChannelBody {
         // `SERVED_TOTAL` = sum of per-path `SERVED_*`.
         let terminal = match self.content_length {
             ContentLength::Exact(_) => self.announced_total_delivered(),
-            ContentLength::Unknown(_) => self.channel_closed,
+            ContentLength::Unknown(_) => self.channel_closed.get(),
         };
-        if terminal && !self.errored {
+        if terminal && !self.errored.get() {
             metrics::SERVED_CHANNEL.increment();
             metrics::SERVED_TOTAL.increment();
         }
@@ -103,7 +103,7 @@ impl Body for ChannelBody {
         // `poll_frame` - the announced total delivered, the channel closed,
         // or an error surfaced - so a consumer relying on the hint stops
         // instead of issuing a redundant poll after the body has terminated.
-        self.announced_total_delivered() || self.channel_closed || self.errored
+        self.announced_total_delivered() || self.channel_closed.get() || self.errored.get()
     }
 
     fn poll_frame(
@@ -113,13 +113,13 @@ impl Body for ChannelBody {
         // `errored` short-circuit makes terminal Err idempotent: a consumer
         // that keeps polling after a `ContentTooLarge` does not re-bump
         // `UPSTREAM_PROTOCOL_VIOLATION` per trailing frame.
-        if self.channel_closed || self.errored {
+        if self.channel_closed.get() || self.errored.get() {
             return std::task::Poll::Ready(None);
         }
 
         let msg = self.receiver.poll_recv(cx);
         if matches!(msg, std::task::Poll::Ready(None)) {
-            self.channel_closed = true;
+            self.channel_closed.set();
         }
 
         msg.map(|d| {
@@ -129,7 +129,7 @@ impl Body for ChannelBody {
                     let received = self.received.saturating_add(datalen);
                     if received > self.content_length.upper().get() {
                         metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                        self.errored = true;
+                        self.errored.set();
                         return Err(Box::new(ChannelBodyError::ContentTooLarge {
                             announced: self.content_length,
                             received,
@@ -140,7 +140,7 @@ impl Body for ChannelBody {
                     Ok(Frame::data(data))
                 }
                 Err(err) => {
-                    self.errored = true;
+                    self.errored.set();
                     Err(Box::new(ChannelBodyError::MirrorDownloadRate(err)))
                 }
             })

@@ -26,7 +26,7 @@ use crate::{
     humanfmt::HumanFmt,
     metrics,
     precise_instant::PreciseInstant,
-    rate_log,
+    rate_log, sticky,
 };
 
 /// What the body delivers, i.e. which completion line and metrics apply.
@@ -66,7 +66,7 @@ pub(crate) struct AccountedBody<B: Body> {
     inner: B,
     subject: Option<Subject>,
     transferred: u64,
-    end_of_stream: bool,
+    end_of_stream: sticky::Bool,
     /// Sticky: vetoes the `SERVED_*` credit even if a later poll reaches
     /// `Ready(None)`.
     error: Option<BodyFailure>,
@@ -94,7 +94,7 @@ impl<B: Body> AccountedBody<B> {
             inner,
             subject: Some(subject),
             transferred: 0,
-            end_of_stream: false,
+            end_of_stream: sticky::Bool::new(),
             error: None,
             peer_disconnect_check,
             start: PreciseInstant::now(),
@@ -131,7 +131,9 @@ where
                     });
                 }
             }
-            Poll::Ready(None) => *this.end_of_stream = true,
+            Poll::Ready(None) => {
+                this.end_of_stream.set();
+            }
             Poll::Pending => {}
         }
         result
@@ -160,7 +162,7 @@ where
 impl<B: Body> PinnedDrop for AccountedBody<B> {
     fn drop(self: Pin<&mut Self>) {
         let transferred = self.transferred;
-        let end_of_stream = self.end_of_stream;
+        let end_of_stream = self.end_of_stream.get();
         let elapsed = self.start.elapsed();
         let this = self.project();
         let error = this.error.take();

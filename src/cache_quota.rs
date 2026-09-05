@@ -31,7 +31,7 @@ use std::{cmp::Ordering, num::NonZero, sync::Arc};
 
 use tracing::{error, info, trace};
 
-use crate::{humanfmt::HumanFmt, metrics, upstream_head::ContentLength, warn_once_or_info};
+use crate::{humanfmt::HumanFmt, metrics, sticky, upstream_head::ContentLength, warn_once_or_info};
 
 /// Represents a quota violation.
 pub(crate) struct QuotaExceeded;
@@ -265,7 +265,7 @@ impl CacheQuota {
             quota: self.clone(),
             reserved,
             prev_file_size,
-            finalized: false,
+            finalized: sticky::Bool::new(),
         }
     }
 
@@ -398,7 +398,7 @@ pub(crate) struct QuotaReservation {
     quota: CacheQuota,
     reserved: NonZero<u64>,
     prev_file_size: u64,
-    finalized: bool,
+    finalized: sticky::Bool,
 }
 
 impl QuotaReservation {
@@ -448,7 +448,7 @@ impl QuotaReservation {
         }
         let new_size = mg.size;
         drop(mg);
-        self.finalized = true;
+        self.finalized.set();
         if bytes_received > reserved {
             self.quota.sample_utilization_peak_with(new_size);
         }
@@ -457,7 +457,7 @@ impl QuotaReservation {
 
 impl Drop for QuotaReservation {
     fn drop(&mut self) {
-        if self.finalized {
+        if self.finalized.get() {
             return;
         }
 

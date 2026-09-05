@@ -85,7 +85,7 @@ use crate::{
         preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, WireBody},
-    static_assert, swrite, tunnel_limiter,
+    static_assert, sticky, swrite, tunnel_limiter,
     upstream_head::ContentLength,
     warn_once, warn_once_or_debug, warn_once_or_info,
     web::{WebResponse, serve_web_interface},
@@ -2296,7 +2296,7 @@ pub(crate) async fn async_sendfile_unfinished(
 
     // A persistently failing fstat would otherwise log + bump the metric on
     // every availability window; report it once per request.
-    let mut fstat_error_logged = false;
+    let mut fstat_error_logged = sticky::Bool::new();
 
     // One dup pair for the whole transfer, reused across availability
     // windows (each window is one `sendfile_chunk_loop` call).
@@ -2331,14 +2331,13 @@ pub(crate) async fn async_sendfile_unfinished(
                 ));
             }
             Err(errno) => {
-                if !fstat_error_logged {
+                if !fstat_error_logged.set() {
                     metrics::CACHE_IO_FAILURE.increment();
                     error!(
                         "Failed to query metadata of downloading file `{}` during sendfile; assuming no further data is available yet:  {}",
                         file_path.display(),
                         ErrorReport(&errno)
                     );
-                    fstat_error_logged = true;
                 }
                 offset_u64
             }

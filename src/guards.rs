@@ -17,6 +17,7 @@ use crate::{
     integrity::{self, CommitError, RenamePlan},
     metrics,
     partial_file::TempPath,
+    sticky,
     upstream_head::ContentLength,
 };
 #[cfg(feature = "splice")]
@@ -174,7 +175,7 @@ impl<'a> InitBarrier<'a> {
                 tx,
                 quota_reservation,
                 bytes_since_ping: 0,
-                pinged_once: false,
+                pinged_once: sticky::Bool::new(),
             }),
         }
     }
@@ -257,7 +258,7 @@ struct DownloadBarrierData {
     /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
     bytes_since_ping: u64,
     /// Whether any ping was sent yet — the first one is unbatched.
-    pinged_once: bool,
+    pinged_once: sticky::Bool,
 }
 
 impl DownloadBarrierData {
@@ -271,7 +272,7 @@ impl DownloadBarrierData {
         // Send error means no receivers; not cached because send() is a cheap atomic load.
         if let Err(_err @ tokio::sync::watch::error::SendError(())) = self.tx.send(()) {}
         self.bytes_since_ping = 0;
-        self.pinged_once = true;
+        self.pinged_once.set();
     }
 }
 
@@ -298,7 +299,7 @@ impl DownloadBarrier {
             .as_mut()
             .expect("every sink consumes the instance");
         data.bytes_since_ping = data.bytes_since_ping.saturating_add(bytes);
-        if !data.pinged_once || data.bytes_since_ping >= PING_BATCH_THRESHOLD {
+        if !data.pinged_once.get() || data.bytes_since_ping >= PING_BATCH_THRESHOLD {
             data.internal_ping();
         }
     }

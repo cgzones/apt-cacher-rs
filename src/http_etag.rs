@@ -1,6 +1,6 @@
 use std::{borrow::Cow, sync::atomic::AtomicBool};
 
-use crate::xattr_helpers::XattrValue;
+use crate::{sticky, xattr_helpers::XattrValue};
 
 /// Return the opaque-tag portion of an `ETag`, stripping the `W/` prefix if present.
 ///
@@ -82,14 +82,14 @@ fn split_if_none_match(header: &str) -> IfNoneMatchSplit<'_> {
     IfNoneMatchSplit {
         header,
         pos: 0,
-        done: false,
+        done: sticky::Bool::new(),
     }
 }
 
 struct IfNoneMatchSplit<'a> {
     header: &'a str,
     pos: usize,
-    done: bool,
+    done: sticky::Bool,
 }
 
 impl<'a> Iterator for IfNoneMatchSplit<'a> {
@@ -100,7 +100,7 @@ impl<'a> Iterator for IfNoneMatchSplit<'a> {
         reason = "splits land on `,` (ASCII) or end-of-string, which are always UTF-8 boundaries"
     )]
     fn next(&mut self) -> Option<&'a str> {
-        if self.done {
+        if self.done.get() {
             return None;
         }
         let bytes = self.header.as_bytes();
@@ -119,7 +119,7 @@ impl<'a> Iterator for IfNoneMatchSplit<'a> {
             }
             i += 1;
         }
-        self.done = true;
+        self.done.set();
         Some(self.header[start..].trim())
     }
 }

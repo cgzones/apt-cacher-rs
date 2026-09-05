@@ -51,7 +51,7 @@ use crate::sendfile_conn::{
 };
 use crate::{
     Never, active_downloads::ActiveDownloadStatus, client_counter, global_config, metrics,
-    static_assert, warn_once_or_debug, warn_once_or_info,
+    static_assert, sticky, warn_once_or_debug, warn_once_or_info,
 };
 
 use super::upstream::{TLS_READ_BUF_SIZE, UpstreamConn};
@@ -528,7 +528,7 @@ impl CacheWriter {
         let batch = self.batch_mut();
         batch.pending = 0;
         batch.queued_at = None;
-        batch.flushed_once = true;
+        batch.flushed_once.set();
         debug_assert!(
             self.hasher.is_none(),
             "tee bytes cannot feed an incremental digest"
@@ -547,7 +547,7 @@ impl CacheWriter {
     /// Flush once the batch is due: at the threshold, or on the very first
     /// bytes of the transfer.
     async fn flush_if_due(&mut self) -> Result<(), BodyTransferError> {
-        if self.batch().pending >= CacheBatch::FLUSH_THRESHOLD || !self.batch().flushed_once {
+        if self.batch().pending >= CacheBatch::FLUSH_THRESHOLD || !self.batch().flushed_once.get() {
             self.flush().await?;
         }
         Ok(())
@@ -1843,7 +1843,7 @@ struct CacheBatch {
     /// When the oldest byte of the current batch was teed; `None` while the
     /// batch is empty.
     queued_at: Option<coarsetime::Instant>,
-    flushed_once: bool,
+    flushed_once: sticky::Bool,
 }
 
 impl CacheBatch {
@@ -1865,7 +1865,7 @@ impl CacheBatch {
             tx,
             pending: 0,
             queued_at: None,
-            flushed_once: false,
+            flushed_once: sticky::Bool::new(),
         })
     }
 
