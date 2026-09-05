@@ -3,7 +3,7 @@
 //! the userspace-TLS loop [`splice_proxy_body_tls`], both keeping only their
 //! read and deliver steps while every shared piece lives on [`BodyTransfer`]
 //! and comes back as [`BodyOutcome`]. Also owns client demotion to file
-//! serving ([`write_client_or_demote`], [`spawn_file_serve_task`],
+//! serving ([`write_client_or_demote`], [`prepare_file_serve`],
 //! [`ClientEnd::Demoted`]), the [`SpliceRangeFilter`] applied to the client
 //! stream, [`BodyTransferError`]/[`BodyFailureSide`] attribution, and the
 //! pipe and `/dev/null` helpers ([`create_pipe`], [`drain_pipe`],
@@ -397,10 +397,6 @@ pub(super) struct BodyTransfer<'a> {
     client_file_pos: u64,
     /// Bytes still owed to the client.
     client_remaining: u64,
-    /// `Some` from [`Self::maybe_demote`] on, paired with
-    /// [`ClientStatus::Demoted`]; [`Self::finish`] folds both into
-    /// [`ClientEnd::Demoted`].
-    demoted_handle: Option<tokio::task::JoinHandle<DeliveryResult>>,
     /// The download's incremental digest, borrowed from `CacheTarget::hasher`
     /// so it advances in place over every cache byte this loop writes.
     /// Always `None` in the zero-copy loop (see [`Self::drain_pipe_to_cache`]);
@@ -465,7 +461,6 @@ impl<'a> BodyTransfer<'a> {
                 .expect("file_start_offset is non-negative by construction")
                 + range_filter.skip,
             client_remaining: range_filter.send,
-            demoted_handle: None,
             hasher,
             range_filter,
             cache_path,
@@ -665,17 +660,19 @@ impl<'a> BodyTransfer<'a> {
             demote_remaining_percent,
         );
         drop(self.counter.take());
-        self.demoted_handle = Some(
-            spawn_file_serve_task(
-                client,
-                self.cache_path,
-                demote_pos,
-                demote_remaining,
-                self.barrier(),
-            )
-            .map_err(BodyTransferError::proxy)?,
-        );
-        self.client_status = ClientStatus::Demoted;
+        self.client_status = match prepare_file_serve(
+            client,
+            self.cache_path,
+            demote_pos,
+            demote_remaining,
+            self.barrier().subscribe(),
+            Arc::clone(self.barrier().status()),
+        )
+        .map_err(BodyTransferError::proxy)?
+        {
+            Some(prepared) => ClientStatus::Demoted(prepared.spawn()),
+            None => ClientStatus::Disconnected,
+        };
         Ok(())
     }
 
@@ -691,7 +688,6 @@ impl<'a> BodyTransfer<'a> {
             bytes_done: _,
             client_file_pos: _,
             client_remaining,
-            demoted_handle,
             hasher: _,
             range_filter,
             cache_path: _,
@@ -713,9 +709,7 @@ impl<'a> BodyTransfer<'a> {
                 client_file_pos: _,
                 client_remaining: _,
             } => ClientEnd::Disconnected,
-            ClientStatus::Demoted => ClientEnd::Demoted(
-                demoted_handle.expect("maybe_demote stores the handle of the task it spawns"),
-            ),
+            ClientStatus::Demoted(handle) => ClientEnd::Demoted(handle),
         };
         BodyOutcome {
             dbarrier: dbarrier.expect("the barrier is only taken on the upstream-rate abort path"),
@@ -1397,8 +1391,8 @@ async fn write_client_or_demote<'a>(
     Ok(())
 }
 
-/// Duplicate the client socket fd and spawn a task that serves remaining bytes
-/// from the cache file.  Returns the `JoinHandle`, which leaves the loop as
+/// Capture the client socket and cache file before spawning their writer.
+/// The eventual `JoinHandle` leaves the loop as
 /// [`ClientEnd::Demoted`] and is awaited only by
 /// `commit::ClientSettlement::settle`.
 ///
@@ -1408,13 +1402,14 @@ async fn write_client_or_demote<'a>(
 /// the handle anywhere the barrier is still owned would therefore wait on a
 /// wake-up that cannot come. The settlement token is returned only after
 /// that drop and the commit spawn.
-fn spawn_file_serve_task(
+fn prepare_file_serve(
     client: &TcpStream,
     cache_path: &Path,
     content_start: u64,
     content_length: u64,
-    dbarrier: &DownloadBarrier,
-) -> std::io::Result<tokio::task::JoinHandle<DeliveryResult>> {
+    receiver: tokio::sync::watch::Receiver<()>,
+    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+) -> std::io::Result<Option<PreparedFileServe>> {
     // Duplicate the client socket so the spawned task owns its own fd.
     // The original fd stays open in the connection handler but won't be
     // written to after demotion.
@@ -1424,8 +1419,6 @@ fn spawn_file_serve_task(
     std_stream.set_nonblocking(true)?;
     let client_stream = TcpStream::from_std(std_stream)?;
 
-    let receiver = dbarrier.subscribe();
-    let status = Arc::clone(dbarrier.status());
     let cache_path = cache_path.to_path_buf();
 
     // Open the cache file synchronously here, before the caller's splice loop
@@ -1444,20 +1437,46 @@ fn spawn_file_serve_task(
                 cache_path.display(),
                 ErrorReport(&err)
             );
-            return Ok(tokio::task::spawn(async { DeliveryResult::Failure(0) }));
+            return Ok(None);
         }
     };
     let file = tokio::fs::File::from_std(std_file);
 
-    Ok(tokio::task::spawn(serve_remaining_from_file(
-        client_stream,
+    Ok(Some(PreparedFileServe {
+        client: client_stream,
         file,
         cache_path,
         content_start,
         content_length,
         receiver,
         status,
-    )))
+    }))
+}
+
+/// All resources are captured before the producer can rename the partial.
+/// Spawning consumes this handoff, so only one task can become its writer.
+struct PreparedFileServe {
+    client: TcpStream,
+    file: tokio::fs::File,
+    cache_path: PathBuf,
+    content_start: u64,
+    content_length: u64,
+    receiver: tokio::sync::watch::Receiver<()>,
+    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+}
+
+impl PreparedFileServe {
+    fn spawn(self) -> tokio::task::JoinHandle<DeliveryResult> {
+        tokio::task::spawn(serve_remaining_from_file(
+            self.client,
+            self.file,
+            self.cache_path,
+            self.content_start,
+            self.content_length,
+            self.receiver,
+            self.status,
+        ))
+    }
 }
 
 /// Serve remaining bytes of a download from the cache file to a demoted client
@@ -1758,7 +1777,6 @@ impl<'a> CacheBatch<'a> {
 /// The socket lives in the two variants that still own one, so "is there a
 /// client to write to" and "where is it" are one question -- answered by
 /// [`Self::client_to_write`], the only way to reach the socket at all.
-#[derive(Clone, Copy)]
 enum ClientStatus<'a> {
     /// Client is still connected and receiving data at acceptable speed.
     Active(&'a TcpStream),
@@ -1791,20 +1809,20 @@ enum ClientStatus<'a> {
     /// splice loop treat this identically to `Disconnected` (cache-only
     /// path), and the byte counts the spawned task needs were already
     /// passed in via the preceding `DemoteRequested`.
-    Demoted,
+    Demoted(tokio::task::JoinHandle<DeliveryResult>),
 }
 
 impl<'a> ClientStatus<'a> {
     /// The socket this transfer may still write body bytes to.  `None`
     /// once the client is absent, gone, or owned by a file-serve task --
     /// all of which mean "carry on cache-only".
-    const fn client_to_write(self) -> Option<&'a TcpStream> {
+    const fn client_to_write(&self) -> Option<&'a TcpStream> {
         // `DemoteRequested` still holds the socket, but the bytes it owes are
         // the file-serve task's to send once `maybe_demote` hands it over;
         // every other non-`Active` state has nothing attached at all.
         match self {
             Self::Active(client) => Some(client),
-            Self::Absent | Self::Disconnected | Self::DemoteRequested { .. } | Self::Demoted => {
+            Self::Absent | Self::Disconnected | Self::DemoteRequested { .. } | Self::Demoted(_) => {
                 None
             }
         }
@@ -2227,6 +2245,64 @@ mod tests {
         assert!(
             size >= 64 * 1024,
             "pipe size shouldn't be too small, got {size}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_demotion_keeps_the_original_inode_after_rename() {
+        let scratch = ScratchFile::new();
+        std::fs::write(&scratch.path, b"prefix-suffix").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (client, _) = listener.accept().await.unwrap();
+        let (_sender, receiver) = tokio::sync::watch::channel(());
+        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Finished {
+            path: scratch.path.clone(),
+            meta: None,
+        }));
+        let prepared = prepare_file_serve(&client, &scratch.path, 7, 6, receiver, status)
+            .unwrap()
+            .expect("readable partial");
+        std::fs::rename(&scratch.path, scratch.path.with_extension("complete")).unwrap();
+        // A replacement at the old path must never become this client's body.
+        std::fs::write(&scratch.path, b"wrong contents").unwrap();
+        drop(client);
+        let writer = tokio::spawn(async move {
+            let mut offset = i64::try_from(prepared.content_start).unwrap();
+            nix::sys::sendfile::sendfile(
+                &prepared.client,
+                &prepared.file,
+                Some(&mut offset),
+                usize::try_from(prepared.content_length).unwrap(),
+            )
+            .unwrap()
+        });
+        assert_eq!(writer.await.unwrap(), 6);
+        let mut payload = Vec::new();
+        peer.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"suffix");
+    }
+
+    #[tokio::test]
+    async fn missing_demotion_file_has_no_writer_to_settle() {
+        let scratch = ScratchFile::new();
+        std::fs::remove_file(&scratch.path).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (client, _) = listener.accept().await.unwrap();
+        let (_sender, receiver) = tokio::sync::watch::channel(());
+        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Finished {
+            path: scratch.path.clone(),
+            meta: None,
+        }));
+        assert!(
+            prepare_file_serve(&client, &scratch.path, 0, 6, receiver, status)
+                .unwrap()
+                .is_none()
         );
     }
 
