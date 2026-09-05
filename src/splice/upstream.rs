@@ -580,7 +580,7 @@ pub(super) async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStr
             std::io::Error::new(
                 ErrorKind::TimedOut,
                 format!(
-                    "upstream TCP connect timed out after {}",
+                    "TCP connect timed out after {}",
                     HumanFmt::Time(http_timeout)
                 ),
             )
@@ -589,7 +589,7 @@ pub(super) async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStr
             metrics::UPSTREAM_CONNECT_FAILED.increment();
             std::io::Error::new(
                 err.kind(),
-                format!("TCP connect to upstream failed:  {err}"),
+                format!("TCP connect failed:  {err}"),
             )
         })
         .inspect(|tcp| {

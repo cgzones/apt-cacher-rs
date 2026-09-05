@@ -16,9 +16,7 @@ use crate::error;
 use crate::response_head::ResponseHead;
 #[cfg(all(feature = "mmap", feature = "hyper"))]
 use crate::{
-    accounted_body,
-    client_info::ClientInfo,
-    mmap_body,
+    accounted_body, mmap_body,
     rate_checked_body::{MaybeRated, RateCheckedBodyErr},
 };
 
@@ -49,10 +47,7 @@ pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
 )]
 pub(crate) enum ProxyCacheBody {
     #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap(
-        #[pin] MaybeRated<accounted_body::AccountedBody<mmap_body::MmapBody>>,
-        ClientInfo,
-    ),
+    Mmap(#[pin] MaybeRated<accounted_body::AccountedBody<mmap_body::MmapBody>>),
     Boxed(#[pin] BoxBody<bytes::Bytes, Box<error::ProxyCacheError>>),
 }
 
@@ -60,7 +55,7 @@ impl Debug for ProxyCacheBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(_, _) => f.debug_tuple("Mmap").finish(),
+            Self::Mmap(_) => f.debug_tuple("Mmap").finish(),
             Self::Boxed(_) => f.debug_tuple("Boxed").finish(),
         }
     }
@@ -78,15 +73,12 @@ impl Body for ProxyCacheBody {
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.project() {
             #[cfg(all(feature = "mmap", feature = "hyper"))]
-            EnumProj::Mmap(memory_map, client) => memory_map
+            EnumProj::Mmap(memory_map) => memory_map
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
                 .map_err(|rerr| match *rerr {
                     RateCheckedBodyErr::RateTimeout(error) => {
-                        Box::new(error::ProxyCacheError::ClientDownloadRate {
-                            error,
-                            client: *client,
-                        })
+                        Box::new(error::ProxyCacheError::ClientDownloadRate { error })
                     }
                     RateCheckedBodyErr::Inner(never) => match never {},
                 }),
@@ -101,7 +93,7 @@ impl Body for ProxyCacheBody {
     fn size_hint(&self) -> SizeHint {
         match self {
             #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(mmap_body, _) => mmap_body.size_hint(),
+            Self::Mmap(mmap_body) => mmap_body.size_hint(),
             Self::Boxed(box_body) => box_body.size_hint(),
         }
     }
@@ -110,7 +102,7 @@ impl Body for ProxyCacheBody {
     fn is_end_stream(&self) -> bool {
         match self {
             #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(mmap_body, _) => mmap_body.is_end_stream(),
+            Self::Mmap(mmap_body) => mmap_body.is_end_stream(),
             Self::Boxed(box_body) => box_body.is_end_stream(),
         }
     }

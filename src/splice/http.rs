@@ -26,7 +26,6 @@ use tokio::{
 };
 
 use crate::cache_layout::ConnectionDetails;
-use crate::error::ErrorReport;
 use crate::http_helpers::{OptHeader, find_header, find_header_end};
 use crate::http_range::parse_content_range;
 use crate::humanfmt::HumanFmt;
@@ -174,14 +173,12 @@ async fn read_upstream_response_headers(
         search_offset = buf.len();
 
         if buf.len() > MAX_UPSTREAM_HEADER_SIZE {
-            warn_once_or_info!(
-                "splice proxy: upstream response header size of {} bytes exceeds {} bytes; aborting the upstream request",
-                buf.len(),
-                MAX_UPSTREAM_HEADER_SIZE
-            );
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
-                "upstream response headers too large",
+                format!(
+                    "upstream response header size of {} bytes exceeds {MAX_UPSTREAM_HEADER_SIZE} byte cap",
+                    buf.len()
+                ),
             ));
         }
     }
@@ -553,12 +550,8 @@ pub(super) async fn send_and_read_headers(
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
     let resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority, request_sent_at)
-        .inspect_err(|err| {
+        .inspect_err(|_err| {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            warn_once_or_info!(
-                "splice proxy: upstream {host_authority} sent malformed HTTP; failing the upstream request:  {}",
-                ErrorReport(err)
-            );
         })?;
     Ok((resp, hdr_buf, hdr_end))
 }
@@ -704,13 +697,9 @@ async fn forward_upstream_body_until_eof(
 
         total += n as u64;
         if total > max_bytes as u64 {
-            warn_once_or_info!(
-                "splice proxy: upstream error response body exceeded {} byte cap; truncating the relayed body",
-                max_bytes
-            );
-            return Err(std::io::Error::other(
-                "upstream error response body exceeded size cap",
-            ));
+            return Err(std::io::Error::other(format!(
+                "upstream error response body exceeded {max_bytes} byte cap (size={total} bytes)"
+            )));
         }
 
         check_upstream_read_rate(&mut rate_checker, n)?;
@@ -748,10 +737,11 @@ enum ChunkedState {
 #[derive(Debug)]
 enum ChunkDecodeError {
     /// The declared payload total crossed the decoder's cap. The decoder
-    /// does not log this: the two I/O wrappers word the line differently
-    /// (relayed body vs volatile body) and each keeps its own
-    /// `warn_once_or_info!` gate.
-    SizeCap { max_bytes: usize },
+    /// leaves logging to callers; the I/O wrappers add body context.
+    SizeCap {
+        max_bytes: usize,
+        declared_bytes: usize,
+    },
     /// A framing violation; `UPSTREAM_PROTOCOL_VIOLATION` has been bumped.
     Framing(std::io::Error),
 }
@@ -874,6 +864,7 @@ impl ChunkDecoder {
                             if self.total > Saturating(self.max_bytes) {
                                 return Err(ChunkDecodeError::SizeCap {
                                     max_bytes: self.max_bytes,
+                                    declared_bytes: self.total.0,
                                 });
                             }
                             self.state = ChunkedState::ReadingData {
@@ -959,14 +950,13 @@ async fn forward_chunked_buf(
 ) -> std::io::Result<bool> {
     let consumed = match decoder.feed(data, |_payload| {}) {
         Ok(consumed) => consumed,
-        Err(ChunkDecodeError::SizeCap { max_bytes }) => {
-            warn_once_or_info!(
-                "splice proxy: chunked response body exceeded {} byte cap; truncating the relayed body",
-                max_bytes
-            );
-            return Err(std::io::Error::other(
-                "chunked response body exceeded size cap",
-            ));
+        Err(ChunkDecodeError::SizeCap {
+            max_bytes,
+            declared_bytes,
+        }) => {
+            return Err(std::io::Error::other(format!(
+                "chunked response body exceeded {max_bytes} byte cap (declared payload={declared_bytes} bytes)"
+            )));
         }
         Err(ChunkDecodeError::Framing(err)) => return Err(err),
     };
@@ -1075,12 +1065,10 @@ async fn read_body_to_vec_until_eof(
 
     loop {
         if body.len() > max_bytes {
-            warn_once_or_info!(
-                "splice proxy: volatile response body exceeded {max_bytes} byte cap; aborting the download"
-            );
-            return Err(std::io::Error::other(
-                "volatile response body exceeded size cap",
-            ));
+            return Err(std::io::Error::other(format!(
+                "volatile response body exceeded {max_bytes} byte cap (size={} bytes)",
+                body.len()
+            )));
         }
 
         // The +1 keeps the take limit strictly positive (so a 0-byte read
@@ -1211,13 +1199,13 @@ async fn read_dechunk_body_to_vec(
 
         let consumed = match decoder.feed(data, |payload| body.extend_from_slice(&data[payload])) {
             Ok(consumed) => consumed,
-            Err(ChunkDecodeError::SizeCap { max_bytes }) => {
-                warn_once_or_info!(
-                    "splice proxy: chunked volatile body exceeded {max_bytes} byte cap; aborting the download"
-                );
-                return Err(std::io::Error::other(
-                    "chunked volatile body exceeded size cap",
-                ));
+            Err(ChunkDecodeError::SizeCap {
+                max_bytes,
+                declared_bytes,
+            }) => {
+                return Err(std::io::Error::other(format!(
+                    "chunked volatile body exceeded {max_bytes} byte cap (declared payload={declared_bytes} bytes)"
+                )));
             }
             Err(ChunkDecodeError::Framing(err)) => return Err(err),
         };
@@ -1829,7 +1817,7 @@ mod tests {
         // a frame whose chunks sum to exactly `max_bytes` passes, one byte
         // more is refused before any of that chunk's data is consumed, and
         // the error is distinct from a framing violation so the I/O
-        // wrappers can word their own log line.
+        // wrappers can add their own error context.
         let input: &[u8] = b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n";
         let (body, consumed) = dechunk_once(input, 6).expect("exactly at the cap is fine");
         assert_eq!(body, b"foobar");
@@ -1837,7 +1825,13 @@ mod tests {
 
         let err = dechunk_once(input, 5).expect_err("one byte over the cap must be refused");
         assert!(
-            matches!(err, ChunkDecodeError::SizeCap { max_bytes: 5 }),
+            matches!(
+                err,
+                ChunkDecodeError::SizeCap {
+                    max_bytes: 5,
+                    declared_bytes: 6
+                }
+            ),
             "expected SizeCap, got {err:?}",
         );
     }

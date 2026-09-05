@@ -411,8 +411,8 @@ impl UpgradeProbe {
 
 /// Wrap a client-facing body in the configured client-rate check and box it
 /// into [`ProxyCacheBody`], mapping a rate timeout to
-/// `ProxyCacheError::ClientDownloadRate` for `client`.
-fn rated_client_body<B>(body: B, client: ClientInfo) -> ProxyCacheBody
+/// `ProxyCacheError::ClientDownloadRate`.
+fn rated_client_body<B>(body: B) -> ProxyCacheBody
 where
     B: Body<Data = bytes::Bytes> + Send + Sync + 'static,
     B::Error: Into<Box<ProxyCacheError>>,
@@ -424,9 +424,9 @@ where
         config.rate_check_timeframe,
         RateCheckDirection::Client,
     )
-    .map_err(move |err| match *err {
+    .map_err(|err| match *err {
         RateCheckedBodyErr::RateTimeout(error) => {
-            Box::new(ProxyCacheError::ClientDownloadRate { error, client })
+            Box::new(ProxyCacheError::ClientDownloadRate { error })
         }
         RateCheckedBodyErr::Inner(ierr) => ierr.into(),
     });
@@ -441,11 +441,10 @@ where
 fn passthrough_response(
     response: Response<Incoming>,
     subject: Subject,
-    client: ClientInfo,
 ) -> Response<ProxyCacheBody> {
     let (parts, body) = response.into_parts();
 
-    let body = rated_client_body(AccountedBody::new(body, subject, |_| false), client);
+    let body = rated_client_body(AccountedBody::new(body, subject, |_| false));
 
     let mut response = Response::from_parts(parts, body);
     response
@@ -552,8 +551,6 @@ fn serve_cached_file_mmap(
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
 
-    let client = conn_details.client;
-
     let memory_body = AccountedBody::new(
         MmapBody::new(memory_map),
         Subject::Cached {
@@ -567,15 +564,12 @@ fn serve_cached_file_mmap(
 
     let config = global_config();
 
-    let body = ProxyCacheBody::Mmap(
-        MaybeRated::new(
-            memory_body,
-            config.min_download_rate,
-            config.rate_check_timeframe,
-            RateCheckDirection::Client,
-        ),
-        client,
-    );
+    let body = ProxyCacheBody::Mmap(MaybeRated::new(
+        memory_body,
+        config.min_download_rate,
+        config.rate_check_timeframe,
+        RateCheckDirection::Client,
+    ));
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(cache_info, params, content_type, body)
@@ -616,7 +610,6 @@ async fn serve_unfinished_file(
     let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-    let client = conn_details.client;
     tokio::task::spawn(async move {
         let start = PreciseInstant::now();
         debug!(
@@ -765,7 +758,7 @@ async fn serve_unfinished_file(
     };
 
     metrics::REQUESTS_CHANNEL.increment();
-    let body = rated_client_body(ChannelBody::new(rx, content_length), client);
+    let body = rated_client_body(ChannelBody::new(rx, content_length));
 
     let response = head.into_hyper(body);
 
@@ -914,7 +907,6 @@ async fn serve_cached_file_buf(
     );
 
     let config = global_config();
-    let client = conn_details.client;
 
     // Every caller hands over a file freshly opened for this response, so at
     // `start == 0` (the whole-file case, i.e. every non-Range request) the
@@ -965,7 +957,7 @@ async fn serve_cached_file_buf(
         is_peer_disconnect,
     );
 
-    let body = rated_client_body(delivery_body, client);
+    let body = rated_client_body(delivery_body);
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(cache_info, params, content_type, body)
@@ -1994,7 +1986,6 @@ async fn serve_new_file(
                     request_received_at: conn_details.request_received_at,
                     request_sent: upstream_request_sent,
                 },
-                conn_details.client,
             );
         }
         DownloadPlan::Reject(reason) => {
@@ -2785,7 +2776,6 @@ async fn pre_process_client_request(
                     request_received_at: passthrough_request_received_at,
                     request_sent: redirected_request_sent,
                 },
-                client,
             );
         }
 
@@ -2801,7 +2791,6 @@ async fn pre_process_client_request(
             request_received_at: passthrough_request_received_at,
             request_sent: fwd_request_sent,
         },
-        client,
     )
 }
 

@@ -876,7 +876,7 @@ async fn drive_batches(
                     return Err(BodyTransferError::upstream(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
                         format!(
-                            "splice proxy: upstream closed prematurely (remaining={}, batched={got}, budget={budget})",
+                            "upstream closed prematurely (remaining={}, batched={got}, budget={budget})",
                             xfer.remaining
                         ),
                     )));
@@ -1288,7 +1288,7 @@ fn tls_premature_eof() -> BodyTransferError {
     metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
     BodyTransferError::upstream(std::io::Error::new(
         ErrorKind::UnexpectedEof,
-        "splice proxy: TLS upstream closed prematurely",
+        "TLS upstream closed prematurely",
     ))
 }
 
@@ -1848,7 +1848,7 @@ async fn tee_and_splice(
                     Ok(0) => {
                         return Err(BodyTransferError::proxy(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
-                            "splice proxy: tee returned 0",
+                            "tee returned 0",
                         )));
                     }
                     Ok(n) => break n,

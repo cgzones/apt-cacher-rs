@@ -3,10 +3,7 @@ use std::fmt::Display;
 #[cfg(feature = "hyper")]
 use crate::channel_body::ChannelBodyError;
 #[cfg(feature = "hyper")]
-use crate::{
-    client_info::ClientInfo, deb_mirror::Mirror, rate_checker::InsufficientRate,
-    upstream_head::ContentLength,
-};
+use crate::{deb_mirror::Mirror, rate_checker::InsufficientRate, upstream_head::ContentLength};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MirrorDownloadRate {
@@ -41,12 +38,11 @@ fn fmt_mirror_download_rate(
 #[cfg(feature = "hyper")]
 fn fmt_client_download_rate(
     error: &InsufficientRate,
-    client: &ClientInfo,
     f: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
     // Sync point: this fragment completes the test needle "Timeout occurred for
-    // client" started in `rate_checker.rs`; keep the " for client " wording stable.
-    error.fmt_with_context(f, format_args!(" for client {client}"))
+    // client" started in `rate_checker.rs`; keep the " for client" wording stable.
+    error.fmt_with_context(f, format_args!(" for client"))
 }
 
 /// Error type of the hyper response bodies (`ProxyCacheBody`).  Every variant
@@ -73,10 +69,7 @@ pub(crate) enum ProxyCacheError {
     Hyper(hyper::Error),
     #[cfg(feature = "hyper")]
     #[error(fmt = fmt_client_download_rate)]
-    ClientDownloadRate {
-        error: InsufficientRate,
-        client: ClientInfo,
-    },
+    ClientDownloadRate { error: InsufficientRate },
     #[cfg(feature = "hyper")]
     #[error(fmt = fmt_mirror_download_rate)]
     MirrorDownloadRate(MirrorDownloadRate),
