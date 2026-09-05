@@ -334,7 +334,9 @@ impl AsRef<Path> for TempPath {
     }
 }
 
-/// Create a temporary file with a unique extension for the given path.
+/// Create a readable/writable temporary file with a unique extension.
+/// Splice demotion duplicates this descriptor to read the growing file without
+/// reopening its pathname.
 pub(crate) async fn tokio_tempfile(
     path: &Path,
     mode: u32,
@@ -360,6 +362,7 @@ pub(crate) async fn tokio_tempfile(
 
         let _: Never = match tokio_nofollow_options()
             .create_new(true)
+            .read(true)
             .write(true)
             .mode(mode)
             .open(&buf)

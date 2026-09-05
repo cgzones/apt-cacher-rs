@@ -36,10 +36,10 @@ use tokio::{
     io::AsyncReadExt as _,
     net::{TcpStream, unix::pipe},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use crate::error::{ErrorReport, errno_to_io_error, is_peer_disconnect};
-use crate::fs_open::{hint_sequential_read, nofollow_options};
+use crate::fs_open::hint_sequential_read;
 use crate::guards::{DownloadBarrier, DownloadWriteLease};
 use crate::humanfmt::HumanFmt;
 use crate::index_parser::{HashAlgo, StreamHasher, StreamedDigest};
@@ -710,10 +710,10 @@ impl<'a> BodyTransfer<'a> {
         }
     }
 
-    fn barrier(&mut self) -> &mut DownloadBarrier {
+    fn barrier(&self) -> &DownloadBarrier {
         self.cache
             .dbarrier
-            .as_mut()
+            .as_ref()
             .expect("the barrier is only taken on the upstream-rate abort path")
     }
 
@@ -851,19 +851,17 @@ impl<'a> BodyTransfer<'a> {
             demote_remaining_percent,
         );
         drop(self.counter.take());
-        self.client_status = match prepare_file_serve(
+        let prepared = prepare_file_serve(
             client,
+            &self.cache.tempfile,
             self.cache_path,
             demote_pos,
             demote_remaining,
             self.barrier().subscribe(),
             Arc::clone(self.barrier().status()),
         )
-        .map_err(BodyTransferError::proxy)?
-        {
-            Some(prepared) => ClientStatus::Demoted(prepared.spawn()),
-            None => ClientStatus::Disconnected,
-        };
+        .map_err(BodyTransferError::proxy)?;
+        self.client_status = ClientStatus::Demoted(prepared.spawn());
         Ok(())
     }
 
@@ -1522,12 +1520,13 @@ async fn write_client_or_demote<'a>(
 /// that drop and the commit spawn.
 fn prepare_file_serve(
     client: &TcpStream,
+    cache_file: &tokio::fs::File,
     cache_path: &Path,
     content_start: u64,
     content_length: u64,
     receiver: tokio::sync::watch::Receiver<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-) -> std::io::Result<Option<PreparedFileServe>> {
+) -> std::io::Result<PreparedFileServe> {
     // Duplicate the client socket so the spawned task owns its own fd.
     // The original fd stays open in the connection handler but won't be
     // written to after demotion.
@@ -1539,28 +1538,15 @@ fn prepare_file_serve(
 
     let cache_path = cache_path.to_path_buf();
 
-    // Open the cache file synchronously here, before the caller's splice loop
-    // continues, so the fd is captured pre-rename: the download is still
-    // mid-body (the file provably exists), and this fixes a race where the
-    // download could finish and `RenamePlan::commit` rename the temp file away
-    // before a spawned task's open ran (NotFound, truncating this client). This
-    // is a short local-file open syscall on the async worker, consistent with
-    // the synchronous `dup(2)` above.
-    let std_file = match nofollow_options().read(true).open(&cache_path) {
-        Ok(f) => f,
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to open cache file `{}` for the demoted client; the demoted client gets no further bytes:  {}",
-                cache_path.display(),
-                ErrorReport(&err)
-            );
-            return Ok(None);
-        }
-    };
-    let file = tokio::fs::File::from_std(std_file);
+    // Retain the writer's inode directly: pathname replacement, rename and
+    // unlink cannot change which bytes this client receives. Duplicate only
+    // the descriptor, not CacheFile's write lease; a slow reader must not keep
+    // a completed/aborted producer registered. Both sides use explicit offsets
+    // (pwrite/splice and sendfile), so sharing the open-file cursor is safe.
+    let fd = cache_file.as_fd().try_clone_to_owned()?;
+    let file = tokio::fs::File::from_std(std::fs::File::from(fd));
 
-    Ok(Some(PreparedFileServe {
+    Ok(PreparedFileServe {
         client: client_stream,
         file,
         cache_path,
@@ -1568,10 +1554,10 @@ fn prepare_file_serve(
         content_length,
         receiver,
         status,
-    }))
+    })
 }
 
-/// All resources are captured before the producer can rename the partial.
+/// Owned descriptors keep the handoff valid across producer rename or unlink.
 /// Spawning consumes this handoff, so only one task can become its writer.
 struct PreparedFileServe {
     client: TcpStream,
@@ -2312,12 +2298,20 @@ mod tests {
             path: scratch.path.clone(),
             meta: None,
         }));
-        let prepared = prepare_file_serve(&client, &scratch.path, 7, 6, receiver, status)
-            .unwrap()
-            .expect("readable partial");
         std::fs::rename(&scratch.path, scratch.path.with_extension("complete")).unwrap();
         // A replacement at the old path must never become this client's body.
         std::fs::write(&scratch.path, b"wrong contents").unwrap();
+        let prepared = prepare_file_serve(
+            &client,
+            &scratch.file,
+            &scratch.path,
+            7,
+            6,
+            receiver,
+            status,
+        )
+        .unwrap();
+        drop(scratch.file);
         drop(client);
         let writer = tokio::spawn(async move {
             let mut offset = i64::try_from(prepared.content_start).unwrap();
@@ -2335,25 +2329,58 @@ mod tests {
         assert_eq!(payload, b"suffix");
     }
 
-    #[tokio::test]
-    async fn missing_demotion_file_has_no_writer_to_settle() {
-        let scratch = ScratchFile::new();
-        std::fs::remove_file(&scratch.path).unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demotion_reads_unlinked_volatile_file_without_retaining_the_write_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, path) = crate::partial_file::tokio_tempfile(&dir.path().join("volatile"), 0o640)
+            .await
+            .unwrap();
+        let barrier = cache_barrier(&path).await;
+        let lifetime = Arc::downgrade(&barrier.write_lease());
+        let receiver = barrier.subscribe();
+        let status = Arc::clone(barrier.status());
+        let mut writer = CacheWriter::new(file, 0, CacheWriteMode::Kernel, barrier)
+            .await
+            .unwrap();
+        writer.write_prefix(b"prefix-").await.unwrap();
+        std::fs::remove_file(&*path).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _peer = TcpStream::connect(listener.local_addr().unwrap())
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (client, _) = listener.accept().await.unwrap();
-        let (_sender, receiver) = tokio::sync::watch::channel(());
-        let status = Arc::new(tokio::sync::RwLock::new(ActiveDownloadStatus::Finished {
-            path: scratch.path.clone(),
-            meta: None,
-        }));
+        let prepared =
+            prepare_file_serve(&client, &writer.tempfile, &path, 7, 6, receiver, status).unwrap();
+        // Bytes arriving after demotion remain visible through the captured fd.
+        writer.write_prefix(b"suffix").await.unwrap();
+        drop(writer);
         assert!(
-            prepare_file_serve(&client, &scratch.path, 0, 6, receiver, status)
-                .unwrap()
-                .is_none()
+            lifetime.upgrade().is_none(),
+            "the reader owns no write lease"
         );
+        drop(client);
+        let mut offset = i64::try_from(prepared.content_start).unwrap();
+        assert_eq!(
+            nix::sys::sendfile::sendfile(
+                &prepared.client,
+                &prepared.file,
+                Some(&mut offset),
+                usize::try_from(prepared.content_length).unwrap(),
+            )
+            .unwrap(),
+            6
+        );
+        // sendfile must leave the shared open-file cursor untouched.
+        assert_eq!(
+            nix::unistd::lseek(&prepared.file, 0, nix::unistd::Whence::SeekCur).unwrap(),
+            0
+        );
+        drop(prepared);
+        let mut payload = Vec::new();
+        peer.read_to_end(&mut payload).await.unwrap();
+        assert_eq!(payload, b"suffix");
+        // Already unlinked deliberately; prevent the scratch guard logging it.
+        path.defuse();
     }
 
     fn owned_fd(fd: &impl std::os::fd::AsFd) -> Arc<OwnedFd> {
@@ -2517,7 +2544,12 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("salvage.partial");
             let file = tokio::fs::File::from_std(
-                std::fs::File::create(&path).expect("create the scratch file"),
+                crate::fs_open::nofollow_options()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("create the scratch file"),
             );
             Self {
                 _dir: dir,
