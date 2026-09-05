@@ -1144,9 +1144,8 @@ async fn write_body_prefix_to_cache(
 
     // The bytes are already in our hands, so the cache file is the source of
     // truth that other clients read from; the caller only attempts its
-    // client write after this returned. Flushing before the splice loop also
-    // keeps the queued write from racing the loop's raw `splice(2)` appends
-    // to the same fd.
+    // client write after this returned. Waiting for the prefix's write job
+    // also prevents it from racing the loop's raw `splice(2)` appends.
     CacheWriter::write_prefix(
         &mut target.tempfile,
         body_prefix,
@@ -1166,17 +1165,30 @@ async fn write_body_prefix_to_cache(
     Ok(())
 }
 
-/// Write `bytes` to a cache temp file and wait for them to land.
-///
-/// `tokio::fs::File::write_all` only queues the write on the blocking pool;
-/// the follow-up `flush` waits for it, so a failure (e.g. disk full)
-/// surfaces at the caller's classified site. Without it the error stays
-/// parked in the file handle -- `sync_all` at commit time never reports a
-/// deferred write error -- and a truncated file would be renamed in as a
-/// success.
-async fn write_all_flushed(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
-    file.write_all(bytes).await?;
-    file.flush().await
+/// Write a prefix or buffered body and wait for the actual write result.
+/// The blocking job owns its descriptor and write lease, so cancelling the
+/// caller cannot admit another writer while this one still modifies the file.
+/// Using the shared file cursor preserves the resume offset selected earlier;
+/// subsequent body writes use their explicit offsets.
+async fn write_all_flushed(
+    file: &mut tokio::fs::File,
+    bytes: &[u8],
+    lease: Arc<crate::guards::DownloadWriteLease>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+
+    file.flush().await?;
+    let fd = file.as_fd().try_clone_to_owned()?;
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+
+        let _lease = lease;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(&bytes)
+    })
+    .await
+    .expect("cache prefix writer should not panic")
 }
 
 /// Cache the new prefix even when an earlier client write failed. Only an

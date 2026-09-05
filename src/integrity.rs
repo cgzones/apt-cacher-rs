@@ -36,6 +36,7 @@ use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::{
     cache_layout::ResourceKind,
     cache_quota::QuotaReservation,
+    guards::DownloadWriteLease,
     index_parser::{self, HashAlgo, IndexFormat, StanzaStream, StreamedDigest},
     metrics, verified_marker,
 };
@@ -698,9 +699,13 @@ fn rename_into_cache(temp_path: &Path, dest_path: &Path) -> std::io::Result<()> 
 /// commit can never leave the file in the cache with its reservation
 /// reverted. On every failure path the reservation is dropped, which
 /// reverts it.
+/// Both blocking jobs own the registry lease: cancelling verification cannot
+/// permit a retry to modify the file while it is read, and cancelling rename
+/// cannot let a retry replace the partial before the queued rename runs.
 pub(crate) async fn verify_and_rename(
     plan: &RenamePlan,
     reservation: QuotaReservation,
+    lease: Arc<DownloadWriteLease>,
 ) -> Result<(), CommitError> {
     let verify_enabled = global_config().verify_checksums;
 
@@ -731,15 +736,16 @@ pub(crate) async fn verify_and_rename(
 
     let temp_path = plan.temp_path.clone();
     let streamed = plan.streamed_digest.clone();
-    let outcome = match tokio::task::spawn_blocking(move || {
-        verify_temp_file(&VerifyInput {
-            verify_enabled,
-            kind,
-            temp_path: &temp_path,
-            streamed,
+    let outcome = match Arc::clone(&lease)
+        .spawn_blocking(move |_lease| {
+            verify_temp_file(&VerifyInput {
+                verify_enabled,
+                kind,
+                temp_path: &temp_path,
+                streamed,
+            })
         })
-    })
-    .await
+        .await
     {
         Ok(outcome) => outcome,
         Err(join_err) => {
@@ -767,10 +773,14 @@ pub(crate) async fn verify_and_rename(
     let temp_path = plan.temp_path.clone();
     let dest_path = plan.dest_path.clone();
     let bytes_received = plan.bytes_received;
-    match tokio::task::spawn_blocking(move || {
-        rename_into_cache(&temp_path, &dest_path).map(|()| reservation.finalize(bytes_received))
-    })
-    .await
+    match lease
+        .spawn_blocking(move |lease| {
+            rename_into_cache(&temp_path, &dest_path).map(|()| {
+                reservation.finalize(bytes_received);
+                lease.invalidate_metadata();
+            })
+        })
+        .await
     {
         Ok(Ok(())) => {}
         Ok(Err(err)) => return Err(CommitError::Rename(err)),

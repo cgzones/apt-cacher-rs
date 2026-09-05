@@ -168,7 +168,13 @@ pub(super) async fn handle_volatile_buffered_download(
     // already-downloaded body (late joiners and future requests keep it).
 
     // Write the full body to the cache temp file (best-effort).
-    let cache_write_ok = match write_all_flushed(&mut target.tempfile, &body).await {
+    let cache_write_ok = match write_all_flushed(
+        &mut target.tempfile,
+        &body,
+        target.dbarrier.write_lease(),
+    )
+    .await
+    {
         Ok(()) => true,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();

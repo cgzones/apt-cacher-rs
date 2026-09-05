@@ -24,7 +24,7 @@ use std::{
     future::Future as _,
     io::ErrorKind,
     ops::Range,
-    os::fd::{AsFd as _, AsRawFd as _, BorrowedFd},
+    os::fd::{AsFd as _, OwnedFd},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     task::Poll,
@@ -40,7 +40,7 @@ use tracing::{debug, error, info};
 
 use crate::error::{ErrorReport, errno_to_io_error, is_peer_disconnect};
 use crate::fs_open::{hint_sequential_read, nofollow_options};
-use crate::guards::DownloadBarrier;
+use crate::guards::{DownloadBarrier, DownloadWriteLease};
 use crate::humanfmt::HumanFmt;
 use crate::index_parser::StreamHasher;
 use crate::log_once::Logged;
@@ -350,11 +350,22 @@ pub(super) enum ClientEnd {
     Demoted(tokio::task::JoinHandle<DeliveryResult>),
 }
 
+/// A blocking cache write must retain both the descriptor and the permission
+/// to write this partial. On cancellation a job can outlive the async transfer;
+/// its last owner releases the lease only after the descriptor is closed.
+struct CacheFile {
+    fd: OwnedFd,
+    _write_lease: Arc<DownloadWriteLease>,
+}
+
 /// The single append owner: the file cursor, pending tee bytes, digest and
 /// publication barrier travel together. All direct writes flush earlier tee
 /// bytes internally; policy flushes retain the existing batching thresholds.
 pub(super) struct CacheWriter<'a> {
-    file: &'a tokio::fs::File,
+    // Keep the exclusive source-file borrow through the raw-I/O phase.
+    _file: &'a tokio::fs::File,
+    file: Arc<CacheFile>,
+    upstream_pipe: Option<Arc<OwnedFd>>,
     file_offset: i64,
     hasher: &'a mut Option<StreamHasher>,
     dbarrier: Option<DownloadBarrier>,
@@ -362,9 +373,9 @@ pub(super) struct CacheWriter<'a> {
 }
 
 impl<'a> CacheWriter<'a> {
-    /// Prefix writes use Tokio's buffered API; publish and hash only after
-    /// its queued write has completed. `prepare` consumes the subsequent
-    /// exclusive file borrow for the raw-I/O phase.
+    /// Prefix writes own their file descriptor and write lease on the blocking
+    /// pool; publish and hash only after the write has completed. `prepare`
+    /// consumes the subsequent exclusive file borrow for the raw-I/O phase.
     pub(super) async fn write_prefix(
         file: &mut tokio::fs::File,
         bytes: &[u8],
@@ -374,7 +385,7 @@ impl<'a> CacheWriter<'a> {
         if bytes.is_empty() {
             return Ok(());
         }
-        super::write_all_flushed(file, bytes).await?;
+        super::write_all_flushed(file, bytes, barrier.write_lease()).await?;
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(bytes);
         }
@@ -382,10 +393,10 @@ impl<'a> CacheWriter<'a> {
         Ok(())
     }
 
-    /// Finish any Tokio-buffered prefix writes before borrowing the file for
-    /// raw explicit-offset I/O. The exclusive borrow prevents further buffered
-    /// writes for this writer's lifetime. Flush with no queued write does not
-    /// issue a syscall or spawn a blocking task.
+    /// Finish any prior buffered I/O before borrowing the file for raw
+    /// explicit-offset writes. Production prefix writes already await their
+    /// owned jobs; an idle flush issues no syscall or blocking task. The
+    /// exclusive borrow prevents buffered writes for this writer's lifetime.
     pub(super) async fn prepare(
         file: &'a mut tokio::fs::File,
         file_offset: i64,
@@ -394,11 +405,20 @@ impl<'a> CacheWriter<'a> {
     ) -> Result<Self, BodyTransferError> {
         use tokio::io::AsyncWriteExt as _;
         file.flush().await.map_err(BodyTransferError::cache)?;
+        let owned_file = file
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(BodyTransferError::cache)?;
         Ok(Self {
-            file,
+            _file: file,
+            file: Arc::new(CacheFile {
+                fd: owned_file,
+                _write_lease: dbarrier.write_lease(),
+            }),
             file_offset,
             hasher,
             dbarrier: Some(dbarrier),
+            upstream_pipe: None,
             batch: None,
         })
     }
@@ -442,7 +462,7 @@ impl<'a> CacheWriter<'a> {
         if let Some(hasher) = self.hasher.as_mut() {
             hasher.update(&buf[..got]);
         }
-        pwrite_buf_to_file(self.file, buf, got, self.file_offset)
+        pwrite_buf_to_file(&self.file, buf, got, self.file_offset)
             .await
             .map_err(BodyTransferError::cache)?;
         self.file_offset +=
@@ -454,7 +474,7 @@ impl<'a> CacheWriter<'a> {
     /// Drain a pipe into the cache file at the current offset and notify
     /// concurrent clients. Count-free like [`drain_pipe_to_file`]: the pipe
     /// holds exactly the bytes to land.
-    async fn drain_pipe_to_cache(&mut self, rx: &pipe::Receiver) -> Result<(), BodyTransferError> {
+    async fn drain_pipe_to_cache(&mut self) -> Result<(), BodyTransferError> {
         // These bytes go pipe-to-file inside the kernel and are never in
         // userspace, so they cannot feed an incremental digest. `transfer_body`
         // drops the hasher before entering the zero-copy loop for exactly this
@@ -464,7 +484,11 @@ impl<'a> CacheWriter<'a> {
             self.hasher.is_none(),
             "the zero-copy path cannot hash: its bytes never reach userspace"
         );
-        let landed = drain_pipe_to_file(rx, self.file, &mut self.file_offset)
+        let rx = self
+            .upstream_pipe
+            .as_ref()
+            .expect("the splice loop installed pipe_A");
+        let landed = drain_pipe_to_file(rx, &self.file, &mut self.file_offset)
             .await
             .map_err(BodyTransferError::cache)?;
         self.barrier().ping_batched(landed as u64);
@@ -488,7 +512,7 @@ impl<'a> CacheWriter<'a> {
         );
         let landed = drain_pipe_to_file(
             &self.batch.as_ref().expect("tee batch").rx,
-            self.file,
+            &self.file,
             &mut self.file_offset,
         )
         .await
@@ -508,12 +532,9 @@ impl<'a> CacheWriter<'a> {
 
     /// Write `pipe_A` straight to the cache file, after the pending `pipe_B`
     /// bytes that precede it in the body.
-    async fn write_through(
-        &mut self,
-        upstream_pipe_rx: &pipe::Receiver,
-    ) -> Result<(), BodyTransferError> {
+    async fn write_through(&mut self) -> Result<(), BodyTransferError> {
         self.flush().await?;
-        self.drain_pipe_to_cache(upstream_pipe_rx).await
+        self.drain_pipe_to_cache().await
     }
 
     /// Land everything a failing transfer left in the pipes in the cache
@@ -545,13 +566,19 @@ impl<'a> CacheWriter<'a> {
     /// A failed salvage is reported here, with the on-disk path, and does not
     /// replace the transfer's own error: `file_offset` still describes what
     /// landed, so a shorter `.partial` is the only consequence.
-    async fn salvage(&mut self, upstream_pipe_rx: &pipe::Receiver, cache_path: &Path) {
+    async fn salvage(&mut self, cache_path: &Path) {
         let batch = self
             .batch
             .take()
             .expect("the splice loop installed its batch");
         if let Err(err) = batch
-            .salvage_into(upstream_pipe_rx, self.file, &mut self.file_offset)
+            .salvage_into(
+                self.upstream_pipe
+                    .as_ref()
+                    .expect("the splice loop installed pipe_A"),
+                &self.file,
+                &mut self.file_offset,
+            )
             .await
         {
             let _logged = Logged::cache_io_failure(format_args!(
@@ -579,7 +606,7 @@ impl<'a> CacheWriter<'a> {
         if got == 0 {
             return;
         }
-        match pwrite_buf_to_file(self.file, read_buf, got, self.file_offset).await {
+        match pwrite_buf_to_file(&self.file, read_buf, got, self.file_offset).await {
             Ok(()) => {
                 self.file_offset += i64::try_from(got)
                     .expect("a chunk is bounded by its read buffer, which fits in i64");
@@ -918,7 +945,16 @@ pub(super) async fn splice_proxy_body(
         create_pipe().map_err(BodyTransferError::proxy)?;
     let (cache_pipe_sender, cache_pipe_receiver) =
         create_pipe().map_err(BodyTransferError::proxy)?;
-    xfer.cache.batch = Some(CacheBatch::new(cache_pipe_receiver, cache_pipe_sender));
+    xfer.cache.upstream_pipe = Some(Arc::new(
+        upstream_pipe_receiver
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(BodyTransferError::proxy)?,
+    ));
+    xfer.cache.batch = Some(
+        CacheBatch::new(cache_pipe_receiver, cache_pipe_sender)
+            .map_err(BodyTransferError::proxy)?,
+    );
 
     // The one exit: whatever the loop leaves in either pipe reaches the cache
     // file here, on success as the last flush and on failure as the salvage.
@@ -932,9 +968,7 @@ pub(super) async fn splice_proxy_body(
     match driven {
         Ok(()) => xfer.cache.flush().await?,
         Err(err) => {
-            xfer.cache
-                .salvage(&upstream_pipe_receiver, xfer.cache_path)
-                .await;
+            xfer.cache.salvage(xfer.cache_path).await;
             return Err(err);
         }
     }
@@ -1160,7 +1194,7 @@ async fn drive_batches(
             // Chunk is entirely outside the client range, or the client is
             // absent/gone/demoted — cache only. `pipe_A` holds exactly the
             // batch, so draining it is the chunk write.
-            xfer.cache.write_through(upstream_pipe_receiver).await?;
+            xfer.cache.write_through().await?;
         }
     }
 
@@ -1168,8 +1202,10 @@ async fn drive_batches(
 }
 
 /// Writes the entire buffer to the cache file via pwrite at the specified offset.
+/// The blocking job owns both its buffer and a file handle even if the awaiting
+/// future is cancelled. Return that handle through retries to avoid re-cloning.
 async fn pwrite_buf_to_file(
-    file: &tokio::fs::File,
+    file: &Arc<CacheFile>,
     buf: &mut Vec<u8>,
     size: usize,
     mut offset: i64,
@@ -1180,25 +1216,23 @@ async fn pwrite_buf_to_file(
     let mut temp = Vec::new();
     std::mem::swap(buf, &mut temp);
 
-    let file_fd = file.as_raw_fd();
+    let mut file = Arc::clone(file);
 
     // Set once by whichever arm ends the loop; the buffer is handed back to
     // the caller after it, on every path.
     let mut outcome: std::io::Result<()> = Ok(());
 
     while written < size {
-        let (pwrite_result, temp_return) = tokio::task::spawn_blocking(move || {
+        let (pwrite_result, temp_return, file_return) = tokio::task::spawn_blocking(move || {
             let avail = &temp[written..size];
 
-            // SAFETY: file_fd is valid because the caller holds a reference to the
-            // tokio::fs::File, and the spawn_blocking result is awaited without cancellation
-            let fd = unsafe { BorrowedFd::borrow_raw(file_fd) };
-            let r = nix::sys::uio::pwrite(fd, avail, offset);
-            (r, temp)
+            let r = nix::sys::uio::pwrite(file.fd.as_fd(), avail, offset);
+            (r, temp, file)
         })
         .await
         .expect("spawn_blocking should not panic");
         temp = temp_return;
+        file = file_return;
 
         match pwrite_result {
             Ok(0) => {
@@ -1730,7 +1764,8 @@ async fn serve_remaining_from_file(
 /// path starts moving it into userspace (its head is then in a buffer that
 /// dies with the frame, so the tail alone would land at the wrong offset).
 struct CacheBatch {
-    rx: pipe::Receiver,
+    // Only blocking drains read B; retain its nonblocking descriptor directly.
+    rx: Arc<OwnedFd>,
     tx: pipe::Sender,
     /// Bytes teed into `pipe_B` since the last flush.
     pending: usize,
@@ -1755,15 +1790,15 @@ impl CacheBatch {
     /// is current to within a fraction of a second.
     const MAX_BATCH_AGE: coarsetime::Duration = coarsetime::Duration::from_millis(200);
 
-    const fn new(rx: pipe::Receiver, tx: pipe::Sender) -> Self {
-        Self {
-            rx,
+    fn new(rx: pipe::Receiver, tx: pipe::Sender) -> std::io::Result<Self> {
+        Ok(Self {
+            rx: Arc::new(rx.into_nonblocking_fd()?),
             tx,
             pending: 0,
             queued_at: None,
             flushed_once: false,
             pipe_a_staged: false,
-        }
+        })
     }
 
     /// `pipe_A` is empty and about to be filled by the accumulation loop;
@@ -1803,8 +1838,8 @@ impl CacheBatch {
     /// The drains of [`CacheWriter::salvage`], without the reporting.
     async fn salvage_into(
         self,
-        upstream_pipe_rx: &pipe::Receiver,
-        cache_file: &tokio::fs::File,
+        upstream_pipe_rx: &Arc<OwnedFd>,
+        cache_file: &Arc<CacheFile>,
         file_offset: &mut i64,
     ) -> std::io::Result<()> {
         drain_pipe_to_file(&self.rx, cache_file, file_offset).await?;
@@ -2071,7 +2106,7 @@ async fn tee_and_splice(
             // Client is absent, gone or demoted — splice pipe_A directly to
             // cache (no tee needed). The batch's `remaining` bytes are all
             // `pipe_A` holds, so draining it is exactly that write.
-            xfer.cache.write_through(upstream_pipe_rx).await?;
+            xfer.cache.write_through().await?;
             remaining = 0;
         }
     }
@@ -2217,34 +2252,29 @@ async fn drain_pipe(rx: &pipe::Receiver, count: usize) -> std::io::Result<()> {
 ///
 /// One blocking-pool hop per call: splicing into a file is a disk write, and
 /// the whole loop runs inside the closure rather than one splice per hop.
+/// Both descriptors stay owned by that closure if its awaiting future is
+/// cancelled. The handles are shared across drains without further dup calls.
 ///
 /// On an error the offset has still advanced by what landed before it, so
 /// the caller's `.partial` accounting stays exact.
 async fn drain_pipe_to_file(
-    rx: &pipe::Receiver,
-    file: &tokio::fs::File,
+    rx: &Arc<OwnedFd>,
+    file: &Arc<CacheFile>,
     file_offset: &mut i64,
 ) -> std::io::Result<usize> {
-    let pipe_r_fd = rx.as_raw_fd();
-    let file_fd = file.as_raw_fd();
+    let src = Arc::clone(rx);
+    let dst = Arc::clone(file);
     let start = *file_offset;
 
     let (landed, off, outcome) = tokio::task::spawn_blocking(move || {
-        // SAFETY: pipe_r_fd is valid because the caller holds the OwnedFd,
-        // and the spawn_blocking result is awaited without cancellation
-        let src = unsafe { BorrowedFd::borrow_raw(pipe_r_fd) };
-        // SAFETY: file_fd is valid because the caller holds a reference to the File,
-        // and the spawn_blocking result is awaited without cancellation
-        let dst = unsafe { BorrowedFd::borrow_raw(file_fd) };
-
         let mut off = start;
         let mut landed: usize = 0;
         let outcome = loop {
             static_assert!(PIPE_BUFFER_SIZE > 0);
             let res = splice(
-                src,
+                src.as_fd(),
                 None,
-                dst,
+                dst.fd.as_fd(),
                 Some(&mut off),
                 PIPE_BUFFER_SIZE as usize,
                 SpliceFFlags::SPLICE_F_MOVE,
@@ -2274,6 +2304,10 @@ async fn drain_pipe_to_file(
 #[cfg(test)]
 mod tests {
     use nix::fcntl::{FcntlArg, fcntl};
+    use std::{
+        os::fd::AsRawFd as _,
+        task::{Context, Waker},
+    };
 
     use super::*;
 
@@ -2351,6 +2385,158 @@ mod tests {
         );
     }
 
+    fn owned_fd(fd: &impl std::os::fd::AsFd) -> Arc<OwnedFd> {
+        Arc::new(fd.as_fd().try_clone_to_owned().unwrap())
+    }
+
+    async fn owned_cache_file(scratch: &ScratchFile) -> Arc<CacheFile> {
+        let barrier = cache_barrier(&scratch.path).await;
+        Arc::new(CacheFile {
+            fd: scratch.file.as_fd().try_clone_to_owned().unwrap(),
+            _write_lease: barrier.write_lease(),
+        })
+    }
+
+    /// Keep the sole blocking thread occupied until the test has cancelled its
+    /// queued I/O future and dropped every original descriptor owner. Dropping
+    /// the sender also releases the thread if an assertion unwinds.
+    fn paused_blocking_runtime() -> (tokio::runtime::Runtime, std::sync::mpsc::Sender<()>) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let (started, ready) = std::sync::mpsc::channel();
+        drop(runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _released = paused.recv();
+        }));
+        ready.recv().unwrap();
+        (runtime, resume)
+    }
+
+    #[test]
+    fn cancelled_pwrite_keeps_its_file_until_the_queued_job_finishes() {
+        let (runtime, resume) = paused_blocking_runtime();
+        runtime.block_on(async {
+            let scratch = ScratchFile::new();
+            let file = owned_cache_file(&scratch).await;
+            let lifetime = Arc::downgrade(&file);
+            let mut bytes = b"body".to_vec();
+            let mut write = Box::pin(pwrite_buf_to_file(&file, &mut bytes, 4, 0));
+            assert!(
+                write
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(write);
+            drop(file);
+            drop(scratch.file);
+            assert!(lifetime.upgrade().is_some(), "the queued job owns its file");
+
+            let original_path = scratch.path.with_extension("original");
+            std::fs::rename(&scratch.path, &original_path).unwrap();
+            std::fs::write(&scratch.path, b"replacement").unwrap();
+            resume.send(()).unwrap();
+            // With one blocking thread this runs after the detached write.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(
+                lifetime.upgrade().is_none(),
+                "the completed job releases its file"
+            );
+            assert_eq!(std::fs::read(original_path).unwrap(), b"body");
+            assert_eq!(std::fs::read(&scratch.path).unwrap(), b"replacement");
+        });
+    }
+
+    #[test]
+    fn cancelled_prefix_keeps_its_write_lease_until_the_job_finishes() {
+        let (runtime, resume) = paused_blocking_runtime();
+        runtime.block_on(async {
+            let mut scratch = ScratchFile::new();
+            let barrier = cache_barrier(&scratch.path).await;
+            let lease = barrier.write_lease();
+            let lifetime = Arc::downgrade(&lease);
+            let mut write = Box::pin(super::super::write_all_flushed(
+                &mut scratch.file,
+                b"prefix",
+                lease,
+            ));
+            assert!(
+                write
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(write);
+            drop(barrier);
+            drop(scratch.file);
+            assert!(
+                lifetime.upgrade().is_some(),
+                "the queued prefix retains the lease"
+            );
+            resume.send(()).unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(lifetime.upgrade().is_none());
+            assert_eq!(std::fs::read(&scratch.path).unwrap(), b"prefix");
+        });
+    }
+
+    #[test]
+    fn cancelled_drain_keeps_both_fds_until_the_queued_job_finishes() {
+        let (runtime, resume) = paused_blocking_runtime();
+        runtime.block_on(async {
+            let scratch = ScratchFile::new();
+            let (tx, rx) = create_pipe().unwrap();
+            nix::unistd::write(&tx, b"body").unwrap();
+            let file = owned_cache_file(&scratch).await;
+            let source = owned_fd(&rx);
+            let file_lifetime = Arc::downgrade(&file);
+            let pipe_lifetime = Arc::downgrade(&source);
+            let mut offset = 0;
+            let mut drain = Box::pin(drain_pipe_to_file(&source, &file, &mut offset));
+            assert!(
+                drain
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(drain);
+            drop(file);
+            drop(source);
+            drop(scratch.file);
+            drop(rx);
+            drop(tx);
+            assert!(
+                file_lifetime.upgrade().is_some(),
+                "the queued job owns its file"
+            );
+            assert!(
+                pipe_lifetime.upgrade().is_some(),
+                "the queued job owns its pipe"
+            );
+
+            let original_path = scratch.path.with_extension("original");
+            std::fs::rename(&scratch.path, &original_path).unwrap();
+            std::fs::write(&scratch.path, b"replacement").unwrap();
+            resume.send(()).unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(
+                file_lifetime.upgrade().is_none(),
+                "the completed job releases its file"
+            );
+            assert!(
+                pipe_lifetime.upgrade().is_none(),
+                "the completed job releases its pipe"
+            );
+            assert_eq!(std::fs::read(original_path).unwrap(), b"body");
+            assert_eq!(std::fs::read(&scratch.path).unwrap(), b"replacement");
+        });
+    }
+
     /// A cache file for the salvage tests, plus its contents so far.
     struct ScratchFile {
         _dir: tempfile::TempDir,
@@ -2424,7 +2610,7 @@ mod tests {
             .await
             .unwrap();
         let (tx, rx) = create_pipe().unwrap();
-        writer.batch = Some(CacheBatch::new(rx, tx));
+        writer.batch = Some(CacheBatch::new(rx, tx).unwrap());
         // Model an earlier teed batch whose client bytes have been delivered.
         nix::unistd::write(&writer.batch().tx, b"queued-").unwrap();
         writer.batch_mut().queue(7);
@@ -2443,7 +2629,8 @@ mod tests {
         writer.batch_mut().queue(8);
         let (source_tx, source_rx) = create_pipe().unwrap();
         nix::unistd::write(&source_tx, b"tail").unwrap();
-        writer.write_through(&source_rx).await.unwrap();
+        writer.upstream_pipe = Some(owned_fd(&source_rx));
+        writer.write_through().await.unwrap();
         assert_eq!(writer.file_offset, 35);
         assert!(writer.batch().is_empty());
         drop(writer);
@@ -2459,7 +2646,7 @@ mod tests {
             .await
             .unwrap();
         let (tx, rx) = create_pipe().unwrap();
-        writer.batch = Some(CacheBatch::new(rx, tx));
+        writer.batch = Some(CacheBatch::new(rx, tx).unwrap());
         nix::unistd::write(&writer.batch().tx, b"first").unwrap();
         writer.batch_mut().queue(5);
         writer.flush_if_due().await.unwrap();
@@ -2515,7 +2702,8 @@ mod tests {
         .unwrap();
         let (tx, rx) = create_pipe().unwrap();
         nix::unistd::write(&tx, b"tail").unwrap();
-        writer.write_through(&rx).await.unwrap();
+        writer.upstream_pipe = Some(owned_fd(&rx));
+        writer.write_through().await.unwrap();
         drop(writer);
         let mut expected = prefix;
         expected.extend_from_slice(b"tail");
@@ -2536,12 +2724,12 @@ mod tests {
     /// delivered must not be landed from `pipe_A` a second time. With
     /// `abcdefgh` teed and `abc` delivered, the salvage used to produce
     /// `abcdefghdefgh`, and a later resume started from that length.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn salvage_does_not_land_a_batch_that_was_already_teed() {
         let (pipe_a_tx, pipe_a_rx) = create_pipe().expect("pipe_A");
         let (pipe_b_tx, pipe_b_rx) = create_pipe().expect("pipe_B");
         let scratch = ScratchFile::new();
-        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx);
+        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx).unwrap();
 
         accumulate(&pipe_a_tx, &mut cache, b"abcdefgh");
         // The fan-out: tee the whole batch, deliver three bytes to the
@@ -2555,7 +2743,11 @@ mod tests {
 
         let mut file_offset = 0;
         cache
-            .salvage_into(&pipe_a_rx, &scratch.file, &mut file_offset)
+            .salvage_into(
+                &owned_fd(&pipe_a_rx),
+                &owned_cache_file(&scratch).await,
+                &mut file_offset,
+            )
             .await
             .expect("salvage");
 
@@ -2566,12 +2758,12 @@ mod tests {
     /// The case the salvage exists for: the accumulation loop fails with a
     /// staged batch in `pipe_A`, behind bytes still pending in `pipe_B` from
     /// the previous batch. Both land, in body order.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn salvage_lands_a_staged_batch_after_the_pending_bytes() {
         let (pipe_a_tx, pipe_a_rx) = create_pipe().expect("pipe_A");
         let (pipe_b_tx, pipe_b_rx) = create_pipe().expect("pipe_B");
         let scratch = ScratchFile::new();
-        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx);
+        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx).unwrap();
 
         // Previous batch: teed, fully delivered, its cache write deferred.
         accumulate(&pipe_a_tx, &mut cache, b"abc");
@@ -2583,7 +2775,11 @@ mod tests {
 
         let mut file_offset = 0;
         cache
-            .salvage_into(&pipe_a_rx, &scratch.file, &mut file_offset)
+            .salvage_into(
+                &owned_fd(&pipe_a_rx),
+                &owned_cache_file(&scratch).await,
+                &mut file_offset,
+            )
             .await
             .expect("salvage");
 
@@ -2593,12 +2789,12 @@ mod tests {
 
     /// The boundary path moves the batch into userspace; a tail left in
     /// `pipe_A` after that has no head to follow and must stay there.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn salvage_leaves_an_unstaged_tail_alone() {
         let (pipe_a_tx, pipe_a_rx) = create_pipe().expect("pipe_A");
         let (pipe_b_tx, pipe_b_rx) = create_pipe().expect("pipe_B");
         let scratch = ScratchFile::new();
-        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx);
+        let mut cache = CacheBatch::new(pipe_b_rx, pipe_b_tx).unwrap();
 
         accumulate(&pipe_a_tx, &mut cache, b"abcdefgh");
         cache.unstage();
@@ -2608,7 +2804,11 @@ mod tests {
 
         let mut file_offset = 0;
         cache
-            .salvage_into(&pipe_a_rx, &scratch.file, &mut file_offset)
+            .salvage_into(
+                &owned_fd(&pipe_a_rx),
+                &owned_cache_file(&scratch).await,
+                &mut file_offset,
+            )
             .await
             .expect("salvage");
 

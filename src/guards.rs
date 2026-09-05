@@ -26,23 +26,55 @@ use crate::{
 };
 
 /// The abort every barrier performs when its owner is dropped without
-/// reaching a sink: publish `Aborted`, count it, retire the registry entry.
+/// reaching a sink: publish `Aborted` and count it. Registry retirement is
+/// separate: a download's write lease can outlive its failure notification.
 /// Shared so the three `Drop` impls cannot drift apart.
 ///
 /// Synchronous by necessity: `Drop` cannot await and the status handle is an
 /// `Arc<RwLock<...>>` (not an owned write guard), so the write lock is taken
 /// under `block_in_place`.
-fn abort_on_drop(
-    status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    active_downloads: &ActiveDownloads,
-    key: CacheEntryKeyRef<'_>,
-) {
+fn abort_on_drop(status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>) {
     tokio::task::block_in_place(|| {
         *status.blocking_write() =
             ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
         metrics::DOWNLOADS_ABORTED.increment();
-        active_downloads.remove(key);
     });
+}
+
+/// Exclusive ownership of a download's registry entry. A failed download
+/// remains registered until its last writer has stopped touching the partial.
+/// Splice's cache file and blocking writes share this lease with the barrier;
+/// notifying readers of an abort therefore cannot admit a replacement writer
+/// during salvage or after cancellation of an outstanding blocking write.
+/// Successful downloads carry the same lease into their rename barrier.
+pub(crate) struct DownloadWriteLease {
+    active_downloads: ActiveDownloads,
+    key: CacheEntryKey,
+}
+
+impl DownloadWriteLease {
+    /// Keep this entry reserved until the actual blocking operation finishes,
+    /// even if its awaiting future or returned handle is dropped.
+    pub(crate) fn spawn_blocking<F, T>(self: Arc<Self>, operation: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce(&Self) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || operation(&self))
+    }
+
+    /// A successful rename changes the bytes even if the async commit owner
+    /// has been cancelled. Invalidate old validators before releasing its
+    /// registry entry so the next request reloads the new inode's metadata.
+    pub(crate) fn invalidate_metadata(&self) {
+        cache_metadata::store().invalidate(&self.key.as_ref());
+    }
+}
+
+impl Drop for DownloadWriteLease {
+    fn drop(&mut self) {
+        self.active_downloads.remove(self.key.as_ref());
+    }
 }
 
 struct InitBarrierData<'a> {
@@ -131,7 +163,10 @@ impl<'a> InitBarrier<'a> {
         DownloadBarrier {
             data: Some(DownloadBarrierData {
                 status: Arc::clone(&data.status),
-                active_downloads: data.active_downloads.clone(),
+                lease: Arc::new(DownloadWriteLease {
+                    active_downloads: data.active_downloads.clone(),
+                    key: data.key.to_owned(),
+                }),
                 slot: data.slot,
                 key: data.key.to_owned(),
                 resource_kind: data.resource_kind,
@@ -197,7 +232,8 @@ impl<'a> InitBarrier<'a> {
 impl Drop for InitBarrier<'_> {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            abort_on_drop(&data.status, data.active_downloads, data.key);
+            abort_on_drop(&data.status);
+            data.active_downloads.remove(data.key);
         }
         // `data` (and with it the `UpstreamSlot`) drops with the struct.
     }
@@ -205,7 +241,7 @@ impl Drop for InitBarrier<'_> {
 
 struct DownloadBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    active_downloads: ActiveDownloads,
+    lease: Arc<DownloadWriteLease>,
     /// The download's `max_upstream_downloads` slot, held until
     /// [`DownloadBarrier::begin_rename`] -- where every backend has
     /// necessarily finished reading the upstream body -- and dropped with the
@@ -268,15 +304,23 @@ impl DownloadBarrier {
     }
 
     pub(crate) async fn abort_with_reason(mut self, reason: AbortReason) {
-        let data = self.data.take().expect("every sink consumes the instance");
+        let data = self
+            .data
+            .as_ref()
+            .expect("every sink consumes the instance");
 
         *data.status.write().await = ActiveDownloadStatus::Aborted(reason);
         metrics::DOWNLOADS_ABORTED.increment();
-        data.active_downloads.remove(data.key.as_ref());
+        // Keep self armed while awaiting the status lock. After publishing,
+        // dropping the sender wakes readers, but writers retain the lease.
+        drop(self.data.take());
     }
 
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
-        let mut data = self.data.take().expect("every sink consumes the instance");
+        let data = self
+            .data
+            .as_mut()
+            .expect("every sink consumes the instance");
 
         // Ordering matters: flush the final ping, flip `Download -> Verifying`
         // under the status write lock, release the lock, then drop `tx`.
@@ -294,10 +338,6 @@ impl DownloadBarrier {
         // take hundreds of ms for a large `.deb`). Late-joiner readers are
         // therefore not stalled during verification.
         data.flush_batched_ping();
-        // The upstream body is fully read by the time any backend gets here,
-        // so the slot is free now: this is the one release point, shared by
-        // every backend, and it comes before anything with I/O in it.
-        drop(data.slot);
         {
             let mut lock = data.status.write().await;
             let prev = std::mem::replace(
@@ -323,12 +363,16 @@ impl DownloadBarrier {
                 }
             };
         }
+        // No await after taking the state: cancellation while acquiring the
+        // status lock still publishes an abort through this barrier's Drop.
+        let data = self.data.take().expect("every sink consumes the instance");
+        drop(data.slot);
         drop(data.tx);
 
         RenameBarrier {
             data: Some(RenameBarrierData {
                 status: data.status,
-                active_downloads: data.active_downloads,
+                lease: data.lease,
                 key: data.key,
                 resource_kind: data.resource_kind,
                 raw_uri_path: data.raw_uri_path,
@@ -340,6 +384,12 @@ impl DownloadBarrier {
 
 #[cfg(feature = "splice")]
 impl DownloadBarrier {
+    /// Retain the registry entry through salvage and every blocking write.
+    /// The lease carries no progress sender, so failed readers wake promptly.
+    pub(crate) fn write_lease(&self) -> Arc<DownloadWriteLease> {
+        Arc::clone(&self.data.as_ref().expect("live download barrier").lease)
+    }
+
     /// Unconditional ping (e.g. startup prefix).
     pub(crate) fn ping(&mut self) {
         let data = self
@@ -417,14 +467,14 @@ impl DownloadBarrier {
 impl Drop for DownloadBarrier {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            abort_on_drop(&data.status, &data.active_downloads, data.key.as_ref());
+            abort_on_drop(&data.status);
         }
     }
 }
 
 struct RenameBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    active_downloads: ActiveDownloads,
+    lease: Arc<DownloadWriteLease>,
     key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
@@ -446,11 +496,11 @@ impl RenameBarrier {
     ///
     /// Verification is delegated to `integrity::verify_and_rename`; this is the
     /// **only** way to finish a `RenameBarrier`, so no download backend can
-    /// commit a download without it. On any `CommitError` the entry is
-    /// retired right here (status `Aborted`, active-downloads entry removed)
-    /// *before* a checksum mismatch arms the re-download throttle, and the
+    /// commit a download without it. On any `CommitError` the status becomes
+    /// `Aborted`; a checksum mismatch also arms the re-download throttle and
+    /// removes the bad partial before the registry entry is retired. The
     /// error is returned to the caller; `Drop` stays the safety net for a
-    /// cancelled future.
+    /// cancelled future, while blocking jobs retain the registry lease.
     ///
     /// Lock ordering: `verify_and_rename` runs *before* the status write lock
     /// is acquired, so late-joiner readers (`status.read().await`) can proceed
@@ -463,7 +513,8 @@ impl RenameBarrier {
     /// rename completing and the status-write lock being acquired, the
     /// renamed file is already in the cache but the `Verifying -> Finished`
     /// flip never runs; `Drop for RenameBarrier` then flips status to
-    /// `Aborted` and removes the active-downloads entry. The quota stays
+    /// `Aborted` and releases its registry lease. Outstanding blocking jobs
+    /// retain their lease until they finish. The quota stays
     /// right: the reservation is finalised inside the rename's blocking
     /// closure, which runs to completion regardless of the cancellation.
     /// The metadata does *not* take care of itself: on a re-download the
@@ -471,9 +522,9 @@ impl RenameBarrier {
     /// hot path answers from that map without ever stat'ing the file -- so
     /// the daemon would serve a stale `ETag` / `Last-Modified` for the new
     /// bytes, and honour an `If-None-Match` on the old tag with a 304, until
-    /// the process exits. The entry is therefore dropped the moment the
-    /// rename lands, before that window opens, so the next `resolve`
-    /// lazy-loads the renamed file's own xattrs.
+    /// the process exits. The metadata entry is therefore invalidated in the
+    /// blocking rename job itself before it releases its registry lease, so
+    /// the next `resolve` lazy-loads the renamed file's own xattrs.
     ///
     /// Aborts *before* the rename invalidate nothing: the cached file is
     /// untouched and its memoized validators still describe it. On a
@@ -535,7 +586,14 @@ impl RenameBarrier {
             .quota_reservation
             .take()
             .expect("commit runs once per barrier");
-        if let Err(err) = integrity::verify_and_rename(&plan, reservation).await {
+        let lease = Arc::clone(
+            &self
+                .data
+                .as_ref()
+                .expect("every sink consumes the instance")
+                .lease,
+        );
+        if let Err(err) = integrity::verify_and_rename(&plan, reservation, lease).await {
             if let CommitError::Rename(io_err) = &err {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -560,7 +618,10 @@ impl RenameBarrier {
             // `AlreadyLoggedJustFail`): every byte is on disk, so readers
             // that already hold the file drain it instead of truncating the
             // body they were promised.
-            let data = self.data.take().expect("every sink consumes the instance");
+            let data = self
+                .data
+                .as_ref()
+                .expect("every sink consumes the instance");
             let checksum_mismatch = matches!(err, CommitError::ChecksumMismatch);
             let throttle = {
                 let mut status = data.status.write().await;
@@ -574,7 +635,14 @@ impl RenameBarrier {
                 throttle
             };
             metrics::DOWNLOADS_ABORTED.increment();
-            data.active_downloads.remove(data.key.as_ref());
+            // Publication is complete, so Drop must not replace Discarded
+            // with a generic abort. Keep the lease until the last mutation
+            // of the partial has finished, including a detached unlink.
+            let data = self.data.take().expect("every sink consumes the instance");
+            if checksum_mismatch {
+                discard_partial(temp_path, Arc::clone(&data.lease)).await;
+            }
+            drop(data.lease);
             if let Some((window, failures)) = throttle {
                 // Integration tests use this line as the "throttle is
                 // observable" sync point: it must stay after the entry
@@ -586,15 +654,6 @@ impl RenameBarrier {
                     HumanFmt::Time(window),
                 );
             }
-            // A content mismatch makes the partial worthless: a later resume
-            // would extend the same wrong bytes and fail verification again,
-            // so unlink it now (attached readers keep their open fd and
-            // drain to EOF). Transient VerifyIo/Rename failures keep the
-            // partial for resumption via the `TempPath` guard's
-            // `OnDrop::Keep`.
-            if checksum_mismatch {
-                temp_path.remove().await;
-            }
             // `data` drops here; the reservation was reverted when
             // `verify_and_rename` dropped it.
             return Err(err);
@@ -603,22 +662,6 @@ impl RenameBarrier {
         // Verified and renamed: the temp file no longer exists under its
         // old name, so the guard must not try to remove it.
         TempPath::defuse(temp_path);
-
-        // The cached file under `key` is now the new version, but its
-        // metadata is not published until the `set` below. Drop the previous
-        // version's entry here, before the first `.await` past the rename:
-        // if the future is cancelled in that window, `resolve` lazy-loads the
-        // new file's own xattrs instead of answering from the old entry.
-        // Serving no validators is safe; serving the previous version's is
-        // the bug this closes.
-        cache_metadata::store().invalidate(
-            &self
-                .data
-                .as_ref()
-                .expect("every sink consumes the instance")
-                .key
-                .as_ref(),
-        );
 
         // The quota was finalised in the rename step. Take the write lock
         // briefly for the `Verifying -> Finished` status flip.
@@ -662,24 +705,48 @@ impl RenameBarrier {
             cache_metadata::store().set(data.key.clone(), meta);
         }
         global_verify_throttle().record_success(data.key.as_ref());
-        data.active_downloads.remove(data.key.as_ref());
+        drop(data.lease);
 
         Ok(())
     }
 }
 
+/// Known-bad bytes cannot be resumed. The blocking unlink owns the registry
+/// lease so cancellation cannot admit a new writer at the same partial path
+/// while that unlink is still queued. Open readers keep their inode as usual.
+async fn discard_partial(temp_path: TempPath, lease: Arc<DownloadWriteLease>) {
+    lease
+        .spawn_blocking(move |_lease| {
+            let path = TempPath::defuse(temp_path);
+            if let Err(err) = std::fs::remove_file(&path) {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to remove partial file `{}`; continuing without it:  {}",
+                        path.display(),
+                        ErrorReport(&err)
+                    );
+                } else {
+                    error!(
+                        "Failed to remove partial file `{}`; it stays on disk:  {}",
+                        path.display(),
+                        ErrorReport(&err)
+                    );
+                }
+            }
+        })
+        .await
+        .expect("partial removal should not panic");
+}
+
 impl Drop for RenameBarrier {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            // Reached before the rename only: `commit` takes `data` the
-            // moment the rename lands, so the post-rename window is its
-            // business (it invalidates there) and never this one. The cached
-            // file is therefore untouched and its memoized validators still
-            // describe it -- invalidating here would be wrong, not merely
-            // wasteful: on a filesystem without xattrs the store is their
-            // only carrier, and `resolve` would negatively cache the
-            // resulting `(None, None)` for the life of the process.
-            abort_on_drop(&data.status, &data.active_downloads, data.key.as_ref());
+            // Before rename, the cached file is untouched and its memoized
+            // validators still describe it. After rename, the blocking job
+            // already invalidates them before releasing its lease. Invalidating
+            // here would discard valid metadata on an earlier abort; on a
+            // filesystem without xattrs the store is its only carrier.
+            abort_on_drop(&data.status);
         }
         // `data` (and with it any still-held `QuotaReservation`) drops with
         // the struct right after this, reverting the reservation.
@@ -704,6 +771,231 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "splice")]
+    fn pause_blocking_pool(runtime: &tokio::runtime::Runtime) -> std::sync::mpsc::Sender<()> {
+        let (resume, paused) = std::sync::mpsc::channel();
+        let (started, ready) = std::sync::mpsc::channel();
+        drop(runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _released = paused.recv();
+        }));
+        ready.recv().unwrap();
+        resume
+    }
+
+    #[cfg(feature = "splice")]
+    #[test]
+    fn cancelled_rename_job_keeps_the_partial_registered_until_it_finishes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("download.partial");
+            let destination = directory.path().join("download.deb");
+            std::fs::write(&source, b"verified body").unwrap();
+            let active = ActiveDownloads::new();
+            let key = key("queued-rename.deb");
+            match cache_metadata::init() {
+                Ok(()) | Err(_) => {}
+            }
+            let old_metadata = Arc::new(UpstreamMetadata::from_upstream(
+                Some(String::from("\"previous-version\"")),
+                None,
+            ));
+            cache_metadata::store().set(key.clone(), Arc::clone(&old_metadata));
+            let barrier = downloading(&active, &key).await.begin_rename().await;
+            let status = Arc::clone(&barrier.data.as_ref().unwrap().status);
+            let lease = Arc::clone(&barrier.data.as_ref().unwrap().lease);
+            let resume = pause_blocking_pool(&runtime);
+            let renamed = destination.clone();
+            let job = lease.spawn_blocking(move |lease| {
+                std::fs::rename(source, renamed).map(|()| lease.invalidate_metadata())
+            });
+
+            drop(job);
+            drop(barrier);
+            assert!(matches!(
+                *status.read().await,
+                ActiveDownloadStatus::Aborted(_)
+            ));
+            assert!(
+                Arc::ptr_eq(&active.insert_uncapped(key.as_ref()), &status,),
+                "cancellation cannot admit a writer before the queued rename"
+            );
+
+            resume.send(()).unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!(active.len(), 0, "the completed rename releases the entry");
+            assert_eq!(std::fs::read(destination).unwrap(), b"verified body");
+            assert_eq!(
+                Arc::strong_count(&old_metadata),
+                1,
+                "the detached rename invalidates the previous version's validators"
+            );
+        });
+    }
+
+    #[cfg(feature = "splice")]
+    #[test]
+    fn cancelled_discard_keeps_the_partial_registered_until_unlink_finishes() {
+        use std::{
+            future::Future as _,
+            task::{Context, Waker},
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let (file, path) =
+                crate::partial_file::tokio_tempfile(&directory.path().join("bad.partial"), 0o600)
+                    .await
+                    .unwrap();
+            drop(file);
+            let original_path = path.to_path_buf();
+            let active = ActiveDownloads::new();
+            let key = key("queued-unlink.deb");
+            let barrier = downloading(&active, &key).await.begin_rename().await;
+            let status = Arc::clone(&barrier.data.as_ref().unwrap().status);
+            let lease = Arc::clone(&barrier.data.as_ref().unwrap().lease);
+            let resume = pause_blocking_pool(&runtime);
+            let mut discard = Box::pin(discard_partial(path, lease));
+            assert!(
+                discard
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+
+            drop(discard);
+            drop(barrier);
+            assert!(original_path.exists(), "unlink is still queued");
+            assert!(
+                Arc::ptr_eq(&active.insert_uncapped(key.as_ref()), &status,),
+                "cancellation cannot admit a writer before the queued unlink"
+            );
+
+            resume.send(()).unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!original_path.exists(), "the detached unlink ran");
+            assert_eq!(active.len(), 0, "unlink completion permits a retry");
+        });
+    }
+
+    #[cfg(feature = "splice")]
+    async fn downloading(active: &ActiveDownloads, key: &CacheEntryKey) -> DownloadBarrier {
+        let details = ConnectionDetails {
+            client: crate::test_support::local_client(),
+            request_received_at: crate::precise_instant::PreciseInstant::now(),
+            upstream_host: key.mirror.host().clone(),
+            mirror: key.mirror.clone(),
+            debname: key.debname.clone(),
+            resource_kind: ResourceKind::Pool,
+            origin_fields: None,
+        };
+        let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
+        let quota = crate::cache_quota::CacheQuota::new(0, None)
+            .try_acquire(length, 0, &key.debname)
+            .ok()
+            .expect("unlimited quota");
+        InitBarrier::new(
+            active.originate_uncapped(key.as_ref()),
+            active,
+            &details,
+            "/debian/pool/test.deb",
+        )
+        .download(
+            PathBuf::from("test.partial"),
+            length,
+            quota,
+            Arc::new(UpstreamMetadata::default()),
+        )
+        .await
+    }
+
+    #[cfg(feature = "splice")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_download_reserves_partial_until_last_writer_finishes() {
+        let active = ActiveDownloads::new();
+        let key = key("salvaging.deb");
+        let barrier = downloading(&active, &key).await;
+        let status = Arc::clone(barrier.status());
+        let mut progress = barrier.subscribe();
+        let writer = barrier.write_lease();
+        let blocking_write = Arc::clone(&writer);
+
+        barrier
+            .abort_with_reason(AbortReason::AlreadyLoggedJustFail)
+            .await;
+        assert!(progress.changed().await.is_err(), "readers wake on failure");
+        assert!(matches!(
+            *status.read().await,
+            ActiveDownloadStatus::Aborted(_)
+        ));
+        assert_eq!(active.upstream_slots(), 0, "the upstream slot is released");
+        assert!(
+            Arc::ptr_eq(&active.insert_uncapped(key.as_ref()), &status,),
+            "a retry must still join the failed writer's entry"
+        );
+
+        drop(writer);
+        assert_eq!(active.len(), 1, "the blocking write still owns the partial");
+        drop(blocking_write);
+        assert_eq!(active.len(), 0, "a retry may now originate a new writer");
+    }
+
+    #[cfg(feature = "splice")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_download_keeps_its_writer_lease() {
+        let active = ActiveDownloads::new();
+        let key = key("cancelled.deb");
+        let barrier = downloading(&active, &key).await;
+        let status = Arc::clone(barrier.status());
+        let mut progress = barrier.subscribe();
+        let writer = barrier.write_lease();
+
+        drop(barrier);
+        assert!(progress.changed().await.is_err());
+        assert!(matches!(
+            *status.read().await,
+            ActiveDownloadStatus::Aborted(_)
+        ));
+        assert_eq!(active.len(), 1);
+        drop(writer);
+        assert_eq!(active.len(), 0);
+    }
+
+    #[cfg(feature = "splice")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_download_passes_its_lease_to_verification() {
+        let active = ActiveDownloads::new();
+        let key = key("verifying.deb");
+        let barrier = downloading(&active, &key).await;
+        let status = Arc::clone(barrier.status());
+        let mut progress = barrier.subscribe();
+        let writer = barrier.write_lease();
+
+        let rename = barrier.begin_rename().await;
+        assert!(progress.changed().await.is_err());
+        assert!(matches!(
+            *status.read().await,
+            ActiveDownloadStatus::Verifying { .. }
+        ));
+        assert_eq!(active.upstream_slots(), 0);
+        drop(writer);
+        assert_eq!(active.len(), 1, "verification still owns the entry");
+        drop(rename);
+        assert_eq!(active.len(), 0);
+    }
+
     /// A barrier over a real registry entry, in the state a download
     /// abandoned *before* the rename leaves behind: the entry is still
     /// registered and joinable, and `Drop` must retire it.
@@ -713,7 +1005,10 @@ mod tests {
         RenameBarrier {
             data: Some(RenameBarrierData {
                 status,
-                active_downloads,
+                lease: Arc::new(DownloadWriteLease {
+                    active_downloads,
+                    key: key.clone(),
+                }),
                 key: key.clone(),
                 resource_kind: ResourceKind::Pool,
                 raw_uri_path: String::from("/debian/pool/main/t/test/test.deb"),
@@ -723,9 +1018,8 @@ mod tests {
         }
     }
 
-    /// `Drop` is reached only before the rename -- `commit` takes `data` the
-    /// moment the rename lands. The cached file is therefore the one the
-    /// memoized validators already describe, and dropping them would be a
+    /// Before rename, the cached file is the one the memoized validators
+    /// already describe, and dropping them would be a
     /// regression, not a safety measure: on a filesystem without xattrs the
     /// store is their only carrier and `resolve` negatively caches the
     /// resulting `(None, None)` for the life of the process, so every
@@ -738,25 +1032,21 @@ mod tests {
             Ok(()) | Err(_) => {}
         }
         let store = cache_metadata::store();
-        // Entry counts, not lookups: a `resolve` would lazy-load the entry
-        // back and hide a removal.
-        let before = store.len();
-
         let key = key("kept-validators.deb");
-        store.set(
-            key.clone(),
-            Arc::new(UpstreamMetadata::from_upstream(
-                Some(String::from("\"current-version\"")),
-                None,
-            )),
-        );
-        assert_eq!(store.len(), before + 1, "the entry under test is present");
+        let metadata = Arc::new(UpstreamMetadata::from_upstream(
+            Some(String::from("\"current-version\"")),
+            None,
+        ));
+        store.set(key.clone(), Arc::clone(&metadata));
+        // Count ownership of this unique entry, independent of concurrent
+        // tests; resolve would reload the entry and hide accidental removal.
+        assert_eq!(Arc::strong_count(&metadata), 2, "the store owns the entry");
 
         drop(abandoned_rename_barrier(&key));
 
         assert_eq!(
-            store.len(),
-            before + 1,
+            Arc::strong_count(&metadata),
+            2,
             "the cached file is unchanged, so its memoized validators must survive"
         );
     }
