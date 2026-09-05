@@ -96,7 +96,7 @@ impl DetachedDownload {
         // task is ever polled at all (e.g. a runtime shutdown racing the
         // `spawn` call), where the upstream connection is guarded neither
         // here nor by the caller, which already released its own guard.
-        // `PoolGuard::check_alive`'s `MSG_PEEK` probe on a pooled connection
+        // `UpstreamConn::check_alive`'s read probe on a pooled connection
         // catches a half-read socket that slipped back in that way.
         let mut upstream_guard = UnconsumedBodyGuard::new(&mut upstream);
 

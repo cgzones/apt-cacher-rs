@@ -45,6 +45,7 @@ pub(crate) use cleanup_bridge::process_cache_request;
 pub(crate) use simple_proxy::splice_simple_proxy;
 #[cfg(feature = "tls_rustls")]
 pub(crate) use upstream::TLS_CLIENT_CONFIG;
+pub(crate) use upstream::pool_reaper;
 
 use std::{
     io::ErrorKind,
@@ -802,26 +803,28 @@ async fn read_volatile_validators(
 /// re-plans the fresh head. No reconnect helper runs past this point, so
 /// the exchange is final on return.
 async fn plan_upstream_response(
-    exchange: &mut UpstreamExchange,
+    exchange: UpstreamExchange,
     conn_details: &ConnectionDetails,
     host_authority: &str,
     upstream_path: &str,
     resume: &mut partial_file::PartialResume,
     volatile_cond: Option<&VolatileCondHeaders>,
     volatile_cache_path: Option<PathBuf>,
-) -> Result<DownloadPlan<PathBuf>, SpliceProxyError> {
-    let redirect = if exchange.response.is_redirect() {
-        follow_redirect(
+) -> Result<(UpstreamExchange, DownloadPlan<PathBuf>), SpliceProxyError> {
+    let (mut exchange, redirect) = if exchange.response.is_redirect() {
+        // Keep the uncommon redirect future's owned TLS state off the
+        // stack of every download.
+        Box::pin(follow_redirect(
             exchange,
             conn_details,
             upstream_path,
             resume.offset,
             resume.if_range.as_deref(),
             volatile_cond,
-        )
+        ))
         .await?
     } else {
-        None
+        (exchange, None)
     };
     exchange.response.discard_invalid_validators(conn_details);
 
@@ -844,7 +847,7 @@ async fn plan_upstream_response(
         volatile_cache_path,
         global_config().max_object_size,
     ) {
-        Ok(plan) => Ok(plan),
+        Ok(plan) => Ok((exchange, plan)),
         Err(anomaly) => {
             match anomaly {
                 ResumeAnomaly::RangeIgnored => info!(
@@ -878,25 +881,26 @@ async fn plan_upstream_response(
                         )
                     },
                 );
-                discard_partial_and_retry(
+                exchange = Box::pin(discard_partial_and_retry(
                     &mut resume.partial,
                     upstream_mirror,
                     host_authority,
                     upstream_path,
                     exchange,
                     conn_details,
-                )
+                ))
                 .await?;
             } else {
                 resume.partial.discard_resume().await;
             }
             // A resume never revalidates: there is no cached copy to serve.
-            Ok(plan_fresh_download(
+            let plan = plan_fresh_download(
                 &exchange.response.head(),
                 conn_details.cached_flavor(),
                 None,
                 global_config().max_object_size,
-            ))
+            );
+            Ok((exchange, plan))
         }
     }
 }
@@ -1452,7 +1456,7 @@ async fn splice_proxy_drive(
     // --- Prepare upstream connection ---
     // Dial the host the client named; `conn_details.mirror` is the
     // canonical cache identity, which may be an alias' main host.
-    let mut exchange = standard_upstream_connect(
+    let exchange = standard_upstream_connect(
         &conn_details.upstream_mirror(),
         &host_authority,
         upstream_path,
@@ -1464,8 +1468,8 @@ async fn splice_proxy_drive(
     .await
     .map_err(SpliceProxyError::Upstream)?;
 
-    let plan = plan_upstream_response(
-        &mut exchange,
+    let (exchange, plan) = plan_upstream_response(
+        exchange,
         conn_details,
         &host_authority,
         upstream_path,
@@ -1501,8 +1505,20 @@ async fn splice_proxy_drive(
                 conn_details.debname, conn_details.mirror
             );
 
-            // Pool the upstream connection back (304 has no body).
-            if upstream_resp.connection_close {
+            // Pool the upstream connection back: a 304 has no body, and the
+            // guard already carries the head's `Connection:` verdict. Bytes
+            // behind the head are junk the next request on this connection
+            // would read as *its* head, so that connection is burned; the
+            // revalidation itself stands and the cached copy is served.
+            let stray = header_buf.len() - header_end;
+            if let Err(reason) = upstream_resp.check_relayable(stray as u64) {
+                reason.record_metrics();
+                warn_once_or_info!(
+                    "splice proxy: upstream mirror {} sent {stray} bytes after a 304 head for {}; not reusing the connection ({})",
+                    conn_details.mirror,
+                    conn_details.debname,
+                    reason.detail()
+                );
                 upstream.unset_poolable();
             }
             drop(upstream);

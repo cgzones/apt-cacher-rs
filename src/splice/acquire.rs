@@ -9,7 +9,7 @@
 //! (`standard_upstream_connect`), plus the drive's reconnect helpers and
 //! `warn_upstream_reject`.
 
-use std::num::NonZero;
+use std::{num::NonZero, time::Duration};
 
 use bytes::BytesMut;
 use tracing::debug;
@@ -26,9 +26,12 @@ use crate::{
     scheme_cache, upstream_retry, warn_once_or_info, warn_once_or_info_logged,
 };
 
-use super::http::{UpstreamResponse, send_and_read_headers};
+use super::http::{
+    BodyFraming, HeadError, MAX_ERROR_BODY_DRAIN, UpstreamResponse, send_and_read_headers,
+};
 use super::upstream::{
-    ConnLabel, PoolGuard, Transience, UpstreamConn, connect_upstream, mirror_port, pool_checkout,
+    ConnLabel, PoolCheckout, PoolGuard, Transience, UpstreamConn, connect_upstream, mirror_port,
+    pool_checkout,
 };
 use super::{SpliceProxyError, UpstreamFailure, VolatileCondHeaders};
 
@@ -60,12 +63,63 @@ impl UpstreamExchange {
     ) -> Self {
         let poolable = !response.connection_close;
         Self {
-            conn: PoolGuard::new(conn, mirror.host().to_string(), port, poolable),
+            conn: PoolGuard::new(conn, mirror.host().clone(), port, poolable),
             response,
             header_buf,
             header_end,
             reused,
         }
+    }
+
+    /// Consume an abandoned response, returning its connection only if its
+    /// body can be drained within a small byte and total-time budget. The
+    /// caller can then acquire a replacement without leaving a live exchange
+    /// containing an empty connection guard.
+    ///
+    /// Close-delimited and explicitly closing responses are dropped at once.
+    /// Timeout/error cancellation poisons the body guard, so a partial drain
+    /// can never make the connection reusable.
+    pub(super) async fn dispose(self, log_prefix: &str) {
+        const MAX_DRAIN_TIME: Duration = Duration::from_millis(250);
+
+        let Self {
+            mut conn,
+            response,
+            header_buf,
+            header_end,
+            reused: _,
+        } = self;
+        if !conn.poolable() || response.framing == BodyFraming::CloseDelimited {
+            conn.unset_poolable();
+            return;
+        }
+
+        let result = tokio::time::timeout(
+            MAX_DRAIN_TIME,
+            response.framing.read_to_vec(
+                &mut conn,
+                &header_buf[header_end..],
+                MAX_ERROR_BODY_DRAIN,
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(_body)) => {}
+            Ok(Err(err)) => debug!(
+                "{log_prefix} not reusing the upstream connection after a {} response, its body could not be drained:  {}",
+                response.status_code,
+                ErrorReport(&err)
+            ),
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                conn.unset_poolable();
+                debug!(
+                    "{log_prefix} not reusing the upstream connection after a {} response, its body exceeded the {} ms drain budget",
+                    response.status_code,
+                    MAX_DRAIN_TIME.as_millis()
+                );
+            }
+        }
+        // Drop returns only a fully consumed, reusable connection.
     }
 
     /// Log suffix naming this exchange's connection flavour.
@@ -127,8 +181,8 @@ pub(super) async fn standard_upstream_connect(
     if let Some(scheme) = resolved_scheme {
         let is_tls = matches!(scheme, Scheme::Https);
         let port = mirror_port(mirror, is_tls);
-        if let Some(mut pooled) = pool_checkout(mirror.host(), port, is_tls) {
-            if pooled.check_alive(mirror.host(), port) {
+        match pool_checkout(mirror.host(), port, is_tls) {
+            PoolCheckout::Live(mut pooled) => {
                 match send_and_read_headers(
                     &mut pooled,
                     host_authority,
@@ -143,7 +197,11 @@ pub(super) async fn standard_upstream_connect(
                         metrics::POOL_REUSED.increment();
                         return Ok(UpstreamExchange::new(pooled, mirror, port, head, true));
                     }
-                    Err(err) => {
+                    Err(HeadError::Transport(err)) => {
+                        // The pooled socket's fault (the peer hung up between
+                        // the liveness probe and the head, a NAT dropped the
+                        // idle flow, the TLS session failed): worth one fresh
+                        // connection.
                         metrics::POOL_MISS_FAILED.increment();
                         debug!(
                             "splice proxy: pooled connection to {host_authority} failed, \
@@ -151,13 +209,20 @@ pub(super) async fn standard_upstream_connect(
                             ErrorReport(&err)
                         );
                     }
+                    Err(HeadError::Protocol(err)) => {
+                        // The upstream's answer is broken, not the socket: a
+                        // fresh connection would fetch the same bytes.
+                        return Err(failed_request(host_authority, upstream_path, err));
+                    }
                 }
-            } else {
+            }
+            PoolCheckout::Dead => {
                 metrics::POOL_MISS_DEAD.increment();
                 debug!("splice proxy: pooled connection to {host_authority} is dead, discarding");
             }
-        } else {
-            metrics::POOL_MISS_EMPTY.increment();
+            PoolCheckout::Empty => {
+                metrics::POOL_MISS_EMPTY.increment();
+            }
         }
     } else {
         metrics::POOL_MISS_NO_SCHEME.increment();
@@ -258,16 +323,24 @@ pub(super) async fn standard_upstream_connect(
         volatile_cond,
     )
     .await
-    .map_err(|err| {
-        let logged = warn_once_or_info_logged!(
-            "splice proxy: failed upstream request to {host_authority} for {upstream_path}; returning 502:  {}",
-            ErrorReport(&err)
-        );
-        UpstreamFailure { err, logged }
-    })?;
+    .map_err(|err| failed_request(host_authority, upstream_path, err.into_io()))?;
 
     let port = mirror_port(mirror, up.is_tls());
     Ok(UpstreamExchange::new(up, mirror, port, head, false))
+}
+
+/// The 502 for a request whose head could not be read, on a pooled or a
+/// fresh connection alike: one wording, one once-gate.
+fn failed_request(
+    host_authority: &str,
+    upstream_path: &str,
+    err: std::io::Error,
+) -> UpstreamFailure {
+    let logged = warn_once_or_info_logged!(
+        "splice proxy: failed upstream request to {host_authority} for {upstream_path}; returning 502:  {}",
+        ErrorReport(&err)
+    );
+    UpstreamFailure { err, logged }
 }
 
 /// Where a followed redirect landed: the mirror the retry/resume logic must
@@ -281,21 +354,20 @@ pub(super) struct RedirectTarget {
 
 /// Follow a 3xx redirect if the Location target is valid and allowed.
 ///
-/// On success, replaces `exchange` (connection, response, header buffer and
-/// TLS label) with the redirected request's exchange, and returns the
-/// [`RedirectTarget`] it landed on. If the redirect is not followable
-/// (invalid URI, disallowed host), logs and returns `None` so the caller
+/// Returns the replacement exchange and the [`RedirectTarget`] it landed
+/// on. If the redirect is not followable (invalid URI, disallowed host),
+/// logs and returns the original exchange with `None` so the caller
 /// falls through to the non-200 forwarding path.
 ///
 /// Times out after the configured HTTP timeout.
 pub(super) async fn follow_redirect(
-    exchange: &mut UpstreamExchange,
+    exchange: UpstreamExchange,
     conn_details: &ConnectionDetails,
     original_path: &str,
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
-) -> Result<Option<RedirectTarget>, SpliceProxyError> {
+) -> Result<(UpstreamExchange, Option<RedirectTarget>), SpliceProxyError> {
     let status = exchange.response.status_code;
     let Some(location) = exchange.response.location.as_deref() else {
         // Every other reject branch below logs; without this one a broken
@@ -306,14 +378,14 @@ pub(super) async fn follow_redirect(
             conn_details.mirror,
             conn_details.debname
         );
-        return Ok(None);
+        return Ok((exchange, None));
     };
     let Ok(moved_uri) = location.parse::<http::Uri>() else {
         debug!(
             "splice proxy: {status} with unparsable Location `{}`, not following",
             location.escape_debug()
         );
-        return Ok(None);
+        return Ok((exchange, None));
     };
     if moved_uri.scheme().is_none() {
         // A relative Location (`/pool/...`) is legal per RFC 9110 and common
@@ -327,21 +399,21 @@ pub(super) async fn follow_redirect(
             conn_details.debname,
             location.escape_debug()
         );
-        return Ok(None);
+        return Ok((exchange, None));
     }
     let Some(redirect_scheme) = moved_uri.scheme().and_then(Scheme::from_uri_scheme) else {
         debug!("splice proxy: {status} redirect to non-HTTP scheme `{moved_uri}`, not following");
-        return Ok(None);
+        return Ok((exchange, None));
     };
     let Some(moved_host) = moved_uri.host() else {
         debug!("splice proxy: {status} redirect target `{moved_uri}` has no host, not following");
-        return Ok(None);
+        return Ok((exchange, None));
     };
     if !is_host_allowed_cached(moved_host) {
         debug!(
             "splice proxy: {status} redirect host `{moved_host}` not in allowed_mirrors, not following"
         );
-        return Ok(None);
+        return Ok((exchange, None));
     }
     let Ok(moved_domain) = ClientHost::new(moved_host.to_owned()) else {
         // Upstream-controlled and per request, like its sibling branches.
@@ -351,7 +423,7 @@ pub(super) async fn follow_redirect(
             conn_details.debname,
             moved_host.escape_debug()
         );
-        return Ok(None);
+        return Ok((exchange, None));
     };
 
     // Reject self-redirects: if the target (host, port, path) matches the request
@@ -376,7 +448,7 @@ pub(super) async fn follow_redirect(
         debug!(
             "splice proxy: {status} redirect target `{moved_uri}` matches original request, not following"
         );
-        return Ok(None);
+        return Ok((exchange, None));
     }
 
     debug!(
@@ -384,9 +456,9 @@ pub(super) async fn follow_redirect(
         conn_details.mirror
     );
 
-    // Mark as non-poolable so the old connection is discarded (not returned to
-    // pool) when we reassign `*exchange` below.
-    exchange.conn.unset_poolable();
+    // Give the connection back before dialling the target: a redirect that
+    // stays on this host (a path rewrite, a `by-hash` bounce) then reuses it.
+    exchange.dispose("splice proxy:").await;
 
     let moved_port = moved_uri.port_u16().and_then(NonZero::new);
     // Redirect Mirror: used only for upstream dispatch/formatting; never persisted.
@@ -398,7 +470,7 @@ pub(super) async fn follow_redirect(
     );
     let redirect_authority = redirect_mirror.format_authority();
 
-    *exchange = standard_upstream_connect(
+    let exchange = standard_upstream_connect(
         &redirect_mirror,
         redirect_authority,
         moved_path,
@@ -421,11 +493,14 @@ pub(super) async fn follow_redirect(
         SpliceProxyError::Upstream(err)
     })?;
 
-    Ok(Some(RedirectTarget {
-        authority: redirect_authority.to_owned(),
-        path: moved_path.to_owned(),
-        mirror: redirect_mirror,
-    }))
+    Ok((
+        exchange,
+        Some(RedirectTarget {
+            authority: redirect_authority.to_owned(),
+            path: moved_path.to_owned(),
+            mirror: redirect_mirror,
+        }),
+    ))
 }
 
 /// Log the planner's refusal of an upstream response.
@@ -457,21 +532,43 @@ pub(super) async fn discard_partial_and_retry(
     mirror: &Mirror,
     host_authority: &str,
     upstream_path: &str,
-    exchange: &mut UpstreamExchange,
+    exchange: UpstreamExchange,
     conn_details: &ConnectionDetails,
-) -> Result<(), SpliceProxyError> {
+) -> Result<UpstreamExchange, SpliceProxyError> {
+    // Try a bounded drain before refetching. Preserve the scheme used by
+    // the discarded connection --
+    // after a redirect it was fixed by the `Location` URL and never cached
+    // for the target host, so re-deciding it (under `Auto`, an HTTPS probe
+    // against a target the redirect named as `http://`) would look the
+    // pooled connection up under the wrong key.
+    let scheme = exchange.conn.scheme();
+    exchange.dispose("splice proxy:").await;
     partial.discard_resume().await;
-    exchange.conn.unset_poolable();
-    *exchange =
-        standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
-            .await
-            .map_err(SpliceProxyError::Upstream)?;
+    let mut exchange = standard_upstream_connect(
+        mirror,
+        host_authority,
+        upstream_path,
+        0,
+        None,
+        None,
+        Some(scheme),
+    )
+    .await
+    .map_err(SpliceProxyError::Upstream)?;
     // The fresh connect above does not follow redirects; the caller's top-level
     // redirect handling already ran on the original (now-discarded) response, so
     // follow one redirect here if the retry also lands on a 3xx (the retry is
     // always a fresh full request: resume_offset=0, no If-Range/volatile cond).
     if exchange.response.is_redirect() {
-        follow_redirect(exchange, conn_details, upstream_path, 0, None, None).await?;
+        (exchange, _) = Box::pin(follow_redirect(
+            exchange,
+            conn_details,
+            upstream_path,
+            0,
+            None,
+            None,
+        ))
+        .await?;
     }
-    Ok(())
+    Ok(exchange)
 }

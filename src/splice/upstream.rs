@@ -14,22 +14,22 @@ use std::sync::Arc;
 use std::{
     io::ErrorKind,
     num::NonZero,
-    os::fd::AsRawFd as _,
+    os::fd::{AsRawFd as _, RawFd},
     pin::Pin,
     sync::OnceLock,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
-use hashbrown::hash_map::EntryRef;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
 use tracing::debug;
 
+use crate::config::ClientHost;
 use crate::deb_mirror::Mirror;
-use crate::error::ErrorReport;
+use crate::error::{ErrorReport, is_peer_disconnect};
 use crate::humanfmt::HumanFmt;
 use crate::{Scheme, global_config, metrics, warn_once_or_debug, warn_once_or_info};
 
@@ -146,6 +146,17 @@ impl UpstreamConn {
         matches!(self, Self::Tls(_))
     }
 
+    /// The scheme the connection was dialled with, derived from the variant
+    /// like [`Self::is_tls`].
+    #[must_use]
+    pub(super) const fn scheme(&self) -> Scheme {
+        if self.is_tls() {
+            Scheme::Https
+        } else {
+            Scheme::Http
+        }
+    }
+
     /// The socket to `splice(2)` the response body from, when the kernel
     /// hands out plaintext (plain TCP). `None` for userspace TLS, whose
     /// plaintext only ever exists in this process.
@@ -169,25 +180,11 @@ struct PooledConn {
 
 /// Pool key includes TLS flag so HTTP and HTTPS connections to the same
 /// (host, port) — possible on mirrors reachable via both protocols on a
-/// non-default port — never get mixed up.
-type PoolKey = (String, u16, bool);
-
-/// Borrowed key for allocation-free pool lookups.
-#[derive(Hash)]
-struct PoolKeyRef<'a>(&'a str, u16, bool);
-
-impl hashbrown::Equivalent<PoolKey> for PoolKeyRef<'_> {
-    #[inline]
-    fn equivalent(&self, key: &PoolKey) -> bool {
-        let Self {
-            0: host,
-            1: port,
-            2: is_tls,
-        } = self;
-        let (khost, kport, kis_tls) = key;
-        host == khost && port == kport && is_tls == kis_tls
-    }
-}
+/// non-default port — never get mixed up. The host is the refcounted
+/// `ClientHost` the mirror already carries, so building a key for a lookup
+/// is a refcount bump, not an allocation: no borrowed-key `Equivalent`
+/// mirror is needed here.
+type PoolKey = (ClientHost, u16, bool);
 
 static UPSTREAM_POOL: OnceLock<parking_lot::Mutex<hashbrown::HashMap<PoolKey, Vec<PooledConn>>>> =
     OnceLock::new();
@@ -203,14 +200,29 @@ pub(super) fn mirror_port(mirror: &Mirror, is_tls: bool) -> u16 {
         .map_or(if is_tls { 443 } else { 80 }, NonZero::get)
 }
 
-/// Try to retrieve an idle connection from the pool.
-///
-/// Pops from the back (most-recently-returned) and skips stale entries
-/// without scanning the entire vec, keeping the lock held briefly.
-pub(super) fn pool_checkout(host: &str, port: u16, is_tls: bool) -> Option<UpstreamConn> {
+/// What [`pool_checkout`] found for a key.
+#[cfg_attr(
+    feature = "tls_rustls",
+    expect(
+        clippy::large_enum_variant,
+        reason = "carries an UpstreamConn, whose TLS variant is the large one; a checkout is moved once"
+    )
+)]
+pub(super) enum PoolCheckout {
+    /// A connection whose peer has not hung up ([`UpstreamConn::check_alive`]).
+    Live(UpstreamConn),
+    /// Entries existed, but the peer had closed every one of them.
+    Dead,
+    /// No entry for the key (never pooled, or every entry idled out).
+    Empty,
+}
+
+/// Pop one entry for the key, most recently returned first, discarding
+/// entries past [`POOL_IDLE_TIMEOUT`]. `None` once the key is exhausted.
+fn pool_pop(host: &ClientHost, port: u16, is_tls: bool) -> Option<UpstreamConn> {
     let mut map = upstream_pool().lock();
-    let key_ref = PoolKeyRef(host, port, is_tls);
-    let conns = map.get_mut(&key_ref)?;
+    let key = (host.clone(), port, is_tls);
+    let conns = map.get_mut(&key)?;
 
     let now = coarsetime::Instant::now();
     let conn = loop {
@@ -225,38 +237,114 @@ pub(super) fn pool_checkout(host: &str, port: u16, is_tls: bool) -> Option<Upstr
         }
     };
     if conns.is_empty() {
-        map.remove(&key_ref);
+        map.remove(&key);
     }
-    drop(map);
-    let conn = conn?;
-    debug!("splice proxy: reusing pooled connection to {host}:{port} (tls={is_tls})");
-    Some(conn)
+    conn
+}
+
+/// Try to retrieve a live idle connection from the pool.
+///
+/// Walks the key's entries most-recently-returned first and probes each
+/// ([`UpstreamConn::check_alive`], one non-blocking syscall) outside the
+/// lock: a server that closes after a request cap kills the busiest entry
+/// first, and giving up on it would open a fresh connection while a live
+/// one sat below it.
+pub(super) fn pool_checkout(host: &ClientHost, port: u16, is_tls: bool) -> PoolCheckout {
+    let mut saw_dead = false;
+    while let Some(mut conn) = pool_pop(host, port, is_tls) {
+        if conn.check_alive(host, port) {
+            debug!("splice proxy: reusing pooled connection to {host}:{port} (tls={is_tls})");
+            return PoolCheckout::Live(conn);
+        }
+        saw_dead = true;
+    }
+    if saw_dead {
+        PoolCheckout::Dead
+    } else {
+        PoolCheckout::Empty
+    }
+}
+
+/// Take every entry past [`POOL_IDLE_TIMEOUT`] out of the pool, for every
+/// key, and hand them to the caller to drop *after* the lock is gone: a
+/// `TcpStream` drop deregisters from the reactor and closes the socket, and
+/// the map is contended by every checkout and return.
+#[must_use]
+fn pool_take_idle(
+    map: &mut hashbrown::HashMap<PoolKey, Vec<PooledConn>>,
+    now: coarsetime::Instant,
+) -> Vec<PooledConn> {
+    let mut expired = Vec::new();
+    map.retain(|_, conns| {
+        expired.extend(conns.extract_if(.., |e| {
+            now.duration_since(e.idle_since) >= POOL_IDLE_TIMEOUT
+        }));
+        !conns.is_empty()
+    });
+    expired
+}
+
+/// Drop every pooled connection that idled past [`POOL_IDLE_TIMEOUT`].
+///
+/// Runs from [`pool_reaper`], independently of request traffic. Checkout
+/// and return only inspect their own key, keeping full-map scans off the
+/// per-request path.
+fn reap_idle_pool() {
+    let now = coarsetime::Instant::now();
+    let expired = pool_take_idle(&mut upstream_pool().lock(), now);
+    if !expired.is_empty() {
+        debug!(
+            "splice proxy: reaped {} idle pooled upstream connection(s)",
+            expired.len()
+        );
+    }
+    drop(expired);
+}
+
+/// The periodic sweep behind [`reap_idle_pool`]: one tick per
+/// [`POOL_IDLE_TIMEOUT`], so an entry lives at most twice the timeout on an
+/// otherwise idle proxy. Spawned once by the main loop; runs until the
+/// runtime shuts down.
+pub(crate) async fn pool_reaper() {
+    let mut interval = tokio::time::interval(POOL_IDLE_TIMEOUT.into());
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires at once; nothing has idled out yet.
+    interval.tick().await;
+    #[expect(
+        clippy::infinite_loop,
+        reason = "a runtime-lifetime task: the main loop's return drops the runtime and the task with it"
+    )]
+    loop {
+        interval.tick().await;
+        reap_idle_pool();
+    }
 }
 
 /// Return a connection to the pool for reuse.
-fn pool_return(host: &str, port: u16, is_tls: bool, conn: UpstreamConn) {
+///
+/// Expires only this key's entries (at most [`POOL_MAX_IDLE_PER_HOST`]);
+/// [`pool_reaper`] handles other keys. Drop removed sockets outside the lock.
+fn pool_return(host: &ClientHost, port: u16, is_tls: bool, conn: UpstreamConn) {
     let mut map = upstream_pool().lock();
-    let key_ref = PoolKeyRef(host, port, is_tls);
-    let conns = match map.entry_ref(&key_ref) {
-        EntryRef::Occupied(oentry) => oentry.into_mut(),
-        EntryRef::Vacant(ventry) => ventry
-            .insert_entry_with_key((key_ref.0.to_owned(), key_ref.1, key_ref.2), Vec::new())
-            .into_mut(),
-    };
-
     let now = coarsetime::Instant::now();
-    conns.retain(|e| now.duration_since(e.idle_since) < POOL_IDLE_TIMEOUT);
+    let conns = map.entry((host.clone(), port, is_tls)).or_default();
+    let mut expired: Vec<_> = conns
+        .extract_if(.., |entry| {
+            now.duration_since(entry.idle_since) >= POOL_IDLE_TIMEOUT
+        })
+        .collect();
 
     if conns.len() >= POOL_MAX_IDLE_PER_HOST {
         debug!("splice proxy: evicting oldest pooled connection for {host}:{port} (pool full)");
         metrics::POOL_RETURN_EVICTED.increment();
-        conns.remove(0);
+        expired.push(conns.remove(0));
     }
     conns.push(PooledConn {
         conn,
         idle_since: now,
     });
     drop(map);
+    drop(expired);
     debug!("splice proxy: returned connection to pool for {host}:{port} (tls={is_tls})");
 }
 
@@ -264,14 +352,14 @@ fn pool_return(host: &str, port: u16, is_tls: bool, conn: UpstreamConn) {
 /// on drop if `poolable` is true. Prevents connection leaks on early-return paths.
 pub(super) struct PoolGuard {
     conn: Option<UpstreamConn>,
-    host: String,
+    host: ClientHost,
     port: u16,
     poolable: bool,
 }
 
 impl PoolGuard {
     /// Creates a new `PoolGuard` wrapping the given `UpstreamConn`.
-    pub(super) fn new(conn: UpstreamConn, host: String, port: u16, poolable: bool) -> Self {
+    pub(super) fn new(conn: UpstreamConn, host: ClientHost, port: u16, poolable: bool) -> Self {
         Self {
             conn: Some(conn),
             host,
@@ -285,46 +373,42 @@ impl PoolGuard {
         self.poolable = false;
     }
 
-    /// Hand the connection back now instead of at drop, for a caller that
-    /// only borrows the guard and is done with the upstream before its owner
-    /// is (`UpstreamExchange::drain_and_release`). An owner simply drops the
-    /// guard.
-    ///
-    /// Leaves the guard inert: `Drop` finds nothing left to do, and any
-    /// `Deref` afterwards panics, so call it once the upstream is finished
-    /// with.
-    pub(super) fn release(&mut self) {
-        let Some(conn) = self.conn.take() else {
-            return;
-        };
-        if !self.poolable {
-            return;
-        }
-        // Derive from the connection itself rather than caching it in a
-        // field that could drift from `conn`'s actual scheme.
-        let is_tls = conn.is_tls();
-        pool_return(&self.host, self.port, is_tls, conn);
+    /// Whether the connection goes back to the pool once released.
+    #[must_use]
+    pub(super) const fn poolable(&self) -> bool {
+        self.poolable
     }
 }
 
 impl std::ops::Deref for PoolGuard {
     type Target = UpstreamConn;
     fn deref(&self) -> &UpstreamConn {
-        self.conn.as_ref().expect("PoolGuard used after take")
+        self.conn
+            .as_ref()
+            .expect("live PoolGuard contains a connection")
     }
 }
 
 impl std::ops::DerefMut for PoolGuard {
     fn deref_mut(&mut self) -> &mut UpstreamConn {
-        self.conn.as_mut().expect("PoolGuard used after take")
+        self.conn
+            .as_mut()
+            .expect("live PoolGuard contains a connection")
     }
 }
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        // The whole of it: a guard that was already `release`d finds no
-        // connection left and does nothing.
-        self.release();
+        // Taking the connection is private to Drop: a live guard always
+        // contains its connection, including across replacement awaits.
+        let conn = self
+            .conn
+            .take()
+            .expect("live PoolGuard contains a connection");
+        if self.poolable {
+            let is_tls = conn.is_tls();
+            pool_return(&self.host, self.port, is_tls, conn);
+        }
     }
 }
 
@@ -375,62 +459,160 @@ impl std::ops::DerefMut for UnconsumedBodyGuard<'_> {
     }
 }
 
-impl UpstreamConn {
-    /// Check if a pooled connection is still alive (not closed by the remote).
-    ///
-    /// For TLS connections on rustls we peek at the raw TCP socket: a closed
-    /// peer (recv → 0) or error rules the connection out, while pending bytes
-    /// on an idle pooled TLS connection almost certainly indicate a `close_notify`
-    /// alert and are treated the same. The native-tls backend does not expose
-    /// the underlying TCP fd cleanly, so we remain optimistic there.
-    pub(super) fn check_alive(&self, host: &str, port: u16) -> bool {
-        fn tcp_peek_alive(fd: std::os::fd::RawFd, host: &str, port: u16) -> bool {
-            use nix::sys::socket::{MsgFlags, recv};
+/// What the liveness probe found on a pooled connection.
+enum Liveness {
+    /// Idle and open: nothing arrived since the last response.
+    Alive,
+    /// The peer hung up (TCP FIN, reset, or a TLS `close_notify`).
+    ClosedByPeer,
+    /// Bytes no request asked for: the next head read would choke on them.
+    UnexpectedData,
+    /// Bytes wait on the socket, but tokio's readiness cache lags it, so
+    /// they could not be read and told apart (a `close_notify` behind the
+    /// last body record, a post-handshake TLS message, junk). Discarded
+    /// like the rest, but nothing is known to be wrong with the peer.
+    Uninterpreted,
+    /// The probe itself failed; the connection is not trusted.
+    Failed(std::io::Error),
+}
 
-            let mut buf = [0u8; 1];
-
-            match recv(fd, &mut buf, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
-                Ok(0) | Err(nix::errno::Errno::ECONNRESET) => {
-                    debug!("splice proxy: pooled connection to {host}:{port} closed by peer");
-                    false
-                }
-                Ok(pending) => {
-                    debug_assert_eq!(pending, 1, "buffer has size of 1");
-                    warn_once_or_debug!(
-                        "splice proxy: pooled connection to {host}:{port} has unexpected data; discarding it and connecting fresh"
-                    );
-                    false
-                }
-                // EAGAIN/EWOULDBLOCK: see module-level static_assert.
-                Err(nix::errno::Errno::EAGAIN) => true,
-                Err(errno) => {
-                    warn_once_or_info!(
-                        "splice proxy: failed to check the pooled connection to {host}:{port}; discarding it and connecting fresh:  {}",
-                        ErrorReport(&errno)
-                    );
-                    false
-                }
+impl Liveness {
+    /// Log the verdict and reduce it to "reuse this connection?".
+    fn report(self, host: &ClientHost, port: u16) -> bool {
+        match self {
+            Self::Alive => true,
+            Self::ClosedByPeer => {
+                debug!("splice proxy: pooled connection to {host}:{port} closed by peer");
+                false
+            }
+            Self::UnexpectedData => {
+                warn_once_or_debug!(
+                    "splice proxy: pooled connection to {host}:{port} has unexpected data; discarding it and connecting fresh"
+                );
+                false
+            }
+            Self::Uninterpreted => {
+                debug!(
+                    "splice proxy: pooled connection to {host}:{port} has pending bytes the reactor has not seen yet; discarding it and connecting fresh"
+                );
+                false
+            }
+            Self::Failed(err) => {
+                warn_once_or_info!(
+                    "splice proxy: failed to check the pooled connection to {host}:{port}; discarding it and connecting fresh:  {}",
+                    ErrorReport(&err)
+                );
+                false
             }
         }
+    }
+}
 
-        /// rustls exposes the underlying TCP socket, so peek at it.
-        #[cfg(feature = "tls_rustls")]
-        fn tls_peek_alive(tls: &TlsStream, host: &str, port: u16) -> bool {
-            let (tcp, _) = tls.get_ref();
-            tcp_peek_alive(tcp.as_raw_fd(), host, port)
+impl UpstreamConn {
+    /// Whether a pooled connection is still usable: the peer has not hung
+    /// up, and nothing has arrived on it since the last response.
+    ///
+    /// Three probes, each answering only what the one before it could not:
+    ///
+    /// 1. The TLS session's buffered plaintext, which can hold trailing
+    ///    bytes even when the socket is empty. Rustls also exposes an
+    ///    already processed `close_notify` here.
+    /// 2. A `MSG_PEEK` on the socket. A raw syscall on purpose: every
+    ///    tokio-level read (`poll_read`, `try_read`) is gated on tokio's
+    ///    cached readiness, which does not reflect a FIN the driver has not
+    ///    turned for yet, so it can report an idle socket as merely pending.
+    ///    EOF is the peer's close, `EAGAIN` an idle connection.
+    /// 3. If the peek found bytes, one `poll_read` on the connection itself
+    ///    with a no-op waker, so the TLS layer can decrypt and interpret
+    ///    them: a zero-length read is a `close_notify` (under TLS 1.3 an
+    ///    encrypted record, indistinguishable from data at the socket);
+    ///    bytes are junk the last response left behind. `Pending` here means
+    ///    the readiness cache lags the socket, which leaves the bytes
+    ///    uninterpreted ([`Liveness::Uninterpreted`]) and the connection
+    ///    untrusted. The no-op waker leaves the readiness state intact for
+    ///    the real read that may follow.
+    pub(super) fn check_alive(&mut self, host: &ClientHost, port: u16) -> bool {
+        if let Self::Tls(tls) = self
+            && let Some(verdict) = tls_session_liveness(tls)
+        {
+            return verdict.report(host, port);
         }
 
-        /// native-tls hides the socket: stay optimistic.
-        #[cfg(not(feature = "tls_rustls"))]
-        fn tls_peek_alive(_tls: &TlsStream, _host: &str, _port: u16) -> bool {
-            true
-        }
+        let verdict = match peek_socket(self.raw_fd()) {
+            Ok(0) | Err(nix::errno::Errno::ECONNRESET) => Liveness::ClosedByPeer,
+            Ok(_pending) => self.interpret_pending(),
+            Err(nix::errno::Errno::EAGAIN) => Liveness::Alive,
+            Err(errno) => Liveness::Failed(std::io::Error::from(errno)),
+        };
+        verdict.report(host, port)
+    }
 
-        match self {
-            Self::Tcp(tcp) => tcp_peek_alive(tcp.as_raw_fd(), host, port),
-            Self::Tls(tls) => tls_peek_alive(tls, host, port),
+    /// Probe 3 of [`Self::check_alive`]: read the bytes the peek found
+    /// through the connection, so a TLS alert is told from data.
+    fn interpret_pending(&mut self) -> Liveness {
+        let mut byte = [0u8; 1];
+        let mut buf = ReadBuf::new(&mut byte);
+        let mut cx = Context::from_waker(Waker::noop());
+        match Pin::new(self).poll_read(&mut cx, &mut buf) {
+            Poll::Ready(Ok(())) if buf.filled().is_empty() => Liveness::ClosedByPeer,
+            Poll::Ready(Ok(())) => Liveness::UnexpectedData,
+            Poll::Pending => Liveness::Uninterpreted,
+            Poll::Ready(Err(err)) if is_peer_disconnect(&err) => Liveness::ClosedByPeer,
+            Poll::Ready(Err(err)) => Liveness::Failed(err),
         }
     }
+
+    /// The TCP socket under the connection.
+    fn raw_fd(&self) -> RawFd {
+        match self {
+            Self::Tcp(tcp) => tcp.as_raw_fd(),
+            #[cfg(feature = "tls_rustls")]
+            Self::Tls(tls) => tls.get_ref().0.as_raw_fd(),
+            #[cfg(not(feature = "tls_rustls"))]
+            Self::Tls(tls) => tls.get_ref().get_ref().get_ref().as_raw_fd(),
+        }
+    }
+}
+
+/// Probe 1 of [`UpstreamConn::check_alive`]: what the rustls session has
+/// already taken off the socket. `None` when nothing is buffered and the
+/// socket has to be asked.
+#[cfg(feature = "tls_rustls")]
+fn tls_session_liveness(tls: &mut TlsStream) -> Option<Liveness> {
+    use std::io::Read as _;
+
+    let (_, session) = tls.get_mut();
+    let mut buf = [0u8; 1];
+    match session.reader().read(&mut buf) {
+        Ok(0) => Some(Liveness::ClosedByPeer),
+        Ok(_) => Some(Liveness::UnexpectedData),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => None,
+        Err(err) if is_peer_disconnect(&err) => Some(Liveness::ClosedByPeer),
+        Err(err) => Some(Liveness::Failed(err)),
+    }
+}
+
+/// Native TLS buffers decrypted bytes separately from the TCP socket too.
+/// A zero count leaves the socket probe to decide; no read is needed to
+/// reject a session that already holds unsolicited plaintext.
+#[cfg(not(feature = "tls_rustls"))]
+fn tls_session_liveness(tls: &TlsStream) -> Option<Liveness> {
+    match tls.get_ref().buffered_read_size() {
+        Ok(0) => None,
+        Ok(_) => Some(Liveness::UnexpectedData),
+        Err(err) => Some(Liveness::Failed(std::io::Error::other(err))),
+    }
+}
+
+/// Probe 2 of [`UpstreamConn::check_alive`]: how many bytes wait on the
+/// socket (`0` is EOF), without consuming them or touching tokio's
+/// readiness state.
+fn peek_socket(fd: RawFd) -> nix::Result<usize> {
+    use nix::sys::socket::{MsgFlags, recv};
+
+    let mut buf = [0u8; 1];
+    // EAGAIN/EWOULDBLOCK: see the static_assert in `super`.
+    recv(fd, &mut buf, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT)
 }
 
 /// Whether a failed connect is worth retrying. `Permanent` means the failure
@@ -677,17 +859,38 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
     Ok(tls_stream)
 }
 
-/// Perform TLS handshake over an established TCP connection with timeout.
+/// The process-wide native-tls connector, built on first use.
 ///
-/// Times out after the configured HTTP timeout.
+/// One `SSL_CTX` for every upstream connection: building a connector loads
+/// and parses the whole system CA bundle, and separate contexts share no
+/// session cache, so a per-connect connector paid that parse on every dial
+/// and could never resume a TLS session. The rustls backend gets the same
+/// sharing from `TLS_CLIENT_CONFIG`. A build failure is not cached: it is
+/// the local TLS stack refusing to initialise, reported per connect.
 #[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
-async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectError> {
+fn native_tls_connector() -> Result<tokio_native_tls::TlsConnector, ConnectError> {
+    static CONNECTOR: OnceLock<tokio_native_tls::TlsConnector> = OnceLock::new();
+
+    if let Some(connector) = CONNECTOR.get() {
+        return Ok(connector.clone());
+    }
     let native_connector = tokio_native_tls::native_tls::TlsConnector::new().map_err(|err| {
         // Building the connector touches no network: a failure here is the
         // local TLS stack refusing to initialise and repeats identically.
         ConnectError::permanent(std::io::Error::other(err))
     })?;
     let connector = tokio_native_tls::TlsConnector::from(native_connector);
+    // Two first connects racing here both built one; whichever landed is
+    // the one every connection shares from now on.
+    Ok(CONNECTOR.get_or_init(|| connector).clone())
+}
+
+/// Perform TLS handshake over an established TCP connection with timeout.
+///
+/// Times out after the configured HTTP timeout.
+#[cfg(all(feature = "tls_hyper", not(feature = "tls_rustls")))]
+async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectError> {
+    let connector = native_tls_connector()?;
 
     debug!("splice proxy: starting TLS handshake with {host}");
     let http_timeout = global_config().http_timeout;
@@ -705,6 +908,8 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use crate::config::ClientHost;
     use crate::deb_mirror::MirrorKind;
 
@@ -750,6 +955,141 @@ mod tests {
                 "{kind:?} may succeed on retry"
             );
         }
+    }
+
+    /// A loopback socket pair: the client side, the server side, and the
+    /// client side's local address (to tell pooled connections apart).
+    async fn tcp_pair(listener: &tokio::net::TcpListener) -> (TcpStream, TcpStream, SocketAddr) {
+        let addr = listener.local_addr().unwrap();
+        let (client, (server, _)) = tokio::try_join!(TcpStream::connect(addr), listener.accept())
+            .expect("loopback connect");
+        let local = client.local_addr().unwrap();
+        (client, server, local)
+    }
+
+    fn test_host(name: &str) -> ClientHost {
+        ClientHost::new(name.to_owned()).unwrap()
+    }
+
+    /// The most recently returned connection is popped first; if the peer
+    /// has closed it, checkout must go on to the older live one rather than
+    /// report a miss and leave that live socket idling.
+    #[tokio::test]
+    async fn pool_checkout_skips_a_dead_entry_for_a_live_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (live, _live_peer, live_addr) = tcp_pair(&listener).await;
+        let (dead, dead_peer, _) = tcp_pair(&listener).await;
+        drop(dead_peer);
+        let host = test_host("pool-checkout-skips-dead.invalid");
+
+        pool_return(&host, 80, false, UpstreamConn::Tcp(live));
+        pool_return(&host, 80, false, UpstreamConn::Tcp(dead));
+
+        let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) else {
+            unreachable!("a live connection was in the pool");
+        };
+        assert_eq!(
+            conn.zero_copy().unwrap().local_addr().unwrap(),
+            live_addr,
+            "checkout must hand out the live connection"
+        );
+        assert!(
+            matches!(pool_checkout(&host, 80, false), PoolCheckout::Empty),
+            "the dead entry was discarded, not left in the pool"
+        );
+    }
+
+    /// A pool holding only closed connections is a `Dead` miss (the entries
+    /// were there but unusable), distinct from an `Empty` one.
+    #[tokio::test]
+    async fn pool_checkout_reports_dead_when_every_entry_is_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (dead, dead_peer, _) = tcp_pair(&listener).await;
+        drop(dead_peer);
+        let host = test_host("pool-checkout-all-dead.invalid");
+
+        pool_return(&host, 80, false, UpstreamConn::Tcp(dead));
+
+        assert!(matches!(
+            pool_checkout(&host, 80, false),
+            PoolCheckout::Dead
+        ));
+        assert!(matches!(
+            pool_checkout(&host, 80, false),
+            PoolCheckout::Empty
+        ));
+    }
+
+    /// Returning to a key expires its old sockets without waiting for the
+    /// periodic sweep.
+    #[tokio::test]
+    async fn pool_return_reaps_idle_entries_of_same_host() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let (stale, mut stale_peer, _) = tcp_pair(&listener).await;
+        let (fresh, _fresh_peer, _) = tcp_pair(&listener).await;
+        let stale_host = test_host("pool-reap-stale.invalid");
+        let fresh_host = stale_host.clone();
+
+        upstream_pool().lock().insert(
+            (stale_host.clone(), 80, false),
+            vec![PooledConn {
+                conn: UpstreamConn::Tcp(stale),
+                idle_since: coarsetime::Instant::now()
+                    - (POOL_IDLE_TIMEOUT + coarsetime::Duration::from_secs(1)),
+            }],
+        );
+
+        pool_return(&fresh_host, 80, false, UpstreamConn::Tcp(fresh));
+
+        let count = upstream_pool()
+            .lock()
+            .get(&(fresh_host, 80, false))
+            .unwrap()
+            .len();
+        assert_eq!(count, 1);
+        let mut byte = [0u8; 1];
+        assert_eq!(stale_peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    /// The periodic reaper sweeps every key, so a host that sees no more
+    /// traffic (and so no `pool_return`) still loses its idled-out sockets.
+    #[tokio::test]
+    async fn reap_idle_pool_drops_expired_entries_without_a_return() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stale, _stale_peer, _) = tcp_pair(&listener).await;
+        let (fresh, _fresh_peer, _) = tcp_pair(&listener).await;
+        let stale_host = test_host("pool-reap-idle-stale.invalid");
+        let fresh_host = test_host("pool-reap-idle-fresh.invalid");
+
+        let now = coarsetime::Instant::now();
+        let mut map = upstream_pool().lock();
+        map.insert(
+            (stale_host.clone(), 80, false),
+            vec![PooledConn {
+                conn: UpstreamConn::Tcp(stale),
+                idle_since: now - (POOL_IDLE_TIMEOUT + coarsetime::Duration::from_secs(1)),
+            }],
+        );
+        map.insert(
+            (fresh_host.clone(), 80, false),
+            vec![PooledConn {
+                conn: UpstreamConn::Tcp(fresh),
+                idle_since: now,
+            }],
+        );
+        drop(map);
+
+        reap_idle_pool();
+
+        let map = upstream_pool().lock();
+        let stale_present = map.contains_key(&(stale_host, 80, false));
+        let fresh_present = map.contains_key(&(fresh_host, 80, false));
+        drop(map);
+        assert!(!stale_present, "the expired entry must be gone");
+        assert!(fresh_present);
     }
 
     #[test]

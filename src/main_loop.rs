@@ -481,6 +481,11 @@ pub(crate) async fn main_loop(
                 .expect("FIRST_CLEANUP_DELAY_SECS fits in i64"),
     );
 
+    // The splice upstream pool's idle sweep, so sockets of a host that sees
+    // no more traffic do not wait for the next return to some host.
+    #[cfg(feature = "splice")]
+    tokio::task::spawn(crate::splice::pool_reaper());
+
     let appstate = AppState {
         database,
         #[cfg(feature = "hyper")]

@@ -173,51 +173,34 @@ async fn cleanup_upstream_fetch(
         .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_owned()));
     let upstream_path = upstream_path_buf.as_deref().unwrap_or(upstream_uri);
     let host_authority = mirror.format_authority();
-    let UpstreamExchange {
-        conn: mut upstream,
-        response: resp,
-        header_buf: hdr_buf,
-        header_end: hdr_end,
-        reused: _,
-    } = match standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
-        .await
-    {
-        Ok(v) => v,
-        Err(UpstreamFailure {
-            err,
-            logged: _logged,
-        }) => {
-            debug!("splice cleanup request to {upstream_path} failed to connect/read headers");
-            let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
-            // The throw site already logged the failure with its context;
-            // hand cleanup's decision log the transport cause the same way
-            // the hyper backend does, rather than a bare 502.
-            resp.extensions_mut().insert(UpstreamFetchError {
-                reason: ErrorReport(&err).to_string(),
-            });
-            return resp;
-        }
-    };
+    let mut exchange =
+        match standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
+            .await
+        {
+            Ok(v) => v,
+            Err(UpstreamFailure {
+                err,
+                logged: _logged,
+            }) => {
+                debug!("splice cleanup request to {upstream_path} failed to connect/read headers");
+                let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
+                // The throw site already logged the failure with its context;
+                // hand cleanup's decision log the transport cause the same way
+                // the hyper backend does, rather than a bare 502.
+                resp.extensions_mut().insert(UpstreamFetchError {
+                    reason: ErrorReport(&err).to_string(),
+                });
+                return resp;
+            }
+        };
 
-    let status = resp.status_code;
-    let body_prefix = &hdr_buf[hdr_end..];
+    let status = exchange.response.status_code;
 
     if status != StatusCode::OK {
         // Drain the (small) error body so the connection returns to the pool;
-        // the `.xz` -> `.gz` -> raw probe cascade reuses it for the next format.
-        // Oversized or unreadable error bodies mark the connection non-poolable
-        // instead (via the cap error or `inspect_err`).
-        const MAX_ERROR_BODY_DRAIN: usize = 64 * 1024;
-        if let Err(err) = resp
-            .framing
-            .read_to_vec(&mut upstream, body_prefix, MAX_ERROR_BODY_DRAIN)
-            .await
-        {
-            debug!(
-                "splice cleanup request to {host_authority}{upstream_path} failed to drain the error body:  {}",
-                ErrorReport(&err)
-            );
-        }
+        // the `.xz` -> `.gz` -> raw probe cascade reuses it for the next
+        // format.
+        exchange.dispose("splice cleanup:").await;
         return cleanup_response(status);
     }
 
@@ -225,9 +208,16 @@ async fn cleanup_upstream_fetch(
         .get()
         .try_into()
         .expect("constant fits into usize");
+    let UpstreamExchange {
+        conn: upstream,
+        response: resp,
+        header_buf: hdr_buf,
+        header_end: hdr_end,
+        reused: _,
+    } = &mut exchange;
     let body = resp
         .framing
-        .read_to_vec(&mut upstream, body_prefix, max_bytes)
+        .read_to_vec(upstream, &hdr_buf[*hdr_end..], max_bytes)
         .await;
 
     match body {

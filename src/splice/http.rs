@@ -44,6 +44,26 @@ use super::VolatileCondHeaders;
 use super::body::BodyTransferError;
 use super::upstream::{PoolGuard, TLS_READ_BUF_SIZE, UnconsumedBodyGuard, UpstreamConn};
 
+/// Maximum body worth draining solely to reuse an upstream connection.
+pub(super) const MAX_ERROR_BODY_DRAIN: usize = 64 * 1024;
+
+/// A failed request head, classified where the failure originated. TLS
+/// reads can report `InvalidData` too, so an I/O error's kind cannot tell
+/// a broken transport from a malformed HTTP response.
+#[derive(Debug)]
+pub(super) enum HeadError {
+    Transport(std::io::Error),
+    Protocol(std::io::Error),
+}
+
+impl HeadError {
+    pub(super) fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Transport(err) | Self::Protocol(err) => err,
+        }
+    }
+}
+
 /// Format an HTTP GET request for the upstream mirror. Always keep-alive:
 /// whether the connection is pooled afterwards is the response's say
 /// (`UpstreamResponse::connection_close`).
@@ -127,7 +147,7 @@ async fn send_upstream_request(
 async fn read_upstream_response_headers(
     upstream: &mut UpstreamConn,
     buf: &mut BytesMut,
-) -> std::io::Result<usize> {
+) -> Result<usize, HeadError> {
     let http_timeout = global_config().http_timeout;
     let deadline = tokio::time::sleep(http_timeout);
     tokio::pin!(deadline);
@@ -142,24 +162,24 @@ async fn read_upstream_response_headers(
         tokio::pin!(read_fut);
         let n = tokio::select! {
             biased;
-            r = &mut read_fut => r?,
+            r = &mut read_fut => r.map_err(HeadError::Transport)?,
             () = &mut deadline => {
                 metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                return Err(std::io::Error::new(
+                return Err(HeadError::Transport(std::io::Error::new(
                     ErrorKind::TimedOut,
                     format!(
                         "timed out reading upstream response headers after {}",
                         HumanFmt::Time(http_timeout)
                     ),
-                ));
+                )));
             }
         };
 
         if n == 0 {
-            return Err(std::io::Error::new(
+            return Err(HeadError::Transport(std::io::Error::new(
                 ErrorKind::UnexpectedEof,
                 "upstream closed before sending complete headers",
-            ));
+            )));
         }
 
         // Scan only the tail not yet covered (plus a 3-byte overlap to catch
@@ -174,13 +194,13 @@ async fn read_upstream_response_headers(
         search_offset = buf.len();
 
         if buf.len() > MAX_UPSTREAM_HEADER_SIZE {
-            return Err(std::io::Error::new(
+            return Err(HeadError::Protocol(std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!(
                     "upstream response header size of {} bytes exceeds {MAX_UPSTREAM_HEADER_SIZE} byte cap",
                     buf.len()
                 ),
-            ));
+            )));
         }
     }
 }
@@ -540,7 +560,7 @@ pub(super) async fn send_and_read_headers(
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
-) -> Result<(UpstreamResponse, BytesMut, usize), std::io::Error> {
+) -> Result<(UpstreamResponse, BytesMut, usize), HeadError> {
     send_upstream_request(
         up,
         host_authority,
@@ -549,7 +569,8 @@ pub(super) async fn send_and_read_headers(
         resume_if_range,
         volatile_cond,
     )
-    .await?;
+    .await
+    .map_err(HeadError::Transport)?;
     let request_sent_at = PreciseInstant::now();
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
@@ -557,7 +578,8 @@ pub(super) async fn send_and_read_headers(
     let resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority, request_sent_at)
         .inspect_err(|_err| {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-        })?;
+        })
+        .map_err(HeadError::Protocol)?;
     Ok((resp, hdr_buf, hdr_end))
 }
 
