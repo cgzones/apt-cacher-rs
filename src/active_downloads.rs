@@ -720,6 +720,17 @@ impl ActiveDownloads {
         .expect("no cap was passed, so origination cannot be refused")
     }
 
+    /// Build the ordinary slot-owning origination without process globals.
+    #[cfg(all(test, feature = "splice"))]
+    pub(crate) fn originate_uncapped(&self, key: CacheEntryKeyRef<'_>) -> Origination {
+        match self.lookup_or_insert(key, None) {
+            LookupResult::Originator(origination) => origination,
+            LookupResult::LateJoiner { .. } | LookupResult::AtCapacity { .. } => {
+                unreachable!("test key must be newly registered")
+            }
+        }
+    }
+
     /// Originate-only variant of `Self::insert`: returns `Concurrent`
     /// when a download for the same key is already in flight, while still
     /// bumping the existing entry's late-joiner accounting to mirror

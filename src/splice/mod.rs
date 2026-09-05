@@ -105,8 +105,8 @@ use acquire::{
     warn_upstream_reject,
 };
 use body::{
-    BodyClient, BodyOutcome, BodyTransfer, BodyTransferError, ClientEnd, SpliceRangeFilter,
-    range_slice, splice_proxy_body, splice_proxy_body_tls,
+    BodyClient, BodyOutcome, BodyTransfer, BodyTransferError, CacheWriter, ClientEnd,
+    SpliceRangeFilter, range_slice, splice_proxy_body, splice_proxy_body_tls,
 };
 use commit::{CommitTail, CompletionBytes, CompletionClient, Served};
 use detached::DetachedDownload;
@@ -405,8 +405,8 @@ struct CacheTarget {
     /// re-reading the finished file.
     ///
     /// Fed by the two -- and only two -- sites that write into `tempfile`:
-    /// [`write_body_prefix_to_cache`] and
-    /// `body::BodyTransfer::write_cache_chunk`. Anything `Some` here that does
+    /// `body::CacheWriter::write_prefix` and
+    /// `body::CacheWriter::write_cache_chunk`. Anything `Some` here that does
     /// not route every byte through those two would be finalised over a
     /// partial stream and fail verification, so the value is chosen by the
     /// caller of [`prepare_cache_target`] rather than derived from the
@@ -433,7 +433,7 @@ struct CacheTarget {
 /// whether an incremental digest is *valid* depends on how the caller writes
 /// the body, not on the download's identity. Only the streaming drive funnels
 /// every cache byte through the two sites that feed it
-/// ([`write_body_prefix_to_cache`] and `body::BodyTransfer::write_cache_chunk`);
+/// (`body::CacheWriter::write_prefix` and `body::CacheWriter::write_cache_chunk`);
 /// [`volatile`] writes its buffered body straight to `tempfile` and so must
 /// pass `None`, or the commit would verify a digest of no input at all. Making
 /// each caller say which it is keeps that a compile-time decision.
@@ -1147,25 +1147,21 @@ async fn write_body_prefix_to_cache(
     // client write after this returned. Flushing before the splice loop also
     // keeps the queued write from racing the loop's raw `splice(2)` appends
     // to the same fd.
-    write_all_flushed(&mut target.tempfile, body_prefix)
-        .await
-        .map_err(|err| SpliceProxyError::AfterHeader {
-            phase: "body prefix to cache",
-            side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
-                "splice proxy: failed to write body prefix to cache file `{}`; {consequence}:  {}",
-                target.temppath.display(),
-                ErrorReport(&err)
-            ))),
-        })?;
-
-    // One of the two sites that write into `target.tempfile`, so one of the
-    // two that must feed the incremental digest.
-    if let Some(hasher) = target.hasher.as_mut() {
-        hasher.update(body_prefix);
-    }
-
-    // Notify concurrent clients of progress.
-    target.dbarrier.ping();
+    CacheWriter::write_prefix(
+        &mut target.tempfile,
+        body_prefix,
+        &mut target.hasher,
+        &mut target.dbarrier,
+    )
+    .await
+    .map_err(|err| SpliceProxyError::AfterHeader {
+        phase: "body prefix to cache",
+        side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
+            "splice proxy: failed to write body prefix to cache file `{}`; {consequence}:  {}",
+            target.temppath.display(),
+            ErrorReport(&err)
+        ))),
+    })?;
 
     Ok(())
 }
@@ -1318,40 +1314,28 @@ async fn transfer_body(
     // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
     // `target.hasher` is borrowed: only the userspace loop advances it, in
     // place.
-    let outcome = if let Some(tcp) = upstream.zero_copy() {
-        // Zero-copy path for plain TCP. The body goes socket->pipe->file
-        // inside the kernel, so no incremental digest is possible and the
-        // commit re-reads and hashes the finished file. `splice_proxy_drive`
-        // already declined to mint a hasher for a zero-copy upstream, so this
-        // is normally a `None` already; clearing it keeps the invariant local
-        // to the branch that depends on it rather than making it an
-        // assumption about a caller.
-        target.hasher = None;
-        let xfer = BodyTransfer::new(
-            client,
-            target.dbarrier,
-            &range_filter,
-            &target.temppath,
-            splice_count,
+    let outcome = async {
+        let zero_copy = upstream.zero_copy();
+        if zero_copy.is_some() {
+            // Kernel-only bytes cannot advance an incremental digest.
+            // Keep that invariant local to the choice of body loop.
+            target.hasher = None;
+        }
+        let cache = CacheWriter::prepare(
+            &mut target.tempfile,
             body_offset,
             &mut target.hasher,
-        );
-        splice_proxy_body(xfer, tcp, &target.tempfile).await
-    } else {
-        // TLS: userspace read, then direct cache write and client write --
-        // the plaintext is in hand, so the digest can be advanced chunk by
-        // chunk.
-        let xfer = BodyTransfer::new(
-            client,
             target.dbarrier,
-            &range_filter,
-            &target.temppath,
-            splice_count,
-            body_offset,
-            &mut target.hasher,
-        );
-        splice_proxy_body_tls(xfer, upstream, &target.tempfile).await
-    };
+        )
+        .await?;
+        let xfer = BodyTransfer::new(client, cache, &range_filter, &target.temppath, splice_count);
+        if let Some(tcp) = zero_copy {
+            splice_proxy_body(xfer, tcp).await
+        } else {
+            splice_proxy_body_tls(xfer, upstream).await
+        }
+    }
+    .await;
     // A failed transfer leaves its response unfinished, so the owner closes
     // the connection on return instead of making it available to another request
     // rather than re-pooling it -- the next checkout would otherwise log
