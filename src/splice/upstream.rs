@@ -44,10 +44,17 @@ const POOL_IDLE_TIMEOUT: coarsetime::Duration = coarsetime::Duration::from_secs(
 /// Maximum number of idle connections kept per host.
 const POOL_MAX_IDLE_PER_HOST: usize = 4;
 
-/// Buffer size for TLS upstream reads.  TLS records are at most 16 KiB, so
-/// a larger buffer amortizes the per-chunk pwrite+write pair — 256 KiB
-/// costs one allocation per concurrent userspace-TLS download (not per
-/// connection) and quarters the loop iterations per MiB.
+/// Buffer size for TLS upstream reads: the `super::http` head scanners and
+/// buffered-body collectors, and the userspace-TLS body loop
+/// (`super::body::splice_proxy_body_tls`).  TLS records are at most 16 KiB,
+/// so a larger buffer amortizes the per-chunk read — 256 KiB costs one
+/// allocation per read site, and these sites are short and numerous.
+///
+/// Raising it for the body loop alone would buy nothing: that loop awaits
+/// one `read_buf` and writes the result immediately, and one `poll_read` on
+/// a `TlsStream` yields about one TLS record however much capacity is
+/// offered.  Only an accumulation loop (the userspace mirror of the
+/// `pipe_A` batching) would turn capacity into fewer `pwrite` handoffs.
 pub(super) const TLS_READ_BUF_SIZE: usize = 256 * 1024;
 
 #[cfg_attr(
