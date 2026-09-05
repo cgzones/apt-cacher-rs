@@ -641,10 +641,13 @@ fn build_configuration_html(rd: &RuntimeDetails) -> String {
             fallback: "None",
         },
     );
-    t.row("Buffer Size", HumanFmt::Size(rd.config.buffer_size as u64));
+    t.row(
+        "Buffer Size",
+        HumanFmt::BinarySize(rd.config.buffer_size as u64),
+    );
     t.row(
         "Mmap Threshold",
-        HumanFmt::Size(rd.config.mmap_threshold.get()),
+        HumanFmt::BinarySize(rd.config.mmap_threshold.get()),
     );
     t.row(
         "Reject pdiff Requests",

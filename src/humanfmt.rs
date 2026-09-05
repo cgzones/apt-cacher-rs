@@ -7,6 +7,11 @@
 //! never read `1000kB`. The decimal count shrinks as the mantissa grows: two
 //! digits below 10, one below 100, none above.
 //!
+//! [`HumanFmt::BinarySize`] is the one IEC exception, for configuration
+//! values that are powers of two by nature (buffer sizes, the mmap
+//! threshold): a 32 KiB buffer reads `32.0KiB`, not `32.8kB`. Same precision
+//! ladder, promotion at `NEXT_BINARY_UNIT` (1023.5) for the same reason.
+//!
 //! [`HumanFmt::Rate`] divides by its window and renders `???B/s` for a
 //! zero-length one - see `precise_instant` for why the std clock makes that
 //! nearly unreachable, and `docs/logging.md` for why it is the formatter's own
@@ -17,6 +22,8 @@
 #[must_use]
 pub(crate) enum HumanFmt {
     Size(u64),
+    /// IEC units (KiB = 1024 B) for values that are naturally powers of two.
+    BinarySize(u64),
     Rate(u64, std::time::Duration),
     /// An already-per-second rate. [`Self::Rate`] divides and delegates here,
     /// so a configured `min_download_rate` on the dashboard and a measured
@@ -40,6 +47,7 @@ impl std::fmt::Display for HumanFmt {
         }
 
         const NEXT_UNIT: f64 = 999.5;
+        const NEXT_BINARY_UNIT: f64 = 1023.5;
 
         /// The `B/s` unit ladder, shared by the two rate variants so a
         /// measured rate and a configured one cannot render differently.
@@ -83,6 +91,25 @@ impl std::fmt::Display for HumanFmt {
                 }
                 let size = size / 1000.0;
                 write!(f, "{size:.0$}TB", precision(size))
+            }
+            Self::BinarySize(bytes) => {
+                if bytes < 1024 {
+                    return write!(f, "{bytes}B");
+                }
+                let size = bytes as f64 / 1024.0;
+                if size < NEXT_BINARY_UNIT {
+                    return write!(f, "{size:.0$}KiB", precision(size));
+                }
+                let size = size / 1024.0;
+                if size < NEXT_BINARY_UNIT {
+                    return write!(f, "{size:.0$}MiB", precision(size));
+                }
+                let size = size / 1024.0;
+                if size < NEXT_BINARY_UNIT {
+                    return write!(f, "{size:.0$}GiB", precision(size));
+                }
+                let size = size / 1024.0;
+                write!(f, "{size:.0$}TiB", precision(size))
             }
             Self::Rate(bytes, time) => {
                 let time = time.as_secs_f64();
@@ -209,6 +236,40 @@ mod tests {
         assert_eq!(format!("{}", HumanFmt::Size(24756)), "24.8kB");
         assert_eq!(format!("{}", HumanFmt::Size(247_569_325_892)), "248GB");
         assert_eq!(format!("{}", HumanFmt::Size(u64::MAX)), "18446744TB");
+    }
+
+    #[test]
+    fn binary_size_test() {
+        assert_eq!(format!("{}", HumanFmt::BinarySize(0)), "0B");
+        assert_eq!(format!("{}", HumanFmt::BinarySize(1000)), "1000B");
+        assert_eq!(format!("{}", HumanFmt::BinarySize(1024)), "1.00KiB");
+        assert_eq!(format!("{}", HumanFmt::BinarySize(32 * 1024)), "32.0KiB");
+        assert_eq!(format!("{}", HumanFmt::BinarySize(1024 * 1024)), "1.00MiB");
+        assert_eq!(
+            format!("{}", HumanFmt::BinarySize(247_569_325_892)),
+            "231GiB"
+        );
+        assert_eq!(format!("{}", HumanFmt::BinarySize(u64::MAX)), "16777216TiB");
+    }
+
+    #[test]
+    fn binary_size_unit_boundary_promotes_instead_of_rounding_to_1024() {
+        // Just below the promotion threshold: still the smaller unit.
+        assert_eq!(
+            format!("{}", HumanFmt::BinarySize(1024 * 1024 - 513)),
+            "1023KiB"
+        );
+        // From here the zero-decimal rendering would read `1024KiB`.
+        assert_eq!(
+            format!("{}", HumanFmt::BinarySize(1024 * 1024 - 512)),
+            "1.00MiB"
+        );
+        assert_eq!(
+            format!("{}", HumanFmt::BinarySize(1024 * 1024 - 1)),
+            "1.00MiB"
+        );
+        assert_eq!(format!("{}", HumanFmt::BinarySize(1 << 30)), "1.00GiB");
+        assert_eq!(format!("{}", HumanFmt::BinarySize(1 << 40)), "1.00TiB");
     }
 
     #[test]
