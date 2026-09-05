@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
-use super::{AfterHeaderSide, SpliceProxyError, UpstreamFailure, VOLATILE_BODY_MAX};
+use super::{SpliceProxyError, UpstreamFailure, VOLATILE_BODY_MAX};
 
 /// Hop-by-hop headers per RFC 9110 §7.6.1 — must not be forwarded to the client.
 const HOP_BY_HOP: &[&str] = &[
@@ -197,10 +197,7 @@ pub(crate) async fn splice_simple_proxy(
             None,
         )
         .await
-        .map_err(|err| SpliceProxyError::Client {
-            phase: "simple-proxy reject 502",
-            err,
-        });
+        .map_err(SpliceProxyError::client("simple-proxy reject 502"));
     }
 
     // Rewrite response headers: adjust HTTP version and Connection header
@@ -245,10 +242,7 @@ pub(crate) async fn splice_simple_proxy(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| SpliceProxyError::Client {
-        phase: "simple-proxy headers",
-        err,
-    })?;
+    .map_err(SpliceProxyError::client("simple-proxy headers"))?;
 
     // Forward the body that arrived with the headers plus the rest, framed
     // per the upstream's framing. Chunked precedence over Content-Length is
@@ -259,10 +253,7 @@ pub(crate) async fn splice_simple_proxy(
         .framing
         .relay_to_client(&mut upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
         .await
-        .map_err(|err| SpliceProxyError::AfterHeader {
-            phase: "simple-proxy body",
-            side: AfterHeaderSide::Client(err),
-        })?;
+        .map_err(SpliceProxyError::after_header_client("simple-proxy body"))?;
 
     let t_done = PreciseInstant::now();
     let in_time = request_received_at.elapsed();

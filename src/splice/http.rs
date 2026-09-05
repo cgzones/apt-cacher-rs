@@ -10,7 +10,7 @@
 //! Consumers: `acquire` (request/parse), the drive in
 //! `mod.rs` and `volatile`/`simple_proxy`/`cleanup_bridge` (framing relays).
 
-use std::{io::ErrorKind, num::Saturating, ops::Range, time::Duration};
+use std::{future::Future, io::ErrorKind, num::Saturating, ops::Range, time::Duration};
 
 use bytes::BytesMut;
 use http::{
@@ -27,7 +27,7 @@ use tokio::{
 
 use crate::cache_layout::ConnectionDetails;
 use crate::error::ErrorReport;
-use crate::http_helpers::{ConnectionAction, OptHeader, find_header, find_header_end};
+use crate::http_helpers::{OptHeader, find_header, find_header_end};
 use crate::http_range::parse_content_range;
 use crate::humanfmt::HumanFmt;
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
@@ -44,14 +44,15 @@ use crate::{
 use super::VolatileCondHeaders;
 use super::upstream::{PoolGuard, TLS_READ_BUF_SIZE, UnconsumedBodyGuard, UpstreamConn};
 
-/// Format an HTTP GET request for the upstream mirror.
+/// Format an HTTP GET request for the upstream mirror. Always keep-alive:
+/// whether the connection is pooled afterwards is the response's say
+/// (`UpstreamResponse::connection_close`).
 pub(super) fn format_http_request(
     path: &str,
     host_authority: &str,
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
-    connection: ConnectionAction,
 ) -> String {
     let range_header = if resume_offset > 0 {
         format!(
@@ -75,7 +76,7 @@ pub(super) fn format_http_request(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_authority}\r\n\
          User-Agent: {APP_USER_AGENT}\r\n\
-         Connection: {connection}\r\n\
+         Connection: keep-alive\r\n\
          {range_header}\
          {volatile_headers}\
          \r\n"
@@ -104,7 +105,6 @@ async fn send_upstream_request(
         resume_offset,
         resume_if_range,
         volatile_cond,
-        ConnectionAction::KeepAlive,
     );
 
     let http_timeout = global_config().http_timeout;
@@ -352,6 +352,19 @@ impl UpstreamResponse {
         Ok(())
     }
 
+    /// A 3xx the drive follows (301/302/307/308) when the `Location` target
+    /// is allowed; the other redirects (303, 304 as a status, 300) are
+    /// relayed as-is.
+    pub(super) fn is_redirect(&self) -> bool {
+        matches!(
+            self.status_code,
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        )
+    }
+
     /// The body's fixed length, only when the response is length-delimited
     /// (`Content-Length`). `None` for chunked or close-delimited framing.
     pub(super) fn content_length(&self) -> Option<u64> {
@@ -586,6 +599,22 @@ fn upstream_read_timeout(phase: &str, timeout: Duration) -> std::io::Error {
     )
 }
 
+/// One upstream body read under the `http_timeout` deadline, for the body
+/// readers below: a deadline hit surfaces as [`upstream_read_timeout`]
+/// tagged with `phase`. A `0` (EOF) is the caller's to interpret.
+async fn read_upstream_timed(
+    read: impl Future<Output = std::io::Result<usize>>,
+    phase: &str,
+    http_timeout: Duration,
+) -> std::io::Result<usize> {
+    match tokio::time::timeout(http_timeout, read).await {
+        Ok(result) => result,
+        Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+            Err(upstream_read_timeout(phase, http_timeout))
+        }
+    }
+}
+
 /// Forward remaining body bytes from upstream to client (no caching).
 /// Used for relaying bodies verbatim: non-200 responses on the cache path
 /// and any status via `splice_simple_proxy`.
@@ -612,24 +641,18 @@ async fn forward_upstream_body(
         );
         buf.clear();
         let to_read = std::cmp::min(remaining, TLS_READ_BUF_SIZE as u64);
-        let n = match tokio::time::timeout(
-            config.http_timeout,
+        let n = read_upstream_timed(
             (&mut *upstream).take(to_read).read_buf(&mut buf),
+            "body forward",
+            config.http_timeout,
         )
-        .await
-        {
-            Ok(Ok(0)) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "upstream closed before sending complete body",
-                ));
-            }
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(err),
-            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                return Err(upstream_read_timeout("body forward", config.http_timeout));
-            }
-        };
+        .await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "upstream closed before sending complete body",
+            ));
+        }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
@@ -668,14 +691,15 @@ async fn forward_upstream_body_until_eof(
 
     loop {
         buf.clear();
-        let n = match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut buf)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(err),
-            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                return Err(upstream_read_timeout("body forward", config.http_timeout));
-            }
-        };
+        let n = read_upstream_timed(
+            upstream.read_buf(&mut buf),
+            "body forward",
+            config.http_timeout,
+        )
+        .await?;
+        if n == 0 {
+            break;
+        }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
@@ -1005,22 +1029,18 @@ async fn forward_upstream_chunked_body(
     let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
     loop {
         buf.clear();
-        let n = match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut buf)).await {
-            Ok(Ok(0)) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "upstream closed during chunked body transfer",
-                ));
-            }
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(err),
-            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                return Err(upstream_read_timeout(
-                    "chunked body forward",
-                    config.http_timeout,
-                ));
-            }
-        };
+        let n = read_upstream_timed(
+            upstream.read_buf(&mut buf),
+            "chunked body forward",
+            config.http_timeout,
+        )
+        .await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "upstream closed during chunked body transfer",
+            ));
+        }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
@@ -1074,22 +1094,15 @@ async fn read_body_to_vec_until_eof(
         // already covers this.
         body.reserve(TLS_READ_BUF_SIZE.min(remaining));
 
-        let n = match tokio::time::timeout(
-            config.http_timeout,
+        let n = read_upstream_timed(
             (&mut *upstream).take(remaining as u64).read_buf(&mut body),
+            "volatile body buffering",
+            config.http_timeout,
         )
-        .await
-        {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(err),
-            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                return Err(upstream_read_timeout(
-                    "volatile body buffering",
-                    config.http_timeout,
-                ));
-            }
-        };
+        .await?;
+        if n == 0 {
+            break;
+        }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
@@ -1135,27 +1148,18 @@ async fn read_body_to_vec_with_content_length(
     while body.len() < content_length {
         let remaining = content_length - body.len();
         body.reserve(TLS_READ_BUF_SIZE.min(remaining));
-        let n = match tokio::time::timeout(
-            config.http_timeout,
+        let n = read_upstream_timed(
             (&mut *upstream).take(remaining as u64).read_buf(&mut body),
+            "length-delimited body buffering",
+            config.http_timeout,
         )
-        .await
-        {
-            Ok(Ok(0)) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "upstream closed before content-length body completed",
-                ));
-            }
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(err),
-            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                return Err(upstream_read_timeout(
-                    "length-delimited body buffering",
-                    config.http_timeout,
-                ));
-            }
-        };
+        .await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "upstream closed before content-length body completed",
+            ));
+        }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
@@ -1187,25 +1191,18 @@ async fn read_dechunk_body_to_vec(
     loop {
         let data = if pending.is_empty() {
             read_buf.clear();
-            let n =
-                match tokio::time::timeout(config.http_timeout, upstream.read_buf(&mut read_buf))
-                    .await
-                {
-                    Ok(Ok(0)) => {
-                        return Err(std::io::Error::new(
-                            ErrorKind::UnexpectedEof,
-                            "upstream closed during chunked body buffering",
-                        ));
-                    }
-                    Ok(Ok(n)) => n,
-                    Ok(Err(err)) => return Err(err),
-                    Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-                        return Err(upstream_read_timeout(
-                            "chunked body buffering",
-                            config.http_timeout,
-                        ));
-                    }
-                };
+            let n = read_upstream_timed(
+                upstream.read_buf(&mut read_buf),
+                "chunked body buffering",
+                config.http_timeout,
+            )
+            .await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "upstream closed during chunked body buffering",
+                ));
+            }
             metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
             check_upstream_read_rate(&mut rate_checker, n)?;
             &read_buf[..n]

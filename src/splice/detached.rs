@@ -22,7 +22,6 @@
 use std::num::NonZero;
 
 use bytes::BytesMut;
-use tracing::debug;
 
 use crate::cache_layout::ConnectionDetails;
 use crate::precise_instant::PreciseInstant;
@@ -30,7 +29,8 @@ use crate::precise_instant::PreciseInstant;
 use super::upstream::{ConnLabel, PoolGuard, UnconsumedBodyGuard};
 use super::{
     BodyTransferFailure, BodyTransferred, CacheTarget, CompletionClient, RateTimestamps,
-    commit_and_record, log_splice_completion, transfer_body, write_body_prefix_to_cache,
+    commit_and_record, log_download_start, log_splice_completion, transfer_body,
+    write_body_prefix_to_cache,
 };
 use crate::cache_conditional::ServeParams;
 
@@ -99,11 +99,12 @@ impl DetachedDownload {
         let start = PreciseInstant::now();
         let mut rates = RateTimestamps::new(request_sent_at);
 
-        log_detached_start(
+        log_download_start(
             &conn_details,
             conn_label,
             resume_offset,
             total_content_length,
+            true,
         );
 
         if write_body_prefix_to_cache(
@@ -178,36 +179,5 @@ impl DetachedDownload {
                 CompletionClient::Nudged,
             );
         }
-    }
-}
-
-/// The debug line opening a nudged download's serve.
-///
-/// Mirrors `log_download_start`'s two shapes, but this download never had a
-/// client attached: it says "after nudging client" rather than "serving ...
-/// for client", since that client already moved on to its retry.
-fn log_detached_start(
-    conn_details: &ConnectionDetails,
-    conn_label: ConnLabel,
-    resume_offset: u64,
-    total_content_length: NonZero<u64>,
-) {
-    if resume_offset > 0 {
-        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-        let resume_percent = resume_offset as f32 / total_content_length.get() as f32 * 100.0;
-
-        debug!(
-            "splice proxy{conn_label}: resuming {} from mirror {} after nudging client {} at byte {} ({:.1}%)...",
-            conn_details.debname,
-            conn_details.mirror,
-            conn_details.client,
-            resume_offset,
-            resume_percent
-        );
-    } else {
-        debug!(
-            "splice proxy{conn_label}: downloading {} from mirror {} after nudging client {}...",
-            conn_details.debname, conn_details.mirror, conn_details.client
-        );
     }
 }

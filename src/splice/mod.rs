@@ -15,8 +15,7 @@
 //! - [`http`]: request formatting, response-head parsing into
 //!   `UpstreamResponse`, the `BodyFraming` relays and the chunked decoder.
 //! - [`acquire`]: standard connect with retry/backoff, redirect and
-//!   partial-discard reconnects, folded into `UpstreamExchange` by
-//!   `acquire_upstream`.
+//!   partial-discard reconnects, each yielding an `UpstreamExchange`.
 //! - [`body`]: the zero-copy and userspace-TLS body loops on `BodyTransfer`,
 //!   client demotion to file serving, pipe helpers.
 //! - [`detached`]: the client-less download the parallel-download hack's
@@ -93,16 +92,16 @@ use crate::{
     cache_metadata::{self, write_upstream_metadata},
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     global_cache_quota, global_config, global_verify_throttle, info_or_warn, metrics,
-    static_assert, warn_once_or_info, warn_once_or_info_logged,
+    static_assert, warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
 };
 
 use acquire::{
-    UpstreamExchange, acquire_upstream, discard_partial_and_retry,
-    follow_redirect, warn_upstream_reject,
+    UpstreamExchange, discard_partial_and_retry, follow_redirect, standard_upstream_connect,
+    warn_upstream_reject,
 };
 use body::{
-    BodyOutcome, BodyTransferError, DeliveryResult, DemotedClientHandle, SpliceRangeFilter,
-    range_slice, splice_proxy_body, splice_proxy_body_tls,
+    BodyOutcome, BodyTransfer, BodyTransferError, DeliveryResult, DemotedClientHandle,
+    SpliceRangeFilter, range_slice, splice_proxy_body, splice_proxy_body_tls,
 };
 use detached::DetachedDownload;
 use http::UpstreamResponse;
@@ -134,6 +133,29 @@ struct ClientConn<'a> {
     stream: &'a TcpStream,
     version: ConnectionVersion,
     action: ConnectionAction,
+}
+
+impl ClientConn<'_> {
+    /// Answer the request with a proxy-generated error response; `phase`
+    /// tags a failed write.
+    async fn write_invalid(
+        self,
+        status: StatusCode,
+        msg: &'static str,
+        retry_after: Option<Duration>,
+        phase: &'static str,
+    ) -> Result<(), SpliceProxyError> {
+        write_invalid_response(
+            self.stream,
+            self.version,
+            self.action,
+            status,
+            msg,
+            retry_after,
+        )
+        .await
+        .map_err(SpliceProxyError::client(phase))
+    }
 }
 
 /// Maximum bytes to forward for volatile responses (no Content-Length / chunked non-cacheable).
@@ -237,42 +259,43 @@ async fn serve_volatile_304_via_sendfile(
         | SendfileResult::ClientError
         | SendfileResult::AfterHeaderError => Ok(()),
         SendfileResult::Invalid { status, msg } => {
-            write_invalid_response(
-                client.stream,
-                client.version,
-                client.action,
-                status,
-                msg,
-                None,
-            )
-            .await
-            .map_err(|err| SpliceProxyError::Client {
-                phase: invalid_tag,
-                err,
-            })?;
-            Ok(())
+            client.write_invalid(status, msg, None, invalid_tag).await
         }
     }
 }
 
-/// Resolve the client's parsed `Range` against the object's `total` size,
-/// answering the 416 on the client's behalf when it cannot be satisfied
-/// (`Ok(None)`; `phase_416` tags a failed 416 write).
+/// Resolve the client's `Range` against the object's `total` size, answering
+/// the 416 on the client's behalf when it cannot be satisfied (`Ok(None)`;
+/// `phase_416` tags a failed 416 write). `cache_time` and `etag` are what an
+/// `If-Range` is compared against. A malformed `Range` is served in full, as
+/// RFC 9110 allows, with a once-gated warn since a client expecting a resume
+/// then gets everything.
 async fn resolve_client_range(
     client: ClientConn<'_>,
-    parsed: Option<ParsedRange>,
+    conn_details: &ConnectionDetails,
+    client_range: RangeRequestHeaders<'_>,
     total: u64,
+    cache_time: HttpDate,
+    etag: Option<&str>,
     phase_416: &'static str,
 ) -> Result<Option<ServeParams>, SpliceProxyError> {
+    let parsed = client_range.range.map(|range| {
+        let parsed = http_parse_range(range, client_range.if_range, total, cache_time, etag);
+        if matches!(parsed, ParsedRange::Invalid) {
+            warn_once_or_debug!(
+                "splice proxy: ignoring malformed Range header `{}` from client {}; serving the full file",
+                range.escape_debug(),
+                conn_details.client
+            );
+        }
+        parsed
+    });
     if let Ok(plan) = ServeParams::from_parsed(parsed, total) {
         return Ok(Some(plan));
     }
     write_416_response(client.stream, client.version, client.action, total)
         .await
-        .map_err(|err| SpliceProxyError::Client {
-            phase: phase_416,
-            err,
-        })?;
+        .map_err(SpliceProxyError::client(phase_416))?;
     Ok(None)
 }
 
@@ -359,7 +382,7 @@ async fn write_splice_response_headers(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| SpliceProxyError::Client { phase, err })?;
+    .map_err(SpliceProxyError::client(phase))?;
     Ok(t_client_first)
 }
 
@@ -463,19 +486,14 @@ async fn prepare_cache_target(
         ) {
             Ok(r) => r,
             Err(_err @ QuotaExceeded) => {
-                write_invalid_response(
-                    client.stream,
-                    client.version,
-                    client.action,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Disk quota reached",
-                    None,
-                )
-                .await
-                .map_err(|err| SpliceProxyError::Client {
-                    phase: quota_phase,
-                    err,
-                })?;
+                client
+                    .write_invalid(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Disk quota reached",
+                        None,
+                        quota_phase,
+                    )
+                    .await?;
                 return Ok(None);
             }
         }
@@ -511,19 +529,14 @@ async fn prepare_cache_target(
                     "splice proxy: partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd; aborting the resume and returning 500",
                     conn_details.debname, conn_details.mirror
                 );
-                write_invalid_response(
-                    client.stream,
-                    client.version,
-                    client.action,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Cache Access Failure",
-                    None,
-                )
-                .await
-                .map_err(|err| SpliceProxyError::Client {
-                    phase: "partial-size mismatch 500",
-                    err,
-                })?;
+                client
+                    .write_invalid(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Cache Access Failure",
+                        None,
+                        "partial-size mismatch 500",
+                    )
+                    .await?;
                 return Ok(None);
             }
             (file, guard)
@@ -825,19 +838,14 @@ async fn reject_if_verify_throttled(
         HumanFmt::Time(throttled.remaining)
     );
     metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-    write_invalid_response(
-        client.stream,
-        client.version,
-        client.action,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Recently failed checksum verification",
-        Some(throttled.remaining),
-    )
-    .await
-    .map_err(|err| SpliceProxyError::Client {
-        phase: "verify-throttle 503",
-        err,
-    })?;
+    client
+        .write_invalid(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Recently failed checksum verification",
+            Some(throttled.remaining),
+            "verify-throttle 503",
+        )
+        .await?;
     Ok(true)
 }
 
@@ -943,13 +951,7 @@ async fn plan_upstream_response(
     volatile_cond: Option<&VolatileCondHeaders>,
     volatile_cache_path: Option<PathBuf>,
 ) -> Result<DownloadPlan<PathBuf>, SpliceProxyError> {
-    let redirect = if matches!(
-        exchange.response.status_code,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    ) {
+    let redirect = if exchange.response.is_redirect() {
         follow_redirect(
             exchange,
             conn_details,
@@ -1094,10 +1096,7 @@ async fn relay_passthrough(
         WritePhase::Header,
     )
     .await
-    .map_err(|err| SpliceProxyError::Client {
-        phase: "passthrough headers",
-        err,
-    })?;
+    .map_err(SpliceProxyError::client("passthrough headers"))?;
 
     // Forward the body that arrived with the headers plus the rest,
     // framed per the upstream's (precedence-resolved) framing.
@@ -1105,10 +1104,7 @@ async fn relay_passthrough(
         .framing
         .relay_to_client(upstream, client.stream, body_prefix, VOLATILE_BODY_MAX)
         .await
-        .map_err(|err| SpliceProxyError::AfterHeader {
-            phase: "passthrough body",
-            side: AfterHeaderSide::Client(err),
-        })?;
+        .map_err(SpliceProxyError::after_header_client("passthrough body"))?;
 
     metrics::SERVED_PASSTHROUGH.increment();
     metrics::SERVED_TOTAL.increment();
@@ -1127,20 +1123,14 @@ async fn reject_upstream_response(
     reason.record_metrics();
     warn_upstream_reject(reason, conn_details);
     upstream.unset_poolable();
-    write_invalid_response(
-        client.stream,
-        client.version,
-        client.action,
-        StatusCode::BAD_GATEWAY,
-        reason.body(),
-        None,
-    )
-    .await
-    .map_err(|err| SpliceProxyError::Client {
-        phase: "upstream reject 502",
-        err,
-    })?;
-    Ok(())
+    client
+        .write_invalid(
+            StatusCode::BAD_GATEWAY,
+            reason.body(),
+            None,
+            "upstream reject 502",
+        )
+        .await
 }
 
 /// The bytes the splice loop has to move once the body prefix that arrived
@@ -1173,19 +1163,28 @@ async fn splice_body_count(
     Ok(None)
 }
 
-/// The debug line opening a download's serve.
+/// The debug line opening a download. A served download reads "downloading
+/// and serving ... for client ..."; a nudged one (`detached`) never had a
+/// client attached and reads "downloading ... after nudging client ...",
+/// since that client already moved on to its retry.
 fn log_download_start(
     conn_details: &ConnectionDetails,
     conn_label: ConnLabel,
     resume_offset: u64,
     total_content_length: NonZero<u64>,
+    nudged: bool,
 ) {
+    let (serving, client) = if nudged {
+        ("", " after nudging client")
+    } else {
+        (" and serving", " for client")
+    };
     if resume_offset > 0 {
         #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
         let resume_percent = resume_offset as f32 / total_content_length.get() as f32 * 100.0;
 
         debug!(
-            "splice proxy{conn_label}: resuming and serving {} from mirror {} for client {} at byte {} ({:.1}%)...",
+            "splice proxy{conn_label}: resuming{serving} {} from mirror {}{client} {} at byte {} ({:.1}%)...",
             conn_details.debname,
             conn_details.mirror,
             conn_details.client,
@@ -1194,7 +1193,7 @@ fn log_download_start(
         );
     } else {
         debug!(
-            "splice proxy{conn_label}: downloading and serving {} from mirror {} for client {}...",
+            "splice proxy{conn_label}: downloading{serving} {} from mirror {}{client} {}...",
             conn_details.debname, conn_details.mirror, conn_details.client
         );
     }
@@ -1268,32 +1267,37 @@ async fn write_body_prefix_to_cache(
 
     // The bytes are already in our hands, so the cache file is the source of
     // truth that other clients read from; the caller only attempts its
-    // client write after this returned.
-    // `tokio::fs::File::write_all` only queues the write on the blocking
-    // pool; the follow-up `flush` waits for it, so a failure (e.g. disk
-    // full) surfaces HERE at the classified site. Without it the error
-    // stays parked in the file handle -- `sync_all` at commit time never
-    // reports a deferred write error -- and a truncated file would be
-    // renamed in as a success. Flushing before the splice loop also keeps
-    // the queued write from racing the loop's raw `splice(2)` appends to the
-    // same fd.
-    let write_res = match target.tempfile.write_all(body_prefix).await {
-        Ok(()) => target.tempfile.flush().await,
-        Err(err) => Err(err),
-    };
-    write_res.map_err(|err| SpliceProxyError::AfterHeader {
-        phase: "body prefix to cache",
-        side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
-            "splice proxy: failed to write body prefix to cache file `{}`; {consequence}:  {}",
-            target.temppath.display(),
-            ErrorReport(&err)
-        ))),
-    })?;
+    // client write after this returned. Flushing before the splice loop also
+    // keeps the queued write from racing the loop's raw `splice(2)` appends
+    // to the same fd.
+    write_all_flushed(&mut target.tempfile, body_prefix)
+        .await
+        .map_err(|err| SpliceProxyError::AfterHeader {
+            phase: "body prefix to cache",
+            side: AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
+                "splice proxy: failed to write body prefix to cache file `{}`; {consequence}:  {}",
+                target.temppath.display(),
+                ErrorReport(&err)
+            ))),
+        })?;
 
     // Notify concurrent clients of progress.
     target.dbarrier.ping();
 
     Ok(())
+}
+
+/// Write `bytes` to a cache temp file and wait for them to land.
+///
+/// `tokio::fs::File::write_all` only queues the write on the blocking pool;
+/// the follow-up `flush` waits for it, so a failure (e.g. disk full)
+/// surfaces at the caller's classified site. Without it the error stays
+/// parked in the file handle -- `sync_all` at commit time never reports a
+/// deferred write error -- and a truncated file would be renamed in as a
+/// success.
+async fn write_all_flushed(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    file.write_all(bytes).await?;
+    file.flush().await
 }
 
 /// Cache the body prefix ([`write_body_prefix_to_cache`]), then write the
@@ -1459,32 +1463,20 @@ async fn transfer_body(
     // rename step; on a structured rate-timeout it's already consumed into
     // `Aborted(MirrorDownloadRate)`; on any other io::Error it's dropped
     // inside the callee and the Drop impl records `AlreadyLoggedJustFail`.
-    let outcome = if let Some(zero_copy_upstream) = upstream_guard.zero_copy() {
+    let xfer = BodyTransfer::new(
+        client_stream,
+        target.dbarrier,
+        &range_filter,
+        &target.temppath,
+        splice_count,
+        body_offset,
+    );
+    let outcome = if let Some(tcp) = upstream_guard.zero_copy() {
         // Zero-copy path for plain TCP
-        splice_proxy_body(
-            zero_copy_upstream,
-            client_stream,
-            &target.tempfile,
-            splice_count,
-            body_offset,
-            target.dbarrier,
-            &range_filter,
-            &target.temppath,
-        )
-        .await
+        splice_proxy_body(xfer, tcp, &target.tempfile).await
     } else {
-        // TLS: userspace read, then tee+splice fan-out
-        splice_proxy_body_tls(
-            upstream_guard,
-            client_stream,
-            &target.tempfile,
-            splice_count,
-            body_offset,
-            target.dbarrier,
-            &range_filter,
-            &target.temppath,
-        )
-        .await
+        // TLS: userspace read, then direct cache write and client write
+        splice_proxy_body_tls(xfer, upstream_guard, &target.tempfile).await
     };
     // Any body-transfer error leaves the upstream mid-message (fewer
     // than content_length bytes consumed), so the socket still holds
@@ -1608,15 +1600,19 @@ async fn splice_proxy_drive(
         read_volatile_validators(conn_details).await?.unzip();
 
     // --- Prepare upstream connection ---
-    let mut exchange = acquire_upstream(
-        conn_details,
+    // Dial the host the client named; `conn_details.mirror` is the
+    // canonical cache identity, which may be an alias' main host.
+    let mut exchange = standard_upstream_connect(
+        &conn_details.upstream_mirror(),
         &host_authority,
         upstream_path,
         resume.offset,
         resume.if_range.as_deref(),
         volatile_cond.as_ref(),
+        None,
     )
-    .await?;
+    .await
+    .map_err(SpliceProxyError::Upstream)?;
 
     let plan = plan_upstream_response(
         &mut exchange,
@@ -1718,8 +1714,7 @@ async fn splice_proxy_drive(
                 conn_details,
                 original_uri_path,
                 &upstream_resp,
-                &header_buf,
-                header_end,
+                &header_buf[header_end..],
                 ibarrier,
                 client_range,
                 conn_label,
@@ -1735,24 +1730,19 @@ async fn splice_proxy_drive(
     // `consumed()` once the body is fully read.
     let mut upstream_guard = UnconsumedBodyGuard::new(&mut upstream);
 
-    let client_range_result = client_range.range.map(|range| {
-        let cache_time = upstream_resp
-            .last_modified
-            .as_deref()
-            .and_then(HttpDate::parse)
-            .unwrap_or(HttpDate::UNIX_EPOCH);
-        http_parse_range(
-            range,
-            client_range.if_range,
-            total_content_length.get(),
-            cache_time,
-            upstream_resp.etag.as_deref(),
-        )
-    });
+    // `If-Range` compares against the validators this response carries.
+    let cache_time = upstream_resp
+        .last_modified
+        .as_deref()
+        .and_then(HttpDate::parse)
+        .unwrap_or(HttpDate::UNIX_EPOCH);
     let Some(range_plan) = resolve_client_range(
         client,
-        client_range_result,
+        conn_details,
+        client_range,
         total_content_length.get(),
+        cache_time,
+        upstream_resp.etag.as_deref(),
         "416 response",
     )
     .await?
@@ -1842,10 +1832,7 @@ async fn splice_proxy_drive(
             )
             .await
             .map(|()| SpliceProxyOutcome::Served)
-            .map_err(|err| SpliceProxyError::Client {
-                phase: "parallel hack nudge",
-                err,
-            });
+            .map_err(SpliceProxyError::client("parallel hack nudge"));
     }
 
     let start = PreciseInstant::now();
@@ -1859,6 +1846,7 @@ async fn splice_proxy_drive(
         conn_label,
         resume_offset,
         total_content_length,
+        false,
     );
 
     // Cork the socket to coalesce headers + body prefix into fewer TCP segments
@@ -2064,6 +2052,22 @@ pub(crate) enum SpliceProxyError {
         phase: &'static str,
         side: AfterHeaderSide,
     },
+}
+
+impl SpliceProxyError {
+    /// [`Self::Client`] for a failed write in `phase`, as a `map_err` closure.
+    fn client(phase: &'static str) -> impl FnOnce(std::io::Error) -> Self {
+        move |err| Self::Client { phase, err }
+    }
+
+    /// [`Self::AfterHeader`] on the client side for a failed write in
+    /// `phase`, as a `map_err` closure.
+    fn after_header_client(phase: &'static str) -> impl FnOnce(std::io::Error) -> Self {
+        move |err| Self::AfterHeader {
+            phase,
+            side: AfterHeaderSide::Client(err),
+        }
+    }
 }
 
 /// A failed upstream connect / request / header read, see

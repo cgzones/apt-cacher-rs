@@ -1,6 +1,5 @@
 //! Upstream connection plumbing for the splice proxy: the [`UpstreamConn`]
-//! enum (plain TCP, userspace TLS, kernel TLS) with its [`TlsMode`] and
-//! [`ConnLabel`] log rendering, the per-host idle pool behind [`PoolGuard`]
+//! enum (plain TCP, userspace TLS) with its [`ConnLabel`] log rendering, the per-host idle pool behind [`PoolGuard`]
 //! and [`UnconsumedBodyGuard`], the TCP/TLS connect helpers
 //! ([`connect_upstream`], [`tcp_connect`], `tls_connect`) and the
 //! [`ConnectError`]/[`Transience`] classification consumed by the retry
@@ -19,6 +18,7 @@ use std::{
     pin::Pin,
     sync::OnceLock,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use hashbrown::hash_map::EntryRef;
@@ -46,15 +46,10 @@ const POOL_MAX_IDLE_PER_HOST: usize = 4;
 
 /// Buffer size for TLS upstream reads: the `super::http` head scanners and
 /// buffered-body collectors, and the userspace-TLS body loop
-/// (`super::body::splice_proxy_body_tls`).  TLS records are at most 16 KiB,
-/// so a larger buffer amortizes the per-chunk read — 256 KiB costs one
-/// allocation per read site, and these sites are short and numerous.
-///
-/// Raising it for the body loop alone would buy nothing: that loop awaits
-/// one `read_buf` and writes the result immediately, and one `poll_read` on
-/// a `TlsStream` yields about one TLS record however much capacity is
-/// offered.  Only an accumulation loop (the userspace mirror of the
-/// `pipe_A` batching) would turn capacity into fewer `pwrite` handoffs.
+/// (`super::body::splice_proxy_body_tls`).  One `poll_read` on a `TlsStream`
+/// yields about one 16 KiB TLS record however much capacity is offered, so
+/// the body loop accumulates several reads into this buffer before each
+/// `pwrite` and client write; 256 KiB costs one allocation per read site.
 pub(super) const TLS_READ_BUF_SIZE: usize = 256 * 1024;
 
 #[cfg_attr(
@@ -70,44 +65,22 @@ pub(super) enum UpstreamConn {
     Tls(#[pin] TlsStream),
 }
 
-/// How an [`UpstreamConn`] is encrypted. Derived from the variant on demand,
-/// never cached, so it cannot drift from the socket it describes.
-#[derive(Clone, Copy)]
-pub(super) enum TlsMode {
-    /// Plain TCP.
-    Plain,
-    /// TLS terminated in userspace by [`TlsStream`].
-    Userspace,
-}
-
-/// An upstream socket whose receive queue holds plaintext the kernel can
-/// `splice(2)` straight into a pipe: plain TCP. Obtained via
-/// [`UpstreamConn::zero_copy`]; userspace TLS never yields one.
-#[derive(Clone, Copy)]
-pub(super) struct ZeroCopyUpstream<'a> {
-    pub(super) tcp: &'a TcpStream,
-}
-
-/// Log suffix naming an exchange's connection flavour -- [`TlsMode`] plus
+/// Log suffix naming an exchange's connection flavour -- TLS or plain, plus
 /// pool reuse -- as in `" (TLS, reused)"`; empty for a fresh plain connection.
 #[derive(Clone, Copy)]
 pub(super) struct ConnLabel {
-    pub(super) mode: TlsMode,
+    pub(super) tls: bool,
     pub(super) reused: bool,
 }
 
 impl std::fmt::Display for ConnLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { mode, reused } = *self;
-        let mode = match mode {
-            TlsMode::Plain => None,
-            TlsMode::Userspace => Some("TLS"),
-        };
-        match (mode, reused) {
-            (None, false) => Ok(()),
-            (None, true) => f.write_str(" (reused)"),
-            (Some(mode), false) => write!(f, " ({mode})"),
-            (Some(mode), true) => write!(f, " ({mode}, reused)"),
+        let Self { tls, reused } = *self;
+        match (tls, reused) {
+            (false, false) => Ok(()),
+            (false, true) => f.write_str(" (reused)"),
+            (true, false) => f.write_str(" (TLS)"),
+            (true, true) => f.write_str(" (TLS, reused)"),
         }
     }
 }
@@ -165,29 +138,21 @@ impl AsyncWrite for UpstreamConn {
 }
 
 impl UpstreamConn {
-    /// How this connection is encrypted.
-    #[must_use]
-    pub(super) const fn tls_mode(&self) -> TlsMode {
-        match self {
-            Self::Tcp(_) => TlsMode::Plain,
-            Self::Tls(_) => TlsMode::Userspace,
-        }
-    }
-
-    /// Whether the connection is encrypted: decides the upstream port and
-    /// the pool key.
+    /// Whether the connection is encrypted: decides the upstream port, the
+    /// pool key and the log label. Derived from the variant on demand, never
+    /// cached, so it cannot drift from the socket it describes.
     #[must_use]
     pub(super) const fn is_tls(&self) -> bool {
-        !matches!(self.tls_mode(), TlsMode::Plain)
+        matches!(self, Self::Tls(_))
     }
 
     /// The socket to `splice(2)` the response body from, when the kernel
     /// hands out plaintext (plain TCP). `None` for userspace TLS, whose
     /// plaintext only ever exists in this process.
     #[must_use]
-    pub(super) const fn zero_copy(&self) -> Option<ZeroCopyUpstream<'_>> {
+    pub(super) const fn zero_copy(&self) -> Option<&TcpStream> {
         match self {
-            Self::Tcp(tcp) => Some(ZeroCopyUpstream { tcp }),
+            Self::Tcp(tcp) => Some(tcp),
             Self::Tls(_) => None,
         }
     }
@@ -487,7 +452,10 @@ impl ConnectError {
 ///
 /// Pass the kind of the *original* error, before it is wrapped: a wrapper
 /// reports its own kind and keeps the cause behind `source()`. Split out of
-/// [`ConnectError`] so it stays unit-testable.
+/// [`ConnectError`] so it stays unit-testable. The native-tls backend has no
+/// kinds to classify (its error is opaque) and treats every failure as
+/// transient.
+#[cfg(feature = "tls_rustls")]
 const fn classify_tls_error(kind: ErrorKind) -> Transience {
     if matches!(kind, ErrorKind::InvalidData | ErrorKind::InvalidInput) {
         Transience::Permanent
@@ -631,6 +599,18 @@ pub(super) async fn tcp_connect(host: &str, port: u16) -> std::io::Result<TcpStr
         })
 }
 
+/// The error a TLS handshake that outlived `http_timeout` fails with.
+fn handshake_timed_out(http_timeout: Duration) -> ConnectError {
+    metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
+    ConnectError::transient(std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!(
+            "TLS handshake timed out after {}",
+            HumanFmt::Time(http_timeout)
+        ),
+    ))
+}
+
 /// Perform TLS handshake over an established TCP connection.
 ///
 /// Times out after the configured HTTP timeout.
@@ -652,16 +632,7 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
     let http_timeout = global_config().http_timeout;
     let tls_stream = tokio::time::timeout(http_timeout, connector.connect(server_name, tcp))
         .await
-        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
-            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            ConnectError::transient(std::io::Error::new(
-                ErrorKind::TimedOut,
-                format!(
-                    "TLS handshake timed out after {}",
-                    HumanFmt::Time(http_timeout)
-                ),
-            ))
-        })?
+        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| handshake_timed_out(http_timeout))?
         .map_err(|err| {
             // Classify before wrapping: the wrapper keeps the cause on
             // `source()`, and only the original kind tells a certificate
@@ -694,24 +665,12 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
     let http_timeout = global_config().http_timeout;
     let tls_stream = tokio::time::timeout(http_timeout, connector.connect(host, tcp))
         .await
-        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| {
-            metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
-            ConnectError::transient(std::io::Error::new(
-                ErrorKind::TimedOut,
-                format!(
-                    "TLS handshake timed out after {}",
-                    HumanFmt::Time(http_timeout)
-                ),
-            ))
-        })?
-        .map_err(|err| {
-            // `native_tls::Error` is opaque: it carries no `io::ErrorKind`, so a
-            // certificate rejection is indistinguishable from a transport error
-            // and lands on `ErrorKind::Other`. Classify conservatively (i.e.
-            // transient, keep retrying) rather than guess from the message.
-            let err = std::io::Error::other(err);
-            ConnectError::new(classify_tls_error(err.kind()), err)
-        })?;
+        .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| handshake_timed_out(http_timeout))?
+        // `native_tls::Error` is opaque: it carries no `io::ErrorKind`, so a
+        // certificate rejection is indistinguishable from a transport error.
+        // Classify conservatively (transient, keep retrying) rather than
+        // guess from the message.
+        .map_err(|err| ConnectError::transient(std::io::Error::other(err)))?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
 }
@@ -725,14 +684,15 @@ mod tests {
 
     #[test]
     fn conn_label_renders_the_log_suffixes() {
-        let label = |mode, reused| ConnLabel { mode, reused }.to_string();
-        assert_eq!(label(TlsMode::Plain, false), "");
-        assert_eq!(label(TlsMode::Plain, true), " (reused)");
-        assert_eq!(label(TlsMode::Userspace, false), " (TLS)");
-        assert_eq!(label(TlsMode::Userspace, true), " (TLS, reused)");
+        let label = |tls, reused| ConnLabel { tls, reused }.to_string();
+        assert_eq!(label(false, false), "");
+        assert_eq!(label(false, true), " (reused)");
+        assert_eq!(label(true, false), " (TLS)");
+        assert_eq!(label(true, true), " (TLS, reused)");
     }
 
     #[test]
+    #[cfg(feature = "tls_rustls")]
     fn classify_tls_error_marks_deterministic_kinds_permanent() {
         // rustls surfaces a rejected certificate chain as InvalidData and an
         // unparsable server name as InvalidInput; both repeat identically.
@@ -749,6 +709,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tls_rustls")]
     fn classify_tls_error_marks_network_kinds_transient() {
         for kind in [
             ErrorKind::TimedOut,

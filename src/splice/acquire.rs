@@ -2,18 +2,16 @@
 //! [`standard_upstream_connect`] owns the retry/backoff envelope over pool
 //! checkout + connect + send + read-headers, [`follow_redirect`] and
 //! [`discard_partial_and_retry`] replace the exchange on a redirect or a
-//! non-resumable partial, and [`acquire_upstream`] is the drive's entry to
-//! all of it. The result is an [`UpstreamExchange`] (connection, parsed
-//! head, header buffer and body-prefix boundary).
+//! non-resumable partial. The result is an [`UpstreamExchange`] (connection,
+//! parsed head, header buffer and body-prefix boundary).
 //!
-//! Consumers: the drive in `mod.rs` (`acquire_upstream`, the reconnect
-//! helpers, `warn_upstream_reject`), `simple_proxy` and `cleanup_bridge`
-//! (`standard_upstream_connect`).
+//! Consumers: the drive in `mod.rs`, `simple_proxy` and `cleanup_bridge`
+//! (`standard_upstream_connect`), plus the drive's reconnect helpers and
+//! `warn_upstream_reject`.
 
 use std::num::NonZero;
 
 use bytes::BytesMut;
-use http::StatusCode;
 use tracing::debug;
 
 use crate::cache_layout::ConnectionDetails;
@@ -29,7 +27,9 @@ use crate::{
 };
 
 use super::http::{UpstreamResponse, send_and_read_headers};
-use super::upstream::{ConnLabel, PoolGuard, connect_upstream, mirror_port, pool_checkout};
+use super::upstream::{
+    ConnLabel, PoolGuard, UpstreamConn, connect_upstream, mirror_port, pool_checkout,
+};
 use super::{SpliceProxyError, UpstreamFailure, VolatileCondHeaders};
 
 /// One upstream request/response in flight: the pool-guarded connection the
@@ -48,6 +48,26 @@ pub(super) struct UpstreamExchange {
 }
 
 impl UpstreamExchange {
+    /// Wrap the head [`send_and_read_headers`] returned on `conn` into an
+    /// exchange; the connection is poolable unless the head said
+    /// `Connection: close`.
+    fn new(
+        conn: UpstreamConn,
+        mirror: &Mirror,
+        port: u16,
+        (response, header_buf, header_end): (UpstreamResponse, BytesMut, usize),
+        reused: bool,
+    ) -> Self {
+        let poolable = !response.connection_close;
+        Self {
+            conn: PoolGuard::new(conn, mirror.host().to_string(), port, poolable),
+            response,
+            header_buf,
+            header_end,
+            reused,
+        }
+    }
+
     /// Log suffix naming this exchange's connection flavour.
     #[must_use]
     pub(super) fn label(&self) -> ConnLabel {
@@ -59,7 +79,7 @@ impl UpstreamExchange {
             reused,
         } = self;
         ConnLabel {
-            mode: conn.tls_mode(),
+            tls: conn.is_tls(),
             reused: *reused,
         }
     }
@@ -119,16 +139,9 @@ pub(super) async fn standard_upstream_connect(
                 )
                 .await
                 {
-                    Ok((resp, hdr_buf, hdr_end)) => {
-                        let poolable = !resp.connection_close;
+                    Ok(head) => {
                         metrics::POOL_REUSED.increment();
-                        return Ok(UpstreamExchange {
-                            conn: PoolGuard::new(pooled, mirror.host().to_string(), port, poolable),
-                            response: resp,
-                            header_buf: hdr_buf,
-                            header_end: hdr_end,
-                            reused: true,
-                        });
+                        return Ok(UpstreamExchange::new(pooled, mirror, port, head, true));
                     }
                     Err(err) => {
                         metrics::POOL_MISS_FAILED.increment();
@@ -236,9 +249,7 @@ pub(super) async fn standard_upstream_connect(
         }
     }
 
-    let is_tls = up.is_tls();
-
-    let (resp, hdr_buf, hdr_end) = send_and_read_headers(
+    let head = send_and_read_headers(
         &mut up,
         host_authority,
         upstream_path,
@@ -255,15 +266,8 @@ pub(super) async fn standard_upstream_connect(
         UpstreamFailure { err, logged }
     })?;
 
-    let poolable = !resp.connection_close;
-    let port = mirror_port(mirror, is_tls);
-    Ok(UpstreamExchange {
-        conn: PoolGuard::new(up, mirror.host().to_string(), port, poolable),
-        response: resp,
-        header_buf: hdr_buf,
-        header_end: hdr_end,
-        reused: false,
-    })
+    let port = mirror_port(mirror, up.is_tls());
+    Ok(UpstreamExchange::new(up, mirror, port, head, false))
 }
 
 /// Where a followed redirect landed: the mirror the retry/resume logic must
@@ -466,44 +470,8 @@ pub(super) async fn discard_partial_and_retry(
     // redirect handling already ran on the original (now-discarded) response, so
     // follow one redirect here if the retry also lands on a 3xx (the retry is
     // always a fresh full request: resume_offset=0, no If-Range/volatile cond).
-    if matches!(
-        exchange.response.status_code,
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    ) {
+    if exchange.response.is_redirect() {
         follow_redirect(exchange, conn_details, upstream_path, 0, None, None).await?;
     }
     Ok(())
-}
-
-/// Acquire the upstream exchange for a cache-miss download:
-/// [`standard_upstream_connect`] dialing the host the client named.
-///
-/// Times out after the configured HTTP timeout.
-pub(super) async fn acquire_upstream(
-    conn_details: &ConnectionDetails,
-    host_authority: &str,
-    upstream_path: &str,
-    resume_offset: u64,
-    resume_if_range: Option<&str>,
-    volatile_cond: Option<&VolatileCondHeaders>,
-) -> Result<UpstreamExchange, SpliceProxyError> {
-    // Dial the host the client named; `conn_details.mirror` is the
-    // canonical cache identity, which may be an alias' main host.
-    let dial_mirror = conn_details.upstream_mirror();
-    let mirror = &dial_mirror;
-
-    standard_upstream_connect(
-        mirror,
-        host_authority,
-        upstream_path,
-        resume_offset,
-        resume_if_range,
-        volatile_cond,
-        None,
-    )
-    .await
-    .map_err(SpliceProxyError::Upstream)
 }

@@ -7,15 +7,13 @@
 use std::num::NonZero;
 
 use http::StatusCode;
-use tokio::io::AsyncWriteExt as _;
 use tracing::{debug, error};
 
 use crate::cache_conditional::RangeRequestHeaders;
 use crate::cache_layout::ConnectionDetails;
 use crate::error::ErrorReport;
 use crate::guards::InitBarrier;
-use crate::http_helpers::write_invalid_response;
-use crate::http_range::{HttpDate, ParsedRange, http_parse_range};
+use crate::http_range::HttpDate;
 use crate::partial_file;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
@@ -23,15 +21,15 @@ use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::tcp_cork_guard::CorkGuard;
 use crate::{
     client_counter, global_config, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics,
-    warn_once, warn_once_or_debug, warn_once_or_info_logged,
+    warn_once, warn_once_or_info_logged,
 };
 
 use super::http::{BodyFraming, UpstreamResponse};
 use super::upstream::{ConnLabel, PoolGuard};
 use super::{
-    AfterHeaderSide, ClientConn, CompletionClient, RateTimestamps, SpliceProxyError,
-    UpstreamFailure, commit_and_record, log_splice_completion, prepare_cache_target,
-    record_delivery, resolve_client_range, write_splice_response_headers,
+    ClientConn, CompletionClient, RateTimestamps, SpliceProxyError, UpstreamFailure,
+    commit_and_record, log_splice_completion, prepare_cache_target, record_delivery,
+    resolve_client_range, write_all_flushed, write_splice_response_headers,
 };
 
 /// Handle the full lifecycle for volatile files whose upstream response has no
@@ -50,8 +48,7 @@ pub(super) async fn handle_volatile_buffered_download(
     // and DB origin rows match the hyper backend.
     original_uri_path: &str,
     upstream_resp: &UpstreamResponse,
-    header_buf: &[u8],
-    header_end: usize,
+    body_prefix: &[u8],
     ibarrier: InitBarrier<'_>,
     client_range: RangeRequestHeaders<'_>,
     conn_label: ConnLabel,
@@ -60,7 +57,6 @@ pub(super) async fn handle_volatile_buffered_download(
         .get()
         .try_into()
         .expect("constant fits"); // TODO: const conversion once stable
-    let body_prefix = &header_buf[header_end..];
 
     // Capture t_req_sent before buffering so the upstream-rate window is never
     // inverted. The fallback is a pre-read now() so t_req_sent <= t_upstream_done.
@@ -104,19 +100,14 @@ pub(super) async fn handle_volatile_buffered_download(
             "splice proxy: zero-length volatile body for {} from mirror {}",
             conn_details.debname, conn_details.mirror
         );
-        write_invalid_response(
-            client.stream,
-            client.version,
-            client.action,
-            StatusCode::BAD_GATEWAY,
-            "zero-length body",
-            None,
-        )
-        .await
-        .map_err(|err| SpliceProxyError::Client {
-            phase: "volatile zero-body 502",
-            err,
-        })?;
+        client
+            .write_invalid(
+                StatusCode::BAD_GATEWAY,
+                "zero-length body",
+                None,
+                "volatile zero-body 502",
+            )
+            .await?;
         return Ok(());
     };
 
@@ -125,31 +116,14 @@ pub(super) async fn handle_volatile_buffered_download(
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
 
-    let cache_time = HttpDate::now();
-    let client_range_result = client_range.range.map(|range| {
-        let parsed = http_parse_range(
-            range,
-            client_range.if_range,
-            total_content_length.get(),
-            cache_time,
-            upstream_resp.etag.as_deref(),
-        );
-        if matches!(parsed, ParsedRange::Invalid) {
-            // Same as the streaming path: RFC 9110 says ignore and serve the
-            // whole entity, but a client expecting a resume gets everything.
-            warn_once_or_debug!(
-                "splice proxy: ignoring malformed Range header `{}` from client {}; serving the full file",
-                range.escape_debug(),
-                conn_details.client
-            );
-        }
-        parsed
-    });
-
+    // The body was just fetched: an `If-Range` date is compared against now.
     let Some(range_plan) = resolve_client_range(
         client,
-        client_range_result,
+        conn_details,
+        client_range,
         total_content_length.get(),
+        HttpDate::now(),
+        upstream_resp.etag.as_deref(),
         "volatile 416 response",
     )
     .await?
@@ -181,15 +155,7 @@ pub(super) async fn handle_volatile_buffered_download(
     // already-downloaded body (late joiners and future requests keep it).
 
     // Write the full body to the cache temp file (best-effort).
-    // `tokio::fs::File::write_all` only queues the write on the blocking
-    // pool; the follow-up `flush` waits for it, so a failure (e.g. disk full)
-    // surfaces here -- `sync_all` below never reports a deferred write error,
-    // and without the flush a truncated file would be committed as a success.
-    let write_res = match target.tempfile.write_all(&body).await {
-        Ok(()) => target.tempfile.flush().await,
-        Err(err) => Err(err),
-    };
-    let cache_write_ok = match write_res {
+    let cache_write_ok = match write_all_flushed(&mut target.tempfile, &body).await {
         Ok(()) => true,
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
@@ -250,10 +216,9 @@ pub(super) async fn handle_volatile_buffered_download(
             config.http_timeout,
         )
         .await
-        .map_err(|err| SpliceProxyError::AfterHeader {
-            phase: "volatile body to client",
-            side: AfterHeaderSide::Client(err),
-        })?;
+        .map_err(SpliceProxyError::after_header_client(
+            "volatile body to client",
+        ))?;
         metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
         rates.client_bytes_sent += body_slice.len() as u64;
     }
