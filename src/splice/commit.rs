@@ -33,6 +33,7 @@
 //! Cancellation drops the verdict sender, so the commit continues and the
 //! reporter treats the delivery as lost.
 
+use std::fmt;
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -467,34 +468,39 @@ fn log_splice_completion(
         ""
     };
     let upstream = rate_log::upstream_segment(upstream_bytes, rates.upstream_window());
-    let (event, segments) = match client {
+    let (event, client_segment) = match client {
         CompletionClient::Served(Served { bytes, partial: _ }) => (
             "Served and cached",
-            format!(
-                "{upstream}, {}",
-                rate_log::client_segment(bytes, rates.client_window())
-            ),
+            Some(rate_log::client_segment(bytes, rates.client_window())),
         ),
         CompletionClient::Lost => (
             "Cached",
-            format!(
-                "{upstream}, {}",
-                rate_log::client_disconnect_segment(rates.client_bytes_sent, rates.client_window())
-            ),
+            Some(rate_log::client_disconnect_segment(
+                rates.client_bytes_sent,
+                rates.client_window(),
+            )),
         ),
-        CompletionClient::Nudged => ("Finished download of", upstream),
+        CompletionClient::Nudged => ("Finished download of", None),
     };
+    let segments = fmt::from_fn(|f| {
+        write!(f, "{upstream}")?;
+        if let Some(client) = client_segment {
+            write!(f, ", {client}")?;
+        }
+        Ok(())
+    });
+    let resume = fmt::from_fn(|f| {
+        if resume_offset > 0 {
+            write!(f, ", resumed from {}", HumanFmt::Size(resume_offset))?;
+        }
+        Ok(())
+    });
     info!(
-        "{event} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({segments}){}",
+        "{event} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({segments}){resume}",
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
         HumanFmt::Time(in_time),
-        if resume_offset > 0 {
-            format!(", resumed from {}", HumanFmt::Size(resume_offset))
-        } else {
-            String::new()
-        },
     );
 }
 

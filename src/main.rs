@@ -229,7 +229,8 @@ impl std::io::Write for ReopenableLogFile {
     )]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         /* Deferred here so the swap happens on the single non-blocking worker thread. */
-        if self.reopen_requested.swap(false, Ordering::Relaxed)
+        if self.reopen_requested.load(Ordering::Relaxed)
+            && self.reopen_requested.swap(false, Ordering::Relaxed)
             && let Err(err) = self.reopen()
         {
             eprintln!(
@@ -243,7 +244,8 @@ impl std::io::Write for ReopenableLogFile {
 
     #[inline]
     fn flush(&mut self) -> std::io::Result<()> {
-        std::io::Write::flush(&mut *self.file.lock())
+        // File writes have no userspace buffer to flush. This is not fsync.
+        Ok(())
     }
 }
 
