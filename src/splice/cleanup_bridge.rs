@@ -19,6 +19,7 @@ use crate::fs_open::{
 };
 use crate::humanfmt::HumanFmt;
 use crate::limits;
+use crate::log_once::Logged;
 use crate::metrics;
 use crate::warn_once_or_info;
 use crate::{
@@ -28,7 +29,6 @@ use crate::{
     proxy_body::{ProxyCacheBody, full_body},
 };
 
-use super::UpstreamFailure;
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
 
 /// Empty-bodied response for the cleanup bridge (`packages.rs` only reads the
@@ -178,17 +178,18 @@ async fn cleanup_upstream_fetch(
             .await
         {
             Ok(v) => v,
-            Err(UpstreamFailure {
-                err,
-                logged: _logged,
-            }) => {
-                debug!("splice cleanup request to {upstream_path} failed to connect/read headers");
+            Err(err) => {
+                // Cleanup fetches run without a download runner: conclude the
+                // upstream failure here; cleanup's decision log reports the
+                // cause from the extension.
+                let reported = err.conclude(|_err| {
+                    Logged::debug(format_args!(
+                        "splice cleanup request to {upstream_path} failed to connect/read headers"
+                    ))
+                });
                 let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
-                // The throw site already logged the failure with its context;
-                // hand cleanup's decision log the transport cause the same way
-                // the hyper backend does, rather than a bare 502.
                 resp.extensions_mut().insert(UpstreamFetchError {
-                    reason: ErrorReport(&err).to_string(),
+                    reason: ErrorReport(reported.get()).to_string(),
                 });
                 return resp;
             }
@@ -226,13 +227,17 @@ async fn cleanup_upstream_fetch(
             .body(full_body(body))
             .expect("upstream response is valid"),
         Err(err) => {
-            debug!(
-                "splice cleanup request to {host_authority}{upstream_path} failed to read the body:  {}",
-                ErrorReport(&err)
-            );
+            // No download runner owns this fetch either, so the body failure
+            // is concluded here as well (a rate abort is the common one).
+            let reported = err.conclude(|err| {
+                Logged::debug(format_args!(
+                    "splice cleanup request to {host_authority}{upstream_path} failed to read the body:  {}",
+                    ErrorReport(err)
+                ))
+            });
             let mut resp = cleanup_response(StatusCode::BAD_GATEWAY);
             resp.extensions_mut().insert(UpstreamFetchError {
-                reason: ErrorReport(&err).to_string(),
+                reason: ErrorReport(reported.get()).to_string(),
             });
             resp
         }

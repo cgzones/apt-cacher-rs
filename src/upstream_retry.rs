@@ -36,6 +36,31 @@ impl fmt::Display for RetryLimit {
     }
 }
 
+/// Why connecting stopped: an exhausted budget or a deterministic failure
+/// for which the retry policy was never consulted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetryStop {
+    Exhausted(RetryLimit),
+    #[cfg(feature = "splice")]
+    Permanent,
+}
+
+impl fmt::Display for RetryStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exhausted(limit) => limit.fmt(f),
+            #[cfg(feature = "splice")]
+            Self::Permanent => f.write_str("permanent failure; not retrying"),
+        }
+    }
+}
+
+impl From<RetryLimit> for RetryStop {
+    fn from(limit: RetryLimit) -> Self {
+        Self::Exhausted(limit)
+    }
+}
+
 /// First delay of the schedule, in milliseconds, and the value
 /// `Backoff::reset_delay` restarts from: keeping both seeds in one place is
 /// what makes a reset provably identical to a fresh schedule.

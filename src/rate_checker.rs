@@ -5,7 +5,7 @@ use tracing::debug;
 
 #[cfg(feature = "sendfile")]
 use crate::config::Config;
-use crate::{humanfmt::HumanFmt, metrics, ringbuffer::SumRingBuffer};
+use crate::{humanfmt::HumanFmt, ringbuffer::SumRingBuffer};
 
 /// A rate checker that tracks download speed over a sliding time window.
 pub(crate) struct RateChecker {
@@ -47,23 +47,6 @@ impl InsufficientRate {
                 std::time::Duration::from_secs(1)
             ),
             HumanFmt::Time(timeframe),
-        )
-    }
-
-    /// Build a `TimedOut` `io::Error` whose message describes the rate
-    /// breach in the supplied context (e.g. `" for upstream"`).
-    #[cfg(feature = "sendfile")]
-    #[must_use]
-    pub(crate) fn to_timeout_io_error(self, context: std::fmt::Arguments<'_>) -> std::io::Error {
-        struct Adapter<'a, 'b>(&'a InsufficientRate, std::fmt::Arguments<'b>);
-        impl std::fmt::Display for Adapter<'_, '_> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt_with_context(f, self.1)
-            }
-        }
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            Adapter(&self, context).to_string(),
         )
     }
 }
@@ -130,7 +113,7 @@ impl RateChecker {
 
     /// Checks if the download rate is below the minimum threshold and returns an `InsufficientRate` error if so.
     #[must_use]
-    pub(crate) fn check_fail(&self, direction: RateCheckDirection) -> Option<InsufficientRate> {
+    pub(crate) fn check_fail(&self) -> Option<InsufficientRate> {
         if !self.buf.is_full() {
             return None;
         }
@@ -141,10 +124,6 @@ impl RateChecker {
             return None;
         }
 
-        match direction {
-            RateCheckDirection::Upstream => metrics::RATE_LIMIT_UPSTREAM.increment(),
-            RateCheckDirection::Client => metrics::RATE_LIMIT_CLIENT.increment(),
-        }
         Some(InsufficientRate {
             transferred,
             timeframe,
@@ -154,16 +133,9 @@ impl RateChecker {
     }
 }
 
-/// Which side of the proxy a `RateCheckedBody` is measuring.
-#[derive(Copy, Clone)]
-pub(crate) enum RateCheckDirection {
-    Upstream,
-    Client,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RateCheckDirection, RateChecker};
+    use super::RateChecker;
     use crate::nonzero;
 
     #[test]
@@ -178,7 +150,7 @@ mod tests {
         }
 
         // Buffer should now be full with 3 bytes over 3s = 1 B/s < 100 B/s.
-        let fail = rc.check_fail(RateCheckDirection::Client);
+        let fail = rc.check_fail();
         assert!(fail.is_some(), "rate check should fail for slow transfer");
         let ir = fail.unwrap();
         assert_eq!(ir.transferred, 3);
@@ -197,7 +169,7 @@ mod tests {
 
         // ~1500 bytes over 3s = 500 B/s > 100 B/s.
         assert!(
-            rc.check_fail(RateCheckDirection::Client).is_none(),
+            rc.check_fail().is_none(),
             "rate check should pass for fast transfer"
         );
     }
@@ -211,7 +183,7 @@ mod tests {
         rc.add(1);
 
         assert!(
-            rc.check_fail(RateCheckDirection::Client).is_none(),
+            rc.check_fail().is_none(),
             "should not fail before buffer is full"
         );
     }
@@ -227,7 +199,7 @@ mod tests {
         rc.add(1);
 
         // Buffer should be [0, 0, 1] — full with 1 byte over 3s = 0 B/s < 100 B/s.
-        let fail = rc.check_fail(RateCheckDirection::Client);
+        let fail = rc.check_fail();
         assert!(fail.is_some(), "rate check should fail after gap");
     }
 
@@ -238,20 +210,20 @@ mod tests {
     fn one_second_window_is_armed_by_the_first_sample() {
         let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
         assert!(
-            rc.check_fail(RateCheckDirection::Client).is_none(),
+            rc.check_fail().is_none(),
             "an empty window cannot judge a rate"
         );
 
         rc.add(1);
         let fail = rc
-            .check_fail(RateCheckDirection::Client)
+            .check_fail()
             .expect("1 B/s is below the 1000 B/s minimum");
         assert_eq!(fail.transferred, 1);
         assert_eq!(fail.timeframe, nonzero!(1));
 
         rc.add(5000);
         assert!(
-            rc.check_fail(RateCheckDirection::Client).is_none(),
+            rc.check_fail().is_none(),
             "the second sample folds into the same window and clears the breach"
         );
     }

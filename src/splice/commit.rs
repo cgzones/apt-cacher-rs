@@ -21,7 +21,7 @@
 //!   not depend on the client write -- and so only knows the client's fate
 //!   afterwards.
 //!
-//! A demoted client (`body::spawn_file_serve_task`) is still writing this
+//! A demoted client (`body::PreparedFileServe::spawn`) is still writing this
 //! response through a `dup(2)` of the connection's socket, so the connection
 //! must not read its next request before that task ends. The task parks in
 //! `receiver.changed()` with no timeout whenever it has drained the file but
@@ -53,8 +53,13 @@ use crate::{metrics, rate_log};
 
 use super::CacheTarget;
 use super::RateTimestamps;
-use super::body::{ClientEnd, DeliveryResult};
+use super::body::ClientEnd;
+use super::body::DemotedDelivery;
 use super::upstream::ConnLabel;
+use crate::transfer_error::{
+    DeliveryEnd, DeliveryFailure, EndsDelivery as _, InternalError, ReportedDelivery,
+    TransferOutcome,
+};
 
 /// The three byte counts a completed download reports with.
 #[derive(Clone, Copy)]
@@ -78,21 +83,22 @@ pub(super) struct Served {
     pub(super) partial: bool,
 }
 
-/// What became of the client a completed download was fetched for; selects
-/// the event wording and the client rate segment of the completion line,
-/// and on the `Served` arm the `partial` flag of the `Delivery` row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What became of the client a completed download was fetched for: a
+/// [`ClientEnd`] once settled, with any demoted writer's verdict folded in.
+/// Selects the event wording and the client rate segment of the completion
+/// line, and on the `Served` arm the `partial` flag of the `Delivery` row.
+#[derive(Debug)]
 pub(super) enum CompletionClient {
     /// The client received the whole response body.
     Served(Served),
     /// The client was lost mid-body -- disconnect, stall, or a failed
-    /// demoted file-serve -- and that failure was logged at its source.
-    Lost,
+    /// demoted file-serve -- and the owner that ended it concluded it.
+    Aborted(ReportedDelivery),
     /// No client was ever attached: the parallel-hack nudge answered the
     /// request and the download ran detached ([`super::detached`]). Reports
     /// the upstream side only, in hyper's "Finished download of ..." wording
     /// plus the splice mechanism token -- there is no fused serve to name.
-    Nudged,
+    Absent,
 }
 
 /// A download past [`CacheTarget::begin_rename`]: every body byte is in the
@@ -122,11 +128,12 @@ impl CacheTarget {
     pub(super) async fn begin_rename(self) -> Committable {
         let Self {
             writer,
+            dbarrier,
             temppath,
             dest_path,
             last_modified: _,
         } = self;
-        let (tempfile, dbarrier, streamed_digest) = writer.finish();
+        let (tempfile, streamed_digest) = writer.finish();
         let rbarrier = dbarrier.begin_rename().await;
         Committable {
             tempfile,
@@ -184,7 +191,10 @@ impl ClientSettlement {
     /// Await the demoted writer before the connection reads its next request:
     /// that writer owns a dup of the same socket. Reporting the verdict is a
     /// synchronous send, so a slow or failed commit cannot delay the client.
-    pub(super) async fn settle(self) -> CompletionClient {
+    ///
+    /// Returns whether the client was fully served; the verdict itself
+    /// belongs to the completion line, which the tail reports.
+    pub(super) async fn settle(self) -> bool {
         let Self {
             end,
             served,
@@ -192,6 +202,7 @@ impl ClientSettlement {
             report,
         } = self;
         let client = settle(end, served, &mut rates).await;
+        let succeeded = matches!(client, CompletionClient::Served(_));
         // The receiver is gone when committing failed; the client must still
         // finish even though there is no cached download to report.
         if let Err(ClientReport {
@@ -199,7 +210,7 @@ impl ClientSettlement {
             client: _,
         }) = report.send(ClientReport { rates, client })
         {}
-        client
+        succeeded
     }
 }
 
@@ -213,7 +224,9 @@ async fn receive_client_report(
         rates.t_client_done = PreciseInstant::now();
         ClientReport {
             rates,
-            client: CompletionClient::Lost,
+            client: CompletionClient::Aborted(DeliveryFailure::Cancelled.conclude(format_args!(
+                "splice proxy: the connection was cancelled before settling its client; reporting the delivery as lost"
+            ))),
         }
     })
 }
@@ -331,46 +344,43 @@ impl CommitTail {
 async fn settle(end: ClientEnd, served: Served, rates: &mut RateTimestamps) -> CompletionClient {
     match end {
         ClientEnd::Served => CompletionClient::Served(served),
-        // `Absent` is the detached path's arm; that path never settles a
-        // client, so here it can only be read as "nobody got the body".
-        ClientEnd::Disconnected | ClientEnd::Absent => CompletionClient::Lost,
-        ClientEnd::Demoted(handle) => {
-            if await_demoted_client(handle, rates).await {
-                CompletionClient::Served(served)
-            } else {
-                CompletionClient::Lost
-            }
-        }
+        ClientEnd::Absent => CompletionClient::Absent,
+        ClientEnd::Aborted(reported) => CompletionClient::Aborted(reported),
+        ClientEnd::Demoted(handle) => match await_demoted_client(handle, rates).await {
+            DeliveryEnd::Complete => CompletionClient::Served(served),
+            DeliveryEnd::Aborted(reported) => CompletionClient::Aborted(reported),
+        },
     }
 }
 
-/// Wait for a demoted client's file-serve task to finish sending, and fold
-/// its byte count and end time into the rate timestamps.
+/// Task boundaries preserve both the bytes written and the terminal cause.
+/// A task that never returned concluded nothing, so its end is concluded here.
 async fn await_demoted_client(
-    handle: tokio::task::JoinHandle<DeliveryResult>,
+    handle: DemotedDelivery,
     rates: &mut RateTimestamps,
-) -> bool {
-    let succeeded = match handle.await {
-        Ok(DeliveryResult::Success(bytes)) => {
-            rates.client_bytes_sent += bytes;
-            true
+) -> DeliveryEnd<ReportedDelivery> {
+    let end = match handle.await {
+        Ok(TransferOutcome { transferred, end }) => {
+            rates.client_bytes_sent += transferred;
+            end
         }
-        Ok(DeliveryResult::Failure(bytes)) => {
-            rates.client_bytes_sent += bytes;
-            false
+        Err(err) if err.is_cancelled() => {
+            DeliveryEnd::Aborted(DeliveryFailure::Cancelled.conclude(format_args!(
+                "splice proxy: demoted client file-serve task was cancelled; closing the connection"
+            )))
         }
-        Err(err) => {
-            error!(
-                "splice proxy: demoted client file-serve task panicked; treating the delivery as failed and closing the connection:  {}",
-                ErrorReport(&err)
-            );
-            false
-        }
+        Err(err) => DeliveryEnd::Aborted(
+            DeliveryFailure::from(InternalError::transport(
+                "demoted client file-serve task panicked",
+                err,
+            ))
+            .conclude(format_args!(
+                "splice proxy: demoted client file-serve task panicked; treating the delivery as failed and closing the connection"
+            )),
+        ),
     };
-    // The demoted file-serve task is the last thing to write to the
-    // client, so the client-rate window ends here.
     rates.t_client_done = PreciseInstant::now();
-    succeeded
+    end
 }
 
 /// The on-disk half of the commit: `sync_all`, then the verify + rename
@@ -421,8 +431,8 @@ impl Committed {
     /// Kept together on purpose: which arms write a `Delivery` row is a
     /// decision that must not drift between the streaming tail and the
     /// volatile path. A `Delivery` row is exactly "this client received the
-    /// whole body", which is exactly the `Served` arm: `Lost` lost it and
-    /// `Nudged` never had a client.
+    /// whole body", which is exactly the `Served` arm: `Aborted` did not receive it and
+    /// `Absent` never had a client.
     pub(super) async fn report(self, rates: &RateTimestamps, client: CompletionClient) {
         let Self {
             conn_details,
@@ -430,7 +440,7 @@ impl Committed {
             bytes,
             elapsed,
         } = self;
-        log_splice_completion(&conn_details, conn_label, rates, bytes, client);
+        log_splice_completion(&conn_details, conn_label, rates, bytes, &client);
 
         if let CompletionClient::Served(Served { bytes: _, partial }) = client {
             let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
@@ -455,7 +465,7 @@ fn log_splice_completion(
     conn_label: ConnLabel,
     rates: &RateTimestamps,
     bytes: CompletionBytes,
-    client: CompletionClient,
+    client: &CompletionClient,
 ) {
     let CompletionBytes {
         total: _,
@@ -472,16 +482,17 @@ fn log_splice_completion(
     let (event, client_segment) = match client {
         CompletionClient::Served(Served { bytes, partial: _ }) => (
             "Served and cached",
-            Some(rate_log::client_segment(bytes, rates.client_window())),
+            Some(rate_log::client_segment(*bytes, rates.client_window())),
         ),
-        CompletionClient::Lost => (
+        CompletionClient::Aborted(reported) => (
             "Cached",
-            Some(rate_log::client_disconnect_segment(
-                rates.client_bytes_sent,
-                rates.client_window(),
-            )),
+            Some(if reported.get().is_peer_disconnect() {
+                rate_log::client_disconnect_segment(rates.client_bytes_sent, rates.client_window())
+            } else {
+                rate_log::client_abort_segment(rates.client_bytes_sent, rates.client_window())
+            }),
         ),
-        CompletionClient::Nudged => ("Finished download of", None),
+        CompletionClient::Absent => ("Finished download of", None),
     };
     let segments = fmt::from_fn(|f| {
         write!(f, "{upstream}")?;
@@ -496,8 +507,14 @@ fn log_splice_completion(
         }
         Ok(())
     });
+    let failure = fmt::from_fn(|f| {
+        if let CompletionClient::Aborted(reported) = client {
+            write!(f, ":  {}", ErrorReport(reported.get()))?;
+        }
+        Ok(())
+    });
     info!(
-        "{event} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({segments}){resume}",
+        "{event} {volatile}file {} from mirror {} for client {} in {} via splice{conn_label} ({segments}){resume}{failure}",
         conn_details.debname,
         conn_details.mirror,
         conn_details.client,
@@ -508,6 +525,46 @@ fn log_splice_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_served(actual: &CompletionClient) {
+        assert!(
+            matches!(actual, CompletionClient::Served(served) if *served == SERVED),
+            "unexpected client outcome: {actual:?}"
+        );
+    }
+
+    fn assert_cancelled(actual: &CompletionClient) {
+        assert!(
+            matches!(actual, CompletionClient::Aborted(reported)
+                if matches!(reported.get(), DeliveryFailure::Cancelled)),
+            "unexpected client outcome: {actual:?}"
+        );
+    }
+
+    fn aborted_failure(outcome: &CompletionClient) -> &DeliveryFailure {
+        let failure = match outcome {
+            CompletionClient::Aborted(reported) => Some(reported.get()),
+            CompletionClient::Served(_) | CompletionClient::Absent => None,
+        };
+        assert!(failure.is_some(), "expected aborted delivery: {outcome:?}");
+        failure.expect("asserted above")
+    }
+
+    fn cancelled() -> ReportedDelivery {
+        DeliveryFailure::Cancelled.conclude(format_args!("test delivery cancelled"))
+    }
+
+    /// The demoted task's own epilogue, `serve_remaining_from_file`,
+    /// concludes the failure it ends with.
+    fn demoted_abort(
+        transferred: u64,
+        failure: DeliveryFailure,
+    ) -> TransferOutcome<ReportedDelivery> {
+        TransferOutcome {
+            transferred,
+            end: DeliveryEnd::Aborted(failure.conclude(format_args!("test demoted delivery"))),
+        }
+    }
 
     const SERVED: Served = Served {
         bytes: 42,
@@ -521,18 +578,12 @@ mod tests {
     #[tokio::test]
     async fn served_and_lost_settle_without_awaiting_anything() {
         let mut rates = rates();
-        assert_eq!(
-            settle(ClientEnd::Served, SERVED, &mut rates).await,
-            CompletionClient::Served(SERVED)
-        );
-        assert_eq!(
-            settle(ClientEnd::Disconnected, SERVED, &mut rates).await,
-            CompletionClient::Lost
-        );
-        assert_eq!(
+        assert_served(&settle(ClientEnd::Served, SERVED, &mut rates).await);
+        assert_cancelled(&settle(ClientEnd::Aborted(cancelled()), SERVED, &mut rates).await);
+        assert!(matches!(
             settle(ClientEnd::Absent, SERVED, &mut rates).await,
-            CompletionClient::Lost
-        );
+            CompletionClient::Absent
+        ));
         assert_eq!(rates.client_bytes_sent, 0);
     }
 
@@ -541,18 +592,12 @@ mod tests {
     #[tokio::test]
     async fn demoted_client_settles_on_the_file_serve_verdict() {
         let mut rates = rates();
-        let ok = tokio::task::spawn(async { DeliveryResult::Success(7) });
-        assert_eq!(
-            settle(ClientEnd::Demoted(ok), SERVED, &mut rates).await,
-            CompletionClient::Served(SERVED)
-        );
+        let ok = tokio::task::spawn(async { TransferOutcome::complete(7) });
+        assert_served(&settle(ClientEnd::Demoted(ok), SERVED, &mut rates).await);
         assert_eq!(rates.client_bytes_sent, 7);
 
-        let failed = tokio::task::spawn(async { DeliveryResult::Failure(3) });
-        assert_eq!(
-            settle(ClientEnd::Demoted(failed), SERVED, &mut rates).await,
-            CompletionClient::Lost
-        );
+        let failed = tokio::task::spawn(async { demoted_abort(3, DeliveryFailure::Cancelled) });
+        assert_cancelled(&settle(ClientEnd::Demoted(failed), SERVED, &mut rates).await);
         assert_eq!(rates.client_bytes_sent, 10);
     }
 
@@ -560,16 +605,16 @@ mod tests {
     async fn settlement_reports_bytes_without_waiting_for_the_commit() {
         let (report, receiver) = oneshot::channel();
         let settlement = ClientSettlement {
-            end: ClientEnd::Demoted(tokio::task::spawn(async { DeliveryResult::Success(7) })),
+            end: ClientEnd::Demoted(tokio::task::spawn(async { TransferOutcome::complete(7) })),
             served: SERVED,
             rates: rates(),
             report,
         };
         // No receiver is polled until settlement completes, like a commit
         // still waiting for fsync. The client must not wait for reporting.
-        assert_eq!(settlement.settle().await, CompletionClient::Served(SERVED));
+        assert!(settlement.settle().await, "the demoted writer completed");
         let report = receive_client_report(receiver, rates()).await;
-        assert_eq!(report.client, CompletionClient::Served(SERVED));
+        assert_served(&report.client);
         assert_eq!(report.rates.client_bytes_sent, 7);
     }
 
@@ -579,7 +624,7 @@ mod tests {
         let (finish, finished) = oneshot::channel();
         let handle = tokio::task::spawn(async move {
             finished.await.expect("test finishes the demoted writer");
-            DeliveryResult::Success(7)
+            TransferOutcome::complete(7)
         });
         let mut rates = rates();
         rates.client_bytes_sent = 3;
@@ -593,7 +638,7 @@ mod tests {
         task.abort();
         assert!(task.await.expect_err("settlement cancelled").is_cancelled());
         let report = receive_client_report(receiver, rates).await;
-        assert_eq!(report.client, CompletionClient::Lost);
+        assert_cancelled(&report.client);
         assert_eq!(report.rates.client_bytes_sent, 3);
         finish.send(()).expect("demoted writer remains independent");
     }
@@ -602,7 +647,7 @@ mod tests {
     async fn failed_commit_does_not_cancel_client_settlement() {
         let (report, receiver) = oneshot::channel();
         let settlement = ClientSettlement {
-            end: ClientEnd::Demoted(tokio::task::spawn(async { DeliveryResult::Success(7) })),
+            end: ClientEnd::Demoted(tokio::task::spawn(async { TransferOutcome::complete(7) })),
             served: SERVED,
             rates: rates(),
             report,
@@ -610,6 +655,52 @@ mod tests {
         // A failed commit drops the receiver. The socket must still finish
         // its response before the connection can be reused.
         drop(receiver);
-        assert_eq!(settlement.settle().await, CompletionClient::Served(SERVED));
+        assert!(settlement.settle().await, "the demoted writer completed");
+    }
+    #[tokio::test]
+    async fn demoted_task_cancellation_and_panic_preserve_distinct_outcomes() {
+        let mut rates = rates();
+        let cancelled = tokio::spawn(std::future::pending::<TransferOutcome<ReportedDelivery>>());
+        cancelled.abort();
+        assert_cancelled(&settle(ClientEnd::Demoted(cancelled), SERVED, &mut rates).await);
+        #[expect(
+            clippy::panic,
+            reason = "inject a task panic to test JoinError attribution"
+        )]
+        let panicked = tokio::spawn(async { panic!("injected file-serve task failure") });
+        let outcome = settle(ClientEnd::Demoted(panicked), SERVED, &mut rates).await;
+        let failure = aborted_failure(&outcome);
+        assert!(
+            matches!(failure, DeliveryFailure::Internal(_)),
+            "panic must retain an internal task failure: {outcome:?}"
+        );
+        assert!(
+            ErrorReport(failure)
+                .to_string()
+                .contains("injected file-serve task failure")
+        );
+        assert!(!failure.is_peer_disconnect());
+    }
+
+    #[tokio::test]
+    async fn demoted_and_prefix_deliveries_retain_the_original_cause() {
+        let mut rates = rates();
+        let failure: DeliveryFailure = crate::transfer_error::ClientError::timeout(
+            "downstream write timeout",
+            Duration::from_secs(10),
+        )
+        .into();
+        let expected = ErrorReport(&failure).to_string();
+        let task_failure = failure.clone();
+        let demoted = tokio::spawn(async { demoted_abort(7, task_failure) });
+        let outcome = settle(ClientEnd::Demoted(demoted), SERVED, &mut rates).await;
+        let observed = aborted_failure(&outcome);
+        assert_eq!(ErrorReport(observed).to_string(), expected);
+        assert!(!observed.is_peer_disconnect());
+        assert_eq!(rates.client_bytes_sent, 7);
+        let reported = failure.conclude(format_args!("test prefix delivery"));
+        let outcome = settle(ClientEnd::Aborted(reported), SERVED, &mut rates).await;
+        let observed = aborted_failure(&outcome);
+        assert_eq!(ErrorReport(observed).to_string(), expected);
     }
 }

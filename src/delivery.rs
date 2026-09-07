@@ -10,7 +10,6 @@
 //! syscall loop. (The splice path logs a combined upstream+client line and
 //! stays separate.)
 
-use std::fmt::Display;
 use std::time::Duration;
 
 use tracing::info;
@@ -19,9 +18,9 @@ use crate::{
     cache_layout::{CachedFlavor, ConnectionDetails},
     database_task::{DbCmdTransfer, TransferKind},
     humanfmt::HumanFmt,
-    info_or_warn,
     metrics::{self, Counter},
     rate_log,
+    transfer_error::{DeliveryEnd, EndsDelivery as _},
 };
 
 /// How the bytes reached the client. Selects the per-mechanism metrics and
@@ -121,17 +120,8 @@ impl Role {
     }
 }
 
-/// Why a delivery stopped short, when the transport reported a reason.
-pub(crate) struct AbortCause<'a> {
-    pub(crate) reason: &'a dyn Display,
-    /// Classified by the caller (`error::is_peer_disconnect` or the body's
-    /// equivalent): demotes the abort line to INFO and bumps
-    /// `CLIENT_DISCONNECTED_MID_BODY`.
-    pub(crate) peer_disconnect: bool,
-}
-
 /// What happened to one served body.
-pub(crate) struct ServeOutcome<'a> {
+pub(crate) struct ServeOutcome {
     /// Bytes the response promised (after Range trimming).
     pub(crate) size: u64,
     /// Bytes actually shipped.
@@ -141,18 +131,7 @@ pub(crate) struct ServeOutcome<'a> {
     /// Client-side transfer window (from the first body byte).
     pub(crate) elapsed: Duration,
     /// How the delivery ended.
-    pub(crate) end: DeliveryEnd<'a>,
-}
-
-/// How a delivery ended. A complete delivery has no abort cause to carry,
-/// which the previous `complete: bool` + `abort: Option<_>` pair could not
-/// say.
-pub(crate) enum DeliveryEnd<'a> {
-    /// The body reached its end: `SERVED_*` credit and a `deliveries` row.
-    Complete,
-    /// The body stopped short. `Some` when the transport surfaced an error;
-    /// `None` for a silent client hang-up, which is logged without a reason.
-    Aborted(Option<AbortCause<'a>>),
+    pub(crate) end: DeliveryEnd,
 }
 
 /// Finish one cached-file delivery: metrics, the completion/abort log line,
@@ -164,7 +143,7 @@ pub(crate) fn finish_cached_serve(
     cd: &ConnectionDetails,
     mechanism: Mechanism,
     role: Role,
-    outcome: ServeOutcome<'_>,
+    outcome: ServeOutcome,
 ) -> Option<DbCmdTransfer> {
     let ServeOutcome {
         size,
@@ -204,40 +183,88 @@ pub(crate) fn finish_cached_serve(
         });
     };
 
-    let segment = rate_log::client_disconnect_segment(transferred, elapsed);
-    match abort {
-        Some(AbortCause {
-            reason,
-            peer_disconnect,
-        }) => {
-            if peer_disconnect {
-                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-            }
-            info_or_warn!(
-                peer_disconnect,
-                "Aborted serving {what} {volatile}file {} from mirror {}{aliased} for {who} {} in {} via {via} ({segment}):  {reason}",
-                cd.debname,
-                cd.mirror,
-                cd.client,
-                HumanFmt::Time(in_time),
-            );
-        }
-        None => {
-            info!(
-                "Aborted serving {what} {volatile}file {} from mirror {}{aliased} for {who} {} in {} via {via} ({segment})",
-                cd.debname,
-                cd.mirror,
-                cd.client,
-                HumanFmt::Time(in_time),
-            );
-        }
-    }
+    let segment = if abort.is_peer_disconnect() {
+        rate_log::client_disconnect_segment(transferred, elapsed)
+    } else {
+        rate_log::client_abort_segment(transferred, elapsed)
+    };
+    let _reported = abort.conclude(format_args!(
+        "Aborted serving {what} {volatile}file {} from mirror {}{aliased} for {who} {} in {} via {via} ({segment})",
+        cd.debname,
+        cd.mirror,
+        cd.client,
+        HumanFmt::Time(in_time),
+    ));
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Mechanism, Role};
+
+    /// A build with neither client-facing backend has no [`Mechanism`] variant
+    /// to serve through, so the abort sink is unreachable there.
+    #[cfg(any(feature = "sendfile", feature = "hyper"))]
+    mod abort {
+        use tracing::Level;
+
+        use super::super::{
+            DeliveryEnd, Duration, Mechanism, Role, ServeOutcome, finish_cached_serve, metrics,
+        };
+        use crate::{
+            test_support::{connection_details, levels_during},
+            transfer_error::{ClientError, DeliveryFailure},
+        };
+
+        /// The mechanism token never enters the abort bookkeeping; the tests
+        /// below take whichever variant the build under test compiles.
+        #[cfg(feature = "sendfile")]
+        const ABORT_VIA: Mechanism = Mechanism::Sendfile;
+        #[cfg(all(feature = "hyper", not(feature = "sendfile")))]
+        const ABORT_VIA: Mechanism = Mechanism::Channel;
+
+        fn aborted(failure: DeliveryFailure) -> ServeOutcome {
+            ServeOutcome {
+                size: 10,
+                transferred: 4,
+                partial: false,
+                elapsed: Duration::from_millis(5),
+                end: DeliveryEnd::Aborted(failure),
+            }
+        }
+
+        /// The sink owns no counter table: the failure counts itself exactly
+        /// once through `record_terminal`, and reports itself at its own
+        /// `severity`.
+        #[test]
+        fn cached_abort_counts_once_and_uses_the_policy_level() {
+            let before = metrics::CLIENT_DISCONNECTED_MID_BODY.get();
+            let cd = connection_details("abort.deb");
+            let outcome = aborted(
+                ClientError::io("write client", std::io::ErrorKind::BrokenPipe.into()).into(),
+            );
+            let levels = levels_during(|| {
+                assert!(finish_cached_serve(&cd, ABORT_VIA, Role::Cached, outcome).is_none());
+            });
+            assert_eq!(metrics::CLIENT_DISCONNECTED_MID_BODY.get(), before + 1);
+            assert_eq!(levels, vec![Level::INFO], "{levels:?}");
+        }
+
+        /// A client that stops reading is expected client behaviour, so the
+        /// severity table reports it at INFO even though it is not a
+        /// disconnect; the pre-policy sink logged this one at WARN.
+        #[test]
+        fn a_client_timeout_abort_is_reported_at_info() {
+            let cd = connection_details("slow.deb");
+            let outcome = aborted(
+                ClientError::io("write client", std::io::ErrorKind::TimedOut.into()).into(),
+            );
+            let levels = levels_during(|| {
+                assert!(finish_cached_serve(&cd, ABORT_VIA, Role::Cached, outcome).is_none());
+            });
+            assert_eq!(levels, vec![Level::INFO], "{levels:?}");
+        }
+    }
 
     /// `docs/logging.md` fixes the completion-line wording: a late-joiner
     /// serve says "joining client", never "client", and the mechanism token

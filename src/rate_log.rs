@@ -23,6 +23,7 @@ enum SegmentKind {
     Upstream,
     Client,
     Disconnected,
+    Aborted,
 }
 
 impl fmt::Display for Segment {
@@ -41,6 +42,14 @@ impl fmt::Display for Segment {
                     "client disconnected after {} ({})",
                     HumanFmt::Time(window),
                     HumanFmt::Size(bytes),
+                );
+            }
+            SegmentKind::Aborted => {
+                return write!(
+                    f,
+                    "delivery stopped after {} ({})",
+                    HumanFmt::Time(window),
+                    HumanFmt::Size(bytes)
                 );
             }
         };
@@ -82,6 +91,16 @@ pub(crate) fn client_segment(bytes: u64, window: Duration) -> Segment {
 pub(crate) fn client_disconnect_segment(bytes: u64, elapsed: Duration) -> Segment {
     Segment {
         kind: SegmentKind::Disconnected,
+        bytes,
+        window: elapsed,
+    }
+}
+
+/// A partial delivery without evidence that the client disconnected.
+#[must_use]
+pub(crate) fn client_abort_segment(bytes: u64, elapsed: Duration) -> Segment {
+    Segment {
+        kind: SegmentKind::Aborted,
         bytes,
         window: elapsed,
     }

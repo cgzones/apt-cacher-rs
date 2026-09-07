@@ -5,20 +5,20 @@
 //! and comes back as [`BodyOutcome`]. Also owns client demotion to file
 //! serving ([`write_client_or_demote`], [`prepare_file_serve`],
 //! [`ClientEnd::Demoted`]), the [`SpliceRangeFilter`] applied to the client
-//! stream, [`BodyTransferError`]/[`BodyFailureSide`] attribution, and the
+//! stream, [`DownloadFailure`]/[`DeliveryFailure`] attribution, and the
 //! pipe and `/dev/null` helpers ([`create_pipe`], [`SplicePipes::discard_duplicate`],
 //! [`drain_pipe_to_file`], [`range_slice`]). [`CacheBatch`] is the zero-copy
 //! loop's cache-file sink: `pipe_B` and the policy for when its teed bytes are
 //! drained to the file.
 //!
-//! Both loops also run client-less: a `None` client (the parallel-hack
+//! Both loops also run client-less: an absent client (the parallel-hack
 //! nudge's detached download, `super::detached`) starts the transfer in
 //! [`ClientStatus::Absent`], which every client-facing step already treats
 //! as cache-only.
 //!
 //! Consumers: the drive in `mod.rs` (body loops, `range_slice`, the outcome
 //! and handle types) and `super::detached` (the client-less form plus
-//! [`BodyTransferError::log_detached`]).
+//! [`super::transfer_body`]).
 
 use std::{
     future::Future as _,
@@ -38,13 +38,13 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::error::{ErrorReport, errno_to_io_error, is_peer_disconnect};
+use crate::error::{ErrorReport, errno_to_io_error};
 use crate::fs_open::hint_sequential_read;
 use crate::guards::{DownloadBarrier, DownloadWriteLease};
 use crate::humanfmt::HumanFmt;
 use crate::index_parser::{HashAlgo, StreamHasher, StreamedDigest};
 use crate::log_once::Logged;
-use crate::rate_checker::{RateCheckDirection, RateChecker};
+use crate::rate_checker::RateChecker;
 use crate::sendfile_conn::{
     async_sendfile_unfinished, clear_tcp_readable_cache, clear_tcp_writable_cache,
     wait_readable_rated, wait_writable_rated,
@@ -55,7 +55,6 @@ use crate::{
 };
 
 use super::upstream::{TLS_READ_BUF_SIZE, UpstreamConn};
-use super::{AfterHeaderSide, SpliceProxyError};
 
 /// Pre-computed byte offsets for range-filtering the splice loop output.
 /// `skip` bytes are suppressed at the start, then `send` bytes are forwarded.
@@ -139,161 +138,78 @@ fn clear_pipe_writable_cache(sender: &pipe::Sender) {
     let _ignore = sender.try_io(|| -> std::io::Result<()> { Err(ErrorKind::WouldBlock.into()) });
 }
 
-/// The client's peer address for a log line. The three client-abandoned
-/// lines below name the client this way rather than through `ClientInfo`,
-/// which the body loops do not carry; a socket already torn down reports
-/// `<unknown>`.
-fn peer_addr_for_log(client: &TcpStream) -> String {
-    client
-        .peer_addr()
-        .map_or_else(|_err| String::from("<unknown>"), |addr| addr.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Socket-to-socket splice proxy
 // ---------------------------------------------------------------------------
 
-pub(super) enum DeliveryResult {
-    Success(u64),
-    Failure(u64),
+use crate::transfer_error::{
+    CacheError, ClientError, DeliveryFailure, Descriptors, DownloadFailure, EndsDelivery as _,
+    InternalError, MixedFailure, ReportedDelivery, UpstreamError, classify_mixed_descriptor,
+};
+/// File delivery tasks return their byte progress and owned terminal cause.
+use crate::transfer_error::{DeliveryEnd, TransferOutcome};
+
+/// The demoted file-serve task: its bytes and the delivery end it concluded.
+pub(super) type DemotedDelivery = tokio::task::JoinHandle<TransferOutcome<ReportedDelivery>>;
+
+fn upstream_io(err: std::io::Error) -> DownloadFailure {
+    UpstreamError::io("splice upstream body read", err).into()
 }
 
-/// Which of the three independent I/O parties a body-transfer failure came
-/// from.
+/// Terminal splice errors involve both descriptors. The shared errno table
+/// attributes the socket's errnos to the upstream; everything else retains
+/// the operation. This direction writes into the pipe, so `EPIPE` names that
+/// destination.
+fn upstream_splice_failure(errno: nix::errno::Errno) -> DownloadFailure {
+    match classify_mixed_descriptor(errno, Descriptors::SocketToPipe) {
+        MixedFailure::Socket(error) => UpstreamError::io("splice upstream socket", error).into(),
+        MixedFailure::Internal(error) => {
+            InternalError::io("splice upstream-to-pipe operation", error).into()
+        }
+    }
+}
+
+/// `splice(2)` returning zero means source EOF. With a duplicated pipe head
+/// still recorded, that is an internal state failure, not proof of peer loss.
+fn zero_client_splice_failure() -> DeliveryFailure {
+    InternalError::invalid(
+        "splice pipe-to-client operation",
+        "source pipe ended with duplicated bytes still pending",
+    )
+    .into()
+}
+
+/// The pipe-to-client direction writes into the socket, so `EPIPE` there is
+/// the peer hanging up.
+fn client_splice_failure(errno: nix::errno::Errno) -> DeliveryFailure {
+    match classify_mixed_descriptor(errno, Descriptors::PipeToSocket) {
+        MixedFailure::Socket(error) => ClientError::io("splice client socket", error).into(),
+        MixedFailure::Internal(error) => {
+            InternalError::io("splice pipe-to-client operation", error).into()
+        }
+    }
+}
+
+/// Half-close the client socket: tell the peer the response is over so it
+/// stops waiting for the `Content-Length` this proxy promised and can no
+/// longer deliver. Without it a client whose delivery was aborted mid-body
+/// keeps its read blocked until the cache-only remainder of the download
+/// finishes and the connection task drops the socket.
 ///
-/// `splice_proxy_body{,_tls}` drive an upstream socket, a client socket and a
-/// cache file (plus the internal splice pipes) in one loop.  They used to
-/// collapse every failure into a bare `io::Error`, which the caller then
-/// labelled `AfterHeaderClient` wholesale -- so an upstream stall was logged
-/// as "client response delivery failed ... upstream read timed out".  Every
-/// throw site now names its side so the outer arm can attribute it correctly.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BodyFailureSide {
-    /// Reading from or rate-checking upstream, or rejecting its body framing
-    /// or size. A size cap is a response-policy rejection, not a client failure.
-    Upstream,
-    /// Writing to the client socket.
-    Client,
-    /// A cached-file syscall (`pwrite`, or the `splice` into the cache fd).
-    /// Kept distinct from `Proxy` so only genuine cached-file failures bump
-    /// `CACHE_IO_FAILURE`, whose documented scope is cached-file syscalls.
-    Cache,
-    /// Another proxy-side resource: the internal splice pipes, or the fd
-    /// duplication behind the demoted file-serve task.
-    Proxy,
+/// `shutdown(2)` is not readiness-gated, so no `try_io` dance is needed, and
+/// its result is discarded: every path reaching here ends as
+/// `SpliceProxyOutcome::ClientLost`, which closes the connection anyway.
+/// Not `sendfile_conn::graceful_close`: that one also drains the read side
+/// and is for a connection the task is about to drop, while this one runs
+/// mid-transfer and leaves the download running.
+pub(super) fn shutdown_client_write(client: &TcpStream) {
+    use std::os::fd::AsRawFd as _;
+
+    if nix::sys::socket::shutdown(client.as_raw_fd(), nix::sys::socket::Shutdown::Write).is_err() {}
 }
 
-/// An `io::Error` from a cached body transfer or passthrough relay, tagged
-/// with the side of the proxy that produced it.  Construct via [`BodyTransferError::upstream`]
-/// / [`BodyTransferError::client`] / [`BodyTransferError::proxy`] so the
-/// tagging stays greppable at every throw site.
-#[derive(Debug)]
-pub(crate) struct BodyTransferError {
-    side: BodyFailureSide,
-    err: std::io::Error,
-}
-
-impl BodyTransferError {
-    pub(super) fn upstream(err: std::io::Error) -> Self {
-        Self {
-            side: BodyFailureSide::Upstream,
-            err,
-        }
-    }
-
-    pub(super) fn client(err: std::io::Error) -> Self {
-        Self {
-            side: BodyFailureSide::Client,
-            err,
-        }
-    }
-
-    fn cache(err: std::io::Error) -> Self {
-        Self {
-            side: BodyFailureSide::Cache,
-            err,
-        }
-    }
-
-    fn proxy(err: std::io::Error) -> Self {
-        Self {
-            side: BodyFailureSide::Proxy,
-            err,
-        }
-    }
-
-    /// Attribute this failure for the outer arm. The peer sides hand their
-    /// error over unchanged; the proxy-local sides are logged here, where
-    /// `subject` identifies the transfer (the quoted cache path for cached
-    /// transfers), and hand over the proof instead. `phase` names the transfer
-    /// for both the log line and the outer arm's tag.
-    pub(super) fn into_after_header(
-        self,
-        phase: &'static str,
-        subject: std::fmt::Arguments<'_>,
-    ) -> SpliceProxyError {
-        let Self { side, err } = self;
-        let side = match side {
-            BodyFailureSide::Upstream => AfterHeaderSide::Upstream(err),
-            BodyFailureSide::Client => AfterHeaderSide::Client(err),
-            BodyFailureSide::Cache => {
-                AfterHeaderSide::Cache(Logged::cache_io_failure(format_args!(
-                    "splice proxy: failed to write the cache file {subject} in {phase}; aborting the transfer and closing the connection:  {}",
-                    ErrorReport(&err)
-                )))
-            }
-            // Splice pipes / fd duplication -- not a cached-file syscall, so
-            // `CACHE_IO_FAILURE` stays out of it.
-            BodyFailureSide::Proxy => AfterHeaderSide::Proxy(Logged::error(format_args!(
-                "splice proxy: proxy-side I/O failure in {phase} for {subject}; aborting the transfer and closing the connection:  {}",
-                ErrorReport(&err)
-            ))),
-        };
-        SpliceProxyError::AfterHeader { phase, side }
-    }
-
-    /// Attribute this failure for a detached, client-less download
-    /// ([`super::detached::DetachedDownload`]).
-    ///
-    /// The sibling of [`Self::into_after_header`] -- same `match` shape, so
-    /// the two attribution tables sit together -- for the one caller with no
-    /// connection to report to: nothing is handed upward, so every arm logs
-    /// here and the [`Logged`] proof is discarded on the spot. The outer
-    /// arm's "closing the connection" tail is replaced by "abandoning the
-    /// download": no client is waiting and the partial is removed by the
-    /// temp-file guard.
-    pub(super) fn log_detached(self, phase: &'static str, temppath: &Path) {
-        let Self { side, err } = self;
-        let _logged: Logged = match side {
-            // Same policy as the outer arm's upstream arm: no
-            // `is_peer_disconnect` demotion, and counter-backed by the
-            // dedicated counter the throw site already bumped.
-            BodyFailureSide::Upstream => Logged::warn(format_args!(
-                "splice proxy: upstream failed in {phase} for `{}`; abandoning the download:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            )),
-            BodyFailureSide::Cache => Logged::cache_io_failure(format_args!(
-                "splice proxy: failed to write the cache file `{}` in {phase}; abandoning the download:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            )),
-            BodyFailureSide::Proxy => Logged::error(format_args!(
-                "splice proxy: proxy-side I/O failure in {phase} for `{}`; abandoning the download:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            )),
-            // Unreachable by construction: a client-less transfer runs in
-            // `ClientStatus::Absent`, which no client-facing step enters.
-            // Reported rather than panicked so a future caller wiring a
-            // client into this path is a log line, not a crash.
-            BodyFailureSide::Client => Logged::error(format_args!(
-                "splice proxy: client-side failure in {phase} for `{}` without an attached client; abandoning the download:  {}",
-                temppath.display(),
-                ErrorReport(&err)
-            )),
-        };
-    }
+fn internal_io(err: std::io::Error) -> DownloadFailure {
+    InternalError::io("splice pipe operation", err).into()
 }
 
 /// The client a body transfer starts with, as `transfer_body` sees it.
@@ -303,18 +219,18 @@ impl BodyTransferError {
 /// [`ClientStatus::client_to_write`] can find it; the other two run the loop
 /// cache-only from the first chunk and differ only in what they mean at the
 /// end ([`ClientEnd`]).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum BodyClient<'a> {
     /// The connection's client, still receiving.
     Attached(&'a TcpStream),
     /// There never was one: the parallel-hack nudge answered the request
     /// and the download runs detached.
     Absent,
-    /// A header or prefix write already failed: its response is short and
-    /// nothing more may be written to it. The loop starts in
-    /// [`ClientStatus::Disconnected`]
-    /// and the transfer ends as [`ClientEnd::Disconnected`].
-    Lost,
+    /// A header or prefix write already failed and was concluded: its
+    /// response is short and nothing more may be written to it. The loop
+    /// starts in [`ClientStatus::Aborted`] and the transfer ends as
+    /// [`ClientEnd::Aborted`].
+    Aborted(ReportedDelivery),
 }
 
 impl BodyClient<'_> {
@@ -324,7 +240,7 @@ impl BodyClient<'_> {
         match self {
             Self::Attached(_) => ClientEnd::Served,
             Self::Absent => ClientEnd::Absent,
-            Self::Lost => ClientEnd::Disconnected,
+            Self::Aborted(failure) => ClientEnd::Aborted(failure),
         }
     }
 }
@@ -343,11 +259,12 @@ pub(super) enum ClientEnd {
     /// There never was a client ([`BodyClient::Absent`]).
     Absent,
     /// The client is gone, or was never written to again after its prefix
-    /// failed ([`BodyClient::Lost`]); the response is short.
-    Disconnected,
+    /// failed ([`BodyClient::Aborted`]); the response is short, and the
+    /// failure that ended it is concluded.
+    Aborted(ReportedDelivery),
     /// The client was handed to a file-serve task that is still writing the
     /// response through a `dup(2)` of the connection's socket.
-    Demoted(tokio::task::JoinHandle<DeliveryResult>),
+    Demoted(DemotedDelivery),
 }
 
 /// A blocking cache write must retain both the descriptor and the permission
@@ -359,16 +276,16 @@ struct CacheFile {
 }
 
 /// The single append owner: the file cursor, pending tee bytes, digest and
-/// publication barrier travel together. All direct writes flush earlier tee
+/// write lease travel together. All direct writes flush earlier tee
 /// bytes internally; policy flushes retain the existing batching thresholds.
 pub(super) struct CacheWriter {
     tempfile: tokio::fs::File,
+    path: PathBuf,
     // Duplicate once, before the first write. Blocking jobs retain their own
     // Arc so cancellation cannot close their file or release the write lease.
     file: Arc<CacheFile>,
     file_offset: i64,
     hasher: Option<StreamHasher>,
-    dbarrier: Option<DownloadBarrier>,
     pipes: Option<SplicePipes>,
 }
 
@@ -386,65 +303,60 @@ impl CacheWriter {
         mut tempfile: tokio::fs::File,
         file_offset: i64,
         mode: CacheWriteMode,
-        dbarrier: DownloadBarrier,
-    ) -> std::io::Result<Self> {
+        dbarrier: &DownloadBarrier,
+        path: &Path,
+    ) -> Result<Self, DownloadFailure> {
         use tokio::io::AsyncWriteExt as _;
-        tempfile.flush().await?;
-        let fd = tempfile.as_fd().try_clone_to_owned()?;
+        tempfile
+            .flush()
+            .await
+            .map_err(|err| CacheError::counted_io("prepare splice cache writer", path, err))?;
+        let fd = tempfile
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|err| InternalError::io("duplicate splice cache descriptor", err))?;
         let hasher = match mode {
             CacheWriteMode::Userspace(algo) if file_offset == 0 => algo.map(StreamHasher::new),
             CacheWriteMode::Kernel | CacheWriteMode::Userspace(_) => None,
         };
         Ok(Self {
             tempfile,
+            path: path.to_owned(),
             file: Arc::new(CacheFile {
                 fd,
                 _write_lease: dbarrier.write_lease(),
             }),
             file_offset,
             hasher,
-            dbarrier: Some(dbarrier),
             pipes: None,
         })
     }
 
     /// Prefixes and fully buffered bodies use the same append path as TLS
     /// chunks. Publish only after the owned blocking write has completed.
-    pub(super) async fn write_prefix(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    pub(super) async fn write_prefix(&mut self, bytes: &[u8]) -> Result<(), DownloadFailure> {
         if bytes.is_empty() {
             return Ok(());
         }
         self.write_cache_chunk(&mut bytes.to_vec(), bytes.len())
             .await
-            .map_err(|err| err.err)
     }
 
     /// Only a drained writer can hand its file and whole-file digest to commit.
-    pub(super) fn finish(self) -> (tokio::fs::File, DownloadBarrier, Option<StreamedDigest>) {
+    pub(super) fn finish(self) -> (tokio::fs::File, Option<StreamedDigest>) {
         assert!(
             self.pipes
                 .as_ref()
                 .is_none_or(|pipes| pipes.cache.is_empty()),
             "all queued cache bytes must land before commit"
         );
-        (
-            self.tempfile,
-            self.dbarrier
-                .expect("a completed writer still owns its barrier"),
-            self.hasher.map(StreamHasher::finalize),
-        )
+        (self.tempfile, self.hasher.map(StreamHasher::finalize))
     }
 
     pub(super) fn position(&self) -> u64 {
         self.file_offset
             .try_into()
             .expect("cache offsets are non-negative")
-    }
-
-    fn barrier(&mut self) -> &mut DownloadBarrier {
-        self.dbarrier
-            .as_mut()
-            .expect("the barrier is only taken on the upstream-rate abort path")
     }
 
     fn pipes(&self) -> &SplicePipes {
@@ -467,8 +379,8 @@ impl CacheWriter {
         &mut self.pipes_mut().cache
     }
 
-    /// `pwrite` a userspace chunk to the cache file at the current offset
-    /// and notify concurrent clients. Always done before the client send so
+    /// `pwrite` a userspace chunk to the cache file at the current offset.
+    /// The transfer owner publishes its progress. Write before the client send so
     /// late joiners are not gated on this client's send speed.
     ///
     /// The only digest update site, shared by prefixes, buffered bodies and
@@ -477,24 +389,23 @@ impl CacheWriter {
         &mut self,
         buf: &mut Vec<u8>,
         got: usize,
-    ) -> Result<(), BodyTransferError> {
+    ) -> Result<(), DownloadFailure> {
         self.flush().await?;
         pwrite_buf_to_file(&self.file, buf, got, self.file_offset)
             .await
-            .map_err(BodyTransferError::cache)?;
+            .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
         if let Some(hasher) = self.hasher.as_mut() {
             hasher.update(&buf[..got]);
         }
         self.file_offset +=
             i64::try_from(got).expect("a chunk is bounded by its read buffer, which fits in i64");
-        self.barrier().ping_batched(got as u64);
         Ok(())
     }
 
-    /// Drain a pipe into the cache file at the current offset and notify
-    /// concurrent clients. Count-free like [`drain_pipe_to_file`]: the pipe
+    /// Drain a pipe into the cache file at the current offset. The transfer
+    /// owner publishes its progress. Count-free like [`drain_pipe_to_file`]: the pipe
     /// holds exactly the bytes to land.
-    async fn drain_pipe_to_cache(&mut self) -> Result<(), BodyTransferError> {
+    async fn drain_pipe_to_cache(&mut self) -> Result<(), DownloadFailure> {
         // These bytes go pipe-to-file inside the kernel and are never in
         // userspace, so kernel mode never creates an incremental digest.
         debug_assert!(
@@ -507,17 +418,16 @@ impl CacheWriter {
             "cache-only writes consume unique pipe bytes"
         );
         let rx = Arc::clone(&pipes.upstream_fd);
-        let landed = drain_pipe_to_file(&rx, &self.file, &mut self.file_offset)
+        let _landed = drain_pipe_to_file(&rx, &self.file, &mut self.file_offset)
             .await
-            .map_err(BodyTransferError::cache)?;
-        self.barrier().ping_batched(landed as u64);
+            .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
         Ok(())
     }
 
-    /// Drain `pipe_B` to the cache file and notify concurrent clients. A
-    /// no-op while nothing is pending, so it is free to call at every point
+    /// Drain `pipe_B` to the cache file. The transfer owner publishes the
+    /// resulting progress. A no-op while nothing is pending, so it is free to call
     /// that needs the file current.
-    async fn flush(&mut self) -> Result<(), BodyTransferError> {
+    async fn flush(&mut self) -> Result<(), DownloadFailure> {
         if self
             .pipes
             .as_ref()
@@ -533,20 +443,19 @@ impl CacheWriter {
             self.hasher.is_none(),
             "tee bytes cannot feed an incremental digest"
         );
-        let landed = drain_pipe_to_file(
+        let _landed = drain_pipe_to_file(
             &self.pipes.as_ref().expect("splice pipes").cache.rx,
             &self.file,
             &mut self.file_offset,
         )
         .await
-        .map_err(BodyTransferError::cache)?;
-        self.barrier().ping_batched(landed as u64);
+        .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
         Ok(())
     }
 
     /// Flush once the batch is due: at the threshold, or on the very first
     /// bytes of the transfer.
-    async fn flush_if_due(&mut self) -> Result<(), BodyTransferError> {
+    async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
         if self.batch().pending >= CacheBatch::FLUSH_THRESHOLD || !self.batch().flushed_once.get() {
             self.flush().await?;
         }
@@ -555,7 +464,7 @@ impl CacheWriter {
 
     /// Write `pipe_A` straight to the cache file, after the pending `pipe_B`
     /// bytes that precede it in the body.
-    async fn write_through(&mut self) -> Result<(), BodyTransferError> {
+    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
         self.flush().await?;
         self.drain_pipe_to_cache().await
     }
@@ -563,11 +472,10 @@ impl CacheWriter {
     /// Preserve received bytes on failure. The pipe owner resolves duplicate
     /// bytes before appending the remaining unique tail. The cache file keeps
     /// its write lease even when the barrier has already published an abort.
-    async fn salvage(&mut self, cache_path: &Path) {
-        let pipes = self
-            .pipes
-            .take()
-            .expect("the splice loop installed its pipes");
+    pub(super) async fn salvage(&mut self, cache_path: &Path) {
+        let Some(pipes) = self.pipes.take() else {
+            return;
+        };
         if let Err(err) = pipes.salvage_into(&self.file, &mut self.file_offset).await {
             let _logged = Logged::cache_io_failure(format_args!(
                 "splice proxy: failed to land the last received bytes of `{}` in the partial file; a later attempt resumes from a shorter partial:  {}",
@@ -584,12 +492,12 @@ impl CacheWriter {
     /// again; without this the `.partial` a later attempt resumes from would be
     /// short of what was received. `read_buf` holds only bytes not yet written
     /// (see [`drive_reads`]), so nothing lands twice. The barrier is not pinged:
-    /// on the upstream-rate abort path it is already consumed, and the joiners
-    /// it would wake have been told the download failed. Nothing is counted
+    /// the guarded runner already retained the failure and will publish it
+    /// after salvage, or on cancellation. Nothing is counted
     /// either: the bytes were counted as downloaded when they arrived, whether
     /// or not `note_chunk` got to run. A failed salvage is reported here and
     /// does not replace the transfer's own error.
-    async fn salvage_read_buf(&mut self, read_buf: &mut Vec<u8>, cache_path: &Path) {
+    pub(super) async fn salvage_read_buf(&mut self, read_buf: &mut Vec<u8>, cache_path: &Path) {
         let got = read_buf.len();
         if got == 0 {
             return;
@@ -619,7 +527,7 @@ impl CacheWriter {
 /// checkers, the upstream-rate gate, the byte cursors, the client state
 /// machine and the demotion hand-off -- lives here so it exists once.
 ///
-/// A client-less transfer ([`BodyClient::Absent`], [`BodyClient::Lost`])
+/// A client-less transfer ([`BodyClient::Absent`], [`BodyClient::Aborted`])
 /// starts the state machine in the matching [`ClientStatus`] with the
 /// client-side accounting (`counter`, `client_rate_checker`) unarmed; the
 /// socket itself is reachable only through [`ClientStatus::client_to_write`],
@@ -636,7 +544,8 @@ pub(super) struct BodyTransfer<'a> {
     /// and `None` from the start for a client-less transfer, which ships no
     /// bytes to any client and so must not bump `ACTIVE_CLIENT_DOWNLOADS`.
     counter: Option<client_counter::ClientDownload>,
-    cache: CacheWriter,
+    cache: &'a mut CacheWriter,
+    barrier: &'a mut DownloadBarrier,
     rate_checker: Option<RateChecker>,
     client_rate_checker: Option<RateChecker>,
     /// Body bytes still to be pulled from upstream.
@@ -658,8 +567,6 @@ pub(super) struct BodyTransfer<'a> {
 
 /// What a body loop hands back to `splice_proxy_drive`.
 pub(super) struct BodyOutcome {
-    /// Returned for the rename step.
-    pub(super) cache: CacheWriter,
     /// How the client came out of the loop.
     pub(super) client: ClientEnd,
     /// Bytes this loop delivered to the client.
@@ -671,13 +578,14 @@ impl<'a> BodyTransfer<'a> {
     /// upstream; the cache writer supplies its starting file offset.
     pub(super) fn new(
         client: BodyClient<'a>,
-        cache: CacheWriter,
+        cache: &'a mut CacheWriter,
+        barrier: &'a mut DownloadBarrier,
         range_filter: &'a SpliceRangeFilter,
         cache_path: &'a Path,
         content_length: u64,
+        config: &crate::config::Config,
     ) -> Self {
         let file_start_offset = cache.position();
-        let config = global_config();
         let rate_checker = RateChecker::from_config(config);
         // `REQUESTS_SPLICE` is bumped by `splice_proxy_drive` alongside the
         // response-headers emission (next to `record_client_status`), since
@@ -692,12 +600,13 @@ impl<'a> BodyTransfer<'a> {
                 ClientStatus::Active(stream),
             ),
             BodyClient::Absent => (None, None, ClientStatus::Absent),
-            BodyClient::Lost => (None, None, ClientStatus::Disconnected),
+            BodyClient::Aborted(failure) => (None, None, ClientStatus::Aborted(failure)),
         };
 
         Self {
             counter,
             cache,
+            barrier,
             rate_checker,
             client_rate_checker,
             remaining: content_length,
@@ -710,33 +619,49 @@ impl<'a> BodyTransfer<'a> {
         }
     }
 
-    fn barrier(&self) -> &DownloadBarrier {
-        self.cache
-            .dbarrier
-            .as_ref()
-            .expect("the barrier is only taken on the upstream-rate abort path")
+    fn check_upstream_rate(&self) -> Result<(), DownloadFailure> {
+        if let Some(rate) = self.rate_checker.as_ref().and_then(RateChecker::check_fail) {
+            return Err(UpstreamError::rate(rate).into());
+        }
+        Ok(())
     }
 
-    /// Hand the barrier out for a consuming abort (the TLS read step's rate
-    /// tick); the transfer is dropped right after.
-    fn take_barrier(&mut self) -> DownloadBarrier {
-        self.cache
-            .dbarrier
-            .take()
-            .expect("the barrier is only taken on the upstream-rate abort path")
+    fn publish_cache_progress(&mut self, previous_position: u64) {
+        let written = self.cache.position() - previous_position;
+        if written != 0 {
+            self.barrier.ping_batched(written);
+        }
     }
 
-    /// Upstream-rate gate: at the top of every iteration, and again before
-    /// accepting a demotion (see [`Self::maybe_demote`]). On failure the
-    /// barrier is consumed into `Aborted(MirrorDownloadRate)`.
-    async fn check_upstream_rate(&mut self) -> Result<(), BodyTransferError> {
-        let dbarrier = self.take_barrier();
-        self.cache.dbarrier = Some(
-            dbarrier
-                .check_upstream_rate(self.rate_checker.as_ref())
-                .await
-                .map_err(BodyTransferError::upstream)?,
-        );
+    async fn flush_cache(&mut self) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        self.cache.flush().await?;
+        self.publish_cache_progress(before);
+        Ok(())
+    }
+
+    async fn flush_cache_if_due(&mut self) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        self.cache.flush_if_due().await?;
+        self.publish_cache_progress(before);
+        Ok(())
+    }
+
+    async fn write_cache_chunk(
+        &mut self,
+        buf: &mut Vec<u8>,
+        got: usize,
+    ) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        self.cache.write_cache_chunk(buf, got).await?;
+        self.publish_cache_progress(before);
+        Ok(())
+    }
+
+    async fn write_through(&mut self) -> Result<(), DownloadFailure> {
+        let before = self.cache.position();
+        self.cache.write_through().await?;
+        self.publish_cache_progress(before);
         Ok(())
     }
 
@@ -786,48 +711,50 @@ impl<'a> BodyTransfer<'a> {
         };
     }
 
-    /// The client hung up mid-body: count it, log it once, and carry on
-    /// cache-only so late joiners still complete.
-    fn client_disconnected(&mut self) {
-        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-        let client_total = self.range_filter.send;
-        let client_sent = client_total - self.client_remaining;
-        #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
-        let client_sent_percent = 100.0 * client_sent as f32 / client_total as f32;
-        info!(
-            "splice proxy: client disconnected after {} out of {} ({:.1}%), continuing cache-only",
-            HumanFmt::Size(client_sent),
-            HumanFmt::Size(client_total),
-            client_sent_percent,
-        );
-        self.client_status = ClientStatus::Disconnected;
+    /// Only this delivery stops; upstream and cache progress retain their
+    /// owner. The one sink for a delivery the body loops end.
+    fn abort_client(&mut self, failure: DeliveryFailure) {
+        // The response is short from here on: half-close so the peer stops
+        // waiting for the promised length instead of blocking until the
+        // cache-only remainder of the download releases the connection. A
+        // `DemoteRequested` socket is still this transfer's own -- the demote
+        // it asked for is what just failed, so no other writer exists. Never
+        // `Demoted`: the spawned file-serve task writes through a dup of this
+        // socket and `shutdown(2)` is socket-wide, so it would cut off a
+        // delivery that is still running.
+        if let ClientStatus::Active(client)
+        | ClientStatus::DemoteRequested {
+            client,
+            client_file_pos: _,
+            client_remaining: _,
+        } = self.client_status
+        {
+            shutdown_client_write(client);
+        }
+        self.client_status = ClientStatus::Aborted(self.conclude_delivery(failure));
     }
 
-    /// A rated client write stalled past `http_timeout` (or under the client
-    /// rate floor) in `phase`: abandon the client but keep the download alive
-    /// for the cache and the late joiners. Propagating would drop the barrier
-    /// and truncate every joiner's body -- a stalled client must not abort a
-    /// shared transfer. No `CLIENT_DISCONNECTED_MID_BODY` bump: the timeout
-    /// counters were bumped where the error was built.
-    fn abandon_stalled_client(&mut self, client: &TcpStream, phase: &str, err: &std::io::Error) {
-        info!(
-            "splice proxy: client {} timed out during {phase}; abandoning the client:  {}",
-            peer_addr_for_log(client),
-            ErrorReport(err)
-        );
-        self.client_status = ClientStatus::Disconnected;
+    fn conclude_delivery(&self, failure: DeliveryFailure) -> ReportedDelivery {
+        let client_total = self.range_filter.send;
+        let client_sent = client_total - self.client_remaining;
+        failure.conclude(format_args!(
+            "splice proxy: delivery of `{}` stopped after {} of the {} streamed past the body prefix; continuing cache-only",
+            self.cache_path.display(),
+            HumanFmt::Size(client_sent),
+            HumanFmt::Size(client_total),
+        ))
     }
 
     /// Adjudicate a `DemoteRequested` client: no-op in every other state.
     ///
     /// Slow upstream is the most common reason the client RC trips, so the
-    /// upstream rate is checked first and its `MirrorDownloadRate` abort
+    /// upstream rate is checked first and its typed upstream-rate failure
     /// surfaces the root cause instead of spinning up a doomed demoted
     /// file-serve task. Only when the upstream is healthy is the client
     /// really the bottleneck: accounting is handed to the spawned task (its
     /// `async_sendfile_unfinished` creates its own `ClientDownload`, so net
     /// `ACTIVE_CLIENT_DOWNLOADS` stays at 1 across the transition).
-    async fn maybe_demote(&mut self) -> Result<(), BodyTransferError> {
+    fn maybe_demote(&mut self) -> Result<(), DownloadFailure> {
         let ClientStatus::DemoteRequested {
             client,
             client_file_pos: demote_pos,
@@ -837,7 +764,7 @@ impl<'a> BodyTransfer<'a> {
             return Ok(());
         };
 
-        self.check_upstream_rate().await?;
+        self.check_upstream_rate()?;
 
         let client_total = self.range_filter.send;
         #[expect(clippy::cast_precision_loss, reason = "only for display purpose")]
@@ -857,22 +784,53 @@ impl<'a> BodyTransfer<'a> {
             self.cache_path,
             demote_pos,
             demote_remaining,
-            self.barrier().subscribe(),
-            Arc::clone(self.barrier().status()),
-        )
-        .map_err(BodyTransferError::proxy)?;
-        self.client_status = ClientStatus::Demoted(prepared.spawn());
+            self.barrier.subscribe(),
+            Arc::clone(self.barrier.status()),
+        );
+        match prepared {
+            Ok(prepared) => self.client_status = ClientStatus::Demoted(prepared.spawn()),
+            Err(err) => {
+                self.abort_client(InternalError::io("prepare demoted delivery", err).into());
+            }
+        }
         Ok(())
     }
 
-    fn finish(self) -> BodyOutcome {
+    fn finish(mut self) -> BodyOutcome {
+        let client = match std::mem::replace(&mut self.client_status, ClientStatus::Absent) {
+            ClientStatus::Active(_) => ClientEnd::Served,
+            ClientStatus::Absent => ClientEnd::Absent,
+            ClientStatus::Aborted(reported) => ClientEnd::Aborted(reported),
+            // Every loop adjudicates a `DemoteRequested` on the iteration
+            // that raised it, so a body cannot end in it -- and if one ever
+            // did, the bytes it still owes would have no sender: a short
+            // response, concluded like any other.
+            ClientStatus::DemoteRequested {
+                client,
+                client_file_pos: _,
+                client_remaining: _,
+            } => {
+                shutdown_client_write(client);
+                ClientEnd::Aborted(
+                    self.conclude_delivery(
+                        InternalError::invalid(
+                            "splice body loop",
+                            "the body ended with a demotion still unadjudicated",
+                        )
+                        .into(),
+                    ),
+                )
+            }
+            ClientStatus::Demoted(handle) => ClientEnd::Demoted(handle),
+        };
         let Self {
             counter: _counter,
-            cache,
+            cache: _,
+            barrier: _,
             rate_checker: _,
             client_rate_checker: _,
             remaining,
-            client_status,
+            client_status: _,
             bytes_done: _,
             client_file_pos: _,
             client_remaining,
@@ -883,23 +841,7 @@ impl<'a> BodyTransfer<'a> {
             remaining, 0,
             "the body loop runs until the body is exhausted"
         );
-        let client = match client_status {
-            ClientStatus::Active(_) => ClientEnd::Served,
-            ClientStatus::Absent => ClientEnd::Absent,
-            // Every loop adjudicates a `DemoteRequested` on the iteration
-            // that raised it, so a body cannot end in it -- and if one ever
-            // did, the bytes it still owes would have no sender, which is a
-            // short response, not a served one.
-            ClientStatus::Disconnected
-            | ClientStatus::DemoteRequested {
-                client: _,
-                client_file_pos: _,
-                client_remaining: _,
-            } => ClientEnd::Disconnected,
-            ClientStatus::Demoted(handle) => ClientEnd::Demoted(handle),
-        };
         BodyOutcome {
-            cache,
             client,
             client_bytes: range_filter.send - client_remaining,
         }
@@ -922,19 +864,10 @@ impl<'a> BodyTransfer<'a> {
 pub(super) async fn splice_proxy_body(
     mut xfer: BodyTransfer<'_>,
     upstream: &TcpStream,
-) -> Result<BodyOutcome, BodyTransferError> {
-    xfer.cache.pipes = Some(SplicePipes::new().map_err(BodyTransferError::proxy)?);
-
-    // One owner settles both pipes on every exit.
-    let driven = drive_batches(&mut xfer, upstream).await;
-    match driven {
-        Ok(()) => xfer.cache.flush().await?,
-        Err(err) => {
-            xfer.cache.salvage(xfer.cache_path).await;
-            return Err(err);
-        }
-    }
-
+) -> Result<BodyOutcome, DownloadFailure> {
+    xfer.cache.pipes = Some(SplicePipes::new().map_err(internal_io)?);
+    drive_batches(&mut xfer, upstream).await?;
+    xfer.flush_cache().await?;
     Ok(xfer.finish())
 }
 
@@ -948,7 +881,7 @@ pub(super) async fn splice_proxy_body(
 async fn drive_batches(
     xfer: &mut BodyTransfer<'_>,
     upstream: &TcpStream,
-) -> Result<(), BodyTransferError> {
+) -> Result<(), DownloadFailure> {
     let config = global_config();
 
     let range_filter = xfer.range_filter;
@@ -956,7 +889,7 @@ async fn drive_batches(
     let client_range_end = range_filter.skip + range_filter.send;
 
     while xfer.remaining > 0 {
-        xfer.check_upstream_rate().await?;
+        xfer.check_upstream_rate()?;
 
         // Cap the batch at the next client-range edge so a batch is either
         // wholly inside or wholly outside the range: accumulating across an
@@ -1019,14 +952,9 @@ async fn drive_batches(
 
             let _: Never = match res {
                 Ok(0) => {
-                    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                    return Err(BodyTransferError::upstream(std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        format!(
-                            "upstream closed prematurely (remaining={}, batched={got}, budget={budget})",
-                            xfer.remaining
-                        ),
-                    )));
+                    return Err(UpstreamError::protocol(format!(
+                        "upstream closed prematurely (remaining={}, batched={got}, budget={budget})", xfer.remaining
+                    )).into());
                 }
                 Ok(n) => {
                     metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
@@ -1060,28 +988,24 @@ async fn drive_batches(
                         r = wait_readable_rated(
                             upstream,
                             &mut xfer.rate_checker,
-                            RateCheckDirection::Upstream,
                             config.http_timeout,
                         ) => {
-                            r.map_err(BodyTransferError::upstream)?;
+                            r?;
                             false
                         }
                         w = xfer.cache.pipes().upstream_tx.writable() => {
-                            w.map_err(BodyTransferError::proxy)?;
+                            w.map_err(internal_io)?;
                             false
                         }
                         () = xfer.cache.batch().until_stale(), if !xfer.cache.batch().is_empty() => true,
                     };
                     if batch_is_stale {
-                        xfer.cache.flush().await?;
+                        xfer.flush_cache().await?;
                     }
                     continue;
                 }
                 Err(err) => {
-                    return Err(BodyTransferError::upstream(errno_to_io_error(
-                        err,
-                        "splice failed",
-                    )));
+                    return Err(upstream_splice_failure(err));
                 }
             };
         }
@@ -1106,7 +1030,7 @@ async fn drive_batches(
             if chunk.start >= client_skip && chunk.end <= client_range_end {
                 // Chunk is entirely inside client range — normal tee
                 tee_and_splice(xfer, got).await?;
-                xfer.maybe_demote().await?;
+                xfer.maybe_demote()?;
                 continue;
             }
 
@@ -1122,7 +1046,7 @@ async fn drive_batches(
                 .pipes_mut()
                 .read_boundary(got)
                 .await
-                .map_err(BodyTransferError::proxy)?;
+                .map_err(internal_io)?;
 
             debug_assert_eq!(buf.len(), got, "read_pipe_to_buf reads exactly `got` bytes");
 
@@ -1130,20 +1054,18 @@ async fn drive_batches(
             // see progress without being gated on the first client's send speed.
             // The pwrite lands at `file_offset`, so the batched `pipe_B` bytes
             // (which come earlier in the body) have to be there already.
-            xfer.cache.write_cache_chunk(&mut buf, got).await?;
+            xfer.write_cache_chunk(&mut buf, got).await?;
 
             let client_slice = range_slice(&buf, chunk.start, range_filter.skip, range_filter.send);
             if !client_slice.is_empty() {
-                write_client_or_demote(xfer, client, client_slice)
-                    .await
-                    .map_err(BodyTransferError::client)?;
-                xfer.maybe_demote().await?;
+                write_client_or_demote(xfer, client, client_slice).await;
+                xfer.maybe_demote()?;
             }
         } else {
             // Chunk is entirely outside the client range, or the client is
             // absent/gone/demoted — cache only. `pipe_A` holds exactly the
             // batch, so draining it is the chunk write.
-            xfer.cache.write_through().await?;
+            xfer.write_through().await?;
         }
     }
 
@@ -1258,20 +1180,9 @@ async fn pwrite_buf_to_file(
 pub(super) async fn splice_proxy_body_tls(
     mut xfer: BodyTransfer<'_>,
     upstream: &mut UpstreamConn,
-) -> Result<BodyOutcome, BodyTransferError> {
-    // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
-    // writes into the spare capacity via `BufMut` so the buffer never has
-    // to be zero-initialized before being overwritten by upstream data.
-    let mut read_buf: Vec<u8> = Vec::with_capacity(TLS_READ_BUF_SIZE);
-
-    let driven = drive_reads(&mut xfer, upstream, &mut read_buf).await;
-    if let Err(err) = driven {
-        xfer.cache
-            .salvage_read_buf(&mut read_buf, xfer.cache_path)
-            .await;
-        return Err(err);
-    }
-
+    read_buf: &mut Vec<u8>,
+) -> Result<BodyOutcome, DownloadFailure> {
+    drive_reads(&mut xfer, upstream, read_buf).await?;
     Ok(xfer.finish())
 }
 
@@ -1286,7 +1197,7 @@ async fn drive_reads(
     xfer: &mut BodyTransfer<'_>,
     upstream: &mut UpstreamConn,
     read_buf: &mut Vec<u8>,
-) -> Result<(), BodyTransferError> {
+) -> Result<(), DownloadFailure> {
     let config = global_config();
     let range_filter = xfer.range_filter;
 
@@ -1300,7 +1211,7 @@ async fn drive_reads(
     tokio::pin!(tick);
 
     while xfer.remaining > 0 {
-        xfer.check_upstream_rate().await?;
+        xfer.check_upstream_rate()?;
 
         // Step 1: async read from TLS stream into userspace buffer
         // The outer http_timeout ensures a fully stalled connection is killed even if
@@ -1342,7 +1253,7 @@ async fn drive_reads(
                         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
                         continue;
                     }
-                    Poll::Ready(Err(err)) => return Err(BodyTransferError::upstream(err)),
+                    Poll::Ready(Err(err)) => return Err(upstream_io(err)),
                 }
             }
 
@@ -1355,7 +1266,7 @@ async fn drive_reads(
                     // tick fires, so no read progress is ever cancelled.
                     result = &mut read_fut => match result {
                         Ok(n) => break n,
-                        Err(err) => return Err(BodyTransferError::upstream(err)),
+                        Err(err) => return Err(upstream_io(err)),
                     },
                     () = &mut tick, if xfer.rate_checker.is_some() => {
                         let rc = xfer
@@ -1363,23 +1274,15 @@ async fn drive_reads(
                             .as_mut()
                             .expect("guarded by rate_checker.is_some()");
                         rc.add(0);
-                        if let Some(rate) = rc.check_fail(RateCheckDirection::Upstream) {
-                            return Err(BodyTransferError::upstream(
-                                xfer.take_barrier().abort_with_rate_timeout(rate).await,
-                            ));
+                        if let Some(rate) = rc.check_fail() {
+                            return Err(UpstreamError::rate(rate).into());
                         }
                         tick.as_mut()
                             .reset(tokio::time::Instant::now() + RATE_TICK_PERIOD);
                     }
                     () = &mut outer => {
                         metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                        return Err(BodyTransferError::upstream(std::io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!(
-                                "upstream TLS read timed out after {}",
-                                HumanFmt::Time(config.http_timeout)
-                            ),
-                        )));
+                        return Err(UpstreamError::timeout("upstream TLS read timed out", config.http_timeout).into());
                     }
                 }
             };
@@ -1400,7 +1303,7 @@ async fn drive_reads(
         // Write the full chunk to cache via pwrite first, so concurrent
         // clients see progress without being gated on this client's send
         // speed.
-        xfer.cache.write_cache_chunk(read_buf, got).await?;
+        xfer.write_cache_chunk(read_buf, got).await?;
 
         // From here on the bytes are on disk: take them out of `read_buf` for
         // the delivery, so a failure in it leaves the buffer empty and the
@@ -1416,10 +1319,8 @@ async fn drive_reads(
         if let Some(client) = xfer.client_status.client_to_write()
             && !client_slice.is_empty()
         {
-            write_client_or_demote(xfer, client, client_slice)
-                .await
-                .map_err(BodyTransferError::client)?;
-            xfer.maybe_demote().await?;
+            write_client_or_demote(xfer, client, client_slice).await;
+            xfer.maybe_demote()?;
         }
         *read_buf = landed;
         read_buf.clear();
@@ -1429,12 +1330,8 @@ async fn drive_reads(
 }
 
 /// The upstream closed before delivering `content_length` bytes.
-fn tls_premature_eof() -> BodyTransferError {
-    metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-    BodyTransferError::upstream(std::io::Error::new(
-        ErrorKind::UnexpectedEof,
-        "TLS upstream closed prematurely",
-    ))
+fn tls_premature_eof() -> DownloadFailure {
+    UpstreamError::protocol("TLS upstream closed prematurely").into()
 }
 
 /// Write `slice` to the client with rate checking, translating client
@@ -1444,67 +1341,56 @@ fn tls_premature_eof() -> BodyTransferError {
 ///
 /// Mirrors the `tee_and_splice` client-splice semantics: a client
 /// rate-check trip after progress leaves `DemoteRequested` (the caller
-/// adjudicates via [`BodyTransfer::maybe_demote`]), a peer disconnect
-/// leaves `Disconnected` (bumping `CLIENT_DISCONNECTED_MID_BODY`), and a
-/// rated wait timeout abandons the client (`Disconnected`, no metric — the
-/// timeout counters were already bumped at rejection) so the download
-/// continues cache-only. Only unexpected I/O errors are returned as
-/// `Err`. The userspace delivery of both loops: every TLS chunk, and the
-/// zero-copy loop's range-boundary chunk.
+/// adjudicates via [`BodyTransfer::maybe_demote`]); every client failure --
+/// a peer disconnect, a rated-wait timeout, any other write error -- goes
+/// through [`BodyTransfer::abort_client`], whose conclusion owns the level
+/// and the counters, and leaves `Aborted`, so the download continues
+/// cache-only. Nothing is returned: no client failure ends the download.
+/// The userspace delivery of both loops: every TLS chunk, and the zero-copy
+/// loop's range-boundary chunk.
 async fn write_client_or_demote<'a>(
     xfer: &mut BodyTransfer<'a>,
     client: &'a TcpStream,
     slice: &[u8],
-) -> std::io::Result<()> {
+) {
     let mut written = 0;
     while written < slice.len() {
-        // `try_write` clears tokio's cached writability itself on
-        // `WouldBlock`, so the rated wait below parks properly.
         match client.try_write(&slice[written..]) {
+            Ok(0) => {
+                xfer.abort_client(
+                    ClientError::io("write client body", ErrorKind::WriteZero.into()).into(),
+                );
+                return;
+            }
             Ok(n) => {
                 written += n;
                 xfer.note_client_bytes(n);
                 if let Some(rc) = &mut xfer.client_rate_checker {
                     rc.add(n);
-                    if rc.check_fail(RateCheckDirection::Client).is_some() {
-                        // Client RC tripped — the cache already has the
-                        // bytes, hand off to the caller for demote
-                        // adjudication.
+                    if rc.check_fail().is_some() {
                         xfer.request_demote(client);
-                        return Ok(());
+                        return;
                     }
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                match wait_writable_rated(
+                if let Err(err) = wait_writable_rated(
                     client,
                     &mut xfer.client_rate_checker,
-                    RateCheckDirection::Client,
                     global_config().http_timeout,
                 )
                 .await
                 {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == ErrorKind::TimedOut => {
-                        xfer.abandon_stalled_client(client, "userspace body", &err);
-                        return Ok(());
-                    }
-                    Err(err) if is_peer_disconnect(&err) => {
-                        xfer.client_disconnected();
-                        return Ok(());
-                    }
-                    Err(err) => return Err(err),
+                    xfer.abort_client(err.into());
+                    return;
                 }
             }
-            Err(err) if is_peer_disconnect(&err) => {
-                xfer.client_disconnected();
-                return Ok(());
+            Err(err) => {
+                xfer.abort_client(ClientError::io("splice client write", err).into());
+                return;
             }
-            Err(err) => return Err(err),
         }
     }
-
-    Ok(())
 }
 
 /// Capture the client socket and cache file before spawning their writer.
@@ -1570,7 +1456,7 @@ struct PreparedFileServe {
 }
 
 impl PreparedFileServe {
-    fn spawn(self) -> tokio::task::JoinHandle<DeliveryResult> {
+    fn spawn(self) -> DemotedDelivery {
         tokio::task::spawn(serve_remaining_from_file(
             self.client,
             self.file,
@@ -1600,7 +1486,7 @@ async fn serve_remaining_from_file(
     content_length: u64,
     receiver: tokio::sync::watch::Receiver<()>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-) -> DeliveryResult {
+) -> TransferOutcome<ReportedDelivery> {
     debug!(
         "splice proxy: starting to serve remaining bytes of `{}` from the cache file for the demoted client at offset {content_start} ({content_length} bytes remaining)",
         cache_path.display()
@@ -1614,7 +1500,7 @@ async fn serve_remaining_from_file(
 
     metrics::CLIENTS_DEMOTED.increment();
 
-    match async_sendfile_unfinished(
+    let TransferOutcome { transferred, end } = async_sendfile_unfinished(
         &client,
         &file,
         &cache_path,
@@ -1623,33 +1509,26 @@ async fn serve_remaining_from_file(
         receiver,
         status,
     )
-    .await
-    {
-        Ok(bytes) => {
+    .await;
+    let end = match end {
+        DeliveryEnd::Complete => {
             debug!(
-                "splice proxy: demoted client file-serve complete, sent {bytes} bytes from cache offset {content_start}"
+                "splice proxy: demoted client file-serve complete, sent {transferred} bytes from cache offset {content_start}"
             );
-            DeliveryResult::Success(bytes)
+            DeliveryEnd::Complete
         }
-        Err((bytes, err)) => {
-            if is_peer_disconnect(&err) {
-                metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-                debug!(
-                    "splice proxy: demoted client disconnected during file-serve of `{}` from cache offset {content_start}:  {}",
-                    cache_path.display(),
-                    ErrorReport(&err)
-                );
-            } else {
-                info!(
-                    "splice proxy: demoted client file-serve of `{}` failed at cache offset {content_start}; the client did not get the full body:  {}",
-                    cache_path.display(),
-                    ErrorReport(&err)
-                );
-            }
-
-            DeliveryResult::Failure(bytes)
+        DeliveryEnd::Aborted(failure) => {
+            // The connection task still owns the original descriptor while
+            // it fills the cache. Dropping this task's dup alone sends no FIN.
+            shutdown_client_write(&client);
+            DeliveryEnd::Aborted(failure.conclude(format_args!(
+                "splice proxy: demoted client delivery of `{}` stopped at cache offset {}; the client did not get the full body",
+                cache_path.display(),
+                content_start + transferred,
+            )))
         }
-    }
+    };
+    TransferOutcome { transferred, end }
 }
 
 /// The leading bytes of pipe A. Only pipe operations change this state, so
@@ -1899,12 +1778,12 @@ enum ClientStatus<'a> {
     /// Client is still connected and receiving data at acceptable speed.
     Active(&'a TcpStream),
     /// No client was ever attached (parallel-hack nudge): cache-only from
-    /// the first byte. Unlike [`Self::Disconnected`] there is no metric and
+    /// the first byte. Unlike [`Self::Aborted`] there is no metric and
     /// no log line -- nothing was lost -- and the transfer ends as
-    /// [`ClientEnd::Absent`], not [`ClientEnd::Disconnected`].
+    /// [`ClientEnd::Absent`], not [`ClientEnd::Aborted`].
     Absent,
-    /// Client disconnected mid-transfer.
-    Disconnected,
+    /// The delivery ended mid-transfer; its failure is concluded.
+    Aborted(ReportedDelivery),
     /// Client send rate dropped below the minimum threshold during the
     /// inner tee+splice loop and the teed bytes still in `pipe_A` have
     /// been drained. The caller adjudicates whether to actually demote
@@ -1924,10 +1803,10 @@ enum ClientStatus<'a> {
     },
     /// Caller has accepted the demote: a file-serve task has been spawned
     /// and is now responsible for the client. Subsequent iterations of the
-    /// splice loop treat this identically to `Disconnected` (cache-only
+    /// splice loop treat this identically to `Aborted` (cache-only
     /// path), and the byte counts the spawned task needs were already
     /// passed in via the preceding `DemoteRequested`.
-    Demoted(tokio::task::JoinHandle<DeliveryResult>),
+    Demoted(DemotedDelivery),
 }
 
 impl<'a> ClientStatus<'a> {
@@ -1940,7 +1819,7 @@ impl<'a> ClientStatus<'a> {
         // every other non-`Active` state has nothing attached at all.
         match self {
             Self::Active(client) => Some(client),
-            Self::Absent | Self::Disconnected | Self::DemoteRequested { .. } | Self::Demoted(_) => {
+            Self::Absent | Self::Aborted(_) | Self::DemoteRequested { .. } | Self::Demoted(_) => {
                 None
             }
         }
@@ -1958,7 +1837,7 @@ impl<'a> ClientStatus<'a> {
 /// caller ([`BodyTransfer::maybe_demote`]) can either promote it to
 /// `ClientStatus::Demoted` (spawn a file-serve task) or abort the splice with
 /// an upstream-rate timeout when the upstream is the actual bottleneck.
-async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), BodyTransferError> {
+async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), DownloadFailure> {
     let mut remaining = got;
 
     while remaining > 0 {
@@ -1974,7 +1853,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
 
                 let _: Never = match res {
                     Ok(0) => {
-                        return Err(BodyTransferError::proxy(std::io::Error::new(
+                        return Err(internal_io(std::io::Error::new(
                             ErrorKind::UnexpectedEof,
                             "tee returned 0",
                         )));
@@ -1987,7 +1866,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
                     // failed and the pipe is smaller than
                     // `CacheBatch::FLUSH_THRESHOLD`.
                     Err(nix::errno::Errno::EAGAIN) if !xfer.cache.batch().is_empty() => {
-                        xfer.cache.flush().await?;
+                        xfer.flush_cache().await?;
                         continue;
                     }
                     // EAGAIN/EWOULDBLOCK: see module-level static_assert.
@@ -1995,16 +1874,13 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
                         clear_pipe_readable_cache(&xfer.cache.pipes().upstream_rx);
                         clear_pipe_writable_cache(&xfer.cache.batch().tx);
                         tokio::select! {
-                            r = xfer.cache.pipes().upstream_rx.readable() => r.map_err(BodyTransferError::proxy)?,
-                            w = xfer.cache.batch().tx.writable() => w.map_err(BodyTransferError::proxy)?,
+                            r = xfer.cache.pipes().upstream_rx.readable() => r.map_err(internal_io)?,
+                            w = xfer.cache.batch().tx.writable() => w.map_err(internal_io)?,
                         }
                         continue;
                     }
                     Err(err) => {
-                        return Err(BodyTransferError::proxy(errno_to_io_error(
-                            err,
-                            "tee failed",
-                        )));
+                        return Err(internal_io(errno_to_io_error(err, "tee failed")));
                     }
                 };
             };
@@ -2014,7 +1890,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
             // A due batch is written before the client splice below, so
             // concurrent clients still see progress without being gated on a
             // potentially slow first client.
-            xfer.cache.flush_if_due().await?;
+            xfer.flush_cache_if_due().await?;
 
             // Step 4: splice pipe_A → client (may be slow, but no longer blocks cache)
             // pipe_A always has data on entry (just filled by tee), so try the
@@ -2029,28 +1905,20 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
                 let result = xfer.cache.pipes_mut().send_to_client(client, usize::MAX);
 
                 let _: Never = match result {
-                    Ok(0)
-                    | Err(
-                        nix::errno::Errno::EPIPE
-                        | nix::errno::Errno::ECONNRESET
-                        | nix::errno::Errno::ECONNABORTED
-                        | nix::errno::Errno::ENOTCONN,
-                    ) => {
-                        // Client disconnected — drain the remaining teed bytes from pipe_A
-                        // by splicing them to /dev/null (discard)
-                        xfer.client_disconnected();
+                    Ok(0) => {
+                        xfer.abort_client(zero_client_splice_failure());
                         xfer.cache
                             .pipes_mut()
                             .discard_duplicate()
                             .await
-                            .map_err(BodyTransferError::proxy)?;
+                            .map_err(internal_io)?;
                         break;
                     }
                     Ok(n) => {
                         xfer.note_client_bytes(n);
                         if let Some(rc) = &mut xfer.client_rate_checker {
                             rc.add(n);
-                            if rc.check_fail(RateCheckDirection::Client).is_some() {
+                            if rc.check_fail().is_some() {
                                 // Client RC tripped — drain remaining teed bytes
                                 // (cache already has them) and hand off to the
                                 // caller. The outer loop decides whether to
@@ -2063,13 +1931,13 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
                                     .pipes_mut()
                                     .discard_duplicate()
                                     .await
-                                    .map_err(BodyTransferError::proxy)?;
+                                    .map_err(internal_io)?;
 
                                 // The file-serve task the caller may spawn
                                 // takes over from `client_file_pos` by reading
                                 // the partial file, so every byte delivered so
                                 // far has to be on disk first.
-                                xfer.cache.flush().await?;
+                                xfer.flush_cache().await?;
                                 xfer.request_demote(client);
                                 break;
                             }
@@ -2087,35 +1955,36 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
                         // other reader until it recovers, times out or is
                         // demoted. Parking on *upstream* is deliberately not a
                         // flush point -- see [`CacheBatch`].
-                        xfer.cache.flush().await?;
+                        xfer.flush_cache().await?;
                         clear_pipe_readable_cache(&xfer.cache.pipes().upstream_rx);
                         clear_tcp_writable_cache(client);
                         tokio::select! {
                             w = wait_writable_rated(
                                 client,
                                 &mut xfer.client_rate_checker,
-                                RateCheckDirection::Client,
                                 global_config().http_timeout,
                             ) => match w {
                                 Ok(()) => {}
-                                Err(err) if err.kind() == ErrorKind::TimedOut => {
-                                    xfer.abandon_stalled_client(client, "zero-copy body", &err);
+                                Err(err) => {
+                                    xfer.abort_client(err.into());
                                     xfer.cache.pipes_mut().discard_duplicate()
                                         .await
-                                        .map_err(BodyTransferError::proxy)?;
+                                        .map_err(internal_io)?;
                                     break;
                                 }
-                                Err(err) => return Err(BodyTransferError::client(err)),
                             },
-                            r = xfer.cache.pipes().upstream_rx.readable() => r.map_err(BodyTransferError::proxy)?,
+                            r = xfer.cache.pipes().upstream_rx.readable() => r.map_err(internal_io)?,
                         }
                         continue;
                     }
                     Err(err) => {
-                        return Err(BodyTransferError::client(errno_to_io_error(
-                            err,
-                            "splice failed",
-                        )));
+                        xfer.abort_client(client_splice_failure(err));
+                        xfer.cache
+                            .pipes_mut()
+                            .discard_duplicate()
+                            .await
+                            .map_err(internal_io)?;
+                        break;
                     }
                 };
             }
@@ -2127,7 +1996,7 @@ async fn tee_and_splice(xfer: &mut BodyTransfer<'_>, got: usize) -> Result<(), B
             // Client is absent, gone or demoted — splice pipe_A directly to
             // cache (no tee needed). The batch's `remaining` bytes are all
             // `pipe_A` holds, so draining it is exactly that write.
-            xfer.cache.write_through().await?;
+            xfer.write_through().await?;
             remaining = 0;
         }
     }
@@ -2267,6 +2136,33 @@ mod tests {
     use nix::fcntl::{FcntlArg, fcntl};
 
     use super::*;
+    use crate::{active_downloads::AbortReason, guards::Consequence};
+
+    #[tokio::test]
+    async fn zero_length_client_splice_is_source_eof_not_peer_loss() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+
+        let (writer, reader) = create_pipe().unwrap();
+        drop(writer);
+        let (mut socket, mut peer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            splice(&reader, None, &socket, None, 1, SpliceFFlags::empty()).unwrap(),
+            0,
+        );
+        // Source EOF is possible with a perfectly healthy destination.
+        socket.write_all(b"x").unwrap();
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
+
+        let failure = zero_client_splice_failure();
+        assert!(matches!(failure, DeliveryFailure::Internal(_)));
+        assert!(!failure.is_peer_disconnect());
+        let before = metrics::CLIENT_DISCONNECTED_MID_BODY.get();
+        let _reported = failure.conclude(format_args!("zero-length client splice"));
+        assert_eq!(metrics::CLIENT_DISCONNECTED_MID_BODY.get(), before);
+    }
 
     #[tokio::test]
     async fn test_create_pipe() {
@@ -2339,7 +2235,7 @@ mod tests {
         let lifetime = Arc::downgrade(&barrier.write_lease());
         let receiver = barrier.subscribe();
         let status = Arc::clone(barrier.status());
-        let mut writer = CacheWriter::new(file, 0, CacheWriteMode::Kernel, barrier)
+        let mut writer = CacheWriter::new(file, 0, CacheWriteMode::Kernel, &barrier, &path)
             .await
             .unwrap();
         writer.write_prefix(b"prefix-").await.unwrap();
@@ -2354,6 +2250,7 @@ mod tests {
         // Bytes arriving after demotion remain visible through the captured fd.
         writer.write_prefix(b"suffix").await.unwrap();
         drop(writer);
+        drop(barrier);
         assert!(
             lifetime.upgrade().is_none(),
             "the reader owns no write lease"
@@ -2457,9 +2354,15 @@ mod tests {
             let scratch = ScratchFile::new();
             let barrier = cache_barrier(&scratch.path).await;
             let lifetime = Arc::downgrade(&barrier.write_lease());
-            let mut writer = CacheWriter::new(scratch.file, 0, CacheWriteMode::Kernel, barrier)
-                .await
-                .unwrap();
+            let mut writer = CacheWriter::new(
+                scratch.file,
+                0,
+                CacheWriteMode::Kernel,
+                &barrier,
+                &scratch.path,
+            )
+            .await
+            .unwrap();
             let mut write = Box::pin(writer.write_prefix(b"prefix"));
             assert!(
                 write
@@ -2469,6 +2372,7 @@ mod tests {
             );
             drop(write);
             drop(writer);
+            drop(barrier);
             assert!(
                 lifetime.upgrade().is_some(),
                 "the queued prefix retains the lease"
@@ -2589,7 +2493,7 @@ mod tests {
             .try_acquire(length, 0, "writer.deb")
             .ok()
             .expect("unlimited quota");
-        InitBarrier::new(origination, &active, &details, "/debian/writer.deb")
+        InitBarrier::new(origination, active.clone(), &details, "/debian/writer.deb")
             .download(
                 path.to_owned(),
                 length,
@@ -2597,23 +2501,117 @@ mod tests {
                 Arc::new(UpstreamMetadata::default()),
             )
             .await
+            .1
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_prefix_error_reaches_shared_status_without_worker_registration() {
+        let scratch = ScratchFile::new();
+        let barrier = cache_barrier(&scratch.path).await;
+        let status = Arc::clone(barrier.status());
+        let mut receiver = barrier.subscribe();
+        let lease = Arc::downgrade(&barrier.write_lease());
+        let readonly = tokio::fs::File::from_std(
+            crate::fs_open::nofollow_options()
+                .read(true)
+                .open(&scratch.path)
+                .unwrap(),
+        );
+        let mut writer =
+            CacheWriter::new(readonly, 0, CacheWriteMode::Kernel, &barrier, &scratch.path)
+                .await
+                .unwrap();
+        let failure = barrier
+            .run(Consequence::CloseConnection, async |_barrier| {
+                writer.write_prefix(b"prefix").await
+            })
+            .await
+            .expect_err("read-only cache descriptor rejects writes");
+        assert!(matches!(failure.failure(), DownloadFailure::Cache(_)));
+        let primary = ErrorReport(failure.failure()).to_string();
+        let before_cleanup = metrics::CACHE_IO_FAILURE.get();
+        writer
+            .salvage_read_buf(&mut b"salvage-tail".to_vec(), &scratch.path)
+            .await;
+        assert!(
+            metrics::CACHE_IO_FAILURE.get() > before_cleanup,
+            "failed cleanup emits its separate cache diagnostic"
+        );
+        assert_eq!(
+            ErrorReport(failure.failure()).to_string(),
+            primary,
+            "a secondary cleanup failure cannot replace the primary cause"
+        );
+        drop(failure);
+        assert!(
+            receiver.changed().await.is_err(),
+            "terminal publication closes progress"
+        );
+        let observed = {
+            let state = status.read().await;
+            let observed = match &*state {
+                ActiveDownloadStatus::Aborted(AbortReason::Failed(failure)) => {
+                    Some(Arc::clone(failure))
+                }
+                ActiveDownloadStatus::Init(_)
+                | ActiveDownloadStatus::Download { .. }
+                | ActiveDownloadStatus::Verifying { .. }
+                | ActiveDownloadStatus::Finished { .. }
+                | ActiveDownloadStatus::Aborted(
+                    AbortReason::Discarded { .. } | AbortReason::Declined(_),
+                ) => None,
+            };
+            assert!(
+                observed.is_some(),
+                "a worker error must publish its retained cause: {state:?}"
+            );
+            drop(state);
+            observed.expect("asserted above")
+        };
+        assert!(
+            matches!(observed.as_ref(), DownloadFailure::Cache(_)),
+            "the published abort carries the retained cause: {observed:?}"
+        );
+        assert!(
+            lease.upgrade().is_some(),
+            "the writer retains its lease through cleanup"
+        );
+        drop(writer);
+        assert!(lease.upgrade().is_none());
+        assert_eq!(scratch.contents(), [] as [u8; 0]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_writer_orders_pending_tee_before_direct_writes_at_resume_offset() {
         let scratch = ScratchFile::new();
         std::fs::write(&scratch.path, b"resume-").unwrap();
-        let barrier = cache_barrier(&scratch.path).await;
+        let mut barrier = cache_barrier(&scratch.path).await;
         let mut receiver = barrier.subscribe();
-        let mut writer = CacheWriter::new(scratch.file, 7, CacheWriteMode::Kernel, barrier)
-            .await
-            .unwrap();
-        writer.pipes = Some(SplicePipes::new().unwrap());
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            7,
+            CacheWriteMode::Kernel,
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
+        let filter = SpliceRangeFilter { skip: 0, send: 0 };
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Absent,
+            &mut writer,
+            &mut barrier,
+            &filter,
+            &scratch.path,
+            1,
+            &crate::config::Config::default(),
+        );
+        xfer.cache.pipes = Some(SplicePipes::new().unwrap());
         // Model an earlier teed batch whose client bytes have been delivered.
-        queue_cache(writer.pipes_mut(), b"queued-").await;
+        queue_cache(xfer.cache.pipes_mut(), b"queued-").await;
         let mut boundary = b"boundary-".to_vec();
-        writer.write_cache_chunk(&mut boundary, 9).await.unwrap();
-        assert_eq!(writer.file_offset, 23);
+        xfer.write_cache_chunk(&mut boundary, 9).await.unwrap();
+        assert_eq!(xfer.cache.file_offset, 23);
         assert!(receiver.has_changed().unwrap());
         receiver.borrow_and_update();
         assert_eq!(
@@ -2622,11 +2620,12 @@ mod tests {
         );
 
         // Switching to cache-only must also land the next queued bytes first.
-        queue_cache(writer.pipes_mut(), b"queued2-").await;
-        accumulate(writer.pipes_mut(), b"tail");
-        writer.write_through().await.unwrap();
-        assert_eq!(writer.file_offset, 35);
-        assert!(writer.batch().is_empty());
+        queue_cache(xfer.cache.pipes_mut(), b"queued2-").await;
+        accumulate(xfer.cache.pipes_mut(), b"tail");
+        xfer.write_through().await.unwrap();
+        assert_eq!(xfer.cache.file_offset, 35);
+        assert!(xfer.cache.batch().is_empty());
+        drop(xfer);
         drop(writer);
         assert_eq!(
             std::fs::read(&scratch.path).unwrap(),
@@ -2638,9 +2637,15 @@ mod tests {
     async fn cache_writer_keeps_small_batches_after_the_first_flush() {
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut writer = CacheWriter::new(scratch.file, 0, CacheWriteMode::Kernel, barrier)
-            .await
-            .unwrap();
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Kernel,
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
         writer.pipes = Some(SplicePipes::new().unwrap());
         queue_cache(writer.pipes_mut(), b"first").await;
         writer.flush_if_due().await.unwrap();
@@ -2664,14 +2669,15 @@ mod tests {
             scratch.file,
             0,
             CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            barrier,
+            &barrier,
+            &scratch.path,
         )
         .await
         .unwrap();
         writer.write_prefix(b"prefix-").await.unwrap();
         let mut body = b"body".to_vec();
         writer.write_cache_chunk(&mut body, 4).await.unwrap();
-        let (_file, _barrier, digest) = writer.finish();
+        let (_file, digest) = writer.finish();
         let digest = digest.unwrap();
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"prefix-body");
         assert_eq!(digest.bytes, 11);
@@ -2689,7 +2695,8 @@ mod tests {
             scratch.file,
             7,
             CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            barrier,
+            &barrier,
+            &scratch.path,
         )
         .await
         .unwrap();
@@ -2698,7 +2705,7 @@ mod tests {
             .write_cache_chunk(&mut b"body".to_vec(), 4)
             .await
             .unwrap();
-        let (_file, _barrier, digest) = writer.finish();
+        let (_file, digest) = writer.finish();
         assert!(digest.is_none(), "a suffix is not a whole-file digest");
         assert_eq!(std::fs::read(&scratch.path).unwrap(), b"resume-prefix-body");
     }
@@ -2709,24 +2716,18 @@ mod tests {
 
         let scratch = ScratchFile::new();
         let barrier = cache_barrier(&scratch.path).await;
-        let mut receiver = barrier.subscribe();
         let mut writer = CacheWriter::new(
             scratch.file,
             0,
             CacheWriteMode::Userspace(Some(HashAlgo::Sha256)),
-            barrier,
+            &barrier,
+            &scratch.path,
         )
         .await
         .unwrap();
         writer.write_prefix(b"whole body").await.unwrap();
-        assert!(
-            receiver.has_changed().unwrap(),
-            "the first write wakes readers"
-        );
-        receiver.borrow_and_update();
         writer.write_prefix(b"").await.unwrap();
-        assert!(!receiver.has_changed().unwrap());
-        let (_file, _barrier, digest) = writer.finish();
+        let (_file, digest) = writer.finish();
         let digest = digest.unwrap();
         assert_eq!(digest.bytes, 10);
         assert_eq!(digest.digest, sha2::Sha256::digest(b"whole body").to_vec());
@@ -2744,7 +2745,8 @@ mod tests {
             scratch.file,
             i64::try_from(prefix.len()).unwrap(),
             CacheWriteMode::Kernel,
-            barrier,
+            &barrier,
+            &scratch.path,
         )
         .await
         .unwrap();

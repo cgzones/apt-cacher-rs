@@ -36,24 +36,89 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::{HashMap, hash_map::Entry};
 use http::StatusCode;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::cache_layout::{CacheEntryKey, CacheEntryKeyRef, ConnectionDetails};
 use crate::cache_metadata::UpstreamMetadata;
-use crate::error::{ErrorReport, MirrorDownloadRate};
+use crate::error::ErrorReport;
 use crate::fs_open::tokio_nofollow_options;
+use crate::guards::CANCELLED_DOWNLOAD;
 use crate::humanfmt::HumanFmt;
-use crate::upstream_head::ContentLength;
+use crate::transfer_error::DownloadFailure;
+use crate::upstream_head::{ContentLength, RejectReason};
 use crate::{global_config, global_verify_throttle, metrics, warn_once_or_info};
+
+/// Why an originator ended its registry entry without downloading anything:
+/// it answered its client from the upstream's head or from its own policy.
+/// A joiner answers what the originator answered ([`Self::response_parts`]),
+/// where a `Cancelled` abort would claim a failure of unknown cause.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Declined {
+    /// The upstream answered with a status that is relayed, not cached.
+    Passthrough(StatusCode),
+    /// The download planner refused the upstream response.
+    Rejected(RejectReason),
+    /// A buffered volatile body turned out to be empty.
+    #[cfg(feature = "splice")]
+    EmptyVolatileBody,
+    /// The cache quota refused the download.
+    QuotaExceeded,
+    /// Recent checksum failures throttle downloads of this file.
+    VerifyThrottled { remaining: std::time::Duration },
+    /// The originating client's own `Range` was unsatisfiable. Nothing is
+    /// wrong with the resource; the joiner still has no bytes to serve.
+    #[cfg(feature = "splice")]
+    RangeNotSatisfiable,
+}
+
+impl Declined {
+    /// The status + body a joiner answers with: the originator's own answer,
+    /// except that a relayed upstream body cannot be replayed.
+    #[must_use]
+    pub(crate) fn response_parts(self) -> (StatusCode, &'static str) {
+        match self {
+            Self::Passthrough(status) => (status, status.canonical_reason().unwrap_or("")),
+            Self::Rejected(reason) => (StatusCode::BAD_GATEWAY, reason.body()),
+            #[cfg(feature = "splice")]
+            Self::EmptyVolatileBody => (StatusCode::BAD_GATEWAY, "zero-length body"),
+            Self::QuotaExceeded => (StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached"),
+            Self::VerifyThrottled { remaining: _ } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Recently failed checksum verification",
+            ),
+            #[cfg(feature = "splice")]
+            Self::RangeNotSatisfiable => (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted"),
+        }
+    }
+}
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Passthrough(status) => write!(f, "upstream answered {status}"),
+            Self::Rejected(reason) => write!(f, "upstream response rejected: {}", reason.detail()),
+            #[cfg(feature = "splice")]
+            Self::EmptyVolatileBody => f.write_str("empty volatile body"),
+            Self::QuotaExceeded => f.write_str("disk quota reached"),
+            Self::VerifyThrottled { remaining } => write!(
+                f,
+                "recently failed checksum verification, retry in {}",
+                HumanFmt::Time(*remaining)
+            ),
+            #[cfg(feature = "splice")]
+            Self::RangeNotSatisfiable => {
+                f.write_str("the originating client's Range was not satisfiable")
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum AbortReason {
-    /// The writer gave up on a stalled mirror (`min_download_rate`); the
-    /// file on disk is incomplete.
-    MirrorDownloadRate(MirrorDownloadRate),
-    /// The writer failed for an already-logged reason before all bytes
-    /// were on disk (or its future was cancelled); the file is incomplete.
-    AlreadyLoggedJustFail,
+    /// The incomplete download's terminal cause, shared without reconstruction.
+    Failed(Arc<DownloadFailure>),
+    /// The originator answered without downloading; see [`Declined`].
+    Declined(Declined),
     /// Every upstream byte was written, but `RenameBarrier::commit`
     /// discarded the download (checksum mismatch, verify I/O or rename
     /// failure). Readers holding an open handle drain it exactly like
@@ -105,6 +170,40 @@ pub(crate) enum ActiveDownloadStatus {
     Aborted(AbortReason),
 }
 
+/// Lifecycle interpretation for readers that already hold an open file.
+/// Admission for new joiners stays separate: a discarded file may be unlinked.
+#[derive(Debug)]
+pub(crate) enum AttachedReaderState {
+    /// Neither on disk nor failed: the writer is still streaming
+    /// (`Download`) or has not started yet (`Init`). The two are one
+    /// variant because no consumer can act on the difference: a follower
+    /// that observes this state after the progress sender dropped treats
+    /// both as a logic error, and the sendfile EOF re-check retries on
+    /// both.
+    Incomplete,
+    Drainable,
+    Failed(Arc<DownloadFailure>),
+}
+
+impl ActiveDownloadStatus {
+    pub(crate) fn attached_reader(&self) -> AttachedReaderState {
+        match self {
+            Self::Download { .. } | Self::Init(_) => AttachedReaderState::Incomplete,
+            Self::Verifying { .. }
+            | Self::Finished { .. }
+            | Self::Aborted(AbortReason::Discarded { .. }) => AttachedReaderState::Drainable,
+            Self::Aborted(AbortReason::Failed(failure)) => {
+                AttachedReaderState::Failed(Arc::clone(failure))
+            }
+            // Only `Init` declines, and no reader attaches before `Download`;
+            // a reader that somehow did has no bytes coming either.
+            Self::Aborted(AbortReason::Declined(_)) => {
+                AttachedReaderState::Failed(Arc::clone(&CANCELLED_DOWNLOAD))
+            }
+        }
+    }
+}
+
 /// A late joiner's view of an in-flight download once it has left `Init`,
 /// with the file already open. Produced by [`await_serveable`].
 pub(crate) enum Serveable {
@@ -130,11 +229,17 @@ pub(crate) enum Serveable {
 /// Why a late joiner could not be served. Every variant was already logged
 /// (and metered where applicable) by [`await_serveable`]; callers only map
 /// it to their transport's response via [`Self::response_parts`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum JoinFailure {
-    /// The writer aborted; `rate_timeout` when it gave up on a stalled
-    /// mirror (`min_download_rate`), which is the client's 504.
-    Aborted { rate_timeout: bool },
+    /// The writer's download failed: answered as the writer answered
+    /// ([`DownloadFailure::response_parts`]), except that a stalled mirror
+    /// (`min_download_rate`) is the joiner's 504.
+    Aborted(Arc<DownloadFailure>),
+    /// Every byte was written but the commit discarded them (a verify I/O or
+    /// rename failure; a checksum mismatch with an expired throttle).
+    Discarded,
+    /// The originator answered without downloading.
+    Declined(Declined),
     /// The writer discarded the download on a checksum mismatch and the
     /// verify throttle is armed for the resource: the same 503 the
     /// pre-upstream gate answers, with `Retry-After`.
@@ -148,14 +253,14 @@ pub(crate) enum JoinFailure {
 impl JoinFailure {
     /// The canonical status + body both backends answer with.
     #[must_use]
-    pub(crate) fn response_parts(self) -> (StatusCode, &'static str) {
+    pub(crate) fn response_parts(&self) -> (StatusCode, &'static str) {
         match self {
-            Self::Aborted { rate_timeout: true } => {
+            Self::Aborted(failure) if failure.is_rate() => {
                 (StatusCode::GATEWAY_TIMEOUT, "Upstream Download Timeout")
             }
-            Self::Aborted {
-                rate_timeout: false,
-            } => (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted"),
+            Self::Aborted(failure) => failure.response_parts(),
+            Self::Discarded => (StatusCode::INTERNAL_SERVER_ERROR, "Download Aborted"),
+            Self::Declined(why) => why.response_parts(),
             Self::VerifyThrottled { remaining: _ } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Recently failed checksum verification",
@@ -170,10 +275,15 @@ impl JoinFailure {
 
     /// `Retry-After` value for the response, when the failure carries one.
     #[must_use]
-    pub(crate) fn retry_after(self) -> Option<std::time::Duration> {
+    pub(crate) fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
-            Self::VerifyThrottled { remaining } => Some(remaining),
-            Self::Aborted { rate_timeout: _ } | Self::StateCorrupted | Self::CacheAccess => None,
+            Self::VerifyThrottled { remaining }
+            | Self::Declined(Declined::VerifyThrottled { remaining }) => Some(*remaining),
+            Self::Aborted(_)
+            | Self::Discarded
+            | Self::Declined(_)
+            | Self::StateCorrupted
+            | Self::CacheAccess => None,
         }
     }
 }
@@ -295,48 +405,77 @@ pub(crate) async fn await_serveable(
                 return Ok(Serveable::Complete { file, path, meta });
             }
             ActiveDownloadStatus::Aborted(reason) => {
-                let rate_timeout = matches!(reason, AbortReason::MirrorDownloadRate(_));
-                let checksum_mismatch = matches!(
-                    reason,
-                    AbortReason::Discarded {
-                        checksum_mismatch: true
+                let failure = match reason {
+                    AbortReason::Failed(failure) => JoinFailure::Aborted(Arc::clone(failure)),
+                    AbortReason::Declined(why) => JoinFailure::Declined(*why),
+                    AbortReason::Discarded { checksum_mismatch } => {
+                        let checksum_mismatch = *checksum_mismatch;
+                        drop(st);
+                        return Err(discarded_join(checksum_mismatch, conn_details));
                     }
-                );
+                };
                 drop(st);
-                // The writer armed the throttle before publishing this
-                // status (same write lock), so a joiner landing here gets
-                // the answer it would get from the pre-upstream gate a
-                // moment later; cleanup's synthetic client is exempt there
-                // and stays exempt here.
-                if checksum_mismatch
-                    && !conn_details.client.is_cleanup_synthetic()
-                    && let Some(throttled) = global_verify_throttle().check(conn_details.key())
-                {
-                    warn_once_or_info!(
-                        "Rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+                let (status, _) = failure.response_parts();
+                match &failure {
+                    JoinFailure::Aborted(cause) => info!(
+                        "Download of {} from mirror {}{} was aborted; returning {} to joining client {}:  {}",
                         conn_details.debname,
+                        conn_details.mirror,
+                        conn_details.alias_suffix(),
+                        status.as_u16(),
                         conn_details.client,
-                        throttled.failures,
-                        HumanFmt::Time(throttled.remaining)
-                    );
-                    metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
-                    return Err(JoinFailure::VerifyThrottled {
-                        remaining: throttled.remaining,
-                    });
+                        ErrorReport(cause.as_ref()),
+                    ),
+                    JoinFailure::Declined(why) => debug!(
+                        "Download of {} from mirror {}{} was declined ({why}); returning {} to joining client {}",
+                        conn_details.debname,
+                        conn_details.mirror,
+                        conn_details.alias_suffix(),
+                        status.as_u16(),
+                        conn_details.client,
+                    ),
+                    JoinFailure::Discarded
+                    | JoinFailure::VerifyThrottled { remaining: _ }
+                    | JoinFailure::StateCorrupted
+                    | JoinFailure::CacheAccess => {}
                 }
-                let failure = JoinFailure::Aborted { rate_timeout };
-                info!(
-                    "Download of {} from mirror {}{} was aborted; returning {} to joining client {}",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    conn_details.alias_suffix(),
-                    failure.response_parts().0.as_u16(),
-                    conn_details.client
-                );
                 return Err(failure);
             }
         }
     }
+}
+
+/// A joiner of a download the commit discarded. The writer armed the throttle
+/// before publishing this status (same write lock), so a joiner landing here
+/// gets the answer it would get from the pre-upstream gate a moment later;
+/// cleanup's synthetic client is exempt there and stays exempt here.
+fn discarded_join(checksum_mismatch: bool, conn_details: &ConnectionDetails) -> JoinFailure {
+    if checksum_mismatch
+        && !conn_details.client.is_cleanup_synthetic()
+        && let Some(throttled) = global_verify_throttle().check(conn_details.key())
+    {
+        warn_once_or_info!(
+            "Rejecting request for {} from client {}: recently failed checksum verification ({} consecutive failures), retry in {}",
+            conn_details.debname,
+            conn_details.client,
+            throttled.failures,
+            HumanFmt::Time(throttled.remaining)
+        );
+        metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
+        return JoinFailure::VerifyThrottled {
+            remaining: throttled.remaining,
+        };
+    }
+    let failure = JoinFailure::Discarded;
+    info!(
+        "Download of {} from mirror {}{} was discarded after completion; returning {} to joining client {}",
+        conn_details.debname,
+        conn_details.mirror,
+        conn_details.alias_suffix(),
+        failure.response_parts().0.as_u16(),
+        conn_details.client,
+    );
+    failure
 }
 
 #[derive(Debug)]
@@ -721,7 +860,7 @@ impl ActiveDownloads {
     }
 
     /// Build the ordinary slot-owning origination without process globals.
-    #[cfg(all(test, feature = "splice"))]
+    #[cfg(test)]
     pub(crate) fn originate_uncapped(&self, key: CacheEntryKeyRef<'_>) -> Origination {
         match self.lookup_or_insert(key, None) {
             LookupResult::Originator(origination) => origination,
@@ -808,6 +947,30 @@ mod tests {
 
     fn test_mirror() -> Mirror {
         structured_mirror("deb.debian.org", "")
+    }
+
+    #[test]
+    fn attached_reader_projection_distinguishes_complete_discard_and_failure() {
+        let (_tx, rx) = tokio::sync::watch::channel(());
+        assert!(matches!(
+            ActiveDownloadStatus::Init(rx).attached_reader(),
+            AttachedReaderState::Incomplete
+        ));
+        let complete = ActiveDownloadStatus::Aborted(AbortReason::Discarded {
+            checksum_mismatch: true,
+        });
+        assert!(matches!(
+            complete.attached_reader(),
+            AttachedReaderState::Drainable
+        ));
+        let failure = Arc::new(DownloadFailure::Cancelled);
+        let incomplete = ActiveDownloadStatus::Aborted(AbortReason::Failed(Arc::clone(&failure)));
+        let actual = match incomplete.attached_reader() {
+            AttachedReaderState::Failed(failure) => Some(failure),
+            AttachedReaderState::Incomplete | AttachedReaderState::Drainable => None,
+        };
+        assert!(actual.is_some(), "incomplete failure must propagate");
+        assert!(Arc::ptr_eq(&actual.expect("asserted above"), &failure));
     }
 
     #[test]

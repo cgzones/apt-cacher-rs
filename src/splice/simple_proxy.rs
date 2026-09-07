@@ -25,7 +25,8 @@ use crate::{
 };
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
-use super::{SpliceProxyError, UpstreamFailure, VOLATILE_BODY_MAX};
+use super::{SpliceProxyError, VOLATILE_BODY_MAX};
+use crate::transfer_error::UpstreamError;
 
 /// Hop-by-hop headers per RFC 9110 §7.6.1 — must not be forwarded to the client.
 const HOP_BY_HOP: &[&str] = &[
@@ -166,7 +167,15 @@ pub(crate) async fn splice_simple_proxy(
         reused: _,
     } = standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
         .await
-        .map_err(SpliceProxyError::Upstream)?;
+        .map_err(|err| {
+            // The report names the attempted target itself.
+            SpliceProxyError::Upstream(err.conclude(|err| {
+                warn_once_or_info_logged!(
+                    "simple proxy: failed to fetch the pass-through for client {client}; returning 502:  {}",
+                    ErrorReport(err)
+                )
+            }))
+        })?;
 
     debug!(
         "simple proxy: upstream returned {} for {upstream_path} from {host_authority}",
@@ -207,11 +216,13 @@ pub(crate) async fn splice_simple_proxy(
     ) {
         Ok(s) => s,
         Err(err) => {
-            let logged = warn_once_or_info_logged!(
-                "simple proxy: failed to rewrite headers for {upstream_path} from {host_authority}; returning 502:  {}",
-                ErrorReport(&err)
-            );
-            return Err(SpliceProxyError::Upstream(UpstreamFailure { err, logged }));
+            let reported = UpstreamError::io("passthrough headers", err).conclude(|err| {
+                warn_once_or_info_logged!(
+                    "simple proxy: failed to rewrite headers for {upstream_path} from {host_authority}; returning 502:  {}",
+                    ErrorReport(err)
+                )
+            });
+            return Err(SpliceProxyError::Upstream(reported));
         }
     };
 
@@ -249,11 +260,9 @@ pub(crate) async fn splice_simple_proxy(
         .framing
         .relay_to_client(upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
         .await
-        .map_err(|err| {
-            err.into_after_header(
-                "simple-proxy body",
-                format_args!("{upstream_path} from {host_authority}"),
-            )
+        .map_err(|failure| SpliceProxyError::AfterHeader {
+            phase: "simple-proxy body",
+            failure,
         })?;
 
     let t_done = PreciseInstant::now();

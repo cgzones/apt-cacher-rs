@@ -10,11 +10,11 @@
 //! here.
 
 use std::{
-    borrow::Cow, convert::Infallible, error::Error as _, num::NonZero,
-    os::unix::fs::MetadataExt as _, path::Path, path::PathBuf, sync::Arc,
+    borrow::Cow, convert::Infallible, fmt, num::NonZero, os::unix::fs::MetadataExt as _,
+    path::Path, path::PathBuf, sync::Arc,
 };
 
-use futures_util::TryStreamExt as _;
+use futures_util::StreamExt as _;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
     header::{
@@ -24,7 +24,7 @@ use http::{
     uri::Authority,
 };
 use http_body::{Body, Frame};
-use http_body_util::{BodyExt as _, Empty, StreamBody, combinators::BoxBody};
+use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::tokio::TokioIo};
 #[cfg(feature = "mmap")]
@@ -38,7 +38,8 @@ use crate::{
     AppState, Never, Scheme,
     accounted_body::{AccountedBody, Subject},
     active_downloads::{
-        AbortReason, ActiveDownloadStatus, InsertOutcome, Origination, Serveable, await_serveable,
+        ActiveDownloadStatus, AttachedReaderState, Declined, InsertOutcome, Origination, Serveable,
+        await_serveable,
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
@@ -47,10 +48,8 @@ use crate::{
         self, InvalidValidator, UpstreamMetadata, check_upstream_validators,
         write_upstream_metadata,
     },
-    cache_paths::CachePaths,
     cache_quota::QuotaExceeded,
-    channel_body::ChannelBody,
-    client_counter,
+    channel_body::{ChannelBody, ChannelEvent},
     client_info::ClientInfo,
     config::ClientHost,
     connect_tunnel::{
@@ -59,28 +58,24 @@ use crate::{
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::{Origin, OriginSighting},
-    delivery::{DeliveryEnd, Mechanism, Role, ServeOutcome, finish_cached_serve},
-    error::{
-        ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError,
-        is_io_timed_out_in_chain, is_peer_disconnect,
-    },
+    delivery::{Mechanism, Role},
+    error::{ErrorReport, UpstreamFetchError, is_io_timed_out_in_chain, is_peer_disconnect},
     fs_open::{
         CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
         touch_volatile_mtime,
     },
     global_cache_quota, global_config, global_verify_throttle,
-    guards::{DownloadBarrier, InitBarrier},
+    guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
     http_range::HttpDate,
     humanfmt::HumanFmt,
     limits::VOLATILE_CACHE_MAX_AGE,
     log_once, metrics,
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
-    partial_file::{self, TempPath, tokio_tempfile},
+    partial_file::{self, TempPath},
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
     proxy_body::{ProxyCacheBody, full_body, quick_response},
-    rate_checked_body::{MaybeRated, RateCheckedBodyErr},
-    rate_checker::RateCheckDirection,
+    rate_checked_body::{ClientBody, MaybeRated, RateCheckedBodyErr},
     rate_log,
     request_dispatch::{
         ClientAcls, DispatchOutcome, PassthroughReason, RequestKind, RequestTarget,
@@ -88,12 +83,15 @@ use crate::{
     },
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
     scheme_cache::{self, SchemeDecision},
-    static_assert, tunnel_limiter,
+    static_assert,
+    transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
+    tunnel_limiter,
     upstream_head::{
         ContentLength, DownloadPlan, RejectGates, ResumeAnomaly, ResumeState, UpstreamHead,
         plan_download, plan_fresh_download,
     },
-    upstream_retry, warn_once_or_debug, warn_once_or_info,
+    upstream_retry::{self, RetryLimit},
+    warn_once_or_debug, warn_once_or_info,
     web::serve_web_interface,
 };
 #[cfg(feature = "tls_rustls")]
@@ -121,6 +119,92 @@ fn cache_access_failure() -> Response<ProxyCacheBody> {
     quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure")
 }
 
+/// The fields of a [`RequestFailure`], separated only so the payload can be
+/// boxed behind it.
+#[derive(Debug)]
+struct FailedRequest {
+    error: hyper_util::client::legacy::Error,
+    /// The URI of the *last* attempt, not the one the caller handed in: the
+    /// scheme cache rewrites the scheme inside the retry loop (the https
+    /// upgrade probe, and the revert back to the original scheme), so a
+    /// caller-side copy would name a URL the proxy never dialled.
+    uri: Uri,
+    attempts: u32,
+    limit: Option<RetryLimit>,
+}
+
+/// A terminal [`request_with_retry`] failure carrying the retry context and
+/// the request identity its report needs. `limit` is `Some` only when the
+/// connect-retry loop ran out of budget, which is exactly what separates a
+/// [`Phase::Connect`] failure from a head-phase transport failure — so the
+/// phase is derived here once instead of being guessed at every call site.
+///
+/// The payload is boxed because it is well past `clippy::result_large_err`'s
+/// threshold and would otherwise widen every `request_with_retry` `Result`,
+/// success path included.
+///
+/// [`Phase::Connect`]: crate::transfer_error::Phase::Connect
+#[derive(Debug)]
+pub(crate) struct RequestFailure(Box<FailedRequest>);
+
+impl fmt::Display for RequestFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every report of this error already names the failed request, so
+        // this layer only adds the retry context an exhausted connect loop
+        // has and a head-phase transport failure has not.
+        let FailedRequest {
+            error: _,
+            uri: _,
+            attempts,
+            limit,
+        } = &*self.0;
+        f.write_str("upstream request")?;
+        if let Some(limit) = limit {
+            write!(f, " after {attempts} connection attempts ({limit})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RequestFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0.error)
+    }
+}
+
+impl RequestFailure {
+    fn new(failed: FailedRequest) -> Self {
+        Self(Box::new(failed))
+    }
+
+    /// The URI of the attempt that failed, after any scheme rewrite.
+    fn uri(&self) -> &Uri {
+        &self.0.uri
+    }
+
+    /// An exhausted connect budget is a connect-phase failure; anything else
+    /// happened once a connection was up, so it is a head-phase transport
+    /// failure. Both phases are once-gated by the download runner.
+    pub(crate) fn into_upstream(self, operation: &'static str) -> UpstreamError {
+        let FailedRequest {
+            error,
+            uri,
+            attempts,
+            limit,
+        } = *self.0;
+        match limit {
+            Some(limit) => UpstreamError::connect(
+                operation,
+                std::io::Error::other(error),
+                attempts,
+                limit.into(),
+            ),
+            None => UpstreamError::head_transport(operation, error),
+        }
+        .with_target(uri.to_string())
+    }
+}
+
 /// On success the request `Parts` are handed back alongside the response —
 /// they were consumed by the request anyway, and returning them lets the
 /// rare redirect-follow path rebuild a request without the caller cloning
@@ -128,7 +212,7 @@ fn cache_access_failure() -> Response<ProxyCacheBody> {
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
-) -> Result<(Response<Incoming>, http::request::Parts), hyper_util::client::legacy::Error> {
+) -> Result<(Response<Incoming>, http::request::Parts), RequestFailure> {
     // Auto-mode's HTTPS-upgrade revert branch only fires once `attempt`
     // has crossed this threshold; below it, transient connect errors
     // retry without reverting the scheme.
@@ -192,10 +276,7 @@ pub(crate) async fn request_with_retry(
         mut parts: http::request::Parts,
         orig_scheme: Option<http::uri::Scheme>,
         mut probe: UpgradeProbe,
-    ) -> Result<
-        (Response<Incoming>, http::request::Parts),
-        Box<(hyper_util::client::legacy::Error, Uri)>,
-    > {
+    ) -> Result<(Response<Incoming>, http::request::Parts), RequestFailure> {
         let mut backoff = upstream_retry::Backoff::new(
             global_config().upstream_retry_budget,
             coarsetime::Instant::now(),
@@ -239,12 +320,12 @@ pub(crate) async fn request_with_retry(
                         // holds.
                         metrics::HTTPS_UPGRADE_FAILED.increment();
                     }
-                    warn_once_or_info!(
-                        "Upstream request to {} failed; returning 502:  {}",
-                        parts.uri,
-                        ErrorReport(&err)
-                    );
-                    return Err(Box::new((err, parts.uri)));
+                    return Err(RequestFailure::new(FailedRequest {
+                        error: err,
+                        uri: parts.uri,
+                        attempts: backoff.attempt(),
+                        limit: None,
+                    }));
                 }
                 Err(err) => {
                     if is_io_timed_out_in_chain(&err) {
@@ -299,19 +380,16 @@ pub(crate) async fn request_with_retry(
                             );
                         }
 
-                        // Single WARN authority for upstream-fetch failures: the
-                        // non-connect arm above already warns; mirror it here so a
-                        // connect-exhaustion terminal is logged once too (callers no
-                        // longer re-warn). The limit names which budget stopped the
-                        // retries -- attempt cap or `upstream_retry_budget`.
-                        warn_once_or_info!(
-                            "Upstream request to {} failed after {attempt} connection attempts ({}); returning 502:  {}",
-                            parts.uri,
-                            backoff.limit(),
-                            ErrorReport(&err)
+                        let limit = backoff.limit();
+                        debug!(
+                            "Upstream retries ended after {attempt} connection attempts ({limit})"
                         );
-
-                        return Err(Box::new((err, parts.uri)));
+                        return Err(RequestFailure::new(FailedRequest {
+                            error: err,
+                            uri: parts.uri,
+                            attempts: attempt,
+                            limit: Some(limit),
+                        }));
                     };
 
                     debug!(
@@ -337,35 +415,37 @@ pub(crate) async fn request_with_retry(
         tokio::task::spawn(async move {
             let result = inner_loop(&client, parts, orig_scheme, probe).await;
             if let Err(ref err) = result {
-                // inner_loop already logged the transport error at WARN; keep this
-                // background-task framing at DEBUG so request_with_retry stays the
-                // single WARN authority (no cold-start double-warn).
+                // The caller owns the terminal failure report. This background
+                // task only records scheme initialization context.
                 debug!(
                     "Failed to initialize scheme cache for host {} in background task:  {}",
-                    err.1
+                    err.uri()
                         .authority()
                         .expect("authority exists in case of https upgrade test"),
-                    ErrorReport(&err.0)
+                    ErrorReport(err)
                 );
             }
-            result.map_err(|err| err.0)
+            result
         })
         .await
         .expect("task should not panic")
     } else {
-        inner_loop(client, parts, orig_scheme, UpgradeProbe::NotProbing)
-            .await
-            .map_err(|err| err.0)
+        inner_loop(client, parts, orig_scheme, UpgradeProbe::NotProbing).await
     }
 }
 
 /// Synthetic `502 Bad Gateway` for an upstream-fetch failure, carrying the real
 /// transport reason as an `http::Extensions` value so an internal caller (cleanup)
 /// can recover it instead of seeing only the laundered status. Real clients ignore
-/// the extension (it is never serialised to the wire). The throw site does NOT log;
-/// `request_with_retry` is the single WARN authority for upstream-fetch failures.
+/// the extension (it is never serialised to the wire). Registered downloads
+/// report through their guard; this adapter owns unregistered passthrough failures.
 #[must_use]
-fn upstream_error_response(err: &hyper_util::client::legacy::Error) -> Response<ProxyCacheBody> {
+fn upstream_error_response(err: &RequestFailure) -> Response<ProxyCacheBody> {
+    warn_once_or_info!(
+        "Upstream request to {} failed; returning 502:  {}",
+        err.uri(),
+        ErrorReport(err)
+    );
     let mut response = quick_response(StatusCode::BAD_GATEWAY, "Upstream Error");
     response.extensions_mut().insert(UpstreamFetchError {
         reason: ErrorReport(err).to_string(),
@@ -409,28 +489,97 @@ impl UpgradeProbe {
     }
 }
 
-/// Wrap a client-facing body in the configured client-rate check and box it
-/// into [`ProxyCacheBody`], mapping a rate timeout to
-/// `ProxyCacheError::ClientDownloadRate`.
-fn rated_client_body<B>(body: B) -> ProxyCacheBody
+/// Put the accounting owner outside both source and downstream-rate adapters.
+fn rated_client_body<B>(body: B, subject: Subject) -> ProxyCacheBody
 where
     B: Body<Data = bytes::Bytes> + Send + Sync + 'static,
-    B::Error: Into<Box<ProxyCacheError>>,
+    B::Error: Into<DeliveryFailure>,
 {
     let config = global_config();
-    let rated = MaybeRated::new(
-        body,
-        config.min_download_rate,
-        config.rate_check_timeframe,
-        RateCheckDirection::Client,
-    )
-    .map_err(|err| match *err {
-        RateCheckedBodyErr::RateTimeout(error) => {
-            Box::new(ProxyCacheError::ClientDownloadRate { error })
+    let rated = ClientBody::new(body, config.min_download_rate, config.rate_check_timeframe);
+    ProxyCacheBody::Boxed(BoxBody::new(AccountedBody::new(rated, subject)))
+}
+
+/// Cache reading establishes both the I/O source and the promised-length
+/// contract before the body reaches generic delivery accounting.
+struct CachedFileBody {
+    reader: tokio_util::io::ReaderStream<tokio::io::Take<tokio::fs::File>>,
+    path: PathBuf,
+    remaining: u64,
+    terminal: bool,
+}
+
+impl CachedFileBody {
+    fn new(file: tokio::fs::File, length: u64, capacity: usize, path: PathBuf) -> Self {
+        Self {
+            reader: tokio_util::io::ReaderStream::with_capacity(file.take(length), capacity),
+            path,
+            remaining: length,
+            terminal: false,
         }
-        RateCheckedBodyErr::Inner(ierr) => ierr.into(),
-    });
-    ProxyCacheBody::Boxed(BoxBody::new(rated))
+    }
+}
+
+impl Body for CachedFileBody {
+    type Data = bytes::Bytes;
+    type Error = CacheError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        if self.is_end_stream() {
+            return Poll::Ready(None);
+        }
+        match self.reader.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.remaining -= bytes.len() as u64;
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.terminal = true;
+                Poll::Ready(Some(Err(CacheError::counted_io(
+                    "read cached file",
+                    &self.path,
+                    error,
+                ))))
+            }
+            Poll::Ready(None) => {
+                self.terminal = true;
+                // A short file is a consistency anomaly with no failed
+                // syscall behind it, so no `CACHE_IO_FAILURE`: the same
+                // treatment `channel_body.rs` and sendfile's unexpected-EOF
+                // arm give it.
+                Poll::Ready(Some(Err(CacheError::invalid(
+                    "read cached file",
+                    format!(
+                        "file shorter than promised ({} bytes missing)",
+                        self.remaining
+                    ),
+                ))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminal || self.remaining == 0
+    }
+}
+
+/// Hyper is the only source of these erased transport errors. Restore upstream
+/// provenance here; library error-chain inspection never reaches a delivery logger.
+fn upstream_body_error(error: hyper::Error) -> UpstreamError {
+    if is_io_timed_out_in_chain(&error) {
+        metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
+    }
+    metrics::UPSTREAM_HYPER_BODY_ERR.increment();
+    UpstreamError::transport("read upstream response body", error)
 }
 
 /// Finish an uncached passthrough: account the upstream body, apply the
@@ -444,7 +593,10 @@ fn passthrough_response(
 ) -> Response<ProxyCacheBody> {
     let (parts, body) = response.into_parts();
 
-    let body = rated_client_body(AccountedBody::new(body, subject, |_| false));
+    let body = rated_client_body(
+        body.map_err(|error| DeliveryFailure::Upstream(upstream_body_error(error))),
+        subject,
+    );
 
     let mut response = Response::from_parts(parts, body);
     response
@@ -551,24 +703,20 @@ fn serve_cached_file_mmap(
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
 
-    let memory_body = AccountedBody::new(
-        MmapBody::new(memory_map),
+    let config = global_config();
+    let body = ProxyCacheBody::Mmap(AccountedBody::new(
+        ClientBody::new(
+            MmapBody::new(memory_map),
+            config.min_download_rate,
+            config.rate_check_timeframe,
+        ),
         Subject::Cached {
             conn_details,
             mechanism: Mechanism::Mmap,
-            size: content_length as u64,
+            size: Some(content_length as u64),
+            role: Role::Cached,
             partial: params.is_partial(),
         },
-        |never| match *never {},
-    );
-
-    let config = global_config();
-
-    let body = ProxyCacheBody::Mmap(MaybeRated::new(
-        memory_body,
-        config.min_download_rate,
-        config.rate_check_timeframe,
-        RateCheckDirection::Client,
     ));
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
@@ -610,138 +758,48 @@ async fn serve_unfinished_file(
     let content_type = content_type_for_cached_file(&conn_details.debname);
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
+    // The feeder owns no delivery counters or summaries: queued bytes have
+    // not yet been consumed by Hyper. The outer body owns that progress.
     tokio::task::spawn(async move {
-        let start = PreciseInstant::now();
-        debug!(
-            "Starting stream task for downloading file `{}` from mirror {} with length {content_length:?} for client {}...",
-            file_path.display(),
-            conn_details.mirror,
-            conn_details.client
-        );
-
-        let counter = client_counter::ClientDownload::new();
-
-        let mut finished = false;
-        let mut bytes = 0;
-        let mut client_disconnected = false;
-        let buf_size = config.buffer_size;
-
-        // Late-joiner reads of an in-progress download are still sequential —
-        // hint readahead before the streaming loop starts.  The final size
-        // is unknown (file still growing), so always hint.
         hint_sequential_read(&file, u64::MAX, &file_path);
-
-        // No BufReader: every read below goes into a fresh BytesMut of the
-        // same capacity, so tokio's BufReader would bypass its internal
-        // buffer on every read anyway — it only cost a dead allocation.
-        'stream: loop {
+        let result = async {
+            let mut draining = false;
             loop {
-                let mut buf = bytes::BytesMut::with_capacity(buf_size);
-                let ret = match file.read_buf(&mut buf).await {
-                    Ok(0) => break, // EOF
-                    Ok(r) => r,
-                    Err(err) => {
-                        metrics::CACHE_IO_FAILURE.increment();
-                        error!(
-                            "Failed to read from file `{}`; cancelling the stream:  {}",
-                            file_path.display(),
-                            ErrorReport(&err)
-                        );
-                        return;
+                loop {
+                    let mut buffer = bytes::BytesMut::with_capacity(config.buffer_size);
+                    let count = file.read_buf(&mut buffer).await.map_err(|error| {
+                        CacheError::counted_io("read growing cache file", &file_path, error)
+                    })?;
+                    if count == 0 {
+                        break;
                     }
-                };
-
-                let buf = buf.freeze();
-
-                assert_eq!(buf.len(), ret, "buffer length must match read bytes");
-
-                if let Err(tokio::sync::mpsc::error::SendError(_err)) = tx.send(Ok(buf)).await {
-                    client_disconnected = true;
-                    break 'stream;
+                    tx.send(ChannelEvent::Data(buffer.freeze()))
+                        .await
+                        .map_err(|_closed| DeliveryFailure::Cancelled)?;
                 }
-
-                bytes += ret as u64;
-            }
-
-            if finished {
-                break;
-            }
-
-            if let Err(tokio::sync::watch::error::RecvError { .. }) = receiver.changed().await {
-                /* sender closed, either download finished or aborted */
-                let st = status.read().await;
-                let _: Never = match *st {
-                    // Verifying: writer has written all bytes and is hashing on
-                    // a blocking thread. The open file handle stays valid
-                    // across the upcoming rename, so drain like Finished.
-                    // Discarded: same complete file, verdict was negative;
-                    // the handle is still ours to drain.
-                    ActiveDownloadStatus::Finished { .. }
-                    | ActiveDownloadStatus::Verifying { .. }
-                    | ActiveDownloadStatus::Aborted(AbortReason::Discarded {
-                        checksum_mismatch: _,
-                    }) => {
-                        drop(st);
-                        finished = true;
-                        continue;
-                    }
-                    ActiveDownloadStatus::Aborted(AbortReason::MirrorDownloadRate(ref mdr)) => {
-                        let mdr = mdr.clone();
-                        drop(st);
-                        if tx.send(Err(mdr)).await.is_err() {
-                            // receiver gone, nothing to recover
+                if draining {
+                    return Ok(());
+                }
+                if receiver.changed().await.is_err() {
+                    let state = status.read().await.attached_reader();
+                    match state {
+                        AttachedReaderState::Drainable => draining = true,
+                        AttachedReaderState::Failed(failure) => {
+                            return Err(DeliveryFailure::Download(failure));
                         }
-                        return;
+                        AttachedReaderState::Incomplete => {
+                            return Err(InternalError::invalid(
+                                "follow growing cache file",
+                                "download progress closed in nonterminal state",
+                            )
+                            .into());
+                        }
                     }
-                    ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail) => {
-                        drop(st);
-                        // Reason already logged
-                        debug!(
-                            "Download of file `{}` aborted, cancelling stream",
-                            file_path.display()
-                        );
-                        return;
-                    }
-                    ActiveDownloadStatus::Init(_) | ActiveDownloadStatus::Download { .. } => {
-                        error!(
-                            "Invalid download state {:?} of file `{}`; cancelling the stream",
-                            *st,
-                            file_path.display()
-                        );
-                        drop(st);
-
-                        return;
-                    }
-                };
+                }
             }
         }
-
-        /* Perform cleanup before database operation */
-        drop(file);
-        drop(receiver);
-        drop(status);
-        drop(tx);
-        drop(counter);
-
-        let elapsed = start.elapsed();
-        let outcome = ServeOutcome {
-            size: bytes,
-            transferred: bytes,
-            partial: false,
-            elapsed,
-            // A late joiner that vanished leaves no transport error behind:
-            // the feeder task notices the closed channel, not an I/O failure.
-            end: if client_disconnected {
-                DeliveryEnd::Aborted(None)
-            } else {
-                DeliveryEnd::Complete
-            },
-        };
-        if let Some(cmd) =
-            finish_cached_serve(&conn_details, Mechanism::Channel, Role::LateJoiner, outcome)
-        {
-            send_db_command(DatabaseCommand::Transfer(cmd)).await;
-        }
+        .await;
+        let _sent = tx.send(ChannelEvent::Finished(result)).await;
     });
 
     let head = ResponseHead {
@@ -757,8 +815,19 @@ async fn serve_unfinished_file(
         ..ResponseHead::bare(StatusCode::OK, ResponseKind::Success)
     };
 
-    metrics::REQUESTS_CHANNEL.increment();
-    let body = rated_client_body(ChannelBody::new(rx, content_length));
+    let body = rated_client_body(
+        ChannelBody::new(rx, content_length),
+        Subject::Cached {
+            conn_details,
+            mechanism: Mechanism::Channel,
+            size: match content_length {
+                ContentLength::Exact(size) => Some(size.get()),
+                ContentLength::Unknown(_) => None,
+            },
+            role: Role::LateJoiner,
+            partial: false,
+        },
+    );
 
     let response = head.into_hyper(body);
 
@@ -937,27 +1006,20 @@ async fn serve_cached_file_buf(
 
     // Bound the reader to the (possibly range-trimmed) content length,
     // mirroring the mmap path: an unbounded stream over-reads past a closed
-    // range's end, and the surplus makes DeliveryStreamBody's Drop
+    // range's end, and the surplus makes AccountedBody's Drop
     // accounting see transferred != size — logging a spurious "Aborted
     // serving" warn and skipping the SERVED_* metrics and delivery DB row
     // for a request that was actually served fully.
-    let reader_stream = tokio_util::io::ReaderStream::with_capacity(
-        tokio::io::AsyncReadExt::take(file, content_length),
-        config.buffer_size,
-    );
-
-    let delivery_body = AccountedBody::new(
-        StreamBody::new(reader_stream.map_ok(Frame::data)),
+    let body = rated_client_body(
+        CachedFileBody::new(file, content_length, config.buffer_size, file_path),
         Subject::Cached {
             conn_details,
             mechanism: Mechanism::Stream,
-            size: content_length,
+            size: Some(content_length),
+            role: Role::Cached,
             partial: params.is_partial(),
         },
-        is_peer_disconnect,
     );
-
-    let body = rated_client_body(delivery_body);
 
     // TODO: use become: https://github.com/rust-lang/rust/issues/112788
     serve_cached_file_response(cache_info, params, content_type, body)
@@ -1020,10 +1082,16 @@ fn serve_cached_file_response(
     response
 }
 
+/// `req` is borrowed, not consumed: this call sits at the tail of
+/// [`serve_new_file_worker`], whose future is already close to
+/// `clippy::large_futures` (see its definition). Moving the request in would
+/// store it inline in that future for the whole upstream exchange -- measured
+/// at 864 bytes -- for a value only `serve_cached_file` ever reads, and by
+/// reference. The other two callers own their request and simply lend it.
 #[must_use]
 async fn serve_downloading_file(
     conn_details: ConnectionDetails,
-    req: Request<Empty<()>>,
+    req: &Request<Empty<()>>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     prefetched_upstream_metadata: Option<&UpstreamMetadata>,
 ) -> Response<ProxyCacheBody> {
@@ -1045,7 +1113,7 @@ async fn serve_downloading_file(
                 (Some(meta), _) => Some(UpstreamMetadataView::Borrowed(meta)),
                 (None, meta) => meta.map(UpstreamMetadataView::Arc),
             };
-            serve_cached_file(conn_details, &req, file, path, meta.as_deref(), None).await
+            serve_cached_file(conn_details, req, file, path, meta.as_deref(), None).await
         }
         Err(failure) => {
             drop(status);
@@ -1202,9 +1270,87 @@ async fn serve_cache_miss(
                     );
                 }
             }
-            serve_downloading_file(conn_details, req, status, None).await
+            serve_downloading_file(conn_details, &req, status, None).await
         }
         InsertOutcome::AtCapacity { max } => upstream_cap_rejection(&conn_details, max),
+    }
+}
+
+/// Cache operation adapter shared by the worker and its salvage path.
+struct DownloadWriter<'a> {
+    writer: tokio::io::BufWriter<tokio::fs::File>,
+    path: &'a Path,
+}
+
+impl DownloadWriter<'_> {
+    async fn write(&mut self, mut chunk: bytes::Bytes) -> Result<(), CacheError> {
+        self.writer
+            .write_all_buf(&mut chunk)
+            .await
+            .map_err(|error| CacheError::counted_io("write download cache file", self.path, error))
+    }
+
+    async fn flush(&mut self) -> Result<(), CacheError> {
+        self.writer
+            .flush()
+            .await
+            .map_err(|error| CacheError::counted_io("flush download cache file", self.path, error))
+    }
+}
+
+async fn download_file_worker(
+    body: &mut MaybeRated<Incoming>,
+    writer: &mut DownloadWriter<'_>,
+    content_length: ContentLength,
+    bytes: &mut u64,
+    barrier: &mut DownloadBarrier,
+) -> Result<PreciseInstant, DownloadFailure> {
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| match *error {
+            RateCheckedBodyErr::RateTimeout(rate) => UpstreamError::rate(rate),
+            RateCheckedBodyErr::Inner(error) => upstream_body_error(error),
+        })?;
+        if let Ok(chunk) = frame.into_data() {
+            let count = chunk.len() as u64;
+            *bytes += count;
+            metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(count);
+            if *bytes > content_length.upper().get() {
+                let reason = format!(
+                    "body exceeded the size limit (received {bytes}, limit {})",
+                    content_length.upper()
+                );
+                return Err(match content_length {
+                    ContentLength::Exact(_) => UpstreamError::protocol(reason),
+                    ContentLength::Unknown(_) => UpstreamError::body_limit(reason),
+                }
+                .into());
+            }
+            writer.write(chunk).await?;
+            barrier.ping_batched(count);
+        }
+    }
+    if let ContentLength::Exact(size) = content_length
+        && *bytes != size.get()
+    {
+        return Err(UpstreamError::protocol(format!(
+            "body length mismatch (received {bytes}, expected {size})"
+        ))
+        .into());
+    }
+    let upstream_done = PreciseInstant::now();
+    writer.flush().await?;
+    Ok(upstream_done)
+}
+
+/// Land the buffered tail after a failed download so a later request can
+/// resume from it. [`crate::guards::FailedDownload::salvage`] runs it only when the cache is
+/// not what failed.
+async fn salvage_partial(writer: &mut DownloadWriter<'_>) {
+    if let Err(error) = writer.flush().await {
+        error!(
+            "Failed to flush partial data after download failure; leaving the partial for resume:  {}",
+            ErrorReport(&error)
+        );
     }
 }
 
@@ -1213,7 +1359,7 @@ async fn download_file(
     warn_on_override: bool,
     (body, content_length): (Incoming, ContentLength),
     (outfile, outpath): (tokio::fs::File, TempPath),
-    mut dbarrier: DownloadBarrier,
+    dbarrier: DownloadBarrier,
     resume_offset: u64,
     request_sent: PreciseInstant,
 ) {
@@ -1227,132 +1373,29 @@ async fn download_file(
     );
 
     let mut bytes = 0;
-    let buf_size = config.buffer_size;
-
-    let mut writer = tokio::io::BufWriter::with_capacity(buf_size, outfile);
-
-    let mut body = MaybeRated::new(
-        body,
-        config.min_download_rate,
-        config.rate_check_timeframe,
-        RateCheckDirection::Upstream,
-    );
-
-    while let Some(next) = body.frame().await {
-        let frame = match next {
-            Ok(f) => f,
-            Err(err) => {
-                match *err {
-                    RateCheckedBodyErr::RateTimeout(download_rate_err) => {
-                        dbarrier
-                            .abort_with_reason(AbortReason::MirrorDownloadRate(
-                                MirrorDownloadRate {
-                                    download_rate_err,
-                                    mirror: conn_details.mirror.clone(),
-                                    debname: conn_details.debname.clone(),
-                                },
-                            ))
-                            .await;
-                    }
-                    RateCheckedBodyErr::Inner(ierr) => {
-                        if is_io_timed_out_in_chain(&ierr) {
-                            metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-                        }
-                        metrics::UPSTREAM_HYPER_BODY_ERR.increment();
-                        warn_once_or_info!(
-                            "Failed to extract frame from body for file {} from mirror {} (time={}, size={}, upstream_rate={}); aborting the download:  {}",
-                            conn_details.debname,
-                            conn_details.mirror,
-                            HumanFmt::Time(start.elapsed()),
-                            HumanFmt::Size(bytes),
-                            HumanFmt::Rate(bytes, start.elapsed()),
-                            ErrorReport(&ierr),
-                        );
-                    }
-                }
-
-                // Flush buffered data so partial files retain what was received
-                if let Err(err) = writer.flush().await {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to flush partial data to `{}`; abandoning the download:  {}",
-                        outpath.display(),
-                        ErrorReport(&err)
-                    );
-                }
-                return;
-            }
-        };
-        if let Ok(mut chunk) = frame.into_data() {
-            let chunk_len = chunk.len() as u64;
-            bytes += chunk_len;
-            metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(chunk_len);
-
-            if bytes > content_length.upper().get() {
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn_once_or_info!(
-                    "More bytes received than expected for file {} from mirror {}: got {bytes} bytes, expected at most {}; aborting the download",
-                    conn_details.debname,
-                    conn_details.mirror,
-                    content_length.upper()
-                );
-                return;
-            }
-
-            if let Err(err) = writer.write_all_buf(&mut chunk).await {
-                metrics::CACHE_IO_FAILURE.increment();
-                error!(
-                    "Failed to write to file `{}`; aborting the download:  {}",
-                    outpath.display(),
-                    ErrorReport(&err)
-                );
-                return;
-            }
-
-            dbarrier.ping_batched(chunk_len);
+    let mut writer = DownloadWriter {
+        writer: tokio::io::BufWriter::with_capacity(config.buffer_size, outfile),
+        path: &outpath,
+    };
+    let mut body = MaybeRated::new(body, config.min_download_rate, config.rate_check_timeframe);
+    let result = dbarrier
+        // Detached from the connection that started it: the client either
+        // already has its response or joins the registry entry.
+        .run(Consequence::Abandon, async |barrier| {
+            download_file_worker(&mut body, &mut writer, content_length, &mut bytes, barrier).await
+        })
+        .await;
+    let (dbarrier, t_upstream_done) = match result {
+        Ok(done) => done,
+        Err(failed) => {
+            // run concluded the primary cause; the failed download publishes
+            // it once salvaged, or on cancellation of the salvage.
+            let _reported = failed
+                .salvage(async || salvage_partial(&mut writer).await)
+                .await;
+            return;
         }
-    }
-
-    match content_length {
-        ContentLength::Exact(size) => {
-            if bytes != size.get() {
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn_once_or_info!(
-                    "Content-Length mismatch: expected {} bytes but got {} for file {} from mirror {}; leaving the download uncached",
-                    size.get(),
-                    bytes,
-                    conn_details.debname,
-                    conn_details.mirror
-                );
-                return;
-            }
-        }
-        ContentLength::Unknown(size) => {
-            if bytes > size.get() {
-                metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-                warn_once_or_info!(
-                    "Content exceeded unknown-length limit: got {} bytes but limit is {} for file {} from mirror {}; leaving the download uncached",
-                    bytes,
-                    size.get(),
-                    conn_details.debname,
-                    conn_details.mirror
-                );
-                return;
-            }
-        }
-    }
-
-    let t_upstream_done = PreciseInstant::now();
-
-    if let Err(err) = writer.flush().await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "Failed to flush file `{}`; leaving the download uncached:  {}",
-            outpath.display(),
-            ErrorReport(&err)
-        );
-        return;
-    }
+    };
     drop(writer);
 
     // Not created here: `integrity::rename_into_cache` creates it at commit
@@ -1518,6 +1561,8 @@ fn upstream_cap_rejection(
     )
 }
 
+/// The registered-download owner retains every terminal setup failure before
+/// returning its response. Successful transitions disarm the initial guard.
 #[must_use]
 async fn serve_new_file(
     conn_details: ConnectionDetails,
@@ -1526,6 +1571,50 @@ async fn serve_new_file(
     cfstate: CacheFileStat,
     appstate: AppState,
 ) -> Response<ProxyCacheBody> {
+    let status = Arc::clone(&origination.status);
+    let barrier = InitBarrier::new(
+        origination,
+        appstate.active_downloads.clone(),
+        &conn_details,
+        req.uri().path(),
+    );
+    match barrier
+        .run_settled(async |barrier| {
+            serve_new_file_worker(&conn_details, barrier, status, &req, cfstate, &appstate).await
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(reported) => {
+            // The runner already reported the cause; the status/body pair is
+            // the failure's own, and only an upstream cause carries a
+            // transport reason cleanup can recover.
+            let (status, body) = reported.failure().response_parts();
+            let mut response = quick_response(status, body);
+            if let DownloadFailure::Upstream(_) = reported.failure() {
+                response.extensions_mut().insert(UpstreamFetchError {
+                    reason: ErrorReport(reported.failure()).to_string(),
+                });
+            }
+            response
+        }
+    }
+}
+
+/// Runs inline in the connection future (`InitBarrier::run` no longer boxes
+/// it), which puts it within roughly 2 KiB of clippy's 16 KiB `large_futures`
+/// threshold. Hence the by-reference parameters below: growing this body, or
+/// taking a large value by move, will trip the lint at
+/// `process_cache_request`. Box the offending inner future -- as
+/// `splice/volatile.rs` does for `read_to_vec` -- rather than the runner.
+async fn serve_new_file_worker(
+    conn_details: &ConnectionDetails,
+    ibarrier: &mut InitBarrier,
+    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    req: &Request<Empty<()>>,
+    cfstate: CacheFileStat,
+    appstate: &AppState,
+) -> Result<(Settled, Response<ProxyCacheBody>), DownloadFailure> {
     // TODO: upstream constant
     const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 
@@ -1642,16 +1731,6 @@ async fn serve_new_file(
 
     let config = global_config();
 
-    // The late-joiner serve below reads the status through its own handle;
-    // the barrier owns the origination itself.
-    let status = Arc::clone(&origination.status);
-    let ibarrier = InitBarrier::new(
-        origination,
-        &appstate.active_downloads,
-        &conn_details,
-        req.uri().path(),
-    );
-
     let (warn_on_override, prev_file_size) = match &cfstate {
         CacheFileStat::Volatile {
             file: _,
@@ -1704,11 +1783,19 @@ async fn serve_new_file(
             HumanFmt::Time(throttled.remaining)
         );
         metrics::DOWNLOAD_REJECTED_VERIFY_THROTTLE.increment();
+        let settled = ibarrier
+            .decline(Declined::VerifyThrottled {
+                remaining: throttled.remaining,
+            })
+            .await;
         let head = ResponseHead {
             retry_after: Some(retry_after_secs(throttled.remaining)),
             ..ResponseHead::error(StatusCode::SERVICE_UNAVAILABLE)
         };
-        return head.into_hyper(full_body("Recently failed checksum verification"));
+        return Ok((
+            settled,
+            head.into_hyper(full_body("Recently failed checksum verification")),
+        ));
     }
 
     let prefetched_upstream_metadata = match &cfstate {
@@ -1739,7 +1826,7 @@ async fn serve_new_file(
         && matches!(cfstate, CacheFileStat::New)
     {
         match partial_file::prepare_partial_resume(
-            &ibarrier,
+            ibarrier,
             &conn_details.debname,
             &conn_details.mirror,
             "",
@@ -1747,13 +1834,9 @@ async fn serve_new_file(
         .await
         {
             Ok(r) => r,
-            Err(partial_file::PartialOpenFailure {
-                logged: _logged,
-                guard,
-            }) => {
-                // Error already logged in `open_partial_file()`.
+            Err(partial_file::PartialOpenFailure { failure, guard }) => {
                 drop(guard);
-                return cache_access_failure();
+                return Err(failure.into());
             }
         }
     } else {
@@ -1773,7 +1856,9 @@ async fn serve_new_file(
     let mut upstream_request_sent = PreciseInstant::now();
     let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
         Ok((r, _parts)) => r,
-        Err(err) => return upstream_error_response(&err),
+        Err(error) => {
+            return Err(error.into_upstream("request upstream response").into());
+        }
     };
 
     trace!("Forwarded response: {fwd_response:?}");
@@ -1817,7 +1902,9 @@ async fn serve_new_file(
             let redirected_response =
                 match request_with_retry(&appstate.https_client, redirected_request).await {
                     Ok((r, _parts)) => r,
-                    Err(err) => return upstream_error_response(&err),
+                    Err(error) => {
+                        return Err(error.into_upstream("request upstream response").into());
+                    }
                 };
 
             trace!("Forwarded redirected response: {redirected_response:?}");
@@ -1911,7 +1998,9 @@ async fn serve_new_file(
                 fwd_response = match request_with_retry(&appstate.https_client, retry_request).await
                 {
                     Ok((r, _parts)) => r,
-                    Err(err) => return upstream_error_response(&err),
+                    Err(error) => {
+                        return Err(error.into_upstream("request upstream response").into());
+                    }
                 };
                 head = UpstreamHead::from_response(&fwd_response);
             }
@@ -1933,19 +2022,25 @@ async fn serve_new_file(
             }
             let file = touch_volatile_mtime(file, &file_path).await;
 
-            ibarrier.finished(file_path.clone()).await;
+            let settled = ibarrier.finished(file_path.clone()).await;
 
-            return serve_cached_file(
-                conn_details,
-                &req,
-                file,
-                file_path,
-                prefetched_upstream_metadata.as_deref(),
-                None,
-            )
-            .await;
+            return Ok((
+                settled,
+                serve_cached_file(
+                    conn_details.clone(),
+                    req,
+                    file,
+                    file_path,
+                    prefetched_upstream_metadata.as_deref(),
+                    None,
+                )
+                .await,
+            ));
         }
         DownloadPlan::Passthrough => {
+            let settled = ibarrier
+                .decline(Declined::Passthrough(fwd_response.status()))
+                .await;
             // Demote routine 4xx for cleanup-synthetic clients to DEBUG:
             // `try_fetch_packages_file` deliberately walks `.xz → .gz → raw`,
             // and on S3-hosted flat repos every miss surfaces as 403 (not
@@ -1974,19 +2069,22 @@ async fn serve_new_file(
             // body just makes the consumer drop it undrained (a spurious
             // "aborted passthrough" log), and these are not client passthroughs.
             if conn_details.client.is_cleanup_synthetic() {
-                return quick_response(fwd_response.status(), "");
+                return Ok((settled, quick_response(fwd_response.status(), "")));
             }
 
-            return passthrough_response(
-                fwd_response,
-                Subject::Passthrough {
-                    host: conn_details.mirror.format_authority().to_string(),
-                    path: req_uri.path().to_owned(),
-                    client: conn_details.client,
-                    request_received_at: conn_details.request_received_at,
-                    request_sent: upstream_request_sent,
-                },
-            );
+            return Ok((
+                settled,
+                passthrough_response(
+                    fwd_response,
+                    Subject::Passthrough {
+                        host: conn_details.mirror.format_authority().to_string(),
+                        path: req_uri.path().to_owned(),
+                        client: conn_details.client,
+                        request_received_at: conn_details.request_received_at,
+                        request_sent: upstream_request_sent,
+                    },
+                ),
+            ));
         }
         DownloadPlan::Reject(reason) => {
             /// One gate per reason: a mirror tripping `max_object_size` must
@@ -2003,7 +2101,11 @@ async fn serve_new_file(
                     reason.detail()
                 ),
             );
-            return quick_response(StatusCode::BAD_GATEWAY, reason.body());
+            let settled = ibarrier.decline(Declined::Rejected(reason)).await;
+            return Ok((
+                settled,
+                quick_response(StatusCode::BAD_GATEWAY, reason.body()),
+            ));
         }
         DownloadPlan::Download {
             total,
@@ -2056,7 +2158,10 @@ async fn serve_new_file(
         ) {
             Ok(r) => r,
             Err(QuotaExceeded) => {
-                return quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached");
+                return Ok((
+                    ibarrier.decline(Declined::QuotaExceeded).await,
+                    quick_response(StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached"),
+                ));
             }
         }
     };
@@ -2109,63 +2214,7 @@ async fn serve_new_file(
     // Create/open the output file: partial path for permanent files, random temp for volatile.
     // Defuse the guard once we take ownership of the partial path — from here on, the
     // download's own `OnDrop::Keep` TempPath manages the file lifetime.
-    let (outfile, outpath) = match partial {
-        partial_file::PartialDownload::Resumable { mut file, guard } => {
-            // Defense in depth: the held-open fd makes this size re-check
-            // redundant, but a wrong offset here would corrupt the cache file.
-            let current_size = match file.seek(std::io::SeekFrom::End(0)).await {
-                Ok(size) => size,
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to seek in partial file for {}; returning 500:  {}",
-                        conn_details.debname,
-                        ErrorReport(&err)
-                    );
-                    return cache_access_failure();
-                }
-            };
-            if current_size != resume_offset {
-                error!(
-                    "Partial file size {current_size} != expected {resume_offset} for {} from mirror {} despite held fd; aborting the resume and returning 500",
-                    conn_details.debname, conn_details.mirror
-                );
-                return cache_access_failure();
-            }
-            (file, guard)
-        }
-        partial_file::PartialDownload::Fresh(guard) => {
-            // Fresh permanent download: create at deterministic partial path
-            match partial_file::create_partial_file(guard, 0o640).await {
-                Ok((f, p)) => (f, p),
-                Err((err, path)) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to create partial file `{}`; rejecting the request:  {}",
-                        path.display(),
-                        ErrorReport(&err)
-                    );
-                    return cache_access_failure();
-                }
-            }
-        }
-        partial_file::PartialDownload::Volatile => {
-            // Volatile file: random temp file
-            let tmppath = CachePaths::new(&config.cache_directory).scratch_file(filename);
-            match tokio_tempfile(&tmppath, 0o640).await {
-                Ok((f, p)) => (f, p),
-                Err(err) => {
-                    metrics::CACHE_IO_FAILURE.increment();
-                    error!(
-                        "Failed to create temporary file `{}`; rejecting the request:  {}",
-                        tmppath.display(),
-                        ErrorReport(&err)
-                    );
-                    return cache_access_failure();
-                }
-            }
-        }
-    };
+    let (outfile, outpath) = partial.into_target(filename, resume_offset).await?;
 
     let upstream_metadata = Arc::new(UpstreamMetadata::from_upstream(
         upstream_etag,
@@ -2194,7 +2243,7 @@ async fn serve_new_file(
         );
     }
 
-    let dbarrier = ibarrier
+    let (settled, dbarrier) = ibarrier
         .download(
             outpath.to_path_buf(),
             total_content_length,
@@ -2229,13 +2278,16 @@ async fn serve_new_file(
         total_content_length.upper(),
         &mut rand::rng(),
     ) {
-        log_nudge(&conn_details, config, "");
+        log_nudge(conn_details, config, "");
         let response = nudge_head(config).into_hyper(full_body(NUDGE_BODY));
         trace!("Outgoing parallel download hack response: {response:?}");
-        return response;
+        return Ok((settled, response));
     }
 
-    serve_downloading_file(conn_details, req, status, Some(&upstream_metadata)).await
+    Ok((
+        settled,
+        serve_downloading_file(conn_details.clone(), req, status, Some(&upstream_metadata)).await,
+    ))
 }
 
 /// Create a TCP connection to host:port, build a tunnel between the connection and
@@ -2582,7 +2634,7 @@ async fn pre_process_client_request(
                 "Serving file {} already in download from mirror {} for client {}...",
                 conn_details.debname, conn_details.mirror, conn_details.client
             );
-            return serve_downloading_file(conn_details, req, status, None).await;
+            return serve_downloading_file(conn_details, &req, status, None).await;
         }
         #[cfg(not(feature = "splice"))]
         Some(HandoffPlan::Passthrough {
@@ -2807,6 +2859,25 @@ fn host_header_from_uri(auth: &Authority) -> HeaderValue {
     HeaderValue::try_from(value).expect("host value is valid")
 }
 
+/// The body failure hyper erased into `err`'s source chain, if any. Hyper
+/// boxes the body's error type as-is, so the chain holds a [`DeliveryFailure`]
+/// by concrete type exactly when [`ProxyCacheBody`]'s error type *is*
+/// `DeliveryFailure` -- a wrapper there (a `Box`, a newtype) would hide it from
+/// this downcast. The owning `AccountedBody` already reported it; socket-only
+/// failures carry none and stay connection-level.
+fn accounted_body_failure<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a DeliveryFailure> {
+    let mut cause = err.source();
+    while let Some(error) = cause {
+        if let Some(failure) = error.downcast_ref::<DeliveryFailure>() {
+            return Some(failure);
+        }
+        cause = error.source();
+    }
+    None
+}
+
 /// Serve every request on `stream` through hyper.
 ///
 /// `handoff` is `Some` when the sendfile backend hands over a connection
@@ -2831,20 +2902,6 @@ pub(crate) async fn handle_hyper_connection<T>(
         }
 
         false
-    }
-
-    #[must_use]
-    fn is_rate_timeout(err: &hyper::Error) -> Option<&ProxyCacheError> {
-        let pe = err.source()?.downcast_ref::<ProxyCacheError>()?;
-
-        if matches!(
-            pe,
-            ProxyCacheError::ClientDownloadRate { .. } | ProxyCacheError::MirrorDownloadRate(_)
-        ) {
-            Some(pe)
-        } else {
-            None
-        }
     }
 
     // The plan pairs with the first service invocation only: the stream's
@@ -2873,7 +2930,12 @@ pub(crate) async fn handle_hyper_connection<T>(
         .with_upgrades()
         .await
     {
-        if err.is_incomplete_message() || hyper_is_peer_disconnect(&err) {
+        if let Some(failure) = accounted_body_failure(&err) {
+            debug!(
+                "Closing connection to client {client} after accounted body failure:  {}",
+                ErrorReport(failure)
+            );
+        } else if err.is_incomplete_message() || hyper_is_peer_disconnect(&err) {
             // Hyper does not expose per-frame write errors, so we cannot
             // tell whether the disconnect happened mid-body, between
             // pipelined requests, or before any response was started. Bump
@@ -2894,11 +2956,6 @@ pub(crate) async fn handle_hyper_connection<T>(
             // and leave HTTP_TIMEOUT_CLIENT_HEADER untouched (the sendfile
             // backend is the sole owner of that counter).
             debug!("Client {client} idle-timed out before sending request headers");
-        } else if let Some(perr) = is_rate_timeout(&err) {
-            info!(
-                "Closing connection to client {client} after a rate timeout:  {}",
-                ErrorReport(perr)
-            );
         } else {
             error!(
                 "Failed to serve connection for client {client}; closing the connection:  {}",
@@ -2911,6 +2968,68 @@ pub(crate) async fn handle_hyper_connection<T>(
 #[cfg(test)]
 mod tests {
     use super::{SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+
+    /// Hyper erases a body error through `Into<Box<dyn Error + Send + Sync>>`
+    /// and exposes the box as its own `source()`. The connection handler must
+    /// find the body's typed failure there, or every accounted body failure
+    /// also reaches its generic `error!` arm.
+    #[test]
+    fn accounted_body_failure_survives_hyper_erasure() {
+        use std::error::Error;
+
+        use super::{Body, ProxyCacheBody, accounted_body_failure};
+        use crate::transfer_error::{ClientError, DeliveryFailure};
+
+        /// Stands in for `hyper::Error`: the erased body error is its source.
+        #[derive(Debug, thiserror::Error)]
+        #[error("error from user's Body stream")]
+        struct Erased(#[source] Box<dyn Error + Send + Sync>);
+
+        fn erase(error: <ProxyCacheBody as Body>::Error) -> Box<dyn Error + Send + Sync> {
+            error.into()
+        }
+
+        let failure: DeliveryFailure =
+            ClientError::io("write client", std::io::ErrorKind::BrokenPipe.into()).into();
+        let erased = Erased(erase(failure));
+        let found = accounted_body_failure(&erased).expect("typed body failure in the chain");
+        assert!(found.is_peer_disconnect());
+
+        let socket = Erased(Box::new(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        assert!(accounted_body_failure(&socket).is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_file_truncation_is_a_cache_failure() {
+        use super::{Body as _, CachedFileBody, metrics};
+        use std::pin::Pin;
+        let before = metrics::CACHE_IO_FAILURE.get();
+        let file = tempfile::tempfile().unwrap();
+        let mut body = CachedFileBody::new(
+            tokio::fs::File::from_std(file),
+            4,
+            4096,
+            "truncated-cache-file".into(),
+        );
+        let error = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("file shorter than promised"));
+        assert_eq!(
+            metrics::CACHE_IO_FAILURE.get(),
+            before,
+            "a short file is a consistency anomaly, not a failed syscall"
+        );
+        assert!(body.is_end_stream());
+        assert!(
+            std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                .await
+                .is_none()
+        );
+    }
 
     /// Only an uncached `Auto` decision may fall back to the original
     /// scheme; `Always` probes without a fallback, and a fixed scheme is no

@@ -18,14 +18,17 @@ use crate::cache_layout::ConnectionDetails;
 use crate::config::ClientHost;
 use crate::deb_mirror::{Mirror, MirrorKind};
 use crate::error::ErrorReport;
+use crate::log_once::Logged;
 use crate::partial_file;
 use crate::scheme_cache::SchemeDecision;
 use crate::upstream_head::{RejectGates, RejectReason};
+use crate::upstream_retry::RetryStop;
 use crate::{
     Scheme, global_config, log_once, metrics, permitted_host_cache::is_host_allowed_cached,
-    scheme_cache, upstream_retry, warn_once_or_info, warn_once_or_info_logged,
+    scheme_cache, upstream_retry, warn_once_or_info,
 };
 
+use super::VolatileCondHeaders;
 use super::http::{
     BodyFraming, HeadError, MAX_ERROR_BODY_DRAIN, UpstreamResponse, send_and_read_headers,
 };
@@ -33,7 +36,7 @@ use super::upstream::{
     ConnLabel, PoolCheckout, ResponseBody, Transience, UpstreamConn, connect_upstream, mirror_port,
     pool_checkout,
 };
-use super::{SpliceProxyError, UpstreamFailure, VolatileCondHeaders};
+use crate::transfer_error::UpstreamError;
 
 /// One upstream request/response in flight: the pool-guarded connection the
 /// response arrived on, its parsed head, and the bytes read alongside it
@@ -101,11 +104,17 @@ impl UpstreamExchange {
         .await;
         match result {
             Ok(Ok(_body)) => {}
-            Ok(Err(err)) => debug!(
-                "{log_prefix} not reusing the upstream connection after a {} response, its body could not be drained:  {}",
-                response.status_code,
-                ErrorReport(&err)
-            ),
+            // A drain that hits a local limit ends the drain for good: it is
+            // concluded, so its counter (`UPSTREAM_BODY_LIMIT`, say) counts.
+            Ok(Err(err)) => {
+                let _reported = err.conclude(|err| {
+                    Logged::debug(format_args!(
+                        "{log_prefix} not reusing the upstream connection after a {} response, its body could not be drained:  {}",
+                        response.status_code,
+                        ErrorReport(err)
+                    ))
+                });
+            }
             Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
                 debug!(
                     "{log_prefix} not reusing the upstream connection after a {} response, its body exceeded the {} ms drain budget",
@@ -156,7 +165,7 @@ pub(super) async fn standard_upstream_connect(
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
     scheme_override: Option<Scheme>,
-) -> Result<UpstreamExchange, UpstreamFailure> {
+) -> Result<UpstreamExchange, UpstreamError> {
     // Resolve the scheme decision ONCE per connect: it drives the pool-lookup
     // key, the HTTPS-upgrade accounting, and the connect itself. A per-request
     // redirect forcing the scheme carries no decision, and so does none of the
@@ -204,10 +213,12 @@ pub(super) async fn standard_upstream_connect(
                             ErrorReport(&err)
                         );
                     }
-                    Err(HeadError::Protocol(err)) => {
+                    Err(HeadError::Protocol(reason)) => {
                         // The upstream's answer is broken, not the socket: a
                         // fresh connection would fetch the same bytes.
-                        return Err(failed_request(host_authority, upstream_path, err));
+                        return Err(HeadError::Protocol(reason)
+                            .into_upstream()
+                            .with_target(format!("{scheme}://{host_authority}{upstream_path}")));
                     }
                 }
             }
@@ -254,20 +265,6 @@ pub(super) async fn standard_upstream_connect(
             backoff.next_retry(coarsetime::Instant::now())
         };
         let Some(delay) = next else {
-            let logged = if permanent {
-                warn_once_or_info_logged!(
-                    "splice proxy: not retrying permanent connect failure to upstream {host_authority} for {upstream_path}; returning 502:  {}",
-                    ErrorReport(&err.err)
-                )
-            } else {
-                // The limit names which budget stopped the retries -- attempt
-                // cap or `upstream_retry_budget`.
-                warn_once_or_info_logged!(
-                    "splice proxy: failed to connect to upstream {host_authority} for {upstream_path} after {attempt} connection attempts ({}); returning 502:  {}",
-                    backoff.limit(),
-                    ErrorReport(&err.err)
-                )
-            };
             if let Some(decision) = decision {
                 // Evict a stale cached scheme so the next request re-resolves,
                 // mirroring the hyper backend.
@@ -285,10 +282,28 @@ pub(super) async fn standard_upstream_connect(
                     metrics::HTTPS_UPGRADE_FAILED.increment();
                 }
             }
-            return Err(UpstreamFailure {
-                err: err.err,
-                logged,
-            });
+            // Nothing is logged here: the attempt count and the reason that
+            // ended the loop ride on the failure itself. The download callers
+            // hand it to the runner, which logs it once-gated with them; the
+            // two callers that have no runner carry the cause themselves --
+            // `simple_proxy` logs its own once-gated 502 line, and
+            // `cleanup_bridge` passes it on as an `UpstreamFetchError`
+            // extension for cleanup's decision log.
+            return Err(UpstreamError::connect(
+                "connect upstream",
+                err.err,
+                attempt,
+                if permanent {
+                    RetryStop::Permanent
+                } else {
+                    backoff.limit().into()
+                },
+            )
+            .with_target(format!(
+                "{}://{host_authority}{upstream_path}",
+                // Auto mode only returns a failure after its HTTP fallback.
+                resolved_scheme.unwrap_or(Scheme::Http)
+            )));
         };
         debug!(
             "splice proxy: failed to connect to {host_authority} after {attempt} connection attempts, will retry in {} ms:  {}",
@@ -318,24 +333,13 @@ pub(super) async fn standard_upstream_connect(
         volatile_cond,
     )
     .await
-    .map_err(|err| failed_request(host_authority, upstream_path, err.into_io()))?;
+    .map_err(|err| {
+        err.into_upstream()
+            .with_target(format!("{scheme}://{host_authority}{upstream_path}"))
+    })?;
 
     let port = mirror_port(mirror, up.is_tls());
     Ok(UpstreamExchange::new(up, mirror, port, head, false))
-}
-
-/// The 502 for a request whose head could not be read, on a pooled or a
-/// fresh connection alike: one wording, one once-gate.
-fn failed_request(
-    host_authority: &str,
-    upstream_path: &str,
-    err: std::io::Error,
-) -> UpstreamFailure {
-    let logged = warn_once_or_info_logged!(
-        "splice proxy: failed upstream request to {host_authority} for {upstream_path}; returning 502:  {}",
-        ErrorReport(&err)
-    );
-    UpstreamFailure { err, logged }
 }
 
 /// Where a followed redirect landed: the mirror the retry/resume logic must
@@ -362,7 +366,7 @@ pub(super) async fn follow_redirect(
     resume_offset: u64,
     resume_if_range: Option<&str>,
     volatile_cond: Option<&VolatileCondHeaders>,
-) -> Result<(UpstreamExchange, Option<RedirectTarget>), SpliceProxyError> {
+) -> Result<(UpstreamExchange, Option<RedirectTarget>), UpstreamError> {
     let status = exchange.response.status_code;
     let Some(location) = exchange.response.location.as_deref() else {
         // Every other reject branch below logs; without this one a broken
@@ -475,17 +479,11 @@ pub(super) async fn follow_redirect(
         Some(redirect_scheme),
     )
     .await
-    .map_err(|err| {
-        // The throw site inside `standard_upstream_connect` already WARNs
-        // with the underlying error detail (the `UpstreamFailure` carries the
-        // proof); this line adds the redirect breadcrumb so an operator can
-        // correlate the connect failure with the redirect that pointed at
-        // the now-failing target.
-        warn_once_or_info!(
-            "splice proxy: failed to connect to the upstream after a {status} redirect from {} to `{moved_uri}`; returning 502",
+    .inspect_err(|_err| {
+        debug!(
+            "splice proxy: failed to connect after a {status} redirect from {} to `{moved_uri}`",
             conn_details.mirror
         );
-        SpliceProxyError::Upstream(err)
     })?;
 
     Ok((
@@ -529,7 +527,7 @@ pub(super) async fn discard_partial_and_retry(
     upstream_path: &str,
     exchange: UpstreamExchange,
     conn_details: &ConnectionDetails,
-) -> Result<UpstreamExchange, SpliceProxyError> {
+) -> Result<UpstreamExchange, UpstreamError> {
     // Try a bounded drain before refetching. Preserve the scheme used by
     // the discarded connection --
     // after a redirect it was fixed by the `Location` URL and never cached
@@ -548,8 +546,7 @@ pub(super) async fn discard_partial_and_retry(
         None,
         Some(scheme),
     )
-    .await
-    .map_err(SpliceProxyError::Upstream)?;
+    .await?;
     // The fresh connect above does not follow redirects; the caller's top-level
     // redirect handling already ran on the original (now-discarded) response, so
     // follow one redirect here if the retry also lands on a 3xx (the retry is

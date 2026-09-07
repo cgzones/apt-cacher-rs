@@ -11,6 +11,7 @@ use std::path::Path;
 
 use tracing::{error, warn};
 
+use crate::transfer_error::CacheError;
 use crate::{error::ErrorReport, log_once::Logged, metrics, warn_once_or_debug};
 
 /// [`std::fs::OpenOptions`] with `O_NOFOLLOW` pre-set: every open of a path
@@ -126,34 +127,67 @@ fn borrowed_metadata(file: &tokio::fs::File) -> std::io::Result<std::fs::Metadat
     // `ManuallyDrop` keeps the wrapper from closing it on drop, so the
     // borrowed `File` never takes ownership of the fd.
     let borrowed = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) });
-    borrowed.metadata()
+    borrowed_metadata_with(|| borrowed.metadata())
+}
+
+/// The EINTR retry of [`borrowed_metadata`], separated from the `unsafe` fd
+/// borrow so a test can drive the loop with an injected `stat`: an interrupted
+/// `statx` is not reproducible on demand.
+fn borrowed_metadata_with(
+    mut stat: impl FnMut() -> std::io::Result<std::fs::Metadata>,
+) -> std::io::Result<std::fs::Metadata> {
+    // A signal delivered mid-`statx` is not a cache anomaly: retry it here so
+    // no caller has to carry an EINTR arm of its own.
+    loop {
+        match stat() {
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
+/// Validate an open cache file and count failures once. The caller's owner
+/// reports the returned error, which retains the operation and path.
+pub(crate) fn regular_file_metadata_typed(
+    file: &tokio::fs::File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<std::fs::Metadata, CacheError> {
+    validate_regular_metadata(borrowed_metadata(file), path, operation)
+}
+
+fn validate_regular_metadata(
+    metadata: std::io::Result<std::fs::Metadata>,
+    path: &Path,
+    operation: &'static str,
+) -> Result<std::fs::Metadata, CacheError> {
+    match metadata {
+        Ok(md) if md.file_type().is_file() => Ok(md),
+        Ok(_) => {
+            metrics::CACHE_NON_REGULAR.increment();
+            Err(CacheError::invalid(
+                operation,
+                format!("`{}` is not a regular file", path.display()),
+            ))
+        }
+        Err(err) => Err(CacheError::counted_io(operation, path, err)),
+    }
 }
 
 /// `statx` an open cache file and require a regular file.
 ///
-/// The single owner of the "stat failed -> `CACHE_IO_FAILURE`, non-regular ->
-/// `CACHE_NON_REGULAR`" policy for files about to be served: every serve path
-/// (hyper, sendfile, splice) goes through here so no path can silently skip
-/// the anomaly accounting.
+/// Reporting adapter for callers that return an already-logged cache failure.
+/// Validation and counters belong to [`regular_file_metadata_typed`].
 pub(crate) fn regular_file_metadata(
     file: &tokio::fs::File,
     path: &Path,
 ) -> Result<std::fs::Metadata, CacheAccessFailure> {
-    match borrowed_metadata(file) {
-        Ok(md) if md.file_type().is_file() => Ok(md),
-        Ok(_) => {
-            metrics::CACHE_NON_REGULAR.increment();
-            Err(CacheAccessFailure(Logged::error(format_args!(
-                "Cache file `{}` is not a regular file; refusing to serve it",
-                path.display()
-            ))))
-        }
-        Err(err) => Err(CacheAccessFailure(Logged::cache_io_failure(format_args!(
-            "Failed to get metadata of cache file `{}`; refusing to serve it:  {}",
-            path.display(),
+    regular_file_metadata_typed(file, path, "inspect cache file").map_err(|err| {
+        CacheAccessFailure(Logged::error(format_args!(
+            "Cache access failed; refusing to serve the file:  {}",
             ErrorReport(&err)
-        )))),
-    }
+        )))
+    })
 }
 
 /// Update a volatile file's mtime to `now` to reset the 30-second freshness window.
@@ -343,6 +377,45 @@ mod tests {
         );
     }
 
+    /// The EINTR retry cannot be provoked with a real signal, so it is driven
+    /// through its injection seam: a retried `statx` must be invisible to the
+    /// caller, which sees only the result of the call that finally landed.
+    #[test]
+    fn borrowed_metadata_retries_an_interrupted_stat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stat-me");
+        std::fs::write(&path, b"0123456789").expect("write");
+
+        let mut calls = 0_u32;
+        let meta = borrowed_metadata_with(|| {
+            calls += 1;
+            if calls <= 2 {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            } else {
+                std::fs::metadata(&path)
+            }
+        })
+        .expect("the third stat succeeds");
+
+        assert_eq!(meta.len(), 10, "the retried call's result is returned");
+        assert_eq!(calls, 3, "both interruptions are retried");
+    }
+
+    /// Only `Interrupted` is a retry: any other failure is the caller's to
+    /// report, and retrying it would spin.
+    #[test]
+    fn borrowed_metadata_returns_a_non_eintr_failure_at_once() {
+        let mut calls = 0_u32;
+        let err = borrowed_metadata_with(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("a non-EINTR failure is not retried");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1, "the first failure is returned");
+    }
+
     #[tokio::test]
     async fn regular_file_metadata_reports_size_without_blocking_pool() {
         use std::io::Write as _;
@@ -373,14 +446,69 @@ mod tests {
         );
     }
 
+    /// The typed sibling carries the path in the error instead of a log line,
+    /// and keeps the same `CACHE_NON_REGULAR` accounting.
+    #[tokio::test]
+    async fn typed_metadata_rejects_a_fifo_and_counts_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fifo");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        // Through the blessed constructor, so `disallowed_methods` stays
+        // clean; `custom_flags` overwrites, so O_NOFOLLOW is re-ORed in.
+        // O_RDWR|O_NONBLOCK is the one FIFO open that never blocks on a
+        // missing peer.
+        let file = tokio_nofollow_options()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(&path)
+            .await
+            .expect("open fifo");
+        let before = metrics::CACHE_NON_REGULAR.get();
+        let err = regular_file_metadata_typed(&file, &path, "cache file metadata")
+            .expect_err("fifo is not regular");
+        assert_eq!(metrics::CACHE_NON_REGULAR.get(), before + 1);
+        assert!(err.to_string().contains("fifo"), "path in the error: {err}");
+    }
+
     #[tokio::test]
     async fn regular_file_metadata_rejects_a_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = tokio::fs::File::open(dir.path()).await.expect("open dir");
+        let before = metrics::CACHE_NON_REGULAR.get();
+        let before_io = metrics::CACHE_IO_FAILURE.get();
 
         assert!(
             regular_file_metadata(&file, dir.path()).is_err(),
             "a directory is not a regular file and must be refused"
         );
+        assert_eq!(
+            metrics::CACHE_NON_REGULAR.get(),
+            before + 1,
+            "the reporting adapter must not count the failure twice"
+        );
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), before_io);
+    }
+
+    #[test]
+    fn metadata_failure_keeps_path_operation_and_errno_once() {
+        use crate::transfer_error::DeliveryFailure;
+        let before = metrics::CACHE_IO_FAILURE.get();
+        let error = validate_regular_metadata(
+            Err(std::io::Error::from_raw_os_error(nix::libc::EIO)),
+            Path::new("injected.partial"),
+            "growing-file metadata",
+        )
+        .expect_err("injected stat failure");
+        let report = ErrorReport(&error).to_string();
+        assert_eq!(report.matches("injected.partial").count(), 1, "{report}");
+        assert_eq!(
+            report.matches("growing-file metadata").count(),
+            1,
+            "{report}"
+        );
+        assert_eq!(report.matches("(os error").count(), 1, "{report}");
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), before + 1);
+        assert!(!DeliveryFailure::from(error).is_peer_disconnect());
     }
 }

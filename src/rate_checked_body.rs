@@ -5,8 +5,9 @@ use http_body::{Body, Frame, SizeHint};
 use pin_project::pin_project;
 
 use crate::{
-    rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
+    rate_checker::{InsufficientRate, RateChecker},
     sticky,
+    transfer_error::{ClientError, DeliveryFailure},
 };
 
 /// Error type for `RateCheckedBody` operations.
@@ -26,12 +27,11 @@ where
     #[pin]
     inner: B,
     rchecker: RateChecker,
-    direction: RateCheckDirection,
-    /// Set once the rate breach has been surfaced. Both consumers
-    /// (hyper's `download_file`, the client-facing `ProxyCacheBody`) drop the
-    /// body at that error, so this only guards a consumer that polls on -
-    /// keeping the terminal `Err` from re-bumping `RATE_LIMIT_*` per poll,
-    /// the same idempotency `channel_body`'s `errored` flag provides.
+    /// Set once the rate breach has been surfaced, so a consumer that polls
+    /// on sees the body end rather than a second breach. Counting is not this
+    /// body's: the owner that ends the transfer concludes the failure once
+    /// (`AccountedBody` for a client body, the download runner for hyper's
+    /// `download_file`).
     rate_failed: sticky::Bool,
 }
 
@@ -41,16 +41,10 @@ where
 {
     /// Creates a new `RateCheckedBody` that wraps the given `body` and checks the download rate against the given `min_download_rate` over the given `timeframe`.
     #[must_use]
-    fn new(
-        body: B,
-        min_download_rate: NonZero<usize>,
-        timeframe: NonZero<usize>,
-        direction: RateCheckDirection,
-    ) -> Self {
+    fn new(body: B, min_download_rate: NonZero<usize>, timeframe: NonZero<usize>) -> Self {
         Self {
             inner: body,
             rchecker: RateChecker::with_timeframe(min_download_rate, timeframe),
-            direction,
             rate_failed: sticky::Bool::new(),
         }
     }
@@ -83,7 +77,7 @@ where
         if self_mut.rate_failed.get() {
             return std::task::Poll::Ready(None);
         }
-        if let Some(download_rate_err) = self_mut.rchecker.check_fail(*self_mut.direction) {
+        if let Some(download_rate_err) = self_mut.rchecker.check_fail() {
             self_mut.rate_failed.set();
             return std::task::Poll::Ready(Some(Err(Box::new(RateCheckedBodyErr::RateTimeout(
                 download_rate_err,
@@ -133,10 +127,9 @@ where
         body: B,
         min_download_rate: Option<NonZero<usize>>,
         timeframe: NonZero<usize>,
-        direction: RateCheckDirection,
     ) -> Self {
         match min_download_rate {
-            Some(rate) => Self::Rated(RateCheckedBody::new(body, rate, timeframe, direction)),
+            Some(rate) => Self::Rated(RateCheckedBody::new(body, rate, timeframe)),
             None => Self::Plain(body),
         }
     }
@@ -179,6 +172,55 @@ where
     }
 }
 
+/// Client operation adapter: rate failures and source-body failures share one
+/// typed delivery result. Keeping it concrete preserves mmap's data type.
+#[pin_project]
+pub(crate) struct ClientBody<B: Body> {
+    #[pin]
+    inner: MaybeRated<B>,
+}
+
+impl<B: Body> ClientBody<B> {
+    pub(crate) fn new(
+        inner: B,
+        minimum: Option<NonZero<usize>>,
+        timeframe: NonZero<usize>,
+    ) -> Self {
+        Self {
+            inner: MaybeRated::new(inner, minimum, timeframe),
+        }
+    }
+}
+
+impl<B> Body for ClientBody<B>
+where
+    B: Body,
+    B::Error: Into<DeliveryFailure>,
+{
+    type Data = B::Data;
+    type Error = DeliveryFailure;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project()
+            .inner
+            .poll_frame(cx)
+            .map_err(|err| match *err {
+                RateCheckedBodyErr::RateTimeout(rate) => ClientError::rate(rate).into(),
+                RateCheckedBodyErr::Inner(err) => err.into(),
+            })
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
@@ -196,7 +238,6 @@ mod tests {
             Full::new(bytes::Bytes::from_static(b"payload")),
             nonzero!(1000),
             nonzero!(1),
-            RateCheckDirection::Client,
         );
         // A single sample fills the one-second window: 1 B/s, far below the
         // 1000 B/s minimum.
@@ -233,6 +274,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn accounting_observes_client_rate_failure() {
+        use crate::{
+            accounted_body::{AccountedBody, Subject},
+            precise_instant::PreciseInstant,
+            transfer_error::DeliveryFailure,
+        };
+        let body = ClientBody {
+            inner: MaybeRated::Rated(breaching_body()),
+        };
+        let mut body = AccountedBody::new(
+            body,
+            Subject::Passthrough {
+                host: "rate.test".into(),
+                path: "/file".into(),
+                client: crate::test_support::local_client(),
+                request_received_at: PreciseInstant::now(),
+                request_sent: PreciseInstant::now(),
+            },
+        );
+        let waker = std::task::Waker::noop();
+        let before = crate::metrics::RATE_LIMIT_CLIENT.get();
+        let failed = match Pin::new(&mut body).poll_frame(&mut Context::from_waker(waker)) {
+            Poll::Ready(Some(Err(error))) => {
+                matches!(error, DeliveryFailure::Client(ref error) if error.is_rate())
+            }
+            Poll::Ready(Some(Ok(_)) | None) | Poll::Pending => false,
+        };
+        assert!(failed, "rate failure must reach outer accounting body");
+        drop(body);
+        assert_eq!(crate::metrics::RATE_LIMIT_CLIENT.get(), before + 1);
+    }
+
     /// Without a configured minimum rate the wrapper is a pass-through: the
     /// inner body's frames arrive unchanged, only re-boxed into the common
     /// error type.
@@ -242,7 +316,6 @@ mod tests {
             Full::new(bytes::Bytes::from_static(b"payload")),
             None,
             nonzero!(1),
-            RateCheckDirection::Client,
         );
         assert!(matches!(body, MaybeRated::Plain(_)));
 

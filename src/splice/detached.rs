@@ -12,8 +12,8 @@
 //! `DetachedDownload::run` mirrors the tail of `splice_proxy_drive` from the body-prefix
 //! step on, minus every client write: the body loops run in
 //! `ClientStatus::Absent` (see `super::body`), and a failure is attributed by
-//! `BodyTransferError::log_detached` because there is no connection left whose
-//! outer arm could report it.
+//! the same guarded runner as an attached download. No connection is needed
+//! to retain or report the cause.
 //!
 //! The very end is not a mirror but the same code: `CacheTarget::begin_rename`
 //! ends the download, and the commit and the completion line are
@@ -30,14 +30,15 @@ use std::num::NonZero;
 use bytes::BytesMut;
 
 use crate::cache_layout::ConnectionDetails;
+use crate::guards::Consequence;
 use crate::precise_instant::PreciseInstant;
 
 use super::body::{BodyClient, ClientEnd};
 use super::commit::{CommitTail, CompletionBytes, CompletionClient};
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
-    BodyTransferFailure, BodyTransferred, CacheTarget, RateTimestamps, log_download_start,
-    transfer_body, write_body_prefix_to_cache,
+    BodyTransferred, CacheTarget, RateTimestamps, log_download_start, transfer_body,
+    write_body_prefix_to_cache,
 };
 use crate::cache_conditional::ServeParams;
 
@@ -81,7 +82,7 @@ impl DetachedDownload {
             mut upstream,
             header_buf,
             header_end,
-            mut target,
+            target,
             conn_details,
             conn_label,
             total_content_length,
@@ -102,19 +103,18 @@ impl DetachedDownload {
             true,
         );
 
-        if write_body_prefix_to_cache(
-            &mut target,
+        let target = match write_body_prefix_to_cache(
+            target,
             &header_buf[header_end..],
-            "abandoning the download",
+            Consequence::Abandon,
         )
         .await
-        .is_err()
         {
-            // The writer logged the failure with the on-disk path and bumped
-            // `CACHE_IO_FAILURE`; dropping `target` here removes the partial
-            // and records the abort on the barrier.
-            return;
-        }
+            Ok(target) => target,
+            // The runner concluded the failure and published it to readers;
+            // a permanent partial stays on disk for a later resume.
+            Err(_reported) => return,
+        };
 
         let target = match transfer_body(
             &mut upstream,
@@ -123,6 +123,7 @@ impl DetachedDownload {
             splice_count,
             &NO_CLIENT_RANGE,
             &mut rates,
+            Consequence::Abandon,
         )
         .await
         {
@@ -133,8 +134,7 @@ impl DetachedDownload {
                 );
                 target
             }
-            Err(BodyTransferFailure { temppath, err }) => {
-                err.log_detached("splice body transfer", &temppath);
+            Err(_reported) => {
                 return;
             }
         };
@@ -158,7 +158,7 @@ impl DetachedDownload {
             },
             start,
         )
-        .finish(rates, CompletionClient::Nudged)
+        .finish(rates, CompletionClient::Absent)
         .await;
     }
 }

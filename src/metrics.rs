@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::StatusCode;
 
+#[derive(Debug)]
 pub(crate) struct Counter(AtomicU64);
 
 impl Counter {
@@ -374,8 +375,11 @@ pub(crate) static SERVED_CHANNEL: Counter = Counter::new();
 /// undershot the announced `Content-Length`, missing or mismatched
 /// `Content-Range`, missing `Content-Length` on a non-volatile fetch, or
 /// `206 Partial Content` returned without a Range request.
-/// Any non-zero value points to a misbehaving upstream.
 pub(crate) static UPSTREAM_PROTOCOL_VIOLATION: Counter = Counter::new();
+
+/// Responses exceeding a local body buffering, relay, or connection-reuse
+/// drain limit. The response may be valid HTTP; these are not protocol faults.
+pub(crate) static UPSTREAM_BODY_LIMIT: Counter = Counter::new();
 
 /// Mirror responses that returned `206 Partial Content` for a request the
 /// proxy issued without a `Range:` header. Treating these as 200-equivalent

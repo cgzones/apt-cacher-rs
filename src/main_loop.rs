@@ -445,8 +445,7 @@ pub(crate) async fn main_loop(
                                 }
                             }
                             Err(err) => {
-                                // request_with_retry() has already logged the error
-                                debug!("Failed to query host {authority} to initialize scheme cache:  {}", ErrorReport(&err));
+                                warn!("Failed to query host {authority} to initialize scheme cache; leaving the scheme unresolved:  {}", ErrorReport(&err));
                             }
                         }
                     }

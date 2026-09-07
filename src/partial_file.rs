@@ -3,8 +3,9 @@
 //! [`TempPath`] guard that decides what happens to either on drop.
 //!
 //! One download runs `InitBarrier` (`guards.rs`) -> [`prepare_partial_resume`]
-//! (open or reserve the `.partial`) -> [`create_partial_file`] /
-//! [`tokio_tempfile`] -> `RenameBarrier::commit` (`guards.rs`), which consumes
+//! (open or reserve the `.partial`) -> [`PartialDownload::into_target`]
+//! ([`create_partial_file`] / [`tokio_tempfile`], one funnel for every
+//! backend) -> `RenameBarrier::commit` (`guards.rs`), which consumes
 //! the [`TempPath`] on the atomic rename. The `.partial` lives in the `tmp/`
 //! sibling of the rename target ([`CachePaths::partial_file`]) so that rename
 //! never crosses a filesystem.
@@ -20,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     Never, cache_paths::CachePaths, deb_mirror, error::ErrorReport,
     fs_open::tokio_nofollow_options, guards::InitBarrier, http_etag::ETag, humanfmt::HumanFmt,
-    log_once::Logged, metrics, xattr_helpers,
+    metrics, transfer_error::CacheError, xattr_helpers,
 };
 
 /// Tri-state of an in-progress download's partial-file handling.
@@ -62,6 +63,42 @@ impl PartialDownload {
                 Self::Fresh(guard.renew().await)
             }
         };
+    }
+
+    /// Open or create the file the body is written into, taking over the path
+    /// guard. The one place the `Resumable`/`Fresh`/`Volatile` sequence lives,
+    /// so both fetching backends agree on the resume check, the modes and the
+    /// operation names; the caller's download runner reports the failure.
+    ///
+    /// A `Resumable` whose length disagrees with `resume_offset` is a
+    /// consistency failure, not a syscall failure: it builds a
+    /// [`CacheError::invalid`] and leaves `CACHE_IO_FAILURE` alone.
+    pub(crate) async fn into_target(
+        self,
+        filename: &Path,
+        resume_offset: u64,
+    ) -> Result<(tokio::fs::File, TempPath), CacheError> {
+        use tokio::io::AsyncSeekExt as _;
+
+        match self {
+            Self::Resumable { mut file, guard } => {
+                let size = file.seek(std::io::SeekFrom::End(0)).await.map_err(|err| {
+                    CacheError::counted_io("seek partial cache file", &guard, err)
+                })?;
+                if size != resume_offset {
+                    return Err(CacheError::invalid(
+                        "validate resumed partial size",
+                        format!("file has {size} bytes; expected {resume_offset}"),
+                    ));
+                }
+                Ok((file, guard))
+            }
+            Self::Fresh(guard) => create_partial_file(guard, 0o640).await,
+            Self::Volatile => {
+                let path = CachePaths::global().scratch_file(filename);
+                tokio_tempfile(&path, 0o640).await
+            }
+        }
     }
 }
 
@@ -119,7 +156,7 @@ impl PartialResume {
 /// partial file could not be opened, see [`PartialOpenFailure`]; the partial
 /// path is left untouched on the filesystem either way.
 pub(crate) async fn prepare_partial_resume(
-    ibarrier: &InitBarrier<'_>,
+    ibarrier: &InitBarrier,
     debname: &str,
     mirror: &deb_mirror::Mirror,
     log_prefix: &'static str,
@@ -137,7 +174,7 @@ async fn prepare_partial_resume_at(
     mirror: &deb_mirror::Mirror,
     log_prefix: &'static str,
 ) -> Result<PartialResume, PartialOpenFailure> {
-    match open_partial_file(path, log_prefix).await {
+    match open_partial_file(path).await {
         Ok((file, size, guard)) if size > 0 => {
             if let Some(if_range) = xattr_helpers::read::<ETag>(&file, &guard) {
                 let if_range = if_range.into_string();
@@ -179,8 +216,8 @@ async fn prepare_partial_resume_at(
         // a fresh download on the guard rather than making both backends
         // undo an `Err` identically.
         Err(PartialOpenError::NotFound(guard)) => Ok(PartialResume::fresh(guard)),
-        Err(PartialOpenError::Failed { logged, guard }) => {
-            Err(PartialOpenFailure { logged, guard })
+        Err(PartialOpenError::Failed { failure, guard }) => {
+            Err(PartialOpenFailure { failure, guard })
         }
     }
 }
@@ -193,19 +230,21 @@ enum PartialOpenError {
     /// No partial file at the path: the normal fresh-download case, not
     /// logged and not counted.
     NotFound(TempPath),
-    /// Any other open/stat/seek failure, logged inside `open_partial_file`
-    /// with the path and the matching `CACHE_IO_FAILURE` / `CACHE_NON_REGULAR`
-    /// bump.
-    Failed { logged: Logged, guard: TempPath },
+    /// Any other open/stat/seek failure. The operation counts cache failures;
+    /// the guarded download owner retains and reports the cause.
+    Failed {
+        failure: CacheError,
+        guard: TempPath,
+    },
 }
 
 /// [`prepare_partial_resume`] could not open the deterministic partial path,
-/// and the failure was already logged with its path and metric. The caller
-/// answers 500 without logging again. Hands back the `TempPath` guard
+/// retaining its cache source for the guarded download runner. Hands back the
+/// `TempPath` guard
 /// (`OnDrop::Keep`, so dropping it touches nothing on disk).
 #[derive(Debug)]
 pub(crate) struct PartialOpenFailure {
-    pub(crate) logged: Logged,
+    pub(crate) failure: CacheError,
     pub(crate) guard: TempPath,
 }
 
@@ -340,7 +379,7 @@ impl AsRef<Path> for TempPath {
 pub(crate) async fn tokio_tempfile(
     path: &Path,
     mode: u32,
-) -> Result<(tokio::fs::File, TempPath), tokio::io::Error> {
+) -> Result<(tokio::fs::File, TempPath), CacheError> {
     let mut rng: SmallRng = rand::make_rng();
 
     let mut buf = path.to_path_buf();
@@ -374,7 +413,11 @@ pub(crate) async fn tokio_tempfile(
             Err(err) if err.kind() == tokio::io::ErrorKind::AlreadyExists => {
                 tries += 1;
                 if tries > MAX_RETRIES {
-                    return Err(err);
+                    return Err(CacheError::counted_io(
+                        "create temporary cache file",
+                        &buf,
+                        err,
+                    ));
                 }
                 assert!(
                     buf.set_extension(""),
@@ -382,7 +425,13 @@ pub(crate) async fn tokio_tempfile(
                 );
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                return Err(CacheError::counted_io(
+                    "create temporary cache file",
+                    &buf,
+                    err,
+                ));
+            }
         };
     }
 }
@@ -400,7 +449,7 @@ pub(crate) async fn tokio_tempfile(
 /// across different sub-directories (`apt/amd64/foo.deb` vs
 /// `apt/arm64/foo.deb`) is implicit in the site's mirror path, which equals
 /// the URL-dir verbatim under the host-anchored flat layout.
-fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier<'_>) -> PathBuf {
+fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier) -> PathBuf {
     let filename = format!("{debname}.partial", debname = ibarrier.debname());
     paths.partial_file(ibarrier.layout(), ibarrier.site(), Path::new(&filename))
 }
@@ -415,20 +464,16 @@ fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier<'_>) -
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
 async fn open_partial_file(
     path: PathBuf,
-    log_prefix: &'static str,
 ) -> Result<(tokio::fs::File, u64, TempPath), PartialOpenError> {
     use tokio::io::AsyncSeekExt as _;
 
     /// [`PartialOpenError`] before the guard is attached.
     enum FileOpsError {
         NotFound,
-        Failed(Logged),
+        Failed(CacheError),
     }
 
-    async fn file_ops(
-        path: &Path,
-        log_prefix: &'static str,
-    ) -> Result<(tokio::fs::File, u64), FileOpsError> {
+    async fn file_ops(path: &Path) -> Result<(tokio::fs::File, u64), FileOpsError> {
         let mut file = tokio_nofollow_options()
             .write(true)
             .read(true)
@@ -441,55 +486,48 @@ async fn open_partial_file(
                 if err.kind() == tokio::io::ErrorKind::NotFound {
                     FileOpsError::NotFound
                 } else {
-                    FileOpsError::Failed(Logged::cache_io_failure(format_args!(
-                        "{log_prefix}failed to open partial file `{}`; returning 500:  {}",
-                        path.display(),
-                        ErrorReport(&err)
-                    )))
+                    FileOpsError::Failed(CacheError::counted_io("open partial file", path, err))
                 }
             })?;
 
         let mdata = file.metadata().await.map_err(|err| {
-            FileOpsError::Failed(Logged::cache_io_failure(format_args!(
-                "{log_prefix}failed to get metadata of partial file `{}`; returning 500:  {}",
-                path.display(),
-                ErrorReport(&err)
-            )))
+            FileOpsError::Failed(CacheError::counted_io(
+                "get metadata of partial file",
+                path,
+                err,
+            ))
         })?;
         if !mdata.file_type().is_file() {
             metrics::CACHE_NON_REGULAR.increment();
-            return Err(FileOpsError::Failed(Logged::warn(format_args!(
-                "{log_prefix}partial file `{}` is not a regular file; returning 500",
-                path.display()
-            ))));
+            return Err(FileOpsError::Failed(CacheError::invalid(
+                "partial file metadata",
+                format!("{} is not a regular file", path.display()),
+            )));
         }
 
         // Seek to the end so subsequent writes append correctly.
         let size = file.seek(std::io::SeekFrom::End(0)).await.map_err(|err| {
-            FileOpsError::Failed(Logged::cache_io_failure(format_args!(
-                "{log_prefix}failed to seek partial file `{}`; returning 500:  {}",
-                path.display(),
-                ErrorReport(&err)
-            )))
+            FileOpsError::Failed(CacheError::counted_io("seek partial file", path, err))
         })?;
 
         Ok((file, size))
     }
 
     let guard = TempPath::keeping(path);
-    match file_ops(&guard, log_prefix).await {
+    match file_ops(&guard).await {
         Ok((file, size)) => Ok((file, size, guard)),
         Err(FileOpsError::NotFound) => Err(PartialOpenError::NotFound(guard)),
-        Err(FileOpsError::Failed(logged)) => Err(PartialOpenError::Failed { logged, guard }),
+        Err(FileOpsError::Failed(failure)) => Err(PartialOpenError::Failed { failure, guard }),
     }
 }
 
 /// Create a new file at the given deterministic partial path, returning the file and a
-/// `OnDrop::Keep` `TempPath` guard.
+/// `OnDrop::Keep` `TempPath` guard. A failure names the path whose syscall
+/// failed: the partial itself, or the parent directory it had to create.
 pub(crate) async fn create_partial_file(
     guard: TempPath,
     mode: u32,
-) -> Result<(tokio::fs::File, TempPath), (tokio::io::Error, PathBuf)> {
+) -> Result<(tokio::fs::File, TempPath), CacheError> {
     async fn open(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
         tokio_nofollow_options()
             .create(true)
@@ -501,7 +539,8 @@ pub(crate) async fn create_partial_file(
             .await
     }
 
-    async fn file_ops(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
+    async fn file_ops(path: &Path, mode: u32) -> Result<tokio::fs::File, CacheError> {
+        let create = |err| CacheError::counted_io("create partial cache file", path, err);
         // Open first and create the parent only on `ENOENT`: with `O_CREAT`
         // set, a missing directory is the sole source of that errno here,
         // and the directory already exists for every download after the
@@ -510,23 +549,20 @@ pub(crate) async fn create_partial_file(
         // rather than two.
         match open(path, mode).await {
             Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {}
-            result => return result,
+            result => return result.map_err(create),
         }
 
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                CacheError::counted_io("create partial cache directory", parent, err)
+            })?;
         }
 
-        open(path, mode).await
+        open(path, mode).await.map_err(create)
     }
 
     let path = guard.defuse();
-
-    let file = match file_ops(&path, mode).await {
-        Ok(file) => file,
-        Err(err) => return Err((err, path)),
-    };
-
+    let file = file_ops(&path, mode).await?;
     Ok((file, TempPath::keeping(path)))
 }
 
@@ -552,6 +588,51 @@ mod tests {
 
     fn partial_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("mirror/tmp/foo_1.0_amd64.deb.partial")
+    }
+
+    /// A resumed partial whose length disagrees with the resume offset is a
+    /// consistency failure, not a syscall failure: no `CACHE_IO_FAILURE`.
+    #[tokio::test]
+    async fn into_target_rejects_a_size_mismatch_without_counting_io() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.partial");
+        tokio::fs::write(&path, b"12345").await.expect("seed");
+        let (file, _size, guard) = open_partial_file(path).await.expect("reopen");
+        let before = metrics::CACHE_IO_FAILURE.get();
+        let err = PartialDownload::Resumable { file, guard }
+            .into_target(Path::new("x.deb"), 4)
+            .await
+            .expect_err("5 != 4");
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), before);
+        assert!(
+            err.to_string().contains("validate resumed partial size"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tempfile_create_failure_keeps_attempted_random_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("missing/volatile");
+        let before = metrics::CACHE_IO_FAILURE.get();
+        let error = tokio_tempfile(&base, 0o640)
+            .await
+            .expect_err("missing parent");
+        let report = ErrorReport(&error).to_string();
+        let attempted = Path::new(report.split('`').nth(1).expect("quoted path"));
+        assert_eq!(attempted.parent(), base.parent(), "{report}");
+        assert_eq!(attempted.file_stem(), base.file_name(), "{report}");
+        assert!(
+            attempted.extension().is_some(),
+            "random extension missing: {report}"
+        );
+        assert_eq!(
+            report.matches("create temporary cache file").count(),
+            1,
+            "{report}"
+        );
+        assert_eq!(report.matches("(os error").count(), 1, "{report}");
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), before + 1);
     }
 
     #[tokio::test]
@@ -581,7 +662,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
 
-        let guard = match open_partial_file(path.clone(), "").await {
+        let guard = match open_partial_file(path.clone()).await {
             Err(PartialOpenError::NotFound(guard)) => guard,
             Ok(_) | Err(PartialOpenError::Failed { .. }) => {
                 unreachable!("no partial exists yet")
@@ -602,7 +683,7 @@ mod tests {
         assert!(path.is_file(), "a partial survives its guard");
 
         // Reopening lands at the end of the existing bytes.
-        let (file, size, guard) = open_partial_file(path.clone(), "")
+        let (file, size, guard) = open_partial_file(path.clone())
             .await
             .expect("partial reopens");
         assert_eq!(size, 5);
@@ -621,11 +702,8 @@ mod tests {
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
 
         let before = metrics::CACHE_NON_REGULAR.get();
-        let guard = match open_partial_file(path.clone(), "").await {
-            Err(PartialOpenError::Failed {
-                logged: Logged { .. },
-                guard,
-            }) => guard,
+        let guard = match open_partial_file(path.clone()).await {
+            Err(PartialOpenError::Failed { failure: _, guard }) => guard,
             Ok(_) | Err(PartialOpenError::NotFound(_)) => {
                 unreachable!("a FIFO is not a partial")
             }

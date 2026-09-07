@@ -22,27 +22,28 @@ use std::num::NonZero;
 use std::sync::Arc;
 
 use http::StatusCode;
-use tracing::{debug, error};
+use tracing::debug;
 
+use crate::active_downloads::Declined;
 use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::ConnectionDetails;
-use crate::error::ErrorReport;
-use crate::guards::InitBarrier;
+use crate::guards::{Consequence, InitBarrier};
 use crate::partial_file;
 use crate::precise_instant::PreciseInstant;
-use crate::rate_checker::{RateCheckDirection, RateChecker};
-use crate::sendfile_conn::write_all_to_stream_rated;
+use crate::rate_checker::RateChecker;
+use crate::sendfile_conn::write_all_to_stream_rated_counted;
 use crate::tcp_cork_guard::CorkGuard;
+use crate::transfer_error::{DeliveryFailure, EndsDelivery, ReportedDelivery};
 use crate::{
     client_counter, global_config, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics,
-    warn_once, warn_once_or_info_logged,
+    warn_once,
 };
 
 use super::commit::{CommitTail, Committed, CompletionBytes, CompletionClient, Served};
 use super::http::{BodyFraming, UpstreamResponse};
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
-    ClientConn, RateTimestamps, SpliceProxyError, UpstreamFailure, prepare_cache_target,
+    ClientConn, RateTimestamps, SpliceProxyError, SpliceProxyOutcome, prepare_cache_target,
     write_splice_response_headers,
 };
 
@@ -59,10 +60,10 @@ pub(super) async fn handle_volatile_buffered_download(
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
     body_prefix: &[u8],
-    ibarrier: InitBarrier<'_>,
+    ibarrier: InitBarrier,
     client_range: RangeRequestHeaders<'_>,
     conn_label: ConnLabel,
-) -> Result<(), SpliceProxyError> {
+) -> Result<SpliceProxyOutcome, SpliceProxyError> {
     let max_bytes: usize = VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER
         .get()
         .try_into()
@@ -84,18 +85,22 @@ pub(super) async fn handle_volatile_buffered_download(
             conn_details.debname
         );
     }
-    let body = upstream_resp
-        .framing
-        .read_to_vec(upstream, body_prefix, max_bytes)
+    // Boxed for size, not for the runner: `read_to_vec` carries the whole
+    // buffered body state, and inlining it into the connection future pushes
+    // `sendfile_conn::try_sendfile_request` past `clippy::large_futures`.
+    let (mut ibarrier, body) = ibarrier
+        .run(async |_barrier| {
+            Box::pin(
+                upstream_resp
+                    .framing
+                    .read_to_vec(upstream, body_prefix, max_bytes),
+            )
+            .await
+            .map_err(Into::into)
+        })
         .await
-        .map_err(|err| {
-            let logged = warn_once_or_info_logged!(
-                "splice proxy: volatile buffered download failed for {}; returning 502:  {}",
-                conn_details.debname,
-                ErrorReport(&err)
-            );
-            SpliceProxyError::Upstream(UpstreamFailure { err, logged })
-        })?;
+        .map_err(SpliceProxyError::ReportedBeforeHeader)?;
+
     let mut rates = RateTimestamps::new(upstream_resp.request_sent_at);
 
     let Some(total_content_length) = NonZero::new(body.len() as u64) else {
@@ -103,6 +108,7 @@ pub(super) async fn handle_volatile_buffered_download(
             "splice proxy: zero-length volatile body for {} from mirror {}",
             conn_details.debname, conn_details.mirror
         );
+        let _settled = ibarrier.decline(Declined::EmptyVolatileBody).await;
         client
             .write_invalid(
                 StatusCode::BAD_GATEWAY,
@@ -111,7 +117,7 @@ pub(super) async fn handle_volatile_buffered_download(
                 "volatile zero-body 502",
             )
             .await?;
-        return Ok(());
+        return Ok(SpliceProxyOutcome::Served);
     };
 
     debug!(
@@ -119,7 +125,7 @@ pub(super) async fn handle_volatile_buffered_download(
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
 
-    let Some((mut target, range_plan)) = prepare_cache_target(
+    let Some((target, range_plan)) = prepare_cache_target(
         client,
         conn_details,
         upstream_resp,
@@ -134,7 +140,7 @@ pub(super) async fn handle_volatile_buffered_download(
     )
     .await?
     else {
-        return Ok(());
+        return Ok(SpliceProxyOutcome::Served);
     };
 
     let start = PreciseInstant::now();
@@ -146,51 +152,43 @@ pub(super) async fn handle_volatile_buffered_download(
     // already-downloaded body (late joiners and future requests keep it).
 
     // Write the full body to the cache temp file (best-effort).
+    // `Abandon`, not `CloseConnection`: the body is already in memory, so a
+    // failed cache write loses only the download -- the client is served
+    // below and the connection survives.
     // The head is written after the commit consumed the target: keep the
     // validator it settled on.
     let last_modified = Arc::clone(&target.last_modified);
-    let cache_write_ok = match target.writer.write_prefix(&body).await {
-        Ok(()) => true,
-        Err(err) => {
-            metrics::CACHE_IO_FAILURE.increment();
-            error!(
-                "splice proxy: failed to write volatile body to cache file `{}`; serving the buffered body to the client without caching it:  {}",
-                target.temppath.display(),
-                ErrorReport(&err)
-            );
-            false
-        }
-    };
+    let cache_write = super::write_body_prefix_to_cache(target, &body, Consequence::Abandon).await;
 
     // Persist via rename+commit, only if the body reached the temp file. When
-    // the write failed, the whole target is dropped here: its barrier records
-    // the terminal aborted state (correct, since nothing is on disk for late
-    // joiners to serve) and gives the `max_upstream_downloads` slot back with
-    // the entry, so the client write below holds neither.
-    let committed = if cache_write_ok {
-        CommitTail::new(
-            target.begin_rename().await,
-            conn_details,
-            conn_label,
-            CompletionBytes {
-                total: total_content_length,
-                upstream: total_content_length.get(),
-                resume_offset: 0,
-            },
-            start,
-        )
-        .commit()
-        .await
-    } else {
-        drop(target);
-        None
+    // the write failed, the target went with the failure: its barrier
+    // published the terminal aborted state (correct, since nothing is on disk
+    // for late joiners to serve) and gave the `max_upstream_downloads` slot
+    // back with the entry, so the client write below holds neither.
+    let committed = match cache_write {
+        Ok(target) => {
+            CommitTail::new(
+                target.begin_rename().await,
+                conn_details,
+                conn_label,
+                CompletionBytes {
+                    total: total_content_length,
+                    upstream: total_content_length.get(),
+                    resume_offset: 0,
+                },
+                start,
+            )
+            .commit()
+            .await
+        }
+        Err(_reported) => None,
     };
 
     // Serve the client from the in-memory body. The cache is already persisted
     // (best-effort above), so a client write failure no longer loses the
     // downloaded body -- and a cached download reports its completion line
     // either way, "Cached ..." for a client that did not get it all, the same
-    // as the streaming tail's `Lost` arm.
+    // as the streaming tail's `Aborted` arm.
     let served = serve_buffered(
         client,
         conn_details,
@@ -202,26 +200,33 @@ pub(super) async fn handle_volatile_buffered_download(
     )
     .await;
 
-    if let Some(committed) = committed {
-        let client = if served.is_ok() {
-            CompletionClient::Served(Served {
+    let (client, outcome) = match served {
+        Ok(()) => {
+            metrics::SERVED_SPLICE.increment();
+            metrics::SERVED_TOTAL.increment();
+            let served = Served {
                 bytes: range_plan.content_length,
                 partial: range_plan.is_partial(),
-            })
-        } else {
-            CompletionClient::Lost
-        };
+            };
+            (CompletionClient::Served(served), SpliceProxyOutcome::Served)
+        }
+        // The write concluded its own failure; the connection closes without
+        // another line.
+        Err(reported) => (
+            CompletionClient::Aborted(reported),
+            SpliceProxyOutcome::ClientLost,
+        ),
+    };
+    if let Some(committed) = committed {
         Committed::report(committed, &rates, client).await;
     }
-
-    served?;
-
-    // The client was fully served (the `?` above skips these).
-    metrics::SERVED_SPLICE.increment();
-    metrics::SERVED_TOTAL.increment();
-
-    Ok(())
+    Ok(outcome)
 }
+
+/// Phase tag of the buffered path's head write.
+const HEAD_PHASE: &str = "volatile response headers";
+/// Phase tag of the buffered path's body write.
+const BODY_PHASE: &str = "volatile body";
 
 /// Write the response head and the range-filtered slice of the buffered body
 /// to the client. Ends the client-rate window on every exit, so the
@@ -234,7 +239,7 @@ async fn serve_buffered(
     last_modified: &str,
     body: &[u8],
     rates: &mut RateTimestamps,
-) -> Result<(), SpliceProxyError> {
+) -> Result<(), ReportedDelivery> {
     // Cork to coalesce headers + body into fewer TCP segments.
     let cork = CorkGuard::new_optional(client.stream);
 
@@ -254,6 +259,19 @@ async fn serve_buffered(
     written
 }
 
+/// The one sink for either client write of this path; the failure's type
+/// decides what it counts (a head counts nothing).
+fn conclude_write(
+    conn_details: &ConnectionDetails,
+    phase: &'static str,
+    failure: impl EndsDelivery,
+) -> ReportedDelivery {
+    failure.conclude(format_args!(
+        "splice proxy: failed to write {phase} to client {} for {} from mirror {}; closing the connection",
+        conn_details.client, conn_details.debname, conn_details.mirror,
+    ))
+}
+
 /// The two client writes of [`serve_buffered`], split out so that function
 /// can time and uncork both exits in one place.
 async fn write_buffered_response(
@@ -264,33 +282,33 @@ async fn write_buffered_response(
     last_modified: &str,
     body: &[u8],
     rates: &mut RateTimestamps,
-) -> Result<(), SpliceProxyError> {
+) -> Result<(), ReportedDelivery> {
     rates.t_client_first = write_splice_response_headers(
         client,
         conn_details,
         upstream_resp,
         range_plan,
         last_modified,
-        "volatile response headers",
+        HEAD_PHASE,
     )
-    .await?;
+    .await
+    .map_err(|failure| conclude_write(conn_details, HEAD_PHASE, failure))?;
 
     #[expect(clippy::cast_possible_truncation, reason = "body capped at 1 MiB")]
     let body_slice = &body[range_plan.content_start as usize..range_plan.content_end() as usize];
     let config = global_config();
     let mut volatile_rc = RateChecker::from_config(config);
-    write_all_to_stream_rated(
+    let before = rates.client_bytes_sent;
+    let delivered = write_all_to_stream_rated_counted(
         client.stream,
         body_slice,
         &mut volatile_rc,
-        RateCheckDirection::Client,
         config.http_timeout,
+        &mut rates.client_bytes_sent,
     )
-    .await
-    .map_err(SpliceProxyError::after_header_client(
-        "volatile body to client",
-    ))?;
-    metrics::BYTES_SERVED_SPLICE.increment_by(body_slice.len() as u64);
-    rates.client_bytes_sent += body_slice.len() as u64;
+    .await;
+    metrics::BYTES_SERVED_SPLICE.increment_by(rates.client_bytes_sent - before);
+    delivered
+        .map_err(|err| conclude_write(conn_details, BODY_PHASE, DeliveryFailure::from(err)))?;
     Ok(())
 }

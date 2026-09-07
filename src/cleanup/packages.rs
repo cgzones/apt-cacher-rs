@@ -18,7 +18,7 @@ use crate::{
     client_info::ClientInfo,
     config::Config,
     deb_mirror::Mirror,
-    error::{ErrorReport, ProxyCacheError, UpstreamFetchError},
+    error::{ErrorReport, UpstreamFetchError},
     index_parser::{Stanza, StanzaStream, hex_encode, structured_lookup_key},
     limits::{
         MAX_DECOMPRESSED_PACKAGES_SIZE, PackagesCompression, decompressed_limit, packages_reader,
@@ -26,6 +26,7 @@ use crate::{
     metrics,
     precise_instant::PreciseInstant,
     proxy_body::ProxyCacheBody,
+    transfer_error::DeliveryFailure,
 };
 // `process_cache_request` has a hyper implementation and a splice-only stub
 // (in `splice/cleanup_bridge.rs`) that bridges to `splice_cleanup_request`;
@@ -68,15 +69,15 @@ impl KeyMapper<'_> {
 /// conservative fetch failure (skip the mirror's reconcile this cycle).
 ///
 /// `Display` renders the wrapped error through [`ErrorReport`] and exposes no
-/// `source()`, matching `ProxyCacheError`.
+/// `source()`.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum PackagesBufferError {
     #[error("{}", ErrorReport(.0))]
     Memfd(memfd::Error),
-    /// The response body yielded an error frame (e.g. `MirrorDownloadRate`,
+    /// The response body yielded an error frame (e.g. an upstream rate limit,
     /// `ContentTooLarge`).
-    #[error("{}", ErrorReport(&**.0))]
-    Body(Box<ProxyCacheError>),
+    #[error("{}", ErrorReport(.0))]
+    Body(DeliveryFailure),
     /// Writing to or rewinding the memfd failed.
     #[error("{}", ErrorReport(.0))]
     Io(io::Error),
@@ -535,7 +536,8 @@ pub(super) async fn try_fetch_packages_file(
         // synthetic 502 by process_cache_request but carries the real reason as a
         // response extension. Recover it so the cleanup decision log names the
         // transport error rather than a misleading "502 Bad Gateway".
-        // request_with_retry already logged the transport error -- don't re-warn.
+        // The download runner (`guards::ReportedDownloadFailure`) already logged
+        // the failure, once-gated for the connect and head phases -- don't re-warn.
         if let Some(upstream) = response.extensions_mut().remove::<UpstreamFetchError>() {
             return Err(FetchFailure {
                 status: StatusCode::BAD_GATEWAY,

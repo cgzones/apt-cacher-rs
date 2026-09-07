@@ -673,6 +673,11 @@ fn build_upstream_group(g: &mut Groups) {
             WarnNonzero(metrics::UPSTREAM_PROTOCOL_VIOLATION.get()),
         );
         t.row_tip(
+            "Body Size Limits",
+            "Responses exceeding a local body buffering, relay, or connection-reuse drain limit. These responses may be valid HTTP and do not count as Protocol Violations.",
+            WarnNonzero(metrics::UPSTREAM_BODY_LIMIT.get()),
+        );
+        t.row_tip(
             "Unsolicited 206",
             "Mirror responses that returned 206 Partial Content for a request the proxy issued without a Range header. Rejected with 502 to avoid cache poisoning. A telemetry slice of Protocol Violations.",
             WarnNonzero(metrics::UPSTREAM_UNSOLICITED_206.get()),

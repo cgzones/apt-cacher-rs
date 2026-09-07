@@ -236,7 +236,7 @@ async fn reduce_against(
         .and_then(|s| s.parse::<u64>().ok());
 
     let memfdname = plan.debname.memfd_name(pkgfmt);
-    // Error-frame aborts (MirrorDownloadRate / ContentTooLarge) and memfd/IO
+    // Typed body failures (rate limits / protocol violations) and memfd/IO
     // failures: skip the mirror conservatively and retry next cycle
     // (packages_body_to_memfd already logged the cause).
     let Ok((file, written)) = packages_body_to_memfd(&memfdname, response.body_mut(), config).await

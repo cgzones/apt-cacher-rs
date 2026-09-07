@@ -1,118 +1,5 @@
 use std::fmt::Display;
 
-#[cfg(feature = "hyper")]
-use crate::channel_body::ChannelBodyError;
-#[cfg(feature = "hyper")]
-use crate::{deb_mirror::Mirror, rate_checker::InsufficientRate, upstream_head::ContentLength};
-
-#[derive(Clone, Debug)]
-pub(crate) struct MirrorDownloadRate {
-    #[cfg(feature = "hyper")]
-    pub(crate) download_rate_err: InsufficientRate,
-    #[cfg(feature = "hyper")]
-    pub(crate) mirror: Mirror,
-    #[cfg(feature = "hyper")]
-    pub(crate) debname: String,
-}
-
-// `InsufficientRate` renders through a `Formatter`, and the `format_args!`
-// holding the context fragment cannot outlive an `#[error("...")]` expression
-// -- hence thiserror's `fmt =` hook, whose parameters are the variant's fields
-// followed by the formatter.
-#[cfg(feature = "hyper")]
-fn fmt_mirror_download_rate(
-    rate: &MirrorDownloadRate,
-    f: &mut std::fmt::Formatter<'_>,
-) -> std::fmt::Result {
-    let MirrorDownloadRate {
-        download_rate_err,
-        mirror,
-        debname,
-    } = rate;
-    download_rate_err.fmt_with_context(
-        f,
-        format_args!(" for mirror {mirror} downloading file {debname}"),
-    )
-}
-
-#[cfg(feature = "hyper")]
-fn fmt_client_download_rate(
-    error: &InsufficientRate,
-    f: &mut std::fmt::Formatter<'_>,
-) -> std::fmt::Result {
-    // Sync point: this fragment completes the test needle "Timeout occurred for
-    // client" started in `rate_checker.rs`; keep the " for client" wording stable.
-    error.fmt_with_context(f, format_args!(" for client"))
-}
-
-/// Error type of the hyper response bodies (`ProxyCacheBody`).  Every variant
-/// is a way a streamed body can fail *after* the response headers went out;
-/// errors raised before that point use the scoped enums of their own module.
-/// Hyper-less builds only ever build infallible bodies, so the enum is empty
-/// there.
-///
-/// The wrapped transport errors render through [`ErrorReport`] inside
-/// `Display` and are deliberately **not** exposed via `source()`.  Log sites
-/// report this type through [`ErrorReport`] too, which walks `source()`, so
-/// re-exposing the transport error there would print it twice; and
-/// `is_io_timed_out_in_chain` walks `source()` looking for a
-/// `TimedOut` `io::Error`, which re-exposure would silently reclassify.  The
-/// cause therefore has to be part of `Display`.  Hence the hand-written `From`
-/// impls below rather than `#[from]`, which would imply `#[source]`.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ProxyCacheError {
-    #[cfg(feature = "hyper")]
-    #[error("{}", ErrorReport(.0))]
-    Io(std::io::Error),
-    #[cfg(feature = "hyper")]
-    #[error("{}", ErrorReport(.0))]
-    Hyper(hyper::Error),
-    #[cfg(feature = "hyper")]
-    #[error(fmt = fmt_client_download_rate)]
-    ClientDownloadRate { error: InsufficientRate },
-    #[cfg(feature = "hyper")]
-    #[error(fmt = fmt_mirror_download_rate)]
-    MirrorDownloadRate(MirrorDownloadRate),
-    #[cfg(feature = "hyper")]
-    #[error(
-        "Upstream sent {received} bytes, exceeding the announced Content-Length of {announced}"
-    )]
-    ContentTooLarge {
-        announced: ContentLength,
-        received: u64,
-    },
-}
-
-#[cfg(feature = "hyper")]
-impl From<std::io::Error> for Box<ProxyCacheError> {
-    fn from(value: std::io::Error) -> Self {
-        Self::new(ProxyCacheError::Io(value))
-    }
-}
-
-#[cfg(feature = "hyper")]
-impl From<hyper::Error> for Box<ProxyCacheError> {
-    fn from(value: hyper::Error) -> Self {
-        Self::new(ProxyCacheError::Hyper(value))
-    }
-}
-
-#[cfg(feature = "hyper")]
-impl From<Box<ChannelBodyError>> for Box<ProxyCacheError> {
-    fn from(value: Box<ChannelBodyError>) -> Self {
-        Self::new(match *value {
-            ChannelBodyError::MirrorDownloadRate(rate) => ProxyCacheError::MirrorDownloadRate(rate),
-            ChannelBodyError::ContentTooLarge {
-                announced,
-                received,
-            } => ProxyCacheError::ContentTooLarge {
-                announced,
-                received,
-            },
-        })
-    }
-}
-
 #[must_use]
 pub(crate) struct ErrorReport<'a, E>(pub(crate) &'a E)
 where
@@ -197,7 +84,7 @@ pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) 
     false
 }
 
-#[cfg(feature = "sendfile")]
+#[cfg(feature = "splice")]
 pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> std::io::Error {
     // `Display` prints only the context message; the errno text lives on the
     // inner io::Error exposed via `source()` and is appended by `ErrorReport`.
@@ -221,7 +108,7 @@ pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> 
 mod tests {
     use super::*;
 
-    #[cfg(feature = "sendfile")]
+    #[cfg(feature = "splice")]
     #[test]
     fn errno_to_io_error_report_does_not_duplicate_errno_text() {
         // ENOENT is portable enough to assert a stable substring on.
@@ -247,25 +134,6 @@ mod tests {
             1,
             "context message duplicated in report: {report}"
         );
-    }
-
-    /// `is_io_timed_out_in_chain` walks `source()` for a `TimedOut`
-    /// `io::Error`. `ProxyCacheError` puts its cause in `Display` instead, so
-    /// exposing it here too would both duplicate it in reports and flip that
-    /// classification -- which is why the `From` impls are hand-written rather
-    /// than `#[from]`.
-    #[cfg(feature = "hyper")]
-    #[test]
-    fn proxy_cache_error_has_no_source() {
-        use std::error::Error as _;
-
-        let err = ProxyCacheError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "timed out",
-        ));
-
-        assert!(err.source().is_none(), "ProxyCacheError must not chain");
-        assert_eq!(err.to_string(), "timed out");
     }
 
     #[test]

@@ -1,10 +1,14 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    fmt,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+};
 
 use tracing::{error, info, warn};
 
 use crate::{
     active_downloads::{
-        AbortReason, ActiveDownloadStatus, ActiveDownloads, Origination, UpstreamSlot,
+        AbortReason, ActiveDownloadStatus, ActiveDownloads, Declined, Origination, UpstreamSlot,
     },
     cache_layout::{CacheEntryKey, CacheEntryKeyRef, CacheLayout, ConnectionDetails, ResourceKind},
     cache_metadata::{self, UpstreamMetadata},
@@ -18,29 +22,83 @@ use crate::{
     metrics,
     partial_file::TempPath,
     sticky,
+    transfer_error::{DownloadFailure, ReportedDownloadFailure},
     upstream_head::ContentLength,
 };
-#[cfg(feature = "splice")]
-use crate::{
-    error::MirrorDownloadRate,
-    rate_checker::{InsufficientRate, RateCheckDirection, RateChecker},
-};
+/// The one `Cancelled` every unexplained drop publishes; readers only match
+/// on the variant, so a single shared allocation serves every such abort.
+pub(crate) static CANCELLED_DOWNLOAD: LazyLock<Arc<DownloadFailure>> =
+    LazyLock::new(|| Arc::new(DownloadFailure::Cancelled));
 
-/// The abort every barrier performs when its owner is dropped without
-/// reaching a sink: publish `Aborted` and count it. Registry retirement is
-/// separate: a download's write lease can outlive its failure notification.
-/// Shared so the three `Drop` impls cannot drift apart.
+/// What the caller does after the runner reported the failure. It ends the
+/// log line, so every abort line carries the consequence clause
+/// `docs/logging.md` requires without a call site spelling it out.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Consequence {
+    /// Nothing went out yet, so the failure still becomes a response:
+    /// `; returning {status}` from [`DownloadFailure::response_parts`].
+    Respond,
+    /// The response head is already on the wire: `; closing the connection`.
+    /// Splice-only: it is the one backend whose download runner keeps serving
+    /// the originating client past its own response head.
+    #[cfg_attr(
+        not(any(feature = "splice", test)),
+        expect(dead_code, reason = "only the splice backend serves past its own head")
+    )]
+    CloseConnection,
+    /// The download ends here and no response depends on it any more:
+    /// `; abandoning the download`. The detached download has no client at
+    /// all; the buffered volatile path still serves its client from memory.
+    Abandon,
+}
+
+/// Publish `failure` as the entry's terminal status and count the abort.
+/// Shared by every barrier `Drop` and by the reporting runners, so they
+/// cannot drift apart. Registry retirement is separate: a download's write
+/// lease can outlive its failure notification.
 ///
 /// Synchronous by necessity: `Drop` cannot await and the status handle is an
 /// `Arc<RwLock<...>>` (not an owned write guard), so the write lock is taken
-/// under `block_in_place`.
-fn abort_on_drop(status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>) {
+/// under `block_in_place`. The runners use it for the same reason a `Drop`
+/// does: an await between concluding the failure and publishing it would let
+/// a cancellation publish `Cancelled` in its place.
+fn publish_abort(
+    status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    failure: Arc<DownloadFailure>,
+) {
     tokio::task::block_in_place(|| {
-        *status.blocking_write() =
-            ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail);
+        *status.blocking_write() = ActiveDownloadStatus::Aborted(AbortReason::Failed(failure));
         metrics::DOWNLOADS_ABORTED.increment();
     });
 }
+
+/// Conclude a download's terminal failure under the one abort wording; the
+/// consequence clause ends the line, so every abort line carries what
+/// `docs/logging.md` requires without a call site spelling it out.
+fn conclude(
+    failure: DownloadFailure,
+    key: CacheEntryKeyRef<'_>,
+    consequence: Consequence,
+) -> ReportedDownloadFailure {
+    let status = failure.response_parts().0.as_u16();
+    let consequence = fmt::from_fn(|f| match consequence {
+        Consequence::Respond => write!(f, "; returning {status}"),
+        Consequence::CloseConnection => f.write_str("; closing the connection"),
+        Consequence::Abandon => f.write_str("; abandoning the download"),
+    });
+    failure.conclude(format_args!(
+        "Aborted downloading file {} from mirror {}{consequence}",
+        key.debname, key.mirror,
+    ))
+}
+
+/// Proof that an [`InitBarrier`] reached a sink: [`InitBarrier::finished`],
+/// [`InitBarrier::download`] or [`InitBarrier::decline`]. A worker driven by
+/// `InitBarrier::run_settled` (hyper) returns one on every success path, so an
+/// answered request cannot leave the entry to `Drop`'s `Cancelled` -- which
+/// would tell every joiner the download was cancelled for no known cause.
+#[must_use = "the init barrier's sink is only proven by handing this on"]
+pub(crate) struct Settled(());
 
 /// Exclusive ownership of a download's registry entry. A failed download
 /// remains registered until its last writer has stopped touching the partial.
@@ -50,7 +108,7 @@ fn abort_on_drop(status: &Arc<tokio::sync::RwLock<ActiveDownloadStatus>>) {
 /// Successful downloads carry the same lease into their rename barrier.
 pub(crate) struct DownloadWriteLease {
     active_downloads: ActiveDownloads,
-    key: CacheEntryKey,
+    key: Arc<CacheEntryKey>,
 }
 
 impl DownloadWriteLease {
@@ -68,38 +126,45 @@ impl DownloadWriteLease {
     /// has been cancelled. Invalidate old validators before releasing its
     /// registry entry so the next request reloads the new inode's metadata.
     pub(crate) fn invalidate_metadata(&self) {
-        cache_metadata::store().invalidate(&self.key.as_ref());
+        cache_metadata::store().invalidate(&self.key.as_ref().as_ref());
     }
 }
 
 impl Drop for DownloadWriteLease {
     fn drop(&mut self) {
-        self.active_downloads.remove(self.key.as_ref());
+        self.active_downloads.remove(self.key.as_ref().as_ref());
     }
 }
 
-struct InitBarrierData<'a> {
+/// Owned setup state permits an unboxed lending async worker. The immutable
+/// key lives beside this state so reporting remains possible after a sink
+/// consumes it; the write lease shares that key with the init barrier.
+struct InitBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
-    active_downloads: &'a ActiveDownloads,
+    active_downloads: ActiveDownloads,
     /// The download's `max_upstream_downloads` slot, travelling with the
     /// barrier chain: `download` hands it to the `DownloadBarrier`, every
     /// other sink drops it here with the rest.
     slot: UpstreamSlot,
-    key: CacheEntryKeyRef<'a>,
     resource_kind: ResourceKind,
     /// The raw client request URI path (pre-normalisation, pre-redirect),
     /// carried through to `RenameBarrier::commit`'s `RenamePlan`.
-    raw_uri_path: &'a str,
+    raw_uri_path: String,
     /// Unused, receivers just need to get notified by drop.
     _tx: tokio::sync::watch::Sender<()>,
 }
 
 #[must_use]
-pub(crate) struct InitBarrier<'a> {
-    data: Option<InitBarrierData<'a>>,
+pub(crate) struct InitBarrier {
+    data: Option<InitBarrierData>,
+    /// Outside `data` on purpose: every sink takes `data`, and a worker may
+    /// reach a sink and only then fail, so the key that names the entry in the
+    /// abort report has to outlive them. Keeping it here means the runners
+    /// need neither a pre-worker capture nor a clone.
+    key: Arc<CacheEntryKey>,
 }
 
-impl<'a> InitBarrier<'a> {
+impl InitBarrier {
     /// `raw_uri_path` is the client's request path exactly as received
     /// (pre-normalisation, and for the splice backend pre-redirect and
     /// query-stripped) - both backends must agree, or registry keys diverge.
@@ -109,9 +174,9 @@ impl<'a> InitBarrier<'a> {
     /// download cannot end up holding its slot loose.
     pub(crate) fn new(
         origination: Origination,
-        active_downloads: &'a ActiveDownloads,
-        conn_details: &'a ConnectionDetails,
-        raw_uri_path: &'a str,
+        active_downloads: ActiveDownloads,
+        conn_details: &ConnectionDetails,
+        raw_uri_path: &str,
     ) -> Self {
         let Origination {
             init_tx,
@@ -119,16 +184,61 @@ impl<'a> InitBarrier<'a> {
             slot,
         } = origination;
         Self {
+            key: Arc::new(conn_details.key().to_owned()),
             data: Some(InitBarrierData {
                 status,
                 active_downloads,
                 slot,
-                key: conn_details.key(),
                 resource_kind: conn_details.resource_kind,
-                raw_uri_path,
+                raw_uri_path: raw_uri_path.to_owned(),
                 _tx: init_tx,
             }),
         }
+    }
+
+    /// Drive one fallible step of registered-download setup under its
+    /// lifecycle owner, handing the barrier back for the next step. A worker
+    /// failure is concluded and published before this returns, and the
+    /// barrier is consumed with it: no later step can run on, or a sink be
+    /// reached by, a setup that already failed.
+    ///
+    /// Safe on a consumed barrier: a worker may reach a sink
+    /// (`finished`/`download`/`decline`) and only then fail, and `self.key`
+    /// lives beside `data` rather than inside it, so the report still names
+    /// the entry without capturing or cloning anything up front.
+    #[cfg(feature = "splice")]
+    pub(crate) async fn run<T>(
+        mut self,
+        worker: impl AsyncFnOnce(&mut Self) -> Result<T, DownloadFailure>,
+    ) -> Result<(Self, T), ReportedDownloadFailure> {
+        match worker(&mut self).await {
+            Ok(result) => Ok((self, result)),
+            Err(failure) => Err(self.fail(failure)),
+        }
+    }
+
+    /// `Self::run` (splice) for a worker that owns the whole setup: every success
+    /// path returns the [`Settled`] proof of the sink it reached, so the
+    /// barrier ends with the worker.
+    #[cfg(feature = "hyper")]
+    pub(crate) async fn run_settled<T>(
+        mut self,
+        worker: impl AsyncFnOnce(&mut Self) -> Result<(Settled, T), DownloadFailure>,
+    ) -> Result<T, ReportedDownloadFailure> {
+        match worker(&mut self).await {
+            Ok((Settled(()), result)) => Ok(result),
+            Err(failure) => Err(self.fail(failure)),
+        }
+    }
+
+    /// Conclude the terminal failure and publish it, retiring the entry.
+    fn fail(mut self, failure: DownloadFailure) -> ReportedDownloadFailure {
+        let reported = conclude(failure, self.key.as_ref().as_ref(), Consequence::Respond);
+        if let Some(data) = self.data.take() {
+            publish_abort(&data.status, reported.shared());
+            data.active_downloads.remove(self.key.as_ref().as_ref());
+        }
+        reported
     }
 
     /// Finalise the entry without going through `Download` (e.g. a
@@ -136,54 +246,76 @@ impl<'a> InitBarrier<'a> {
     /// file remains valid).  No upstream metadata is published; readers
     /// that observe `Finished { meta: None }` fall through to the
     /// post-flight cache, which will lazy-load from xattr if needed.
-    pub(crate) async fn finished(mut self, path: PathBuf) {
-        let data = self.data.take().expect("every sink consumes the instance");
+    pub(crate) async fn finished(&mut self, path: PathBuf) -> Settled {
+        self.settle(ActiveDownloadStatus::Finished { path, meta: None })
+            .await
+    }
 
-        *data.status.write().await = ActiveDownloadStatus::Finished { path, meta: None };
-        data.active_downloads.remove(data.key);
+    /// End the entry without a download: the upstream answered with nothing
+    /// to cache, or this proxy refused to fetch it. Joiners answer from
+    /// `why` what the originator answered (`active_downloads::JoinFailure`);
+    /// nothing failed, so `DOWNLOADS_ABORTED` stays untouched.
+    pub(crate) async fn decline(&mut self, why: Declined) -> Settled {
+        self.settle(ActiveDownloadStatus::Aborted(AbortReason::Declined(why)))
+            .await
+    }
+
+    /// Publish a final status and retire the entry. `data` is taken only
+    /// under the status write lock, so a future cancelled while waiting for it
+    /// leaves `Drop` armed.
+    async fn settle(&mut self, final_status: ActiveDownloadStatus) -> Settled {
+        let status = Arc::clone(&self.data().status);
+        let mut state = status.write().await;
+        let data = self.data.take().expect("every sink consumes the instance");
+        *state = final_status;
+        drop(state);
+        data.active_downloads.remove(self.key.as_ref().as_ref());
+        Settled(())
     }
 
     pub(crate) async fn download(
-        mut self,
+        &mut self,
         path: PathBuf,
         content_length: ContentLength,
         quota_reservation: QuotaReservation,
         meta: Arc<UpstreamMetadata>,
-    ) -> DownloadBarrier {
+    ) -> (Settled, DownloadBarrier) {
+        let status = Arc::clone(&self.data().status);
+        let mut state = status.write().await;
         let data = self.data.take().expect("every sink consumes the instance");
-
         let (tx, rx) = tokio::sync::watch::channel(());
 
-        *data.status.write().await = ActiveDownloadStatus::Download {
+        *state = ActiveDownloadStatus::Download {
             path,
             content_length,
             rx,
             meta,
         };
+        drop(state);
 
-        DownloadBarrier {
+        let download = DownloadBarrier {
             data: Some(DownloadBarrierData {
                 status: Arc::clone(&data.status),
                 lease: Arc::new(DownloadWriteLease {
-                    active_downloads: data.active_downloads.clone(),
-                    key: data.key.to_owned(),
+                    active_downloads: data.active_downloads,
+                    key: Arc::clone(&self.key),
                 }),
                 slot: data.slot,
-                key: data.key.to_owned(),
                 resource_kind: data.resource_kind,
-                raw_uri_path: data.raw_uri_path.to_owned(),
+                raw_uri_path: data.raw_uri_path,
                 tx,
                 quota_reservation,
                 bytes_since_ping: 0,
                 pinged_once: sticky::Bool::new(),
             }),
-        }
+        };
+        (Settled(()), download)
     }
 
-    /// The live barrier state. `finished`, `download` and `Drop` are the only
-    /// sinks and each takes it, so it is `Some` for the barrier's whole
+    /// The live barrier state. `finished`, `download`, `decline`, a failed
+    /// run and `Drop` are the only sinks and each takes it, so it is `Some` for the barrier's whole
     /// observable lifetime.
-    fn data(&self) -> &InitBarrierData<'a> {
+    fn data(&self) -> &InitBarrierData {
         self.data
             .as_ref()
             .expect("every sink consumes the instance")
@@ -191,7 +323,7 @@ impl<'a> InitBarrier<'a> {
 
     #[must_use]
     pub(crate) fn debname(&self) -> &str {
-        self.data().key.debname
+        &self.key.debname
     }
 
     /// The raw client request path this barrier will hand to `RenamePlan`.
@@ -204,12 +336,12 @@ impl<'a> InitBarrier<'a> {
     #[cfg(feature = "splice")]
     #[must_use]
     pub(crate) fn raw_uri_path(&self) -> &str {
-        self.data().raw_uri_path
+        &self.data().raw_uri_path
     }
 
     #[must_use]
     pub(crate) fn layout(&self) -> CacheLayout {
-        self.data().key.layout
+        self.key.layout
     }
 
     /// The alias-resolved on-disk identity of the download's mirror - the
@@ -221,7 +353,7 @@ impl<'a> InitBarrier<'a> {
     pub(crate) fn site(&self) -> MirrorSite<'_> {
         // `key.mirror` is the canonical (alias-resolved) mirror, so this is
         // the same projection as `ConnectionDetails::site`.
-        let mirror = self.data().key.mirror;
+        let mirror = &self.key.mirror;
         MirrorSite {
             host: mirror.host().as_cache_host(),
             port: mirror.port(),
@@ -230,11 +362,21 @@ impl<'a> InitBarrier<'a> {
     }
 }
 
-impl Drop for InitBarrier<'_> {
+impl fmt::Debug for InitBarrier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { data, key } = self;
+        f.debug_struct("InitBarrier")
+            .field("key", key)
+            .field("live", &data.is_some())
+            .finish()
+    }
+}
+
+impl Drop for InitBarrier {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            abort_on_drop(&data.status);
-            data.active_downloads.remove(data.key);
+            publish_abort(&data.status, Arc::clone(&CANCELLED_DOWNLOAD));
+            data.active_downloads.remove(self.key.as_ref().as_ref());
         }
         // `data` (and with it the `UpstreamSlot`) drops with the struct.
     }
@@ -248,7 +390,6 @@ struct DownloadBarrierData {
     /// necessarily finished reading the upstream body -- and dropped with the
     /// rest on every other exit. Never reaches the `RenameBarrier`.
     slot: UpstreamSlot,
-    key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
     tx: tokio::sync::watch::Sender<()>,
@@ -304,17 +445,29 @@ impl DownloadBarrier {
         }
     }
 
-    pub(crate) async fn abort_with_reason(mut self, reason: AbortReason) {
-        let data = self
-            .data
-            .as_ref()
-            .expect("every sink consumes the instance");
-
-        *data.status.write().await = ActiveDownloadStatus::Aborted(reason);
-        metrics::DOWNLOADS_ABORTED.increment();
-        // Keep self armed while awaiting the status lock. After publishing,
-        // dropping the sender wakes readers, but writers retain the lease.
-        drop(self.data.take());
+    /// A worker can only end the shared download with a source-typed failure.
+    /// It is concluded before this returns, and the barrier becomes the
+    /// [`FailedDownload`] that publishes it: a failed download can be
+    /// salvaged, but never run again or renamed.
+    ///
+    /// `consequence` is what the caller does once this returns; it ends the
+    /// reported line, so a detached download and a connection-driven one
+    /// describe the same cause with their own outcome.
+    pub(crate) async fn run<T>(
+        mut self,
+        consequence: Consequence,
+        worker: impl AsyncFnOnce(&mut Self) -> Result<T, DownloadFailure>,
+    ) -> Result<(Self, T), FailedDownload> {
+        match worker(&mut self).await {
+            Ok(result) => Ok((self, result)),
+            Err(failure) => {
+                // Only `begin_rename(self)` consumes the data, so a worker
+                // holding `&mut self` cannot have emptied it.
+                let data = self.data.take().expect("live download barrier");
+                let reported = conclude(failure, data.lease.key.as_ref().as_ref(), consequence);
+                Err(FailedDownload { data, reported })
+            }
+        }
     }
 
     pub(crate) async fn begin_rename(mut self) -> RenameBarrier {
@@ -341,28 +494,17 @@ impl DownloadBarrier {
         data.flush_batched_ping();
         {
             let mut lock = data.status.write().await;
-            let prev = std::mem::replace(
-                &mut *lock,
-                ActiveDownloadStatus::Aborted(AbortReason::AlreadyLoggedJustFail),
-            );
-            *lock = match prev {
-                ActiveDownloadStatus::Download {
-                    path,
-                    content_length: _,
-                    rx: _,
-                    meta,
-                } => ActiveDownloadStatus::Verifying { path, meta },
-                other @ (ActiveDownloadStatus::Init(_)
-                | ActiveDownloadStatus::Verifying { .. }
-                | ActiveDownloadStatus::Finished { .. }
-                | ActiveDownloadStatus::Aborted(_)) => {
-                    error!(
-                        "Download barrier begin_rename reached with non-Download status for {} from mirror {}; leaving the status untouched: {other:?}",
-                        data.key.debname, data.key.mirror
-                    );
-                    other
-                }
-            };
+            if let ActiveDownloadStatus::Download { path, meta, .. } = &mut *lock {
+                let path = std::mem::take(path);
+                let meta = Arc::clone(meta);
+                *lock = ActiveDownloadStatus::Verifying { path, meta };
+            } else {
+                error!(
+                    "Download barrier begin_rename reached with non-Download status for {} from mirror {}; leaving the status untouched: {lock:?}",
+                    data.lease.key.debname, data.lease.key.mirror
+                );
+            }
+            drop(lock);
         }
         // No await after taking the state: cancellation while acquiring the
         // status lock still publishes an abort through this barrier's Drop.
@@ -374,7 +516,6 @@ impl DownloadBarrier {
             data: Some(RenameBarrierData {
                 status: data.status,
                 lease: data.lease,
-                key: data.key,
                 resource_kind: data.resource_kind,
                 raw_uri_path: data.raw_uri_path,
                 quota_reservation: Some(data.quota_reservation),
@@ -407,67 +548,77 @@ impl DownloadBarrier {
             .expect("every sink consumes the instance");
         &data.status
     }
+}
 
-    /// Upstream-rate check that consumes the barrier on failure (into
-    /// `Aborted(MirrorDownloadRate)`) and returns the `io::Error` to propagate.
-    /// Bundling the check and the abort in one by-value call removes the
-    /// "remember to also abort" maintenance burden at every splice loop top.
-    pub(crate) async fn check_upstream_rate(
-        self,
-        rate_checker: Option<&RateChecker>,
-    ) -> Result<Self, std::io::Error> {
-        let Some(rate) = rate_checker.and_then(|rc| rc.check_fail(RateCheckDirection::Upstream))
-        else {
-            return Ok(self);
-        };
-        Err(self.abort_with_rate_timeout(rate).await)
-    }
-
-    /// Mid-stream variant of [`Self::check_upstream_rate`] for callers that already
-    /// obtained an `InsufficientRate` outside of an awaitable barrier-owning
-    /// context (e.g. surfaced from a closure that does not own the barrier).
-    pub(crate) async fn abort_with_rate_timeout(
-        self,
-        download_rate_err: InsufficientRate,
-    ) -> std::io::Error {
-        // The `io::Error` only ever surfaces inside a splice log line that
-        // already names the file and mirror (`splice_error_outcome`'s
-        // subject, or the tmp path of a detached download), so its own
-        // context names just the side, like the sendfile and
-        // `splice/http.rs` rate-timeout sites.  The `AbortReason` below keeps
-        // the mirror and file: hyper joiners render it on their own.
-        let io_err = download_rate_err.to_timeout_io_error(format_args!(" for upstream"));
-        #[cfg(feature = "hyper")]
-        let reason = {
-            let data = self
-                .data
-                .as_ref()
-                .expect("every sink consumes the instance");
-            AbortReason::MirrorDownloadRate(MirrorDownloadRate {
-                download_rate_err,
-                mirror: data.key.mirror.clone(),
-                debname: data.key.debname.clone(),
-            })
-        };
-        #[cfg(not(feature = "hyper"))]
-        let reason = AbortReason::MirrorDownloadRate(MirrorDownloadRate {});
-        self.abort_with_reason(reason).await;
-        io_err
+impl fmt::Debug for DownloadBarrier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { data } = self;
+        f.debug_struct("DownloadBarrier")
+            .field("key", &data.as_ref().map(|data| &data.lease.key))
+            .finish()
     }
 }
 
 impl Drop for DownloadBarrier {
     fn drop(&mut self) {
         if let Some(data) = &self.data {
-            abort_on_drop(&data.status);
+            publish_abort(&data.status, Arc::clone(&CANCELLED_DOWNLOAD));
         }
+    }
+}
+
+/// A download whose runner concluded a terminal failure. It still owns the
+/// barrier state -- the registry entry, the write lease, the progress sender
+/// and the upstream slot -- so readers keep waiting and no replacement writer
+/// is admitted while the partial is salvaged; dropping it (after salvage, or
+/// on cancellation of it) publishes the concluded cause, never `Cancelled`.
+#[must_use = "dropping a failed download publishes its failure; salvage it first"]
+pub(crate) struct FailedDownload {
+    data: DownloadBarrierData,
+    reported: ReportedDownloadFailure,
+}
+
+impl FailedDownload {
+    pub(crate) fn failure(&self) -> &DownloadFailure {
+        self.reported.failure()
+    }
+
+    /// Land what the transfer already received so a later request can resume
+    /// from it, then publish the failure. Skipped when the cache itself is what
+    /// failed: re-attempting the write that just failed would repeat it, count
+    /// `CACHE_IO_FAILURE` twice and log a second error for one condition.
+    pub(crate) async fn salvage(self, salvage: impl AsyncFnOnce()) -> ReportedDownloadFailure {
+        if !matches!(self.failure(), DownloadFailure::Cache(_)) {
+            salvage().await;
+        }
+        self.into_reported()
+    }
+
+    /// Publish the failure now and hand its proof on.
+    pub(crate) fn into_reported(self) -> ReportedDownloadFailure {
+        self.reported.clone()
+    }
+}
+
+impl fmt::Debug for FailedDownload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { data, reported } = self;
+        f.debug_struct("FailedDownload")
+            .field("key", &data.lease.key)
+            .field("failure", reported.failure())
+            .finish()
+    }
+}
+
+impl Drop for FailedDownload {
+    fn drop(&mut self) {
+        publish_abort(&self.data.status, self.reported.shared());
     }
 }
 
 struct RenameBarrierData {
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     lease: Arc<DownloadWriteLease>,
-    key: CacheEntryKey,
     resource_kind: ResourceKind,
     raw_uri_path: String,
     /// `Some` until `commit` hands it to `integrity::verify_and_rename`,
@@ -564,9 +715,9 @@ impl RenameBarrier {
                 dest_path,
                 bytes_received,
                 resource_kind: data.resource_kind,
-                debname: data.key.debname.clone(),
-                host: data.key.mirror.host().as_str().to_owned(),
-                mirror_path: data.key.mirror.path().to_owned(),
+                debname: data.lease.key.debname.clone(),
+                host: data.lease.key.mirror.host().as_str().to_owned(),
+                mirror_path: data.lease.key.mirror.path().to_owned(),
                 raw_uri_path: data.raw_uri_path.clone(),
                 streamed_digest,
             }
@@ -607,7 +758,7 @@ impl RenameBarrier {
             // the throttle armed and answers its 503 (`await_serveable`);
             // a request arriving after the removal below originates anew
             // and hits the pre-upstream throttle gate. `Discarded` (not
-            // `AlreadyLoggedJustFail`): every byte is on disk, so readers
+            // an incomplete failure): every byte is on disk, so readers
             // that already hold the file drain it instead of truncating the
             // body they were promised.
             let data = self
@@ -618,7 +769,7 @@ impl RenameBarrier {
             let throttle = {
                 let mut status = data.status.write().await;
                 let throttle = if checksum_mismatch {
-                    global_verify_throttle().record_failure(data.key.as_ref())
+                    global_verify_throttle().record_failure(data.lease.key.as_ref().as_ref())
                 } else {
                     None
                 };
@@ -634,6 +785,7 @@ impl RenameBarrier {
             if checksum_mismatch {
                 discard_partial(temp_path, Arc::clone(&data.lease)).await;
             }
+            let key = Arc::clone(&data.lease.key);
             drop(data.lease);
             if let Some((window, failures)) = throttle {
                 // Integration tests use this line as the "throttle is
@@ -641,8 +793,8 @@ impl RenameBarrier {
                 // removal above.
                 info!(
                     "Throttling downloads of {} from mirror {} for {} after checksum verification failure (consecutive failures: {failures})",
-                    data.key.debname,
-                    data.key.mirror,
+                    key.debname,
+                    key.mirror,
                     HumanFmt::Time(window),
                 );
             }
@@ -678,7 +830,7 @@ impl RenameBarrier {
                 | ActiveDownloadStatus::Aborted(_) => {
                     error!(
                         "RenameBarrier::commit reached with non-Verifying status for {} from mirror {}; finishing the download without publishing cache metadata: {:?}",
-                        data.key.debname, data.key.mirror, *lock
+                        data.lease.key.debname, data.lease.key.mirror, *lock
                     );
                     // Nothing to publish; the invalidate above already
                     // dropped the previous version's validators.
@@ -694,9 +846,9 @@ impl RenameBarrier {
 
         let data = self.data.take().expect("every sink consumes the instance");
         if let Some(meta) = meta_for_status {
-            cache_metadata::store().set(data.key.clone(), meta);
+            cache_metadata::store().set(data.lease.key.as_ref().clone(), meta);
         }
-        global_verify_throttle().record_success(data.key.as_ref());
+        global_verify_throttle().record_success(data.lease.key.as_ref().as_ref());
         drop(data.lease);
 
         Ok(())
@@ -738,7 +890,7 @@ impl Drop for RenameBarrier {
             // already invalidates them before releasing its lease. Invalidating
             // here would discard valid metadata on an earlier abort; on a
             // filesystem without xattrs the store is its only carrier.
-            abort_on_drop(&data.status);
+            publish_abort(&data.status, Arc::clone(&CANCELLED_DOWNLOAD));
         }
         // `data` (and with it any still-held `QuotaReservation`) drops with
         // the struct right after this, reverting the reservation.
@@ -748,7 +900,7 @@ impl Drop for RenameBarrier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::ClientHost, deb_mirror::MirrorKind};
+    use crate::{config::ClientHost, deb_mirror::MirrorKind, test_support::levels_during};
 
     fn key(debname: &str) -> CacheEntryKey {
         CacheEntryKey {
@@ -761,6 +913,205 @@ mod tests {
             debname: debname.into(),
             layout: CacheLayout::StructuredPool,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_cleanup_preserves_the_worker_failure() {
+        use crate::transfer_error::CacheError;
+        let active = ActiveDownloads::new();
+        let key = key("failed-before-cleanup.deb");
+        let barrier = downloading(&active, &key).await;
+        let data = barrier.data.as_ref().expect("live barrier");
+        let status = Arc::clone(&data.status);
+        let mut progress = data.tx.subscribe();
+        let (failed, observed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = barrier
+                .run(
+                    Consequence::CloseConnection,
+                    async |_barrier| -> Result<(), DownloadFailure> {
+                        // Ordinary propagation at a cache operation boundary.
+                        let operation: Result<(), CacheError> = Err(CacheError::io(
+                            "injected cache write",
+                            std::io::ErrorKind::StorageFull.into(),
+                        ));
+                        operation?;
+                        Ok(())
+                    },
+                )
+                .await;
+            let failure = result.expect_err("worker failed");
+            failed
+                .send(failure.reported.shared())
+                .expect("receiver live");
+            // Model an uncompleted salvage flush after the runner returned.
+            std::future::pending::<()>().await;
+            drop(failure);
+        });
+        let expected = observed.await.expect("worker reached cleanup");
+        task.abort();
+        assert!(task.await.expect_err("cancelled task").is_cancelled());
+        assert!(
+            progress.changed().await.is_err(),
+            "terminal publication closes sender"
+        );
+        let state = status.read().await;
+        let actual = match &*state {
+            ActiveDownloadStatus::Aborted(AbortReason::Failed(failure)) => Some(failure),
+            ActiveDownloadStatus::Init(_)
+            | ActiveDownloadStatus::Download { .. }
+            | ActiveDownloadStatus::Verifying { .. }
+            | ActiveDownloadStatus::Finished { .. }
+            | ActiveDownloadStatus::Aborted(
+                AbortReason::Discarded { .. } | AbortReason::Declined(_),
+            ) => None,
+        };
+        assert!(
+            actual.is_some(),
+            "cancelled cleanup must publish its failure: {state:?}"
+        );
+        assert!(
+            Arc::ptr_eq(actual.expect("asserted above"), &expected),
+            "Drop must publish the retained allocation, including after cancellation"
+        );
+        drop(state);
+        assert_eq!(active.len(), 0, "writer lease retires the entry");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_worker_without_observed_failure_is_cancelled() {
+        let active = ActiveDownloads::new();
+        let key = key("cancelled-worker.deb");
+        let barrier = downloading(&active, &key).await;
+        let status = Arc::clone(&barrier.data.as_ref().expect("live barrier").status);
+        drop(barrier);
+        assert!(matches!(&*status.read().await,
+            ActiveDownloadStatus::Aborted(AbortReason::Failed(failure))
+                if matches!(failure.as_ref(), DownloadFailure::Cancelled)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_init_transitions_keep_the_owner_until_status_publication() {
+        use std::task::{Context, Waker};
+        for download in [false, true] {
+            let active = ActiveDownloads::new();
+            let key = key("cancelled-init-transition.deb");
+            let details = details_for(&key);
+            let origination = active.originate_uncapped(key.as_ref());
+            let status = Arc::clone(&origination.status);
+            let mut barrier = InitBarrier::new(
+                origination,
+                active.clone(),
+                &details,
+                "/debian/pool/test.deb",
+            );
+            let held = status.write().await;
+            if download {
+                let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
+                let quota = crate::cache_quota::CacheQuota::new(0, None)
+                    .try_acquire(length, 0, &key.debname)
+                    .ok()
+                    .expect("unlimited quota");
+                let mut transition = Box::pin(barrier.download(
+                    PathBuf::from("test.partial"),
+                    length,
+                    quota,
+                    Arc::new(UpstreamMetadata::default()),
+                ));
+                assert!(
+                    transition
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                drop(transition);
+            } else {
+                let mut transition = Box::pin(barrier.finished(PathBuf::from("test.deb")));
+                assert!(
+                    transition
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                drop(transition);
+            }
+            assert!(
+                barrier.data.is_some(),
+                "the pending transition cannot disarm its owner"
+            );
+            drop(held);
+            drop(barrier);
+            assert!(matches!(&*status.read().await,
+                ActiveDownloadStatus::Aborted(AbortReason::Failed(failure))
+                    if matches!(failure.as_ref(), DownloadFailure::Cancelled)));
+            assert_eq!(
+                active.len(),
+                0,
+                "cancellation retires the initialized entry"
+            );
+        }
+    }
+
+    /// Salvage re-attempts nothing when the cache itself failed: the retry
+    /// would fail again, count `CACHE_IO_FAILURE` a second time and log a
+    /// second error for one condition. Any other cause salvages.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_download_salvages_unless_the_cache_failed() {
+        use crate::transfer_error::{CacheError, InternalError};
+        let active = ActiveDownloads::new();
+        let key = key("salvage.deb");
+        for (failure, salvages) in [
+            (
+                DownloadFailure::from(CacheError::io(
+                    "write download cache file",
+                    std::io::ErrorKind::StorageFull.into(),
+                )),
+                false,
+            ),
+            (InternalError::invalid("pipe", "broken").into(), true),
+        ] {
+            let barrier = downloading(&active, &key).await;
+            let status = Arc::clone(&barrier.data.as_ref().expect("live barrier").status);
+            let failed = barrier
+                .run(Consequence::Abandon, async |_barrier| Err::<(), _>(failure))
+                .await
+                .expect_err("worker failed");
+            let mut ran = false;
+            let reported = failed.salvage(async || ran = true).await;
+            assert_eq!(ran, salvages, "{:?}", reported.failure());
+            assert!(matches!(&*status.read().await,
+                ActiveDownloadStatus::Aborted(AbortReason::Failed(published))
+                    if Arc::ptr_eq(published, &reported.shared())));
+        }
+    }
+
+    /// A declined setup retires the entry without counting an abort, and a
+    /// joiner answers what the originator answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declined_setup_tells_joiners_what_the_originator_answered() {
+        use crate::active_downloads::{JoinFailure, await_serveable};
+        let active = ActiveDownloads::new();
+        let key = key("declined.deb");
+        let details = details_for(&key);
+        let origination = active.originate_uncapped(key.as_ref());
+        let status = Arc::clone(&origination.status);
+        let mut barrier = InitBarrier::new(origination, active.clone(), &details, "/declined.deb");
+        let aborted = metrics::DOWNLOADS_ABORTED.get();
+        let _settled = barrier
+            .decline(Declined::Passthrough(http::StatusCode::NOT_FOUND))
+            .await;
+        drop(barrier);
+        assert_eq!(metrics::DOWNLOADS_ABORTED.get(), aborted);
+        assert_eq!(active.len(), 0, "the declined entry is retired");
+        let failure = await_serveable(&status, &details).await.err();
+        assert!(
+            matches!(failure, Some(JoinFailure::Declined(_))),
+            "{failure:?}"
+        );
+        assert_eq!(
+            failure.expect("asserted above").response_parts(),
+            (http::StatusCode::NOT_FOUND, "Not Found")
+        );
     }
 
     #[cfg(feature = "splice")]
@@ -882,9 +1233,8 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "splice")]
-    async fn downloading(active: &ActiveDownloads, key: &CacheEntryKey) -> DownloadBarrier {
-        let details = ConnectionDetails {
+    fn details_for(key: &CacheEntryKey) -> ConnectionDetails {
+        ConnectionDetails {
             client: crate::test_support::local_client(),
             request_received_at: crate::precise_instant::PreciseInstant::now(),
             upstream_host: key.mirror.host().clone(),
@@ -892,7 +1242,11 @@ mod tests {
             debname: key.debname.clone(),
             resource_kind: ResourceKind::Pool,
             origin_fields: None,
-        };
+        }
+    }
+
+    async fn downloading(active: &ActiveDownloads, key: &CacheEntryKey) -> DownloadBarrier {
+        let details = details_for(key);
         let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
         let quota = crate::cache_quota::CacheQuota::new(0, None)
             .try_acquire(length, 0, &key.debname)
@@ -900,7 +1254,7 @@ mod tests {
             .expect("unlimited quota");
         InitBarrier::new(
             active.originate_uncapped(key.as_ref()),
-            active,
+            active.clone(),
             &details,
             "/debian/pool/test.deb",
         )
@@ -911,6 +1265,7 @@ mod tests {
             Arc::new(UpstreamMetadata::default()),
         )
         .await
+        .1
     }
 
     #[cfg(feature = "splice")]
@@ -924,9 +1279,7 @@ mod tests {
         let writer = barrier.write_lease();
         let blocking_write = Arc::clone(&writer);
 
-        barrier
-            .abort_with_reason(AbortReason::AlreadyLoggedJustFail)
-            .await;
+        drop(barrier);
         assert!(progress.changed().await.is_err(), "readers wake on failure");
         assert!(matches!(
             *status.read().await,
@@ -999,15 +1352,123 @@ mod tests {
                 status,
                 lease: Arc::new(DownloadWriteLease {
                     active_downloads,
-                    key: key.clone(),
+                    key: Arc::new(key.clone()),
                 }),
-                key: key.clone(),
                 resource_kind: ResourceKind::Pool,
                 raw_uri_path: String::from("/debian/pool/main/t/test/test.deb"),
                 // No reservation: the drop path under test never consults it.
                 quota_reservation: None,
             }),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_transitions_share_identity_without_retaining_the_write_lease() {
+        use crate::cache_quota::CacheQuota;
+
+        let active = ActiveDownloads::new();
+        let key = key("shared-key.deb");
+        let details = details_for(&key);
+        let mut init = InitBarrier::new(
+            active.originate_uncapped(key.as_ref()),
+            active.clone(),
+            &details,
+            "/test.deb",
+        );
+        let identity = Arc::clone(&init.key);
+        let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
+        let quota = CacheQuota::new(0, None)
+            .try_acquire(length, 0, &key.debname)
+            .ok()
+            .expect("unlimited quota");
+        let (_settled, download) = init
+            .download(
+                PathBuf::from("test.partial"),
+                length,
+                quota,
+                Arc::new(UpstreamMetadata::default()),
+            )
+            .await;
+        assert!(Arc::ptr_eq(
+            &identity,
+            &download.data.as_ref().unwrap().lease.key
+        ));
+        let rename = download.begin_rename().await;
+        assert!(Arc::ptr_eq(
+            &identity,
+            &rename.data.as_ref().unwrap().lease.key
+        ));
+        drop(rename);
+        assert_eq!(
+            active.len(),
+            0,
+            "the consumed init barrier's key must not retain the write lease"
+        );
+        assert_eq!(active.upstream_slots(), 0);
+        drop(init);
+        assert_eq!(Arc::strong_count(&identity), 1);
+    }
+
+    #[cfg(feature = "splice")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runner_reports_after_a_consumed_sink() {
+        let active = ActiveDownloads::new();
+        let key = key("consumed-then-failed.deb");
+        let details = details_for(&key);
+        let origination = active.originate_uncapped(key.as_ref());
+        let barrier = InitBarrier::new(
+            origination,
+            active.clone(),
+            &details,
+            "/debian/pool/test.deb",
+        );
+        let result = barrier
+            .run(async |barrier| {
+                let _settled = barrier.finished(PathBuf::from("test.deb")).await;
+                Err::<(), _>(DownloadFailure::Cancelled)
+            })
+            .await;
+        let reported = result.expect_err("worker failed after consuming the sink");
+        assert!(matches!(reported.failure(), DownloadFailure::Cancelled));
+    }
+
+    #[test]
+    fn cancelled_publication_shares_one_static_arc() {
+        let a = Arc::clone(&CANCELLED_DOWNLOAD);
+        let b = Arc::clone(&CANCELLED_DOWNLOAD);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(matches!(a.as_ref(), DownloadFailure::Cancelled));
+    }
+
+    #[test]
+    fn connect_failures_are_once_gated_and_body_failures_are_not() {
+        use crate::{transfer_error::UpstreamError, upstream_retry::RetryLimit};
+
+        let key = key("gated.deb");
+        let connect = || {
+            DownloadFailure::Upstream(UpstreamError::connect(
+                "connect upstream",
+                std::io::ErrorKind::ConnectionRefused.into(),
+                2,
+                RetryLimit::Attempts.into(),
+            ))
+        };
+        let body = || DownloadFailure::Upstream(UpstreamError::protocol("short body"));
+        let levels = levels_during(|| {
+            drop(conclude(connect(), key.as_ref(), Consequence::Respond));
+            drop(conclude(connect(), key.as_ref(), Consequence::Respond));
+            drop(conclude(body(), key.as_ref(), Consequence::CloseConnection));
+            drop(conclude(body(), key.as_ref(), Consequence::CloseConnection));
+        });
+        // The gate is process-global: another test may have fired it first, so
+        // only the relative shape is asserted.
+        assert_eq!(levels.len(), 4, "{levels:?}");
+        assert!(
+            levels[1] == tracing::Level::INFO,
+            "second connect failure demoted: {levels:?}"
+        );
+        assert_eq!(levels[2], tracing::Level::WARN);
+        assert_eq!(levels[3], tracing::Level::WARN);
     }
 
     /// Before rename, the cached file is the one the memoized validators

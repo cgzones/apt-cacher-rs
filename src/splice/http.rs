@@ -31,8 +31,9 @@ use crate::http_range::parse_content_range;
 use crate::humanfmt::HumanFmt;
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
 use crate::precise_instant::PreciseInstant;
-use crate::rate_checker::{RateCheckDirection, RateChecker};
+use crate::rate_checker::RateChecker;
 use crate::sendfile_conn::write_all_to_stream_rated;
+use crate::transfer_error::{ClientError, DeliveryFailure, UpstreamError};
 use crate::upstream_head::{RejectReason, UpstreamHead};
 use crate::{
     build_info::APP_USER_AGENT,
@@ -40,9 +41,10 @@ use crate::{
     global_config, metrics, warn_once_or_info,
 };
 
-use super::VolatileCondHeaders;
-use super::body::BodyTransferError;
-use super::upstream::{ResponseBody, TLS_READ_BUF_SIZE, UpstreamConn};
+use super::{
+    VolatileCondHeaders,
+    upstream::{ResponseBody, TLS_READ_BUF_SIZE, UpstreamConn},
+};
 
 /// Maximum body worth draining solely to reuse an upstream connection.
 pub(super) const MAX_ERROR_BODY_DRAIN: usize = 64 * 1024;
@@ -50,16 +52,22 @@ pub(super) const MAX_ERROR_BODY_DRAIN: usize = 64 * 1024;
 /// A failed request head, classified where the failure originated. TLS
 /// reads can report `InvalidData` too, so an I/O error's kind cannot tell
 /// a broken transport from a malformed HTTP response.
+///
+/// The protocol arm carries a reason, not an error: nothing below the HTTP
+/// layer failed, so there is no `io::Error` to preserve as a source.
 #[derive(Debug)]
 pub(super) enum HeadError {
     Transport(std::io::Error),
-    Protocol(std::io::Error),
+    Protocol(String),
 }
 
 impl HeadError {
-    pub(super) fn into_io(self) -> std::io::Error {
+    pub(super) fn into_upstream(self) -> UpstreamError {
         match self {
-            Self::Transport(err) | Self::Protocol(err) => err,
+            Self::Transport(err) => {
+                UpstreamError::head_io("upstream request or response headers", err)
+            }
+            Self::Protocol(reason) => UpstreamError::head_protocol(reason),
         }
     }
 }
@@ -194,12 +202,9 @@ async fn read_upstream_response_headers(
         search_offset = buf.len();
 
         if buf.len() > MAX_UPSTREAM_HEADER_SIZE {
-            return Err(HeadError::Protocol(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "upstream response header size of {} bytes exceeds {MAX_UPSTREAM_HEADER_SIZE} byte cap",
-                    buf.len()
-                ),
+            return Err(HeadError::Protocol(format!(
+                "upstream response header size of {} bytes exceeds {MAX_UPSTREAM_HEADER_SIZE} byte cap",
+                buf.len()
             )));
         }
     }
@@ -234,12 +239,12 @@ impl BodyFraming {
         client_stream: &TcpStream,
         body_prefix: &[u8],
         max_bytes: usize,
-    ) -> Result<u64, BodyTransferError> {
+    ) -> Result<u64, DeliveryFailure> {
         /// Write the bytes that arrived with the headers, rate-checked.
         async fn write_prefix(
             client_stream: &TcpStream,
             body_prefix: &[u8],
-        ) -> std::io::Result<()> {
+        ) -> Result<(), ClientError> {
             if body_prefix.is_empty() {
                 return Ok(());
             }
@@ -249,7 +254,6 @@ impl BodyFraming {
                 client_stream,
                 body_prefix,
                 &mut rate_checker,
-                RateCheckDirection::Client,
                 config.http_timeout,
             )
             .await?;
@@ -260,9 +264,7 @@ impl BodyFraming {
         let prefix_len = body_prefix.len() as u64;
         match self {
             Self::ContentLength(cl) => {
-                write_prefix(client_stream, body_prefix)
-                    .await
-                    .map_err(BodyTransferError::client)?;
+                write_prefix(client_stream, body_prefix).await?;
                 let remaining = cl.saturating_sub(prefix_len);
                 let forwarded = if remaining > 0 {
                     forward_upstream_body(&mut upstream, client_stream, remaining).await?
@@ -287,9 +289,7 @@ impl BodyFraming {
                 Ok(forwarded)
             }
             Self::CloseDelimited => {
-                write_prefix(client_stream, body_prefix)
-                    .await
-                    .map_err(BodyTransferError::client)?;
+                write_prefix(client_stream, body_prefix).await?;
                 let forwarded =
                     forward_upstream_body_until_eof(&mut upstream, client_stream, max_bytes)
                         .await?;
@@ -310,7 +310,7 @@ impl BodyFraming {
         mut upstream: ResponseBody,
         body_prefix: &[u8],
         max_bytes: usize,
-    ) -> std::io::Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, UpstreamError> {
         match self {
             Self::Chunked => {
                 let body = read_dechunk_body_to_vec(&mut upstream, body_prefix, max_bytes).await?;
@@ -441,27 +441,20 @@ pub(super) fn parse_upstream_response(
     header_end: usize,
     host_authority: &str,
     request_sent_at: PreciseInstant,
-) -> std::io::Result<UpstreamResponse> {
+) -> Result<UpstreamResponse, &'static str> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
 
     match resp.parse(&buf[..header_end]) {
         Ok(httparse::Status::Complete(_)) => {}
         _ => {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "failed to parse upstream response headers",
-            ));
+            return Err("failed to parse upstream response headers");
         }
     }
 
     let raw_code = resp.code.expect("complete header parsed");
-    let status_code = StatusCode::from_u16(raw_code).map_err(|_err| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            "invalid HTTP status code from upstream",
-        )
-    })?;
+    let status_code =
+        StatusCode::from_u16(raw_code).map_err(|_err| "invalid HTTP status code from upstream")?;
 
     let headers = resp.headers;
 
@@ -572,10 +565,10 @@ pub(super) async fn send_and_read_headers(
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
     let resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority, request_sent_at)
-        .inspect_err(|_err| {
+        .inspect_err(|_reason| {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         })
-        .map_err(HeadError::Protocol)?;
+        .map_err(|reason| HeadError::Protocol(reason.to_owned()))?;
     Ok((resp, hdr_buf, hdr_end))
 }
 
@@ -589,13 +582,13 @@ pub(super) async fn send_and_read_headers(
 fn check_upstream_read_rate(
     rate_checker: &mut Option<RateChecker>,
     n: usize,
-) -> std::io::Result<()> {
+) -> Result<(), UpstreamError> {
     let Some(rate_checker) = rate_checker.as_mut() else {
         return Ok(());
     };
     rate_checker.add(n);
-    match rate_checker.check_fail(RateCheckDirection::Upstream) {
-        Some(rate) => Err(rate.to_timeout_io_error(format_args!(" for upstream"))),
+    match rate_checker.check_fail() {
+        Some(rate) => Err(UpstreamError::rate(rate)),
         None => Ok(()),
     }
 }
@@ -603,15 +596,9 @@ fn check_upstream_read_rate(
 /// The `TimedOut` error every upstream body read in this module returns:
 /// bumps `HTTP_TIMEOUT_UPSTREAM_READ` and names the phase alongside the
 /// budget that ran out.
-fn upstream_read_timeout(phase: &str, timeout: Duration) -> std::io::Error {
+fn upstream_read_timeout(timeout: Duration) -> UpstreamError {
     metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
-    std::io::Error::new(
-        ErrorKind::TimedOut,
-        format!(
-            "upstream read timed out during {phase} after {}",
-            HumanFmt::Time(timeout)
-        ),
-    )
+    UpstreamError::timeout("upstream read timed out", timeout)
 }
 
 /// One upstream body read under the `http_timeout` deadline, for the body
@@ -619,13 +606,13 @@ fn upstream_read_timeout(phase: &str, timeout: Duration) -> std::io::Error {
 /// tagged with `phase`. A `0` (EOF) is the caller's to interpret.
 async fn read_upstream_timed(
     read: impl Future<Output = std::io::Result<usize>>,
-    phase: &str,
+    phase: &'static str,
     http_timeout: Duration,
-) -> std::io::Result<usize> {
+) -> Result<usize, UpstreamError> {
     match tokio::time::timeout(http_timeout, read).await {
-        Ok(result) => result,
+        Ok(result) => result.map_err(|error| UpstreamError::io(phase, error)),
         Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
-            Err(upstream_read_timeout(phase, http_timeout))
+            Err(upstream_read_timeout(http_timeout))
         }
     }
 }
@@ -638,7 +625,7 @@ async fn forward_upstream_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
     count: u64,
-) -> Result<u64, BodyTransferError> {
+) -> Result<u64, DeliveryFailure> {
     let config = global_config();
     // `Vec::with_capacity` reserves uninitialized backing storage; `read_buf`
     // fills bytes into the spare capacity via `BufMut`, so the buffer is
@@ -661,28 +648,19 @@ async fn forward_upstream_body(
             "body forward",
             config.http_timeout,
         )
-        .await
-        .map_err(BodyTransferError::upstream)?;
+        .await?;
         if n == 0 {
-            return Err(BodyTransferError::upstream(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
+            return Err(DeliveryFailure::from(UpstreamError::protocol(
                 "upstream closed before sending complete body",
             )));
         }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
-        check_upstream_read_rate(&mut rate_checker, n).map_err(BodyTransferError::upstream)?;
+        check_upstream_read_rate(&mut rate_checker, n)?;
 
-        write_all_to_stream_rated(
-            client,
-            &buf,
-            &mut client_rate_checker,
-            RateCheckDirection::Client,
-            config.http_timeout,
-        )
-        .await
-        .map_err(BodyTransferError::client)?;
+        write_all_to_stream_rated(client, &buf, &mut client_rate_checker, config.http_timeout)
+            .await?;
         metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n as u64);
         remaining = remaining
             .checked_sub(n as u64)
@@ -699,7 +677,7 @@ async fn forward_upstream_body_until_eof(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
     max_bytes: usize,
-) -> Result<u64, BodyTransferError> {
+) -> Result<u64, DeliveryFailure> {
     let config = global_config();
     let mut buf = BytesMut::with_capacity(TLS_READ_BUF_SIZE);
     let mut total = 0;
@@ -713,8 +691,7 @@ async fn forward_upstream_body_until_eof(
             "body forward",
             config.http_timeout,
         )
-        .await
-        .map_err(BodyTransferError::upstream)?;
+        .await?;
         if n == 0 {
             break;
         }
@@ -723,22 +700,20 @@ async fn forward_upstream_body_until_eof(
 
         total += n as u64;
         if total > max_bytes as u64 {
-            return Err(BodyTransferError::upstream(std::io::Error::other(format!(
+            return Err(DeliveryFailure::from(UpstreamError::body_limit(format!(
                 "upstream error response body exceeded {max_bytes} byte cap (size={total} bytes)"
             ))));
         }
 
-        check_upstream_read_rate(&mut rate_checker, n).map_err(BodyTransferError::upstream)?;
+        check_upstream_read_rate(&mut rate_checker, n)?;
 
         write_all_to_stream_rated(
             client,
             &buf[..n],
             &mut client_rate_checker,
-            RateCheckDirection::Client,
             config.http_timeout,
         )
-        .await
-        .map_err(BodyTransferError::client)?;
+        .await?;
         metrics::BYTES_SERVED_PASSTHROUGH.increment_by(n as u64);
     }
 
@@ -769,8 +744,9 @@ enum ChunkDecodeError {
         max_bytes: usize,
         declared_bytes: usize,
     },
-    /// A framing violation; `UPSTREAM_PROTOCOL_VIOLATION` has been bumped.
-    Framing(std::io::Error),
+    /// A framing violation, as the reason phrase its I/O wrapper hands to
+    /// `UpstreamError::protocol` (which owns the counter bump).
+    Framing(&'static str),
 }
 
 /// What one [`ChunkDecoder::feed`] call took from its input.
@@ -794,14 +770,10 @@ impl Consumed {
     /// Kept out of [`ChunkDecoder::feed`] so the streaming relay can first
     /// forward the validated `[..raw]` prefix (the terminator included) and
     /// only then fail the connection.
-    fn ensure_no_trailing_bytes(self, data_len: usize) -> std::io::Result<()> {
+    fn ensure_no_trailing_bytes(self, data_len: usize) -> Result<(), &'static str> {
         let Self { raw, done } = self;
         if done && raw < data_len {
-            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "chunked encoding: trailing bytes after 0-length chunk",
-            ));
+            return Err("chunked encoding: trailing bytes after 0-length chunk");
         }
         Ok(())
     }
@@ -854,8 +826,7 @@ impl ChunkDecoder {
         mut on_payload: impl FnMut(Range<usize>),
     ) -> Result<Consumed, ChunkDecodeError> {
         fn framing_violation(msg: &'static str) -> ChunkDecodeError {
-            metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
-            ChunkDecodeError::Framing(std::io::Error::new(ErrorKind::InvalidData, msg))
+            ChunkDecodeError::Framing(msg)
         }
 
         let mut i = 0usize;
@@ -974,36 +945,30 @@ async fn forward_chunked_buf(
     client_rate_checker: &mut Option<RateChecker>,
     client_total: &mut u64,
     http_timeout: Duration,
-) -> Result<bool, BodyTransferError> {
+) -> Result<bool, DeliveryFailure> {
     let consumed = match decoder.feed(data, |_payload| {}) {
         Ok(consumed) => consumed,
         Err(ChunkDecodeError::SizeCap {
             max_bytes,
             declared_bytes,
         }) => {
-            return Err(BodyTransferError::upstream(std::io::Error::other(format!(
+            return Err(DeliveryFailure::from(UpstreamError::body_limit(format!(
                 "chunked response body exceeded {max_bytes} byte cap (declared payload={declared_bytes} bytes)"
             ))));
         }
-        Err(ChunkDecodeError::Framing(err)) => return Err(BodyTransferError::upstream(err)),
+        Err(ChunkDecodeError::Framing(reason)) => {
+            return Err(DeliveryFailure::from(UpstreamError::protocol(reason)));
+        }
     };
     let forward_slice = &data[..consumed.raw];
     if !forward_slice.is_empty() {
-        write_all_to_stream_rated(
-            client,
-            forward_slice,
-            client_rate_checker,
-            RateCheckDirection::Client,
-            http_timeout,
-        )
-        .await
-        .map_err(BodyTransferError::client)?;
+        write_all_to_stream_rated(client, forward_slice, client_rate_checker, http_timeout).await?;
         metrics::BYTES_SERVED_PASSTHROUGH.increment_by(forward_slice.len() as u64);
         *client_total += forward_slice.len() as u64;
     }
     consumed
         .ensure_no_trailing_bytes(data.len())
-        .map_err(BodyTransferError::upstream)?;
+        .map_err(UpstreamError::protocol)?;
     Ok(consumed.done)
 }
 
@@ -1019,7 +984,7 @@ async fn forward_upstream_chunked_body(
     client: &TcpStream,
     body_prefix: &[u8],
     max_bytes: usize,
-) -> Result<u64, BodyTransferError> {
+) -> Result<u64, DeliveryFailure> {
     let config = global_config();
     let mut rate_checker = RateChecker::from_config(config);
     let mut client_rate_checker = RateChecker::from_config(config);
@@ -1050,18 +1015,16 @@ async fn forward_upstream_chunked_body(
             "chunked body forward",
             config.http_timeout,
         )
-        .await
-        .map_err(BodyTransferError::upstream)?;
+        .await?;
         if n == 0 {
-            return Err(BodyTransferError::upstream(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
+            return Err(DeliveryFailure::from(UpstreamError::protocol(
                 "upstream closed during chunked body transfer",
             )));
         }
 
         metrics::BYTES_DOWNLOADED_UPSTREAM.increment_by(n as u64);
 
-        check_upstream_read_rate(&mut rate_checker, n).map_err(BodyTransferError::upstream)?;
+        check_upstream_read_rate(&mut rate_checker, n)?;
 
         if forward_chunked_buf(
             &mut decoder,
@@ -1084,7 +1047,7 @@ async fn read_body_to_vec_until_eof(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
     max_bytes: usize,
-) -> std::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, UpstreamError> {
     let config = global_config();
     let size = (prefix.len() + 4096).min(max_bytes.saturating_add(1));
     let mut body = Vec::with_capacity(size);
@@ -1093,7 +1056,7 @@ async fn read_body_to_vec_until_eof(
 
     loop {
         if body.len() > max_bytes {
-            return Err(std::io::Error::other(format!(
+            return Err(UpstreamError::body_limit(format!(
                 "volatile response body exceeded {max_bytes} byte cap (size={} bytes)",
                 body.len()
             )));
@@ -1133,21 +1096,17 @@ async fn read_body_to_vec_with_content_length(
     prefix: &[u8],
     content_length: u64,
     max_bytes: usize,
-) -> std::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, UpstreamError> {
     let content_length = usize::try_from(content_length).map_err(|_err| {
-        std::io::Error::new(
-            ErrorKind::InvalidData,
-            "content-length value too large to fit in memory address space",
-        )
+        UpstreamError::body_limit("content-length value too large to fit in memory address space")
     })?;
     if content_length > max_bytes {
-        return Err(std::io::Error::other(
+        return Err(UpstreamError::body_limit(
             "content-length exceeds the body buffering cap",
         ));
     }
     if prefix.len() > content_length {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
+        return Err(UpstreamError::protocol(
             "upstream body prefix exceeds content-length",
         ));
     }
@@ -1170,8 +1129,7 @@ async fn read_body_to_vec_with_content_length(
         )
         .await?;
         if n == 0 {
-            return Err(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
+            return Err(UpstreamError::protocol(
                 "upstream closed before content-length body completed",
             ));
         }
@@ -1192,7 +1150,7 @@ async fn read_dechunk_body_to_vec(
     upstream: &mut UpstreamConn,
     prefix: &[u8],
     max_bytes: usize,
-) -> std::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, UpstreamError> {
     let config = global_config();
     let mut body = Vec::with_capacity(4096);
     let mut rate_checker = RateChecker::from_config(config);
@@ -1213,8 +1171,7 @@ async fn read_dechunk_body_to_vec(
             )
             .await?;
             if n == 0 {
-                return Err(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
+                return Err(UpstreamError::protocol(
                     "upstream closed during chunked body buffering",
                 ));
             }
@@ -1231,15 +1188,17 @@ async fn read_dechunk_body_to_vec(
                 max_bytes,
                 declared_bytes,
             }) => {
-                return Err(std::io::Error::other(format!(
+                return Err(UpstreamError::body_limit(format!(
                     "chunked volatile body exceeded {max_bytes} byte cap (declared payload={declared_bytes} bytes)"
                 )));
             }
-            Err(ChunkDecodeError::Framing(err)) => return Err(err),
+            Err(ChunkDecodeError::Framing(reason)) => return Err(UpstreamError::protocol(reason)),
         };
 
         if consumed.done {
-            consumed.ensure_no_trailing_bytes(data.len())?;
+            consumed
+                .ensure_no_trailing_bytes(data.len())
+                .map_err(UpstreamError::protocol)?;
             break;
         }
     }
@@ -1269,12 +1228,9 @@ mod tests {
         )
         .await
         .expect_err("writing after shutdown must fail");
-        let classified = err.into_after_header("test relay", format_args!("test response"));
         assert!(
-            matches!(classified, super::super::SpliceProxyError::AfterHeader {
-            side: super::super::AfterHeaderSide::Client(err), ..
-        } if err.kind() == ErrorKind::BrokenPipe && err.raw_os_error().is_some()),
-            "client write must retain its side and original OS error"
+            matches!(err, DeliveryFailure::Client(ref error) if error.is_peer_disconnect()),
+            "client write must retain its source and disconnect cause"
         );
     }
 
@@ -1590,8 +1546,8 @@ mod tests {
 
     fn assert_framing_error(err: &ChunkDecodeError) {
         assert!(
-            matches!(err, ChunkDecodeError::Framing(io_err) if io_err.kind() == ErrorKind::InvalidData),
-            "expected an InvalidData framing error, got {err:?}",
+            matches!(err, ChunkDecodeError::Framing(reason) if reason.starts_with("chunked encoding:")),
+            "expected a chunked-framing error, got {err:?}",
         );
     }
 
@@ -1708,10 +1664,13 @@ mod tests {
             Consumed { raw: 5, done: true },
             "decoder must stop right after the closing CRLF, not swallow trailing bytes",
         );
-        let err = consumed
+        let reason = consumed
             .ensure_no_trailing_bytes(input.len())
             .expect_err("trailing bytes after the terminator must be rejected");
-        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            reason,
+            "chunked encoding: trailing bytes after 0-length chunk"
+        );
         // A frame that ends exactly at the terminator passes the check.
         consumed
             .ensure_no_trailing_bytes(5)

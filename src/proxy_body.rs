@@ -11,14 +11,11 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt as _, Full, combinators::BoxBody};
 use pin_project::pin_project;
 
-use crate::error;
 #[cfg(feature = "hyper")]
 use crate::response_head::ResponseHead;
+use crate::transfer_error::DeliveryFailure;
 #[cfg(all(feature = "mmap", feature = "hyper"))]
-use crate::{
-    accounted_body, mmap_body,
-    rate_checked_body::{MaybeRated, RateCheckedBodyErr},
-};
+use crate::{accounted_body, mmap_body, rate_checked_body::ClientBody};
 
 #[must_use]
 #[cfg(feature = "hyper")]
@@ -47,8 +44,8 @@ pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
 )]
 pub(crate) enum ProxyCacheBody {
     #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap(#[pin] MaybeRated<accounted_body::AccountedBody<mmap_body::MmapBody>>),
-    Boxed(#[pin] BoxBody<bytes::Bytes, Box<error::ProxyCacheError>>),
+    Mmap(#[pin] accounted_body::AccountedBody<ClientBody<mmap_body::MmapBody>>),
+    Boxed(#[pin] BoxBody<bytes::Bytes, DeliveryFailure>),
 }
 
 impl Debug for ProxyCacheBody {
@@ -64,7 +61,7 @@ impl Debug for ProxyCacheBody {
 impl Body for ProxyCacheBody {
     type Data = ProxyCacheBodyData;
 
-    type Error = Box<error::ProxyCacheError>;
+    type Error = DeliveryFailure;
 
     #[inline]
     fn poll_frame(
@@ -75,13 +72,7 @@ impl Body for ProxyCacheBody {
             #[cfg(all(feature = "mmap", feature = "hyper"))]
             EnumProj::Mmap(memory_map) => memory_map
                 .poll_frame(cx)
-                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap))
-                .map_err(|rerr| match *rerr {
-                    RateCheckedBodyErr::RateTimeout(error) => {
-                        Box::new(error::ProxyCacheError::ClientDownloadRate { error })
-                    }
-                    RateCheckedBodyErr::Inner(never) => match never {},
-                }),
+                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap)),
 
             EnumProj::Boxed(bytes) => bytes
                 .poll_frame(cx)

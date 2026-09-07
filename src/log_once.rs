@@ -6,11 +6,9 @@
 //! call site, not once per process. `docs/logging.md` is the binding policy
 //! for which level each variant carries.
 
-#[cfg(feature = "splice")]
-use tracing::info;
-use tracing::{error, warn};
+use tracing::error;
 
-use crate::metrics;
+use crate::{metrics, transfer_error::Severity};
 
 /// The gate every `*_once` macro and gated helper below is built on: `true`
 /// exactly once per `fired`, `false` on every later call.
@@ -48,6 +46,24 @@ macro_rules! info_or_warn {
             ::tracing::info!($($arg)*);
         } else {
             ::tracing::warn!($($arg)*);
+        }
+    }};
+}
+
+/// Emit one message at a severity chosen at runtime.
+///
+/// Expands to an explicit `tracing` call per `transfer_error::Severity` arm
+/// rather than `event!(level, …)` so each level keeps its own call-site
+/// metadata (and its static level filter). An exported macro cannot link that
+/// crate-private type, so it is named in plain text. Not gated -- like
+/// [`info_or_warn!`](crate::info_or_warn) these are per-request narrative lines.
+#[macro_export]
+macro_rules! log_at {
+    ($severity:expr, $($arg:tt)*) => {{
+        match $severity {
+            $crate::transfer_error::Severity::Info => ::tracing::info!($($arg)*),
+            $crate::transfer_error::Severity::Warn => ::tracing::warn!($($arg)*),
+            $crate::transfer_error::Severity::Error => ::tracing::error!($($arg)*),
         }
     }};
 }
@@ -102,7 +118,7 @@ macro_rules! info_once {
 
 /// [`warn_once_or_info!`] that returns the [`Logged`] proof for
 /// an error variant whose policy is "logged at the throw site". Same per-site
-/// once-gate; the level split lives in `Logged::warn_once_or_info`.
+/// once-gate; the level split lives in `warn_once_or_info_gated`.
 #[macro_export]
 macro_rules! warn_once_or_info_logged {
     ($($t:tt)*) => {{
@@ -127,35 +143,63 @@ pub(crate) fn warn_once_or_info_gated(
     }
 }
 
-/// Proof that a failure was logged at its throw site.
+/// Proof that a failure was logged, carrying the value it was logged for.
 ///
-/// A failure is logged once, at the site that decides the
-/// outcome. Some sites must be that site because the context that makes the
-/// line actionable -- the on-disk path, the upstream authority and attempt
-/// count -- exists only there; the error variant they return then carries
-/// this token instead of (or next to) the error, and the outer arm receiving
-/// it maps silently. The field is private and the only constructors are the
-/// logging helpers below, so such a variant cannot be thrown without its log
-/// line, and a reviewer reading `Logged` at a throw site knows which helper
-/// wrote it.
+/// A failure is logged once, at the site that decides the outcome. Some sites
+/// must be that site because the context that makes the line actionable --
+/// the on-disk path, the upstream authority and attempt count -- exists only
+/// there; the error variant they return then carries this token instead of
+/// (or next to) the error, and the outer arm receiving it maps silently. The
+/// field is private and every constructor logs: the [`Logged`] helpers below
+/// write the line, and [`Logged::with`] attaches the value to that proof, so a
+/// `Reported<T>` cannot exist without its log line, and a reviewer reading one
+/// at a throw site knows which helper wrote it.
+///
+/// Terminal failures reach it through their `conclude` methods
+/// (`transfer_error`), which count the cause before logging it; that is the
+/// only way to count one.
 ///
 /// The helpers log from this module, so the `target` recorded for the line
 /// (visible only in the web interface's log store, which prints targets) is
 /// `log_once`, not the throw site's module. The console/file sinks print no
 /// target.
-#[derive(Debug)]
-pub(crate) struct Logged(());
+#[derive(Clone, Debug)]
+#[must_use = "a reported failure proves its line was written; hand it on"]
+pub(crate) struct Reported<T>(T);
+
+/// The bare proof, before a value is attached.
+pub(crate) type Logged = Reported<()>;
+
+impl<T> Reported<T> {
+    pub(crate) fn get(&self) -> &T {
+        &self.0
+    }
+}
 
 impl Logged {
-    /// `error!` the line and prove it.
-    pub(crate) fn error(args: std::fmt::Arguments<'_>) -> Self {
-        error!("{args}");
+    /// Attach the value this line reported.
+    pub(crate) fn with<T>(self, value: T) -> Reported<T> {
+        let Self(()) = self;
+        Reported(value)
+    }
+
+    /// Log the line at `severity` and prove it.
+    pub(crate) fn at(severity: Severity, args: std::fmt::Arguments<'_>) -> Self {
+        crate::log_at!(severity, "{args}");
         Self(())
     }
 
-    /// `warn!` the line and prove it.
-    pub(crate) fn warn(args: std::fmt::Arguments<'_>) -> Self {
-        warn!("{args}");
+    /// `debug!` the line and prove it: a terminal failure whose outcome the
+    /// caller reports itself (cleanup's decision log).
+    #[cfg(feature = "splice")]
+    pub(crate) fn debug(args: std::fmt::Arguments<'_>) -> Self {
+        tracing::debug!("{args}");
+        Self(())
+    }
+
+    /// `error!` the line and prove it.
+    pub(crate) fn error(args: std::fmt::Arguments<'_>) -> Self {
+        error!("{args}");
         Self(())
     }
 
@@ -166,20 +210,16 @@ impl Logged {
         Self::error(args)
     }
 
-    /// The body of [`crate::warn_once_or_info_logged!`]: `fired` is that
-    /// call site's own once-gate, so per-site flood control is unchanged
-    /// from [`crate::warn_once_or_info!`]. Call through the macro, never
-    /// directly -- a shared gate would collapse every site into one.
-    #[cfg(feature = "splice")]
+    /// WARN on `fired`'s first use, INFO after. The body of
+    /// [`crate::warn_once_or_info_logged!`], where `fired` is that call site's
+    /// own once-gate, so per-site flood control is unchanged from
+    /// [`crate::warn_once_or_info!`]; a caller handing in a shared gate
+    /// deliberately collapses every site that uses it into one condition.
     pub(crate) fn warn_once_or_info(
         fired: &'static std::sync::atomic::AtomicBool,
         args: std::fmt::Arguments<'_>,
     ) -> Self {
-        if first_fire(fired) {
-            warn!("{args}");
-        } else {
-            info!("{args}");
-        }
+        warn_once_or_info_gated(fired, args);
         Self(())
     }
 }
