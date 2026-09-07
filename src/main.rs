@@ -79,6 +79,7 @@ mod scheme_cache;
 mod sendfile_conn;
 #[cfg(feature = "splice")]
 mod splice;
+mod sqlite_error;
 mod string_write;
 mod task_cache_scan;
 mod task_setup;

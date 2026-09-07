@@ -1432,6 +1432,11 @@ impl Database {
 
 #[cfg(test)]
 impl Database {
+    /// The raw pool, for tests that need a statement the API never issues.
+    pub(crate) fn pool(&self) -> &Pool<Sqlite> {
+        &self.conn
+    }
+
     /// A fresh schema in a temporary directory, for unit tests in this and
     /// other modules (`database_task`). The directory lives as long as the
     /// returned guard.

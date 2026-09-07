@@ -9,8 +9,8 @@ use tracing::{debug, error, info, warn};
 use crate::{
     database::{Database, DeliveryRow, DownloadRow, OriginRow},
     deb_mirror::{Mirror, Origin},
-    error::ErrorReport,
     metrics,
+    sqlite_error::SqlxErrorReport,
 };
 
 /// Which per-transfer table a [`DbCmdTransfer`] is recorded in.
@@ -225,7 +225,7 @@ async fn stage(
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
                         "Failed to resolve the mirror id for a {noun} of {debname} from mirror {mirror}; dropping the {noun} record:  {}",
-                        ErrorReport(&err),
+                        SqlxErrorReport(&err),
                         debname = c.debname,
                         mirror = c.mirror
                     );
@@ -258,7 +258,7 @@ async fn stage(
                     metrics::DB_OPERATION_FAILED.increment();
                     error!(
                         "Failed to resolve the mirror id for an origin of mirror {mirror}; dropping the origin record:  {}",
-                        ErrorReport(&err),
+                        SqlxErrorReport(&err),
                         mirror = origin.mirror
                     );
                     return;
@@ -285,7 +285,7 @@ async fn stage(
                 metrics::DB_OPERATION_FAILED.increment();
                 error!(
                     "Failed to ping the database; reporting the health check as failing:  {}",
-                    ErrorReport(err)
+                    SqlxErrorReport(err)
                 );
             }
             // Replied-to-nobody is fine: the healthcheck timed out and
@@ -334,7 +334,7 @@ async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReaso
         error!(
             "Failed to flush {} delivery rows, dropping them:  {}",
             buf.deliveries.len(),
-            ErrorReport(&err)
+            SqlxErrorReport(&err)
         );
     }
     buf.deliveries.clear();
@@ -344,7 +344,7 @@ async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReaso
         error!(
             "Failed to flush {} download rows, dropping them:  {}",
             buf.downloads.len(),
-            ErrorReport(&err)
+            SqlxErrorReport(&err)
         );
     }
     buf.downloads.clear();
@@ -354,7 +354,7 @@ async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReaso
         error!(
             "Failed to flush {} origin rows, dropping them:  {}",
             buf.origins.len(),
-            ErrorReport(&err)
+            SqlxErrorReport(&err)
         );
     }
     buf.origins.clear();
@@ -395,7 +395,7 @@ async fn flush_last_seen(db: &Database, cache: &mut HashMap<Mirror, CachedMirror
             error!(
                 "Failed to flush {} mirror last_seen rows, retrying at the next flush:  {}",
                 pairs.len(),
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
         }
     }
@@ -430,7 +430,7 @@ pub(crate) async fn db_loop(
             metrics::DB_OPERATION_FAILED.increment();
             warn!(
                 "Failed to hydrate the mirror-id cache; starting empty and re-resolving every mirror on first use:  {}",
-                ErrorReport(&err)
+                SqlxErrorReport(&err)
             );
         }
     }
