@@ -5,7 +5,7 @@ use tracing::error;
 use crate::{LOGSTORE, error::ErrorReport, global_config, swrite};
 
 use super::{
-    fmt::HtmlEscape,
+    fmt::{HtmlEscape, Utc},
     page::{Heading, Page, PageTitle, QueryOptions, build_nav_html, build_page},
     response::WebResponse,
 };
@@ -49,13 +49,14 @@ pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
 
     let heading = Heading;
     let capacity = global_config().logstore_capacity;
+    let generated_at = Utc::now();
     let body_html = format_args!(
         "{nav}{heading}\
          <div class=\"section\">\
          <h2>Log Entries <span class=\"count\">{entry_count} / {capacity}</span></h2>\
          <pre class=\"log\">{escaped_logs}</pre>\
          </div>\
-         <footer><hr><p>All dates are in UTC.</p></footer>"
+         <footer><hr><p>All dates are in UTC. Page generated at {generated_at}.</p></footer>"
     );
 
     // The logs page is a tailing view; auto-refresh would fight the reader.

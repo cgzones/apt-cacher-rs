@@ -934,7 +934,8 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
 
     swrite!(
         body,
-        "<footer><hr><p>All dates are in UTC. Generated in {} (db {}, disk {}).</p></footer>",
+        "<footer><hr><p>All dates are in UTC. Page generated at {}. Generated in {} (db {}, disk {}).</p></footer>",
+        Utc::now(),
         Millis(data.generation_start.elapsed().into()),
         Millis(data.db_elapsed),
         Millis(data.fs_elapsed),
