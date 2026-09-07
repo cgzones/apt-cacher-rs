@@ -297,6 +297,30 @@ async fn stage(
     }
 }
 
+// Commands are received in chunks of up to this many: one `select!` round
+// (shutdown watch, interval tick, channel) and one permit release per chunk
+// instead of per command. The `biased` order already keeps the tick and the
+// shutdown arm ahead of the channel, so the chunk size only amortises that
+// overhead; it is not what keeps a busy producer from starving them.
+const RECEIVE_BATCH_LIMIT: usize = 32;
+
+/// Empty the reusable receive buffer without exceeding the row flush
+/// threshold. A command contributes at most one row.
+async fn stage_received(
+    db: &Database,
+    cache: &mut HashMap<Mirror, CachedMirror>,
+    buf: &mut BatchBuffers,
+    received: &mut Vec<DatabaseCommand>,
+    flush_max_count: usize,
+) {
+    for cmd in received.drain(..) {
+        stage(db, cache, buf, cmd).await;
+        if buf.len() >= flush_max_count {
+            flush_batches(db, buf, FlushReason::BySize).await;
+        }
+    }
+}
+
 /// Flush all three batch buffers in sequence. Errors are logged and the
 /// affected buffer is dropped — the next flush starts with empty buffers.
 async fn flush_batches(db: &Database, buf: &mut BatchBuffers, reason: FlushReason) {
@@ -421,13 +445,15 @@ pub(crate) async fn db_loop(
 
     let mut at_cap = false;
     let max_capacity = db_thread_rx.max_capacity();
+    let receive_limit = RECEIVE_BATCH_LIMIT.min(max_capacity);
+    let mut received = Vec::with_capacity(receive_limit);
 
     loop {
         tokio::select! {
             // Order matters under `biased`: shutdown must win, the periodic
-            // tick must get polled (otherwise a saturated `recv()` would
+            // tick must get polled (otherwise a saturated `recv_many()` would
             // starve it and `last_seen` flushes would never run), and only
-            // then do we accept the next command.
+            // then do we accept the next bounded chunk of commands.
             biased;
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
@@ -437,6 +463,12 @@ pub(crate) async fn db_loop(
                     // metric bump rather than queueing into a buffer we will
                     // never drain.
                     db_thread_rx.close();
+                    // Non-blocking drain: a `send` that was handed a slot
+                    // before `close()` fails on its next poll anyway, so
+                    // nothing is gained by parking on the channel, and a
+                    // parked drain could only end via the caller's timeout.
+                    // The whole backlog goes out in one shutdown flush;
+                    // `batch_insert_*` chunk to the bind-parameter limit.
                     while let Ok(cmd) = db_thread_rx.try_recv() {
                         stage(&database, &mut cache, &mut buf, cmd).await;
                     }
@@ -451,22 +483,24 @@ pub(crate) async fn db_loop(
                 // Sync point for `wait_for_next_db_flush`; keep the wording stable.
                 debug!("Periodic database batch flush cycle complete");
             }
-            maybe = db_thread_rx.recv() => {
-                let Some(cmd) = maybe else {
+            count = db_thread_rx.recv_many(&mut received, receive_limit) => {
+                if count == 0 {
                     debug!("Database task channel closed, draining...");
                     flush_batches(&database, &mut buf, FlushReason::OnShutdown).await;
                     flush_last_seen(&database, &mut cache).await;
                     break;
-                };
-
-                stage(&database, &mut cache, &mut buf, cmd).await;
-
-                if buf.len() >= flush_max_count {
-                    flush_batches(&database, &mut buf, FlushReason::BySize).await;
                 }
 
-                let curr_capacity = db_thread_rx.capacity();
-                if curr_capacity == 0 && !at_cap {
+                // Was the channel full when this chunk was taken? Sample it
+                // from the queue length rather than `capacity()`: the slots a
+                // chunk frees go to parked senders first, so `capacity()`
+                // only reads zero again once a whole chunk's worth of them
+                // was waiting. Sampled once per chunk; the producer-side
+                // full-wait/depth counters remain per send.
+                let was_full = count.saturating_add(db_thread_rx.len()) >= max_capacity;
+                stage_received(&database, &mut cache, &mut buf, &mut received, flush_max_count).await;
+
+                if was_full && !at_cap {
                     // `send_db_command` awaits on a full queue, so request
                     // paths now block on database writes.
                     warn!(
@@ -474,7 +508,7 @@ pub(crate) async fn db_loop(
                     );
                     metrics::DB_QUEUE_FULL_TRANSITIONS.increment();
                     at_cap = true;
-                } else if at_cap && curr_capacity == max_capacity {
+                } else if at_cap && db_thread_rx.capacity() == max_capacity {
                     info!("Database command channel empty (0/{max_capacity})");
                     at_cap = false;
                 }
@@ -483,4 +517,196 @@ pub(crate) async fn db_loop(
     }
 
     debug!("Database task stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use tokio::sync::{mpsc, oneshot, watch};
+    use tokio::task::JoinHandle;
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::{deb_mirror::OriginFields, test_support::structured_mirror};
+
+    const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+    const HOST: &str = "deb.example.org";
+    const PATH: &str = "debian";
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        database: Database,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let (dir, database) = Database::temp().await;
+            // Seed the one mirror so hydration serves every command from the
+            // mirror-id cache; see `Database::insert_mirror_host`.
+            database.insert_mirror_host(HOST, PATH).await;
+            Self {
+                _dir: dir,
+                database,
+            }
+        }
+
+        fn spawn(
+            &self,
+            rx: mpsc::Receiver<DatabaseCommand>,
+            shutdown_rx: watch::Receiver<bool>,
+            flush_max_count: usize,
+            flush_interval: StdDuration,
+        ) -> JoinHandle<()> {
+            tokio::spawn(db_loop(
+                self.database.clone(),
+                rx,
+                shutdown_rx,
+                flush_max_count,
+                flush_interval,
+            ))
+        }
+
+        /// `(rows, bytes)` over deliveries and downloads of the seeded mirror.
+        async fn transfers(&self) -> (i64, i64) {
+            let stats = self
+                .database
+                .get_mirrors_with_stats()
+                .await
+                .expect("mirror stats");
+            assert_eq!(stats.len(), 1, "only the seeded mirror exists");
+            let stats = stats.first().expect("asserted above");
+            (
+                stats.delivery_count + stats.download_count,
+                stats.total_delivery_size + stats.total_download_size,
+            )
+        }
+
+        async fn origins(&self) -> usize {
+            self.database.get_origins().await.expect("origins").len()
+        }
+    }
+
+    fn mirror() -> Mirror {
+        structured_mirror(HOST, PATH)
+    }
+
+    fn transfer(index: u64) -> DatabaseCommand {
+        DatabaseCommand::Transfer(DbCmdTransfer {
+            mirror: mirror(),
+            debname: format!("test_{index}_amd64.deb"),
+            size: index + 1,
+            elapsed: StdDuration::from_millis(1),
+            client_ip: Ipv4Addr::LOCALHOST.into(),
+            kind: if index.is_multiple_of(2) {
+                TransferKind::Delivery { partial: false }
+            } else {
+                TransferKind::Download
+            },
+        })
+    }
+
+    async fn ping(tx: &mpsc::Sender<DatabaseCommand>) {
+        let (reply, received) = oneshot::channel();
+        assert!(tx.send(DatabaseCommand::Ping(reply)).await.is_ok());
+        timeout(TEST_TIMEOUT, received)
+            .await
+            .expect("ping timeout")
+            .expect("reply")
+            .expect("database ping");
+    }
+
+    #[tokio::test]
+    async fn receive_chunks_preserve_size_flush_and_channel_close_tail() {
+        let fixture = Fixture::new().await;
+        let (tx, rx) = mpsc::channel(128);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = fixture.spawn(rx, shutdown_rx, 7, StdDuration::from_secs(3600));
+        // More than two receive chunks, with a row threshold that does not
+        // divide the receive limit. Ping must not force an early row flush.
+        for index in 0..75 {
+            assert!(tx.send(transfer(index)).await.is_ok());
+        }
+        ping(&tx).await;
+        assert_eq!(fixture.transfers().await, (70, 2485));
+        drop(tx);
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("drain timeout")
+            .expect("db task");
+        assert_eq!(fixture.transfers().await, (75, 2850));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_a_backlog_larger_than_one_chunk() {
+        let fixture = Fixture::new().await;
+        let (tx, rx) = mpsc::channel(128);
+        for index in 0..75 {
+            assert!(tx.send(transfer(index)).await.is_ok());
+        }
+        let (tail_reply, tail_received) = oneshot::channel();
+        assert!(tx.send(DatabaseCommand::Ping(tail_reply)).await.is_ok());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("shutdown");
+        let task = fixture.spawn(rx, shutdown_rx, 7, StdDuration::from_secs(3600));
+        timeout(TEST_TIMEOUT, tx.closed())
+            .await
+            .expect("receiver closes");
+        // The command queued behind the backlog is still answered.
+        timeout(TEST_TIMEOUT, tail_received)
+            .await
+            .expect("queued tail timeout")
+            .expect("queued tail reply")
+            .expect("queued tail ping");
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("drain timeout")
+            .expect("db task");
+        assert_eq!(fixture.transfers().await, (75, 2850));
+    }
+
+    #[tokio::test]
+    async fn busy_queue_still_flushes_by_time_and_observes_shutdown() {
+        let fixture = Fixture::new().await;
+        let (tx, rx) = mpsc::channel(128);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = fixture.spawn(rx, shutdown_rx, 4096, StdDuration::from_millis(10));
+        ping(&tx).await;
+        // Repeating one origin keeps the staged row count below the size
+        // threshold, even with a continuously replenished command channel.
+        let producer = tokio::spawn(async move {
+            let mirror = mirror();
+            let fields = OriginFields {
+                distribution: "stable".to_owned(),
+                component: "main".to_owned(),
+                architecture: "amd64".to_owned(),
+            };
+            loop {
+                let origin = Origin {
+                    mirror: mirror.clone(),
+                    fields: fields.clone(),
+                };
+                if tx.send(DatabaseCommand::Origin(origin)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        timeout(TEST_TIMEOUT, async {
+            while fixture.origins().await != 1 {
+                sleep(StdDuration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("periodic flush while producer is active");
+        assert!(!producer.is_finished());
+        shutdown_tx.send(true).expect("shutdown");
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("shutdown timeout")
+            .expect("db task");
+        timeout(TEST_TIMEOUT, producer)
+            .await
+            .expect("producer timeout")
+            .expect("producer");
+    }
 }

@@ -1431,17 +1431,40 @@ impl Database {
 }
 
 #[cfg(test)]
-mod retention_tests {
-    use super::*;
-
-    async fn temp_db() -> (tempfile::TempDir, Database) {
+impl Database {
+    /// A fresh schema in a temporary directory, for unit tests in this and
+    /// other modules (`database_task`). The directory lives as long as the
+    /// returned guard.
+    pub(crate) async fn temp() -> (tempfile::TempDir, Self) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Database::connect(&dir.path().join("t.db"), Duration::from_secs(5))
+        let db = Self::connect(&dir.path().join("t.db"), Duration::from_secs(5))
             .await
             .expect("connect");
         db.init_tables().await.expect("schema");
         (dir, db)
     }
+
+    /// Insert a structured mirror row on the default port directly, so the
+    /// `db_loop` mirror-id cache hydrates it and later commands never take
+    /// the `upsert_mirror_id` miss path. That path needs no global config,
+    /// but on a `flat`-colliding mirror path it records the host in
+    /// `flat_blocklist`, whose `OnceLock` only `main()` initialises.
+    pub(crate) async fn insert_mirror_host(&self, host: &str, path: &str) -> i64 {
+        let row = query(
+            "INSERT INTO mirrors_v2 (host, port, path, kind) VALUES (?, 0, ?, 0) RETURNING id",
+        )
+        .bind(host)
+        .bind(path)
+        .fetch_one(&self.conn)
+        .await
+        .expect("insert mirror");
+        sqlx::Row::get(&row, 0)
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
 
     async fn count_downloads(db: &Database) -> i64 {
         let row = query("SELECT COUNT(*) FROM downloads")
@@ -1451,22 +1474,8 @@ mod retention_tests {
         sqlx::Row::get(&row, 0)
     }
 
-    /// Insert a mirror row directly: `upsert_mirror_id` resolves aliases
-    /// through `global_config()`, which no unit test can initialise.
-    async fn insert_mirror_host(db: &Database, host: &str, path: &str) -> i64 {
-        let row = query(
-            "INSERT INTO mirrors_v2 (host, port, path, kind) VALUES (?, 0, ?, 0) RETURNING id",
-        )
-        .bind(host)
-        .bind(path)
-        .fetch_one(&db.conn)
-        .await
-        .expect("insert mirror");
-        sqlx::Row::get(&row, 0)
-    }
-
     async fn insert_mirror(db: &Database, path: &str) -> i64 {
-        insert_mirror_host(db, "deb.example.org", path).await
+        db.insert_mirror_host("deb.example.org", path).await
     }
 
     fn origin(mirror_id: i64, distribution: &str) -> OriginRow {
@@ -1513,7 +1522,7 @@ mod retention_tests {
 
     #[tokio::test]
     async fn delete_stale_origins_keeps_recent_rows() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
         let fresh_id = insert_mirror(&db, "fresh").await;
         let stale_id = insert_mirror(&db, "stale").await;
         db.batch_upsert_origins(&[origin(fresh_id, "sid"), origin(stale_id, "sid")])
@@ -1537,11 +1546,11 @@ mod retention_tests {
     #[tokio::test]
     async fn merge_alias_rows_folds_alias_rows_into_the_main_row() {
         use crate::config::Alias;
-        let (_dir, db) = temp_db().await;
-        let main_id = insert_mirror_host(&db, "deb.example.org", "debian").await;
-        let alias_id = insert_mirror_host(&db, "ftp.example.org", "debian").await;
+        let (_dir, db) = Database::temp().await;
+        let main_id = db.insert_mirror_host("deb.example.org", "debian").await;
+        let alias_id = db.insert_mirror_host("ftp.example.org", "debian").await;
         // An alias row with no main counterpart is renamed, not merged.
-        let lone_alias_id = insert_mirror_host(&db, "ftp.example.org", "ubuntu").await;
+        let lone_alias_id = db.insert_mirror_host("ftp.example.org", "ubuntu").await;
         db.batch_upsert_origins(&[
             origin(main_id, "sid"),
             origin(alias_id, "sid"),
@@ -1595,7 +1604,7 @@ mod retention_tests {
 
     #[tokio::test]
     async fn mirrors_without_origins_lists_only_orphans() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
         let with_id = insert_mirror(&db, "with").await;
         let without_id = insert_mirror(&db, "without").await;
         db.batch_upsert_origins(&[origin(with_id, "sid")])
@@ -1619,7 +1628,7 @@ mod retention_tests {
 
     #[tokio::test]
     async fn usage_row_scrub_is_startup_only() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
         let mirror_id = insert_mirror(&db, "scrub").await;
 
         // A row an older version could have written: client_ip is not 16 bytes.
@@ -1690,7 +1699,7 @@ mod retention_tests {
     /// by bytes.
     #[tokio::test]
     async fn top_packages_ranks_by_count_and_by_size_independently() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
         let mirror = insert_mirror(&db, "debian").await;
 
         for _ in 0..5 {
@@ -1715,7 +1724,7 @@ mod retention_tests {
     /// both rankings; only `.deb`/`.udeb`/`.ddeb` may appear.
     #[tokio::test]
     async fn top_packages_excludes_non_package_deliveries() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
         let mirror = insert_mirror(&db, "debian").await;
 
         for _ in 0..20 {
@@ -1734,7 +1743,7 @@ mod retention_tests {
     /// reshuffling rows between loads.
     #[tokio::test]
     async fn top_packages_breaks_ties_by_name() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
         let mirror = insert_mirror(&db, "debian").await;
 
         for name in ["c.deb", "a.deb", "b.deb"] {
@@ -1751,7 +1760,7 @@ mod retention_tests {
     /// its own cutoff.
     #[tokio::test]
     async fn bandwidth_windows_filter_each_cutoff_separately() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
         let mirror = insert_mirror(&db, "debian").await;
 
         // Timestamps: 100 is inside both windows, 50 only inside the week
@@ -1779,7 +1788,7 @@ mod retention_tests {
     /// An empty database must report zeroes, not an error or a missing row.
     #[tokio::test]
     async fn bandwidth_windows_report_zero_on_an_empty_database() {
-        let (_dir, db) = temp_db().await;
+        let (_dir, db) = Database::temp().await;
 
         let windows = db.get_bandwidth_windows(0, 0).await.expect("bandwidth");
 
