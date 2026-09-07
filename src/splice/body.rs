@@ -1280,8 +1280,8 @@ pub(super) async fn splice_proxy_body_tls(
 /// is exhausted.
 ///
 /// Every failure returns straight out, leaving the not-yet-written bytes in
-/// `read_buf` for the caller's [`salvage_read_buf`]; nothing in here has to
-/// remember them.
+/// `read_buf` for the caller's [`CacheWriter::salvage_read_buf`]; nothing in
+/// here has to remember them.
 async fn drive_reads(
     xfer: &mut BodyTransfer<'_>,
     upstream: &mut UpstreamConn,
