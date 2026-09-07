@@ -83,6 +83,15 @@ Default cache directory.
 .TP
 .I /var/lib/apt\-cacher\-rs/apt\-cacher\-rs.db
 Default database file.
+.SH ENVIRONMENT
+.TP
+.B SQLITE_TMPDIR
+Directory for SQLite temporary files.
+When unset or empty, the daemon exports the
+.I tmp
+subdirectory of the cache directory, so the database never depends on a
+writable
+.IR /tmp .
 .SH SIGNALS
 .TP
 .B SIGUSR1

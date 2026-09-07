@@ -109,6 +109,7 @@ use std::{
 };
 
 use build_info::{APP_VERSION, FEATURES_ONE_LINE, VERSION_AND_FEATURES};
+use cache_paths::CachePaths;
 use clap::Parser;
 use time::format_description::well_known::Rfc2822;
 use tokio::runtime::Builder;
@@ -503,6 +504,28 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         args.bind.take(),
     )?;
 
+    // SQLite spills statement journals and sort b-trees to a temp file in
+    // the first writable of `SQLITE_TMPDIR`, `TMPDIR`, `/var/tmp`,
+    // `/usr/tmp`, `/tmp` and `.`, located once at `sqlite3_initialize`. A
+    // container without `/tmp` or a hardened unit with read-only fallbacks
+    // leaves none, and every spilling flush then fails with
+    // `SQLITE_IOERR_GETTEMPPATH`. The cache scratch directory is the one the
+    // daemon is guaranteed to own, so export it unless the operator chose
+    // (an empty value counts as unset: SQLite would `stat("")` and fall
+    // through anyway). Unix SQLite unlinks a temp file right after opening
+    // it, so the scratch walker and the partial-file sweep never see one.
+    let inherited_sqlite_tmpdir = std::env::var_os("SQLITE_TMPDIR").filter(|v| !v.is_empty());
+    let exported_sqlite_tmpdir = inherited_sqlite_tmpdir
+        .is_none()
+        .then(|| CachePaths::new(&config.cache_directory).scratch_dir());
+    if let Some(path) = &exported_sqlite_tmpdir {
+        // SAFETY: edition 2024 makes `set_var` unsafe because a concurrent
+        // `getenv` on another thread races it. The process is still
+        // single-threaded here: config load, `LogTracer::init` and clap
+        // spawn nothing, and the log appender's worker starts below.
+        unsafe { std::env::set_var("SQLITE_TMPDIR", path) };
+    }
+
     let output_log_level = args.log_level.unwrap_or(config.log_level);
     let output_log_file = args.log_file.as_ref().unwrap_or(&config.log_file);
 
@@ -676,6 +699,15 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         "Using cache directory `{}`",
         global_config().cache_directory.display()
     );
+
+    if let Some(path) = &exported_sqlite_tmpdir {
+        debug!("Using `{}` for SQLite temporary files", path.display());
+    } else if let Some(inherited) = &inherited_sqlite_tmpdir {
+        debug!(
+            "Keeping the inherited SQLITE_TMPDIR `{}` for SQLite temporary files",
+            inherited.display()
+        );
+    }
 
     let _cache_lock = task_setup::task_setup().inspect_err(|err| {
         error!(
