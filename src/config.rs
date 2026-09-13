@@ -1620,20 +1620,6 @@ impl Config {
             }
         }
 
-        if self.https_tunnel_enabled && !self.allowed_mirrors.is_empty() {
-            for mirror in &self.https_tunnel_allowed_mirrors {
-                if !self
-                    .allowed_mirrors
-                    .iter()
-                    .any(|a| a.permits(mirror.as_str()))
-                {
-                    warnings.push(format!(
-                        "https_tunnel_allowed_mirrors entry `{mirror}` is not permitted by allowed_mirrors"
-                    ));
-                }
-            }
-        }
-
         if !self.allowed_mirrors.is_empty() {
             for alias in &self.aliases {
                 if !self
