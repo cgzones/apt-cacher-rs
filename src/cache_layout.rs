@@ -39,6 +39,11 @@
 //! disambiguate per-distribution copies that share the same on-disk
 //! `mirror_path`.
 //!
+//! `ByHash` keys on the digest alone, but still carries the
+//! `dists/<dist>/<comp>/<arch>/` scope it was fetched under: an
+//! `Acquire-By-Hash: yes` mirror never sends a literal `Packages*` URL, so
+//! that scope is its only source of an `Origin` row.
+//!
 //! # Paths
 //!
 //! The joins themselves - and the subdirectory names (`dists/`, `flat/`,
@@ -63,9 +68,9 @@ use crate::{
     config::ClientHost,
     database_task::{DatabaseCommand, send_db_command_nonblocking},
     deb_mirror::{
-        FlatKind, Mirror, MirrorKind, Origin, OriginFields, ResourceFile, is_deb_package,
-        is_flat_deb_filename, is_pseudo_arch, valid_architecture, valid_component,
-        valid_distribution, valid_filename, valid_mirrorname,
+        ByHashScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
+        ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, valid_architecture,
+        valid_component, valid_distribution, valid_filename, valid_mirrorname,
     },
     precise_instant::PreciseInstant,
 };
@@ -351,22 +356,46 @@ pub(crate) struct ConnectionDetails {
     /// The classified kind; [`Self::cached_flavor`] and [`Self::layout`] are
     /// derived from it rather than stored, so the three cannot disagree.
     pub(crate) resource_kind: ResourceKind,
-    /// The `Origin` this request would register, for real-arch `Packages`
-    /// requests only.  Recorded by [`Self::record_origin`] once the request
-    /// is *answered* (a cache hit, or a 2xx/304 upstream head) -- never at
-    /// dispatch time, so a probe the upstream 404s mints no row.  Boxed:
+    /// The `Origin` this request would register, for real-arch index
+    /// requests only -- a `Packages*` URL, or the architecture-scoped
+    /// `by-hash` URL an `Acquire-By-Hash: yes` mirror serves instead.
+    /// Recorded by [`Self::record_origin`] once the request is *answered*
+    /// (a cache hit, or a 2xx/304 upstream head) -- never at dispatch time,
+    /// so a probe the upstream 404s mints no row.  Boxed:
     /// only index requests carry one, and `ConnectionDetails` rides inside
     /// per-request enums whose size the other variants set.
     pub(crate) origin_fields: Option<Box<OriginFields>>,
 }
 
 impl ConnectionDetails {
-    /// Enqueue this request's `Origin` row, if it carries one.  Idempotent
-    /// per request (the DB batch dedups identical rows) and skipped for
-    /// cleanup's synthetic index fetches, which are bookkeeping, not client
-    /// demand.  Non-blocking: it runs on the request path, so a saturated
-    /// DB queue must not stall request handling.
+    /// Enqueue this request's `Origin` row, if it carries one, for a request
+    /// the upstream answered (fresh body or 304): the scope is proven, so the
+    /// row is created if absent.
+    ///
+    /// Idempotent per request (the DB batch dedups identical rows) and
+    /// skipped for cleanup's synthetic index fetches, which are bookkeeping,
+    /// not client demand.  Non-blocking: it runs on the request path, so a
+    /// saturated DB queue must not stall request handling.
     pub(crate) fn record_origin(&self) {
+        self.send_origin(OriginSighting::Upstream);
+    }
+
+    /// As [`Self::record_origin`], for a request served entirely from cache:
+    /// refreshes an existing row's `last_seen` — a warm mirror would
+    /// otherwise age its own origins out — but creates none.
+    ///
+    /// A `ByHash` hit serves a `Permanent` entry keyed by `{mirror, digest}`
+    /// without contacting the upstream, so it never checks that the requested
+    /// `dists/<dist>/<comp>/<arch>/` exists; minting from one would put an
+    /// unverified scope in `origins`, and cleanup then fetches a `Packages`
+    /// whose 404 bails the mirror's sweep.  A `Packages` hit does carry its
+    /// scope in the cache key, and loses nothing by taking this path too.
+    pub(crate) fn refresh_origin(&self) {
+        self.send_origin(OriginSighting::CacheHit);
+    }
+
+    /// Shared tail of [`Self::record_origin`] and [`Self::refresh_origin`].
+    fn send_origin(&self, sighting: OriginSighting) {
         let Some(fields) = &self.origin_fields else {
             return;
         };
@@ -377,7 +406,7 @@ impl ConnectionDetails {
             mirror: self.mirror.clone(),
             fields: (**fields).clone(),
         };
-        send_db_command_nonblocking(DatabaseCommand::Origin(origin));
+        send_db_command_nonblocking(DatabaseCommand::Origin(origin, sighting));
     }
 
     /// [`ResourceKind::cached_flavor`] of this request's resource.
@@ -635,6 +664,7 @@ pub(crate) fn classify_request<'a>(
         ResourceFile::ByHash {
             mirror_path,
             filename,
+            scope,
         } => {
             let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
             let filename = decode_validate(filename, ValidateKind::Filename)?;
@@ -643,11 +673,42 @@ pub(crate) fn classify_request<'a>(
                 "Decoded mirror path: `{mirror_path}`; Decoded filename: `{filename}` (client {client})"
             );
 
+            // On an `Acquire-By-Hash: yes` mirror this arm - not the
+            // `Packages` one - is where the `Origin` row is earned.  The
+            // scope is no part of the cache identity; it is decoded and
+            // validated here only because it reaches the database and
+            // cleanup's index-fetch URLs.
+            let origin_fields = match scope {
+                Some(ByHashScope {
+                    distribution,
+                    component,
+                    architecture,
+                }) => {
+                    let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
+                    let component = decode_validate(component, ValidateKind::Component)?;
+                    let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
+
+                    // Only `binary-<arch>` is a real architecture; the
+                    // metadata trees sharing its depth (`dep11`, `i18n`,
+                    // `source`, Ubuntu's `cnf`) map to no origin.
+                    if is_binary_arch(&architecture) {
+                        Some(OriginFields {
+                            distribution: distribution.into_owned(),
+                            component: component.into_owned(),
+                            architecture: architecture.into_owned(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: filename.into_owned(),
                 resource_kind: ResourceKind::ByHash,
-                origin_fields: None,
+                origin_fields,
             })
         }
         ResourceFile::Icon {
@@ -735,11 +796,9 @@ pub(crate) fn classify_request<'a>(
 
             let debname = dists_debname(&distribution, &component, &architecture, &filename);
 
-            // dep11 / i18n / source aren't real architectures and don't map
-            // to per-binary origins.
-            let origin_fields = if is_pseudo_arch(&architecture) {
-                None
-            } else {
+            // Only `binary-<arch>` is a real architecture; the metadata
+            // trees sharing its depth map to no origin.
+            let origin_fields = if is_binary_arch(&architecture) {
                 // The debname is built, so the decoded fields can be moved
                 // into the record instead of re-formatted out of the `Cow`s.
                 Some(OriginFields {
@@ -747,6 +806,8 @@ pub(crate) fn classify_request<'a>(
                     component: component.into_owned(),
                     architecture: architecture.into_owned(),
                 })
+            } else {
+                None
             };
 
             Ok(RequestClass {
@@ -848,7 +909,7 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::local_client;
+    use crate::{deb_mirror::parse_request_path, test_support::local_client};
 
     #[test]
     fn classify_pool() {
@@ -934,6 +995,7 @@ mod tests {
         let res = ResourceFile::ByHash {
             mirror_path: "debian",
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            scope: None,
         };
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(
@@ -942,6 +1004,70 @@ mod tests {
         );
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
         assert_eq!(class.resource_kind.layout(), CacheLayout::DistsByHash);
+    }
+
+    /// Regression: an `Acquire-By-Hash: yes` mirror sends no literal
+    /// `Packages*` URL, so before this arm carried an origin it could mint
+    /// no `Origin` row at all - and cleanup, which reconciles cached debs
+    /// against the indices of *active* origins, lost its reference set.
+    #[test]
+    fn classify_byhash_mints_the_origin_a_packages_url_would() {
+        const PATH: &str = "debian/dists/sid/main/binary-amd64/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+
+        let byhash = parse_request_path(PATH).expect("by-hash path parses");
+        let fields = classify_request(&byhash, &local_client())
+            .unwrap()
+            .origin_fields
+            .expect("an architecture-scoped by-hash earns an origin");
+
+        // Byte-for-byte what the `Packages.xz` sibling records: the two
+        // URL shapes for one index must not produce two rows.
+        let packages = parse_request_path("debian/dists/sid/main/binary-amd64/Packages.xz")
+            .expect("Packages path parses");
+        assert_eq!(
+            Some(fields),
+            classify_request(&packages, &local_client())
+                .unwrap()
+                .origin_fields
+        );
+    }
+
+    /// The shapes that carry no per-binary origin: a pseudo-architecture, a
+    /// component-scoped `by-hash` (the `Release` sibling) and a deeper path
+    /// such as `Packages.diff/by-hash`.
+    #[test]
+    fn classify_byhash_without_a_real_architecture_records_nothing() {
+        for path in [
+            "debian/dists/sid/main/dep11/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "debian/dists/sid/main/i18n/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "debian/dists/sid/main/source/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "debian/dists/trixie/main/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            "debian/dists/sid/main/binary-amd64/Packages.diff/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+        ] {
+            let res = parse_request_path(path).expect("by-hash path parses");
+            let class = classify_request(&res, &local_client()).unwrap();
+            assert_eq!(class.resource_kind, ResourceKind::ByHash, "{path}");
+            assert!(class.origin_fields.is_none(), "{path} must mint no origin");
+        }
+    }
+
+    /// Regression: the by-hash scope's third segment is at architecture depth
+    /// but need not be an architecture. Ubuntu's `cnf` (and the `uefi`/
+    /// `signed` trees) sit there and escaped the old pseudo-arch denylist,
+    /// minting rows whose `Packages` 404 bails the mirror's sweep.
+    #[test]
+    fn classify_byhash_under_a_non_binary_directory_records_nothing() {
+        const DIGEST: &str = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        for dir in ["cnf", "uefi", "signed", "binary-"] {
+            let path = format!("ubuntu/dists/noble/main/{dir}/by-hash/SHA256/{DIGEST}");
+            let res = parse_request_path(&path).expect("by-hash path parses");
+            let class = classify_request(&res, &local_client()).unwrap();
+            assert_eq!(class.resource_kind, ResourceKind::ByHash, "{path}");
+            assert!(
+                class.origin_fields.is_none(),
+                "`{dir}` is not an architecture and must mint no origin"
+            );
+        }
     }
 
     #[test]
@@ -1154,6 +1280,7 @@ mod tests {
         let byhash = ResourceFile::ByHash {
             mirror_path: "debian",
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+            scope: None,
         };
         assert_eq!(
             classify_request(&byhash, &local_client())

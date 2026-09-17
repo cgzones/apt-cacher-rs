@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, trace};
 
 use crate::database_task::{DatabaseCommand, send_db_command};
-use crate::deb_mirror::{Mirror, Origin};
+use crate::deb_mirror::{Mirror, Origin, OriginSighting};
 use crate::error::ErrorReport;
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, WritePhase, write_all_to_stream, write_invalid_response,
@@ -227,7 +227,7 @@ pub(crate) async fn splice_simple_proxy(
         && let Some(origin) =
             Origin::from_path(original_uri_path, mirror.host().clone(), mirror.port())
     {
-        let cmd = DatabaseCommand::Origin(origin);
+        let cmd = DatabaseCommand::Origin(origin, OriginSighting::Upstream);
         send_db_command(cmd).await;
     }
 

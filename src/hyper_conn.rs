@@ -58,7 +58,7 @@ use crate::{
     },
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
-    deb_mirror::Origin,
+    deb_mirror::{Origin, OriginSighting},
     delivery::{DeliveryEnd, Mechanism, Role, ServeOutcome, finish_cached_serve},
     error::{
         ErrorReport, MirrorDownloadRate, ProxyCacheError, UpstreamFetchError,
@@ -2317,7 +2317,7 @@ pub(crate) async fn process_cache_request(
             if conn_details.cached_flavor() == CachedFlavor::Permanent {
                 metrics::CACHE_HITS.increment();
             }
-            conn_details.record_origin();
+            conn_details.refresh_origin();
 
             trace!(
                 "File {} found, serving {} version...",
@@ -2728,7 +2728,7 @@ async fn pre_process_client_request(
         debug!("Extracted origin: {origin:?}");
 
         // TODO: cache some of them?
-        let cmd = DatabaseCommand::Origin(origin);
+        let cmd = DatabaseCommand::Origin(origin, OriginSighting::Upstream);
         send_db_command(cmd).await;
     }
 
