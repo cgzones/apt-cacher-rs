@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM origins WHERE architecture NOT GLOB 'binary-?*';",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "0502477c3fc333d35b59bc47f1948f1a4b0d0eca2f295d9f4b90e36f782b9c5b"
+}

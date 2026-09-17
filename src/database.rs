@@ -345,14 +345,29 @@ pub(crate) struct OrphanMirror {
 
 /// Pre-converted SQL-ready row for an `origins` upsert.
 ///
-/// `PartialEq` supports batch-level dedup in the DB task: every Packages
-/// request for an origin enqueues the same upsert.
+/// [`Self::same_scope`] supports batch-level dedup in the DB task: every
+/// Packages request for an origin enqueues the same row.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OriginRow {
     pub(crate) mirror_id: i64,
     pub(crate) distribution: String,
     pub(crate) component: String,
     pub(crate) architecture: String,
+    /// Whether this sighting may create the row, or only refresh an existing
+    /// one's `last_seen`; `false` for a cache hit. See
+    /// [`crate::deb_mirror::OriginSighting`].
+    pub(crate) create: bool,
+}
+
+impl OriginRow {
+    /// Whether two rows name the same origin, ignoring [`Self::create`].
+    #[must_use]
+    pub(crate) fn same_scope(&self, other: &Self) -> bool {
+        self.mirror_id == other.mirror_id
+            && self.distribution == other.distribution
+            && self.component == other.component
+            && self.architecture == other.architecture
+    }
 }
 
 /// Upsert a mirror row and return `(id, was_inserted)` in a single round
@@ -1107,6 +1122,10 @@ impl Database {
     /// UPSERT a batch of origin rows in a single transaction. The per-row
     /// `ON CONFLICT DO UPDATE last_seen` clause prevents a true multi-row
     /// VALUES form, but transaction grouping still amortises the commit.
+    ///
+    /// A `create == false` row is refreshed only: it bumps `last_seen` if the
+    /// origin exists and is a no-op otherwise, so an unverified scope cannot
+    /// enter the table.
     pub(crate) async fn batch_upsert_origins(&self, rows: &[OriginRow]) -> Result<(), Error> {
         if rows.is_empty() {
             return Ok(());
@@ -1114,8 +1133,9 @@ impl Database {
 
         let mut tx = self.conn.begin().await?;
         for row in rows {
-            query!(
-                r"
+            if row.create {
+                query!(
+                    r"
                     INSERT INTO origins
                     (mirror_id, distribution, component, architecture)
                     VALUES
@@ -1123,13 +1143,31 @@ impl Database {
                     ON CONFLICT (mirror_id, distribution, component, architecture)
                     DO UPDATE SET last_seen = unixepoch(CURRENT_TIMESTAMP);
                 ",
-                row.mirror_id,
-                row.distribution,
-                row.component,
-                row.architecture,
-            )
-            .execute(&mut *tx)
-            .await?;
+                    row.mirror_id,
+                    row.distribution,
+                    row.component,
+                    row.architecture,
+                )
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                query!(
+                    r"
+                    UPDATE origins
+                    SET last_seen = unixepoch(CURRENT_TIMESTAMP)
+                    WHERE mirror_id = ?
+                      AND distribution = ?
+                      AND component = ?
+                      AND architecture = ?;
+                ",
+                    row.mirror_id,
+                    row.distribution,
+                    row.component,
+                    row.architecture,
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await
     }
@@ -1191,6 +1229,23 @@ impl Database {
         }
 
         let mut tx = self.conn.begin().await?;
+
+        // Origins an earlier version minted from a metadata directory that
+        // merely shares `binary-<arch>`'s depth — Ubuntu's `cnf`, the
+        // `uefi`/`signed` trees. Cleanup fetches a `Packages` for every active
+        // origin, and that 404 bails the mirror's whole sweep; nothing
+        // refreshes such a row any more, so left alone it would keep doing so
+        // until it ages out. GLOB, not LIKE: it is case-sensitive and `?*`
+        // requires a non-empty architecture, matching `is_binary_arch`.
+        let stale_origins = query!(r"DELETE FROM origins WHERE architecture NOT GLOB 'binary-?*';")
+            .execute(&mut *tx)
+            .await?;
+        if stale_origins.rows_affected() > 0 {
+            warn!(
+                "Removed {} origin rows whose architecture names no binary architecture",
+                stale_origins.rows_affected()
+            );
+        }
 
         let mirrors = query_as!(
             MirrorRow,
@@ -1489,6 +1544,7 @@ mod retention_tests {
             distribution: distribution.to_owned(),
             component: "main".to_owned(),
             architecture: "amd64".to_owned(),
+            create: true,
         }
     }
 
@@ -1629,6 +1685,37 @@ mod retention_tests {
                 .is_empty()
         );
         assert_eq!(db.get_mirrors().await.expect("mirrors").len(), 1);
+    }
+
+    /// Regression: an earlier version minted origins from any directory that
+    /// was not a pseudo-arch, so deployments carry rows for metadata trees at
+    /// `binary-<arch>` depth (Ubuntu's `cnf`). Cleanup fetches a `Packages`
+    /// for each active origin; that 404 bails the mirror's whole sweep, and
+    /// nothing refreshes such a row any more, so it would sit there for the
+    /// eight weeks of the retention window. The repair pass drops them.
+    #[tokio::test]
+    async fn origins_outside_a_binary_architecture_are_purged() {
+        let (_dir, db) = Database::temp().await;
+        let mirror_id = insert_mirror(&db, "ubuntu").await;
+        let row = |architecture: &str| OriginRow {
+            mirror_id,
+            distribution: "noble".to_owned(),
+            component: "main".to_owned(),
+            architecture: architecture.to_owned(),
+            create: true,
+        };
+        db.batch_upsert_origins(&[row("binary-amd64"), row("cnf"), row("binary-")])
+            .await
+            .expect("seed origins");
+
+        db.cleanup_invalid_rows().await.expect("repair pass");
+
+        let left = db.get_origins().await.expect("origins");
+        assert_eq!(
+            left.iter().map(|o| &o.architecture).collect::<Vec<_>>(),
+            ["binary-amd64"],
+            "only a real binary architecture survives"
+        );
     }
 
     #[tokio::test]

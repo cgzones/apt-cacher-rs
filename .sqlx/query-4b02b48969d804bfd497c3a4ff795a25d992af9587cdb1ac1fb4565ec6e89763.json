@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                    UPDATE origins\n                    SET last_seen = unixepoch(CURRENT_TIMESTAMP)\n                    WHERE mirror_id = ?\n                      AND distribution = ?\n                      AND component = ?\n                      AND architecture = ?;\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "4b02b48969d804bfd497c3a4ff795a25d992af9587cdb1ac1fb4565ec6e89763"
+}

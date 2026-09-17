@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     database::{Database, DeliveryRow, DownloadRow, OriginRow},
-    deb_mirror::{Mirror, Origin},
+    deb_mirror::{Mirror, Origin, OriginSighting},
     metrics,
     sqlite_error::SqlxErrorReport,
 };
@@ -45,7 +45,7 @@ pub(crate) struct DbCmdTransfer {
 
 pub(crate) enum DatabaseCommand {
     Transfer(DbCmdTransfer),
-    Origin(Origin),
+    Origin(Origin, OriginSighting),
     /// Round-trips the queue so the healthcheck learns the DB task is alive
     /// and draining; the reply carries the probe query's own result.
     Ping(tokio::sync::oneshot::Sender<Result<(), sqlx::Error>>),
@@ -251,7 +251,7 @@ async fn stage(
                 }),
             }
         }
-        DatabaseCommand::Origin(origin) => {
+        DatabaseCommand::Origin(origin, sighting) => {
             let mirror_id = match resolve_mirror_id(db, cache, &origin.mirror).await {
                 Ok(id) => id,
                 Err(err) => {
@@ -269,13 +269,22 @@ async fn stage(
                 distribution: origin.fields.distribution,
                 component: origin.fields.component,
                 architecture: origin.fields.architecture,
+                create: sighting == OriginSighting::Upstream,
             };
             // Dedup within the batch: every Packages request for an origin
             // enqueues the same upsert, so a fleet refreshing one suite
             // produces runs of identical rows. Batches are <= flush size
             // (256), and origin rows are a small fraction, so a linear scan
             // is fine.
-            if !buf.origins.contains(&row) {
+            if let Some(staged) = buf
+                .origins
+                .iter_mut()
+                .find(|staged| staged.same_scope(&row))
+            {
+                // A verified sighting outranks an unverified one for the same
+                // scope.
+                staged.create |= row.create;
+            } else {
                 buf.origins.push(row);
             }
         }
@@ -606,6 +615,113 @@ mod tests {
         })
     }
 
+    fn origin_cmd(architecture: &str, sighting: OriginSighting) -> DatabaseCommand {
+        DatabaseCommand::Origin(
+            Origin {
+                mirror: mirror(),
+                fields: OriginFields {
+                    distribution: "stable".to_owned(),
+                    component: "main".to_owned(),
+                    architecture: architecture.to_owned(),
+                },
+            },
+            sighting,
+        )
+    }
+
+    /// Regression: a by-hash cache hit never contacts the upstream and its
+    /// scope is no part of the cache key, so the scope is unverified and must
+    /// mint no row — cleanup would fetch a `Packages` that 404s and bail the
+    /// mirror's sweep.
+    ///
+    /// Ordering carries the assertion: both commands land in one batch, so
+    /// once the verified row is visible the unverified one has had its turn.
+    #[tokio::test]
+    async fn a_cache_hit_sighting_never_creates_an_origin() {
+        let fixture = Fixture::new().await;
+        let (tx, rx) = mpsc::channel(128);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = fixture.spawn(rx, shutdown_rx, 4096, StdDuration::from_millis(10));
+
+        tx.send(origin_cmd("binary-i386", OriginSighting::CacheHit))
+            .await
+            .expect("send unverified");
+        tx.send(origin_cmd("binary-amd64", OriginSighting::Upstream))
+            .await
+            .expect("send verified");
+
+        timeout(TEST_TIMEOUT, async {
+            while fixture.origins().await != 1 {
+                sleep(StdDuration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the upstream-verified origin is flushed");
+
+        let rows = fixture.database.get_origins().await.expect("origins");
+        assert_eq!(
+            rows.first().expect("asserted above").architecture,
+            "binary-amd64",
+            "only the upstream-verified scope may exist"
+        );
+
+        shutdown_tx.send(true).expect("shutdown");
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("shutdown timeout")
+            .expect("db task");
+    }
+
+    /// The other half: a cache hit is still evidence the client uses the
+    /// scope, so it refreshes `last_seen`. Without that a fully warm mirror
+    /// would age its own origins out.
+    #[tokio::test]
+    async fn a_cache_hit_sighting_refreshes_an_existing_origin() {
+        let fixture = Fixture::new().await;
+        let (tx, rx) = mpsc::channel(128);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = fixture.spawn(rx, shutdown_rx, 4096, StdDuration::from_millis(10));
+
+        tx.send(origin_cmd("binary-amd64", OriginSighting::Upstream))
+            .await
+            .expect("send verified");
+        timeout(TEST_TIMEOUT, async {
+            while fixture.origins().await != 1 {
+                sleep(StdDuration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the upstream-verified origin is flushed");
+
+        sqlx::query("UPDATE origins SET last_seen = 1000")
+            .execute(fixture.database.pool())
+            .await
+            .expect("backdate");
+
+        tx.send(origin_cmd("binary-amd64", OriginSighting::CacheHit))
+            .await
+            .expect("send cache hit");
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                let rows = fixture.database.get_origins().await.expect("origins");
+                if rows.first().expect("row exists").last_seen != 1000 {
+                    break;
+                }
+                sleep(StdDuration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the cache hit refreshes last_seen");
+
+        assert_eq!(fixture.origins().await, 1, "no second row was minted");
+
+        shutdown_tx.send(true).expect("shutdown");
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("shutdown timeout")
+            .expect("db task");
+    }
+
     async fn ping(tx: &mpsc::Sender<DatabaseCommand>) {
         let (reply, received) = oneshot::channel();
         assert!(tx.send(DatabaseCommand::Ping(reply)).await.is_ok());
@@ -686,7 +802,11 @@ mod tests {
                     mirror: mirror.clone(),
                     fields: fields.clone(),
                 };
-                if tx.send(DatabaseCommand::Origin(origin)).await.is_err() {
+                if tx
+                    .send(DatabaseCommand::Origin(origin, OriginSighting::Upstream))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }

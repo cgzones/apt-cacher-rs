@@ -191,20 +191,43 @@ pub(crate) struct OriginFields {
     pub(crate) architecture: String,
 }
 
-/// Returns `true` for Debian-archive "pseudo-architectures" — values that
-/// appear in the `architecture` position of a `dists/` URL but do not
-/// describe a real binary architecture and therefore are never recorded as
-/// per-binary origins.
+/// How much a request proved about the `dists/<d>/<c>/<a>/` scope it carried.
 ///
-/// The current pseudo-arches are `dep11` (`AppStream` component metadata),
-/// `i18n` (Translation indices), and `source` (source-package indices).
+/// A `by-hash` cache entry is keyed by `{mirror, digest}` with the scope
+/// deliberately outside the cache identity, so a hit confirms nothing about
+/// the scope the client spelled. Only a request the upstream answered may
+/// create a row; a hit refreshes one that already exists.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OriginSighting {
+    /// The upstream answered (fresh body or 304): creates the row, or
+    /// refreshes it.
+    Upstream,
+    /// Served from cache, so the scope is unverified: refreshes an existing
+    /// row's `last_seen`, never creates one.
+    CacheHit,
+}
+
+/// Returns `true` for the `dists/<dist>/<comp>/<slot>/` segment that names a
+/// real binary architecture (`binary-<arch>`) — the only slot with a
+/// `Packages` index, and therefore the only one recorded as a per-binary
+/// origin.
 ///
-/// Single source of truth for the list, and applied in the two places that
-/// can mint the triple: the `origin_fields` arm of
-/// `cache_layout::classify_request` and [`Origin::from_path`].
+/// An allowlist rather than a denylist of metadata directories, because the
+/// slot is just the third segment of a `dists/` URL and archives put more
+/// than architectures there: `dep11`, `i18n`, `source`, Ubuntu's `cnf`, the
+/// `uefi`/`signed` trees. A wrongly minted row costs more than a missed one —
+/// cleanup fetches `<slot>/Packages` for every active origin, and that 404
+/// bails the mirror's whole sweep. (`debian-installer/binary-<arch>` sits a
+/// segment deeper than the three-segment scope both callers accept.)
+///
+/// Single source of truth, applied in the three places that can mint the
+/// triple — the `Packages` and `ByHash` arms of
+/// `cache_layout::classify_request` and [`Origin::from_path`] — and in the
+/// per-component `Release` parser, which accepts the same form (or `source`).
 #[must_use]
-pub(crate) fn is_pseudo_arch(arch: &str) -> bool {
-    matches!(arch, "dep11" | "i18n" | "source")
+pub(crate) fn is_binary_arch(arch: &str) -> bool {
+    arch.strip_prefix("binary-")
+        .is_some_and(|arch| !arch.is_empty())
 }
 
 impl Origin {
@@ -276,12 +299,12 @@ impl Origin {
             return None;
         }
 
-        // A pseudo-architecture mints no row. Only the `by-hash` shape can
-        // reach here carrying one (`dists/<d>/<c>/dep11/by-hash/SHA256/<hex>`)
-        // — `dep11`/`i18n`/`source` have no `Packages*` file of their own.
-        // The rejection lives here rather than at the three recording
-        // backends, each of which used to repeat it after the call.
-        if is_pseudo_arch(architecture) {
+        // Only a `binary-<arch>` slot mints a row.  In practice just the
+        // `by-hash` shape reaches here with anything else — `dep11`, `cnf`
+        // and friends have no `Packages*` file of their own — but the check
+        // covers both, and lives here rather than being repeated at the three
+        // recording backends.
+        if !is_binary_arch(architecture) {
             return None;
         }
 
@@ -398,6 +421,13 @@ pub(crate) enum ResourceFile<'a> {
     ByHash {
         mirror_path: &'a str,
         filename: &'a str,
+        /// The `dists/<dist>/<comp>/<arch>/` scope the object hangs under,
+        /// when the path has exactly that shape; `None` at any other depth
+        /// (a component-scoped `Release` sibling, or `Packages.diff/`).  No
+        /// part of the cache identity - it exists so
+        /// [`crate::cache_layout::classify_request`] can mint the `Origin`
+        /// row a literal `Packages*` request would.
+        scope: Option<ByHashScope<'a>>,
     },
     /// An icons file
     Icon {
@@ -506,6 +536,16 @@ fn needs_normalization(path: &str) -> bool {
     path.split('/').any(|seg| seg == ".")
 }
 
+/// The `<dist>/<component>/<architecture>` scope a `by-hash` object sits
+/// under.  The architecture slot is the raw URL segment (`binary-amd64`, or
+/// a pseudo-arch such as `dep11`), as in the `Packages` variant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ByHashScope<'a> {
+    pub(crate) distribution: &'a str,
+    pub(crate) component: &'a str,
+    pub(crate) architecture: &'a str,
+}
+
 /// The `<dist>/<component>` pair a scoped `dists/` index sits under.  Named
 /// fields rather than a tuple: both segments are `&str`, so a swapped pair
 /// would parse every URL into a silently mislabelled cache entry.
@@ -536,6 +576,23 @@ fn scoped_component_dist<'a>(
     Some(ScopedIndexPath {
         distribution,
         component,
+    })
+}
+
+/// The `<dist>/<component>/<architecture>` scope of a `by-hash` path, if it
+/// has exactly that shape.  `parts` is the `rsplit('/')` iterator just past
+/// the `by-hash` segment, so the segments arrive innermost-first.
+fn byhash_scope<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<ByHashScope<'a>> {
+    let architecture = parts.next()?;
+    let component = parts.next()?;
+    let distribution = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ByHashScope {
+        distribution,
+        component,
+        architecture,
     })
 }
 
@@ -606,10 +663,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                         return None;
                     }
                     let architecture = next;
-                    let valid_binary = architecture
-                        .strip_prefix("binary-")
-                        .is_some_and(|arch| !arch.is_empty());
-                    if !valid_binary && architecture != "source" {
+                    if !is_binary_arch(architecture) && architecture != "source" {
                         return None;
                     }
                     let distribution = parts.next()?;
@@ -685,9 +739,17 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 return None;
             }
 
+            // Exactly three remaining segments are the
+            // `<dist>/<comp>/<arch>` scope an `Origin` is made of - the
+            // acceptance `Origin::from_path` applies here too.  Any other
+            // depth yields no scope rather than rejecting the request: the
+            // object is still cacheable by its digest.
+            let scope = byhash_scope(&mut parts);
+
             return Some(ResourceFile::ByHash {
                 mirror_path,
                 filename,
+                scope,
             });
         }
 
@@ -1289,6 +1351,42 @@ mod tests {
 
     use super::*;
 
+    /// Regression (the `Acquire-By-Hash` origin gap): the scope has to
+    /// survive the parse for `classify_request` to mint an `Origin` from it.
+    /// Acceptance matches [`Origin::from_path`]: exactly
+    /// `<dist>/<comp>/<arch>` before `by-hash`, nothing else.
+    #[test]
+    fn byhash_carries_the_origin_scope_at_exactly_three_segments() {
+        const SHA256: &str = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        const PATH: &str = "debian/dists/sid/main/binary-amd64/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+
+        let scoped = parse_request_path(PATH).expect("architecture-scoped by-hash parses");
+        assert_eq!(
+            scoped,
+            ResourceFile::ByHash {
+                mirror_path: "debian",
+                filename: SHA256,
+                scope: Some(ByHashScope {
+                    distribution: "sid",
+                    component: "main",
+                    architecture: "binary-amd64"
+                })
+            }
+        );
+
+        // Parser and `Origin::from_path` must not drift apart on the same
+        // URL.
+        let origin = Origin::from_path(
+            PATH,
+            ClientHost::new("deb.debian.org".to_string()).unwrap(),
+            None,
+        )
+        .expect("the same URL mints an Origin");
+        assert_eq!(origin.fields.distribution, "sid");
+        assert_eq!(origin.fields.component, "main");
+        assert_eq!(origin.fields.architecture, "binary-amd64");
+    }
+
     #[test]
     fn test_parse_1() {
         let result = Origin::from_path(
@@ -1588,7 +1686,9 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
-                filename: "491ddac17f4b86d771a457e6b084c499dfeb9ee29004b92d5d05fe79f1f0dede"
+                filename: "491ddac17f4b86d771a457e6b084c499dfeb9ee29004b92d5d05fe79f1f0dede",
+                // Four segments before `by-hash`: not the origin shape.
+                scope: None
             })
         );
 
@@ -1598,7 +1698,14 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
-                filename: "cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482"
+                filename: "cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482",
+                // A pseudo-arch still yields a scope; the "no origin"
+                // rule is `is_binary_arch`, applied by `classify_request`.
+                scope: Some(ByHashScope {
+                    distribution: "sid",
+                    component: "main",
+                    architecture: "dep11"
+                })
             })
         );
 
@@ -1608,7 +1715,10 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
-                filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+                filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+                // Component-scoped (the `Release` sibling): no architecture,
+                // so no origin.
+                scope: None
             })
         );
 
@@ -1894,7 +2004,8 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
-                filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
+                filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+                scope: None
             })
         );
 
@@ -2313,6 +2424,26 @@ mod tests {
             Origin::from_path(&real, host(), None).is_some(),
             "a real architecture still parses"
         );
+    }
+
+    /// Regression: depth alone does not make a segment an architecture.
+    /// Ubuntu's `dists/<dist>/<comp>/cnf/by-hash/...` sits at `binary-<arch>`
+    /// depth and escaped the old pseudo-arch denylist; the row it minted made
+    /// cleanup fetch a `cnf/Packages` whose 404 bails the mirror's sweep.
+    #[test]
+    fn non_binary_directories_mint_no_origin() {
+        const DIGEST: &str = "84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83";
+        let host = || ClientHost::new("archive.ubuntu.com".to_string()).unwrap();
+        // `binary-` with an empty suffix names no architecture either; the
+        // per-component `Release` parser has always rejected it.
+        for dir in ["cnf", "uefi", "signed", "binary-"] {
+            let path = format!("/ubuntu/dists/noble/main/{dir}/by-hash/SHA256/{DIGEST}");
+            assert_eq!(
+                Origin::from_path(&path, host(), None),
+                None,
+                "`{dir}` is not an architecture and has no Packages index"
+            );
+        }
     }
 
     #[test]
