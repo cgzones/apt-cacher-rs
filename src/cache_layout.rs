@@ -359,9 +359,9 @@ pub(crate) struct ConnectionDetails {
     /// The `Origin` this request would register, for real-arch index
     /// requests only -- a `Packages*` URL, or the architecture-scoped
     /// `by-hash` URL an `Acquire-By-Hash: yes` mirror serves instead.
-    /// Recorded by [`Self::record_origin`] once the request is *answered*
-    /// (a cache hit, or a 2xx/304 upstream head) -- never at dispatch time,
-    /// so a probe the upstream 404s mints no row.  Boxed:
+    /// On an answered request, [`Self::record_origin`] handles a 2xx/304
+    /// upstream response and [`Self::refresh_origin`] handles a cache hit; a
+    /// probe the upstream 404s mints no row.  Boxed:
     /// only index requests carry one, and `ConnectionDetails` rides inside
     /// per-request enums whose size the other variants set.
     pub(crate) origin_fields: Option<Box<OriginFields>>,
