@@ -57,7 +57,7 @@ pub(crate) const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 /// zero-fills the dictionary from the block header *before* the output
 /// caps above see a single byte, so a hostile ~200-byte `Packages.xz` could
 /// otherwise commit up to 4 GiB per concurrent ingest.  Enforced through
-/// `lzma_rust2::XzStream::new_mem_limit` in `xz_stream`.
+/// `lzma_rust2::XzReader::new_mem_limit` in `xz_stream`.
 pub(crate) const MAX_XZ_DICT_SIZE: NonZero<u64> = nonzero!(64 * 1024 * 1024);
 
 /// Maximum length (bytes) of a single line read from upstream metadata.
