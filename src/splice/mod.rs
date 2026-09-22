@@ -597,21 +597,23 @@ async fn prepare_cache_target(
             })?
         }
     };
-    // The creation date the synthesized `Last-Modified` falls back to; read
-    // now, before any byte lands, so a resumed partial keeps its first
-    // attempt's and the head matches what later cache hits report.
-    let file_date = regular_file_metadata(&tempfile, &temppath)
-        .map(|mdata| cache_file_http_date(&mdata))
-        .map_err(|CacheAccessFailure(logged)| SpliceProxyError::Cache(logged))?;
-
     let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
         upstream_resp.etag.clone(),
         upstream_resp.last_modified.clone(),
     );
     let (last_modified, cache_time): (Arc<str>, HttpDate) =
-        match download_meta.last_modified.as_ref() {
-            Some((raw, time)) => (Arc::clone(raw), *time),
-            None => (file_date.format().into(), file_date),
+        if let Some((raw, time)) = download_meta.last_modified.as_ref() {
+            (Arc::clone(raw), *time)
+        } else {
+            // The creation date the synthesized `Last-Modified` falls back
+            // to; read now, before any byte lands, so a resumed partial
+            // keeps its first attempt's and the head matches what later
+            // cache hits report. Only this arm pays the stat (and can fail
+            // on it): a validated upstream value needs nothing from the file.
+            let file_date = regular_file_metadata(&tempfile, &temppath)
+                .map(|mdata| cache_file_http_date(&mdata))
+                .map_err(|CacheAccessFailure(logged)| SpliceProxyError::Cache(logged))?;
+            (file_date.format().into(), file_date)
         };
     // `If-Range` compares against the validators this response carries.
     let Some(range_plan) = resolve_client_range(
