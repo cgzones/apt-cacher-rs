@@ -235,8 +235,8 @@ pub(crate) static CONNECTION_REJECTED_GLOBAL_CAP: Counter = Counter::new();
 pub(crate) static PROXY_LOOP_REJECTED: Counter = Counter::new();
 
 /// Highest concurrent connection count observed from any single source IP.
-/// Only updated when `max_connections_per_client_ip` is configured (the
-/// per-IP map is otherwise not maintained). Use to size the cap: deploy
+/// Only updated while `max_connections_per_client_ip` is enabled (the
+/// default; 0 disables it and the per-IP map is then not maintained). Use to size the cap: deploy
 /// with a generously high value, watch this peak settle, then lower the
 /// cap to a comfortable margin above it.
 pub(crate) static PER_CLIENT_IP_PEAK: Peak = Peak::new();
@@ -524,6 +524,14 @@ pub(crate) static UPSTREAM_DOWNLOAD_CAP_TRANSITIONS: Counter = Counter::new();
 
 /// Requests rejected (503) because the active-download set was already at the cap.
 pub(crate) static UPSTREAM_DOWNLOAD_REJECTED_CAP: Counter = Counter::new();
+
+/// Uncached passthrough requests refused (503) because
+/// `max_passthrough_relays` relays were already active, bumped by
+/// `passthrough_limiter::admit` for every backend.
+pub(crate) static PASSTHROUGH_REJECTED_CAP: Counter = Counter::new();
+/// Highest number of concurrent passthrough relays since startup, sampled on
+/// every admission (capped or not).
+pub(crate) static PASSTHROUGH_ACTIVE_PEAK: Peak = Peak::new();
 
 /// Upstream connect attempts past the first, bumped by
 /// `upstream_retry::Backoff::next_retry` for both backends.

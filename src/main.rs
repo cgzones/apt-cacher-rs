@@ -63,6 +63,7 @@ mod metrics;
 mod mmap_body;
 mod parallel_hack;
 mod partial_file;
+mod passthrough_limiter;
 mod per_ip_counter;
 mod permitted_host_cache;
 mod precise_instant;

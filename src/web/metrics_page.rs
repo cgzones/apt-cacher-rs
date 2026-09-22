@@ -188,7 +188,7 @@ fn build_requests_group(g: &mut Groups) {
         );
         t.row_tip(
             "Connections Rejected (per-IP cap)",
-            "Plain-HTTP connections dropped at accept time because `max_connections_per_client_ip` was reached. Stays at 0 unless the cap is configured; climbing values point to a noisy or malicious source IP.",
+            "Plain-HTTP connections dropped at accept time because `max_connections_per_client_ip` was reached. Stays at 0 while no source IP reaches the cap (128 by default, 0 disables it); climbing values point to a noisy or malicious source IP, or to many clients sharing one NAT address.",
             WarnNonzero(metrics::CONNECTION_REJECTED_PER_IP_CAP.get()),
         );
         t.row_tip(
@@ -589,6 +589,11 @@ fn build_upstream_group(g: &mut Groups) {
             "Downloads Rejected (cap)",
             "Downloads refused because the concurrent-upstream-download cap was reached.",
             metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.get(),
+        );
+        t.row_tip(
+            "Passthroughs Rejected (cap)",
+            "Uncached passthrough requests refused with 503 because `max_passthrough_relays` relays were already active.",
+            WarnNonzero(metrics::PASSTHROUGH_REJECTED_CAP.get()),
         );
         t.row_tip(
             "Downloads Aborted",

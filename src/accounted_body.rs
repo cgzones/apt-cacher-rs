@@ -25,6 +25,7 @@ use crate::{
     delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
     humanfmt::HumanFmt,
     metrics,
+    passthrough_limiter::RelaySlot,
     precise_instant::PreciseInstant,
     rate_log, sticky,
     transfer_error::{DeliveryEnd, DeliveryFailure, EndsDelivery as _},
@@ -50,6 +51,11 @@ pub(crate) enum Subject {
         client: ClientInfo,
         request_received_at: PreciseInstant,
         request_sent: PreciseInstant,
+        /// The `max_passthrough_relays` slot, held until the body is
+        /// dropped. Every relay takes one, the cache fetch whose upstream
+        /// answer is relayed uncached included: its download slot rides on
+        /// the `InitBarrier`, which is gone by the time this body streams.
+        relay_slot: RelaySlot,
     },
 }
 
@@ -192,6 +198,7 @@ impl<B: Body<Error = DeliveryFailure>> PinnedDrop for AccountedBody<B> {
                 client,
                 request_received_at,
                 request_sent,
+                relay_slot,
             } => {
                 metrics::BYTES_SERVED_PASSTHROUGH.increment_by(transferred);
                 let in_time = request_received_at.elapsed();
@@ -211,6 +218,8 @@ impl<B: Body<Error = DeliveryFailure>> PinnedDrop for AccountedBody<B> {
                         rate_log::client_abort_segment(transferred, elapsed),
                     ));
                 }
+                // Released only now, once the relay can move no more bytes.
+                drop(relay_slot);
             }
         }
     }
@@ -221,7 +230,7 @@ mod tests {
     use super::*;
     use crate::{
         channel_body::{ChannelBody, ChannelEvent},
-        nonzero,
+        nonzero, passthrough_limiter,
         test_support::{connection_details, local_client},
         transfer_error::CacheError,
         upstream_head::ContentLength,
@@ -360,6 +369,8 @@ mod tests {
                 client: local_client(),
                 request_received_at: PreciseInstant::now(),
                 request_sent: PreciseInstant::now(),
+                relay_slot: passthrough_limiter::admit(None, "/body", &local_client())
+                    .expect("uncapped"),
             },
         );
         let before = metrics::SERVED_PASSTHROUGH.get();

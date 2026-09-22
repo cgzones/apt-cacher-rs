@@ -72,6 +72,7 @@ use crate::{
     log_once, metrics,
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
     partial_file::{self, TempPath},
+    passthrough_limiter,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
     proxy_body::{ProxyCacheBody, full_body, quick_response},
@@ -2047,18 +2048,43 @@ async fn serve_new_file_worker(
             ));
         }
         DownloadPlan::Passthrough => {
+            let cleanup_probe = conn_details.client.is_cleanup_synthetic();
+            // The relay streams after this function returns, and `decline`
+            // gives back the upstream-download slot before that, so the body
+            // needs a relay slot of its own. Admitted before `decline`, so
+            // joiners learn the 503 a refusal answers rather than the
+            // upstream status, and before the log line below, which promises
+            // the relay. Cleanup probes relay nothing (answered status-only
+            // below).
+            let relay_slot = if cleanup_probe {
+                None
+            } else {
+                let Some(slot) = passthrough_limiter::admit(
+                    config.max_passthrough_relays,
+                    &req_uri,
+                    &conn_details.client,
+                ) else {
+                    return Ok((
+                        ibarrier.decline(Declined::RelayRefused).await,
+                        quick_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            passthrough_limiter::REFUSAL_BODY,
+                        ),
+                    ));
+                };
+                Some(slot)
+            };
             let settled = ibarrier
                 .decline(Declined::Passthrough(fwd_response.status()))
                 .await;
+
             // Demote routine 4xx for cleanup-synthetic clients to DEBUG:
             // `try_fetch_packages_file` deliberately walks `.xz → .gz → raw`,
             // and on S3-hosted flat repos every miss surfaces as 403 (not
             // 404). At WARN that's three loud lines per cleanup cycle for
             // a benign probe sequence — the cleanup's own DEBUG line on
             // each miss is the operator-visible record.
-            if fwd_response.status() == StatusCode::NOT_FOUND
-                || conn_details.client.is_cleanup_synthetic()
-            {
+            if fwd_response.status() == StatusCode::NOT_FOUND || cleanup_probe {
                 debug!(
                     "Request for file {} from mirror {} with URI `{req_uri}` failed with status {}",
                     conn_details.debname,
@@ -2077,9 +2103,9 @@ async fn serve_new_file_worker(
             // Cleanup probes read only the status; relaying the upstream error
             // body just makes the consumer drop it undrained (a spurious
             // "aborted passthrough" log), and these are not client passthroughs.
-            if conn_details.client.is_cleanup_synthetic() {
+            let Some(relay_slot) = relay_slot else {
                 return Ok((settled, quick_response(fwd_response.status(), "")));
-            }
+            };
 
             return Ok((
                 settled,
@@ -2091,6 +2117,7 @@ async fn serve_new_file_worker(
                         client: conn_details.client,
                         request_received_at: conn_details.request_received_at,
                         request_sent: upstream_request_sent,
+                        relay_slot,
                     },
                 ),
             ));
@@ -2768,6 +2795,15 @@ async fn pre_process_client_request(
     // Simple proxy (without any caching)
     //
 
+    let Some(relay_slot) =
+        passthrough_limiter::admit(global_config().max_passthrough_relays, req.uri(), &client)
+    else {
+        return quick_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            passthrough_limiter::REFUSAL_BODY,
+        );
+    };
+
     warn_once_or_info!(
         "Proxying (without caching) request {} for client {client} ({})",
         req.uri(),
@@ -2855,6 +2891,7 @@ async fn pre_process_client_request(
                     client,
                     request_received_at: passthrough_request_received_at,
                     request_sent: redirected_request_sent,
+                    relay_slot,
                 },
             );
         }
@@ -2870,6 +2907,7 @@ async fn pre_process_client_request(
             client,
             request_received_at: passthrough_request_received_at,
             request_sent: fwd_request_sent,
+            relay_slot,
         },
     )
 }

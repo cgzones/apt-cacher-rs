@@ -44,6 +44,7 @@ use crate::error::ErrorReport;
 use crate::fs_open::tokio_nofollow_options;
 use crate::guards::CANCELLED_DOWNLOAD;
 use crate::humanfmt::HumanFmt;
+use crate::passthrough_limiter;
 use crate::transfer_error::DownloadFailure;
 use crate::upstream_head::{ContentLength, RejectReason};
 use crate::{global_config, global_verify_throttle, metrics, warn_once_or_info};
@@ -58,6 +59,9 @@ pub(crate) enum Declined {
     Passthrough(StatusCode),
     /// The download planner refused the upstream response.
     Rejected(RejectReason),
+    /// The upstream answer was to be relayed, but `max_passthrough_relays`
+    /// relays were already active.
+    RelayRefused,
     /// A buffered volatile body turned out to be empty.
     #[cfg(feature = "splice")]
     EmptyVolatileBody,
@@ -79,6 +83,10 @@ impl Declined {
         match self {
             Self::Passthrough(status) => (status, status.canonical_reason().unwrap_or("")),
             Self::Rejected(reason) => (StatusCode::BAD_GATEWAY, reason.body()),
+            Self::RelayRefused => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                passthrough_limiter::REFUSAL_BODY,
+            ),
             #[cfg(feature = "splice")]
             Self::EmptyVolatileBody => (StatusCode::BAD_GATEWAY, "zero-length body"),
             Self::QuotaExceeded => (StatusCode::SERVICE_UNAVAILABLE, "Disk quota reached"),
@@ -97,6 +105,7 @@ impl std::fmt::Display for Declined {
         match self {
             Self::Passthrough(status) => write!(f, "upstream answered {status}"),
             Self::Rejected(reason) => write!(f, "upstream response rejected: {}", reason.detail()),
+            Self::RelayRefused => f.write_str("too many concurrent passthrough relays"),
             #[cfg(feature = "splice")]
             Self::EmptyVolatileBody => f.write_str("empty volatile body"),
             Self::QuotaExceeded => f.write_str("disk quota reached"),

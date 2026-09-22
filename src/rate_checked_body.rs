@@ -278,6 +278,7 @@ mod tests {
     fn accounting_observes_client_rate_failure() {
         use crate::{
             accounted_body::{AccountedBody, Subject},
+            passthrough_limiter,
             precise_instant::PreciseInstant,
             transfer_error::DeliveryFailure,
         };
@@ -292,6 +293,12 @@ mod tests {
                 client: crate::test_support::local_client(),
                 request_received_at: PreciseInstant::now(),
                 request_sent: PreciseInstant::now(),
+                relay_slot: passthrough_limiter::admit(
+                    None,
+                    "/file",
+                    &crate::test_support::local_client(),
+                )
+                .expect("uncapped"),
             },
         );
         let waker = std::task::Waker::noop();

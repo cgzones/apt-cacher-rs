@@ -76,6 +76,7 @@ use crate::humanfmt::HumanFmt;
 use crate::integrity;
 use crate::parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge};
 use crate::partial_file::{self, TempPath};
+use crate::passthrough_limiter;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::RateChecker;
 use crate::response_head::WireBody;
@@ -1508,6 +1509,26 @@ async fn splice_proxy_drive(
             .map(|()| SpliceProxyOutcome::Served);
         }
         DownloadPlan::Passthrough => {
+            // `decline` gives back the upstream-download slot before the body
+            // is relayed, so the relay holds a slot of its own until it ends.
+            // Admitted before `decline`, so joiners learn the 503 a refusal
+            // answers rather than the upstream status.
+            let Some(_relay_slot) = passthrough_limiter::admit(
+                global_config().max_passthrough_relays,
+                original_uri_path,
+                &conn_details.client,
+            ) else {
+                let _settled = ibarrier.decline(Declined::RelayRefused).await;
+                client
+                    .write_invalid(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        passthrough_limiter::REFUSAL_BODY,
+                        None,
+                        "passthrough relay 503",
+                    )
+                    .await?;
+                return Ok(SpliceProxyOutcome::Served);
+            };
             let _settled = ibarrier
                 .decline(Declined::Passthrough(upstream_resp.status_code))
                 .await;

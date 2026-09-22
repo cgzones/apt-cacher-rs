@@ -25,7 +25,9 @@ use crate::{
     error::ErrorReport,
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
-    metrics, swrite,
+    metrics,
+    passthrough_limiter::active_relays,
+    swrite,
     tunnel_limiter::active_tunnels,
     uncacheables::{UNCACHEABLES_MAX, get_uncacheables},
     warn_once_or_debug,
@@ -563,6 +565,16 @@ fn build_daemon_status_html(
             "{} (peak {})",
             active_client_downloads(),
             metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.get(),
+        ),
+    );
+    t.row_tip(
+        "Active Passthrough Relays",
+        "Uncached requests currently relayed to an upstream, against `max_passthrough_relays`, with the peak since startup.",
+        format_args!(
+            "{} / {} (peak {})",
+            active_relays(),
+            OptOrUnlimited(rd.config.max_passthrough_relays),
+            metrics::PASSTHROUGH_ACTIVE_PEAK.get(),
         ),
     );
     t.row("Active HTTPS Tunnels", active_tunnels());

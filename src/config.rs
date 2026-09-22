@@ -873,9 +873,11 @@ pub(crate) struct Config {
     pub(crate) https_tunnel_max_connections_per_client: Option<NonZero<usize>>,
 
     /// Maximum number of concurrent plain-HTTP connections accepted per source
-    /// IP address. `None` means unlimited. Set to bound resource use against
-    /// half-open connection floods on deployments exposed to less-trusted
-    /// networks. Note: clients behind a NAT share a single IP for this cap.
+    /// IP address. `None` (configured as 0) means unlimited. Defaults to 128,
+    /// which bounds what one source can hold against an idle- or half-open
+    /// connection flood while leaving room for many pipelining APT clients
+    /// behind one address. Note: clients behind a NAT share a single IP for
+    /// this cap.
     #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) max_connections_per_client_ip: Option<NonZero<usize>>,
 
@@ -899,6 +901,16 @@ pub(crate) struct Config {
     /// `None` means unlimited.
     #[serde(deserialize_with = "from_nonzero_usize")]
     pub(crate) max_upstream_downloads: Option<NonZero<usize>>,
+
+    /// Maximum number of concurrent uncached passthrough relays (requests
+    /// the cache declines and forwards as-is), across all clients; further
+    /// ones are answered 503. Passthroughs do not count against
+    /// `max_upstream_downloads`, except that a cache fetch whose upstream
+    /// error answer is relayed holds an upstream-download slot until the
+    /// answer arrives and a relay slot while it is relayed.
+    /// `None` (configured as 0) means unlimited.
+    #[serde(deserialize_with = "from_nonzero_usize")]
+    pub(crate) max_passthrough_relays: Option<NonZero<usize>>,
 
     /// Capacity of the internal database command channel.
     pub(crate) db_channel_capacity: NonZero<usize>,
@@ -1020,11 +1032,12 @@ impl Default for Config {
             https_tunnel_allowed_ports: vec![nonzero!(443)],
             https_tunnel_allowed_mirrors: Vec::new(),
             https_tunnel_max_connections_per_client: Some(nonzero!(10)),
-            max_connections_per_client_ip: None,
+            max_connections_per_client_ip: Some(nonzero!(128)),
             max_connections: Some(client_counter::default_max_connections()),
             min_download_rate: Some(nonzero!(10000)), // 10 kB/s
             rate_check_timeframe: DEFAULT_RATE_CHECK_TIMEFRAME,
             max_upstream_downloads: Some(nonzero!(20)),
+            max_passthrough_relays: Some(nonzero!(100)),
             db_channel_capacity: nonzero!(128),
             db_batch_flush_max_count: nonzero!(256),
             db_batch_flush_interval_secs: nonzero!(15),
@@ -2506,6 +2519,26 @@ mod test {
 
         let warnings = Config::default().validate().expect("defaults validate");
         assert!(warnings.is_empty(), "defaults must not warn: {warnings:?}");
+    }
+
+    #[test]
+    fn passthrough_relay_cap_defaults_to_100_and_zero_disables_it() {
+        let default = Config::from_toml("").expect("empty config parses");
+        assert_eq!(default.max_passthrough_relays, Some(nonzero!(100)));
+        let disabled = Config::from_toml("max_passthrough_relays = 0").expect("0 parses");
+        assert_eq!(disabled.max_passthrough_relays, None);
+    }
+
+    #[test]
+    fn per_client_ip_cap_defaults_to_128_and_zero_disables_it() {
+        let default = Config::from_toml("").expect("empty config parses");
+        assert_eq!(default.max_connections_per_client_ip, Some(nonzero!(128)));
+
+        let disabled = Config::from_toml("max_connections_per_client_ip = 0").expect("0 parses");
+        assert_eq!(disabled.max_connections_per_client_ip, None);
+
+        let custom = Config::from_toml("max_connections_per_client_ip = 16").expect("16 parses");
+        assert_eq!(custom.max_connections_per_client_ip, Some(nonzero!(16)));
     }
 
     #[test]

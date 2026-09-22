@@ -1032,73 +1032,85 @@ async fn try_sendfile_request(
     // runs once per request: a handoff carries its outcome to hyper.  This
     // match only maps outcomes to ZeroCopyResult.
     let uri_path = uri.path();
-    let conn_details =
-        match dispatch_request(uri_path, requested_host, requested_port, &client).await {
-            DispatchOutcome::Cache(conn_details) => conn_details,
-            DispatchOutcome::Reject(reason) => return reject_result(reason, || conn_action),
-            #[cfg(feature = "splice")]
-            DispatchOutcome::Passthrough {
-                reason,
-                requested_host,
-                request_received_at,
-            } => {
-                use crate::{
-                    deb_mirror::{Mirror, MirrorKind},
-                    splice::splice_simple_proxy,
+    let conn_details = match dispatch_request(uri_path, requested_host, requested_port, &client)
+        .await
+    {
+        DispatchOutcome::Cache(conn_details) => conn_details,
+        DispatchOutcome::Reject(reason) => return reject_result(reason, || conn_action),
+        #[cfg(feature = "splice")]
+        DispatchOutcome::Passthrough {
+            reason,
+            requested_host,
+            request_received_at,
+        } => {
+            use crate::{
+                deb_mirror::{Mirror, MirrorKind},
+                passthrough_limiter,
+                splice::splice_simple_proxy,
+            };
+
+            let Some(_relay_slot) =
+                passthrough_limiter::admit(global_config().max_passthrough_relays, &uri, &client)
+            else {
+                return ZeroCopyResult::Rejection {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    conn_action,
+                    msg: passthrough_limiter::REFUSAL_BODY,
                 };
+            };
 
-                warn_once_or_info!(
-                    "Proxying (without caching) request {uri} for client {client} ({})",
-                    reason.label()
-                );
+            warn_once_or_info!(
+                "Proxying (without caching) request {uri} for client {client} ({})",
+                reason.label()
+            );
 
-                // Simple-proxy path: this Mirror is used only for upstream
-                // dispatch/formatting and is never persisted; kind is arbitrary.
-                let mirror = Mirror::new(
+            // Simple-proxy path: this Mirror is used only for upstream
+            // dispatch/formatting and is never persisted; kind is arbitrary.
+            let mirror = Mirror::new(
+                requested_host,
+                requested_port,
+                String::new(),
+                MirrorKind::Structured,
+            );
+
+            return match splice_simple_proxy(
+                stream,
+                *conn_version,
+                conn_action,
+                &mirror,
+                uri.path_and_query().map_or(uri_path, |pq| pq.as_str()),
+                client,
+                request_received_at,
+            )
+            .await
+            {
+                Ok(()) => ZeroCopyResult::Served(conn_action),
+                Err(err) => splice_error_outcome(
+                    err,
+                    "simple proxy",
+                    format_args!("{uri_path} from host {}", mirror.format_authority()),
+                ),
+            };
+        }
+        #[cfg(not(feature = "splice"))]
+        DispatchOutcome::Passthrough {
+            reason,
+            requested_host,
+            request_received_at,
+        } => {
+            // Without splice this backend has no uncached forwarder; hyper
+            // continues from the dispatch verdict.
+            return ZeroCopyResult::NotApplicable {
+                reason: reason.label(),
+                plan: HandoffPlan::Passthrough {
+                    reason,
                     requested_host,
                     requested_port,
-                    String::new(),
-                    MirrorKind::Structured,
-                );
-
-                return match splice_simple_proxy(
-                    stream,
-                    *conn_version,
-                    conn_action,
-                    &mirror,
-                    uri.path_and_query().map_or(uri_path, |pq| pq.as_str()),
-                    client,
                     request_received_at,
-                )
-                .await
-                {
-                    Ok(()) => ZeroCopyResult::Served(conn_action),
-                    Err(err) => splice_error_outcome(
-                        err,
-                        "simple proxy",
-                        format_args!("{uri_path} from host {}", mirror.format_authority()),
-                    ),
-                };
-            }
-            #[cfg(not(feature = "splice"))]
-            DispatchOutcome::Passthrough {
-                reason,
-                requested_host,
-                request_received_at,
-            } => {
-                // Without splice this backend has no uncached forwarder; hyper
-                // continues from the dispatch verdict.
-                return ZeroCopyResult::NotApplicable {
-                    reason: reason.label(),
-                    plan: HandoffPlan::Passthrough {
-                        reason,
-                        requested_host,
-                        requested_port,
-                        request_received_at,
-                    },
-                };
-            }
-        };
+                },
+            };
+        }
+    };
 
     let aliased = conn_details.alias_suffix();
 
