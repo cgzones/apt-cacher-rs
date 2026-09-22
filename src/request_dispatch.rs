@@ -739,6 +739,26 @@ mod tests {
             RejectReason::InvalidPort.response_parts(),
             (StatusCode::BAD_REQUEST, "Invalid port")
         );
+        assert_eq!(
+            RejectReason::BadEncoding.response_parts(),
+            (StatusCode::BAD_REQUEST, "Unsupported URL encoding")
+        );
+        assert_eq!(
+            RejectReason::InvalidValue.response_parts(),
+            (StatusCode::BAD_REQUEST, "Unsupported request")
+        );
+        assert_eq!(
+            RejectReason::UnsafePath.response_parts(),
+            (StatusCode::BAD_REQUEST, "Unsupported request")
+        );
+        assert_eq!(
+            RejectReason::DiffRequest.response_parts(),
+            (StatusCode::GONE, "Diff requests are not supported")
+        );
+        assert_eq!(
+            RejectReason::LoopDetected.response_parts(),
+            (StatusCode::LOOP_DETECTED, "Proxy loop detected")
+        );
     }
 
     fn fake_host() -> ClientHost {
@@ -974,6 +994,46 @@ mod tests {
         assert!(
             matches!(decision, Decision::Reject(RejectReason::UnsafePath)),
             "expected UnsafePath reject, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn reject_bad_encoding_in_pool_filename() {
+        // `%ff%fe` survives `parse_request_path` (percent-escapes are kept
+        // raw there) and fails UTF-8 validation in `classify_request`.
+        let decision = decide_request(
+            "/debian/pool/main/f/foo/foo%ff%fe_1.0_amd64.deb",
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        assert!(
+            matches!(decision, Decision::Reject(RejectReason::BadEncoding)),
+            "expected BadEncoding reject, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_value_in_pool_filename() {
+        // `%2F` decodes to `/`, which `valid_filename` refuses; the decode
+        // happens per field, so the structural parse above it still succeeds.
+        let decision = decide_request(
+            "/debian/pool/main/f/foo/foo%2Fbar_1.0_amd64.deb",
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        assert!(
+            matches!(decision, Decision::Reject(RejectReason::InvalidValue)),
+            "expected InvalidValue reject, got {decision:?}"
         );
     }
 

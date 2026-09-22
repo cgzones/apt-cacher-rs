@@ -477,7 +477,12 @@ mod tests {
 
     #[test]
     fn quota_above_limit_fails() {
-        assert!(!check_quota(101, Some(nonzero!(100_u64))).ok());
+        assert_eq!(
+            check_quota(101, Some(nonzero!(100_u64))),
+            CheckResult::Fail(String::from(
+                "disk quota exhausted: cache size 101 of 100 bytes"
+            ))
+        );
     }
 
     #[test]

@@ -2684,6 +2684,107 @@ mod test {
     }
 
     #[test]
+    fn numeric_options_just_past_their_range_are_rejected() {
+        // One row per `validate` rule, each one step past its bound; the
+        // twin at the bound is in `numeric_options_at_their_bounds_are_accepted`.
+        for (input, expected) in [
+            (
+                "buffer_size = '1023'",
+                "Invalid buffer_size value of 1023: must be between 1KiB and 1GiB",
+            ),
+            (
+                "buffer_size = '1073741825'",
+                "Invalid buffer_size value of 1073741825: must be between 1KiB and 1GiB",
+            ),
+            (
+                "max_object_size = '1048575'",
+                "Invalid max_object_size value of 1048575: must be at least the volatile unknown content length upper bound of 1048576",
+            ),
+            (
+                "byhash_retention_days = 213503982334602",
+                "Invalid byhash_retention_days value of 213503982334602: Overflow",
+            ),
+            (
+                "usage_retention_days = 213503982334602",
+                "Invalid usage_retention_days value of 213503982334602: Overflow",
+            ),
+            (
+                "db_channel_capacity = 4097",
+                "Invalid db_channel_capacity value of 4097: must be between 1 and 4096",
+            ),
+            (
+                "db_batch_flush_max_count = 4097",
+                "Invalid db_batch_flush_max_count value of 4097: must be between 1 and 4096",
+            ),
+            (
+                "db_batch_flush_interval_secs = 301",
+                "Invalid db_batch_flush_interval_secs value of 301: must be between 1 and 300",
+            ),
+            (
+                "min_download_rate = '0'\nrate_check_timeframe = 31",
+                "rate_check_timeframe is set to 31s but min_download_rate is disabled",
+            ),
+            (
+                "min_download_rate = '1000'\nrate_check_timeframe = 361",
+                "Invalid rate_check_timeframe value of 361s: must be between 1s and 360s",
+            ),
+            (
+                "experimental_parallel_hack_factor = 0.0",
+                "Invalid experimental_parallel_hack_factor of 0: must be between 0 and 1",
+            ),
+            (
+                "experimental_parallel_hack_factor = -0.5",
+                "Invalid experimental_parallel_hack_factor of -0.5: must be between 0 and 1",
+            ),
+            (
+                "experimental_parallel_hack_factor = 1.5",
+                "Invalid experimental_parallel_hack_factor of 1.5: must be between 0 and 1",
+            ),
+            (
+                "experimental_parallel_hack_factor = nan",
+                "Invalid experimental_parallel_hack_factor of NaN: must be between 0 and 1",
+            ),
+            (
+                "experimental_parallel_hack_retryafter = 0",
+                "Invalid experimental_parallel_hack_retryafter value of 0: must be between 1 and 300",
+            ),
+            (
+                "experimental_parallel_hack_retryafter = 301",
+                "Invalid experimental_parallel_hack_retryafter value of 301: must be between 1 and 300",
+            ),
+        ] {
+            assert_eq!(error_for(input), expected, "input `{input}`");
+        }
+    }
+
+    #[test]
+    fn numeric_options_at_their_bounds_are_accepted() {
+        for input in [
+            "buffer_size = '1024'",
+            "buffer_size = '1073741824'",
+            "max_object_size = '1048576'",
+            "byhash_retention_days = 213503982334601",
+            "usage_retention_days = 213503982334601",
+            "db_channel_capacity = 4096",
+            "db_batch_flush_max_count = 4096",
+            "db_batch_flush_interval_secs = 300",
+            // Spelling out the default next to a disabled min_download_rate
+            // must keep starting the daemon.
+            "min_download_rate = '0'\nrate_check_timeframe = 30",
+            "min_download_rate = '1000'\nrate_check_timeframe = 1",
+            "min_download_rate = '1000'\nrate_check_timeframe = 360",
+            "experimental_parallel_hack_factor = 0.001",
+            "experimental_parallel_hack_factor = 1.0",
+            "experimental_parallel_hack_retryafter = 1",
+            "experimental_parallel_hack_retryafter = 300",
+        ] {
+            let mut cfg = Config::from_toml(input).expect("config parses");
+            let result = cfg.validate();
+            assert!(result.is_ok(), "input `{input}` must validate: {result:?}");
+        }
+    }
+
+    #[test]
     fn timeouts_at_their_bounds_are_accepted() {
         let mut cfg = Config::from_toml(
             "database_slow_timeout = 60\n\

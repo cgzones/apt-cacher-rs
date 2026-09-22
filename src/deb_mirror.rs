@@ -2475,7 +2475,17 @@ mod tests {
         let sha512_digest = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba\
                              4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
         let path = format!("/debian/dists/sid/main/binary-amd64/by-hash/SHA512/{sha512_digest}");
-        assert!(Origin::from_path(&path, host(), None).is_some());
+        assert_eq!(
+            Origin::from_path(&path, host(), None),
+            Some(Origin {
+                mirror: Mirror::new(host(), None, String::from("debian"), MirrorKind::Structured),
+                fields: OriginFields {
+                    distribution: String::from("sid"),
+                    component: String::from("main"),
+                    architecture: String::from("binary-amd64"),
+                },
+            })
+        );
 
         // Unsupported algorithm: rejected.
         assert_eq!(
@@ -2872,8 +2882,14 @@ mod tests {
         let raw = "debian//dists/sid/InRelease";
         let normalized = normalize_uri_path(raw);
         assert!(matches!(normalized, Cow::Owned(_)));
-        let parsed = parse_request_path(&normalized);
-        assert!(parsed.is_some());
+        assert_eq!(
+            parse_request_path(&normalized),
+            Some(ResourceFile::Release {
+                mirror_path: "debian",
+                distribution: "sid",
+                filename: "InRelease",
+            })
+        );
     }
 
     #[test]

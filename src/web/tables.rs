@@ -565,3 +565,100 @@ pub(super) fn render_top_packages_table(
         rows,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn merge_min_and_max_treat_none_as_absent() {
+        assert_eq!(merge_min(None, None), None);
+        assert_eq!(merge_max(None, None), None);
+
+        assert_eq!(merge_min(Some(at(5)), None), Some(at(5)));
+        assert_eq!(merge_min(None, Some(at(5))), Some(at(5)));
+        assert_eq!(merge_max(Some(at(5)), None), Some(at(5)));
+        assert_eq!(merge_max(None, Some(at(5))), Some(at(5)));
+
+        assert_eq!(merge_min(Some(at(5)), Some(at(9))), Some(at(5)));
+        assert_eq!(merge_min(Some(at(9)), Some(at(5))), Some(at(5)));
+        assert_eq!(merge_max(Some(at(5)), Some(at(9))), Some(at(9)));
+        assert_eq!(merge_max(Some(at(9)), Some(at(5))), Some(at(9)));
+    }
+
+    #[test]
+    fn dir_stats_merge_sums_counts_and_folds_extremes() {
+        let mut acc = DirStats::default();
+        acc.merge(DirStats {
+            files: 3,
+            size: 300,
+            byhash_files: 1,
+            deb_files: 2,
+            metadata_files: 1,
+            max_file_size: 200,
+            oldest_mtime: Some(at(50)),
+            newest_mtime: Some(at(80)),
+        });
+        // A mirror whose walk saw no mtimes leaves the extremes untouched.
+        acc.merge(DirStats {
+            files: 1,
+            size: 10,
+            byhash_files: 0,
+            deb_files: 0,
+            metadata_files: 1,
+            max_file_size: 10,
+            oldest_mtime: None,
+            newest_mtime: None,
+        });
+        acc.merge(DirStats {
+            files: 2,
+            size: 1000,
+            byhash_files: 2,
+            deb_files: 0,
+            metadata_files: 2,
+            max_file_size: 900,
+            oldest_mtime: Some(at(20)),
+            newest_mtime: Some(at(70)),
+        });
+
+        assert_eq!(acc.files, 6);
+        assert_eq!(acc.size, 1310);
+        assert_eq!(acc.byhash_files, 3);
+        assert_eq!(acc.deb_files, 2);
+        assert_eq!(acc.metadata_files, 4);
+        assert_eq!(acc.deb_files + acc.metadata_files, acc.files);
+        assert_eq!(acc.max_file_size, 900);
+        assert_eq!(acc.oldest_mtime, Some(at(20)));
+        assert_eq!(acc.newest_mtime, Some(at(80)));
+    }
+
+    #[test]
+    fn dir_stats_merge_into_default_is_identity() {
+        let stats = DirStats {
+            files: 1,
+            size: 2,
+            byhash_files: 3,
+            deb_files: 4,
+            metadata_files: 5,
+            max_file_size: 6,
+            oldest_mtime: Some(at(7)),
+            newest_mtime: Some(at(8)),
+        };
+        let mut acc = DirStats::default();
+        acc.merge(stats);
+        assert_eq!(acc.files, 1);
+        assert_eq!(acc.size, 2);
+        assert_eq!(acc.byhash_files, 3);
+        assert_eq!(acc.deb_files, 4);
+        assert_eq!(acc.metadata_files, 5);
+        assert_eq!(acc.max_file_size, 6);
+        assert_eq!(acc.oldest_mtime, Some(at(7)));
+        assert_eq!(acc.newest_mtime, Some(at(8)));
+    }
+}

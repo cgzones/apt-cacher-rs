@@ -555,6 +555,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_line_capped_skips_one_past_limit() {
+        // 5 data bytes + '\n' = 6 bytes total, one over max_len: the line
+        // (newline included) is consumed and skipped, nothing is appended,
+        // and the reader is left at EOF.
+        let input = b"abcde\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let mut buf = String::new();
+        let mut line_buf = Vec::new();
+        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 5)
+            .await
+            .expect("one past the limit must be skipped, not errored");
+        assert!(matches!(result, CappedLine::Skipped));
+        assert_eq!(buf, "");
+
+        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 5)
+            .await
+            .expect("follow-on read");
+        assert!(matches!(result, CappedLine::Eof));
+        assert_eq!(buf, "");
+    }
+
+    #[tokio::test]
     async fn read_line_capped_rejects_non_utf8() {
         let input = b"\xff\xfe\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);

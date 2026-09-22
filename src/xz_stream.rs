@@ -230,11 +230,35 @@ mod tests {
         bad[32] ^= 0xFF;
         let mut decoder = xz_decoder(Cursor::new(bad));
         let mut out = Vec::new();
-        let result = decoder.read_to_end(&mut out).await;
-        assert!(
-            result.is_err() || out != b"hello world\n",
-            "corrupt xz must either return io::Error or produce different output, got Ok with {out:?}"
-        );
+        let err = decoder
+            .read_to_end(&mut out)
+            .await
+            .expect_err("corrupt xz must surface an io::Error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(out.is_empty(), "nothing must be decoded, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn truncated_input_surfaces_unexpected_eof() {
+        let mut decoder = xz_decoder(Cursor::new(&HELLO_XZ[..40]));
+        let mut out = Vec::new();
+        let err = decoder
+            .read_to_end(&mut out)
+            .await
+            .expect_err("a truncated stream must surface an io::Error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+    }
+
+    #[tokio::test]
+    async fn concatenated_streams_decode_back_to_back() {
+        let both = [HELLO_XZ, HELLO_XZ].concat();
+        let mut decoder = xz_decoder(Cursor::new(both));
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .await
+            .expect("two concatenated xz streams decode");
+        assert_eq!(&out, b"hello world\nhello world\n");
     }
 
     #[tokio::test]
@@ -265,11 +289,12 @@ mod tests {
         // The tail must still be intact: a subsequent real read should still
         // surface the decode error (or at minimum, not yield the clean output).
         let mut out = Vec::new();
-        let real = decoder.read_to_end(&mut out).await;
-        assert!(
-            real.is_err() || out != b"hello world\n",
-            "tail error must still be available after empty-buf read, got Ok({out:?})"
-        );
+        let err = decoder
+            .read_to_end(&mut out)
+            .await
+            .expect_err("tail error must still be available after empty-buf read");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(out.is_empty(), "nothing must be decoded, got {out:?}");
     }
 
     #[tokio::test]

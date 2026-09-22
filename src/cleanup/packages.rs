@@ -1031,9 +1031,61 @@ mod tests {
             &config,
         )
         .await;
+        let err = result.expect_err("a decompression bomb must abort reduce_file_list");
         assert!(
-            result.is_err(),
-            "a decompression bomb must abort reduce_file_list"
+            matches!(err, ReduceError::Read { ref filename, .. } if filename == "Packages.gz"),
+            "a decompression bomb is a read failure of the named index, got {err:?}"
+        );
+    }
+
+    /// A zero-byte compressed index is malformed (gzip needs at least a
+    /// header): the mirror bails with `ZeroSizeCompressed` and the candidate
+    /// list is left untouched rather than reconciled against nothing.
+    #[tokio::test]
+    async fn reduce_file_list_rejects_empty_compressed_index() {
+        use std::num::NonZero;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Packages.gz");
+        tokio::fs::write(&path, b"").await.expect("write empty");
+        let file = tokio::fs::File::open(&path).await.expect("open empty");
+
+        let config: Config = toml::from_str("").expect("default config");
+        let mirror = Mirror::new(
+            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            None::<NonZero<u16>>,
+            "debian".to_owned(),
+            MirrorKind::Structured,
+        );
+        let mut file_list = cands(&["keep-me.deb"]);
+        let mut tally = UnitStats::default();
+        let km = KeyMapper::Basename;
+        let mut ctx = ReduceContext {
+            root: Path::new("/tmp"),
+            mirror: &mirror,
+            layout: CacheLayout::StructuredPool,
+            tally: &mut tally,
+            keymap: &km,
+        };
+
+        let err = reduce_file_list(
+            PackagesCompression::Gz,
+            file,
+            "Packages.gz",
+            &mut file_list,
+            &mut ctx,
+            &config,
+        )
+        .await
+        .expect_err("an empty compressed index must bail the mirror");
+        assert!(
+            matches!(err, ReduceError::ZeroSizeCompressed { ref filename } if filename == "Packages.gz"),
+            "got {err:?}"
+        );
+        assert_eq!(file_list.len(), 1);
+        assert!(
+            file_list.contains_key(OsStr::new("keep-me.deb")),
+            "a rejected index must leave the candidate list untouched"
         );
     }
 

@@ -199,8 +199,49 @@ mod tests {
         rc.add(1);
 
         // Buffer should be [0, 0, 1] — full with 1 byte over 3s = 0 B/s < 100 B/s.
-        let fail = rc.check_fail();
-        assert!(fail.is_some(), "rate check should fail after gap");
+        let fail = rc.check_fail().expect("rate check should fail after gap");
+        assert_eq!(fail.transferred, 1);
+        assert_eq!(fail.timeframe, nonzero!(3));
+        assert_eq!(fail.min_rate, nonzero!(100));
+    }
+
+    /// `transferred / timeframe >= min_rate` passes at exactly the minimum
+    /// and fails one byte below it.
+    #[test]
+    fn one_second_window_threshold_is_inclusive() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
+        rc.add(999);
+        let fail = rc.check_fail().expect("999 B/s is below 1000 B/s");
+        assert_eq!(fail.transferred, 999);
+
+        let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
+        rc.add(1000);
+        assert!(
+            rc.check_fail().is_none(),
+            "exactly the minimum rate must pass"
+        );
+    }
+
+    /// Over a three-second window the average is an integer division of the
+    /// window sum: 299 B over 3 s rounds down to 99 B/s and fails a 100 B/s
+    /// minimum, one more byte reaches exactly 100 B/s and passes.
+    #[test]
+    fn multi_second_window_threshold_uses_integer_division() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(100), nonzero!(3));
+
+        // One gap-filling add lands the window at [0, 0, 299]; the later
+        // sub-second add folds into the newest sample.
+        std::thread::sleep(std::time::Duration::from_millis(3100));
+        rc.add(299);
+        let fail = rc.check_fail().expect("299 / 3 = 99 B/s is below 100 B/s");
+        assert_eq!(fail.transferred, 299);
+        assert_eq!(fail.timeframe, nonzero!(3));
+
+        rc.add(1);
+        assert!(
+            rc.check_fail().is_none(),
+            "300 / 3 = 100 B/s meets the minimum exactly"
+        );
     }
 
     /// The window is "full" as soon as it holds `timeframe` samples, and the

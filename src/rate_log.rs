@@ -110,7 +110,9 @@ pub(crate) fn client_abort_segment(bytes: u64, elapsed: Duration) -> Segment {
 mod tests {
     use std::time::Duration;
 
-    use super::{client_disconnect_segment, client_segment, upstream_segment};
+    use super::{
+        client_abort_segment, client_disconnect_segment, client_segment, upstream_segment,
+    };
 
     #[test]
     fn upstream_segment_format() {
@@ -144,6 +146,14 @@ mod tests {
         assert_eq!(
             client_disconnect_segment(1_200_000, Duration::from_millis(18)).to_string(),
             "client disconnected after 18.0ms (1.20MB)"
+        );
+    }
+
+    #[test]
+    fn client_abort_segment_format() {
+        assert_eq!(
+            client_abort_segment(1_200_000, Duration::from_millis(18)).to_string(),
+            "delivery stopped after 18.0ms (1.20MB)"
         );
     }
 

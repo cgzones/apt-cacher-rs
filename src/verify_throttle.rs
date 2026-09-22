@@ -245,27 +245,60 @@ mod tests {
 
     #[test]
     fn consecutive_failures_double_up_to_cap() {
+        // base 30s doubling per failure, clamped at the 3600s cap: the
+        // eighth failure would be 3840s and lands on the cap instead.
+        const EXPECTED: [(u64, u32); 10] = [
+            (30, 1),
+            (60, 2),
+            (120, 3),
+            (240, 4),
+            (480, 5),
+            (960, 6),
+            (1920, 7),
+            (3600, 8),
+            (3600, 9),
+            (3600, 10),
+        ];
+        assert_eq!(EXPECTED[0].0, BASE_SECS);
+        assert_eq!(EXPECTED[9].0, CAP_SECS);
+
         let t = throttle();
         let mirror = test_mirror();
         let mut now = Instant::now();
 
-        let mut expected = vec![];
-        let mut secs = BASE_SECS;
-        for _ in 0..10 {
-            expected.push(secs.min(CAP_SECS));
-            secs *= 2;
-        }
-
-        for want in expected {
-            let (window, _) = t
+        for (want_secs, want_failures) in EXPECTED {
+            let (window, failures) = t
                 .record_failure_at(
                     CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
                     now,
                 )
                 .expect("throttle enabled");
-            assert_eq!(window, std_secs(want));
+            assert_eq!(window, std_secs(want_secs), "failure #{want_failures}");
+            assert_eq!(failures, want_failures);
             now += SECOND;
         }
+    }
+
+    #[test]
+    fn streak_ttl_boundary_is_inclusive() {
+        let t = throttle();
+        let mirror = test_mirror();
+        let t0 = Instant::now();
+
+        t.record_failure_at(
+            CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+            t0,
+        );
+        // The first window ends at t0 + base; the streak survives until
+        // exactly cap after that (`now <= until + cap`).
+        let (window, failures) = t
+            .record_failure_at(
+                CacheEntryKeyRef::new(&mirror, "foo.deb", CacheLayout::StructuredPool),
+                t0 + BASE + CAP,
+            )
+            .expect("throttle enabled");
+        assert_eq!(window, std_secs(2 * BASE_SECS));
+        assert_eq!(failures, 2);
     }
 
     #[test]

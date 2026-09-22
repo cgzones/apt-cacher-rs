@@ -613,4 +613,85 @@ mod tests {
         };
         assert_eq!(info(None).plan(SIZE, &later, &local_client()), full());
     }
+
+    #[test]
+    fn from_parsed_resolves_each_outcome() {
+        // No `Range` and a failed `If-Range` both serve the whole entity; a
+        // valid-but-unsatisfiable range is the caller's 416.
+        assert_eq!(ServeParams::from_parsed(None, 7), Ok(ServeParams::full(7)));
+        assert_eq!(
+            ServeParams::from_parsed(Some(ParsedRange::IfRangeFailed), 7),
+            Ok(ServeParams::full(7))
+        );
+        assert_eq!(
+            ServeParams::from_parsed(Some(ParsedRange::Invalid), 7),
+            Ok(ServeParams::full(7))
+        );
+        assert_eq!(
+            ServeParams::from_parsed(Some(ParsedRange::NotSatisfiable), 7),
+            Err(RangeNotSatisfiable)
+        );
+        assert_eq!(
+            ServeParams::from_parsed(
+                Some(ParsedRange::Satisfiable {
+                    content_range: String::from("bytes 2-4/7"),
+                    start: 2,
+                    length: 3,
+                }),
+                7
+            ),
+            Ok(ServeParams {
+                content_start: 2,
+                content_length: 3,
+                content_range: Some(String::from("bytes 2-4/7")),
+            })
+        );
+    }
+
+    #[test]
+    fn with_meta_falls_back_to_the_file_timestamp() {
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        let metadata = std::fs::metadata(file.path()).expect("stat temp file");
+        let expected = cache_file_http_date(&metadata);
+
+        let info = CacheInfo::with_meta(
+            &metadata,
+            &UpstreamMetadata {
+                etag: None,
+                last_modified: None,
+            },
+        );
+        assert_eq!(info.file_etag, None);
+        assert_eq!(info.last_modified_for_ims, expected);
+        assert_eq!(info.last_modified_str.as_ref(), expected.format());
+
+        // An upstream `Last-Modified` wins over the file timestamp.
+        let upstream = HttpDate::parse(LAST_MODIFIED).unwrap();
+        let info = CacheInfo::with_meta(
+            &metadata,
+            &UpstreamMetadata {
+                etag: Some(Arc::from(ETAG)),
+                last_modified: Some((Arc::from(LAST_MODIFIED), upstream)),
+            },
+        );
+        assert_eq!(info.file_etag.as_deref(), Some(ETAG));
+        assert_eq!(info.last_modified_for_ims, upstream);
+        assert_eq!(info.last_modified_str.as_ref(), LAST_MODIFIED);
+    }
+
+    #[cfg(feature = "splice")]
+    #[test]
+    fn content_end_and_status_line_follow_the_range() {
+        let whole = ServeParams::full(SIZE);
+        assert_eq!(whole.content_end(), SIZE);
+        assert_eq!(whole.status_line(), "200 OK");
+
+        let partial = ServeParams {
+            content_start: 100,
+            content_length: 100,
+            content_range: Some(String::from("bytes 100-199/1000")),
+        };
+        assert_eq!(partial.content_end(), 200);
+        assert_eq!(partial.status_line(), "206 Partial Content");
+    }
 }

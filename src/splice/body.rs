@@ -2166,11 +2166,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_pipe() {
-        let (tx, rx) = create_pipe().expect("pipe creation should succeed");
-        // Verify the fds are valid (non-negative)
-        assert!(rx.as_raw_fd() >= 0);
-        assert!(tx.as_raw_fd() >= 0);
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut tx, mut rx) = create_pipe().expect("pipe creation should succeed");
         assert_ne!(rx.as_raw_fd(), tx.as_raw_fd());
+        // The two ends are wired to each other.
+        tx.write_all(b"ping").await.expect("write into the pipe");
+        let mut got = [0u8; 4];
+        rx.read_exact(&mut got).await.expect("read from the pipe");
+        assert_eq!(&got, b"ping");
         // `create_pipe()` treats pipe resizing as best-effort, so do not
         // require the kernel to honor `PIPE_BUFFER_SIZE` exactly here.
         let size = fcntl(rx.as_fd(), FcntlArg::F_GETPIPE_SZ).unwrap();
@@ -2581,6 +2585,87 @@ mod tests {
         assert_eq!(scratch.contents(), [] as [u8; 0]);
     }
 
+    /// `maybe_demote` adjudicates a `DemoteRequested` client against the
+    /// upstream rate *before* spawning a file-serve task: a starved upstream
+    /// is the root cause and surfaces as the typed upstream-rate failure,
+    /// the client stays `DemoteRequested` (never `Demoted`), and `finish`
+    /// then concludes the un-served remainder as an internal failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_upstream_wins_over_demotion() {
+        use crate::nonzero;
+
+        let scratch = ScratchFile::new();
+        let mut barrier = cache_barrier(&scratch.path).await;
+        let mut writer = CacheWriter::new(
+            scratch.file,
+            0,
+            CacheWriteMode::Kernel,
+            &barrier,
+            &scratch.path,
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (client, _) = listener.accept().await.unwrap();
+
+        // A one-second window that one noted byte fills, far below the rate
+        // floor: the upstream checker trips on the first check.
+        let mut config = crate::config::Config::default();
+        config.min_download_rate = Some(nonzero!(1_000_000));
+        config.rate_check_timeframe = nonzero!(1);
+        let filter = SpliceRangeFilter { skip: 0, send: 1 };
+        let mut xfer = BodyTransfer::new(
+            BodyClient::Attached(&client),
+            &mut writer,
+            &mut barrier,
+            &filter,
+            &scratch.path,
+            1,
+            &config,
+        );
+        assert!(matches!(xfer.client_status, ClientStatus::Active(_)));
+        assert_eq!(xfer.note_chunk(1), 0..1);
+        assert!(xfer.check_upstream_rate().is_err(), "the window is armed");
+
+        xfer.request_demote(&client);
+        let err = xfer
+            .maybe_demote()
+            .expect_err("a starved upstream must win over the demote");
+        assert!(
+            matches!(err, DownloadFailure::Upstream(ref upstream) if upstream.is_rate()),
+            "the typed upstream-rate failure surfaces: {err:?}"
+        );
+        assert!(
+            matches!(
+                xfer.client_status,
+                ClientStatus::DemoteRequested {
+                    client: _,
+                    client_file_pos: 0,
+                    client_remaining: 1,
+                }
+            ),
+            "no file-serve task may have been spawned"
+        );
+        assert!(
+            xfer.counter.is_some(),
+            "the client accounting is not handed off"
+        );
+
+        let outcome = xfer.finish();
+        assert!(
+            matches!(
+                outcome.client,
+                ClientEnd::Aborted(ref reported)
+                    if matches!(reported.get(), DeliveryFailure::Internal(_))
+            ),
+            "an unadjudicated demote is a short response"
+        );
+        assert_eq!(outcome.client_bytes, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_writer_orders_pending_tee_before_direct_writes_at_resume_offset() {
         let scratch = ScratchFile::new();
@@ -2932,7 +3017,11 @@ mod tests {
         let f2 = dev_null().expect("second call should reuse cached fd");
         // Same underlying fd both calls (OnceLock returns the cached File).
         assert_eq!(f1.as_raw_fd(), f2.as_raw_fd());
-        assert!(f1.as_raw_fd() >= 0);
+        assert_eq!(
+            nix::unistd::write(f1, b"x"),
+            Ok(1),
+            "the cached /dev/null fd must be open for writing"
+        );
     }
 
     #[test]

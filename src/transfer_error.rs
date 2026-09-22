@@ -833,6 +833,18 @@ mod tests {
         let other: DeliveryFailure =
             ClientError::io("write client", io::ErrorKind::InvalidInput.into()).into();
         assert_eq!(other.severity(), Severity::Warn);
+        // A client rate breach is expected, counter-backed behaviour: INFO
+        // alongside a disconnect. The same breach on the upstream side is a
+        // stalling mirror and stays at WARN.
+        let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
+        rc.add(1);
+        let rate = rc.check_fail().expect("1 B/s breaches 1000 B/s");
+        let client_rate: DeliveryFailure = ClientError::rate(rate).into();
+        assert_eq!(client_rate.severity(), Severity::Info);
+        let upstream_rate: DeliveryFailure = UpstreamError::rate(rate).into();
+        assert_eq!(upstream_rate.severity(), Severity::Warn);
+        let upstream: DeliveryFailure = UpstreamError::protocol("bad").into();
+        assert_eq!(upstream.severity(), Severity::Warn);
         assert_eq!(DeliveryFailure::Cancelled.severity(), Severity::Info);
         let shared_cancel = DeliveryFailure::Download(Arc::new(DownloadFailure::Cancelled));
         assert_eq!(shared_cancel.severity(), Severity::Info);

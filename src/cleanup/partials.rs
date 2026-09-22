@@ -128,3 +128,119 @@ pub(super) async fn cleanup_tmp_dir(
 
     removed
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    use filetime::{FileTime, set_file_mtime};
+
+    use super::cleanup_tmp_dir;
+
+    const PARTIAL_MAX_AGE: Duration = Duration::from_hours(1);
+    const ONE_DAY: Duration = Duration::from_hours(24);
+
+    /// Create `name` under `tmp` holding `content`, with its mtime backdated
+    /// by `age` relative to `now`.
+    fn plant_file(tmp: &Path, name: &str, content: &[u8], now: SystemTime, age: Duration) {
+        let path = tmp.join(name);
+        std::fs::write(&path, content).expect("write tmp entry");
+        set_file_mtime(&path, FileTime::from_system_time(now - age)).expect("backdate mtime");
+    }
+
+    /// Create the directory `name` under `tmp` with its mtime backdated by
+    /// `age` relative to `now`.
+    fn plant_dir(tmp: &Path, name: &str, now: SystemTime, age: Duration) {
+        let path = tmp.join(name);
+        std::fs::create_dir(&path).expect("create stray dir");
+        set_file_mtime(&path, FileTime::from_system_time(now - age)).expect("backdate mtime");
+    }
+
+    #[tokio::test]
+    async fn partials_are_reaped_when_empty_or_past_partial_max_age() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path();
+        let now = SystemTime::now();
+
+        // A zero-byte partial carries no resume state: reaped however fresh.
+        plant_file(tmp, "empty.partial", b"", now, Duration::ZERO);
+        // Non-empty partials follow the injected `partial_max_age`.
+        plant_file(tmp, "young.partial", b"resume", now, PARTIAL_MAX_AGE / 2);
+        plant_file(tmp, "old.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
+
+        let removed = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+
+        assert_eq!(removed, 2);
+        assert!(!tmp.join("empty.partial").exists(), "empty partial reaped");
+        assert!(tmp.join("young.partial").exists(), "young partial kept");
+        assert!(!tmp.join("old.partial").exists(), "aged partial reaped");
+    }
+
+    #[tokio::test]
+    async fn foreign_files_are_reaped_only_past_a_week() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path();
+        let now = SystemTime::now();
+
+        // Non-`.partial` regular files ignore `partial_max_age` (an hour here)
+        // and only go once older than `FOREIGN_MAX_AGE` (a week).
+        plant_file(tmp, "fresh.bin", b"", now, Duration::ZERO);
+        plant_file(tmp, "six-days.bin", b"x", now, ONE_DAY * 6);
+        plant_file(tmp, "eight-days.bin", b"x", now, ONE_DAY * 8);
+
+        let removed = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+
+        assert_eq!(removed, 1);
+        assert!(tmp.join("fresh.bin").exists(), "fresh foreign file kept");
+        assert!(
+            tmp.join("six-days.bin").exists(),
+            "six-day foreign file kept"
+        );
+        assert!(
+            !tmp.join("eight-days.bin").exists(),
+            "eight-day foreign file reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn stray_directories_are_reaped_only_past_a_week() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path();
+        let now = SystemTime::now();
+
+        // A directory named `*.partial` is not a partial: it is foreign and
+        // follows the week-long cutoff like any other stray directory.
+        plant_dir(tmp, "young.partial", now, PARTIAL_MAX_AGE * 2);
+        plant_dir(tmp, "six-days", now, ONE_DAY * 6);
+        plant_dir(tmp, "eight-days", now, ONE_DAY * 8);
+        // Contents do not shield an aged stray directory (adding the entry
+        // bumps the directory's mtime, so backdate it again afterwards).
+        std::fs::write(tmp.join("eight-days").join("inner"), b"x").expect("write inner");
+        set_file_mtime(
+            tmp.join("eight-days"),
+            FileTime::from_system_time(now - ONE_DAY * 8),
+        )
+        .expect("backdate mtime");
+
+        let removed = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+
+        assert_eq!(removed, 1);
+        assert!(tmp.join("young.partial").is_dir(), "young stray dir kept");
+        assert!(tmp.join("six-days").is_dir(), "six-day stray dir kept");
+        assert!(
+            !tmp.join("eight-days").exists(),
+            "eight-day stray dir reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_tmp_dir_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+
+        let removed = cleanup_tmp_dir(&dir.path().join("absent"), now, PARTIAL_MAX_AGE).await;
+
+        assert_eq!(removed, 0);
+    }
+}

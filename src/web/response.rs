@@ -209,3 +209,145 @@ impl Body for WebUiCountedBody {
         self.inner.size_hint()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header<'a>(headers: &'a [(&str, &'a str)], name: &str) -> Option<&'a str> {
+        headers.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+    }
+
+    #[test]
+    fn html_kind_headers() {
+        let r = WebResponse::html("<p>hi</p>".to_owned());
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(&r.body[..], b"<p>hi</p>");
+        assert_eq!(r.content_type(), "text/html; charset=utf-8");
+        assert_eq!(
+            r.extra_headers(),
+            &[
+                ("Cache-Control", "no-store"),
+                ("Content-Security-Policy", HTML_CSP),
+                ("X-Content-Type-Options", "nosniff"),
+                ("X-Frame-Options", "DENY"),
+                ("X-Robots-Tag", "noindex"),
+                ("Referrer-Policy", "no-referrer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn static_kind_headers() {
+        let r = WebResponse::static_resource("text/css", "body{}");
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(&r.body[..], b"body{}");
+        assert_eq!(r.content_type(), "text/css");
+        assert_eq!(
+            r.extra_headers(),
+            &[
+                ("Cache-Control", "public, max-age=86400"),
+                ("X-Content-Type-Options", "nosniff"),
+            ]
+        );
+        assert!(
+            header(r.extra_headers(), "Content-Security-Policy").is_none(),
+            "assets carry no document CSP"
+        );
+    }
+
+    #[test]
+    fn json_kind_headers() {
+        let r = WebResponse::json(StatusCode::SERVICE_UNAVAILABLE, "{}".to_owned());
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(&r.body[..], b"{}");
+        assert_eq!(r.content_type(), "application/json");
+        assert_eq!(
+            r.extra_headers(),
+            &[
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+            ]
+        );
+        assert!(header(r.extra_headers(), "X-Frame-Options").is_none());
+    }
+
+    #[test]
+    fn error_kind_headers() {
+        let r = WebResponse::not_found("nope");
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        assert_eq!(&r.body[..], b"nope");
+        assert_eq!(r.content_type(), "text/plain; charset=utf-8");
+        assert_eq!(r.extra_headers(), []);
+    }
+
+    #[cfg(feature = "hyper")]
+    mod counted_body {
+        use std::task::{Context, Waker};
+
+        use super::super::*;
+
+        fn body(bytes: &'static [u8]) -> WebUiCountedBody {
+            WebUiCountedBody {
+                inner: Full::new(bytes::Bytes::from_static(bytes)),
+                delivered: sticky::Bool::new(),
+            }
+        }
+
+        fn served() -> (u64, u64) {
+            (metrics::SERVED_WEBUI.get(), metrics::SERVED_TOTAL.get())
+        }
+
+        fn delta(before: (u64, u64)) -> (u64, u64) {
+            let after = served();
+            (after.0 - before.0, after.1 - before.1)
+        }
+
+        /// `Full` never returns `Pending`, so no runtime is needed.
+        #[test]
+        fn credits_once_polled_to_end() {
+            let before = served();
+            let mut body = body(b"page");
+            let mut cx = Context::from_waker(Waker::noop());
+
+            assert!(!body.is_end_stream());
+            let polled = Pin::new(&mut body).poll_frame(&mut cx);
+            assert!(
+                matches!(polled, Poll::Ready(Some(Ok(_)))),
+                "Full yields its one data frame on the first poll"
+            );
+            let Poll::Ready(Some(Ok(frame))) = polled else {
+                return;
+            };
+            assert_eq!(&frame.into_data().expect("data frame")[..], b"page");
+            assert!(body.is_end_stream());
+            assert_eq!(delta(before), (0, 0), "credited in Drop, not on poll");
+
+            drop(body);
+            assert_eq!(delta(before), (1, 1));
+        }
+
+        #[test]
+        fn empty_body_credits_on_the_terminal_poll() {
+            let before = served();
+            let mut body = body(b"");
+            let mut cx = Context::from_waker(Waker::noop());
+
+            assert!(matches!(
+                Pin::new(&mut body).poll_frame(&mut cx),
+                Poll::Ready(None)
+            ));
+            drop(body);
+            assert_eq!(delta(before), (1, 1));
+        }
+
+        #[test]
+        fn dropped_unpolled_is_not_credited() {
+            let before = served();
+            let body = body(b"page");
+            assert_eq!(body.size_hint().exact(), Some(4));
+            drop(body);
+            assert_eq!(delta(before), (0, 0));
+        }
+    }
+}

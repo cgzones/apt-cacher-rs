@@ -920,6 +920,7 @@ mod tests {
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.mirror_path, "debian");
         assert_eq!(class.debname, "firefox-esr_115.9.1esr-1_amd64.deb");
+        assert_eq!(class.resource_kind, ResourceKind::Pool);
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
         assert_eq!(class.resource_kind.layout(), CacheLayout::StructuredPool);
         assert!(class.origin_fields.is_none());
@@ -946,6 +947,7 @@ mod tests {
         };
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_InRelease");
+        assert_eq!(class.resource_kind, ResourceKind::Release);
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
         assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
         assert!(class.origin_fields.is_none());
@@ -962,6 +964,7 @@ mod tests {
         };
         let class = classify_request(&res, &local_client()).unwrap();
         assert_eq!(class.debname, "sid_main_binary-amd64_Packages.gz");
+        assert_eq!(class.resource_kind, ResourceKind::Packages);
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Volatile);
         assert_eq!(class.resource_kind.layout(), CacheLayout::Dists);
         let origin = class
@@ -1002,6 +1005,7 @@ mod tests {
             class.debname,
             "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
         );
+        assert_eq!(class.resource_kind, ResourceKind::ByHash);
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
         assert_eq!(class.resource_kind.layout(), CacheLayout::DistsByHash);
     }
@@ -1248,58 +1252,6 @@ mod tests {
             assert_eq!(kind.cached_flavor(), flavor, "{kind:?} flavor");
             assert_eq!(kind.layout(), layout, "{kind:?} layout");
         }
-    }
-
-    #[test]
-    fn classify_sets_resource_kind() {
-        let pool = ResourceFile::Pool {
-            mirror_path: "debian",
-            filename: "foo_1.0_amd64.deb",
-        };
-        assert_eq!(
-            classify_request(&pool, &local_client())
-                .unwrap()
-                .resource_kind,
-            ResourceKind::Pool
-        );
-
-        let pkgs = ResourceFile::Packages {
-            mirror_path: "debian",
-            distribution: "sid",
-            component: "main",
-            architecture: "binary-amd64",
-            filename: "Packages.xz",
-        };
-        assert_eq!(
-            classify_request(&pkgs, &local_client())
-                .unwrap()
-                .resource_kind,
-            ResourceKind::Packages
-        );
-
-        let byhash = ResourceFile::ByHash {
-            mirror_path: "debian",
-            filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
-            scope: None,
-        };
-        assert_eq!(
-            classify_request(&byhash, &local_client())
-                .unwrap()
-                .resource_kind,
-            ResourceKind::ByHash
-        );
-
-        let rel = ResourceFile::Release {
-            mirror_path: "debian",
-            distribution: "sid",
-            filename: "Release",
-        };
-        assert_eq!(
-            classify_request(&rel, &local_client())
-                .unwrap()
-                .resource_kind,
-            ResourceKind::Release
-        );
     }
 
     #[test]

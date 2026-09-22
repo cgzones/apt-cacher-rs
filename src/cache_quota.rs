@@ -523,6 +523,27 @@ mod tests {
     }
 
     #[test]
+    fn fresh_download_exactly_at_quota_accepts() {
+        // The projected size may equal the quota (`> quota` rejects, not
+        // `>=`); one byte past it is refused.
+        let quota = CacheQuota::new(90, Some(nz(100)));
+        let reservation = quota
+            .try_acquire(exact(10), 0, "fresh-at")
+            .ok()
+            .expect("projected size equal to the quota must be accepted");
+        assert_eq!(quota.current_size(), 100);
+        drop(reservation);
+        assert_eq!(quota.current_size(), 90);
+
+        let quota = CacheQuota::new(91, Some(nz(100)));
+        assert!(
+            quota.try_acquire(exact(10), 0, "fresh-past").is_err(),
+            "projected size one byte over the quota must be rejected"
+        );
+        assert_eq!(quota.current_size(), 91);
+    }
+
+    #[test]
     fn overwrite_same_size_under_quota_accepts() {
         let quota = CacheQuota::new(80, Some(nz(100)));
         let reservation = quota

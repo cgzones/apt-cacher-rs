@@ -1508,19 +1508,119 @@ mod tests {
         );
     }
 
-    /// `parse_upstream_response` does not panic on a response one byte over
-    /// `MAX_UPSTREAM_HEADER_SIZE` (the read-loop would have rejected it first,
-    /// but the parser itself must be robust).
+    /// The byte cap is enforced by `read_upstream_response_headers`, not by
+    /// the parser: handed a head one byte over `MAX_UPSTREAM_HEADER_SIZE`,
+    /// `parse_upstream_response` still parses it.
     #[test]
-    fn test_parse_upstream_response_one_over_max_header_size() {
+    fn test_parse_upstream_response_is_not_size_capped() {
         let preamble = b"HTTP/1.1 200 OK\r\nX-Pad: \r\n\r\n";
         let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len() + 1;
         let buf = make_padded_response(pad_len);
         assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE + 1);
-        // Must not panic; Ok or Err both acceptable.
-        match parse_upstream_response(&buf, buf.len(), "test.mirror", PreciseInstant::now()) {
-            Ok(_) | Err(_) => {}
+        let resp = parse_upstream_response(&buf, buf.len(), "test.mirror", PreciseInstant::now())
+            .expect("the parser itself applies no size cap");
+        assert_eq!(resp.status_code, StatusCode::OK);
+    }
+
+    /// Header-value edge cases the parser resolves itself: an unparsable
+    /// `Content-Length` (junk or a folded duplicate) degrades to
+    /// close-delimited framing, a 1xx head is bodyless whatever it claims,
+    /// a `chunked` token anywhere in `Transfer-Encoding` wins, and a `close`
+    /// token anywhere in `Connection` closes.
+    #[test]
+    fn parse_upstream_response_header_value_edge_cases() {
+        struct Case {
+            head: &'static [u8],
+            framing: BodyFraming,
+            connection_close: bool,
         }
+        let cases = [
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n",
+                framing: BodyFraming::CloseDelimited,
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 100, 100\r\n\r\n",
+                framing: BodyFraming::CloseDelimited,
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 100 Continue\r\nContent-Length: 5\r\n\r\n",
+                framing: BodyFraming::ContentLength(0),
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nContent-Length: 5\r\n\r\n",
+                framing: BodyFraming::Chunked,
+                connection_close: false,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive, close\r\n\r\n",
+                framing: BodyFraming::ContentLength(7),
+                connection_close: true,
+            },
+        ];
+        for case in cases {
+            let head = case.head;
+            let resp =
+                parse_upstream_response(head, head.len(), "test.mirror", PreciseInstant::now())
+                    .expect("every case is a syntactically valid head");
+            assert_eq!(
+                resp.framing,
+                case.framing,
+                "framing for {:?}",
+                head.escape_ascii().to_string()
+            );
+            assert_eq!(
+                resp.content_length(),
+                match case.framing {
+                    BodyFraming::ContentLength(n) => Some(n),
+                    BodyFraming::Chunked | BodyFraming::CloseDelimited => None,
+                },
+                "content_length() for {:?}",
+                head.escape_ascii().to_string()
+            );
+            assert_eq!(
+                resp.connection_close,
+                case.connection_close,
+                "connection_close for {:?}",
+                head.escape_ascii().to_string()
+            );
+        }
+    }
+
+    /// `MAX_UPSTREAM_HEADERS` is the httparse slot count: exactly that many
+    /// headers parse, one more is a parse failure.
+    #[test]
+    fn parse_upstream_response_header_count_cap() {
+        let build = |count: usize| {
+            let mut buf = b"HTTP/1.1 200 OK\r\n".to_vec();
+            for i in 0..count {
+                buf.extend_from_slice(format!("X-H{i}: v\r\n").as_bytes());
+            }
+            buf.extend_from_slice(b"\r\n");
+            buf
+        };
+
+        let at_cap = build(MAX_UPSTREAM_HEADERS);
+        assert!(
+            parse_upstream_response(&at_cap, at_cap.len(), "test.mirror", PreciseInstant::now())
+                .is_ok(),
+            "exactly MAX_UPSTREAM_HEADERS headers must parse"
+        );
+
+        let over_cap = build(MAX_UPSTREAM_HEADERS + 1);
+        // `UpstreamResponse` is not `Debug`, so go through `Option`.
+        let err = parse_upstream_response(
+            &over_cap,
+            over_cap.len(),
+            "test.mirror",
+            PreciseInstant::now(),
+        )
+        .err()
+        .expect("one header over the slot count must fail to parse");
+        assert_eq!(err, "failed to parse upstream response headers");
     }
 
     // Feed one buffer through a decoder, collecting the reported payload

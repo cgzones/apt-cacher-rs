@@ -223,3 +223,96 @@ impl Logged {
         Self(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+    use crate::test_support::levels_during;
+
+    #[test]
+    fn first_fire_is_true_exactly_once() {
+        let gate = AtomicBool::new(false);
+        assert!(first_fire(&gate));
+        assert!(!first_fire(&gate));
+        assert!(!first_fire(&gate));
+    }
+
+    #[test]
+    fn gates_are_independent() {
+        let a = AtomicBool::new(false);
+        let b = AtomicBool::new(false);
+        assert!(first_fire(&a));
+        assert!(first_fire(&b), "a spent gate does not spend its sibling");
+        assert!(!first_fire(&a));
+        assert!(!first_fire(&b));
+    }
+
+    #[test]
+    fn a_pre_fired_gate_never_fires() {
+        let gate = AtomicBool::new(true);
+        assert!(!first_fire(&gate));
+    }
+
+    #[test]
+    fn once_macros_gate_per_call_site() {
+        // Two expansions plant two gates: the second site still warns after
+        // the first has fired, and each site only warns once.
+        let levels = levels_during(|| {
+            for _ in 0..3 {
+                warn_once!("site one");
+            }
+            for _ in 0..3 {
+                warn_once!("site two");
+            }
+        });
+        assert_eq!(levels, [tracing::Level::WARN, tracing::Level::WARN]);
+    }
+
+    #[test]
+    fn warn_once_or_info_demotes_after_the_first_line() {
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        let levels = levels_during(|| {
+            for _ in 0..3 {
+                warn_once_or_info_gated(&FIRED, format_args!("repeat"));
+            }
+        });
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::WARN,
+                tracing::Level::INFO,
+                tracing::Level::INFO
+            ]
+        );
+    }
+
+    #[test]
+    fn logged_error_emits_one_error_line() {
+        let levels = levels_during(|| {
+            let _proof = Logged::error(format_args!("boom"));
+        });
+        assert_eq!(levels, [tracing::Level::ERROR]);
+    }
+
+    #[test]
+    fn logged_cache_io_failure_bumps_the_counter_and_errors() {
+        let before = metrics::CACHE_IO_FAILURE.get();
+        let levels = levels_during(|| {
+            let _proof = Logged::cache_io_failure(format_args!("stat failed"));
+        });
+        assert_eq!(levels, [tracing::Level::ERROR]);
+        assert_eq!(metrics::CACHE_IO_FAILURE.get() - before, 1);
+    }
+
+    #[test]
+    fn logged_warn_once_or_info_uses_the_handed_in_gate() {
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        let levels = levels_during(|| {
+            let _first = Logged::warn_once_or_info(&FIRED, format_args!("x"));
+            let _second = Logged::warn_once_or_info(&FIRED, format_args!("x"));
+        });
+        assert_eq!(levels, [tracing::Level::WARN, tracing::Level::INFO]);
+    }
+}

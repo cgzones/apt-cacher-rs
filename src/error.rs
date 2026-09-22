@@ -136,6 +136,63 @@ mod tests {
         );
     }
 
+    /// The wrapper keeps the errno's `ErrorKind` but not its `raw_os_error`;
+    /// the errno itself lives on the inner `io::Error` reached via `source()`.
+    #[cfg(feature = "splice")]
+    #[test]
+    fn errno_to_io_error_keeps_kind_and_moves_errno_to_source() {
+        use std::error::Error as _;
+
+        let err = errno_to_io_error(nix::errno::Errno::ENOENT, "open failed");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(err.raw_os_error(), None);
+
+        let source = err.source().expect("the errno error is the source");
+        let inner = source
+            .downcast_ref::<std::io::Error>()
+            .expect("the source is the errno io::Error");
+        assert_eq!(inner.raw_os_error(), Some(nix::libc::ENOENT));
+        assert_eq!(inner.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn is_peer_disconnect_excludes_timed_out() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(!is_peer_disconnect(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_peer_disconnect(&Error::from(ErrorKind::Other)));
+        assert!(is_peer_disconnect(&Error::from(ErrorKind::BrokenPipe)));
+        assert!(is_peer_disconnect(&Error::from(ErrorKind::UnexpectedEof)));
+    }
+
+    #[cfg(feature = "hyper")]
+    #[test]
+    fn is_io_timed_out_in_chain_walks_nested_sources() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("outer")]
+        struct Outer<E>(#[source] E);
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("middle")]
+        struct Middle<E>(#[source] E);
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("leaf")]
+        struct Leaf;
+
+        // outer -> middle -> io::Error(TimedOut): two `source()` hops deep.
+        let timed_out = Outer(Middle(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        assert!(is_io_timed_out_in_chain(&timed_out));
+
+        // The same depth with a non-timeout io::Error at the leaf.
+        let other_io = Outer(Middle(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+        assert!(!is_io_timed_out_in_chain(&other_io));
+
+        // A chain that holds no io::Error at all.
+        let no_io = Outer(Middle(Leaf));
+        assert!(!is_io_timed_out_in_chain(&no_io));
+    }
+
     #[test]
     fn upstream_fetch_error_display_is_the_reason() {
         let err = UpstreamFetchError {
