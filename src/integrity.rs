@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use hashbrown::{Equivalent, HashMap};
 use parking_lot::Mutex;
+use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
@@ -845,6 +846,79 @@ pub(crate) async fn verify_and_rename(
     Ok(())
 }
 
+/// How many `Packages` ingests decode at once. Every committed index spawns
+/// one, and by-hash indexes are distinct resources, so an upstream serving
+/// many small hostile `.xz` files would otherwise hold one blocking-pool
+/// thread each for up to [`limits::MAX_XZ_DECODE_CPU`] and starve every
+/// other `spawn_blocking` user (`tokio::fs`, verification). Two keep an
+/// `apt update` over several components flowing while bounding that.
+/// `Release` ingest reads a capped, uncompressed file and is not gated.
+const PACKAGES_INGEST_CONCURRENCY: usize = 2;
+
+static PACKAGES_INGEST_PERMITS: Semaphore = Semaphore::const_new(PACKAGES_INGEST_CONCURRENCY);
+
+/// Named `Packages*` ingests that may wait for a permit at once. The permits
+/// alone bound the CPU, not the line in front of them: a mirror serving
+/// budget-burning indexes would otherwise queue one task per committed index
+/// and push every later ingest back by one [`limits::MAX_XZ_DECODE_CPU`]
+/// turn each. Eight covers an `apt update` over several suites and
+/// components landing at once.
+const NAMED_INGEST_QUEUE: usize = 8;
+
+/// By-hash `Packages` ingests that may wait for a permit at once. By-hash
+/// digests are the cheap way to commit many distinct hostile indexes, so
+/// their line is shorter than [`NAMED_INGEST_QUEUE`]; it is not zero because
+/// by-hash is also how `apt` fetches every index from an `Acquire-By-Hash:
+/// yes` archive (Debian, Ubuntu), so a legitimate burst lands here too.
+const BYHASH_INGEST_QUEUE: usize = 4;
+
+static NAMED_INGEST_WAITERS: IngestQueue = IngestQueue::new(NAMED_INGEST_QUEUE);
+static BYHASH_INGEST_WAITERS: IngestQueue = IngestQueue::new(BYHASH_INGEST_QUEUE);
+
+/// A bounded line of ingests waiting for an ingest permit: each waiter
+/// holds one of `places`.
+struct IngestQueue {
+    places: Semaphore,
+}
+
+impl IngestQueue {
+    const fn new(max_waiting: usize) -> Self {
+        Self {
+            places: Semaphore::const_new(max_waiting),
+        }
+    }
+
+    /// A permit from `permits`, taken at once if one is free, else after
+    /// waiting in this line; `None` when the line is already full, in which
+    /// case the caller skips its ingest. Cancel-safe: a dropped waiter gives
+    /// its place back.
+    async fn acquire<'a>(&self, permits: &'a Semaphore) -> Option<SemaphorePermit<'a>> {
+        if let Ok(permit) = permits.try_acquire() {
+            return Some(permit);
+        }
+        let _place = match self.places.try_acquire() {
+            Ok(place) => place,
+            Err(_err @ (TryAcquireError::NoPermits | TryAcquireError::Closed)) => return None,
+        };
+        Some(
+            permits
+                .acquire()
+                .await
+                .expect("the ingest semaphore is never closed"),
+        )
+    }
+}
+
+/// Run one `Packages` ingest under [`PACKAGES_INGEST_PERMITS`], waiting in
+/// `queue`; `None` when the line was full and the ingest was skipped.
+async fn with_packages_ingest_permit<F: Future>(
+    queue: &IngestQueue,
+    ingest: F,
+) -> Option<F::Output> {
+    let _permit = queue.acquire(&PACKAGES_INGEST_PERMITS).await?;
+    Some(ingest.await)
+}
+
 /// Spawn a detached best-effort task to parse a just-committed index file into
 /// the registry. No-op for non-index resources.
 fn spawn_ingest(plan: &RenamePlan) {
@@ -948,19 +1022,23 @@ fn spawn_ingest(plan: &RenamePlan) {
                 compression,
                 format,
             } => {
-                ingest_packages_file(
-                    registry,
-                    &host,
-                    &mirror_path,
-                    &dest,
-                    compression,
-                    format,
-                    buffer_size,
+                with_packages_ingest_permit(
+                    &NAMED_INGEST_WAITERS,
+                    ingest_packages_file(
+                        registry,
+                        &host,
+                        &mirror_path,
+                        &dest,
+                        compression,
+                        format,
+                        buffer_size,
+                    ),
                 )
                 .await
             }
-            IngestKind::PackagesSniff { format } => match sniff_packages_compression(&dest).await {
-                Ok(compression) => {
+            IngestKind::PackagesSniff { format } => {
+                with_packages_ingest_permit(&BYHASH_INGEST_WAITERS, async {
+                    let compression = sniff_packages_compression(&dest).await?;
                     ingest_packages_file(
                         registry,
                         &host,
@@ -971,25 +1049,29 @@ fn spawn_ingest(plan: &RenamePlan) {
                         buffer_size,
                     )
                     .await
-                }
-                Err(err) => Err(err),
-            },
+                })
+                .await
+            }
             IngestKind::Release { release_dir } => {
-                ingest_release_file(registry, &host, &mirror_path, &dest, &release_dir).await
+                Some(ingest_release_file(registry, &host, &mirror_path, &dest, &release_dir).await)
             }
         };
-        if let Err(err) = result {
+        match result {
+            // Ingest's failure policy: degrade to a less-populated registry.
+            None => warn_once_or_debug!(
+                "Skipping registry ingest of index `{}` for host {host} mirror {mirror_path} (ingest queue full); its debs stay unverified until a later ingest succeeds",
+                dest.display(),
+            ),
             // A persistent ingest failure leaves the registry empty, so every
             // deb from this mirror is committed unverified -- so far visible
             // only as a climbing CHECKSUM_UNVERIFIED.
-            warn_once_or_debug!(
+            Some(Err(err)) => warn_once_or_debug!(
                 "Failed to ingest index `{}` for host {host} mirror {mirror_path}; debs from this mirror stay unverified until an ingest succeeds:  {}",
                 dest.display(),
                 ErrorReport(&err),
-            );
-        } else {
+            ),
             // Sync point for `wait_for_log("Index ingestion completed")`; keep the wording stable.
-            debug!("Index ingestion completed for `{}`", dest.display());
+            Some(Ok(())) => debug!("Index ingestion completed for `{}`", dest.display()),
         }
     });
 }
@@ -1365,6 +1447,89 @@ mod tests {
             algo: HashAlgo::Sha256,
             digest: vec![0u8; 32],
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn packages_ingests_run_at_most_two_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static PEAK: AtomicUsize = AtomicUsize::new(0);
+        let tasks: Vec<_> = std::iter::repeat_with(|| {
+            tokio::spawn(with_packages_ingest_permit(&NAMED_INGEST_WAITERS, async {
+                let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+                PEAK.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                RUNNING.fetch_sub(1, Ordering::SeqCst);
+            }))
+        })
+        .take(6)
+        .collect();
+        for task in tasks {
+            assert!(
+                task.await.expect("ingest task").is_some(),
+                "six ingests fit two permits plus the named line"
+            );
+        }
+        assert_eq!(PEAK.load(Ordering::SeqCst), PACKAGES_INGEST_CONCURRENCY);
+    }
+
+    /// With every permit held, an ingest joins the line while it has room
+    /// and is skipped once it is full; a cancelled waiter leaves the line,
+    /// and a queued waiter gets the next released permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_queue_skips_once_full() {
+        fn noop_cx() -> std::task::Context<'static> {
+            std::task::Context::from_waker(std::task::Waker::noop())
+        }
+
+        let permits = Semaphore::new(1);
+        let queue = IngestQueue::new(1);
+        let held = permits.try_acquire().expect("the only permit");
+
+        let mut waiter = std::pin::pin!(queue.acquire(&permits));
+        assert!(
+            waiter.as_mut().poll(&mut noop_cx()).is_pending(),
+            "the first ingest waits in the line"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), queue.acquire(&permits))
+                .await
+                .expect("a full line answers at once")
+                .is_none(),
+            "a full line skips the ingest"
+        );
+
+        drop(held);
+        let permit = waiter.await.expect("the queued ingest gets the permit");
+        assert_eq!(queue.places.available_permits(), 1);
+        drop(permit);
+
+        let held = permits.try_acquire().expect("the permit is back");
+        {
+            let mut cancelled = std::pin::pin!(queue.acquire(&permits));
+            assert!(cancelled.as_mut().poll(&mut noop_cx()).is_pending());
+            assert_eq!(queue.places.available_permits(), 0);
+        }
+        assert_eq!(
+            queue.places.available_permits(),
+            1,
+            "a cancelled waiter leaves the line"
+        );
+        drop(held);
+    }
+
+    /// A zero-length line is try-acquire-or-skip.
+    #[tokio::test]
+    async fn empty_ingest_queue_only_takes_a_free_permit() {
+        let permits = Semaphore::new(1);
+        let queue = IngestQueue::new(0);
+        let held = queue
+            .acquire(&permits)
+            .await
+            .expect("a free permit is taken");
+        assert!(queue.acquire(&permits).await.is_none());
+        drop(held);
     }
 
     #[test]

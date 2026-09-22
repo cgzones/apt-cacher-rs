@@ -60,6 +60,17 @@ pub(crate) const MAX_DECOMPRESSION_RATIO: NonZero<u64> = nonzero!(100);
 /// `lzma_rust2::XzStream::new_mem_limit` in `xz_stream`.
 pub(crate) const MAX_XZ_DICT_SIZE: NonZero<u64> = nonzero!(64 * 1024 * 1024);
 
+/// CPU time one `.xz` index decode may spend before it is abandoned.  The
+/// dictionary cap bounds a block's memory, not how many blocks a stream
+/// holds: every block allocates and zero-fills its dictionary afresh, and an
+/// empty block costs 18 input bytes and yields no output, so neither the
+/// output caps nor the ratio guard ever see it (see `xz_stream`).  A
+/// 70 MiB synthetic `Packages` (larger than Debian's `main/binary-amd64`)
+/// decodes in 1.1-1.5 s of CPU on a desktop core, so 30 s leaves a factor
+/// of twenty for slow hardware, while bounding what one hostile index can
+/// cost.
+pub(crate) const MAX_XZ_DECODE_CPU: Duration = Duration::from_secs(30);
+
 /// Maximum length (bytes) of a single line read from upstream metadata.
 pub(crate) const MAX_METADATA_LINE_LEN: usize = 8 * 1024;
 
