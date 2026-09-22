@@ -18,7 +18,7 @@ use crate::fs_open::{
     CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
 };
 use crate::humanfmt::HumanFmt;
-use crate::limits;
+use crate::limits::{self, PackagesCompression};
 use crate::log_once::Logged;
 use crate::metrics;
 use crate::warn_once_or_info;
@@ -38,6 +38,21 @@ fn cleanup_response(status: StatusCode) -> http::Response<ProxyCacheBody> {
         .status(status)
         .body(full_body(bytes::Bytes::new()))
         .expect("static response is valid")
+}
+
+/// Most bytes of the index at `path` the bridge buffers:
+/// `limits::packages_file_cap` for its compression (what cleanup's reduce
+/// would decode at most), the decompressed ceiling for a leaf that names none.
+fn buffering_cap(path: &str) -> u64 {
+    let path = path.split_once('?').map_or(path, |(path, _query)| path);
+    path.rsplit('/')
+        .next()
+        .and_then(PackagesCompression::from_filename)
+        .map_or(
+            limits::MAX_DECOMPRESSED_PACKAGES_SIZE,
+            limits::packages_file_cap,
+        )
+        .get()
 }
 
 /// Parse the `max-age` directive from a request's `Cache-Control` header.
@@ -87,7 +102,7 @@ async fn serve_cached_cleanup_file(
         return None;
     }
 
-    let max_bytes = limits::MAX_DECOMPRESSED_PACKAGES_SIZE.get();
+    let max_bytes = buffering_cap(req.uri().path());
     if mdata.len() > max_bytes {
         warn_once_or_info!(
             "splice cleanup: cached file `{}` exceeds the {max_bytes} byte buffering cap; refetching from upstream",
@@ -205,8 +220,7 @@ async fn cleanup_upstream_fetch(
         return cleanup_response(status);
     }
 
-    let max_bytes: usize = limits::MAX_DECOMPRESSED_PACKAGES_SIZE
-        .get()
+    let max_bytes: usize = buffering_cap(upstream_path)
         .try_into()
         .expect("constant fits into usize");
     let UpstreamExchange {
@@ -251,4 +265,29 @@ pub(crate) async fn process_cache_request(
     _appstate: AppState,
 ) -> http::Response<ProxyCacheBody> {
     splice_cleanup_request(&conn_details, &req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffering_cap_follows_the_index_compression() {
+        let compressed = limits::MAX_COMPRESSED_PACKAGES_SIZE.get();
+        let raw = limits::MAX_DECOMPRESSED_PACKAGES_SIZE.get();
+        assert_eq!(
+            buffering_cap("/debian/dists/sid/main/binary-amd64/Packages.xz"),
+            compressed
+        );
+        assert_eq!(
+            buffering_cap("/debian/dists/sid/main/binary-amd64/Packages.gz"),
+            compressed
+        );
+        assert_eq!(buffering_cap("/repo/Packages.gz?x=1"), compressed);
+        assert_eq!(
+            buffering_cap("/debian/dists/sid/main/binary-amd64/Packages"),
+            raw
+        );
+        assert_eq!(buffering_cap("/repo/Packages.zst"), raw);
+    }
 }

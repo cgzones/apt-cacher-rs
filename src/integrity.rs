@@ -1299,7 +1299,10 @@ async fn ingest_packages_file(
     // Compute the decompressed-output ceiling from the compressed file size.
     // Fall back to the absolute cap if stat fails (non-fatal).
     let compressed_size = match file.metadata().await {
-        Ok(m) => m.len(),
+        Ok(m) => {
+            limits::check_packages_file_size(compression, m.len())?;
+            m.len()
+        }
         Err(err) => {
             warn!(
                 "Failed to stat `{}` for the decompression-ratio guard during Packages ingestion; ingesting with the guard disabled:  {}",
@@ -2213,6 +2216,32 @@ mod tests {
             reg.lookup("deb.debian.org", "debian", "a_1_amd64.deb")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_packages_refuses_an_oversized_compressed_index_unread() {
+        use std::num::NonZero;
+
+        // A sparse file one byte past the compressed cap: refused on its
+        // size, so nothing (not even the xz header) is decoded.
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        f.as_file()
+            .set_len(limits::MAX_COMPRESSED_PACKAGES_SIZE.get() + 1)
+            .expect("extend sparse");
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+        let err = ingest_packages_file(
+            &reg,
+            "deb.debian.org",
+            "debian",
+            f.path(),
+            PackagesCompression::Xz,
+            IndexFormat::Structured,
+            64 * 1024,
+        )
+        .await
+        .expect_err("an index past the compressed cap must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("exceeds the"), "{err}");
     }
 
     #[tokio::test]

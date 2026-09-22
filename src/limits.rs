@@ -38,8 +38,23 @@ pub(crate) const MAX_UPSTREAM_HEADER_SIZE: usize = 8192;
 /// Maximum number of header fields parsed from an upstream HTTP response.
 pub(crate) const MAX_UPSTREAM_HEADERS: usize = 32;
 
-/// Absolute ceiling (bytes) on the decompressed output of a `Packages` file.
-pub(crate) const MAX_DECOMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(1024 * 1024 * 1024);
+/// Absolute ceiling (bytes) on the decompressed output of a `Packages` file,
+/// and so on a raw one, which cleanup buffers whole (memfd, plus a `Vec` in
+/// hyper-less builds) for up to ten mirrors at once. Debian's largest,
+/// `main/binary-amd64/Packages`, decompresses to well under 100 MiB; 256 MiB
+/// leaves room for bigger archives while bounding that buffering at a
+/// quarter of the former 1 GiB.
+pub(crate) const MAX_DECOMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(256 * 1024 * 1024);
+
+/// Ceiling (bytes) on a compressed (`.gz`/`.xz`) `Packages` file, checked
+/// before it is decoded or, by cleanup, buffered. Debian's largest,
+/// `main/binary-amd64/Packages.xz`, is ~10 MiB. Without it the
+/// decompressed caps alone admitted a compressed body as large as the
+/// decompressed ceiling, which cleanup
+/// holds in memory (memfd, plus a `Vec` in hyper-less builds) for up to ten
+/// mirrors at once, and whose xz decoder keeps a 16-byte index record per
+/// block (~0.9x the compressed size for a stream of empty blocks).
+pub(crate) const MAX_COMPRESSED_PACKAGES_SIZE: NonZero<u64> = nonzero!(128 * 1024 * 1024);
 
 /// Maximum size (bytes) of a `Release` / `InRelease` file ingested into the
 /// checksum registry. Real Release files for Debian-scale archives are tens
@@ -272,6 +287,38 @@ impl PackagesCompression {
     }
 }
 
+/// Largest `Packages` file in `compression` that is decoded or buffered: the
+/// file itself for raw bytes, so the decompressed ceiling, and
+/// [`MAX_COMPRESSED_PACKAGES_SIZE`] for a compressed one.
+#[must_use]
+pub(crate) const fn packages_file_cap(compression: PackagesCompression) -> NonZero<u64> {
+    match compression {
+        PackagesCompression::Raw => MAX_DECOMPRESSED_PACKAGES_SIZE,
+        PackagesCompression::Gz | PackagesCompression::Xz => MAX_COMPRESSED_PACKAGES_SIZE,
+    }
+}
+
+/// Refuse, with [`io::ErrorKind::InvalidData`], a `Packages` file of `size`
+/// bytes above [`packages_file_cap`], before a byte of it is decoded. Both
+/// decode sites call it on the size they stat.
+pub(crate) fn check_packages_file_size(
+    compression: PackagesCompression,
+    size: u64,
+) -> io::Result<()> {
+    let cap = packages_file_cap(compression);
+    if size > cap.get() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Packages{} index of {size} bytes exceeds the {} byte cap",
+                compression.extension(),
+                cap.get()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The effective decompressed-output ceiling for a `Packages` file of
 /// `compressed_size` bytes: the smaller of [`MAX_DECOMPRESSED_PACKAGES_SIZE`]
 /// and the size multiplied by [`MAX_DECOMPRESSION_RATIO`].
@@ -388,6 +435,23 @@ mod tests {
         // Zero-length, or a size the caller could not stat: the ratio bound has
         // no anchor, so only the absolute cap applies.
         assert_eq!(decompressed_limit(None), MAX_DECOMPRESSED_PACKAGES_SIZE);
+    }
+
+    #[test]
+    fn packages_file_size_is_capped_per_compression() {
+        for compression in [PackagesCompression::Gz, PackagesCompression::Xz] {
+            let cap = MAX_COMPRESSED_PACKAGES_SIZE.get();
+            check_packages_file_size(compression, cap).expect("at the cap");
+            let err = check_packages_file_size(compression, cap + 1)
+                .expect_err("a compressed index past the cap must be refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+        // A raw index is its own decompressed output, capped at 256 MiB.
+        let cap = MAX_DECOMPRESSED_PACKAGES_SIZE.get();
+        assert_eq!(cap, 256 * 1024 * 1024);
+        check_packages_file_size(PackagesCompression::Raw, cap).expect("at the cap");
+        check_packages_file_size(PackagesCompression::Raw, cap + 1)
+            .expect_err("a raw index past the decompressed cap must be refused");
     }
 
     #[test]

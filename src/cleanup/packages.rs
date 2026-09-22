@@ -21,7 +21,8 @@ use crate::{
     error::{ErrorReport, UpstreamFetchError},
     index_parser::{Stanza, StanzaStream, hex_encode, structured_lookup_key},
     limits::{
-        MAX_DECOMPRESSED_PACKAGES_SIZE, PackagesCompression, decompressed_limit, packages_reader,
+        PackagesCompression, check_packages_file_size, decompressed_limit, packages_file_cap,
+        packages_reader,
     },
     metrics,
     precise_instant::PreciseInstant,
@@ -143,6 +144,7 @@ pub(super) fn body_is_incomplete(announced: Option<u64>, written: u64) -> bool {
 
 pub(super) async fn packages_body_to_memfd(
     memfdname: &str,
+    compression: PackagesCompression,
     body: &mut ProxyCacheBody,
     config: &Config,
 ) -> Result<(tokio::fs::File, u64), PackagesBufferError> {
@@ -154,10 +156,10 @@ pub(super) async fn packages_body_to_memfd(
         PackagesBufferError::Memfd(err)
     })?;
     let file = tokio::fs::File::from_std(memfd.into_file());
-    // Cap the buffered body at the decompressed ceiling: a compressed index can
-    // never legitimately exceed its own decompressed size, so this rejects
-    // nothing real while bounding memory before `reduce_file_list`'s guards run.
-    body_to_file(body, file, MAX_DECOMPRESSED_PACKAGES_SIZE, config)
+    // Cap the buffered body at the most `reduce_file_list` would decode (the
+    // decompressed ceiling for a raw index, the compressed one otherwise), so
+    // memory is bounded before its guards run.
+    body_to_file(body, file, packages_file_cap(compression), config)
         .await
         .inspect_err(|err| {
             error!(
@@ -291,6 +293,13 @@ pub(super) enum ReduceError {
         #[source]
         source: io::Error,
     },
+    /// Larger than `limits::packages_file_cap` allows; refused undecoded.
+    #[error("Packages index `{filename}` is too large to decode")]
+    TooLarge {
+        filename: String,
+        #[source]
+        source: io::Error,
+    },
     /// Decode/read failure, including the decompressed-size and line caps
     /// and a decompression bomb.
     #[error("failed to read Packages index `{filename}` (may exceed the size or line limit)")]
@@ -325,6 +334,11 @@ pub(super) async fn reduce_file_list(
     let buffer_size = config.buffer_size;
 
     let mdata = file.metadata().await.map_err(|source| ReduceError::Stat {
+        filename: filename.to_owned(),
+        source,
+    })?;
+
+    check_packages_file_size(compression, mdata.len()).map_err(|source| ReduceError::TooLarge {
         filename: filename.to_owned(),
         source,
     })?;
@@ -590,7 +604,7 @@ mod tests {
         config::ClientHost,
         deb_mirror::MirrorKind,
         index_parser::{HashAlgo, hex_decode_exact, parse_filename_field, parse_hex_field},
-        limits::MAX_METADATA_LINE_LEN,
+        limits::{MAX_COMPRESSED_PACKAGES_SIZE, MAX_METADATA_LINE_LEN},
         nonzero,
         proxy_body::full_body,
     };
@@ -693,10 +707,14 @@ mod tests {
         let payload = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n\n";
         let mut body = full_body(bytes::Bytes::from_static(payload));
 
-        let (mut file, written) =
-            packages_body_to_memfd("apt_cacher_rs_test_count", &mut body, &config)
-                .await
-                .expect("buffer body");
+        let (mut file, written) = packages_body_to_memfd(
+            "apt_cacher_rs_test_count",
+            PackagesCompression::Raw,
+            &mut body,
+            &config,
+        )
+        .await
+        .expect("buffer body");
 
         assert_eq!(
             written,
@@ -1036,6 +1054,57 @@ mod tests {
             matches!(err, ReduceError::Read { ref filename, .. } if filename == "Packages.gz"),
             "a decompression bomb is a read failure of the named index, got {err:?}"
         );
+    }
+
+    /// A compressed index past `MAX_COMPRESSED_PACKAGES_SIZE` is refused on
+    /// its size, before the decoder sees a byte (the sparse fixture holds no
+    /// valid xz header, so a decode attempt would fail differently).
+    #[tokio::test]
+    async fn reduce_file_list_refuses_an_oversized_compressed_index_unread() {
+        use std::num::NonZero;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Packages.xz");
+        let std_file = std::fs::File::create(&path).expect("create fixture");
+        std_file
+            .set_len(MAX_COMPRESSED_PACKAGES_SIZE.get() + 1)
+            .expect("extend sparse");
+        drop(std_file);
+        let file = tokio::fs::File::open(&path).await.expect("open fixture");
+
+        let config: Config = toml::from_str("").expect("default config");
+        let mirror = Mirror::new(
+            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            None::<NonZero<u16>>,
+            "apt/amd64".to_owned(),
+            MirrorKind::Flat,
+        );
+        let mut file_list = cands(&["never-matched.deb"]);
+        let mut tally = UnitStats::default();
+        let km = KeyMapper::RelpathUnderPrefix { prefix: "amd64/" };
+        let mut ctx = ReduceContext {
+            root: Path::new("/tmp"),
+            mirror: &mirror,
+            layout: CacheLayout::Flat,
+            tally: &mut tally,
+            keymap: &km,
+        };
+
+        let err = reduce_file_list(
+            PackagesCompression::Xz,
+            file,
+            "Packages.xz",
+            &mut file_list,
+            &mut ctx,
+            &config,
+        )
+        .await
+        .expect_err("an oversized compressed index must bail the mirror");
+        assert!(
+            matches!(err, ReduceError::TooLarge { ref filename, .. } if filename == "Packages.xz"),
+            "got {err:?}"
+        );
+        assert_eq!(file_list.len(), 1, "the candidates must be left untouched");
     }
 
     /// A zero-byte compressed index is malformed (gzip needs at least a
