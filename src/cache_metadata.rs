@@ -134,7 +134,10 @@ impl UpstreamMetadata {
     /// `Last-Modified` is not inherited next to a *different* `ETag` the
     /// `206` names: that response does not vouch for the stored
     /// representation, so the date would be paired with a tag it never
-    /// belonged to.
+    /// belonged to. That branch is defense in depth, not a production path:
+    /// `upstream_head::plan_download` already turns such a `206` into
+    /// `ResumeAnomaly::ETagMismatch`, which discards the partial before any
+    /// metadata is built.
     #[must_use]
     pub(crate) fn inherit_resumed(self, resumed: Option<&Self>) -> Self {
         let Some(Self {
@@ -721,7 +724,8 @@ mod tests {
 
     /// A `206` naming a different `ETag` does not vouch for the stored
     /// representation: its own tag stands and the stored date is not paired
-    /// with it.
+    /// with it. Defense in depth: the planner already refuses such a `206`
+    /// as `ResumeAnomaly::ETagMismatch`, so no production path gets here.
     #[test]
     fn inherit_resumed_keeps_the_stored_date_off_a_different_etag() {
         let stored = stored_validators();

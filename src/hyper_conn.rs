@@ -1953,7 +1953,11 @@ async fn serve_new_file_worker(
 
     let plan = match plan_download(
         &head,
-        ResumeState::new(resume_offset, resume_expected_total),
+        ResumeState::new(
+            resume_offset,
+            resume_expected_total,
+            resume_if_range.as_deref(),
+        ),
         conn_details.cached_flavor(),
         cached,
         config.max_object_size,
@@ -1980,6 +1984,11 @@ async fn serve_new_file_worker(
                 ),
                 ResumeAnomaly::ContentRangeMismatch => warn_once_or_info!(
                     "Invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+                ResumeAnomaly::ETagMismatch => warn_once_or_info!(
+                    "Server returned 206 for resume of {} from mirror {} naming an ETag other than the If-Range one; discarding the partial and retrying fresh",
                     conn_details.debname,
                     conn_details.mirror
                 ),

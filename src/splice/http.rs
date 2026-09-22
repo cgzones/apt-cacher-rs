@@ -34,7 +34,7 @@ use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::RateChecker;
 use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::transfer_error::{ClientError, DeliveryFailure, UpstreamError};
-use crate::upstream_head::{RejectReason, UpstreamHead};
+use crate::upstream_head::{RejectReason, UpstreamHead, well_formed_etag};
 use crate::{
     build_info::APP_USER_AGENT,
     cache_metadata::{self, InvalidValidator},
@@ -394,11 +394,15 @@ impl UpstreamResponse {
 
     /// The backend-neutral projection consumed by
     /// `upstream_head::plan_download`.
-    pub(super) fn head(&self) -> UpstreamHead {
+    /// Its `ETag` goes through the same `well_formed_etag` filter as hyper's
+    /// projection, so the planner's input does not depend on whether
+    /// [`Self::discard_invalid_validators`] ran first.
+    pub(super) fn head(&self) -> UpstreamHead<'_> {
         UpstreamHead {
             status: self.status_code,
             content_length: self.content_length(),
             content_range: self.content_range.as_deref().and_then(parse_content_range),
+            etag: well_formed_etag(self.etag.as_deref()),
         }
     }
 

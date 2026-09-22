@@ -810,7 +810,8 @@ async fn read_volatile_validators(
 /// mirroring `hyper_conn.rs` which follows the redirect before its
 /// `NOT_MODIFIED` check. Then discards malformed validators, counts a fresh
 /// volatile body, and classifies the head; a resume anomaly discards the
-/// partial (re-fetching without `Range` when the response is unusable) and
+/// partial (re-fetching without `Range` when the response is unusable, and
+/// discarding the refetched response's malformed validators in turn) and
 /// re-plans the fresh head. No reconnect helper runs past this point, so
 /// the exchange is final on return.
 async fn plan_upstream_response(
@@ -853,7 +854,11 @@ async fn plan_upstream_response(
 
     match plan_download(
         &exchange.response.head(),
-        ResumeState::new(resume.offset, resume.expected_total),
+        ResumeState::new(
+            resume.offset,
+            resume.expected_total,
+            resume.if_range.as_deref(),
+        ),
         conn_details.cached_flavor(),
         volatile_cache_path,
         global_config().max_object_size,
@@ -873,6 +878,11 @@ async fn plan_upstream_response(
                 ),
                 ResumeAnomaly::ContentRangeMismatch => warn_once_or_info!(
                     "splice proxy: invalid or mismatched Content-Range in 206 for {} from mirror {}; discarding the partial and retrying fresh",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
+                ResumeAnomaly::ETagMismatch => warn_once_or_info!(
+                    "splice proxy: server returned 206 for resume of {} from mirror {} naming an ETag other than the If-Range one; discarding the partial and retrying fresh",
                     conn_details.debname,
                     conn_details.mirror
                 ),
@@ -901,6 +911,11 @@ async fn plan_upstream_response(
                     conn_details,
                 ))
                 .await?;
+                // A new response: its validators reach the client head, the
+                // xattrs and the published metadata just like the first
+                // one's, so they get the same filter (hyper validates its
+                // final response too).
+                exchange.response.discard_invalid_validators(conn_details);
             } else {
                 resume.partial.discard_resume().await;
             }

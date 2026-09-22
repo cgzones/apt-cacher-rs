@@ -10,12 +10,15 @@
 //!
 //! - [`UpstreamHead`] is the projection of a response head the table reads:
 //!   status, the length-delimited `Content-Length` (already resolved against
-//!   chunked framing, RFC 9112 section 6.1) and the parsed `Content-Range`.
-//!   Constructors: `UpstreamHead::from_response` for hyper's
-//!   `http::Response` and `splice::http::UpstreamResponse::head` for splice's
-//!   httparse-based parser.  Validator and metadata headers (`ETag`,
-//!   `Last-Modified`, `Content-Type`) are deliberately absent: no shared
-//!   decision reads them and each backend validates them on its own schedule.
+//!   chunked framing, RFC 9112 section 6.1), the parsed `Content-Range` and
+//!   the well-formed `ETag`.  Constructors: `UpstreamHead::from_response` for
+//!   hyper's `http::Response` and `splice::http::UpstreamResponse::head` for
+//!   splice's httparse-based parser; both drop a malformed `ETag` themselves
+//!   (`is_valid_etag`), so the table sees the same input whether or not the
+//!   backend has already discarded it.  The `ETag` is read by one decision
+//!   only, the resumed-206 identity check against [`ResumeState::if_range`];
+//!   `Last-Modified` and `Content-Type` stay absent, and each backend still
+//!   validates its validators for storage on its own schedule.
 //! - [`plan_download`] and [`plan_fresh_download`] are pure: no I/O, no
 //!   `global_config()`, no metric bumps, no logging.  The backends own how to
 //!   discard a partial, how to re-fetch, how to write the 502 and the log
@@ -41,6 +44,7 @@ use http::StatusCode;
 
 use crate::{
     cache_layout::CachedFlavor,
+    http_etag::{etag_strong_match, is_valid_etag},
     http_range::ContentRange,
     humanfmt::HumanFmt,
     limits::{self, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER},
@@ -75,7 +79,7 @@ impl Display for ContentLength {
 
 /// The part of an upstream response head the download decision reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UpstreamHead {
+pub(crate) struct UpstreamHead<'a> {
     pub(crate) status: StatusCode,
     /// Declared body length of a length-delimited response.  `None` when the
     /// header is absent or unparsable, or when `Transfer-Encoding: chunked`
@@ -84,15 +88,27 @@ pub(crate) struct UpstreamHead {
     pub(crate) content_length: Option<u64>,
     /// Parsed `Content-Range`; `None` when absent or malformed.
     pub(crate) content_range: Option<ContentRange>,
+    /// The `ETag`; `None` when absent or malformed (RFC 9110 section 8.8.3),
+    /// filtered by the constructor through [`well_formed_etag`].
+    pub(crate) etag: Option<&'a str>,
+}
+
+/// The `ETag` value an [`UpstreamHead`] constructor may carry: the one
+/// filter both backends' constructors apply, so a malformed tag is absent to
+/// the table in either -- splice discards it before planning, hyper only
+/// after.
+#[must_use]
+pub(crate) fn well_formed_etag(etag: Option<&str>) -> Option<&str> {
+    etag.filter(|etag| is_valid_etag(etag))
 }
 
 #[cfg(feature = "hyper")]
-impl UpstreamHead {
+impl<'a> UpstreamHead<'a> {
     /// Project a hyper response.  The body type is irrelevant; only the
     /// status and headers are read.
     #[must_use]
-    pub(crate) fn from_response<B>(response: &http::Response<B>) -> Self {
-        use http::header::{CONTENT_LENGTH, CONTENT_RANGE, TRANSFER_ENCODING};
+    pub(crate) fn from_response<B>(response: &'a http::Response<B>) -> Self {
+        use http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, TRANSFER_ENCODING};
 
         let headers = response.headers();
 
@@ -114,11 +130,13 @@ impl UpstreamHead {
             .get(CONTENT_RANGE)
             .and_then(|hv| hv.to_str().ok())
             .and_then(crate::http_range::parse_content_range);
+        let etag = well_formed_etag(headers.get(ETAG).and_then(|hv| hv.to_str().ok()));
 
         Self {
             status: response.status(),
             content_length,
             content_range,
+            etag,
         }
     }
 }
@@ -126,23 +144,31 @@ impl UpstreamHead {
 /// A partial download the upstream request asked to resume (`Range:
 /// bytes=<offset>-` plus `If-Range`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ResumeState {
+pub(crate) struct ResumeState<'a> {
     /// Bytes already on disk; the requested range starts here.
     pub(crate) offset: NonZero<u64>,
     /// Total size recorded when the partial was started, if the xattr
     /// survived; a 206 whose `Content-Range` total differs means the upstream
     /// file was replaced.
     pub(crate) expected_total: Option<u64>,
+    /// The stored `ETag` the request sent as `If-Range`; a 206 naming a
+    /// different one is not the representation the partial holds.
+    pub(crate) if_range: Option<&'a str>,
 }
 
-impl ResumeState {
+impl<'a> ResumeState<'a> {
     /// `None` for `offset == 0`: nothing to resume, the request was sent
     /// without `Range`.
     #[must_use]
-    pub(crate) fn new(offset: u64, expected_total: Option<u64>) -> Option<Self> {
+    pub(crate) fn new(
+        offset: u64,
+        expected_total: Option<u64>,
+        if_range: Option<&'a str>,
+    ) -> Option<Self> {
         NonZero::new(offset).map(|offset| Self {
             offset,
             expected_total,
+            if_range,
         })
     }
 }
@@ -163,6 +189,13 @@ pub(crate) enum ResumeAnomaly {
     /// other than the one the partial was started with.  The stored bytes
     /// cannot be appended to; re-fetch without `Range`.
     ContentRangeMismatch,
+    /// 206 naming an `ETag` other than the one sent as `If-Range`: the
+    /// upstream served a range of a representation the partial does not
+    /// hold (it should have answered 200, RFC 9110 section 13.1.5).
+    /// Appending would splice two representations; re-fetch without
+    /// `Range`.  A 206 that names no `ETag` (or a malformed one) is not
+    /// this anomaly: it answered the `If-Range` it was sent.
+    ETagMismatch,
 }
 
 impl ResumeAnomaly {
@@ -172,7 +205,7 @@ impl ResumeAnomaly {
     pub(crate) const fn needs_refetch(self) -> bool {
         match self {
             Self::RangeIgnored => false,
-            Self::RangeNotSatisfiable | Self::ContentRangeMismatch => true,
+            Self::RangeNotSatisfiable | Self::ContentRangeMismatch | Self::ETagMismatch => true,
         }
     }
 }
@@ -418,8 +451,8 @@ impl<C> DownloadPlan<C> {
 /// `Err` reports a resume anomaly: discard the partial, then re-plan through
 /// [`plan_fresh_download`] (see [`ResumeAnomaly::needs_refetch`]).
 pub(crate) fn plan_download<C>(
-    head: &UpstreamHead,
-    resume: Option<ResumeState>,
+    head: &UpstreamHead<'_>,
+    resume: Option<ResumeState<'_>>,
     flavor: CachedFlavor,
     cached: Option<C>,
     max_object_size: Option<NonZero<u64>>,
@@ -444,12 +477,20 @@ pub(crate) fn plan_download<C>(
 }
 
 /// A resumed request answered with 206: accept only a response delivering
-/// exactly the remainder of the object the partial was started from.
+/// exactly the remainder of the object the partial was started from.  The
+/// representation is checked first: a different `ETag` makes the range
+/// irrelevant.
 fn plan_resumed_206<C>(
-    head: &UpstreamHead,
-    resume: ResumeState,
+    head: &UpstreamHead<'_>,
+    resume: ResumeState<'_>,
     max_object_size: Option<NonZero<u64>>,
 ) -> Result<DownloadPlan<C>, ResumeAnomaly> {
+    if let (Some(etag), Some(if_range)) = (head.etag, resume.if_range)
+        && !etag_strong_match(etag, if_range)
+    {
+        return Err(ResumeAnomaly::ETagMismatch);
+    }
+
     let Some(range) = head.content_range.filter(|range| {
         range.start() == resume.offset.get()
             && range.runs_to_end()
@@ -491,7 +532,7 @@ fn plan_resumed_206<C>(
 /// request of a non-resuming download, the re-fetch after a resume anomaly,
 /// or the same 200 head re-planned after the upstream ignored `Range`.
 pub(crate) fn plan_fresh_download<C>(
-    head: &UpstreamHead,
+    head: &UpstreamHead<'_>,
     flavor: CachedFlavor,
     cached: Option<C>,
     max_object_size: Option<NonZero<u64>>,
@@ -549,16 +590,21 @@ mod tests {
 
     const NO_CAP: Option<NonZero<u64>> = None;
 
-    fn head(status: u16, content_length: Option<u64>, content_range: Option<&str>) -> UpstreamHead {
+    fn head(
+        status: u16,
+        content_length: Option<u64>,
+        content_range: Option<&str>,
+    ) -> UpstreamHead<'static> {
         UpstreamHead {
             status: StatusCode::from_u16(status).unwrap(),
             content_length,
             content_range: content_range.and_then(crate::http_range::parse_content_range),
+            etag: None,
         }
     }
 
     fn fresh(
-        head: &UpstreamHead,
+        head: &UpstreamHead<'_>,
         flavor: CachedFlavor,
         cached: Option<Cached>,
         cap: Option<NonZero<u64>>,
@@ -566,15 +612,18 @@ mod tests {
         plan_download(head, None, flavor, cached, cap).unwrap()
     }
 
+    /// The `If-Range` value every [`resumed`] request carries.
+    const IF_RANGE: &str = "\"partial\"";
+
     fn resumed(
-        head: &UpstreamHead,
+        head: &UpstreamHead<'_>,
         offset: u64,
         expected_total: Option<u64>,
         cap: Option<NonZero<u64>>,
     ) -> Result<DownloadPlan<Cached>, ResumeAnomaly> {
         plan_download(
             head,
-            ResumeState::new(offset, expected_total),
+            ResumeState::new(offset, expected_total, Some(IF_RANGE)),
             CachedFlavor::Permanent,
             None,
             cap,
@@ -591,12 +640,13 @@ mod tests {
 
     #[test]
     fn resume_state_zero_offset_is_none() {
-        assert_eq!(ResumeState::new(0, Some(10)), None);
+        assert_eq!(ResumeState::new(0, Some(10), Some(IF_RANGE)), None);
         assert_eq!(
-            ResumeState::new(5, Some(10)),
+            ResumeState::new(5, Some(10), Some(IF_RANGE)),
             Some(ResumeState {
                 offset: nonzero!(5),
                 expected_total: Some(10),
+                if_range: Some(IF_RANGE),
             })
         );
     }
@@ -801,6 +851,41 @@ mod tests {
         assert!(ResumeAnomaly::ContentRangeMismatch.needs_refetch());
     }
 
+    /// A 206 naming another `ETag` than the `If-Range` value served a range
+    /// of a representation the partial does not hold, however well its
+    /// `Content-Range` fits.  One that names none, or the same one, answered
+    /// the `If-Range` and resumes; a malformed tag never reaches the table
+    /// (`well_formed_etag`).
+    #[test]
+    fn resume_206_with_a_different_etag_needs_refetch() {
+        let fitting = head(206, Some(60), Some("bytes 40-99/100"));
+        for other in ["\"other\"", "W/\"partial\""] {
+            assert_eq!(
+                resumed(
+                    &UpstreamHead {
+                        etag: Some(other),
+                        ..fitting
+                    },
+                    40,
+                    Some(100),
+                    NO_CAP
+                ),
+                Err(ResumeAnomaly::ETagMismatch),
+                "etag {other}"
+            );
+        }
+        assert!(ResumeAnomaly::ETagMismatch.needs_refetch());
+        for etag in [None, Some(IF_RANGE)] {
+            assert_eq!(
+                resumed(&UpstreamHead { etag, ..fitting }, 40, Some(100), NO_CAP),
+                Ok(exact_download(100, 60, 40)),
+                "etag {etag:?}"
+            );
+        }
+        assert_eq!(well_formed_etag(Some("not quoted")), None);
+        assert_eq!(well_formed_etag(Some(IF_RANGE)), Some(IF_RANGE));
+    }
+
     #[test]
     fn resume_206_content_length_disagreeing_with_span_rejects() {
         assert_eq!(
@@ -1003,17 +1088,24 @@ mod tests {
             .status(206)
             .header("content-length", " 60 ")
             .header("content-range", "bytes 40-99/100")
+            .header("etag", "\"abc\"")
             .body(())
             .unwrap();
         assert_eq!(
             UpstreamHead::from_response(&response),
-            head(206, Some(60), Some("bytes 40-99/100"))
+            UpstreamHead {
+                etag: Some("\"abc\""),
+                ..head(206, Some(60), Some("bytes 40-99/100"))
+            }
         );
 
+        // A malformed `ETag` is dropped here, as splice drops it before
+        // planning.
         let response = http::Response::builder()
             .status(200)
             .header("content-length", "junk")
             .header("content-range", "bytes x-y/z")
+            .header("etag", "unquoted")
             .body(())
             .unwrap();
         assert_eq!(
