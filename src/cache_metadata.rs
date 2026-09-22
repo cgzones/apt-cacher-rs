@@ -82,7 +82,7 @@ use hashbrown::{Equivalent, HashMap, hash_map::Entry};
 
 use crate::{
     cache_layout::{CacheEntryKey, CacheEntryKeyRef},
-    http_etag::{ETag, is_valid_etag},
+    http_etag::{ETag, MAX_ETAG_LEN, is_valid_etag},
     http_last_modified::{LastModified, is_valid_http_date},
     http_range::HttpDate,
     warn_once, warn_once_or_info,
@@ -257,7 +257,16 @@ pub(crate) enum InvalidValidator<'a> {
     ETag(&'a str),
     /// `Last-Modified` not an IMF-fixdate HTTP-date (RFC 9110 §5.6.7).
     LastModified(&'a str),
+    /// A validator longer than [`MAX_VALIDATOR_LEN`]: reported by length,
+    /// never by value, so a hostile upstream cannot put the value (up to the
+    /// ~400 KiB a hyper response head may hold) into the log.
+    Oversized { header: &'static str, len: usize },
 }
+
+/// Longest upstream validator value [`check_upstream_validators`] inspects:
+/// [`MAX_ETAG_LEN`], which an IMF-fixdate `Last-Modified` (29 bytes) is far
+/// below as well.
+const MAX_VALIDATOR_LEN: usize = MAX_ETAG_LEN;
 
 /// Validate the raw upstream `ETag`/`Last-Modified` header values once per
 /// upstream response, before either reaches a client response header, an
@@ -266,12 +275,23 @@ pub(crate) enum InvalidValidator<'a> {
 /// Both backends route through here so the accepted set is identical;
 /// `on_invalid` receives each discarded value so the caller emits its
 /// backend's warn line.
+///
+/// A value longer than [`MAX_VALIDATOR_LEN`] is discarded before it is
+/// parsed: a kept validator is retained per cached file (metadata store,
+/// xattr), which is sized for short values.
 pub(crate) fn check_upstream_validators(
     etag: Option<String>,
     last_modified: Option<String>,
     mut on_invalid: impl FnMut(InvalidValidator<'_>),
 ) -> (Option<String>, Option<String>) {
     let etag = etag.filter(|etag| {
+        if etag.len() > MAX_VALIDATOR_LEN {
+            on_invalid(InvalidValidator::Oversized {
+                header: "ETag",
+                len: etag.len(),
+            });
+            return false;
+        }
         let valid = is_valid_etag(etag);
         if !valid {
             on_invalid(InvalidValidator::ETag(etag));
@@ -279,6 +299,13 @@ pub(crate) fn check_upstream_validators(
         valid
     });
     let last_modified = last_modified.filter(|lm| {
+        if lm.len() > MAX_VALIDATOR_LEN {
+            on_invalid(InvalidValidator::Oversized {
+                header: "Last-Modified",
+                len: lm.len(),
+            });
+            return false;
+        }
         let valid = is_valid_http_date(lm);
         if !valid {
             on_invalid(InvalidValidator::LastModified(lm));
@@ -969,6 +996,42 @@ mod tests {
         assert_eq!(etag.as_deref(), Some("\"abc\""));
         assert_eq!(lm, None);
         assert_eq!(rejected, vec!["LastModified(\"not a date\")".to_owned()]);
+    }
+
+    #[test]
+    fn check_upstream_validators_discards_oversized_values_by_length() {
+        // Well-formed apart from their length: an upstream head may carry
+        // ~400 KiB through the hyper client, and a kept value is retained
+        // per cached file.
+        let etag = format!("\"{}\"", "a".repeat(MAX_VALIDATOR_LEN - 1));
+        let lm = format!(
+            "Thu, 01 Jan 1970 00:00:00 GMT{}",
+            " ".repeat(MAX_VALIDATOR_LEN)
+        );
+        let mut rejected = Vec::new();
+        let (kept_etag, kept_lm) =
+            check_upstream_validators(Some(etag.clone()), Some(lm.clone()), |invalid| {
+                rejected.push(format!("{invalid:?}"));
+            });
+        assert_eq!(kept_etag, None);
+        assert_eq!(kept_lm, None);
+        assert_eq!(
+            rejected,
+            vec![
+                format!("Oversized {{ header: \"ETag\", len: {} }}", etag.len()),
+                format!(
+                    "Oversized {{ header: \"Last-Modified\", len: {} }}",
+                    lm.len()
+                ),
+            ]
+        );
+
+        let at_cap = format!("\"{}\"", "a".repeat(MAX_VALIDATOR_LEN - 2));
+        let mut calls = 0;
+        let (kept_etag, _) =
+            check_upstream_validators(Some(at_cap.clone()), None, |_invalid| calls += 1);
+        assert_eq!(kept_etag, Some(at_cap));
+        assert_eq!(calls, 0);
     }
 
     #[test]

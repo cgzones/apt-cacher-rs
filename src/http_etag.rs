@@ -11,14 +11,39 @@ fn etag_opaque_tag(s: &str) -> &str {
     s.strip_prefix("W/").unwrap_or(s)
 }
 
+/// Longest `ETag` accepted, in bytes. RFC 9110 sets no bound, and real
+/// servers send a few dozen bytes (an inode/size/mtime hash); an upstream
+/// head may carry ~400 KiB through the hyper client, and a validated tag is
+/// kept per cached file in the metadata store (sized for "a few hundred bytes
+/// each") and written to an xattr (which fails past 64 KiB). Past this
+/// length a tag is treated as malformed and discarded.
+pub(crate) const MAX_ETAG_LEN: usize = 1024;
+
 /// Validate that a string is a well-formed `ETag` per RFC 9110 §8.8.3.
 ///
 /// Accepts both strong (`"<etagc>"`) and weak (`W/"<etagc>"`) forms, where etagc consists
-/// of `0x21` or `0x23..=0x7E` or bytes `>= 0x80` (obs-text).
-/// For now only valid UTF-8 sequences are accepted.
+/// of `0x21` or `0x23..=0x7E`.
 /// Note that an empty `ETag` (`""`) is valid.
+///
+/// Stricter than RFC 9110, which also allows obs-text (bytes `>= 0x80`) in
+/// etagc: hyper's `HeaderValue::to_str` rejects such a value, so the hyper
+/// backend never sees it, while splice parses the raw head bytes and would
+/// keep it. Accepting obs-text here made the backends disagree about one
+/// response (a non-ASCII tag resumed on hyper, where it was absent, and
+/// refetched on splice); refusing it makes the tag absent on both.
+/// A value longer than [`MAX_ETAG_LEN`] is not accepted.
+///
+/// Callers: `cache_metadata::check_upstream_validators` (an upstream
+/// response's tag), `upstream_head::well_formed_etag` (the planner's view of
+/// it) and [`ETag`]'s xattr parse (a stored tag). Client conditionals are
+/// not validated here: [`if_none_match`] and the `If-Range` comparison
+/// (`http_range`) match the client's value against a stored tag that was, so
+/// a malformed or overlong candidate simply never matches.
 #[must_use]
 pub(crate) fn is_valid_etag(s: &str) -> bool {
+    if s.len() > MAX_ETAG_LEN {
+        return false;
+    }
     let opaque = etag_opaque_tag(s).as_bytes();
     let Some(etagc) = opaque
         .strip_prefix(b"\"")
@@ -28,7 +53,7 @@ pub(crate) fn is_valid_etag(s: &str) -> bool {
     };
     etagc
         .iter()
-        .all(|&c| c == 0x21 || (0x23..=0x7E).contains(&c) || c >= 0x80)
+        .all(|&c| c == 0x21 || (0x23..=0x7E).contains(&c))
 }
 
 /// A validated `ETag`, persisted on a cached file as
@@ -168,8 +193,9 @@ mod tests {
         assert!(is_valid_etag("\"!\""));
         // 0x23..=0x7E
         assert!(is_valid_etag("\"#~\""));
-        // obs-text (>= 0x80)
-        assert!(is_valid_etag("\"caffe\u{e9}\""));
+        // obs-text (>= 0x80) is refused: hyper cannot see such a value.
+        assert!(!is_valid_etag("\"caffe\u{e9}\""));
+        assert!(!is_valid_etag("W/\"\u{e9}\""));
 
         // Valid weak ETags
         assert!(is_valid_etag("W/\"abc\""));
@@ -195,6 +221,14 @@ mod tests {
         // is ordinary etagc.
         assert!(is_valid_etag("\"W/\""));
         assert!(!is_valid_etag("W/W/\"abc\""));
+        // Length cap, counting the quotes and the weak indicator.
+        let at_cap = format!("\"{}\"", "a".repeat(MAX_ETAG_LEN - 2));
+        assert!(is_valid_etag(&at_cap));
+        assert!(!is_valid_etag(&format!("W/{at_cap}")));
+        assert!(!is_valid_etag(&format!(
+            "\"{}\"",
+            "a".repeat(MAX_ETAG_LEN - 1)
+        )));
     }
 
     #[test]

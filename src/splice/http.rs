@@ -417,12 +417,19 @@ impl UpstreamResponse {
             self.last_modified.take(),
             |invalid| match invalid {
                 InvalidValidator::ETag(etag) => warn_once_or_info!(
-                    "splice proxy: upstream mirror {} sent an invalid ETag `{etag}` for {}; discarding it",
+                    "splice proxy: upstream mirror {} sent an invalid ETag `{}` for {}; discarding it",
                     conn_details.mirror,
+                    etag.escape_debug(),
                     conn_details.debname
                 ),
                 InvalidValidator::LastModified(lm) => warn_once_or_info!(
-                    "splice proxy: upstream mirror {} sent an invalid Last-Modified `{lm}` for {}; discarding it",
+                    "splice proxy: upstream mirror {} sent an invalid Last-Modified `{}` for {}; discarding it",
+                    conn_details.mirror,
+                    lm.escape_debug(),
+                    conn_details.debname
+                ),
+                InvalidValidator::Oversized { header, len } => warn_once_or_info!(
+                    "splice proxy: upstream mirror {} sent a {len} byte {header} for {}; discarding it",
                     conn_details.mirror,
                     conn_details.debname
                 ),
@@ -1429,6 +1436,31 @@ mod tests {
             Some("Mon, 01 Jan 2024 00:00:00 GMT")
         );
         assert_eq!(resp.etag.as_deref(), Some("\"xyz\""));
+    }
+
+    /// A non-ASCII (obs-text) `ETag` survives splice's raw head parse but is
+    /// absent to the planner and discarded as a validator, as it is on
+    /// hyper (`upstream_head`'s projection test), so both backends plan a
+    /// resume against it the same way.
+    #[test]
+    fn obs_text_etag_is_absent_from_the_head_and_discarded() {
+        let headers = "HTTP/1.1 206 Partial Content\r\n\
+                       content-length: 60\r\n\
+                       content-range: bytes 40-99/100\r\n\
+                       etag: \"caffe\u{e9}\"\r\n\
+                       \r\n"
+            .as_bytes();
+        let resp =
+            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
+                .expect("should parse");
+        assert_eq!(resp.etag.as_deref(), Some("\"caffe\u{e9}\""), "kept raw");
+        assert_eq!(resp.head().etag, None);
+        let mut discarded = Vec::new();
+        let (etag, _) = cache_metadata::check_upstream_validators(resp.etag, None, |v| {
+            discarded.push(format!("{v:?}"));
+        });
+        assert_eq!(etag, None);
+        assert_eq!(discarded.len(), 1);
     }
 
     #[test]

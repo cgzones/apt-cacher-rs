@@ -2176,26 +2176,36 @@ async fn serve_new_file_worker(
     };
 
     // Wording mirrors `splice/http.rs::UpstreamResponse::discard_invalid_validators`
-    // modulo the subsystem prefix.
+    // modulo the subsystem prefix. The raw values are read the way splice's
+    // `find_header` reads them, as UTF-8 rather than through `to_str` (visible
+    // ASCII only): an obs-text value then reaches the check and its warn
+    // instead of vanishing silently, so both backends log it alike.
     let (upstream_etag, upstream_last_modified) = check_upstream_validators(
         fwd_response
             .headers()
             .get(ETAG)
-            .and_then(|hv| hv.to_str().ok())
+            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
             .map(String::from),
         fwd_response
             .headers()
             .get(LAST_MODIFIED)
-            .and_then(|hv| hv.to_str().ok())
+            .and_then(|hv| std::str::from_utf8(hv.as_bytes()).ok())
             .map(String::from),
         |invalid| match invalid {
             InvalidValidator::ETag(etag) => warn_once_or_info!(
-                "Upstream mirror {} sent an invalid ETag `{etag}` for {}; discarding it",
+                "Upstream mirror {} sent an invalid ETag `{}` for {}; discarding it",
                 conn_details.mirror,
+                etag.escape_debug(),
                 conn_details.debname
             ),
             InvalidValidator::LastModified(lm) => warn_once_or_info!(
-                "Upstream mirror {} sent an invalid Last-Modified `{lm}` for {}; discarding it",
+                "Upstream mirror {} sent an invalid Last-Modified `{}` for {}; discarding it",
+                conn_details.mirror,
+                lm.escape_debug(),
+                conn_details.debname
+            ),
+            InvalidValidator::Oversized { header, len } => warn_once_or_info!(
+                "Upstream mirror {} sent a {len} byte {header} for {}; discarding it",
                 conn_details.mirror,
                 conn_details.debname
             ),

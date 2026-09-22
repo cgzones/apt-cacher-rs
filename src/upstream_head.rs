@@ -1114,6 +1114,25 @@ mod tests {
         );
     }
 
+    /// A non-ASCII (obs-text) `ETag` is absent to the planner on hyper, as
+    /// it is on splice (`splice::http`'s projection test): `to_str` drops it
+    /// here and `well_formed_etag` would too.
+    #[cfg(feature = "hyper")]
+    #[test]
+    fn from_response_treats_an_obs_text_etag_as_absent() {
+        let response = http::Response::builder()
+            .status(200)
+            .header(
+                "etag",
+                http::HeaderValue::from_bytes(b"\"caffe\xc3\xa9\"")
+                    .expect("obs-text is a valid header value"),
+            )
+            .body(())
+            .unwrap();
+        assert_eq!(UpstreamHead::from_response(&response).etag, None);
+        assert_eq!(well_formed_etag(Some("\"caffe\u{e9}\"")), None);
+    }
+
     #[cfg(feature = "hyper")]
     #[test]
     fn from_response_chunked_overrides_content_length() {
