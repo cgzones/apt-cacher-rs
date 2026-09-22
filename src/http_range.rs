@@ -166,6 +166,14 @@ const AGE_OVERFLOW_VALUE: u64 = 1u64 << 31;
 /// mtime (see `touch_volatile_mtime`) to record the last upstream check, so on non-btime
 /// filesystems the returned timestamp tracks that instead of the original creation time.
 /// Permanent entries are unaffected since they are never mtime-touched after rename.
+///
+/// The first client of a download whose upstream sent no `Last-Modified` gets the same
+/// fallback: both backends synthesize one from the temp file at open (`CacheInfo::with_meta`
+/// for hyper, `CacheTarget::last_modified` for splice). Without btime that is the mtime at
+/// the start of the download, while later cache hits see the mtime of the last body write,
+/// so a download crossing a second boundary hands out a validator no later hit reproduces:
+/// `If-Range` fails safe to a full 200, `If-Modified-Since` costs one refetch. Accepted as
+/// a degradation of such filesystems, which startup only warns about.
 #[must_use]
 pub(crate) fn cache_file_http_date(metadata: &std::fs::Metadata) -> HttpDate {
     let st = metadata.created().unwrap_or_else(|_err| {
