@@ -1,21 +1,21 @@
 //! Pure-Rust XZ streaming decompressor.
 //!
-//! Drives `lzma_rust2::XzStream` (the push-style decoder) in a tokio blocking
-//! task feeding a `tokio::io::duplex` pipe, so callers can treat it as any
-//! other `AsyncRead`. Replaces `async_compression::tokio::bufread::XzDecoder`
-//! to remove the C `liblzma`/`liblzma-sys` dependency.
+//! Drives `lzma_rust2::XzReader` in a tokio blocking task feeding a
+//! `tokio::io::duplex` pipe, so callers can treat it as any other
+//! `AsyncRead`. Replaces `async_compression::tokio::bufread::XzDecoder` to
+//! remove the C `liblzma`/`liblzma-sys` dependency.
 //!
-//! `XzStream` rather than the `Read`-adapter `XzReader` because only the
-//! former takes a memory limit: the LZMA2 dictionary size comes verbatim from
-//! the (untrusted) block header and is allocated before any output reaches
-//! the callers' decompression caps.  [`crate::limits::MAX_XZ_DICT_SIZE`] bounds it.
+//! The reader is built through `new_mem_limit`: the LZMA2 dictionary size
+//! comes verbatim from the (untrusted) block header and is allocated before
+//! any output reaches the callers' decompression caps.
+//! [`crate::limits::MAX_XZ_DICT_SIZE`] bounds it.
 
 use std::future::Future as _;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use lzma_rust2::{Action, Status, XzStream};
+use lzma_rust2::XzReader;
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
 use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
@@ -27,7 +27,7 @@ use crate::limits::MAX_XZ_DICT_SIZE;
 /// of memory.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
-/// Async wrapper over a blocking [`XzStream`] decode.
+/// Async wrapper over a blocking [`XzReader`] decode.
 ///
 /// EOF on the inner pipe triggers a poll of `tail` to surface any terminal
 /// `io::Error` the decoder produced; a clean decode reports the EOF verbatim.
@@ -48,7 +48,7 @@ where
     let (err_tx, err_rx) = oneshot::channel::<io::Result<()>>();
 
     tokio::task::spawn_blocking(move || {
-        let mut bridge_in = SyncIoBridge::new(reader);
+        let bridge_in = SyncIoBridge::new(reader);
         // Buffer up to the duplex capacity: writing straight through would
         // cross the bridge in small pieces, each a block_on round-trip
         // between the blocking thread and the runtime — the BufWriter cuts
@@ -56,7 +56,7 @@ where
         // the result send (BufWriter's Drop swallows them).
         let mut bridge_out =
             io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
-        let result = decode_stream(&mut bridge_in, &mut bridge_out)
+        let result = decode_stream(bridge_in, &mut bridge_out)
             .and_then(|()| io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
         // EOF on `inner` before polling `tail`. Without this, the consumer can
@@ -77,46 +77,27 @@ where
 }
 
 /// The decoder's memory limit in KiB: the dictionary cap plus the fixed
-/// per-stream overhead `lzma_rust2` adds on top (a few dozen KiB; one MiB of
-/// slack keeps a `-9` index decodable without tracking the crate's exact
-/// formula).
+/// per-block overhead `lzma_rust2` adds on top (its 64 KiB range-decoder
+/// buffer and a few dozen KiB of state; one MiB of slack keeps a `-9` index
+/// decodable without tracking the crate's exact formula).
 fn xz_mem_limit_kb() -> u32 {
     let dict_kib = MAX_XZ_DICT_SIZE.get() / 1024 + 1024;
     u32::try_from(dict_kib).expect("64 MiB in KiB fits u32")
 }
 
-/// Pump `input` through a memory-limited [`XzStream`] into `output` until the
-/// stream ends.
-fn decode_stream(input: &mut impl io::Read, output: &mut impl io::Write) -> io::Result<()> {
-    let mut stream =
-        XzStream::new_mem_limit(/* allow_multiple_streams = */ true, xz_mem_limit_kb());
-    let mut in_buf = vec![0u8; PIPE_CAPACITY];
-    let mut out_buf = vec![0u8; PIPE_CAPACITY];
-    let mut in_len = 0;
-    let mut in_pos = 0;
-    let mut eof = false;
-
-    loop {
-        if in_pos == in_len && !eof {
-            in_len = input.read(&mut in_buf)?;
-            in_pos = 0;
-            eof = in_len == 0;
-        }
-        let action = if eof { Action::Finish } else { Action::Run };
-        let step = stream.process(&in_buf[in_pos..in_len], &mut out_buf, action)?;
-        in_pos += step.bytes_consumed;
-        output.write_all(&out_buf[..step.bytes_produced])?;
-        match step.status {
-            Status::StreamEnd => return Ok(()),
-            Status::Ok => {}
-        }
-        if eof && step.bytes_consumed == 0 && step.bytes_produced == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "xz stream ended without a stream footer",
-            ));
-        }
-    }
+/// Pump `input` through a memory-limited [`XzReader`] into `output` until the
+/// stream ends.  A truncated stream surfaces as the reader's `UnexpectedEof`.
+fn decode_stream(input: impl io::Read, output: &mut impl io::Write) -> io::Result<()> {
+    // Buffer the input side too: the reader pulls block and chunk headers
+    // in a few bytes at a time, each of which would otherwise be its own
+    // bridge round-trip.
+    let input = io::BufReader::with_capacity(PIPE_CAPACITY, input);
+    let mut reader = XzReader::new_mem_limit(
+        input,
+        /* allow_multiple_streams = */ true,
+        xz_mem_limit_kb(),
+    );
+    io::copy(&mut reader, output).map(|_bytes| ())
 }
 
 impl AsyncRead for XzDecoderStream {
@@ -226,6 +207,19 @@ mod tests {
             .expect_err("a dictionary above the cap must be refused");
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
         assert!(out.is_empty(), "nothing must be decoded");
+    }
+
+    #[tokio::test]
+    async fn truncated_input_surfaces_io_error() {
+        // Cut the stream before its index and footer: the decoder must not
+        // report a clean EOF.
+        let mut decoder = xz_decoder(Cursor::new(&HELLO_XZ[..48]));
+        let mut out = Vec::new();
+        let err = decoder
+            .read_to_end(&mut out)
+            .await
+            .expect_err("a truncated xz stream must be an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     }
 
     #[tokio::test]
