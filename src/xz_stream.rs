@@ -1,21 +1,31 @@
 //! Pure-Rust XZ streaming decompressor.
 //!
-//! Drives `lzma_rust2::XzReader` in a tokio blocking task feeding a
-//! `tokio::io::duplex` pipe, so callers can treat it as any other
-//! `AsyncRead`. Replaces `async_compression::tokio::bufread::XzDecoder` to
-//! remove the C `liblzma`/`liblzma-sys` dependency.
+//! Drives `lzma_rust2::XzStream` (the push-style decoder) in a tokio blocking
+//! task feeding a `tokio::io::duplex` pipe, so callers can treat it as any
+//! other `AsyncRead`. Replaces `async_compression::tokio::bufread::XzDecoder`
+//! to remove the C `liblzma`/`liblzma-sys` dependency.
 //!
-//! The reader is built through `new_mem_limit`: the LZMA2 dictionary size
+//! The decoder is built through `new_mem_limit`: the LZMA2 dictionary size
 //! comes verbatim from the (untrusted) block header and is allocated before
 //! any output reaches the callers' decompression caps.
 //! [`crate::limits::MAX_XZ_DICT_SIZE`] bounds it.
+//!
+//! `XzStream` rather than the `Read`-adapter `XzReader`, although the latter
+//! takes the same memory limit since lzma-rust2 0.21: `XzReader`'s index
+//! parser reserves and fills a record vector sized by the (untrusted) index
+//! record count before comparing it with the blocks it decoded, and never
+//! checks a record against its block.  An index yields no output, so none of
+//! the callers' decompression caps see it; a few dozen bytes can claim 2^31
+//! records.  `XzStream` rejects a count that differs from the decoded block
+//! count before reading a single record, and validates each record as it
+//! arrives.
 
 use std::future::Future as _;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use lzma_rust2::XzReader;
+use lzma_rust2::{Action, Status, XzStream};
 use tokio::io::{AsyncRead, DuplexStream, ReadBuf};
 use tokio::sync::oneshot;
 use tokio_util::io::SyncIoBridge;
@@ -27,7 +37,7 @@ use crate::limits::MAX_XZ_DICT_SIZE;
 /// of memory.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
-/// Async wrapper over a blocking [`XzReader`] decode.
+/// Async wrapper over a blocking [`XzStream`] decode.
 ///
 /// EOF on the inner pipe triggers a poll of `tail` to surface any terminal
 /// `io::Error` the decoder produced; a clean decode reports the EOF verbatim.
@@ -48,7 +58,7 @@ where
     let (err_tx, err_rx) = oneshot::channel::<io::Result<()>>();
 
     tokio::task::spawn_blocking(move || {
-        let bridge_in = SyncIoBridge::new(reader);
+        let mut bridge_in = SyncIoBridge::new(reader);
         // Buffer up to the duplex capacity: writing straight through would
         // cross the bridge in small pieces, each a block_on round-trip
         // between the blocking thread and the runtime — the BufWriter cuts
@@ -56,7 +66,7 @@ where
         // the result send (BufWriter's Drop swallows them).
         let mut bridge_out =
             io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
-        let result = decode_stream(bridge_in, &mut bridge_out)
+        let result = decode_stream(&mut bridge_in, &mut bridge_out)
             .and_then(|()| io::Write::flush(&mut bridge_out));
         // Drop the write half BEFORE sending the result so the consumer sees
         // EOF on `inner` before polling `tail`. Without this, the consumer can
@@ -85,19 +95,42 @@ fn xz_mem_limit_kb() -> u32 {
     u32::try_from(dict_kib).expect("64 MiB in KiB fits u32")
 }
 
-/// Pump `input` through a memory-limited [`XzReader`] into `output` until the
-/// stream ends.  A truncated stream surfaces as the reader's `UnexpectedEof`.
-fn decode_stream(input: impl io::Read, output: &mut impl io::Write) -> io::Result<()> {
-    // Buffer the input side too: the reader pulls block and chunk headers
-    // in a few bytes at a time, each of which would otherwise be its own
-    // bridge round-trip.
-    let input = io::BufReader::with_capacity(PIPE_CAPACITY, input);
-    let mut reader = XzReader::new_mem_limit(
-        input,
-        /* allow_multiple_streams = */ true,
-        xz_mem_limit_kb(),
-    );
-    io::copy(&mut reader, output).map(|_bytes| ())
+/// Pump `input` through a memory-limited [`XzStream`] into `output` until the
+/// stream ends.  A truncated stream surfaces as `UnexpectedEof`.
+fn decode_stream(input: &mut impl io::Read, output: &mut impl io::Write) -> io::Result<()> {
+    // Not `XzReader`: see the module doc (its index parser allocates from the
+    // untrusted record count before the count-vs-blocks check).
+    let mut stream =
+        XzStream::new_mem_limit(/* allow_multiple_streams = */ true, xz_mem_limit_kb());
+    // Input is read in `PIPE_CAPACITY` chunks, so the bridge is crossed once
+    // per chunk, not once per header field.
+    let mut in_buf = vec![0u8; PIPE_CAPACITY];
+    let mut out_buf = vec![0u8; PIPE_CAPACITY];
+    let mut in_len = 0;
+    let mut in_pos = 0;
+    let mut eof = false;
+
+    loop {
+        if in_pos == in_len && !eof {
+            in_len = input.read(&mut in_buf)?;
+            in_pos = 0;
+            eof = in_len == 0;
+        }
+        let action = if eof { Action::Finish } else { Action::Run };
+        let step = stream.process(&in_buf[in_pos..in_len], &mut out_buf, action)?;
+        in_pos += step.bytes_consumed;
+        output.write_all(&out_buf[..step.bytes_produced])?;
+        match step.status {
+            Status::StreamEnd => return Ok(()),
+            Status::Ok => {}
+        }
+        if eof && step.bytes_consumed == 0 && step.bytes_produced == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "xz stream ended without a stream footer",
+            ));
+        }
+    }
 }
 
 impl AsyncRead for XzDecoderStream {
@@ -206,6 +239,31 @@ mod tests {
             .await
             .expect_err("a dictionary above the cap must be refused");
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory, "{err}");
+        assert!(out.is_empty(), "nothing must be decoded");
+    }
+
+    /// A stream header followed straight by an index (indicator 0x00, so
+    /// zero blocks) whose record count claims 2^31 records, then nothing.
+    /// `XzReader`'s index parser reserves `count * 16` bytes (32 GiB) before
+    /// it compares the count with the blocks it saw; the decoder must reject
+    /// the mismatch from the count alone.
+    const HOSTILE_INDEX_XZ: &[u8] = &[
+        0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x00, 0x80, 0x80,
+        0x80, 0x80, 0x08,
+    ];
+
+    #[tokio::test]
+    async fn hostile_index_record_count_is_refused_before_allocation() {
+        let mut decoder = xz_decoder(Cursor::new(HOSTILE_INDEX_XZ));
+        let mut out = Vec::new();
+        let err = decoder
+            .read_to_end(&mut out)
+            .await
+            .expect_err("an index claiming records for absent blocks must be refused");
+        // `InvalidData` from the count check, not `OutOfMemory` (a failed
+        // reservation) or `UnexpectedEof` (a granted one, then reading the
+        // records off the end of the input).
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         assert!(out.is_empty(), "nothing must be decoded");
     }
 
