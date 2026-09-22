@@ -2211,22 +2211,31 @@ async fn serve_new_file_worker(
         "path construction must not contain absolute components"
     );
 
+    // A resumed `206` keeps the partial's validators it does not repeat
+    // (`inherit_resumed`); read them before `into_target` consumes the partial.
+    let upstream_metadata = Arc::new(
+        UpstreamMetadata::from_upstream(upstream_etag, upstream_last_modified)
+            .inherit_resumed(partial.resumed_validators()),
+    );
+    let target_file = partial.target_file();
+
     // Create/open the output file: partial path for permanent files, random temp for volatile.
     // Defuse the guard once we take ownership of the partial path — from here on, the
     // download's own `OnDrop::Keep` TempPath manages the file lifetime.
     let (outfile, outpath) = partial.into_target(filename, resume_offset).await?;
-
-    let upstream_metadata = Arc::new(UpstreamMetadata::from_upstream(
-        upstream_etag,
-        upstream_last_modified,
-    ));
     // Persist the validators (and the expected total, so a resume can detect
     // an upstream change) early, so they survive an interrupted download.
     let expected_size = match total_content_length {
         ContentLength::Exact(total) => Some(total.get()),
         ContentLength::Unknown(_) => None,
     };
-    write_upstream_metadata(&outfile, &outpath, &upstream_metadata, expected_size);
+    write_upstream_metadata(
+        &outfile,
+        &outpath,
+        &upstream_metadata,
+        expected_size,
+        target_file,
+    );
 
     if resume_offset > 0 {
         info!(

@@ -169,11 +169,15 @@ const AGE_OVERFLOW_VALUE: u64 = 1u64 << 31;
 ///
 /// The first client of a download whose upstream sent no `Last-Modified` gets the same
 /// fallback: both backends synthesize one from the temp file at open (`CacheInfo::with_meta`
-/// for hyper, `CacheTarget::last_modified` for splice). Without btime that is the mtime at
-/// the start of the download, while later cache hits see the mtime of the last body write,
-/// so a download crossing a second boundary hands out a validator no later hit reproduces:
-/// `If-Range` fails safe to a full 200, `If-Modified-Since` costs one refetch. Accepted as
-/// a degradation of such filesystems, which startup only warns about.
+/// in hyper's `serve_unfinished_file`, `HeadValidators::last_modified` for splice). Without
+/// btime that is the mtime at the start of the download, while later cache hits see the
+/// mtime of the last body write, so a download crossing a second boundary hands out a
+/// validator no later hit reproduces: `If-Range` fails safe to a full 200,
+/// `If-Modified-Since` costs one refetch. The same drift voids the splice `If-Range` match
+/// on a resume: a retry resuming a `.partial` with the date its interrupted first attempt
+/// sent should get its `206`, but the partial's mtime has since moved with that attempt's
+/// writes, so the resumed download synthesizes a later date and the retry gets a full 200.
+/// Accepted as a degradation of such filesystems, which startup only warns about.
 #[must_use]
 pub(crate) fn cache_file_http_date(metadata: &std::fs::Metadata) -> HttpDate {
     let st = metadata.created().unwrap_or_else(|_err| {

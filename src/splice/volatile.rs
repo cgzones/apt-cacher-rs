@@ -19,7 +19,6 @@
 //! commit-time verification instead of an incremental digest.
 
 use std::num::NonZero;
-use std::sync::Arc;
 
 use http::StatusCode;
 use tracing::debug;
@@ -43,8 +42,8 @@ use super::commit::{CommitTail, Committed, CompletionBytes, CompletionClient, Se
 use super::http::{BodyFraming, UpstreamResponse};
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
-    ClientConn, RateTimestamps, SpliceProxyError, SpliceProxyOutcome, prepare_cache_target,
-    write_splice_response_headers,
+    ClientConn, HeadValidators, RateTimestamps, SpliceProxyError, SpliceProxyOutcome,
+    prepare_cache_target, write_splice_response_headers,
 };
 
 /// Handle the full lifecycle for volatile files whose upstream response has no
@@ -157,7 +156,7 @@ pub(super) async fn handle_volatile_buffered_download(
     // below and the connection survives.
     // The head is written after the commit consumed the target: keep the
     // validator it settled on.
-    let last_modified = Arc::clone(&target.last_modified);
+    let validators = target.validators.clone();
     let cache_write = super::write_body_prefix_to_cache(target, &body, Consequence::Abandon).await;
 
     // Persist via rename+commit, only if the body reached the temp file. When
@@ -194,7 +193,7 @@ pub(super) async fn handle_volatile_buffered_download(
         conn_details,
         upstream_resp,
         &range_plan,
-        &last_modified,
+        &validators,
         &body,
         &mut rates,
     )
@@ -236,7 +235,7 @@ async fn serve_buffered(
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
     range_plan: &ServeParams,
-    last_modified: &str,
+    validators: &HeadValidators,
     body: &[u8],
     rates: &mut RateTimestamps,
 ) -> Result<(), ReportedDelivery> {
@@ -248,7 +247,7 @@ async fn serve_buffered(
         conn_details,
         upstream_resp,
         range_plan,
-        last_modified,
+        validators,
         body,
         rates,
     )
@@ -279,7 +278,7 @@ async fn write_buffered_response(
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
     range_plan: &ServeParams,
-    last_modified: &str,
+    validators: &HeadValidators,
     body: &[u8],
     rates: &mut RateTimestamps,
 ) -> Result<(), ReportedDelivery> {
@@ -288,7 +287,7 @@ async fn write_buffered_response(
         conn_details,
         upstream_resp,
         range_plan,
-        last_modified,
+        validators,
         HEAD_PHASE,
     )
     .await

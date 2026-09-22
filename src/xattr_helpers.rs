@@ -198,9 +198,10 @@ fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, why: Remo
 
 /// Remove a `V` the current download does not carry, so an attribute left
 /// by an earlier attempt on the same file (a resumed partial) cannot outlive
-/// the value it belonged to. Absent attributes are the common case and
-/// silent; the caller is `cache_metadata::write_upstream_metadata`, which
-/// must leave the file's xattrs equal to the metadata it then publishes.
+/// the value it belonged to. An absent attribute is success and silent; the
+/// caller is `cache_metadata::write_upstream_metadata`, which must leave the
+/// file's xattrs equal to the metadata it then publishes and calls this only
+/// for a resumed partial (a file the download created has nothing to remove).
 pub(crate) fn remove_stale<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) {
     remove::<V>(file, display_path, Removal::Stale);
 }
@@ -321,6 +322,7 @@ impl XattrValue for ExpectedSize {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_support::levels_during;
 
     /// Plant a raw (possibly malformed) value under `V`'s key, bypassing the
     /// typed layer. `false` when the test filesystem rejects user xattrs, so
@@ -369,8 +371,12 @@ pub(crate) mod tests {
 
         remove_stale::<V>(&file, &path);
         assert!(matches!(try_read::<V>(&file, &path), Ok(None)));
-        // Removing an absent attribute is the common case and must be silent.
-        remove_stale::<V>(&file, &path);
+        // Removing an absent attribute (`ENODATA`) is success: no warn.
+        let levels = levels_during(|| remove_stale::<V>(&file, &path));
+        assert!(
+            levels.is_empty(),
+            "removing an absent attribute must be silent, logged {levels:?}"
+        );
         assert!(matches!(try_read::<V>(&file, &path), Ok(None)));
     }
 

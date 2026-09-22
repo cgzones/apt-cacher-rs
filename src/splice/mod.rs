@@ -319,20 +319,24 @@ async fn resolve_client_range(
 /// headers differently; the wire bytes are pinned by the
 /// `splice_response_head_renders_the_pinned_bytes` test.
 ///
-/// `last_modified` is always sent: the upstream's validated value, else the
-/// one [`CacheTarget::last_modified`] synthesizes -- the same value every
-/// later cache hit of this file carries, so the first client gets the same
-/// `If-Modified-Since` validator as the next (hyper's `serve_new_file` does
+/// The validators are the download's settled ones ([`HeadValidators`]), not
+/// the upstream head's: `Last-Modified` is always sent -- the same value
+/// every later cache hit of this file carries, so the first client gets the
+/// same `If-Modified-Since` validator as the next (hyper's
+/// `serve_unfinished_file`, reached through `serve_downloading_file`, does
 /// the same through `CacheInfo::with_meta`).
 fn render_splice_response_head(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
-    upstream_resp: &UpstreamResponse,
     range: &ServeParams,
     content_type: &str,
     date: &str,
-    last_modified: &str,
+    validators: &HeadValidators,
 ) -> String {
+    let HeadValidators {
+        etag,
+        last_modified,
+    } = validators;
     let status_line = range.status_line();
     let response_content_length = range.content_length;
     // `Age: 0` is a constant here: a fresh response streamed straight from
@@ -350,7 +354,7 @@ fn render_splice_response_head(
          Age: 0\r\n\
          {content_range_header}\
          \r\n",
-        etag_header = OptHeader("ETag", upstream_resp.etag.as_deref()),
+        etag_header = OptHeader("ETag", etag.as_deref()),
         content_range_header = OptHeader("Content-Range", range.content_range.as_deref()),
     )
 }
@@ -369,7 +373,7 @@ async fn write_splice_response_headers(
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
     range: &ServeParams,
-    last_modified: &str,
+    validators: &HeadValidators,
     phase: &'static str,
 ) -> Result<PreciseInstant, HeaderWriteFailure> {
     let content_type = content_type_for_cached_file(&conn_details.debname);
@@ -382,11 +386,10 @@ async fn write_splice_response_headers(
     let response_headers = render_splice_response_head(
         client.version,
         client.action,
-        upstream_resp,
         range,
         content_type,
         &date,
-        last_modified,
+        validators,
     );
 
     trace!(
@@ -421,10 +424,23 @@ struct CacheTarget {
     dbarrier: DownloadBarrier,
     temppath: TempPath,
     dest_path: PathBuf,
-    /// The `Last-Modified` the response head carries: the upstream's
-    /// validated value, else the temp file's creation date, which the
-    /// rename preserves and every later cache hit therefore reports too
-    /// (`CacheInfo::with_meta`); a resumed partial keeps its first attempt's.
+    /// The validators the response head carries and a client `If-Range` is
+    /// resolved against.
+    validators: HeadValidators,
+}
+
+/// The validators of a splice-served head: the download's settled metadata
+/// (the upstream's validated values, each one a resumed `206` omits taken
+/// from the partial -- `UpstreamMetadata::inherit_resumed`), not the
+/// upstream head's, so the first client sees what every later cache hit
+/// reports and what hyper's joining serve sends.
+#[derive(Clone)]
+struct HeadValidators {
+    etag: Option<Arc<str>>,
+    /// Always set: the settled value, else the temp file's creation date,
+    /// which the rename preserves and every later cache hit therefore
+    /// reports too (`CacheInfo::with_meta`); a resumed partial keeps its
+    /// first attempt's.
     last_modified: Arc<str>,
 }
 
@@ -437,7 +453,7 @@ struct CacheTarget {
 ///
 /// The client's `Range` is resolved here too, once the file exists: an
 /// `If-Range` date is compared against the very `Last-Modified` the head
-/// then carries ([`CacheTarget::last_modified`]), which for a synthesized
+/// then carries ([`HeadValidators::last_modified`]), which for a synthesized
 /// one is the temp file's creation date and so cannot be known before the
 /// open. A retry that resumes a `.partial` with the date its first attempt
 /// sent therefore gets its `206`; a mismatching date gets the whole file.
@@ -446,7 +462,9 @@ struct CacheTarget {
 /// `503 Disk quota reached` (tagged `quota_phase`), the 500 for a
 /// `Resumable` partial that does not hold exactly `resume_offset` bytes, or
 /// the `416` (tagged `phase_416`; a `Fresh` partial stays behind empty,
-/// which the next attempt treats as no partial at all).
+/// which the next attempt treats as no partial at all and replaces with a
+/// new file -- `partial_file::create_partial_file` -- so its creation date
+/// does not become that download's synthesized `Last-Modified`).
 ///
 /// The caller selects the transport's write mode; the writer enables hashing
 /// only when it can cover the entire file, including the prefix.
@@ -529,11 +547,14 @@ async fn prepare_cache_target(
     // random temp file for volatile ones. The permanent arms take over the
     // caller's path guard, whose `OnDrop::Keep` is what leaves a failed
     // download's partial on disk for a later resume; the volatile temp file is
-    // removed on drop instead.
+    // removed on drop instead. A resumed `206` keeps the partial's validators
+    // it does not repeat (`inherit_resumed`).
     let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
         upstream_resp.etag.clone(),
         upstream_resp.last_modified.clone(),
-    );
+    )
+    .inherit_resumed(partial.resumed_validators());
+    let target_file = partial.target_file();
     let (mut ibarrier, (tempfile, temppath, last_modified, cache_time)) = ibarrier
         .run(async |_barrier| {
             let (tempfile, temppath) = partial.into_target(filename, resume_offset).await?;
@@ -556,6 +577,10 @@ async fn prepare_cache_target(
         })
         .await
         .map_err(SpliceProxyError::ReportedBeforeHeader)?;
+    let validators = HeadValidators {
+        etag: download_meta.etag.clone(),
+        last_modified,
+    };
     // `If-Range` compares against the validators this response carries.
     let Some(range_plan) = resolve_client_range(
         &mut ibarrier,
@@ -564,7 +589,7 @@ async fn prepare_cache_target(
         client_range,
         total_content_length.get(),
         cache_time,
-        upstream_resp.etag.as_deref(),
+        validators.etag.as_deref(),
         phase_416,
     )
     .await?
@@ -578,6 +603,7 @@ async fn prepare_cache_target(
         &temppath,
         &download_meta,
         Some(total_content_length.get()),
+        target_file,
     );
     let (_settled, dbarrier) = ibarrier
         .download(
@@ -608,7 +634,7 @@ async fn prepare_cache_target(
         dbarrier,
         temppath,
         dest_path,
-        last_modified,
+        validators,
     };
     Ok(Some((target, range_plan)))
 }
@@ -1148,7 +1174,7 @@ async fn write_body_prefix_to_cache(
         dbarrier,
         temppath,
         dest_path,
-        last_modified,
+        validators,
     } = target;
     let (dbarrier, ()) = dbarrier
         .run(consequence, async |barrier| {
@@ -1163,7 +1189,7 @@ async fn write_body_prefix_to_cache(
         dbarrier,
         temppath,
         dest_path,
-        last_modified,
+        validators,
     })
 }
 
@@ -1285,7 +1311,7 @@ async fn transfer_body(
         dbarrier,
         temppath,
         dest_path,
-        last_modified,
+        validators,
     } = target;
     let outcome = dbarrier
         .run(consequence, async |barrier| {
@@ -1327,7 +1353,7 @@ async fn transfer_body(
         dbarrier,
         temppath,
         dest_path,
-        last_modified,
+        validators,
     };
     // Every body byte is on disk now (the loops' final `cache.flush`); the
     // readers learn that from `begin_rename`, which every caller reaches
@@ -1643,7 +1669,7 @@ async fn splice_proxy_drive(
         conn_details,
         &upstream_resp,
         &range_plan,
-        &target.last_modified,
+        &target.validators,
         head_phase,
     )
     .await
@@ -1891,14 +1917,21 @@ mod tests {
             parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
                 .expect("should parse");
         let whole = ServeParams::from_parsed(None, 1000).expect("no range");
+        let validators = HeadValidators {
+            etag: resp.etag.as_deref().map(Arc::from),
+            last_modified: resp
+                .last_modified
+                .as_deref()
+                .expect("upstream sent one")
+                .into(),
+        };
         let head = render_splice_response_head(
             ConnectionVersion::Http11,
             ConnectionAction::KeepAlive,
-            &resp,
             &whole,
             "application/vnd.debian.binary-package",
             date,
-            resp.last_modified.as_deref().expect("upstream sent one"),
+            &validators,
         );
         assert_eq!(
             head,
@@ -1917,10 +1950,6 @@ mod tests {
             )
         );
 
-        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
         let partial = ServeParams::from_parsed(
             Some(ParsedRange::Satisfiable {
                 content_range: "bytes 200-499/1000".to_owned(),
@@ -1930,16 +1959,19 @@ mod tests {
             1000,
         )
         .expect("satisfiable");
-        // No upstream `Last-Modified`: the caller hands in the synthesized
-        // one, which is rendered like any other.
+        // No `ETag`, and a synthesized `Last-Modified`, which is rendered
+        // like any other.
+        let validators = HeadValidators {
+            etag: None,
+            last_modified: "Sat, 03 Jan 2026 00:00:00 GMT".into(),
+        };
         let head = render_splice_response_head(
             ConnectionVersion::Http10,
             ConnectionAction::Close,
-            &resp,
             &partial,
             "text/plain",
             date,
-            "Sat, 03 Jan 2026 00:00:00 GMT",
+            &validators,
         );
         assert_eq!(
             head,

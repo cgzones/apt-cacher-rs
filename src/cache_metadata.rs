@@ -28,10 +28,14 @@
 //! to the xattr helpers and inserts the result. xattr writes still happen
 //! on the download path (every backend calls [`write_upstream_metadata`]
 //! on the same [`UpstreamMetadata`] it later publishes) so the values
-//! survive process restarts. A validator the metadata lacks is *removed*
-//! there, not left alone: a resumed partial still carries its first
-//! attempt's xattrs, and a stale one would otherwise be what a restart
-//! reads back for a file whose download published `None`.
+//! survive process restarts. A resumed download's metadata first inherits
+//! each validator its `206` omitted from the partial
+//! ([`UpstreamMetadata::inherit_resumed`]); on a resumed partial a
+//! validator it still lacks is *removed* there, not left alone: the partial
+//! still carries its first attempt's xattrs, and a stale one would
+//! otherwise be what a restart reads back for a file whose download
+//! published `None`. Every other download writes to a file it just created
+//! ([`TargetFile::New`]), which has nothing to remove.
 //!
 //! # Publication invariant
 //!
@@ -113,6 +117,60 @@ impl UpstreamMetadata {
             last_modified,
         }
     }
+
+    /// Fill in, for a download that resumes a partial, each validator the
+    /// upstream's `206` omitted from `resumed` -- the values the partial's
+    /// first attempt stored ([`crate::partial_file::PartialDownload::resumed_validators`];
+    /// `None` for any other download, which leaves `self` as it is).
+    ///
+    /// A resume is only ever requested with the stored strong `ETag` as
+    /// `If-Range`, so a `206` is the upstream's statement that the
+    /// representation is unchanged (RFC 9110 §13.1.5): the first attempt's
+    /// validators still describe it, and RFC 9110 §15.3.7 does not require a
+    /// `206` to repeat `Last-Modified`. Without this, a `206` lacking one
+    /// would publish a synthesized `Last-Modified` in place of the real one,
+    /// and one lacking the `ETag` would leave the file unresumable after a
+    /// second interruption. A value the `206` does carry wins. The stored
+    /// `Last-Modified` is not inherited next to a *different* `ETag` the
+    /// `206` names: that response does not vouch for the stored
+    /// representation, so the date would be paired with a tag it never
+    /// belonged to.
+    #[must_use]
+    pub(crate) fn inherit_resumed(self, resumed: Option<&Self>) -> Self {
+        let Some(Self {
+            etag: stored_etag,
+            last_modified: stored_last_modified,
+        }) = resumed
+        else {
+            return self;
+        };
+        let Self {
+            etag,
+            last_modified,
+        } = self;
+        let same_representation = etag.is_none() || etag == *stored_etag;
+        let last_modified = match last_modified {
+            Some(own) => Some(own),
+            None if same_representation => stored_last_modified.clone(),
+            None => None,
+        };
+        Self {
+            etag: etag.or_else(|| stored_etag.clone()),
+            last_modified,
+        }
+    }
+}
+
+/// Where [`write_upstream_metadata`] writes: what decides whether a
+/// validator the metadata lacks can be left alone. From
+/// `partial_file::PartialDownload::target_file`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetFile {
+    /// Created for this download (`O_EXCL`: a `Fresh` partial or a volatile
+    /// temp file), so it carries no xattrs yet.
+    New,
+    /// A resumed partial, still carrying its first attempt's xattrs.
+    Resumed,
 }
 
 /// Persist a download's upstream metadata on its cache file: the `ETag` and
@@ -122,8 +180,10 @@ impl UpstreamMetadata {
 /// interrupted download for resume; every backend calls this on the very
 /// [`UpstreamMetadata`] it hands the download barrier, which is what keeps
 /// the publication invariant (module docs) trivially true -- including for
-/// a validator `meta` lacks, whose attribute is removed in case an earlier
-/// attempt on the same partial left one behind.
+/// a validator `meta` lacks on a [`TargetFile::Resumed`] partial, whose
+/// attribute is removed in case the earlier attempt left one behind (an
+/// absent one is success). A [`TargetFile::New`] file skips those removals:
+/// they could only ever answer `ENODATA`.
 ///
 /// `meta`'s strings were validated once per upstream response by
 /// [`check_upstream_validators`], so the re-parse here cannot fail; the
@@ -133,6 +193,7 @@ pub(crate) fn write_upstream_metadata(
     display_path: &Path,
     meta: &UpstreamMetadata,
     expected_size: Option<u64>,
+    target: TargetFile,
 ) {
     let UpstreamMetadata {
         etag,
@@ -155,7 +216,11 @@ pub(crate) fn write_upstream_metadata(
                     );
                 }
             }
-            None => xattr_helpers::remove_stale::<ETag>(file, display_path),
+            None => {
+                if target == TargetFile::Resumed {
+                    xattr_helpers::remove_stale::<ETag>(file, display_path);
+                }
+            }
         }
         match last_modified {
             Some((raw, _time)) => {
@@ -169,7 +234,11 @@ pub(crate) fn write_upstream_metadata(
                     );
                 }
             }
-            None => xattr_helpers::remove_stale::<LastModified>(file, display_path),
+            None => {
+                if target == TargetFile::Resumed {
+                    xattr_helpers::remove_stale::<LastModified>(file, display_path);
+                }
+            }
         }
         if let Some(size) = expected_size {
             xattr_helpers::write(file, display_path, &ExpectedSize(size));
@@ -547,7 +616,7 @@ mod tests {
             Some("\"abc\"".into()),
             Some("Thu, 01 Jan 1970 00:00:00 GMT".into()),
         );
-        write_upstream_metadata(&file, &path, &meta, Some(4096));
+        write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::New);
 
         let resolved = store.resolve(&fixture_key(), &file, &path);
         // Skip on filesystems that reject xattr writes.
@@ -580,7 +649,7 @@ mod tests {
         }
 
         let meta = UpstreamMetadata::from_upstream(None, None);
-        write_upstream_metadata(&file, &path, &meta, Some(4096));
+        write_upstream_metadata(&file, &path, &meta, Some(4096), TargetFile::Resumed);
 
         assert!(
             xattr_helpers::read::<ETag>(&file, &path).is_none(),
@@ -596,11 +665,83 @@ mod tests {
         );
     }
 
+    /// A file the download just created has no xattrs to remove, so the
+    /// removals are skipped: a value planted anyway survives, which is how
+    /// the skip shows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn write_upstream_metadata_skips_removals_on_a_new_file() {
+        let (_dir, file, path) = fixture_file().await;
+        write_etag(&file, &path, "\"planted\"");
+        // Skip on filesystems that reject xattr writes.
+        if xattr_helpers::read::<ETag>(&file, &path).is_none() {
+            return;
+        }
+
+        let meta = UpstreamMetadata::from_upstream(None, None);
+        write_upstream_metadata(&file, &path, &meta, None, TargetFile::New);
+
+        assert_eq!(
+            xattr_helpers::read::<ETag>(&file, &path),
+            ETag::parse("\"planted\""),
+            "no removal is attempted on a new file"
+        );
+    }
+
+    const STORED_ETAG: &str = "\"first\"";
+    const STORED_LM: &str = "Thu, 01 Jan 2004 00:00:00 GMT";
+
+    fn stored_validators() -> UpstreamMetadata {
+        UpstreamMetadata::from_upstream(Some(STORED_ETAG.into()), Some(STORED_LM.into()))
+    }
+
+    /// A `206` answering the stored `ETag` as `If-Range` proves the first
+    /// attempt's validators still hold: the ones it omits are inherited.
+    #[test]
+    fn inherit_resumed_fills_what_the_206_omits() {
+        let stored = stored_validators();
+        assert_eq!(
+            UpstreamMetadata::from_upstream(None, None).inherit_resumed(Some(&stored)),
+            stored,
+            "a 206 without validators keeps both"
+        );
+        assert_eq!(
+            UpstreamMetadata::from_upstream(Some(STORED_ETAG.into()), None)
+                .inherit_resumed(Some(&stored)),
+            stored,
+            "a 206 echoing the ETag keeps the stored Last-Modified"
+        );
+        let own_lm = "Fri, 02 Jan 2004 00:00:00 GMT";
+        assert_eq!(
+            UpstreamMetadata::from_upstream(None, Some(own_lm.into()))
+                .inherit_resumed(Some(&stored)),
+            UpstreamMetadata::from_upstream(Some(STORED_ETAG.into()), Some(own_lm.into())),
+            "a value the 206 carries wins; the ETag it omits is inherited"
+        );
+    }
+
+    /// A `206` naming a different `ETag` does not vouch for the stored
+    /// representation: its own tag stands and the stored date is not paired
+    /// with it.
+    #[test]
+    fn inherit_resumed_keeps_the_stored_date_off_a_different_etag() {
+        let stored = stored_validators();
+        let other = UpstreamMetadata::from_upstream(Some("\"second\"".into()), None);
+        assert_eq!(other.clone().inherit_resumed(Some(&stored)), other);
+    }
+
+    /// Anything but a resumed download publishes the upstream's values as
+    /// they are.
+    #[test]
+    fn inherit_resumed_without_a_resumed_partial_is_identity() {
+        let upstream = UpstreamMetadata::from_upstream(None, Some(STORED_LM.into()));
+        assert_eq!(upstream.clone().inherit_resumed(None), upstream);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_upstream_metadata_without_size_leaves_no_expected_size() {
         let (_dir, file, path) = fixture_file().await;
         let meta = UpstreamMetadata::from_upstream(Some("\"abc\"".into()), None);
-        write_upstream_metadata(&file, &path, &meta, None);
+        write_upstream_metadata(&file, &path, &meta, None, TargetFile::New);
         assert_eq!(xattr_helpers::read::<ExpectedSize>(&file, &path), None);
         assert!(xattr_helpers::read::<LastModified>(&file, &path).is_none());
     }

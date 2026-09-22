@@ -13,15 +13,26 @@
 use std::{
     ops::Deref,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use rand::{RngExt as _, distr::Alphanumeric, rngs::SmallRng};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    Never, cache_paths::CachePaths, deb_mirror, error::ErrorReport,
-    fs_open::tokio_nofollow_options, guards::InitBarrier, http_etag::ETag, humanfmt::HumanFmt,
-    metrics, transfer_error::CacheError, xattr_helpers,
+    Never,
+    cache_metadata::{TargetFile, UpstreamMetadata},
+    cache_paths::CachePaths,
+    deb_mirror,
+    error::ErrorReport,
+    fs_open::tokio_nofollow_options,
+    guards::InitBarrier,
+    http_etag::ETag,
+    http_last_modified::LastModified,
+    humanfmt::HumanFmt,
+    metrics,
+    transfer_error::CacheError,
+    xattr_helpers,
 };
 
 /// Tri-state of an in-progress download's partial-file handling.
@@ -32,7 +43,9 @@ use crate::{
 ///   the deterministic partial path so a failed download can be resumed on the next attempt.
 /// - `Resumable`: permanent cache flavor with an existing valid partial whose file handle
 ///   has been held open since the size/ETag check (avoiding TOCTOU); caller resumes from
-///   `file`'s current offset.
+///   `file`'s current offset. `stored` holds the validators the first attempt persisted
+///   on the partial (its `ETag` is always set: it is what made the partial resumable),
+///   read through the same descriptor; see [`Self::resumed_validators`].
 ///
 /// The `Resumable` handle is opened once, up front, so size and mtime come
 /// from the same descriptor the download then writes through — there is no
@@ -48,6 +61,7 @@ pub(crate) enum PartialDownload {
     Resumable {
         file: tokio::fs::File,
         guard: TempPath,
+        stored: UpstreamMetadata,
     },
 }
 
@@ -58,11 +72,47 @@ impl PartialDownload {
         *self = match std::mem::replace(self, Self::Volatile) {
             Self::Volatile => Self::Volatile,
             Self::Fresh(guard) => Self::Fresh(guard),
-            Self::Resumable { file, guard } => {
+            Self::Resumable {
+                file,
+                guard,
+                stored: _,
+            } => {
                 drop(file);
                 Self::Fresh(guard.renew().await)
             }
         };
+    }
+
+    /// The validators the partial's first attempt stored, while the download
+    /// still resumes it: `Some` only for `Resumable`, which a resume anomaly
+    /// has already downgraded (see [`Self::discard_resume`]) by the time the
+    /// upstream's answer is a usable `206`. Both backends hand this to
+    /// [`UpstreamMetadata::inherit_resumed`].
+    pub(crate) fn resumed_validators(&self) -> Option<&UpstreamMetadata> {
+        match self {
+            Self::Resumable {
+                file: _,
+                guard: _,
+                stored,
+            } => Some(stored),
+            Self::Fresh(_) | Self::Volatile => None,
+        }
+    }
+
+    /// What [`Self::into_target`] hands back, for
+    /// `cache_metadata::write_upstream_metadata`: only a resumed partial
+    /// can carry xattrs of an earlier attempt; a `Fresh` partial is created
+    /// with `O_EXCL` ([`create_partial_file`]) and a volatile temp file
+    /// likewise ([`tokio_tempfile`]).
+    pub(crate) fn target_file(&self) -> TargetFile {
+        match self {
+            Self::Resumable {
+                file: _,
+                guard: _,
+                stored: _,
+            } => TargetFile::Resumed,
+            Self::Fresh(_) | Self::Volatile => TargetFile::New,
+        }
     }
 
     /// Open or create the file the body is written into, taking over the path
@@ -81,7 +131,11 @@ impl PartialDownload {
         use tokio::io::AsyncSeekExt as _;
 
         match self {
-            Self::Resumable { mut file, guard } => {
+            Self::Resumable {
+                mut file,
+                guard,
+                stored: _,
+            } => {
                 let size = file.seek(std::io::SeekFrom::End(0)).await.map_err(|err| {
                     CacheError::counted_io("seek partial cache file", &guard, err)
                 })?;
@@ -140,8 +194,9 @@ impl PartialResume {
 /// whether it can be safely resumed.
 ///
 /// Strong-validator requirement: a partial is only resumable when it carries
-/// a stored upstream `ETag`.  RFC 9110 §8.8.2.2 requires a strong validator
-/// for `If-Range`; `Last-Modified` / mtime are weak when the origin does not
+/// a stored upstream `ETag` that is strong (no `W/`).  RFC 9110 §13.1.5
+/// forbids a weak entity tag in `If-Range`, and §8.8.2.2 requires a strong
+/// validator for it; `Last-Modified` / mtime are weak when the origin does not
 /// guarantee sub-second-unique change detection — Debian mirror infrastructure
 /// does not — and the stored total-size xattr is insufficient to detect a
 /// same-size replacement within the mtime granularity.  Partials without an
@@ -176,8 +231,17 @@ async fn prepare_partial_resume_at(
 ) -> Result<PartialResume, PartialOpenFailure> {
     match open_partial_file(path).await {
         Ok((file, size, guard)) if size > 0 => {
-            if let Some(if_range) = xattr_helpers::read::<ETag>(&file, &guard) {
+            if let Some(if_range) =
+                xattr_helpers::read::<ETag>(&file, &guard).filter(ETag::is_strong)
+            {
                 let if_range = if_range.into_string();
+                let last_modified = xattr_helpers::read::<LastModified>(&file, &guard)
+                    .map(LastModified::into_parts)
+                    .map(|(raw, time)| (Arc::from(raw), time));
+                let stored = UpstreamMetadata {
+                    etag: Some(Arc::from(if_range.as_str())),
+                    last_modified,
+                };
                 let expected_total =
                     xattr_helpers::read::<xattr_helpers::ExpectedSize>(&file, &guard)
                         .map(|xattr_helpers::ExpectedSize(size)| size);
@@ -201,7 +265,11 @@ async fn prepare_partial_resume_at(
                     offset: size,
                     expected_total,
                     if_range: Some(if_range),
-                    partial: PartialDownload::Resumable { file, guard },
+                    partial: PartialDownload::Resumable {
+                        file,
+                        guard,
+                        stored,
+                    },
                 })
             } else {
                 warn!(
@@ -524,14 +592,19 @@ async fn open_partial_file(
 /// Create a new file at the given deterministic partial path, returning the file and a
 /// `OnDrop::Keep` `TempPath` guard. A failure names the path whose syscall
 /// failed: the partial itself, or the parent directory it had to create.
+///
+/// A file already at the path (the empty partial a `Fresh` download reuses,
+/// e.g. one a splice `416` or an attempt that failed before its first byte
+/// left behind) is unlinked and replaced, not truncated: the download must
+/// start on a new inode, or it would inherit the old attempt's creation date
+/// -- which a synthesized `Last-Modified` reports -- and any xattrs it wrote.
 pub(crate) async fn create_partial_file(
     guard: TempPath,
     mode: u32,
 ) -> Result<(tokio::fs::File, TempPath), CacheError> {
     async fn open(path: &Path, mode: u32) -> Result<tokio::fs::File, tokio::io::Error> {
         tokio_nofollow_options()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .read(true)
             .mode(mode)
@@ -547,15 +620,26 @@ pub(crate) async fn create_partial_file(
         // first into a given `tmp/`. `create_dir_all` is a blocking-pool
         // round trip of its own, so the steady state now costs one hop
         // rather than two.
+        // A leftover file costs the same extra hop: unlink it (a symlink
+        // planted there included -- `O_EXCL` does not follow it) and create
+        // afresh.
         match open(path, mode).await {
-            Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                        CacheError::counted_io("create partial cache directory", parent, err)
+                    })?;
+                }
+            }
+            Err(err) if err.kind() == tokio::io::ErrorKind::AlreadyExists => {
+                match tokio::fs::remove_file(path).await {
+                    Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {}
+                    result => result.map_err(|err| {
+                        CacheError::counted_io("remove leftover partial cache file", path, err)
+                    })?,
+                }
+            }
             result => return result.map_err(create),
-        }
-
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|err| {
-                CacheError::counted_io("create partial cache directory", parent, err)
-            })?;
         }
 
         open(path, mode).await.map_err(create)
@@ -599,10 +683,14 @@ mod tests {
         tokio::fs::write(&path, b"12345").await.expect("seed");
         let (file, _size, guard) = open_partial_file(path).await.expect("reopen");
         let before = metrics::CACHE_IO_FAILURE.get();
-        let err = PartialDownload::Resumable { file, guard }
-            .into_target(Path::new("x.deb"), 4)
-            .await
-            .expect_err("5 != 4");
+        let err = PartialDownload::Resumable {
+            file,
+            guard,
+            stored: UpstreamMetadata::default(),
+        }
+        .into_target(Path::new("x.deb"), 4)
+        .await
+        .expect_err("5 != 4");
         assert_eq!(metrics::CACHE_IO_FAILURE.get(), before);
         assert!(
             err.to_string().contains("validate resumed partial size"),
@@ -694,6 +782,43 @@ mod tests {
         assert!(!path.exists(), "remove unlinks regardless of OnDrop");
     }
 
+    /// A leftover file at the partial path is replaced by a new inode, not
+    /// truncated in place: the old one's creation date and xattrs must not
+    /// reach the new download.
+    // The xattr read runs through `block_in_place`, which needs the
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_partial_file_replaces_a_leftover_instead_of_truncating_it() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"").expect("write");
+        // Held open across the call, so the old inode stays allocated and its
+        // number cannot be handed straight back to the new file.
+        let leftover = std::fs::File::open(&path).expect("open leftover");
+        let planted = plant_raw::<ETag>(&leftover, b"\"old\"");
+        let old_ino = leftover.metadata().expect("stat leftover").ino();
+
+        let (file, guard) = create_partial_file(TempPath::keeping(path.clone()), 0o640)
+            .await
+            .expect("create over a leftover");
+        assert_eq!(&*guard, path.as_path());
+        assert_ne!(
+            file.metadata().await.expect("stat new").ino(),
+            old_ino,
+            "the download starts on a new inode"
+        );
+        if planted {
+            assert!(
+                xattr_helpers::read::<ETag>(&file, &path).is_none(),
+                "the leftover's xattrs stay with the leftover"
+            );
+        }
+        drop(leftover);
+    }
+
     #[tokio::test]
     async fn open_partial_file_rejects_a_non_regular_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -743,6 +868,37 @@ mod tests {
     // The xattr read runs through `block_in_place`, which needs the
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_partial_resume_discards_a_partial_with_a_weak_etag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"partial-bytes").expect("write");
+        let std_file = std::fs::File::open(&path).expect("open");
+        if !plant_raw::<ETag>(&std_file, b"W/\"weak\"") {
+            // Filesystem without user xattrs: nothing to gate on here.
+            return;
+        }
+        drop(std_file);
+        let mirror = structured_mirror("deb.example.org", "debian");
+
+        let resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
+            .await
+            .expect("a discarded partial is a fresh download");
+        assert_eq!(resume.offset, 0);
+        assert_eq!(
+            resume.if_range, None,
+            "a weak tag must never be sent as If-Range"
+        );
+        assert!(
+            matches!(resume.partial, PartialDownload::Fresh(_)),
+            "a weak ETag makes the partial unresumable"
+        );
+        assert!(!path.exists(), "the stale partial is unlinked");
+    }
+
+    // The xattr read runs through `block_in_place`, which needs the
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
     async fn prepare_partial_resume_resumes_a_partial_with_etag() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
@@ -754,6 +910,11 @@ mod tests {
             // exercised here.
             return;
         }
+        let stored_lm = "Thu, 01 Jan 2004 00:00:00 GMT";
+        assert!(
+            plant_raw::<LastModified>(&std_file, stored_lm.as_bytes()),
+            "the ETag planted, so the Last-Modified attribute must too"
+        );
         drop(std_file);
         let mirror = structured_mirror("deb.example.org", "debian");
 
@@ -767,6 +928,14 @@ mod tests {
             matches!(resume.partial, PartialDownload::Resumable { .. }),
             "a strong ETag makes the partial resumable"
         );
+        // Both stored validators ride along, for a `206` that omits them.
+        assert_eq!(
+            resume.partial.resumed_validators(),
+            Some(&UpstreamMetadata::from_upstream(
+                Some("\"strong\"".into()),
+                Some(stored_lm.into())
+            ))
+        );
 
         // A rejected resume (416 upstream) downgrades to a fresh download on
         // the same path.
@@ -774,6 +943,11 @@ mod tests {
         assert!(
             matches!(resume.partial, PartialDownload::Fresh(_)),
             "discard_resume yields Fresh"
+        );
+        assert_eq!(
+            resume.partial.resumed_validators(),
+            None,
+            "a discarded partial's validators describe nothing the download serves"
         );
         assert!(!path.exists(), "the stale partial is unlinked");
     }

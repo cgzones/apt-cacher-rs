@@ -39,6 +39,14 @@ pub(crate) fn is_valid_etag(s: &str) -> bool {
 pub(crate) struct ETag(String);
 
 impl ETag {
+    /// Whether the tag is strong (no `W/` weak indicator, RFC 9110 §8.8.1):
+    /// only a strong tag may be sent as `If-Range` (§13.1.5).
+    #[must_use]
+    pub(crate) fn is_strong(&self) -> bool {
+        let Self(etag) = self;
+        !etag.starts_with("W/")
+    }
+
     pub(crate) fn into_string(self) -> String {
         let Self(etag) = self;
         etag
