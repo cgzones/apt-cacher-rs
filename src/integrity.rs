@@ -539,6 +539,25 @@ impl ChecksumRegistry {
         self.inner.lock().len
     }
 
+    /// `(entries, entry capacity, order length, order capacity)` of one
+    /// scope.
+    #[cfg(test)]
+    fn scope_footprint(&self, host: &str, mirror_path: &str) -> (usize, usize, usize, usize) {
+        self.inner
+            .lock()
+            .map
+            .get(&RegistryScopeRef { host, mirror_path })
+            .map(|state| {
+                (
+                    state.entries.len(),
+                    state.entries.capacity(),
+                    state.order.len(),
+                    state.order.capacity(),
+                )
+            })
+            .expect("scope present")
+    }
+
     #[cfg(test)]
     fn order_len(&self) -> usize {
         self.inner.lock().map.values().map(|s| s.order.len()).sum()
@@ -579,11 +598,29 @@ fn evict(inner: &mut RegistryInner, cap: usize) {
         }
         if state.entries.is_empty() {
             inner.map.remove(&scope);
-        } else if live < quota {
+            continue;
+        }
+        shrink_scope(state);
+        if live < quota {
             // Its order log drained without meeting the quota: only stale
             // entries were left, which the pops above already discarded.
             break;
         }
+    }
+}
+
+/// Give back the memory an eviction freed. Neither the entry map nor the
+/// order log shrinks on its own, so a scope that once held most of the cap
+/// (a hostile index, which is what eviction hits first) would keep its peak
+/// footprint after losing most of its entries. Shrinking only past twice the
+/// live size keeps the rehash cost amortised over the evictions that
+/// caused it.
+fn shrink_scope(state: &mut ScopeState) {
+    if state.entries.capacity() > 2 * state.entries.len() + 16 {
+        state.entries.shrink_to_fit();
+    }
+    if state.order.capacity() > 2 * state.order.len() + 16 {
+        state.order.shrink_to_fit();
     }
 }
 
@@ -1281,12 +1318,19 @@ fn ingest_stanza_into_registry(
     mirror_path: &str,
     format: IndexFormat,
 ) {
-    if let Some(filename) = stanza.filename.as_deref()
-        && let Some(sha256) = stanza.sha256
-        && let Some(key) = index_parser::registry_key_from_filename_field(filename, format)
-    {
-        registry.insert(host, mirror_path, &key, sha256);
-    }
+    let (Some(filename), Some(sha256)) = (stanza.filename.as_deref(), stanza.sha256) else {
+        return;
+    };
+    let Some(key) = index_parser::registry_key_from_filename_field(filename, format) else {
+        // `Stanza` already rejected (and logged) unsafe values, so this is
+        // the length gate: a name no cache file can have.
+        warn_once_or_debug!(
+            "Not registering the digest of a {} byte Filename value from host {host} mirror {mirror_path}; no cache file can have that name",
+            filename.len()
+        );
+        return;
+    };
+    registry.insert(host, mirror_path, &key, sha256);
 }
 
 #[cfg(test)]
@@ -1726,6 +1770,32 @@ mod tests {
     }
 
     #[test]
+    fn eviction_shrinks_the_scope_it_drains() {
+        use std::num::NonZero;
+        // One scope fills the cap, then another mirror's inserts make it pay
+        // for the evictions: its map and order log must give the memory back
+        // instead of keeping the footprint of 1000 entries.
+        let reg = ChecksumRegistry::new(NonZero::new(1000).unwrap());
+        for i in 0..1000u32 {
+            reg.insert("big", "m", &format!("b{i}"), [0; 32]);
+        }
+        let (_, peak_capacity, _, _) = reg.scope_footprint("big", "m");
+        for i in 0..600u32 {
+            reg.insert("small", "m", &format!("s{i}"), [0; 32]);
+        }
+        let (len, capacity, order_len, order_capacity) = reg.scope_footprint("big", "m");
+        assert!(len <= 500, "big paid for the evictions, {len} left");
+        assert!(
+            capacity <= 2 * len + 16 && capacity < peak_capacity,
+            "entry capacity {capacity} for {len} entries (peak {peak_capacity})"
+        );
+        assert!(
+            order_capacity <= 2 * order_len + 16,
+            "order capacity {order_capacity} for {order_len} records"
+        );
+    }
+
+    #[test]
     fn registry_reinsert_refreshes_value() {
         use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
@@ -1940,6 +2010,43 @@ mod tests {
         assert_eq!(
             reg.lookup("deb.debian.org", "debian", "b_2_amd64.deb"),
             Some(sha_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_packages_skips_filenames_no_cache_file_can_have() {
+        use std::io::Write as _;
+        use std::num::NonZero;
+
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+        let digest = index_parser::hex_encode(&[0xaau8; 32]);
+        // A basename up to the 8 KiB line cap: before the length gate it was
+        // retained verbatim, per entry.
+        let long = "a".repeat(8000);
+        let packages = format!(
+            "Package: a\nFilename: pool/main/a/a/a_1_amd64.deb\nSHA256: {digest}\n\n\
+             Package: long\nFilename: pool/main/l/l/{long}.deb\nSHA256: {digest}\n"
+        );
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(packages.as_bytes()).expect("write");
+        f.flush().expect("flush");
+
+        ingest_packages_file(
+            &reg,
+            "deb.debian.org",
+            "debian",
+            f.path(),
+            PackagesCompression::Raw,
+            IndexFormat::Structured,
+            64 * 1024,
+        )
+        .await
+        .expect("ingest ok");
+
+        assert_eq!(reg.len(), 1, "only the cacheable name is registered");
+        assert!(
+            reg.lookup("deb.debian.org", "debian", "a_1_amd64.deb")
+                .is_some()
         );
     }
 
