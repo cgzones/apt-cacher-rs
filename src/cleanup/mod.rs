@@ -286,10 +286,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
         .iter()
         .zip(&host_keys)
         .map(|(mirror, &key)| {
-            let host_paths = paths_by_host
-                .get(&key)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
+            let host_paths = paths_by_host.get(&key).map_or_default(Vec::as_slice);
             derive_nested_paths(&mirror.path, host_paths)
         })
         .collect();
