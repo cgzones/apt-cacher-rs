@@ -5,7 +5,7 @@
 use std::{
     cmp::Reverse,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::SystemTime,
 };
 
@@ -105,26 +105,78 @@ fn merge_max(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime>
     a.into_iter().chain(b).max()
 }
 
-type DirStatsCache = parking_lot::Mutex<HashMap<PathBuf, (Instant, DirStats)>>;
+/// One mirror directory's cached walk result. The async lock is held for the
+/// whole refresh, so concurrent dashboard loads that find the entry stale wait
+/// for the one walk in flight and read its result instead of each walking
+/// the tree again.
+type DirStatsSlot = Arc<tokio::sync::Mutex<Option<(Instant, DirStats)>>>;
+
+type DirStatsCache = parking_lot::Mutex<HashMap<PathBuf, DirStatsSlot>>;
 
 static DIR_STATS_CACHE: LazyLock<DirStatsCache> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 async fn cached_mirror_directory_size(path: &Path) -> DirStats {
-    // Bind the lookup to a local so the `MutexGuard` drops at this `;`,
+    cached_dir_stats(
+        path,
+        |path| async move { mirror_directory_size(&path).await },
+    )
+    .await
+}
+
+/// The slot's result while it is younger than [`DIR_STATS_TTL_SECS`].
+fn fresh_dir_stats(cached: Option<(Instant, DirStats)>) -> Option<DirStats> {
+    cached
+        .filter(|(ts, _)| ts.elapsed().as_secs() < DIR_STATS_TTL_SECS)
+        .map(|(_, stats)| stats)
+}
+
+/// [`cached_mirror_directory_size`] with the walk passed in, so the
+/// single-flight refresh is testable without a mirror tree.
+///
+/// A refresh runs as its own task holding the slot, so a dashboard load
+/// cancelled mid-walk (the browser went away) does not throw the walk away:
+/// it completes and publishes, and the next load reads its result.
+async fn cached_dir_stats<F>(
+    path: &Path,
+    walk: impl FnOnce(PathBuf) -> F + Send + 'static,
+) -> DirStats
+where
+    F: Future<Output = DirStats> + Send + 'static,
+{
+    // Bind the slot to a local so the `MutexGuard` drops at this `;`,
     // before any `.await` below — `parking_lot::Mutex` held across an
     // await is a deadlock waiting for someone to extend the body.
-    let cached = DIR_STATS_CACHE.lock().get(path).copied();
-    if let Some((ts, stats)) = cached
-        && ts.elapsed().as_secs() < DIR_STATS_TTL_SECS
-    {
+    // `entry_ref` looks up by the borrowed `&Path`; only a first visit
+    // materialises the owned `PathBuf` key.
+    let slot = Arc::clone(DIR_STATS_CACHE.lock().entry_ref(path).or_default());
+    // Waits for a refresh in flight, which holds the lock.
+    let cached = *slot.lock().await;
+    if let Some(stats) = fresh_dir_stats(cached) {
         return stats;
     }
-    let stats = mirror_directory_size(path).await;
-    DIR_STATS_CACHE
-        .lock()
-        .insert(path.to_path_buf(), (Instant::now(), stats));
-    stats
+    let owned = path.to_path_buf();
+    let refresh = tokio::spawn(async move {
+        let mut cached = slot.lock_owned().await;
+        // Another load may have refreshed the slot since the check above.
+        if let Some(stats) = fresh_dir_stats(*cached) {
+            return stats;
+        }
+        let stats = walk(owned).await;
+        *cached = Some((Instant::now(), stats));
+        stats
+    });
+    match refresh.await {
+        Ok(stats) => stats,
+        Err(err) => {
+            error!(
+                "Failed to walk mirror directory `{}` for the dashboard; reporting it as empty:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            DirStats::default()
+        }
+    }
 }
 
 static DASHBOARD_WALK: WalkContext = WalkContext {
@@ -574,6 +626,68 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// Counts its calls; each takes 50 ms and reports seven files.
+    fn counted_walk(
+        walks: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce(PathBuf) -> std::pin::Pin<Box<dyn Future<Output = DirStats> + Send>> + Send + 'static
+    {
+        let walks = Arc::clone(walks);
+        move |_path| {
+            Box::pin(async move {
+                walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                DirStats {
+                    files: 7,
+                    ..DirStats::default()
+                }
+            })
+        }
+    }
+
+    /// Dashboard loads that find the same entry stale share one walk: the
+    /// others wait for it and read its result.
+    #[tokio::test]
+    async fn concurrent_refreshes_of_one_directory_walk_it_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let walks = Arc::new(AtomicUsize::new(0));
+        let results = futures_util::future::join_all(
+            std::iter::repeat_with(|| cached_dir_stats(dir.path(), counted_walk(&walks))).take(5),
+        )
+        .await;
+        assert!(results.iter().all(|stats| stats.files == 7));
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+        DIR_STATS_CACHE.lock().remove(dir.path());
+    }
+
+    /// A load cancelled mid-walk leaves the walk running: the next load
+    /// reads its result instead of walking again.
+    #[tokio::test]
+    async fn a_cancelled_refresh_still_publishes_its_walk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let walks = Arc::new(AtomicUsize::new(0));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                cached_dir_stats(dir.path(), counted_walk(&walks)),
+            )
+            .await
+            .is_err(),
+            "the first load is cancelled before its 50 ms walk ends"
+        );
+        let stats = cached_dir_stats(dir.path(), counted_walk(&walks)).await;
+        assert_eq!(stats.files, 7);
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            1,
+            "the cancelled walk was kept"
+        );
+        DIR_STATS_CACHE.lock().remove(dir.path());
     }
 
     #[test]
