@@ -72,7 +72,9 @@ use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, WritePhase, write_416_response,
     write_all_to_stream, write_invalid_response,
 };
-use crate::http_range::{HttpDate, ParsedRange, format_http_date, http_parse_range};
+use crate::http_range::{
+    HttpDate, ParsedRange, cache_file_http_date, format_http_date, http_parse_range,
+};
 use crate::humanfmt::HumanFmt;
 use crate::integrity;
 use crate::log_once::Logged;
@@ -308,6 +310,12 @@ async fn resolve_client_range(
 /// Deliberately not built on `ResponseHead::render`, which orders the
 /// headers differently; the wire bytes are pinned by the
 /// `splice_response_head_renders_the_pinned_bytes` test.
+///
+/// `last_modified` is always sent: the upstream's validated value, else the
+/// one [`CacheTarget::last_modified`] synthesizes -- the same value every
+/// later cache hit of this file carries, so the first client gets the same
+/// `If-Modified-Since` validator as the next (hyper's `serve_new_file` does
+/// the same through `CacheInfo::with_meta`).
 fn render_splice_response_head(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
@@ -315,6 +323,7 @@ fn render_splice_response_head(
     range: &ServeParams,
     content_type: &str,
     date: &str,
+    last_modified: &str,
 ) -> String {
     let status_line = range.status_line();
     let response_content_length = range.content_length;
@@ -327,13 +336,12 @@ fn render_splice_response_head(
          Connection: {conn_action}\r\n\
          Content-Length: {response_content_length}\r\n\
          Content-Type: {content_type}\r\n\
-         {last_modified_header}\
+         Last-Modified: {last_modified}\r\n\
          {etag_header}\
          Accept-Ranges: bytes\r\n\
          Age: 0\r\n\
          {content_range_header}\
          \r\n",
-        last_modified_header = OptHeader("Last-Modified", upstream_resp.last_modified.as_deref()),
         etag_header = OptHeader("ETag", upstream_resp.etag.as_deref()),
         content_range_header = OptHeader("Content-Range", range.content_range.as_deref()),
     )
@@ -350,6 +358,7 @@ async fn write_splice_response_headers(
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
     range: &ServeParams,
+    last_modified: &str,
     phase: &'static str,
 ) -> Result<PreciseInstant, SpliceProxyError> {
     let content_type = content_type_for_cached_file(&conn_details.debname);
@@ -366,6 +375,7 @@ async fn write_splice_response_headers(
         range,
         content_type,
         &date,
+        last_modified,
     );
 
     trace!(
@@ -399,6 +409,11 @@ struct CacheTarget {
     writer: CacheWriter,
     temppath: TempPath,
     dest_path: PathBuf,
+    /// The `Last-Modified` the response head carries: the upstream's
+    /// validated value, else the temp file's creation date, which the
+    /// rename preserves and every later cache hit therefore reports too
+    /// (`CacheInfo::with_meta`); a resumed partial keeps its first attempt's.
+    last_modified: Arc<str>,
 }
 
 /// Reserve the cache quota and open the file the body is written into: the
@@ -408,9 +423,18 @@ struct CacheTarget {
 /// DownloadBarrier` transition. Shared by the streaming drive and the
 /// buffered volatile path (which always passes `PartialDownload::Volatile`).
 ///
+/// The client's `Range` is resolved here too, once the file exists: an
+/// `If-Range` date is compared against the very `Last-Modified` the head
+/// then carries ([`CacheTarget::last_modified`]), which for a synthesized
+/// one is the temp file's creation date and so cannot be known before the
+/// open. A retry that resumes a `.partial` with the date its first attempt
+/// sent therefore gets its `206`; a mismatching date gets the whole file.
+///
 /// `Ok(None)` means a rejection was already written to the client: the
-/// `503 Disk quota reached` (tagged `quota_phase`) or the 500 for a
-/// `Resumable` partial that does not hold exactly `resume_offset` bytes.
+/// `503 Disk quota reached` (tagged `quota_phase`), the 500 for a
+/// `Resumable` partial that does not hold exactly `resume_offset` bytes, or
+/// the `416` (tagged `phase_416`; a `Fresh` partial stays behind empty,
+/// which the next attempt treats as no partial at all).
 ///
 /// The caller selects the transport's write mode; the writer enables hashing
 /// only when it can cover the entire file, including the prefix.
@@ -427,8 +451,10 @@ async fn prepare_cache_target(
     total_content_length: NonZero<u64>,
     ibarrier: InitBarrier<'_>,
     quota_phase: &'static str,
+    client_range: RangeRequestHeaders<'_>,
+    phase_416: &'static str,
     mode: CacheWriteMode,
-) -> Result<Option<CacheTarget>, SpliceProxyError> {
+) -> Result<Option<(CacheTarget, ServeParams)>, SpliceProxyError> {
     // Not created here: `integrity::rename_into_cache` creates it at commit
     // time, and only on `ENOENT`. Everything below tolerates its absence --
     // the volatile `prev_path` stat treats `NotFound` as "nothing to free",
@@ -571,11 +597,36 @@ async fn prepare_cache_target(
             })?
         }
     };
+    // The creation date the synthesized `Last-Modified` falls back to; read
+    // now, before any byte lands, so a resumed partial keeps its first
+    // attempt's and the head matches what later cache hits report.
+    let file_date = regular_file_metadata(&tempfile, &temppath)
+        .map(|mdata| cache_file_http_date(&mdata))
+        .map_err(|CacheAccessFailure(logged)| SpliceProxyError::Cache(logged))?;
 
     let download_meta = cache_metadata::UpstreamMetadata::from_upstream(
         upstream_resp.etag.clone(),
         upstream_resp.last_modified.clone(),
     );
+    let (last_modified, cache_time): (Arc<str>, HttpDate) =
+        match download_meta.last_modified.as_ref() {
+            Some((raw, time)) => (Arc::clone(raw), *time),
+            None => (file_date.format().into(), file_date),
+        };
+    // `If-Range` compares against the validators this response carries.
+    let Some(range_plan) = resolve_client_range(
+        client,
+        conn_details,
+        client_range,
+        total_content_length.get(),
+        cache_time,
+        upstream_resp.etag.as_deref(),
+        phase_416,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     // Persist the validators and the expected total early, so they survive
     // an interrupted download for resume.
     write_upstream_metadata(
@@ -607,11 +658,13 @@ async fn prepare_cache_target(
             ErrorReport(&err)
         )))
     })?;
-    Ok(Some(CacheTarget {
+    let target = CacheTarget {
         writer,
         temppath,
         dest_path: dest_dir.join(filename),
-    }))
+        last_modified,
+    };
+    Ok(Some((target, range_plan)))
 }
 
 /// Per-request rate-logging timestamps for the completion line
@@ -1498,26 +1551,6 @@ async fn splice_proxy_drive(
         }
     };
 
-    // `If-Range` compares against the validators this response carries.
-    let cache_time = upstream_resp
-        .last_modified
-        .as_deref()
-        .and_then(HttpDate::parse)
-        .unwrap_or(HttpDate::UNIX_EPOCH);
-    let Some(range_plan) = resolve_client_range(
-        client,
-        conn_details,
-        client_range,
-        total_content_length.get(),
-        cache_time,
-        upstream_resp.etag.as_deref(),
-        "416 response",
-    )
-    .await?
-    else {
-        return Ok(SpliceProxyOutcome::Served);
-    };
-
     // Select the transport mode before creating the writer. The writer itself
     // excludes resumed suffixes from whole-file hashing.
     let mode = if upstream.zero_copy().is_some() {
@@ -1532,7 +1565,7 @@ async fn splice_proxy_drive(
         ))
     };
 
-    let Some(mut target) = prepare_cache_target(
+    let Some((mut target, range_plan)) = prepare_cache_target(
         client,
         conn_details,
         &upstream_resp,
@@ -1541,6 +1574,8 @@ async fn splice_proxy_drive(
         total_content_length,
         ibarrier,
         "quota 503",
+        client_range,
+        "416 response",
         mode,
     )
     .await?
@@ -1626,6 +1661,7 @@ async fn splice_proxy_drive(
         conn_details,
         &upstream_resp,
         &range_plan,
+        &target.last_modified,
         "response headers",
     )
     .await
@@ -1948,6 +1984,7 @@ mod tests {
             &whole,
             "application/vnd.debian.binary-package",
             date,
+            resp.last_modified.as_deref().expect("upstream sent one"),
         );
         assert_eq!(
             head,
@@ -1979,6 +2016,8 @@ mod tests {
             1000,
         )
         .expect("satisfiable");
+        // No upstream `Last-Modified`: the caller hands in the synthesized
+        // one, which is rendered like any other.
         let head = render_splice_response_head(
             ConnectionVersion::Http10,
             ConnectionAction::Close,
@@ -1986,6 +2025,7 @@ mod tests {
             &partial,
             "text/plain",
             date,
+            "Sat, 03 Jan 2026 00:00:00 GMT",
         );
         assert_eq!(
             head,
@@ -1996,6 +2036,7 @@ mod tests {
                  Connection: close\r\n\
                  Content-Length: 300\r\n\
                  Content-Type: text/plain\r\n\
+                 Last-Modified: Sat, 03 Jan 2026 00:00:00 GMT\r\n\
                  Accept-Ranges: bytes\r\n\
                  Age: 0\r\n\
                  Content-Range: bytes 200-499/1000\r\n\
