@@ -11,10 +11,38 @@
 //!
 //! Readers take the same lock the writer does, so `entries()` blocks every
 //! logging thread for as long as its guard lives — copy out and drop it.
+//!
+//! An entry keeps at most [`MAX_ENTRY_LEN`] bytes: some warnings quote
+//! upstream- or client-supplied values, and the ring holds
+//! `logstore_capacity` entries for the life of the process. The console/file
+//! sink still receives the whole line.
 
 use std::{num::NonZero, sync::Arc};
 
 use crate::{metrics, ringbuffer::RingBuffer};
+
+/// Longest entry the ring keeps, in bytes; a longer line is cut at a char
+/// boundary and marked with [`TRUNCATION_MARK`].
+const MAX_ENTRY_LEN: usize = 4 * 1024;
+
+const TRUNCATION_MARK: &str = " [truncated]";
+
+/// The ring entry for one raw log line: lossily decoded, trimmed, and cut to
+/// [`MAX_ENTRY_LEN`].
+fn entry_from_line(line: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(line);
+    let trimmed = decoded.trim();
+    if trimmed.len() <= MAX_ENTRY_LEN {
+        return trimmed.to_owned();
+    }
+    let kept = trimmed
+        .get(..trimmed.floor_char_boundary(MAX_ENTRY_LEN))
+        .expect("floor_char_boundary yields a char boundary");
+    let mut entry = String::with_capacity(kept.len() + TRUNCATION_MARK.len());
+    entry.push_str(kept);
+    entry.push_str(TRUNCATION_MARK);
+    entry
+}
 
 #[derive(Debug)]
 struct LogStoreImpl {
@@ -37,12 +65,11 @@ impl std::io::Write for LogStoreImpl {
         self.buffer.extend_from_slice(buf);
         let mut start = 0;
         while let Some(pos) = self.buffer[start..].iter().position(|&x| x == b'\n') {
-            let line = &self.buffer[start..start + pos];
-            let s = String::from_utf8_lossy(line);
+            let entry = entry_from_line(&self.buffer[start..start + pos]);
             if self.entries.is_full() {
                 metrics::LOGSTORE_EVICTIONS.increment();
             }
-            self.entries.push(s.trim().to_string());
+            self.entries.push(entry);
             start += pos + 1;
         }
         if start > 0 {
@@ -162,6 +189,34 @@ mod tests {
         store.write_all(b"three\n").expect("write");
         assert_eq!(lines(&store), ["two", "three"]);
         assert_eq!(metrics::LOGSTORE_EVICTIONS.get(), before + 1);
+    }
+
+    /// A line longer than the entry cap is kept cut and marked, so a warning
+    /// quoting a huge upstream value cannot pin that much memory per entry.
+    #[test]
+    fn an_overlong_line_is_truncated_at_a_char_boundary() {
+        let mut store = new_store(4);
+
+        // A two-byte char straddles the cap, so the cut must back off by one.
+        let mut line = "a".repeat(MAX_ENTRY_LEN - 1);
+        line.push_str(&"\u{e9}".repeat(1000));
+        line.push('\n');
+        store.write_all(line.as_bytes()).expect("write");
+        store.write_all(b"next\n").expect("write");
+
+        let entries = lines(&store);
+        assert_eq!(entries.len(), 2);
+        let expected = format!("{}{TRUNCATION_MARK}", "a".repeat(MAX_ENTRY_LEN - 1));
+        assert_eq!(entries[0], expected);
+        assert_eq!(entries[1], "next");
+
+        // A line exactly at the cap is kept whole.
+        let mut store = new_store(4);
+        let at_cap = "b".repeat(MAX_ENTRY_LEN);
+        store
+            .write_all(format!("{at_cap}\n").as_bytes())
+            .expect("write");
+        assert_eq!(lines(&store), [at_cap]);
     }
 
     /// Invalid UTF-8 must not lose the record or panic the logging path.
