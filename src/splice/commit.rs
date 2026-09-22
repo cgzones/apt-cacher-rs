@@ -124,6 +124,7 @@ impl CacheTarget {
             writer,
             temppath,
             dest_path,
+            last_modified: _,
         } = self;
         let (tempfile, dbarrier, streamed_digest) = writer.finish();
         let rbarrier = dbarrier.begin_rename().await;

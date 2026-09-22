@@ -19,6 +19,7 @@
 //! commit-time verification instead of an incremental digest.
 
 use std::num::NonZero;
+use std::sync::Arc;
 
 use http::StatusCode;
 use tracing::{debug, error};
@@ -43,7 +44,7 @@ use super::http::{BodyFraming, UpstreamResponse};
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
     ClientConn, RateTimestamps, SpliceProxyError, UpstreamFailure, prepare_cache_target,
-    resolve_client_range, write_splice_response_headers,
+    write_splice_response_headers,
 };
 
 /// Handle the full lifecycle for volatile files whose upstream response has no
@@ -119,22 +120,7 @@ pub(super) async fn handle_volatile_buffered_download(
         conn_details.debname, conn_details.mirror, conn_details.client, total_content_length
     );
 
-    // The body was just fetched: an `If-Range` date is compared against now.
-    let Some(range_plan) = resolve_client_range(
-        client,
-        conn_details,
-        client_range,
-        total_content_length.get(),
-        HttpDate::now(),
-        upstream_resp.etag.as_deref(),
-        "volatile 416 response",
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-
-    let Some(mut target) = prepare_cache_target(
+    let Some((mut target, range_plan)) = prepare_cache_target(
         client,
         conn_details,
         upstream_resp,
@@ -143,6 +129,8 @@ pub(super) async fn handle_volatile_buffered_download(
         total_content_length,
         ibarrier,
         "volatile quota 503",
+        client_range,
+        "volatile 416 response",
         super::body::CacheWriteMode::Userspace(None),
     )
     .await?
@@ -159,6 +147,9 @@ pub(super) async fn handle_volatile_buffered_download(
     // already-downloaded body (late joiners and future requests keep it).
 
     // Write the full body to the cache temp file (best-effort).
+    // The head is written after the commit consumed the target: keep the
+    // validator it settled on.
+    let last_modified = Arc::clone(&target.last_modified);
     let cache_write_ok = match target.writer.write_prefix(&body).await {
         Ok(()) => true,
         Err(err) => {
@@ -206,6 +197,7 @@ pub(super) async fn handle_volatile_buffered_download(
         conn_details,
         upstream_resp,
         &range_plan,
+        &last_modified,
         &body,
         &mut rates,
     )
@@ -240,14 +232,23 @@ async fn serve_buffered(
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
     range_plan: &ServeParams,
+    last_modified: &str,
     body: &[u8],
     rates: &mut RateTimestamps,
 ) -> Result<(), SpliceProxyError> {
     // Cork to coalesce headers + body into fewer TCP segments.
     let cork = CorkGuard::new_optional(client.stream);
 
-    let written =
-        write_buffered_response(client, conn_details, upstream_resp, range_plan, body, rates).await;
+    let written = write_buffered_response(
+        client,
+        conn_details,
+        upstream_resp,
+        range_plan,
+        last_modified,
+        body,
+        rates,
+    )
+    .await;
     rates.t_client_done = PreciseInstant::now();
 
     drop(cork);
@@ -261,6 +262,7 @@ async fn write_buffered_response(
     conn_details: &ConnectionDetails,
     upstream_resp: &UpstreamResponse,
     range_plan: &ServeParams,
+    last_modified: &str,
     body: &[u8],
     rates: &mut RateTimestamps,
 ) -> Result<(), SpliceProxyError> {
@@ -269,6 +271,7 @@ async fn write_buffered_response(
         conn_details,
         upstream_resp,
         range_plan,
+        last_modified,
         "volatile response headers",
     )
     .await?;
