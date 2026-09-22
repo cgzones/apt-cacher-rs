@@ -3,7 +3,7 @@
 //!
 //! A persisted attribute is a type implementing [`XattrValue`] (`ETag`,
 //! `LastModified`, [`ExpectedSize`], [`crate::verified_marker::CleanupMarker`]); the generic
-//! [`try_read`] / [`read`] / [`write()`] / [`remove`] helpers own the whole
+//! [`try_read`] / [`read`] / [`write()`] / [`remove_stale`] helpers own the whole
 //! degradation policy once - the `XATTR_SUPPORTED` short-circuit, the
 //! absent/unsupported/`ENODATA` collapse to `None`, the malformed-value scrub
 //! and its once-gated warn, and the transient-failure warn - so a new
@@ -159,24 +159,50 @@ pub(crate) fn xattr_supported() -> bool {
 #[derive(Debug)]
 pub(crate) struct XattrIoError;
 
+/// Why an attribute is being removed; picks the wording of the failure
+/// warn, whose consequence is the same either way: the value stays on the
+/// file.
+#[derive(Clone, Copy, Debug)]
+enum Removal {
+    /// [`try_read`]'s scrub of a value [`XattrValue::parse`] rejected; the
+    /// next read discards it again.
+    Malformed,
+    /// [`remove_stale`]'s unlink of a value the current download no longer
+    /// asserts.
+    Stale,
+}
+
 /// Remove `V`'s attribute from the file. Logs on failure but never
-/// propagates errors: the only caller is [`try_read`]'s malformed-value
-/// scrub, whose failure leaves the invalid value in place for the next read
-/// to discard again.
-fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) {
+/// propagates errors; an attribute that is not there (`ENODATA`) is the
+/// success case for [`Removal::Stale`] and silent for both.
+fn remove<V: XattrValue>(file: &impl XattrTarget, display_path: &Path, why: Removal) {
     if !xattr_supported() {
         return;
     }
     if let Err(err) = file.remove(V::KEY)
         && err.kind() != io::ErrorKind::Unsupported
+        && err.raw_os_error() != Some(libc::ENODATA)
     {
+        let what = match why {
+            Removal::Malformed => "invalid",
+            Removal::Stale => "stale",
+        };
         warn!(
-            "Failed to remove invalid xattr from `{}` for key `{}`; the invalid value stays on the file:  {}",
+            "Failed to remove {what} xattr from `{}` for key `{}`; the {what} value stays on the file:  {}",
             display_path.display(),
             V::KEY,
             ErrorReport(&err)
         );
     }
+}
+
+/// Remove a `V` the current download does not carry, so an attribute left
+/// by an earlier attempt on the same file (a resumed partial) cannot outlive
+/// the value it belonged to. Absent attributes are the common case and
+/// silent; the caller is `cache_metadata::write_upstream_metadata`, which
+/// must leave the file's xattrs equal to the metadata it then publishes.
+pub(crate) fn remove_stale<V: XattrValue>(file: &impl XattrTarget, display_path: &Path) {
+    remove::<V>(file, display_path, Removal::Stale);
 }
 
 /// Read `V` from the file, distinguishing transient I/O errors from a
@@ -230,7 +256,7 @@ pub(crate) fn try_read<V: XattrValue>(
                 String::from_utf8_lossy(&raw).escape_debug()
             ),
         );
-        remove::<V>(file, display_path);
+        remove::<V>(file, display_path, Removal::Malformed);
         return Ok(None);
     };
     Ok(Some(value))
@@ -341,7 +367,10 @@ pub(crate) mod tests {
         write(&file, &path, valid);
         assert_eq!(read::<V>(&file, &path).as_ref(), Some(valid));
 
-        remove::<V>(&file, &path);
+        remove_stale::<V>(&file, &path);
+        assert!(matches!(try_read::<V>(&file, &path), Ok(None)));
+        // Removing an absent attribute is the common case and must be silent.
+        remove_stale::<V>(&file, &path);
         assert!(matches!(try_read::<V>(&file, &path), Ok(None)));
     }
 

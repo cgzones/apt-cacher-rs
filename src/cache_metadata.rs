@@ -28,7 +28,10 @@
 //! to the xattr helpers and inserts the result. xattr writes still happen
 //! on the download path (every backend calls [`write_upstream_metadata`]
 //! on the same [`UpstreamMetadata`] it later publishes) so the values
-//! survive process restarts.
+//! survive process restarts. A validator the metadata lacks is *removed*
+//! there, not left alone: a resumed partial still carries its first
+//! attempt's xattrs, and a stale one would otherwise be what a restart
+//! reads back for a file whose download published `None`.
 //!
 //! # Publication invariant
 //!
@@ -118,7 +121,9 @@ impl UpstreamMetadata {
 /// Written early, on the partial/temp file, so the values survive an
 /// interrupted download for resume; every backend calls this on the very
 /// [`UpstreamMetadata`] it hands the download barrier, which is what keeps
-/// the publication invariant (module docs) trivially true.
+/// the publication invariant (module docs) trivially true -- including for
+/// a validator `meta` lacks, whose attribute is removed in case an earlier
+/// attempt on the same partial left one behind.
 ///
 /// `meta`'s strings were validated once per upstream response by
 /// [`check_upstream_validators`], so the re-parse here cannot fail; the
@@ -138,27 +143,33 @@ pub(crate) fn write_upstream_metadata(
     // attribute, and every fresh download writes up to three.
     tokio::task::block_in_place(|| {
         let file = &xattr_helpers::XattrFile(file);
-        if let Some(etag) = etag {
-            if let Some(etag) = ETag::parse(etag) {
-                xattr_helpers::write(file, display_path, &etag);
-            } else {
-                warn_once_or_info!(
-                    "Skipping write of malformed ETag to `{}`: `{}`",
-                    display_path.display(),
-                    etag.escape_debug()
-                );
+        match etag {
+            Some(etag) => {
+                if let Some(etag) = ETag::parse(etag) {
+                    xattr_helpers::write(file, display_path, &etag);
+                } else {
+                    warn_once_or_info!(
+                        "Skipping write of malformed ETag to `{}`: `{}`",
+                        display_path.display(),
+                        etag.escape_debug()
+                    );
+                }
             }
+            None => xattr_helpers::remove_stale::<ETag>(file, display_path),
         }
-        if let Some((raw, _time)) = last_modified {
-            if let Some(lm) = LastModified::parse(raw) {
-                xattr_helpers::write(file, display_path, &lm);
-            } else {
-                warn_once_or_info!(
-                    "Skipping write of malformed Last-Modified to `{}`: `{}`",
-                    display_path.display(),
-                    raw.escape_debug()
-                );
+        match last_modified {
+            Some((raw, _time)) => {
+                if let Some(lm) = LastModified::parse(raw) {
+                    xattr_helpers::write(file, display_path, &lm);
+                } else {
+                    warn_once_or_info!(
+                        "Skipping write of malformed Last-Modified to `{}`: `{}`",
+                        display_path.display(),
+                        raw.escape_debug()
+                    );
+                }
             }
+            None => xattr_helpers::remove_stale::<LastModified>(file, display_path),
         }
         if let Some(size) = expected_size {
             xattr_helpers::write(file, display_path, &ExpectedSize(size));
@@ -547,6 +558,37 @@ mod tests {
             resolved.as_ref(),
             &meta,
             "the published value is what was persisted"
+        );
+        assert_eq!(
+            xattr_helpers::read::<ExpectedSize>(&file, &path),
+            Some(ExpectedSize(4096))
+        );
+    }
+
+    /// A resumed partial carries the xattrs of its first attempt; when the
+    /// resuming response no longer sends a validator, the published metadata
+    /// is `None` and the file must agree (publication invariant), or a
+    /// restart resurrects the first attempt's value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn write_upstream_metadata_removes_validators_the_download_lacks() {
+        let (_dir, file, path) = fixture_file().await;
+        write_etag(&file, &path, "\"first\"");
+        write_last_modified(&file, &path, "Thu, 01 Jan 1970 00:00:00 GMT");
+        // Skip on filesystems that reject xattr writes.
+        if xattr_helpers::read::<ETag>(&file, &path).is_none() {
+            return;
+        }
+
+        let meta = UpstreamMetadata::from_upstream(None, None);
+        write_upstream_metadata(&file, &path, &meta, Some(4096));
+
+        assert!(
+            xattr_helpers::read::<ETag>(&file, &path).is_none(),
+            "the first attempt's ETag must not outlive a download without one"
+        );
+        assert!(
+            xattr_helpers::read::<LastModified>(&file, &path).is_none(),
+            "the first attempt's Last-Modified must not outlive a download without one"
         );
         assert_eq!(
             xattr_helpers::read::<ExpectedSize>(&file, &path),
