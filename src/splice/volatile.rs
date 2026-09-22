@@ -28,7 +28,6 @@ use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::ConnectionDetails;
 use crate::error::ErrorReport;
 use crate::guards::InitBarrier;
-use crate::http_range::HttpDate;
 use crate::partial_file;
 use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::{RateCheckDirection, RateChecker};
