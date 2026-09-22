@@ -2906,6 +2906,36 @@ fn accounted_body_failure<'a>(
     None
 }
 
+/// The request-head allowance in [`client_max_buf_size`], and its floor:
+/// the sendfile backend refuses a head past 8 KiB, and twice that leaves
+/// room for a pipelined request behind a maximal head in a sendfile handoff.
+const CLIENT_HEAD_ALLOWANCE: usize = 16 * 1024;
+
+/// `max_buf_size` of the client-facing server connection, i.e. hyper
+/// serving an apt client. Not the upstream hyper client's read buffer,
+/// which `main.rs` caps separately (`limits::MAX_UPSTREAM_READ_BUFFER`).
+///
+/// It bounds two buffers, because hyper has one setting for both:
+/// - the read buffer, and so the request head hyper accepts (a longer one is
+///   answered 431). hyper's default is ~400 KiB, held per connection for up
+///   to `client_idle_timeout`.
+/// - the write queue (`WriteBuf::can_buffer`): once the queued bytes reach
+///   the limit, hyper flushes before it polls the body for the next frame.
+///   Below one body frame (`buffer_size`) that serialises every file read
+///   behind the previous frame's socket write: at 16 KiB with 32 KiB frames
+///   a loopback cache hit through the stream body measured about 24 % less
+///   throughput and 14 % more CPU per MiB than with no limit.
+///
+/// Hence `buffer_size` plus [`CLIENT_HEAD_ALLOWANCE`], never below that
+/// allowance: one queued frame (plus its response head) stays under the
+/// limit, so the next file read overlaps the write, while the head bound
+/// (48 KiB at the default 32 KiB `buffer_size`) stays far below hyper's
+/// default.
+#[must_use]
+fn client_max_buf_size(buffer_size: usize) -> usize {
+    CLIENT_HEAD_ALLOWANCE.max(buffer_size.saturating_add(CLIENT_HEAD_ALLOWANCE))
+}
+
 /// Serve every request on `stream` through hyper.
 ///
 /// `handoff` is `Some` when the sendfile backend hands over a connection
@@ -2944,6 +2974,7 @@ pub(crate) async fn handle_hyper_connection<T>(
     if let Err(err) = http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(global_config().client_idle_timeout)
+        .max_buf_size(client_max_buf_size(global_config().buffer_size))
         .serve_connection(
             TokioIo::new(stream),
             service_fn(move |req| {
@@ -3027,6 +3058,20 @@ mod tests {
             std::io::ErrorKind::ConnectionReset,
         )));
         assert!(accounted_body_failure(&socket).is_none());
+    }
+
+    /// One `buffer_size` frame must stay below the limit, or hyper flushes
+    /// it before polling the body for the next (see `client_max_buf_size`).
+    #[test]
+    fn client_max_buf_size_leaves_room_for_one_frame_and_a_head() {
+        use super::{CLIENT_HEAD_ALLOWANCE, client_max_buf_size};
+        assert_eq!(client_max_buf_size(32 * 1024), 48 * 1024);
+        for buffer_size in [1024, 32 * 1024, 128 * 1024, 16 * 1024 * 1024] {
+            let limit = client_max_buf_size(buffer_size);
+            assert!(limit >= CLIENT_HEAD_ALLOWANCE);
+            assert!(limit >= buffer_size + CLIENT_HEAD_ALLOWANCE);
+        }
+        assert_eq!(client_max_buf_size(usize::MAX), usize::MAX);
     }
 
     #[tokio::test]
