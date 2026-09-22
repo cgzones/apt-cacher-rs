@@ -38,6 +38,14 @@ pub(crate) const MAX_UPSTREAM_HEADER_SIZE: usize = 8192;
 /// Maximum number of header fields parsed from an upstream HTTP response.
 pub(crate) const MAX_UPSTREAM_HEADERS: usize = 32;
 
+/// Largest read buffer the hyper client grows per upstream connection, which
+/// also bounds the response head it accepts. hyper's default is ~400 KiB.
+/// Not [`MAX_UPSTREAM_HEADER_SIZE`]: the same buffer carries every body
+/// read, and at 16 KiB eight 256 MiB loopback downloads cost 1.5-2x the
+/// daemon CPU of the default, while 128 KiB measured within noise of it.
+#[cfg(feature = "hyper")]
+pub(crate) const MAX_UPSTREAM_READ_BUFFER: usize = 128 * 1024;
+
 /// Absolute ceiling (bytes) on the decompressed output of a `Packages` file,
 /// and so on a raw one, which cleanup buffers whole (memfd, plus a `Vec` in
 /// hyper-less builds) for up to ten mirrors at once. Debian's largest,
@@ -85,6 +93,12 @@ pub(crate) const MAX_XZ_DICT_SIZE: NonZero<u64> = nonzero!(64 * 1024 * 1024);
 /// of twenty for slow hardware, while bounding what one hostile index can
 /// cost.
 pub(crate) const MAX_XZ_DECODE_CPU: Duration = Duration::from_secs(30);
+
+/// Idle upstream connections kept per host, by the splice backend's own pool
+/// and the hyper client's alike. Each one holds a socket and its read buffer
+/// (up to 256 KiB over TLS in splice, hyper's adaptive buffer otherwise);
+/// hyper-util's default keeps every one ever opened.
+pub(crate) const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 
 /// Maximum length (bytes) of a single line read from upstream metadata.
 pub(crate) const MAX_METADATA_LINE_LEN: usize = 8 * 1024;

@@ -31,6 +31,7 @@ use crate::config::ClientHost;
 use crate::deb_mirror::Mirror;
 use crate::error::{ErrorReport, is_peer_disconnect};
 use crate::humanfmt::HumanFmt;
+use crate::limits::UPSTREAM_POOL_MAX_IDLE_PER_HOST;
 use crate::{Scheme, global_config, metrics, warn_once_or_debug, warn_once_or_info};
 
 /// Pre-computed TLS client config for use with `tls_rustls`.
@@ -40,9 +41,6 @@ pub(crate) static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceL
 
 /// How long an idle pooled connection is kept before eviction.
 const POOL_IDLE_TIMEOUT: coarsetime::Duration = coarsetime::Duration::from_secs(90);
-
-/// Maximum number of idle connections kept per host.
-const POOL_MAX_IDLE_PER_HOST: usize = 4;
 
 /// Buffer size for TLS upstream reads: the `super::http` head scanners and
 /// buffered-body collectors, and the userspace-TLS body loop
@@ -322,7 +320,7 @@ pub(crate) async fn pool_reaper() {
 
 /// Return a connection to the pool for reuse.
 ///
-/// Expires only this key's entries (at most [`POOL_MAX_IDLE_PER_HOST`]);
+/// Expires only this key's entries (at most [`UPSTREAM_POOL_MAX_IDLE_PER_HOST`]);
 /// [`pool_reaper`] handles other keys. Drop removed sockets outside the lock.
 fn pool_return(host: &ClientHost, port: u16, is_tls: bool, conn: UpstreamConn) {
     let mut map = upstream_pool().lock();
@@ -334,7 +332,7 @@ fn pool_return(host: &ClientHost, port: u16, is_tls: bool, conn: UpstreamConn) {
         })
         .collect();
 
-    if conns.len() >= POOL_MAX_IDLE_PER_HOST {
+    if conns.len() >= UPSTREAM_POOL_MAX_IDLE_PER_HOST {
         debug!("splice proxy: evicting oldest pooled connection for {host}:{port} (pool full)");
         metrics::POOL_RETURN_EVICTED.increment();
         expired.push(conns.remove(0));

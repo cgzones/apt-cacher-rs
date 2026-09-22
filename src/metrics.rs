@@ -326,7 +326,7 @@ pub(crate) static POOL_REUSED: Counter = Counter::new();
 pub(crate) static POOL_NEW: Counter = Counter::new();
 
 /// Why a checkout missed: no entry for this host (raise
-/// `POOL_MAX_IDLE_PER_HOST`), every entry had been closed by the peer (lower
+/// `UPSTREAM_POOL_MAX_IDLE_PER_HOST`), every entry had been closed by the peer (lower
 /// `POOL_IDLE_TIMEOUT`), or the request on the live entry failed in flight
 /// with a transport error (a protocol violation on it is a 502, not a miss).
 pub(crate) static POOL_MISS_EMPTY: Counter = Counter::new();
@@ -338,7 +338,7 @@ pub(crate) static POOL_MISS_FAILED: Counter = Counter::new();
 pub(crate) static POOL_MISS_NO_SCHEME: Counter = Counter::new();
 
 /// Pool returns where the per-host slot was full and the oldest entry was
-/// evicted (raise `POOL_MAX_IDLE_PER_HOST` if recurring).
+/// evicted (raise `UPSTREAM_POOL_MAX_IDLE_PER_HOST` if recurring).
 pub(crate) static POOL_RETURN_EVICTED: Counter = Counter::new();
 
 /// Downloads rejected by `CacheQuota::try_acquire` (would exceed `disk_quota`).
