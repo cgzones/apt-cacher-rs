@@ -165,9 +165,10 @@ enum VerifyOutcome {
 /// registry-backed lookups for `Pool` (.deb) and `Packages` resources.
 ///
 /// Global-free (no `global_config()`, no registry): all inputs arrive via
-/// [`VerifyInput`], making this unit-testable. It does perform file I/O
-/// (reads and hashes `temp_path`); callers on an async worker must wrap this
-/// in `spawn_blocking` (see `verify_and_rename`).
+/// [`VerifyInput`], making this unit-testable. It performs file I/O (reads
+/// and hashes `temp_path`) only for [`VerifyKind::Expected`] with
+/// verification enabled; callers on an async worker must wrap that case in
+/// `spawn_blocking` (see `verify_and_rename`).
 fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     if !input.verify_enabled {
         return VerifyOutcome::Proceed;
@@ -926,30 +927,43 @@ pub(crate) async fn verify_and_rename(
         VerifyKind::Unverifiable
     };
 
-    let temp_path = plan.temp_path.clone();
-    let streamed = plan.streamed_digest.clone();
-    let outcome = match Arc::clone(&lease)
-        .spawn_blocking(move |_lease| {
-            verify_temp_file(&VerifyInput {
-                verify_enabled,
-                kind,
-                temp_path: &temp_path,
-                streamed,
+    // Only an expected digest makes `verify_temp_file` read the file. Every
+    // other kind, and a disabled check, is answered `Proceed` without I/O
+    // (`Unknown` also bumps `CHECKSUM_UNVERIFIED`), so it runs inline rather
+    // than paying a blocking-pool round trip that issues no syscall.
+    let outcome = if matches!(kind, VerifyKind::Expected { .. }) {
+        let temp_path = plan.temp_path.clone();
+        let streamed = plan.streamed_digest.clone();
+        match Arc::clone(&lease)
+            .spawn_blocking(move |_lease| {
+                verify_temp_file(&VerifyInput {
+                    verify_enabled,
+                    kind,
+                    temp_path: &temp_path,
+                    streamed,
+                })
             })
-        })
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(join_err) => {
-            error!(
-                "Failed to run the verification task for {} from host {}; discarding the download, not caching:  {}",
-                plan.debname,
-                plan.host,
-                ErrorReport(&join_err),
-            );
-            metrics::CACHE_IO_FAILURE.increment();
-            return Err(CommitError::VerifyIo(std::io::Error::other(join_err)));
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                error!(
+                    "Failed to run the verification task for {} from host {}; discarding the download, not caching:  {}",
+                    plan.debname,
+                    plan.host,
+                    ErrorReport(&join_err),
+                );
+                metrics::CACHE_IO_FAILURE.increment();
+                return Err(CommitError::VerifyIo(std::io::Error::other(join_err)));
+            }
         }
+    } else {
+        verify_temp_file(&VerifyInput {
+            verify_enabled,
+            kind,
+            temp_path: &plan.temp_path,
+            streamed: None,
+        })
     };
 
     if let VerifyOutcome::Reject(err) = outcome {
