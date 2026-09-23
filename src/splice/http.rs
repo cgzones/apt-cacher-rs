@@ -101,8 +101,8 @@ pub(super) fn format_http_request(
 
     let volatile_headers = match volatile_cond {
         Some(vc) => format!(
-            "If-Modified-Since: {}\r\nCache-Control: max-age=300\r\n{}",
-            vc.if_modified_since,
+            "{}Cache-Control: max-age=300\r\n{}",
+            OptHeader("If-Modified-Since", vc.if_modified_since.as_deref()),
             OptHeader("If-None-Match", vc.if_none_match.as_deref())
         ),
         None => String::new(),

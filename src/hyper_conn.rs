@@ -62,7 +62,6 @@ use crate::{
     },
     global_cache_quota, global_config, global_verify_throttle, global_webif_hosts,
     guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
-    http_range::HttpDate,
     humanfmt::HumanFmt,
     integrity::note_cached_index_touch,
     limits::VOLATILE_CACHE_MAX_AGE,
@@ -1044,7 +1043,6 @@ enum CacheFileStat {
     Volatile {
         file: tokio::fs::File,
         file_path: PathBuf,
-        local_modification_time: HttpDate,
         /// Existing on-disk size at the time `serve_volatile_file` opened the
         /// file.  Plumbed through so `serve_new_file` does not have to fetch
         /// the metadata a second time to size the quota reservation.
@@ -1120,7 +1118,6 @@ async fn serve_volatile_file(
         file_path,
         CacheMiss::StaleVolatile {
             file,
-            modified: modified_system_time,
             size: mdata.size(),
         },
         appstate,
@@ -1152,14 +1149,9 @@ async fn serve_cache_miss(
                     );
                     CacheFileStat::New
                 }
-                CacheMiss::StaleVolatile {
-                    file,
-                    modified,
-                    size,
-                } => CacheFileStat::Volatile {
+                CacheMiss::StaleVolatile { file, size } => CacheFileStat::Volatile {
                     file,
                     file_path: cache_path,
-                    local_modification_time: HttpDate::from(modified),
                     prev_size: size,
                 },
             };
@@ -1532,12 +1524,13 @@ async fn serve_new_file_worker(
     // TODO: upstream constant
     const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 
+    /// `revalidate` carries the stored upstream validators of a stale
+    /// volatile copy; `None` is an unconditional fetch.
     #[must_use]
     fn build_fwd_request(
         uri: &Uri,
         host: &HeaderValue,
-        cfstate: &CacheFileStat,
-        volatile_etag: Option<&str>,
+        revalidate: Option<&UpstreamMetadata>,
         resume_offset: u64,
         resume_if_range: Option<&str>,
     ) -> Request<Empty<bytes::Bytes>> {
@@ -1598,27 +1591,29 @@ async fn serve_new_file_worker(
             .body(Empty::new())
             .expect("request should be valid");
 
-        if let CacheFileStat::Volatile {
-            file: _,
-            file_path: _,
-            local_modification_time,
-            prev_size: _,
-        } = cfstate
+        if let Some(UpstreamMetadata {
+            etag,
+            last_modified,
+        }) = revalidate
         {
-            let date_fmt = local_modification_time.format();
-
-            let r = request.headers_mut().append(
-                IF_MODIFIED_SINCE,
-                HeaderValue::try_from(date_fmt).expect("HTTP datetime should be valid"),
-            );
-            assert!(!r, "header does not exist by previous construction");
+            // The upstream's own `Last-Modified`, never the local mtime:
+            // that only dates the last fetch or revalidation, so a copy
+            // replayed or lagging behind the upstream would keep drawing
+            // 304s. Without a stored date, `If-None-Match` alone asks.
+            if let Some((_raw, date)) = last_modified {
+                let r = request.headers_mut().append(
+                    IF_MODIFIED_SINCE,
+                    HeaderValue::try_from(date.format()).expect("HTTP datetime should be valid"),
+                );
+                assert!(!r, "header does not exist by previous construction");
+            }
 
             let r = request
                 .headers_mut()
                 .append(CACHE_CONTROL, HeaderValue::from_static("max-age=300"));
             assert!(!r, "header does not exist by previous construction");
 
-            if let Some(etag) = volatile_etag {
+            if let Some(etag) = etag.as_deref() {
                 let r = request.headers_mut().append(
                     IF_NONE_MATCH,
                     HeaderValue::try_from(etag).expect("ETag is validated by read_etag"),
@@ -1653,7 +1648,6 @@ async fn serve_new_file_worker(
         CacheFileStat::Volatile {
             file: _,
             file_path: _,
-            local_modification_time: _,
             prev_size,
         } => (false, *prev_size),
         CacheFileStat::New => (true, 0),
@@ -1720,7 +1714,6 @@ async fn serve_new_file_worker(
         CacheFileStat::Volatile {
             file,
             file_path,
-            local_modification_time: _,
             prev_size: _,
         } => {
             let key = conn_details.key();
@@ -1729,9 +1722,7 @@ async fn serve_new_file_worker(
         }
         CacheFileStat::New => None,
     };
-    let volatile_etag = prefetched_upstream_metadata
-        .as_ref()
-        .and_then(|m| m.etag.as_deref());
+    let revalidate = prefetched_upstream_metadata.as_deref();
 
     // Permanent files only; see `partial_file::PartialDownload` for the
     // open-once and keep-on-drop rules this relies on.
@@ -1764,8 +1755,7 @@ async fn serve_new_file_worker(
     let fwd_request = build_fwd_request(
         &req_uri,
         host,
-        &cfstate,
-        volatile_etag,
+        revalidate,
         resume_offset,
         resume_if_range.as_deref(),
     );
@@ -1808,8 +1798,7 @@ async fn serve_new_file_worker(
             let redirected_request = build_fwd_request(
                 &req_uri,
                 &redirected_host,
-                &cfstate,
-                volatile_etag,
+                revalidate,
                 resume_offset,
                 resume_if_range.as_deref(),
             );
@@ -1839,7 +1828,6 @@ async fn serve_new_file_worker(
         CacheFileStat::Volatile {
             file,
             file_path,
-            local_modification_time: _,
             prev_size: _,
         } => Some((file, file_path)),
         CacheFileStat::New => None,
@@ -1914,12 +1902,11 @@ async fn serve_new_file_worker(
             partial.discard_resume().await;
 
             if anomaly.needs_refetch() {
-                // Deliberately pass CacheFileStat::New here: the partial file
-                // has been discarded, so from the upstream's perspective this
-                // is a fresh unconditional fetch (no If-Modified-Since, no
+                // Deliberately no validators here: the partial file has been
+                // discarded, so from the upstream's perspective this is a
+                // fresh unconditional fetch (no If-Modified-Since, no
                 // If-None-Match, no Range).
-                let retry_request =
-                    build_fwd_request(&req_uri, host, &CacheFileStat::New, volatile_etag, 0, None);
+                let retry_request = build_fwd_request(&req_uri, host, None, 0, None);
 
                 upstream_request_sent = PreciseInstant::now();
                 fwd_response = match request_with_retry(&appstate.https_client, retry_request).await

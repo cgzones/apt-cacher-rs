@@ -128,8 +128,10 @@ static_assert!(nix::errno::Errno::EAGAIN as i32 == nix::errno::Errno::EWOULDBLOC
 
 /// Conditional headers for volatile resource revalidation.
 /// Sent to upstream when a cached volatile file is stale (>30s).
+/// `if_modified_since` is the stored upstream `Last-Modified`, absent when
+/// none was stored.
 struct VolatileCondHeaders {
-    if_modified_since: String,
+    if_modified_since: Option<String>,
     if_none_match: Option<Arc<str>>,
 }
 
@@ -781,20 +783,21 @@ async fn read_volatile_validators(
             );
         }
     };
-    let mdata = regular_file_metadata_typed(&file, &cache_path, "stat volatile cached file")?;
+    // Only the regular-file check is needed; the mtime is no validator.
+    regular_file_metadata_typed(&file, &cache_path, "stat volatile cached file")?;
 
-    // Use mtime (last revalidated time), matching the hyper backend.
-    // Mtime is repurposed as "last revalidated" by touch_volatile_mtime(),
-    // so it correctly tells upstream "has this changed since I last checked?".
-    let mtime = mdata
-        .modified()
-        .expect("Platform should support modification timestamps via setup check");
-    let if_modified_since = HttpDate::from(mtime).format();
+    // The stored upstream `Last-Modified`, never the local mtime, matching
+    // the hyper backend: the mtime only dates the last fetch or
+    // revalidation (`touch_volatile_mtime`), so a copy replayed or lagging
+    // behind the upstream would keep drawing 304s. Without a stored date,
+    // `If-None-Match` alone asks.
     let key = conn_details.key();
-    let if_none_match = cache_metadata::store()
-        .resolve(&key, &file, &cache_path)
-        .etag
-        .clone();
+    let cache_metadata::UpstreamMetadata {
+        etag,
+        last_modified,
+    } = &*cache_metadata::store().resolve(&key, &file, &cache_path);
+    let if_modified_since = last_modified.as_ref().map(|(_raw, date)| date.format());
+    let if_none_match = etag.clone();
     Ok(Some((
         VolatileCondHeaders {
             if_modified_since,

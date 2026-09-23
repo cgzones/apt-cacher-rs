@@ -1222,7 +1222,6 @@ async fn try_sendfile_request(
                     let Some(elapsed) = fresh_age else {
                         break 'cache_lookup Err(CacheMiss::StaleVolatile {
                             file,
-                            modified: last_modified,
                             size: md.size(),
                         });
                     };

@@ -334,8 +334,6 @@ pub(crate) enum CacheMiss {
     /// (or its mtime is in the future); revalidate it upstream.
     StaleVolatile {
         file: tokio::fs::File,
-        /// The copy's mtime, the `If-Modified-Since` value for revalidation.
-        modified: std::time::SystemTime,
         /// The copy's on-disk size, for the quota reservation
         /// (`cache_quota.rs`: `prev_file_size`).
         size: u64,
