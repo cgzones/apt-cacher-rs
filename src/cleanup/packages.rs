@@ -58,7 +58,7 @@ pub(super) enum KeyMapper<'a> {
 impl KeyMapper<'_> {
     pub(super) fn map<'a>(&self, filename: &'a str) -> Option<Cow<'a, str>> {
         match self {
-            Self::Basename => structured_lookup_key(filename).map(Cow::Borrowed),
+            Self::Basename => Some(Cow::Borrowed(structured_lookup_key(filename))),
             Self::Relpath => Some(Cow::Borrowed(filename)),
             Self::RelpathUnderPrefix { prefix } => filename.strip_prefix(prefix).map(Cow::Borrowed),
         }
@@ -200,7 +200,7 @@ async fn process_stanza(
     file_list: &mut HashMap<OsString, SpanClass>,
     ctx: &mut ReduceContext<'_>,
 ) {
-    let Some(filename) = stanza.filename.as_deref() else {
+    let Some(filename) = stanza.filename() else {
         return;
     };
 
@@ -855,11 +855,11 @@ mod tests {
     fn structured_lookup_key_extracts_basename() {
         assert_eq!(
             structured_lookup_key("pool/main/a/abc/abc_1.0_amd64.deb"),
-            Some("abc_1.0_amd64.deb"),
+            "abc_1.0_amd64.deb",
         );
         assert_eq!(
             structured_lookup_key("abc_1.0_amd64.deb"),
-            Some("abc_1.0_amd64.deb"),
+            "abc_1.0_amd64.deb",
         );
     }
 
@@ -934,7 +934,7 @@ mod tests {
         s.ingest("Package: stub\n");
         s.ingest("Description: a stub\n");
         s.ingest(" continued description text\n");
-        assert!(s.filename.is_none());
+        assert_eq!(s.filename(), None);
         assert_eq!(s.chosen(), None);
     }
 

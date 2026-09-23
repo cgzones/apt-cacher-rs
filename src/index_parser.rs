@@ -6,7 +6,7 @@
 //! `cleanup` sweep (and its tests). Cold-path only; the helpers
 //! stay free of hot-path-specific coupling.
 
-use std::{io, path::Path};
+use std::io;
 
 use tokio::io::AsyncBufRead;
 
@@ -105,8 +105,14 @@ fn is_safe_filename_relpath(s: &str) -> bool {
 /// basename. Borrows from `relpath` to avoid allocating a fresh `String` per
 /// matched stanza (the returned key borrows the input — the caller's source
 /// string must outlive it).
-pub(crate) fn structured_lookup_key(relpath: &str) -> Option<&str> {
-    Path::new(relpath).file_name().and_then(|n| n.to_str())
+///
+/// `relpath` must have passed [`is_safe_filename_relpath`] (a [`Stanza`]'s
+/// `Filename:` has): with no empty, `.` or `..` segment, the last
+/// `/`-separated segment is exactly what `Path::file_name` would return,
+/// without its component parser.
+pub(crate) fn structured_lookup_key(relpath: &str) -> &str {
+    debug_assert!(is_safe_filename_relpath(relpath), "{relpath:?}");
+    relpath.rsplit_once('/').map_or(relpath, |(_, name)| name)
 }
 
 /// Decode `hex` into exactly `N` bytes. `None` on wrong length / non-hex.
@@ -209,7 +215,12 @@ impl TrackedField {
 /// Accumulated state of the current Debian `Packages` stanza.
 #[derive(Debug)]
 pub(crate) struct Stanza {
-    pub(crate) filename: Option<String>,
+    /// The `Filename:` value, empty until one is seen (a valid value never
+    /// is: [`is_safe_filename_relpath`] rejects it). A `String` kept across
+    /// [`Self::reset`] rather than an `Option<String>`, so a stream of stanzas
+    /// reuses one allocation instead of making one per stanza; read it
+    /// through [`Self::filename`].
+    filename: String,
     pub(crate) sha256: Option<[u8; 32]>,
     pub(crate) sha512: Option<[u8; 64]>,
     /// [`TrackedField::bit`]s of the fields seen so far, valid or not: a
@@ -233,7 +244,7 @@ pub(crate) struct Stanza {
 impl Stanza {
     pub(crate) const fn new() -> Self {
         Self {
-            filename: None,
+            filename: String::new(),
             sha256: None,
             sha512: None,
             seen: 0,
@@ -246,7 +257,7 @@ impl Stanza {
     /// A stanza whose consumer only reads SHA256 (see `want_sha512`).
     pub(crate) const fn new_sha256_only() -> Self {
         Self {
-            filename: None,
+            filename: String::new(),
             sha256: None,
             sha512: None,
             seen: 0,
@@ -268,8 +279,13 @@ impl Stanza {
         self.source.as_deref().unwrap_or("<unknown index>")
     }
 
+    /// The stanza's `Filename:` value, once one was seen.
+    pub(crate) fn filename(&self) -> Option<&str> {
+        (!self.filename.is_empty()).then_some(self.filename.as_str())
+    }
+
     pub(crate) fn reset(&mut self) {
-        self.filename = None;
+        self.filename.clear();
         self.sha256 = None;
         self.sha512 = None;
         self.seen = 0;
@@ -293,7 +309,7 @@ impl Stanza {
         self.seen |= field.bit();
         match field {
             TrackedField::Filename => match filename_value(value) {
-                Ok(name) => self.filename = Some(name.to_owned()),
+                Ok(name) => self.filename.push_str(name),
                 Err(bad) => {
                     // Dropping the field drops a real entry: integrity loses
                     // this package's expected digest and cleanup loses its
@@ -308,8 +324,11 @@ impl Stanza {
                 }
             },
             TrackedField::Sha256 => self.sha256 = hex_decode_exact::<32>(value),
+            // `chosen` prefers SHA256, so once it is known a SHA512 would
+            // never be read: skip its 128-digit decode (the field still
+            // counts as seen, so a repeat still rejects the stanza).
             TrackedField::Sha512 => {
-                if self.want_sha512 {
+                if self.want_sha512 && self.sha256.is_none() {
                     self.sha512 = hex_decode_exact::<64>(value);
                 }
             }
@@ -432,7 +451,7 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
     /// and once when an accepted stanza advertises none of the digests its
     /// consumer can use.
     fn accept(&self) -> bool {
-        let Some(filename) = self.stanza.filename.as_deref() else {
+        let Some(filename) = self.stanza.filename() else {
             return false;
         };
         if let Some(field) = self.stanza.repeated {
@@ -519,7 +538,7 @@ const MAX_REGISTRY_FLAT_KEY_LEN: usize = 1024;
 pub(crate) fn registry_key_from_filename_field(
     filename_field: &str,
     format: IndexFormat,
-) -> Option<String> {
+) -> Option<&str> {
     let filename_field = strip_leading_dot_segments(filename_field);
     if !is_safe_filename_relpath(filename_field) {
         return None;
@@ -528,11 +547,11 @@ pub(crate) fn registry_key_from_filename_field(
         IndexFormat::Flat => {
             (filename_field.len() <= MAX_REGISTRY_FLAT_KEY_LEN).then_some(filename_field)
         }
-        IndexFormat::Structured => structured_lookup_key(filename_field),
+        IndexFormat::Structured => Some(structured_lookup_key(filename_field)),
     }?;
     key.split('/')
         .all(|component| component.len() <= MAX_REGISTRY_KEY_COMPONENT_LEN)
-        .then(|| key.to_owned())
+        .then_some(key)
 }
 
 /// A `SHA256:` / `SHA512:` section of a Debian `Release`/`InRelease` file.
@@ -823,10 +842,7 @@ mod tests {
         let mut s = Stanza::new();
         s.ingest("Filename: pool/main/a/abc/abc_1.0_amd64.deb\n");
         s.ingest(&format!("SHA256: {}\n", hex_encode(&[0xab; 32])));
-        assert_eq!(
-            s.filename.as_deref(),
-            Some("pool/main/a/abc/abc_1.0_amd64.deb"),
-        );
+        assert_eq!(s.filename(), Some("pool/main/a/abc/abc_1.0_amd64.deb"),);
         assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0xab; 32].as_slice())));
     }
 
@@ -838,10 +854,7 @@ mod tests {
         // cleanup reference and cleanup-time digest.
         let mut s = Stanza::new();
         s.ingest("Filename: ./collectx-bringup_1.22.1-1_amd64.deb\n");
-        assert_eq!(
-            s.filename.as_deref(),
-            Some("collectx-bringup_1.22.1-1_amd64.deb"),
-        );
+        assert_eq!(s.filename(), Some("collectx-bringup_1.22.1-1_amd64.deb"),);
     }
 
     #[test]
@@ -865,6 +878,35 @@ mod tests {
     }
 
     #[test]
+    fn stanza_ingest_skips_sha512_once_sha256_is_known() {
+        let sha512 = format!("SHA512: {}", hex_encode(&[0x22; 64]));
+        let mut s = Stanza::new();
+        s.ingest(&format!("SHA256: {}", hex_encode(&[0x11; 32])));
+        s.ingest(&sha512);
+        assert_eq!(s.sha512, None, "never read: `chosen` prefers SHA256");
+        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0x11; 32].as_slice())));
+
+        // A SHA512 listed first is kept, and SHA256 still wins.
+        let mut s = Stanza::new();
+        s.ingest(&sha512);
+        s.ingest(&format!("SHA256: {}", hex_encode(&[0x11; 32])));
+        assert_eq!(s.sha512, Some([0x22; 64]));
+        assert_eq!(s.chosen(), Some((HashAlgo::Sha256, [0x11; 32].as_slice())));
+    }
+
+    #[test]
+    fn stanza_reset_reuses_the_filename_buffer() {
+        let mut s = Stanza::new();
+        s.ingest("Filename: pool/main/a/abc/abc_1.0_amd64.deb");
+        let capacity = s.filename.capacity();
+        s.reset();
+        assert_eq!(s.filename(), None);
+        s.ingest("Filename: pool/b.deb");
+        assert_eq!(s.filename(), Some("pool/b.deb"));
+        assert_eq!(s.filename.capacity(), capacity);
+    }
+
+    #[test]
     fn stanza_chosen_prefers_sha256_over_sha512() {
         let mut s = Stanza::new();
         s.sha256 = Some([0x11u8; 32]);
@@ -881,9 +923,9 @@ mod tests {
         let mut out = Vec::new();
         while let Some(s) = stream.next().await.expect("readable") {
             out.push((
-                s.filename
-                    .clone()
-                    .expect("only stanzas with a Filename are yielded"),
+                s.filename()
+                    .expect("only stanzas with a Filename are yielded")
+                    .to_owned(),
                 s.chosen().map(|(algo, _)| algo),
             ));
         }
@@ -988,7 +1030,7 @@ mod tests {
         s.ingest(" Filename: pool/evil.deb\n");
         s.ingest(&format!("\tSHA256: {}\n", hex_encode(&[0xee; 32])));
         s.ingest(&format!("  SHA512: {}\n", hex_encode(&[0xee; 64])));
-        assert!(s.filename.is_none());
+        assert_eq!(s.filename(), None);
         assert_eq!(s.chosen(), None);
     }
 
@@ -1002,7 +1044,7 @@ mod tests {
         );
         let mut stream = StanzaStream::new(input.as_bytes(), Stanza::new());
         let stanza = stream.next().await.expect("readable").expect("one stanza");
-        assert_eq!(stanza.filename.as_deref(), Some("pool/a.deb"));
+        assert_eq!(stanza.filename(), Some("pool/a.deb"));
         assert_eq!(
             stanza.chosen(),
             Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
@@ -1109,7 +1151,7 @@ mod tests {
         let input = b"Filename: pool/a.deb\n\nFilename: pool/b.deb\n\n";
         let mut stream = StanzaStream::new(&input[..], Stanza::new());
         let first = stream.next().await.expect("readable").expect("first");
-        assert_eq!(first.filename.as_deref(), Some("pool/a.deb"));
+        assert_eq!(first.filename(), Some("pool/a.deb"));
         // Leaving the loop here is the early exit; nothing else is read.
         drop(stream);
     }
@@ -1236,7 +1278,7 @@ mod tests {
                 "pool/main/f/foo/foo_1.0_amd64.deb",
                 IndexFormat::Structured,
             ),
-            Some("foo_1.0_amd64.deb".to_string())
+            Some("foo_1.0_amd64.deb")
         );
     }
 
@@ -1244,7 +1286,7 @@ mod tests {
     fn registry_key_for_flat_uses_relpath_verbatim() {
         assert_eq!(
             registry_key_from_filename_field("amd64/foo_1.0_amd64.deb", IndexFormat::Flat),
-            Some("amd64/foo_1.0_amd64.deb".to_string())
+            Some("amd64/foo_1.0_amd64.deb")
         );
     }
 
@@ -1252,12 +1294,12 @@ mod tests {
     fn registry_key_strips_leading_dot_slash() {
         assert_eq!(
             registry_key_from_filename_field("./foo_1.0_amd64.deb", IndexFormat::Flat),
-            Some("foo_1.0_amd64.deb".to_string()),
+            Some("foo_1.0_amd64.deb"),
             "the flat key must match the cache path relative to the mirror root"
         );
         assert_eq!(
             registry_key_from_filename_field("./foo_1.0_amd64.deb", IndexFormat::Structured),
-            Some("foo_1.0_amd64.deb".to_string())
+            Some("foo_1.0_amd64.deb")
         );
     }
 
@@ -1282,7 +1324,7 @@ mod tests {
         let long_dir = format!("pool/{}{at_cap}", "d/".repeat(1000));
         assert_eq!(
             registry_key_from_filename_field(&long_dir, IndexFormat::Structured),
-            Some(at_cap.clone())
+            Some(at_cap.as_str())
         );
         // ... but a basename past NAME_MAX, up to the 8 KiB line cap, does.
         for name in [
@@ -1299,7 +1341,7 @@ mod tests {
 
         assert_eq!(
             registry_key_from_filename_field(&format!("sub/{at_cap}"), IndexFormat::Flat),
-            Some(format!("sub/{at_cap}"))
+            Some(format!("sub/{at_cap}").as_str())
         );
         assert_eq!(
             registry_key_from_filename_field(&format!("sub/{over_cap}"), IndexFormat::Flat),
@@ -1317,7 +1359,7 @@ mod tests {
         assert!(at_flat_cap.len() <= MAX_REGISTRY_FLAT_KEY_LEN);
         assert_eq!(
             registry_key_from_filename_field(&at_flat_cap, IndexFormat::Flat),
-            Some(at_flat_cap.clone())
+            Some(at_flat_cap.as_str())
         );
     }
 

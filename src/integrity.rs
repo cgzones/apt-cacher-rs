@@ -1869,7 +1869,7 @@ fn ingest_stanza_into_registry(
     mirror_path: &str,
     format: IndexFormat,
 ) {
-    let (Some(filename), Some(sha256)) = (stanza.filename.as_deref(), stanza.sha256) else {
+    let (Some(filename), Some(sha256)) = (stanza.filename(), stanza.sha256) else {
         return;
     };
     let Some(key) = index_parser::registry_key_from_filename_field(filename, format) else {
@@ -1881,7 +1881,7 @@ fn ingest_stanza_into_registry(
         );
         return;
     };
-    registry.insert(host, mirror_path, &key, sha256);
+    registry.insert(host, mirror_path, key, sha256);
 }
 
 #[cfg(test)]
