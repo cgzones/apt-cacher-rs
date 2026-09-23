@@ -973,7 +973,9 @@ pub(crate) fn is_unsafe_cache_path(normalized_path: &str) -> bool {
 /// A decoded path segment that is a dot segment or carries a control byte.
 #[must_use]
 fn is_unsafe_segment(seg: &str) -> bool {
-    seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control())
+    // Byte scan: UTF-8 never reuses an ASCII byte inside a multi-byte
+    // sequence, so this matches exactly the ASCII control characters.
+    seg == "." || seg == ".." || seg.bytes().any(|b| b.is_ascii_control())
 }
 
 /// A digest algorithm the Debian repository format names as a
