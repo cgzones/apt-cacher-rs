@@ -283,8 +283,6 @@ pub(crate) static CONNECTED_CLIENTS_PEAK: Peak = Peak::new();
 pub(crate) static ACTIVE_UPSTREAM_DOWNLOADS_PEAK: Peak = Peak::new();
 pub(crate) static ACTIVE_CLIENT_DOWNLOADS_PEAK: Peak = Peak::new();
 
-/// Bytes delivered via memory-mapped file I/O.
-pub(crate) static BYTES_SERVED_MMAP: Accumulator = Accumulator::new();
 /// Bytes delivered via Linux `sendfile(2)` zero-copy.
 pub(crate) static BYTES_SERVED_SENDFILE: Accumulator = Accumulator::new();
 /// Bytes delivered to the client by the splice proxy backend.  The bulk of
@@ -371,8 +369,6 @@ pub(crate) static CACHE_MISSES: Counter = Counter::new();
 /// counts responses that started down that path, `SERVED_X` the subset that
 /// completed, and `BYTES_SERVED_X` (above) their bytes. `SERVED_TOTAL` is the
 /// sum of the `SERVED_X` plus `SERVED_WEBUI`.
-pub(crate) static REQUESTS_MMAP: Counter = Counter::new();
-pub(crate) static SERVED_MMAP: Counter = Counter::new();
 pub(crate) static REQUESTS_SENDFILE: Counter = Counter::new();
 pub(crate) static SERVED_SENDFILE: Counter = Counter::new();
 pub(crate) static REQUESTS_SPLICE: Counter = Counter::new();
@@ -411,7 +407,7 @@ pub(crate) static UPSTREAM_HYPER_REQUEST_FAILED: Counter = Counter::new();
 pub(crate) static UPSTREAM_HYPER_BODY_ERR: Counter = Counter::new();
 
 /// Local cache I/O failures: any cached-file syscall (write/flush/read/
-/// rename/create/stat/open/mmap/seek) that fails, regardless of whether a
+/// rename/create/stat/open/seek) that fails, regardless of whether a
 /// 5xx is returned to the client. Distinct from `CACHE_SIZE_CORRUPTION`,
 /// which is specific to on-disk size accounting drift.
 pub(crate) static CACHE_IO_FAILURE: Counter = Counter::new();

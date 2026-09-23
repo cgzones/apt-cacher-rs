@@ -60,8 +60,6 @@ mod logstore;
 mod macros;
 mod main_loop;
 mod metrics;
-#[cfg(all(feature = "mmap", feature = "hyper"))]
-mod mmap_body;
 mod parallel_hack;
 mod partial_file;
 mod passthrough_limiter;

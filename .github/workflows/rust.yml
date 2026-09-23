@@ -23,7 +23,7 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
       SQLX_OFFLINE: true
-      # `default` resolves identically to the explicit `hyper,mmap,sendfile,tls_rustls`
+      # `default` resolves identically to the explicit `hyper,sendfile,tls_rustls`
       # combination, so excluding it drops two duplicate runs from the powerset.
       HACK: >-
         --feature-powerset

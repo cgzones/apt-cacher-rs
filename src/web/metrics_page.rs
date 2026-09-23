@@ -439,15 +439,6 @@ fn build_delivery_group(g: &mut Groups) {
     g.group("Delivery", |t| {
         delivery_path(
             t,
-            "mmap Requests \u{2192} Served",
-            "mmap Bytes",
-            "Cached responses served via memory-mapped file I/O: requests that entered this path \u{2192} requests whose body was fully delivered.",
-            metrics::REQUESTS_MMAP.get(),
-            metrics::SERVED_MMAP.get(),
-            metrics::BYTES_SERVED_MMAP.get(),
-        );
-        delivery_path(
-            t,
             "sendfile Requests \u{2192} Served",
             "sendfile Bytes",
             "Cached responses served via Linux sendfile(2) zero-copy: requests that entered this path \u{2192} requests whose body was fully delivered.",
@@ -909,7 +900,7 @@ fn build_errors_group(g: &mut Groups) {
     g.group("Storage Errors", |t| {
         t.row_tip(
             "Cache I/O Failures",
-            "Cached-file syscall failures (write/flush/read/rename/create/stat/open/mmap/seek) on serving, download, scan and cleanup paths, regardless of whether a client response was affected.",
+            "Cached-file syscall failures (write/flush/read/rename/create/stat/open/seek) on serving, download, scan and cleanup paths, regardless of whether a client response was affected.",
             AlertNonzero(metrics::CACHE_IO_FAILURE.get()),
         );
         t.row_tip(

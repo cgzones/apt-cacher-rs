@@ -8,9 +8,9 @@
 //! digits below 10, one below 100, none above.
 //!
 //! [`HumanFmt::BinarySize`] is the one IEC exception, for configuration
-//! values that are powers of two by nature (buffer sizes, the mmap
-//! threshold): a 32 KiB buffer reads `32.0KiB`, not `32.8kB`. Same precision
-//! ladder, promotion at `NEXT_BINARY_UNIT` (1023.5) for the same reason.
+//! values that are powers of two by nature (buffer sizes): a 32 KiB buffer
+//! reads `32.0KiB`, not `32.8kB`. Same precision ladder, promotion at
+//! `NEXT_BINARY_UNIT` (1023.5) for the same reason.
 //!
 //! [`HumanFmt::Rate`] divides by its window and renders `???B/s` for a
 //! zero-length one - see `precise_instant` for why the std clock makes that

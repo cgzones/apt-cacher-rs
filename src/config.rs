@@ -11,7 +11,11 @@
 //! "Set but has no effect" warnings must test `self.is_set("key")` (the
 //! key's structural presence in the TOML document), never compare the value
 //! against its default: an operator who writes the default value explicitly
-//! still gets the warning. Feature-gated options mirror `mmap_threshold`.
+//! still gets the warning.
+//!
+//! Removing an option: its key goes into [`REMOVED_OPTIONS`] instead of
+//! vanishing, so `deny_unknown_fields` does not turn an old configuration
+//! file into a startup failure; `validate()` warns that it is ignored.
 //!
 //! A CLI flag that *overrides* a config field instead: a `Cli` field in
 //! `main.rs` + a `Config::load` parameter applied on top of the parsed TOML
@@ -67,6 +71,15 @@ macro_rules! invalid {
 }
 
 pub(crate) const DEFAULT_CONFIGURATION_PATH: &str = "/etc/apt-cacher-rs/apt-cacher-rs.conf";
+
+/// Top-level keys of options that no longer exist. [`Config::from_toml`]
+/// drops them before deserializing (whatever their value), and `validate()`
+/// warns about each one set.
+///
+/// - `mmap_threshold`: the memory-mapped serve path was removed, because a
+///   mapped cache file truncated behind the daemon's back (or a media error)
+///   raises `SIGBUS` and kills the whole process.
+const REMOVED_OPTIONS: &[&str] = &["mmap_threshold"];
 
 /// Default of [`Config::rate_check_timeframe`]; a named const (not a field of
 /// `Config::default()`) because `ringbuffer.rs` pins its inline capacity to it
@@ -929,9 +942,6 @@ pub(crate) struct Config {
     /// `last_seen` syncs.
     pub(crate) db_batch_flush_interval_secs: NonZero<u64>,
 
-    /// Threshold (in bytes) for using memory-mapped files for large downloads.
-    pub(crate) mmap_threshold: NonZero<u64>,
-
     /// Whether to set `TCP_NODELAY` on upstream sockets (hyper, splice, and
     /// CONNECT tunnels).  Mirror requests are typically a small header
     /// followed by a long body read; disabling Nagle's algorithm avoids the
@@ -1049,7 +1059,6 @@ impl Default for Config {
             db_channel_capacity: nonzero!(128),
             db_batch_flush_max_count: nonzero!(256),
             db_batch_flush_interval_secs: nonzero!(15),
-            mmap_threshold: nonzero!(1024 * 1024), // 1 MiB
             upstream_tcp_nodelay: true,
             reject_pdiff_requests: true,
             verify_checksums: true,
@@ -1391,17 +1400,21 @@ impl Config {
     }
 
     /// Parse a TOML document, recording which top-level keys it spells out
-    /// (see [`Self::is_set`]) before deserializing it.
+    /// (see [`Self::is_set`]) before deserializing it without the
+    /// [`REMOVED_OPTIONS`].
     ///
     /// Parses to a spanned table first so unknown-key and type errors keep
     /// their line/column information.
     fn from_toml(content: &str) -> Result<Self, toml::de::Error> {
-        let table = toml::de::DeTable::parse(content)?;
+        let mut table = toml::de::DeTable::parse(content)?;
         let present = table
             .get_ref()
             .keys()
             .map(|key| key.get_ref().to_string())
             .collect();
+        for key in REMOVED_OPTIONS {
+            table.get_mut().remove(*key);
+        }
         let mut config = Self::deserialize(toml::de::Deserializer::from(table))?;
         config.present = present;
         Ok(config)
@@ -1526,13 +1539,6 @@ impl Config {
                 )
             }
 
-            if max_object_size < self.mmap_threshold {
-                warnings.push(format!(
-                    "max_object_size of {} is smaller than mmap_threshold ({}); accepted downloads will always stay below the mmap threshold, so the mmap delivery path will never be exercised",
-                    max_object_size.get(),
-                    self.mmap_threshold.get()
-                ));
-            }
             if max_object_size < nonzero!(100 * 1024 * 1024) {
                 warnings.push(format!(
                     "max_object_size of {} is very small; consider a larger value to avoid requests being rejected",
@@ -1738,12 +1744,12 @@ impl Config {
             ));
         }
 
-        #[cfg(not(feature = "mmap"))]
-        if self.is_set("mmap_threshold") {
-            warnings.push(format!(
-                "mmap_threshold is set to {} but mmap feature is not enabled",
-                self.mmap_threshold
-            ));
+        for key in REMOVED_OPTIONS {
+            if self.is_set(key) {
+                warnings.push(format!(
+                    "{key} is no longer supported and is ignored; remove it from the configuration"
+                ));
+            }
         }
 
         if !self.experimental_parallel_hack_enabled
@@ -2566,7 +2572,7 @@ mod test {
         assert!(cfg.is_set("https_tunnel_enabled"));
         assert!(cfg.is_set("aliases"));
         assert!(!cfg.is_set("bind_addr"));
-        assert!(!cfg.is_set("mmap_threshold"));
+        assert!(!cfg.is_set("log_file"));
         assert!(!Config::default().is_set("bind_port"));
     }
 
@@ -2670,21 +2676,23 @@ mod test {
         }
     }
 
+    /// A removed option still loads, whatever value it carries, so an old
+    /// configuration file does not stop the daemon from starting; it only
+    /// earns a warning naming the key.
     #[test]
-    fn mmap_threshold_set_warns_only_without_mmap_feature() {
-        let warnings = warnings_for("mmap_threshold = 1048576");
-        let warned = warnings
-            .iter()
-            .any(|w| w == "mmap_threshold is set to 1048576 but mmap feature is not enabled");
-        assert_eq!(
-            warned,
-            !cfg!(feature = "mmap"),
-            "mmap_threshold warning must track the mmap feature: {warnings:?}"
-        );
+    fn removed_mmap_threshold_is_ignored_with_a_warning() {
+        const WARNING: &str = "mmap_threshold is no longer supported and is ignored; remove it from the configuration";
+        for value in ["1048576", "0", "'1M'"] {
+            let warnings = warnings_for(&format!("mmap_threshold = {value}"));
+            assert!(
+                warnings.iter().any(|w| w == WARNING),
+                "mmap_threshold = {value}: {warnings:?}"
+            );
+        }
         assert!(
             !warnings_for("")
                 .iter()
-                .any(|w| w.contains("mmap feature is not enabled")),
+                .any(|w| w.contains("mmap_threshold")),
             "unset mmap_threshold must not warn"
         );
     }

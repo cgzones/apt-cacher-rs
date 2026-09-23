@@ -173,7 +173,8 @@ where
 }
 
 /// Client operation adapter: rate failures and source-body failures share one
-/// typed delivery result. Keeping it concrete preserves mmap's data type.
+/// typed delivery result. Generic over the source so its data type passes
+/// through unboxed.
 #[pin_project]
 pub(crate) struct ClientBody<B: Body> {
     #[pin]

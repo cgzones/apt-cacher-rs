@@ -1,6 +1,6 @@
 //! Completion bookkeeping for bodies served from the cache to a client.
 //!
-//! Every path that ships a cached (or in-progress) file - hyper stream, mmap,
+//! Every path that ships a cached (or in-progress) file - hyper stream,
 //! channel, sendfile - ends the same way: bump `SERVED_<mechanism>` +
 //! `SERVED_TOTAL` iff the body was fully delivered, log one completion or
 //! abort line whose wording only differs in the mechanism token and the
@@ -30,9 +30,6 @@ pub(crate) enum Mechanism {
     /// hyper, buffered file read (`REQUESTS_COPY`).
     #[cfg(feature = "hyper")]
     Stream,
-    /// hyper, memory-mapped file.
-    #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap,
     /// hyper, late joiner fed through an in-process channel.
     #[cfg(feature = "hyper")]
     Channel,
@@ -48,8 +45,6 @@ impl Mechanism {
         match self {
             #[cfg(feature = "hyper")]
             Self::Stream => "stream",
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap => "mmap",
             #[cfg(feature = "hyper")]
             Self::Channel => "channel",
             #[cfg(feature = "sendfile")]
@@ -63,8 +58,6 @@ impl Mechanism {
     pub(crate) fn requests(self) -> &'static Counter {
         match self {
             Self::Stream => &metrics::REQUESTS_COPY,
-            #[cfg(feature = "mmap")]
-            Self::Mmap => &metrics::REQUESTS_MMAP,
             Self::Channel => &metrics::REQUESTS_CHANNEL,
             #[cfg(feature = "sendfile")]
             Self::Sendfile => &metrics::REQUESTS_SENDFILE,
@@ -77,8 +70,6 @@ impl Mechanism {
     pub(crate) fn bytes_served(self) -> &'static metrics::Accumulator {
         match self {
             Self::Stream => &metrics::BYTES_SERVED_COPY,
-            #[cfg(feature = "mmap")]
-            Self::Mmap => &metrics::BYTES_SERVED_MMAP,
             Self::Channel => &metrics::BYTES_SERVED_CHANNEL,
             #[cfg(feature = "sendfile")]
             Self::Sendfile => &metrics::BYTES_SERVED_SENDFILE,
@@ -90,8 +81,6 @@ impl Mechanism {
         match self {
             #[cfg(feature = "hyper")]
             Self::Stream => &metrics::SERVED_COPY,
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap => &metrics::SERVED_MMAP,
             #[cfg(feature = "hyper")]
             Self::Channel => &metrics::SERVED_CHANNEL,
             #[cfg(feature = "sendfile")]
@@ -279,8 +268,6 @@ mod tests {
             assert_eq!(Mechanism::Stream.via(), "stream");
             assert_eq!(Mechanism::Channel.via(), "channel");
         }
-        #[cfg(all(feature = "mmap", feature = "hyper"))]
-        assert_eq!(Mechanism::Mmap.via(), "mmap");
         #[cfg(feature = "sendfile")]
         assert_eq!(Mechanism::Sendfile.via(), "sendfile");
     }

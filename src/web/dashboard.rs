@@ -441,7 +441,7 @@ impl Display for SavedShare {
 /// The one thing the daemon exists to do, at the top of the page: bytes in
 /// from upstream, bytes out to clients, and the difference it kept. That
 /// difference was previously the third cell of the fourth card, in the same
-/// weight as the mmap threshold.
+/// weight as the buffer size.
 fn build_hero_html(mirrors: &[MirrorStatEntry], cache_size: u64, quota: Option<u64>) -> String {
     let downloaded_raw: i64 = mirrors.iter().map(|m| m.total_download_size).sum();
     let delivered_raw: i64 = mirrors.iter().map(|m| m.total_delivery_size).sum();
@@ -656,10 +656,6 @@ fn build_configuration_html(rd: &RuntimeDetails) -> String {
     t.row(
         "Buffer Size",
         HumanFmt::BinarySize(rd.config.buffer_size as u64),
-    );
-    t.row(
-        "Mmap Threshold",
-        HumanFmt::BinarySize(rd.config.mmap_threshold.get()),
     );
     t.row(
         "Reject pdiff Requests",

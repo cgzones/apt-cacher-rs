@@ -27,13 +27,9 @@ use http_body::{Body, Frame};
 use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::tokio::TokioIo};
-#[cfg(feature = "mmap")]
-use memmap2::{Advice, MmapOptions};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tracing::{debug, error, info, trace, warn};
 
-#[cfg(feature = "mmap")]
-use crate::mmap_body::MmapBody;
 use crate::{
     AppState, Never, Scheme,
     accounted_body::{AccountedBody, Subject},
@@ -610,121 +606,6 @@ fn passthrough_response(
     response
 }
 
-#[cfg(feature = "mmap")]
-#[expect(
-    clippy::inline_always,
-    reason = "function has only 1 caller and is a tail call"
-)]
-#[inline(always)]
-fn serve_cached_file_mmap(
-    conn_details: ConnectionDetails,
-    file: tokio::fs::File,
-    file_path: &Path,
-    aliased: &str,
-    cache_info: &CacheInfo,
-    params: ServeParams,
-) -> Response<ProxyCacheBody> {
-    let content_start = params.content_start;
-    let content_length: usize = match params.content_length.try_into() {
-        Ok(c) => c,
-        Err(_err @ std::num::TryFromIntError { .. }) => {
-            error!(
-                "Content-Length of {} bytes for file `{}` from mirror {}{aliased} for client {} is too large; returning 500",
-                params.content_length,
-                file_path.display(),
-                conn_details.mirror,
-                conn_details.client
-            );
-            return cache_access_failure();
-        }
-    };
-
-    debug!(
-        "Serving cached file {} from mirror {}{aliased} for client {} via mmap...",
-        conn_details.debname, conn_details.mirror, conn_details.client
-    );
-
-    // mmap path uses madvise(SEQUENTIAL) on the mapping itself, so no
-    // posix_fadvise is needed here.
-
-    trace!(
-        "Using mmap(2) with start={content_start} and length={content_length} from content_range={:?} for file `{}`",
-        params.content_range,
-        file_path.display()
-    );
-
-    // block_in_place, not spawn_blocking: mmap(2)/madvise(2) only build a
-    // VMA (no I/O), so the blocking-pool dispatch/rendezvous would cost
-    // more than the syscalls themselves — per-hit latency on every
-    // mmap-served file.
-    let Some(memory_map) = tokio::task::block_in_place(|| {
-        // SAFETY:
-        // The file is only read from and only forwarded as bytes to a network socket.
-        // Also clients perform a signature check on received packages.
-        let memory_map = unsafe {
-            MmapOptions::new()
-                .offset(content_start)
-                .len(content_length)
-                .map(&file)
-        }
-        .inspect_err(|err| {
-            error!(
-                "Failed to mmap downloaded file `{}`; returning 500:  {}",
-                file_path.display(),
-                ErrorReport(err)
-            );
-        })
-        .ok()?;
-
-        // `MmapBody` derives the body length from the mapping alone, while
-        // the head announces `content_length`: pin the two together, or a
-        // mapping longer than requested would stream past the announced
-        // length with no debug-build signal.
-        debug_assert_eq!(
-            memory_map.len(),
-            content_length,
-            "MmapOptions::len must produce exactly the announced body length"
-        );
-
-        // close file, since mapping is independent
-        drop(file);
-
-        if let Err(err) = memory_map.advise(Advice::Sequential) {
-            warn_once_or_info!(
-                "Failed to advise memory mapping of file `{}`; serving without the readahead hint:  {}",
-                file_path.display(),
-                ErrorReport(&err)
-            );
-        }
-
-        Some(memory_map)
-    }) else {
-        metrics::CACHE_IO_FAILURE.increment();
-        return cache_access_failure();
-    };
-
-    let content_type = content_type_for_cached_file(&conn_details.debname);
-
-    let config = global_config();
-    let body = ProxyCacheBody::Mmap(AccountedBody::new(
-        ClientBody::new(
-            MmapBody::new(memory_map),
-            config.min_download_rate,
-            config.rate_check_timeframe,
-        ),
-        Subject::Cached {
-            conn_details,
-            mechanism: Mechanism::Mmap,
-            size: Some(content_length as u64),
-            role: Role::Cached,
-            partial: params.is_partial(),
-        },
-    ));
-
-    // TODO: use become: https://github.com/rust-lang/rust/issues/112788
-    serve_cached_file_response(cache_info, params, content_type, body)
-}
-
 #[must_use]
 #[expect(
     clippy::unused_async,
@@ -923,20 +804,7 @@ async fn serve_cached_file(
         }
     };
 
-    #[cfg(feature = "mmap")]
-    if params.content_length >= global_config().mmap_threshold.get() {
-        // TODO: use become: https://github.com/rust-lang/rust/issues/112788
-        return serve_cached_file_mmap(
-            conn_details,
-            file,
-            &file_path,
-            &aliased,
-            &cache_info,
-            params,
-        );
-    }
-
-    // Buf path streams the file straight through; let the kernel grow its
+    // The file is streamed straight through; let the kernel grow its
     // readahead window accordingly.
     hint_sequential_read(&file, params.content_length, &file_path);
 
@@ -1006,12 +874,12 @@ async fn serve_cached_file_buf(
 
     let content_type = content_type_for_cached_file(&conn_details.debname);
 
-    // Bound the reader to the (possibly range-trimmed) content length,
-    // mirroring the mmap path: an unbounded stream over-reads past a closed
-    // range's end, and the surplus makes AccountedBody's Drop
-    // accounting see transferred != size — logging a spurious "Aborted
-    // serving" warn and skipping the SERVED_* metrics and delivery DB row
-    // for a request that was actually served fully.
+    // Bound the reader to the (possibly range-trimmed) content length: an
+    // unbounded stream over-reads past a closed range's end, and the surplus
+    // makes AccountedBody's Drop accounting see transferred != size —
+    // logging a spurious "Aborted serving" warn and skipping the SERVED_*
+    // metrics and delivery DB row for a request that was actually served
+    // fully.
     let body = rated_client_body(
         CachedFileBody::new(file, content_length, config.buffer_size, file_path),
         Subject::Cached {
@@ -1027,8 +895,8 @@ async fn serve_cached_file_buf(
     serve_cached_file_response(cache_info, params, content_type, body)
 }
 
-/// Shared response builder for `serve_cached_file_mmap` and
-/// `serve_cached_file_buf`; always called as a tail call.
+/// Response builder of `serve_cached_file_buf`; always called as a tail
+/// call.
 fn serve_cached_file_response(
     cache_info: &CacheInfo,
     params: ServeParams,

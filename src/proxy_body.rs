@@ -1,6 +1,5 @@
 //! [`ProxyCacheBody`], the response body every hyper-served response (and
-//! the hyper-less cleanup bridge) is built from: a memory-mapped cached file
-//! or a boxed dynamic body. [`full_body`] and `quick_response` wrap small,
+//! the hyper-less cleanup bridge) is built from: a boxed dynamic body. [`full_body`] and `quick_response` wrap small,
 //! fully buffered payloads.
 
 use std::{fmt::Debug, pin::Pin};
@@ -14,8 +13,6 @@ use pin_project::pin_project;
 #[cfg(feature = "hyper")]
 use crate::response_head::ResponseHead;
 use crate::transfer_error::DeliveryFailure;
-#[cfg(all(feature = "mmap", feature = "hyper"))]
-use crate::{accounted_body, mmap_body, rate_checked_body::ClientBody};
 
 #[must_use]
 #[cfg(feature = "hyper")]
@@ -34,25 +31,13 @@ pub(crate) fn full_body<T: Into<bytes::Bytes>>(content: T) -> ProxyCacheBody {
 }
 
 #[pin_project(project = EnumProj)]
-#[cfg_attr(
-    all(feature = "mmap", feature = "hyper"),
-    expect(
-        clippy::large_enum_variant,
-        reason = "Mmap is the zero-allocation hot path; boxing it would add a heap \
-                  alloc per cached-file response which is exactly what this variant exists to avoid"
-    )
-)]
 pub(crate) enum ProxyCacheBody {
-    #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap(#[pin] accounted_body::AccountedBody<ClientBody<mmap_body::MmapBody>>),
     Boxed(#[pin] BoxBody<bytes::Bytes, DeliveryFailure>),
 }
 
 impl Debug for ProxyCacheBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(_) => f.debug_tuple("Mmap").finish(),
             Self::Boxed(_) => f.debug_tuple("Boxed").finish(),
         }
     }
@@ -69,11 +54,6 @@ impl Body for ProxyCacheBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.project() {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            EnumProj::Mmap(memory_map) => memory_map
-                .poll_frame(cx)
-                .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Mmap)),
-
             EnumProj::Boxed(bytes) => bytes
                 .poll_frame(cx)
                 .map_ok(|frame| frame.map_data(ProxyCacheBodyData::Bytes)),
@@ -83,8 +63,6 @@ impl Body for ProxyCacheBody {
     #[inline]
     fn size_hint(&self) -> SizeHint {
         match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(mmap_body) => mmap_body.size_hint(),
             Self::Boxed(box_body) => box_body.size_hint(),
         }
     }
@@ -92,40 +70,30 @@ impl Body for ProxyCacheBody {
     #[inline]
     fn is_end_stream(&self) -> bool {
         match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(mmap_body) => mmap_body.is_end_stream(),
             Self::Boxed(box_body) => box_body.is_end_stream(),
         }
     }
 }
 
 pub(crate) enum ProxyCacheBodyData {
-    #[cfg(all(feature = "mmap", feature = "hyper"))]
-    Mmap(mmap_body::MmapData),
     Bytes(bytes::Bytes),
 }
 
 impl bytes::buf::Buf for ProxyCacheBodyData {
     fn remaining(&self) -> usize {
         match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(memory_map) => memory_map.remaining(),
             Self::Bytes(bytes) => bytes.remaining(),
         }
     }
 
     fn chunk(&self) -> &[u8] {
         match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(memory_map) => memory_map.chunk(),
             Self::Bytes(bytes) => bytes.chunk(),
         }
     }
 
     fn advance(&mut self, cnt: usize) {
         match self {
-            #[cfg(all(feature = "mmap", feature = "hyper"))]
-            Self::Mmap(memory_map) => memory_map.advance(cnt),
             Self::Bytes(bytes) => bytes.advance(cnt),
         }
     }

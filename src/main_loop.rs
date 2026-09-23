@@ -66,7 +66,6 @@ fn log_shutdown_summary(signal: &str, active_downloads: &ActiveDownloads) {
     let uptime = (time::OffsetDateTime::now_utc() - rd.start_time).unsigned_abs();
 
     let bytes_served = [
-        metrics::BYTES_SERVED_MMAP.get(),
         metrics::BYTES_SERVED_SENDFILE.get(),
         metrics::BYTES_SERVED_SPLICE.get(),
         metrics::BYTES_SERVED_COPY.get(),

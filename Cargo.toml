@@ -25,14 +25,13 @@ exclude = [
 
 
 [features]
-default = ["hyper", "mmap", "tls_rustls", "sendfile"]
+default = ["hyper", "tls_rustls", "sendfile"]
 hyper = [
     "dep:hyper",
     "dep:hyper-util",
     "dep:hyper-timeout",
 ]
 webpki-roots = ["tls_rustls", "dep:webpki-roots"]
-mmap = ["dep:memmap2"]
 sendfile = ["dep:httparse", "nix/zerocopy", "nix/socket"]
 splice = ["sendfile", "nix/socket"]
 tls_hyper = ["dep:hyper-tls", "dep:tokio-native-tls"]
@@ -59,7 +58,6 @@ ipnet = { version = "2.9.0", features = ["serde"] }
 log = "0.4.20"
 lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz"] }
 memfd = "0.6.4"
-memmap2 = { version = "0.9", optional = true }
 memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
 nix = { version = "0.31", features = ["fs", "hostname", "resource", "user"] }
 parking_lot = "0.12.5"
@@ -310,4 +308,4 @@ changelog = "debian/changelog"
 license-file = ["LICENSE", "0"]
 systemd-units = { enable = true, start = true }
 default-features = false
-features = ["hyper", "mmap", "tls_hyper", "sendfile"]
+features = ["hyper", "tls_hyper", "sendfile"]
