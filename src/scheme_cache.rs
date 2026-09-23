@@ -5,11 +5,18 @@
 //! flow (splice `connect_upstream`) stay backend-specific — this module owns the
 //! scheme types, the decision (`resolve`/`decide`), and the cache read/insert/evict
 //! (`record_success`/`record_failure`).
+//!
+//! A learned HTTPS scheme is kept until a terminal failure evicts it. A learned
+//! HTTP scheme only lives for [`HTTP_SCHEME_TTL`]: under `Auto` it records a
+//! failed upgrade probe, and a host that could not do TLS once (a transient
+//! outage, an on-path attacker blocking the handshake) must not be dialled in
+//! cleartext for the rest of the process lifetime.
 
 use std::fmt::Display;
 use std::num::NonZero;
 use std::sync::OnceLock;
 
+use coarsetime::Instant;
 use hashbrown::{Equivalent, HashMap, hash_map::EntryRef};
 use http::uri::Authority;
 use parking_lot::RwLock;
@@ -101,11 +108,35 @@ impl Equivalent<SchemeKey> for SchemeKeyRef<'_> {
     }
 }
 
+/// How long a learned HTTP scheme is remembered before the host is treated
+/// as uncached again, so `Auto` mode probes HTTPS anew. Learned HTTPS is not
+/// aged.
+pub(crate) const HTTP_SCHEME_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(60 * 60);
+
+/// A cache entry: the scheme and when it was learned.
+#[derive(Clone, Copy, Debug)]
+struct CachedScheme {
+    scheme: Scheme,
+    learned: Instant,
+}
+
+impl CachedScheme {
+    /// The scheme, unless it is an HTTP entry older than [`HTTP_SCHEME_TTL`]
+    /// at `now`.
+    fn live_at(self, now: Instant) -> Option<Scheme> {
+        let Self { scheme, learned } = self;
+        match scheme {
+            Scheme::Https => Some(scheme),
+            Scheme::Http => (now.duration_since(learned) < HTTP_SCHEME_TTL).then_some(scheme),
+        }
+    }
+}
+
 /// Process-wide cache of the scheme last known good for each upstream host.
 /// Module-private: reach it only through [`cache`] and the functions below.
-static SCHEME_CACHE: OnceLock<RwLock<HashMap<SchemeKey, Scheme>>> = OnceLock::new();
+static SCHEME_CACHE: OnceLock<RwLock<HashMap<SchemeKey, CachedScheme>>> = OnceLock::new();
 
-fn cache() -> &'static RwLock<HashMap<SchemeKey, Scheme>> {
+fn cache() -> &'static RwLock<HashMap<SchemeKey, CachedScheme>> {
     SCHEME_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -175,15 +206,19 @@ fn decide(cached: Option<Scheme>, is_http_only: bool, mode: HttpsUpgradeMode) ->
     }
 }
 
-/// The scheme currently cached for `key`, if any.
-fn cached_scheme(key: SchemeKeyRef<'_>) -> Option<Scheme> {
-    cache().read().get(&key).copied()
+/// The scheme cached for `key` at `now`, if a live one. Taking the clock as
+/// a parameter keeps the TTL testable without sleeping.
+fn cached_scheme_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<Scheme> {
+    cache()
+        .read()
+        .get(&key)
+        .and_then(|entry| entry.live_at(now))
 }
 
 /// Resolve the upstream scheme for `key` from the cache and config — the single
 /// entry point both backends use to decide HTTP vs HTTPS.
 pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision {
-    let cached = cached_scheme(key);
+    let cached = cached_scheme_at(key, Instant::now());
     // `decide` returns on `cached` before reading `is_http_only`; skip the
     // `http_only_mirrors` scan on a cache hit.
     let is_http_only =
@@ -191,33 +226,59 @@ pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision 
     decide(cached, is_http_only, config.https_upgrade_mode)
 }
 
-/// Cache the scheme a successful upstream connection used. Vacant-only: an
-/// existing entry is left untouched. Returns `true` if newly inserted, so the
-/// caller can emit its own backend-flavored debug log.
+/// Cache the scheme a successful upstream connection used. Vacant-only: a
+/// live entry is left untouched, an expired HTTP entry is replaced (and dated
+/// afresh). Returns `true` if newly inserted, so the caller can emit its own
+/// backend-flavored debug log.
 pub(crate) fn record_success(key: SchemeKeyRef<'_>, scheme: Scheme) -> bool {
-    let scheme_cache = cache();
-    if scheme_cache.read().contains_key(&key) {
+    record_success_at(key, scheme, Instant::now())
+}
+
+/// [`record_success`] at the given clock reading.
+fn record_success_at(key: SchemeKeyRef<'_>, scheme: Scheme, now: Instant) -> bool {
+    if cached_scheme_at(key, now).is_some() {
         return false;
     }
-    if let EntryRef::Vacant(ventry) = scheme_cache.write().entry_ref(&key) {
-        ventry.insert_entry_with_key(
-            SchemeKey {
-                host: key.host.to_owned(),
-                port: key.port,
-            },
-            scheme,
-        );
-        true
-    } else {
-        false
+    let entry = CachedScheme {
+        scheme,
+        learned: now,
+    };
+    match cache().write().entry_ref(&key) {
+        EntryRef::Occupied(mut occupied) => {
+            // Re-checked under the write lock: a racing request may have
+            // learned a scheme since the read above.
+            if occupied.get().live_at(now).is_some() {
+                return false;
+            }
+            *occupied.get_mut() = entry;
+        }
+        EntryRef::Vacant(ventry) => {
+            ventry.insert_entry_with_key(
+                SchemeKey {
+                    host: key.host.to_owned(),
+                    port: key.port,
+                },
+                entry,
+            );
+        }
     }
+    true
 }
 
 /// Evict any cached scheme for `key` after a terminal upstream failure, so the
 /// next request re-resolves instead of retrying a dead scheme. Owns the
-/// `SCHEME_CACHE_REMOVED` metric bump. Returns the removed scheme for logging.
+/// `SCHEME_CACHE_REMOVED` metric bump. Returns the removed scheme for logging;
+/// an expired entry is dropped silently, as it no longer decided anything.
 pub(crate) fn record_failure(key: SchemeKeyRef<'_>) -> Option<Scheme> {
-    let removed = cache().write().remove(&key);
+    record_failure_at(key, Instant::now())
+}
+
+/// [`record_failure`] at the given clock reading.
+fn record_failure_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<Scheme> {
+    let removed = cache()
+        .write()
+        .remove(&key)
+        .and_then(|entry| entry.live_at(now));
     if removed.is_some() {
         metrics::SCHEME_CACHE_REMOVED.increment();
     }
@@ -261,10 +322,10 @@ mod tests {
     fn record_success_inserts_once_and_is_vacant_only() {
         let host = key("record-success.test.invalid");
         assert!(record_success(host, Scheme::Https));
-        assert_eq!(cached_scheme(host), Some(Scheme::Https));
+        assert_eq!(cached_scheme_at(host, Instant::now()), Some(Scheme::Https));
         // Vacant-only: an existing entry is never overwritten.
         assert!(!record_success(host, Scheme::Http));
-        assert_eq!(cached_scheme(host), Some(Scheme::Https));
+        assert_eq!(cached_scheme_at(host, Instant::now()), Some(Scheme::Https));
     }
 
     #[test]
@@ -272,9 +333,80 @@ mod tests {
         let host = key("record-failure.test.invalid");
         record_success(host, Scheme::Https);
         assert_eq!(record_failure(host), Some(Scheme::Https));
-        assert_eq!(cached_scheme(host), None);
+        assert_eq!(cached_scheme_at(host, Instant::now()), None);
         // Evicting an absent entry is a no-op returning None.
         assert_eq!(record_failure(host), None);
+    }
+
+    /// An Auto-mode HTTP fallback is only remembered for `HTTP_SCHEME_TTL`;
+    /// then the host is treated as uncached again, so Auto probes HTTPS.
+    #[test]
+    fn http_entry_expires_after_ttl() {
+        let host = key("http-ttl.test.invalid");
+        let t0 = Instant::now();
+        let second = coarsetime::Duration::from_secs(1);
+        assert!(record_success_at(host, Scheme::Http, t0));
+        assert_eq!(
+            cached_scheme_at(host, t0 + HTTP_SCHEME_TTL - second),
+            Some(Scheme::Http)
+        );
+        let expired = t0 + HTTP_SCHEME_TTL;
+        assert_eq!(cached_scheme_at(host, expired), None);
+        assert_eq!(
+            decide(
+                cached_scheme_at(host, expired),
+                false,
+                HttpsUpgradeMode::Auto
+            ),
+            SchemeDecision::AutoUpgrade,
+            "an expired HTTP fallback re-probes HTTPS"
+        );
+    }
+
+    #[test]
+    fn https_entry_does_not_expire() {
+        let host = key("https-no-ttl.test.invalid");
+        let t0 = Instant::now();
+        assert!(record_success_at(host, Scheme::Https, t0));
+        assert_eq!(
+            cached_scheme_at(host, t0 + HTTP_SCHEME_TTL + HTTP_SCHEME_TTL),
+            Some(Scheme::Https)
+        );
+    }
+
+    /// Vacant-only applies to live entries: an expired HTTP entry is
+    /// replaced by the outcome of the next probe, and dated afresh.
+    #[test]
+    fn expired_http_entry_is_replaced() {
+        let host = key("http-replace.test.invalid");
+        let t0 = Instant::now();
+        let second = coarsetime::Duration::from_secs(1);
+        assert!(record_success_at(host, Scheme::Http, t0));
+        assert!(
+            !record_success_at(host, Scheme::Https, t0 + second),
+            "a live entry is never overwritten"
+        );
+        let expired = t0 + HTTP_SCHEME_TTL;
+        assert!(record_success_at(host, Scheme::Http, expired));
+        assert_eq!(
+            cached_scheme_at(host, expired + HTTP_SCHEME_TTL - second),
+            Some(Scheme::Http),
+            "the re-learned fallback runs its own TTL"
+        );
+        let expired_again = expired + HTTP_SCHEME_TTL;
+        assert!(record_success_at(host, Scheme::Https, expired_again));
+        assert_eq!(cached_scheme_at(host, expired_again), Some(Scheme::Https));
+    }
+
+    /// Evicting an expired entry reports nothing: it no longer decided how
+    /// the host was dialled.
+    #[test]
+    fn record_failure_ignores_expired_entry() {
+        let host = key("http-evict-expired.test.invalid");
+        let t0 = Instant::now();
+        assert!(record_success_at(host, Scheme::Http, t0));
+        assert_eq!(record_failure_at(host, t0 + HTTP_SCHEME_TTL), None);
+        assert_eq!(cached_scheme_at(host, t0), None, "the entry is gone");
     }
 
     #[test]

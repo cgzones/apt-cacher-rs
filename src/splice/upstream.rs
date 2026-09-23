@@ -667,7 +667,8 @@ pub(super) async fn connect_upstream(
         }
         None => {
             // Auto mode: try HTTPS first, fall back to HTTP
-            // TODO: retry HTTPS after small period, fall back to HTTP
+            // (the fallback is remembered for `HTTP_SCHEME_TTL` only, after
+            // which the next request probes HTTPS again).
             match tcp_connect(host, mirror_port(mirror, true)).await {
                 Ok(tcp) => match tls_connect(tcp, host).await {
                     Ok(tls) => {
