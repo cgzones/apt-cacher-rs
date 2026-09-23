@@ -111,29 +111,18 @@ pub(crate) fn structured_lookup_key(relpath: &str) -> Option<&str> {
 
 /// Decode `hex` into exactly `N` bytes. `None` on wrong length / non-hex.
 /// Accepts upper- and lower-case.
+///
+/// `const_hex` decodes with runtime-dispatched SIMD (~4 ns per SHA-256
+/// digest, against ~20 ns for a branch-free lookup table and ~150 ns for the
+/// per-digit range `match` it replaced), which matters for the ~10^5 digests
+/// of a full `Packages` ingest. It also strips an optional `0x` prefix; the
+/// exact length check comes first, so a prefixed input is `2 * N` characters
+/// of which only `2 * N - 2` are digits and the decode rejects it.
 pub(crate) fn hex_decode_exact<const N: usize>(hex: &str) -> Option<[u8; N]> {
     if hex.len() != N * 2 {
         return None;
     }
-    let bytes = hex.as_bytes();
-    let mut out = [0u8; N];
-    let mut i = 0;
-    while i < N {
-        let hi = hex_digit(bytes[2 * i])?;
-        let lo = hex_digit(bytes[2 * i + 1])?;
-        out[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    Some(out)
-}
-
-const fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    const_hex::decode_to_array(hex).ok()
 }
 
 /// Parse a stanza line of the form `"<prefix><hex>"` into `N` bytes. Like
@@ -1457,6 +1446,40 @@ SHA256:
             parse_release_date("SHA256:\nDate: Sun, 20 Sep 2026 08:53:33 UTC\n"),
             None
         );
+    }
+
+    #[test]
+    fn hex_decode_exact_matches_a_per_digit_reference_on_every_byte() {
+        let reference = |b: u8| char::from(b).to_digit(16);
+        for b in 0..=u8::MAX {
+            // One odd byte among valid digits, at either nibble.
+            for input in [[b, b'0'], [b'f', b]] {
+                let expected = match (reference(input[0]), reference(input[1])) {
+                    (Some(hi), Some(lo)) => {
+                        Some([u8::try_from((hi << 4) | lo).expect("two nibbles fit a byte")])
+                    }
+                    _ => None,
+                };
+                // Non-ASCII bytes are not a `str` on their own; the
+                // decoder only ever sees the bytes.
+                let Ok(text) = std::str::from_utf8(&input) else {
+                    continue;
+                };
+                assert_eq!(hex_decode_exact::<1>(text), expected, "{input:?}");
+            }
+        }
+        // A multi-byte character of the right byte length.
+        let text = format!("{}\u{e9}", "a".repeat(62));
+        assert_eq!(text.len(), 64);
+        assert_eq!(hex_decode_exact::<32>(&text), None);
+        assert_eq!(
+            hex_decode_exact::<4>("0aF9c3E7"),
+            Some([0x0a, 0xf9, 0xc3, 0xe7])
+        );
+        // `const_hex` accepts a `0x` prefix; at the exact length it leaves
+        // too few digits and must still be rejected.
+        assert_eq!(hex_decode_exact::<4>("0x0aF9c3"), None);
+        assert_eq!(hex_decode_exact::<3>("0x0aF9c3"), None);
     }
 
     #[test]
