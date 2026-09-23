@@ -389,6 +389,13 @@ pub(crate) enum ResourceFile<'a> {
     /// A pool file
     Pool {
         mirror_path: &'a str,
+        /// The raw `[updates/]<component>/<prefix>/<package>` run between
+        /// `pool/` and the filename.  No part of the cache identity (the
+        /// file caches flat under the mirror), but the upstream is asked for
+        /// it verbatim, so [`crate::cache_layout::classify_request`] decodes
+        /// and validates every segment: an unchecked `..` here would fetch
+        /// one file and cache it under another's name.
+        dirs: &'a str,
         filename: &'a str,
     },
     /// A dists file
@@ -420,6 +427,11 @@ pub(crate) enum ResourceFile<'a> {
     /// A file named and acquired by its hash value
     ByHash {
         mirror_path: &'a str,
+        /// The raw `/`-joined directory run between `dists/` and `/by-hash/`,
+        /// empty when there is none.  Like the `Pool` directories no part of
+        /// the cache identity but forwarded upstream, so every segment is
+        /// decoded and validated by [`crate::cache_layout::classify_request`].
+        dirs: &'a str,
         filename: &'a str,
         /// The `dists/<dist>/<comp>/<arch>/` scope the object hangs under,
         /// when the path has exactly that shape; `None` at any other depth
@@ -739,15 +751,20 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 return None;
             }
 
-            // Exactly three remaining segments are the
-            // `<dist>/<comp>/<arch>` scope an `Origin` is made of - the
-            // acceptance `Origin::from_path` applies here too.  Any other
-            // depth yields no scope rather than rejecting the request: the
-            // object is still cacheable by its digest.
-            let scope = byhash_scope(&mut parts);
+            // Everything before `by-hash/<ALGO>/<hex>`; empty for a
+            // `dists/by-hash/...` object.
+            let dirs = dists_path.rsplitn(4, '/').nth(3).unwrap_or_default();
+
+            // Exactly three directories are the `<dist>/<comp>/<arch>` scope
+            // an `Origin` is made of - the acceptance `Origin::from_path`
+            // applies here too.  Any other depth yields no scope rather than
+            // rejecting the request: the object is still cacheable by its
+            // digest.
+            let scope = byhash_scope(&mut dirs.rsplit('/'));
 
             return Some(ResourceFile::ByHash {
                 mirror_path,
+                dirs,
                 filename,
                 scope,
             });
@@ -766,9 +783,9 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
 /// path not matching that exact convention; the caller then falls back to the
 /// flat handler.
 fn parse_structured_pool<'a>(mirror_path: &'a str, pool_path: &'a str) -> Option<ResourceFile<'a>> {
-    let mut parts = pool_path.rsplit('/');
+    let (dirs, filename) = pool_path.rsplit_once('/')?;
 
-    let filename = parts.next()?;
+    let mut parts = dirs.rsplit('/');
 
     let package = parts.next()?;
 
@@ -788,6 +805,7 @@ fn parse_structured_pool<'a>(mirror_path: &'a str, pool_path: &'a str) -> Option
 
     Some(ResourceFile::Pool {
         mirror_path,
+        dirs,
         filename,
     })
 }
@@ -943,9 +961,36 @@ pub(crate) fn is_unsafe_proxy_path(raw_path: &str) -> bool {
         Err(_err @ std::string::FromUtf8Error { .. }) => return true,
     };
 
+    decoded.split('/').any(is_unsafe_segment)
+}
+
+/// The cache-route sibling of [`is_unsafe_proxy_path`], for a request the
+/// classifier accepted: `normalized_path` is the [`normalize_uri_path`] form,
+/// so the `//` runs and `.` segments APT itself emits are already gone, and
+/// any empty, `.` or `..` segment left after percent-decoding - or a control
+/// byte - is refused.  A cached request is forwarded upstream as sent while
+/// its cache name comes from the validated fields alone, so a traversal the
+/// validators missed would store one resource under another's name.
+///
+/// Returns `true` if the path is unsafe and should be rejected.
+#[must_use]
+pub(crate) fn is_unsafe_cache_path(normalized_path: &str) -> bool {
+    let decoded = match urlencoding::decode(normalized_path) {
+        Ok(d) => d,
+        Err(_err @ std::string::FromUtf8Error { .. }) => return true,
+    };
+
     decoded
+        .strip_prefix('/')
+        .unwrap_or(&decoded)
         .split('/')
-        .any(|seg| seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control()))
+        .any(|seg| seg.is_empty() || is_unsafe_segment(seg))
+}
+
+/// A decoded path segment that is a dot segment or carries a control byte.
+#[must_use]
+fn is_unsafe_segment(seg: &str) -> bool {
+    seg == "." || seg == ".." || seg.contains(|c: char| c.is_ascii_control())
 }
 
 /// A digest algorithm the Debian repository format names as a
@@ -1323,6 +1368,21 @@ fn valid_path_segment(name: &str) -> bool {
         })
 }
 
+/// Whether `name` is acceptable as one intermediate directory of a cached
+/// URL that is no part of its cache name - a pool
+/// `[updates/]<component>/<prefix>/<package>` segment, or a directory of a
+/// `by-hash` object's `dists/` run: a [`valid_path_segment`] that may also
+/// carry `+` past its first byte, which Debian source package names (the
+/// pool `<package>` directory, e.g. `gtk+3.0`) allow.
+#[must_use]
+pub(crate) fn valid_directory(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SEGMENT_LEN
+        && name.bytes().enumerate().all(|(i, b)| {
+            b.is_ascii_alphanumeric() || (i > 0 && matches!(b, b'-' | b'.' | b'_' | b'+'))
+        })
+}
+
 // The three field validators below are [`valid_path_segment`] under
 // per-field names, so `cache_layout::ValidateKind` dispatches to a name that
 // says which URL field is being checked and one rule can diverge later
@@ -1365,6 +1425,7 @@ mod tests {
             scoped,
             ResourceFile::ByHash {
                 mirror_path: "debian",
+                dirs: "sid/main/binary-amd64",
                 filename: SHA256,
                 scope: Some(ByHashScope {
                     distribution: "sid",
@@ -1530,6 +1591,7 @@ mod tests {
             parse_request_path("debian/pool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
             Some(ResourceFile::Pool {
                 mirror_path: "debian",
+                dirs: "main/f/firefox-esr",
                 filename: "firefox-esr_115.9.1esr-1_amd64.deb"
             })
         );
@@ -1540,6 +1602,7 @@ mod tests {
             ),
             Some(ResourceFile::Pool {
                 mirror_path: "private/ubuntu",
+                dirs: "main/f/firefox-esr",
                 filename: "firefox-esr_115.9.1esr-1_amd64.deb"
             })
         );
@@ -1548,6 +1611,7 @@ mod tests {
             parse_request_path("debian/pool/main/libs/libssh/libssh-doc_0.10.6-2_all.deb"),
             Some(ResourceFile::Pool {
                 mirror_path: "debian",
+                dirs: "main/libs/libssh",
                 filename: "libssh-doc_0.10.6-2_all.deb"
             })
         );
@@ -1558,6 +1622,7 @@ mod tests {
             ),
             Some(ResourceFile::Pool {
                 mirror_path: "debian",
+                dirs: "main/libt/libtirpc",
                 filename: "libtirpc3t64_1.3.4%2bds-1.2_amd64.deb"
             })
         );
@@ -1566,6 +1631,7 @@ mod tests {
             parse_request_path("debian/pool/main/m/mesa/libgl1-mesa-dri_24.0.5-1_amd64.deb"),
             Some(ResourceFile::Pool {
                 mirror_path: "debian",
+                dirs: "main/m/mesa",
                 filename: "libgl1-mesa-dri_24.0.5-1_amd64.deb"
             })
         );
@@ -1676,6 +1742,7 @@ mod tests {
             ),
             Some(ResourceFile::Pool {
                 mirror_path: "pool/dists/debian-security",
+                dirs: "updates/main/c/chromium",
                 filename: "chromium-common_141.0.7390.65-1%7edeb12u1_amd64.deb"
             })
         );
@@ -1686,6 +1753,7 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
+                dirs: "sid/main/binary-amd64/Packages.diff",
                 filename: "491ddac17f4b86d771a457e6b084c499dfeb9ee29004b92d5d05fe79f1f0dede",
                 // Four segments before `by-hash`: not the origin shape.
                 scope: None
@@ -1698,6 +1766,7 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
+                dirs: "sid/main/dep11",
                 filename: "cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482",
                 // A pseudo-arch still yields a scope; the "no origin"
                 // rule is `is_binary_arch`, applied by `classify_request`.
@@ -1715,6 +1784,7 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
+                dirs: "trixie/main",
                 filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
                 // Component-scoped (the `Release` sibling): no architecture,
                 // so no origin.
@@ -2004,6 +2074,7 @@ mod tests {
             ),
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
+                dirs: "trixie/main",
                 filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
                 scope: None
             })
@@ -2043,6 +2114,7 @@ mod tests {
             parse_request_path("debian/pool/main/f/firefox-esr/firefox-esr_115.9.1esr-1_amd64.deb"),
             Some(ResourceFile::Pool {
                 mirror_path: "debian",
+                dirs: "main/f/firefox-esr",
                 filename: "firefox-esr_115.9.1esr-1_amd64.deb",
             })
         );
@@ -2288,6 +2360,7 @@ mod tests {
             parse_request_path(&normalized),
             Some(ResourceFile::Pool {
                 mirror_path: "debian",
+                dirs: "main/f/firefox-esr",
                 filename: "firefox-esr_115.9.1esr-1_amd64.deb"
             })
         );
@@ -2637,6 +2710,61 @@ mod tests {
 
         // invalid UTF-8 in percent-encoding
         assert!(is_unsafe_proxy_path("/debian/%ff%fe"));
+    }
+
+    #[test]
+    fn test_is_unsafe_cache_path() {
+        // What a classified request looks like once normalised: the `/./`
+        // and `//` APT itself emits are gone, legitimate escapes stay.
+        assert!(!is_unsafe_cache_path(
+            "/debian/pool/main/a/apt/apt_2.9.8_amd64.deb"
+        ));
+        assert!(!is_unsafe_cache_path(
+            "/debian/pool/main/libt/libtirpc/libtirpc3t64_1.3.4%2bds-1.2_amd64.deb"
+        ));
+        assert!(!is_unsafe_cache_path(&normalize_uri_path(
+            "/cuda/repos/./debian12//x86_64/Packages.gz"
+        )));
+
+        // Dot segments, raw or encoded.
+        assert!(is_unsafe_cache_path(
+            "/debian/pool/updates/../../../victim_1.0_amd64.deb"
+        ));
+        assert!(is_unsafe_cache_path(
+            "/debian/pool/main/%2e%2e/%2E%2E/victim_1.0_amd64.deb"
+        ));
+        assert!(is_unsafe_cache_path("/debian/dists/%2e/Release"));
+        // An empty segment only an encoded separator can produce.
+        assert!(is_unsafe_cache_path(
+            "/debian/pool/main%2F%2Fx/y/y_1_all.deb"
+        ));
+        assert!(is_unsafe_cache_path("/debian/pool/main/x/y/%2Fy_1_all.deb"));
+        // Control bytes and undecodable escapes.
+        assert!(is_unsafe_cache_path("/debian/dists/sid%00/Release"));
+        assert!(is_unsafe_cache_path("/debian/dists/sid%0a/Release"));
+        assert!(is_unsafe_cache_path("/debian/dists/%ff%fe/Release"));
+    }
+
+    #[test]
+    fn test_valid_directory() {
+        for ok in [
+            "main",
+            "updates",
+            "f",
+            "libt",
+            "firefox-esr",
+            "gtk+3.0",
+            "0ad",
+            "binary-amd64",
+        ] {
+            assert!(valid_directory(ok), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", "+x", "-x", "_x", "a/b", "a b", "a%2e", "a\0b",
+        ] {
+            assert!(!valid_directory(bad), "{bad:?}");
+        }
+        assert!(!valid_directory(&"a".repeat(MAX_SEGMENT_LEN + 1)));
     }
 
     #[test]

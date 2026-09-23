@@ -21,9 +21,11 @@
 //!   2. [`normalize_uri_path`]     - collapse `//` runs / strip `.` segments
 //!   3. [`parse_request_path`]     - structural shape-match into `ResourceFile`
 //!   4. [`classify_request`]       - per-field URL-decode + allowlist validate
-//!   5. flat-blocklist collision   - host-level `flat/` claimed by structured
-//!   6. deferred `Origin` DB write - for `Packages` requests w/ a real arch
-//!   7. unsafe-proxy-path gate     - traversal/control bytes in passthrough
+//!   5. unsafe-cache-path gate     - empty/dot segments, control bytes once
+//!      decoded, on a classified request
+//!   6. flat-blocklist collision   - host-level `flat/` claimed by structured
+//!   7. deferred `Origin` DB write - for `Packages` requests w/ a real arch
+//!   8. unsafe-proxy-path gate     - traversal/control bytes in passthrough
 //!
 //! Backends translate the returned [`DispatchOutcome`] into their response
 //! type.  All logging, metric bumping, the deferred `Origin` DB write and
@@ -48,7 +50,8 @@ use crate::{
     client_info::ClientInfo,
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
     deb_mirror::{
-        Mirror, is_diff_request_path, is_unsafe_proxy_path, normalize_uri_path, parse_request_path,
+        Mirror, is_diff_request_path, is_unsafe_cache_path, is_unsafe_proxy_path,
+        normalize_uri_path, parse_request_path,
     },
     error::ErrorReport,
     flat_blocklist, global_config, info_once, metrics,
@@ -97,7 +100,8 @@ pub(crate) enum RejectReason {
     /// (`valid_mirrorname`, `valid_distribution`, etc.).
     InvalidValue,
     /// The simple-proxy gate found `..`/`.` traversal segments or a
-    /// control byte in the percent-decoded path.
+    /// control byte in the percent-decoded path, or the cache-route gate an
+    /// empty or dot segment or a control byte in the decoded normalized path.
     UnsafePath,
     /// Configured to refuse pdiff requests, and this is one
     /// (`/Packages.diff/T-...`, `/Sources.diff/T-...`,
@@ -569,6 +573,18 @@ fn decide_request(
         }
         Some(resource) => match cache_layout::classify_request(&resource, client) {
             Ok(class) => {
+                // The upstream is asked for the path as sent, while the cache
+                // name comes from the validated fields alone: a dot segment
+                // the validators missed would cache one resource under
+                // another's name.
+                if is_unsafe_cache_path(&normalized) {
+                    warn_once_or_info!(
+                        "Rejecting unsafe cache path {uri_path} for client {client} with 400"
+                    );
+                    metrics::UNSAFE_PATH_REJECTED.increment();
+                    return Decision::Reject(RejectReason::UnsafePath);
+                }
+
                 let aliased_host = resolve_alias(aliases, &requested_host);
 
                 let cache_id = aliased_host.unwrap_or_else(|| requested_host.as_cache_host());
@@ -1210,6 +1226,33 @@ mod tests {
             matches!(decision, Decision::Reject(RejectReason::UnsafePath)),
             "expected UnsafePath reject, got {decision:?}"
         );
+    }
+
+    /// Regression (cache poisoning): the traversal used to reach the cache
+    /// as `debian/victim_1.0_amd64.deb` while the upstream was asked for
+    /// `/victim_1.0_amd64.deb`.
+    #[test]
+    fn reject_dot_segments_on_a_cached_route() {
+        for path in [
+            "/debian/pool/updates/../../../victim_1.0_amd64.deb",
+            "/debian/pool/main/%2e%2e/%2e%2e/victim_1.0_amd64.deb",
+            "/debian/dists/../../evil/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
+        ] {
+            let decision = decide_request(
+                path,
+                fake_host(),
+                None,
+                &local_client(),
+                &[],
+                true,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            );
+            assert!(
+                matches!(decision, Decision::Reject(RejectReason::InvalidValue)),
+                "{path}: expected InvalidValue reject, got {decision:?}"
+            );
+        }
     }
 
     #[test]

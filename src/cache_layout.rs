@@ -70,7 +70,7 @@ use crate::{
     deb_mirror::{
         ByHashScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
         ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, valid_architecture,
-        valid_component, valid_distribution, valid_filename, valid_mirrorname,
+        valid_component, valid_directory, valid_distribution, valid_filename, valid_mirrorname,
     },
     precise_instant::PreciseInstant,
 };
@@ -502,6 +502,9 @@ pub(crate) enum ValidateKind {
     Distribution,
     Component,
     Architecture,
+    /// A directory segment outside the cache name: see
+    /// [`crate::deb_mirror::valid_directory`].
+    Directory,
     Filename,
 }
 
@@ -516,6 +519,7 @@ impl ValidateKind {
             Self::Distribution => valid_distribution(decoded),
             Self::Component => valid_component(decoded),
             Self::Architecture => valid_architecture(decoded),
+            Self::Directory => valid_directory(decoded),
             Self::Filename => valid_filename(decoded),
         }
     }
@@ -528,6 +532,7 @@ impl std::fmt::Display for ValidateKind {
             Self::Distribution => "distribution",
             Self::Component => "component",
             Self::Architecture => "architecture",
+            Self::Directory => "directory",
             Self::Filename => "filename",
         })
     }
@@ -621,9 +626,11 @@ pub(crate) fn classify_request<'a>(
     match resource {
         ResourceFile::Pool {
             mirror_path,
+            dirs,
             filename,
         } => {
             let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
+            validate_directories(dirs)?;
             let filename = decode_validate(filename, ValidateKind::Filename)?;
 
             if !is_deb_package(&filename) {
@@ -663,6 +670,7 @@ pub(crate) fn classify_request<'a>(
         }
         ResourceFile::ByHash {
             mirror_path,
+            dirs,
             filename,
             scope,
         } => {
@@ -676,32 +684,34 @@ pub(crate) fn classify_request<'a>(
             // On an `Acquire-By-Hash: yes` mirror this arm - not the
             // `Packages` one - is where the `Origin` row is earned.  The
             // scope is no part of the cache identity; it is decoded and
-            // validated here only because it reaches the database and
-            // cleanup's index-fetch URLs.
-            let origin_fields = match scope {
-                Some(ByHashScope {
-                    distribution,
-                    component,
-                    architecture,
-                }) => {
-                    let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
-                    let component = decode_validate(component, ValidateKind::Component)?;
-                    let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
+            // validated here because it reaches the upstream, the database
+            // and cleanup's index-fetch URLs.  A run of any other depth
+            // reaches only the upstream, and is validated just the same.
+            let origin_fields = if let Some(ByHashScope {
+                distribution,
+                component,
+                architecture,
+            }) = scope
+            {
+                let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
+                let component = decode_validate(component, ValidateKind::Component)?;
+                let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
 
-                    // Only `binary-<arch>` is a real architecture; the
-                    // metadata trees sharing its depth (`dep11`, `i18n`,
-                    // `source`, Ubuntu's `cnf`) map to no origin.
-                    if is_binary_arch(&architecture) {
-                        Some(OriginFields {
-                            distribution: distribution.into_owned(),
-                            component: component.into_owned(),
-                            architecture: architecture.into_owned(),
-                        })
-                    } else {
-                        None
-                    }
+                // Only `binary-<arch>` is a real architecture; the metadata
+                // trees sharing its depth (`dep11`, `i18n`, `source`,
+                // Ubuntu's `cnf`) map to no origin.
+                if is_binary_arch(&architecture) {
+                    Some(OriginFields {
+                        distribution: distribution.into_owned(),
+                        component: component.into_owned(),
+                        architecture: architecture.into_owned(),
+                    })
+                } else {
+                    None
                 }
-                None => None,
+            } else {
+                validate_directories(dirs)?;
+                None
             };
 
             Ok(RequestClass {
@@ -885,6 +895,20 @@ fn classify_component_scoped<'a>(
     })
 }
 
+/// Decode + validate every segment of a raw `/`-joined directory run that is
+/// forwarded upstream but no part of the cache name (the `dirs` of
+/// [`ResourceFile::Pool`] and [`ResourceFile::ByHash`]).  Per segment, so an
+/// encoded `%2F` stays inside the segment it was sent in and fails there.
+fn validate_directories(dirs: &str) -> Result<(), ClassifyError<'_>> {
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    for segment in dirs.split('/') {
+        decode_validate(segment, ValidateKind::Directory)?;
+    }
+    Ok(())
+}
+
 /// URL-decode `raw` and check the result with the validator selected by
 /// `kind`.  Returns a `Cow` borrowing the input when no percent-escape was
 /// present (the common case for ASCII Debian paths), so callers that feed
@@ -915,6 +939,7 @@ mod tests {
     fn classify_pool() {
         let res = ResourceFile::Pool {
             mirror_path: "debian",
+            dirs: "main/f/foo",
             filename: "firefox-esr_115.9.1esr-1_amd64.deb",
         };
         let class = classify_request(&res, &local_client()).unwrap();
@@ -930,6 +955,7 @@ mod tests {
     fn classify_pool_non_deb_extension_returns_non_deb_pool() {
         let res = ResourceFile::Pool {
             mirror_path: "debian",
+            dirs: "main/f/foo",
             filename: "README.txt",
         };
         assert!(matches!(
@@ -997,6 +1023,7 @@ mod tests {
     fn classify_byhash() {
         let res = ResourceFile::ByHash {
             mirror_path: "debian",
+            dirs: "trixie/main",
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
             scope: None,
         };
@@ -1185,6 +1212,7 @@ mod tests {
         // value is preserved on the error so callers can log it.
         let res = ResourceFile::Pool {
             mirror_path: "debian",
+            dirs: "main/f/foo",
             filename: "%ff%fe",
         };
         assert!(matches!(
@@ -1202,6 +1230,7 @@ mod tests {
         // valid_filename rejects names whose first byte is not alphanumeric.
         let res = ResourceFile::Pool {
             mirror_path: "debian",
+            dirs: "main/f/foo",
             filename: "_foo.deb",
         };
         assert!(matches!(
@@ -1219,6 +1248,7 @@ mod tests {
         // even decoded.
         let res = ResourceFile::Pool {
             mirror_path: "../escape",
+            dirs: "main/f/foo",
             filename: "foo_1.0_amd64.deb",
         };
         assert!(matches!(
@@ -1295,6 +1325,7 @@ mod tests {
         // can never carve an extra directory level out of a leaf name.
         let res = ResourceFile::Pool {
             mirror_path: "debian",
+            dirs: "main/f/foo",
             filename: "foo%2Fbar_1.0_amd64.deb",
         };
         assert!(matches!(
@@ -1304,6 +1335,93 @@ mod tests {
                 decoded,
             }) if decoded == "foo/bar_1.0_amd64.deb"
         ));
+    }
+
+    /// Regression (cache poisoning): the pool directories are no part of the
+    /// cache name but are forwarded upstream verbatim, so a `..` among them
+    /// fetched `/victim_...deb` from the mirror root and cached it as
+    /// `debian/victim_...deb`, served to every later canonical request.
+    #[test]
+    fn classify_rejects_dot_segments_in_pool_directories() {
+        for (path, bad) in [
+            ("debian/pool/updates/../../../victim_1.0_amd64.deb", ".."),
+            ("debian/pool/main/%2e%2e/%2e%2e/victim_1.0_amd64.deb", ".."),
+            (
+                "debian/pool/main/v/v%2F..%2F..%2Fx/victim_1.0_amd64.deb",
+                "v/../../x",
+            ),
+        ] {
+            let res = parse_request_path(path).expect("parses as a pool file");
+            assert!(matches!(&res, ResourceFile::Pool { .. }), "{path}: {res:?}");
+            assert!(
+                matches!(
+                    classify_request(&res, &local_client()),
+                    Err(ClassifyError::InvalidValue {
+                        kind: ValidateKind::Directory,
+                        ref decoded,
+                    }) if decoded == bad
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    /// A `+` in a source package name (the pool `<package>` directory) is
+    /// legitimate, raw or percent-encoded as APT sends it.
+    #[test]
+    fn classify_accepts_a_plus_in_the_pool_package_directory() {
+        for path in [
+            "debian/pool/main/g/gtk+3.0/libgtk-3-0_3.24.41-1_amd64.deb",
+            "debian/pool/main/g/gtk%2b3.0/libgtk-3-0_3.24.41-1_amd64.deb",
+            "debian-security/pool/updates/main/g/gtk%2B3.0/libgtk-3-0_3.24.41-1_amd64.deb",
+        ] {
+            let res = parse_request_path(path).expect("parses as a pool file");
+            let class = classify_request(&res, &local_client()).expect(path);
+            assert_eq!(class.debname, "libgtk-3-0_3.24.41-1_amd64.deb", "{path}");
+        }
+    }
+
+    /// The `by-hash` directory run is validated at every depth, not only the
+    /// three-segment one that yields an origin scope.
+    #[test]
+    fn classify_rejects_dot_segments_in_byhash_directories() {
+        const H: &str = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        for dirs in [
+            "../..",
+            "sid/..",
+            "..",
+            "sid/main/binary-amd64/../..",
+            "%2e%2e/x",
+        ] {
+            let path = format!("debian/dists/{dirs}/by-hash/SHA256/{H}");
+            let res = parse_request_path(&path).expect("parses as a by-hash object");
+            assert!(
+                matches!(&res, ResourceFile::ByHash { .. }),
+                "{path}: {res:?}"
+            );
+            assert!(
+                matches!(
+                    classify_request(&res, &local_client()),
+                    Err(ClassifyError::InvalidValue { .. })
+                ),
+                "{path}"
+            );
+        }
+        // Every legitimate depth still classifies.
+        for dirs in [
+            "",
+            "trixie",
+            "trixie/main",
+            "trixie/main/debian-installer/binary-amd64",
+        ] {
+            let path = if dirs.is_empty() {
+                format!("debian/dists/by-hash/SHA256/{H}")
+            } else {
+                format!("debian/dists/{dirs}/by-hash/SHA256/{H}")
+            };
+            let res = parse_request_path(&path).expect("parses as a by-hash object");
+            assert!(classify_request(&res, &local_client()).is_ok(), "{path}");
+        }
     }
 
     /// [`ValidateKind`] carries both a label and the validator to apply; this
