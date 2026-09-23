@@ -16,6 +16,13 @@ use super::scan::{remove_non_regular, remove_stray_dir};
 /// which this sentence spells out.
 const FOREIGN_CONSEQUENCE: &str = "removing it once it is older than a week";
 
+/// Age before a zero-byte `.partial` is reaped. A download creates its
+/// partial before the first body byte lands, so an empty one may belong to
+/// a download still waiting on its upstream -- at most `http_timeout` (capped
+/// at six minutes) per read. An hour is far past that, and still far below
+/// the partial span that governs partials with resume state.
+const EMPTY_PARTIAL_MIN_AGE: Duration = Duration::from_hours(1);
+
 static TMP_WALK: WalkContext = WalkContext {
     what: "a tmp directory",
     dir_failure: DirFailure::Continue("leaving its unread entries unreaped this cycle"),
@@ -25,7 +32,8 @@ static TMP_WALK: WalkContext = WalkContext {
 
 /// Remove stale entries from a single `tmp/` directory.
 ///
-/// `.partial` files are deleted when zero-byte (no useful resume state) or older
+/// `.partial` files are deleted when zero-byte (no useful resume state) and
+/// older than `EMPTY_PARTIAL_MIN_AGE`, or older
 /// than `partial_max_age` — the `PartialsUnit` span, so tuning it in
 /// `model.rs` actually moves this threshold. Any other artifact
 /// (defensive — current code only writes `.partial` here) is deleted once it has
@@ -49,6 +57,7 @@ pub(super) async fn cleanup_tmp_dir(
     const FOREIGN_MAX_AGE: Duration = Duration::from_hours(7 * 24);
 
     let partial_cutoff = now - partial_max_age;
+    let empty_cutoff = now - EMPTY_PARTIAL_MIN_AGE;
     let foreign_cutoff = now - FOREIGN_MAX_AGE;
 
     let mut reaped = TmpReap::default();
@@ -88,8 +97,10 @@ pub(super) async fn cleanup_tmp_dir(
                 .to_str()
                 .is_some_and(|name| name.ends_with(".partial"));
         let stale = if is_partial {
-            // Zero-byte partials carry no resume state; aged partials are stale.
-            mdata.len() == 0 || mtime < partial_cutoff
+            // Zero-byte partials carry no resume state and go once no
+            // download can still be about to fill them; aged partials are
+            // stale.
+            (mdata.len() == 0 && mtime < empty_cutoff) || mtime < partial_cutoff
         } else if mtime < foreign_cutoff {
             true
         } else {
@@ -151,7 +162,7 @@ mod tests {
 
     use filetime::{FileTime, set_file_mtime};
 
-    use super::cleanup_tmp_dir;
+    use super::{EMPTY_PARTIAL_MIN_AGE, cleanup_tmp_dir};
 
     const PARTIAL_MAX_AGE: Duration = Duration::from_hours(1);
     const ONE_DAY: Duration = Duration::from_hours(24);
@@ -173,27 +184,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partials_are_reaped_when_empty_or_past_partial_max_age() {
+    async fn partials_are_reaped_when_past_partial_max_age() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tmp = dir.path();
         let now = SystemTime::now();
 
-        // A zero-byte partial carries no resume state: reaped however fresh.
-        plant_file(tmp, "empty.partial", b"", now, Duration::ZERO);
         // Non-empty partials follow the injected `partial_max_age`.
         plant_file(tmp, "young.partial", b"resume", now, PARTIAL_MAX_AGE / 2);
         plant_file(tmp, "old.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
 
         let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
 
-        assert_eq!(reaped.entries, 2);
+        assert_eq!(reaped.entries, 1);
         assert_eq!(
             reaped.bytes, 4096,
             "the aged partial's accounted block feeds the quota reconcile"
         );
-        assert!(!tmp.join("empty.partial").exists(), "empty partial reaped");
         assert!(tmp.join("young.partial").exists(), "young partial kept");
         assert!(!tmp.join("old.partial").exists(), "aged partial reaped");
+    }
+
+    /// A zero-byte partial carries no resume state, so it goes long before
+    /// `partial_max_age` -- but not while young: a download creates its
+    /// partial before the first body byte arrives, and reaping it then made
+    /// the finished download's rename fail with `ENOENT`.
+    #[tokio::test]
+    async fn empty_partials_are_reaped_only_past_their_minimum_age() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path();
+        let now = SystemTime::now();
+        let long_max_age = ONE_DAY;
+
+        plant_file(tmp, "starting.partial", b"", now, Duration::ZERO);
+        plant_file(
+            tmp,
+            "abandoned.partial",
+            b"",
+            now,
+            EMPTY_PARTIAL_MIN_AGE + Duration::from_mins(1),
+        );
+        plant_file(
+            tmp,
+            "resumable.partial",
+            b"resume",
+            now,
+            EMPTY_PARTIAL_MIN_AGE + Duration::from_mins(1),
+        );
+
+        let reaped = cleanup_tmp_dir(tmp, now, long_max_age).await;
+
+        assert_eq!(reaped.entries, 1);
+        assert!(
+            tmp.join("starting.partial").exists(),
+            "a running download's empty partial is kept"
+        );
+        assert!(
+            !tmp.join("abandoned.partial").exists(),
+            "an old empty partial is reaped"
+        );
+        assert!(
+            tmp.join("resumable.partial").exists(),
+            "a non-empty partial waits for partial_max_age"
+        );
     }
 
     #[tokio::test]
