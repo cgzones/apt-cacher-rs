@@ -1,5 +1,14 @@
 //! Disk-quota accounting for the cache directory.
 //!
+//! Every size is counted as [`accounted_size`]: the length rounded up to
+//! whole [`QUOTA_BLOCK_SIZE`] (4 KiB) blocks, 0 for an empty file. Counting
+//! apparent lengths let millions of tiny index and by-hash files occupy far
+//! more disk than the quota saw. The rounding applies to every input -- a
+//! reservation's `Content-Length`, the replaced file, an adopted, kept or
+//! removed partial, the finalised size -- and to every file the cache scan
+//! and cleanup count, so the reconcile compares like with like; all figures
+//! below are in these units.
+//!
 //! One mutex guards every number the quota decision depends on, so a check,
 //! its reservation, a finalisation and the cleanup reconcile can never
 //! interleave inconsistently:
@@ -77,21 +86,52 @@ use crate::{
 /// Represents a quota violation.
 pub(crate) struct QuotaExceeded;
 
+/// The allocation granularity the quota charges every file in: the block
+/// size of the common Linux filesystems (ext4, XFS, btrfs).
+pub(crate) const QUOTA_BLOCK_SIZE: u64 = 4096;
+
+/// The size a file of `len` bytes is accounted as: `len` rounded up to whole
+/// [`QUOTA_BLOCK_SIZE`] blocks, saturating. An empty file counts 0: it holds
+/// no data block, and inodes are not what the quota measures.
+///
+/// Every length reaching the quota goes through this -- reservations,
+/// finalisation, a replaced file, a kept or removed partial -- and so does
+/// every file the cache scan and cleanup count, or the reconcile would
+/// "repair" the difference between the two sums.
+#[must_use]
+pub(crate) const fn accounted_size(len: u64) -> u64 {
+    len.div_ceil(QUOTA_BLOCK_SIZE)
+        .saturating_mul(QUOTA_BLOCK_SIZE)
+}
+
+/// [`accounted_size`] of a non-zero length, which stays non-zero.
+#[expect(
+    clippy::non_zero_suggestions,
+    reason = "misfires on the local `accounted_size`, which has no NonZero form to call"
+)]
+fn accounted_nonzero(len: NonZero<u64>) -> NonZero<u64> {
+    NonZero::new(accounted_size(len.get())).unwrap_or(len)
+}
+
 /// The `.partial` file a permanent download writes into, handed to the quota
 /// so the bytes a failed download leaves behind stay accounted.
 #[derive(Debug)]
 pub(crate) struct ReservedPartial {
     path: PathBuf,
-    /// Bytes the partial held when the download took it over: the resume
-    /// offset, 0 for a fresh download. Accounted as a kept partial until
-    /// then, they move into the reservation.
+    /// What the partial was accounted as when the download took it over (see
+    /// [`accounted_size`]): the resume offset, 0 for a fresh download.
+    /// Accounted as a kept partial until then, it moves into the reservation.
     adopted: u64,
 }
 
 impl ReservedPartial {
+    /// `adopted` is the partial's length in bytes.
     #[must_use]
     pub(crate) const fn new(path: PathBuf, adopted: u64) -> Self {
-        Self { path, adopted }
+        Self {
+            path,
+            adopted: accounted_size(adopted),
+        }
     }
 }
 
@@ -458,7 +498,8 @@ impl CacheQuota {
         partial: Option<ReservedPartial>,
         debname: &str,
     ) -> Result<QuotaReservation, QuotaExceeded> {
-        let reserved = content_length.upper();
+        let reserved = accounted_nonzero(content_length.upper());
+        let prev_file_size = accounted_size(prev_file_size);
         let replaced = replaced_size(prev_file_size, partial.as_ref());
         let mg = self.inner.accounting.lock();
         let curr = mg.size;
@@ -521,7 +562,8 @@ impl CacheQuota {
         partial: Option<ReservedPartial>,
         debname: &str,
     ) -> QuotaReservation {
-        let reserved = content_length.upper();
+        let reserved = accounted_nonzero(content_length.upper());
+        let prev_file_size = accounted_size(prev_file_size);
         let replaced = replaced_size(prev_file_size, partial.as_ref());
         let mg = self.inner.accounting.lock();
         let curr = mg.size;
@@ -599,6 +641,7 @@ impl CacheQuota {
     /// mismatch, a leftover replaced by a fresh download. `len` is the size
     /// the file had when it was removed.
     pub(crate) fn release_removed_partial(&self, len: u64) {
+        let len = accounted_size(len);
         if len == 0 {
             return;
         }
@@ -768,6 +811,7 @@ impl QuotaReservation {
     /// scan may have counted it too, so its full size is also recorded as a
     /// possible shrink.
     pub(crate) fn finalize(mut self, bytes_received: u64) {
+        let bytes_received = accounted_size(bytes_received);
         let reserved = self.reserved.get();
         let prev = self.prev_file_size;
         let partial = self.partial.as_deref();
@@ -820,7 +864,7 @@ impl Drop for QuotaReservation {
         let prev = self.prev_file_size;
         let partial = self.partial.as_deref();
         let adopted = partial.map_or(0, |p| p.adopted);
-        let kept = partial.map_or(0, |p| partial_len(&p.path));
+        let kept = partial.map_or(0, |p| accounted_size(partial_len(&p.path)));
         // `reserved` out, `prev_file_size` and the kept partial back in.
         let restored = prev.saturating_add(kept);
         // Both trace lines below start with "Reverting quota reservation",
@@ -869,139 +913,206 @@ impl Drop for QuotaReservation {
 mod tests {
     use super::*;
 
-    fn nz(v: u64) -> NonZero<u64> {
-        NonZero::new(v).expect("non-zero test value")
+    /// `n` whole quota blocks, in bytes. Every size the quota handles is
+    /// rounded up to a block, so the tests count in blocks.
+    const fn b(n: u64) -> u64 {
+        n * QUOTA_BLOCK_SIZE
     }
 
+    /// `v` blocks.
+    fn nz(v: u64) -> NonZero<u64> {
+        NonZero::new(b(v)).expect("non-zero test value")
+    }
+
+    /// A `Content-Length` of `v` blocks.
     fn exact(v: u64) -> ContentLength {
         ContentLength::Exact(nz(v))
     }
 
     #[test]
+    fn sizes_are_accounted_in_whole_blocks() {
+        assert_eq!(accounted_size(0), 0, "an empty file has no data block");
+        assert_eq!(accounted_size(1), 4096);
+        assert_eq!(accounted_size(4096), 4096);
+        assert_eq!(accounted_size(4097), 8192);
+        assert_eq!(accounted_size(u64::MAX), u64::MAX, "saturates");
+    }
+
+    /// Many tiny files take far more disk than their lengths add up to: each
+    /// is charged a whole block, in the reservation, at finalisation, on
+    /// replacement and when its partial is kept or removed alike.
+    #[test]
+    fn every_quota_input_is_rounded_to_whole_blocks() {
+        let quota = CacheQuota::new(0, Some(nz(2)));
+        let tiny = ContentLength::Exact(NonZero::new(10).expect("non-zero"));
+        let first = quota
+            .try_acquire(tiny, 0, None, "first")
+            .ok()
+            .expect("one block");
+        assert_eq!(quota.current_size(), b(1));
+        first.finalize(10);
+        assert_eq!(quota.current_size(), b(1));
+        let second = quota
+            .try_acquire(tiny, 0, None, "second")
+            .ok()
+            .expect("the second block");
+        assert!(
+            quota.try_acquire(tiny, 0, None, "third").is_err(),
+            "two 10-byte files fill a two-block quota"
+        );
+        drop(second);
+
+        // Replacing a 10-byte file with a 20-byte one needs no new block.
+        let overwrite = quota
+            .try_acquire(
+                ContentLength::Exact(NonZero::new(20).expect("non-zero")),
+                10,
+                None,
+                "overwrite",
+            )
+            .ok()
+            .expect("fits");
+        assert_eq!(quota.current_size(), b(1));
+        overwrite.finalize(20);
+        assert_eq!(quota.current_size(), b(1));
+
+        let (_dir, path) = partial_path();
+        let reservation = quota
+            .try_acquire(tiny, 0, Some(ReservedPartial::new(path.clone(), 0)), "kept")
+            .ok()
+            .expect("fits");
+        std::fs::write(&path, b"x").expect("write partial");
+        drop(reservation);
+        assert_eq!(quota.current_size(), b(2), "a 1-byte partial keeps a block");
+        quota.release_removed_partial(1);
+        assert_eq!(quota.current_size(), b(1));
+    }
+
+    #[test]
     fn fresh_download_under_quota_accepts() {
-        let quota = CacheQuota::new(80, Some(nz(100)));
+        let quota = CacheQuota::new(b(80), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(10), 0, None, "fresh-under")
             .ok()
             .expect("fresh download under quota should be accepted");
-        assert_eq!(quota.current_size(), 90);
+        assert_eq!(quota.current_size(), b(90));
         drop(reservation);
         // Drop reverts the reservation since `finalize` was not called.
-        assert_eq!(quota.current_size(), 80);
+        assert_eq!(quota.current_size(), b(80));
     }
 
     #[test]
     fn fresh_download_over_quota_rejects() {
-        let quota = CacheQuota::new(100, Some(nz(100)));
+        let quota = CacheQuota::new(b(100), Some(nz(100)));
         let res = quota.try_acquire(exact(10), 0, None, "fresh-over");
         assert!(
             res.is_err(),
             "fresh download that would exceed quota must be rejected"
         );
-        assert_eq!(quota.current_size(), 100);
+        assert_eq!(quota.current_size(), b(100));
     }
 
     #[test]
     fn fresh_download_exactly_at_quota_accepts() {
         // The projected size may equal the quota (`> quota` rejects, not
         // `>=`); one byte past it is refused.
-        let quota = CacheQuota::new(90, Some(nz(100)));
+        let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(10), 0, None, "fresh-at")
             .ok()
             .expect("projected size equal to the quota must be accepted");
-        assert_eq!(quota.current_size(), 100);
+        assert_eq!(quota.current_size(), b(100));
         drop(reservation);
-        assert_eq!(quota.current_size(), 90);
+        assert_eq!(quota.current_size(), b(90));
 
-        let quota = CacheQuota::new(91, Some(nz(100)));
+        let quota = CacheQuota::new(b(91), Some(nz(100)));
         assert!(
             quota.try_acquire(exact(10), 0, None, "fresh-past").is_err(),
             "projected size one byte over the quota must be rejected"
         );
-        assert_eq!(quota.current_size(), 91);
+        assert_eq!(quota.current_size(), b(91));
     }
 
     #[test]
     fn overwrite_same_size_under_quota_accepts() {
-        let quota = CacheQuota::new(80, Some(nz(100)));
+        let quota = CacheQuota::new(b(80), Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(10), 10, None, "overwrite-same")
+            .try_acquire(exact(10), b(10), None, "overwrite-same")
             .ok()
             .expect("same-size overwrite under quota should be accepted");
         // Reserve adds 10, subtracts prev 10: net 0.
-        assert_eq!(quota.current_size(), 80);
+        assert_eq!(quota.current_size(), b(80));
         drop(reservation);
-        assert_eq!(quota.current_size(), 80);
+        assert_eq!(quota.current_size(), b(80));
     }
 
     #[test]
     fn overwrite_smaller_while_over_quota_accepts() {
         // Cache is currently over quota, and the replacement would actually
         // shrink it: `curr - prev + reserved = 110 - 20 + 5 = 95 <= 100`.
-        let quota = CacheQuota::new(110, Some(nz(100)));
+        let quota = CacheQuota::new(b(110), Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(5), 20, None, "shrink-while-over")
+            .try_acquire(exact(5), b(20), None, "shrink-while-over")
             .ok()
             .expect("smaller overwrite must be accepted to allow self-heal");
-        assert_eq!(quota.current_size(), 95);
+        assert_eq!(quota.current_size(), b(95));
         drop(reservation);
-        assert_eq!(quota.current_size(), 110);
+        assert_eq!(quota.current_size(), b(110));
     }
 
     #[test]
     fn overwrite_larger_that_would_push_over_rejects() {
-        let quota = CacheQuota::new(80, Some(nz(100)));
+        let quota = CacheQuota::new(b(80), Some(nz(100)));
         // 80 - 10 + 40 = 110 > 100 → reject.
-        let res = quota.try_acquire(exact(40), 10, None, "grow-over");
+        let res = quota.try_acquire(exact(40), b(10), None, "grow-over");
         assert!(
             res.is_err(),
             "overwrite that would push past quota must be rejected"
         );
-        assert_eq!(quota.current_size(), 80);
+        assert_eq!(quota.current_size(), b(80));
     }
 
     #[test]
     fn release_round_trip_finalize_exact() {
-        let quota = CacheQuota::new(50, Some(nz(100)));
+        let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(20), 5, None, "round-trip")
+            .try_acquire(exact(20), b(5), None, "round-trip")
             .ok()
             .expect("must accept");
         // 50 - 5 + 20 = 65 in flight.
-        assert_eq!(quota.current_size(), 65);
+        assert_eq!(quota.current_size(), b(65));
         // Finalize with the announced size: no further adjustment.
-        reservation.finalize(20);
-        assert_eq!(quota.current_size(), 65);
+        reservation.finalize(b(20));
+        assert_eq!(quota.current_size(), b(65));
     }
 
     #[test]
     fn release_round_trip_finalize_under_delivers() {
-        let quota = CacheQuota::new(50, Some(nz(100)));
+        let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(20), 0, None, "under-deliver")
             .ok()
             .expect("must accept");
-        assert_eq!(quota.current_size(), 70);
+        assert_eq!(quota.current_size(), b(70));
         // Upstream sent only 12 bytes — the unused 8-byte reservation
         // must be reclaimed.
-        reservation.finalize(12);
-        assert_eq!(quota.current_size(), 62);
+        reservation.finalize(b(12));
+        assert_eq!(quota.current_size(), b(62));
     }
 
     #[test]
     fn release_round_trip_finalize_over_delivers() {
-        let quota = CacheQuota::new(50, Some(nz(100)));
+        let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
             .try_acquire(exact(20), 0, None, "over-deliver")
             .ok()
             .expect("must accept");
-        assert_eq!(quota.current_size(), 70);
+        assert_eq!(quota.current_size(), b(70));
         // Upstream sent 25 bytes despite announcing 20; the accounted size
         // must follow the bytes that actually landed on disk, not the
         // reservation, or the quota under-counts the cache forever.
-        reservation.finalize(25);
-        assert_eq!(quota.current_size(), 75);
+        reservation.finalize(b(25));
+        assert_eq!(quota.current_size(), b(75));
     }
 
     #[test]
@@ -1009,32 +1120,32 @@ mod tests {
         // A download that never commits must widen no reconcile interval:
         // only `finalize` records an on-disk delta, so a scan taken after the
         // abort sees the truth and the accounted size needs no repair.
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(30), 0, None, "abandoned")
             .ok()
             .expect("must accept");
-        assert_eq!(quota.current_size(), 80);
+        assert_eq!(quota.current_size(), b(80));
         drop(reservation);
-        let r = quota.subtract_and_reconcile(0, 50, window);
-        assert_eq!(r.grown_during_scan, 0, "an abort commits nothing");
-        assert_eq!(r.shrunk_during_scan, 0);
-        assert_eq!(r.difference, 0);
-        assert_eq!(quota.current_size(), 50);
+        let r = quota.subtract_and_reconcile(b(0), b(50), window);
+        assert_eq!(r.grown_during_scan, b(0), "an abort commits nothing");
+        assert_eq!(r.shrunk_during_scan, b(0));
+        assert_eq!(r.difference, b(0));
+        assert_eq!(quota.current_size(), b(50));
     }
 
     #[test]
     fn release_round_trip_drop_without_finalize_reverts() {
-        let quota = CacheQuota::new(50, Some(nz(100)));
+        let quota = CacheQuota::new(b(50), Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(20), 5, None, "drop-revert")
+            .try_acquire(exact(20), b(5), None, "drop-revert")
             .ok()
             .expect("must accept");
-        assert_eq!(quota.current_size(), 65);
+        assert_eq!(quota.current_size(), b(65));
         drop(reservation);
         // Drop without finalize reverts net change: back to original 50.
-        assert_eq!(quota.current_size(), 50);
+        assert_eq!(quota.current_size(), b(50));
     }
 
     #[test]
@@ -1049,51 +1160,51 @@ mod tests {
 
     #[test]
     fn cleanup_index_fetch_is_admitted_over_quota() {
-        let quota = CacheQuota::new(100, Some(nz(100)));
-        let reservation = quota.acquire_for_cleanup(exact(10), 4, None, "Packages.xz");
+        let quota = CacheQuota::new(b(100), Some(nz(100)));
+        let reservation = quota.acquire_for_cleanup(exact(10), b(4), None, "Packages.xz");
         // Accounted like any other reservation: 100 - 4 + 10.
-        assert_eq!(quota.current_size(), 106);
-        reservation.finalize(10);
-        assert_eq!(quota.current_size(), 106);
+        assert_eq!(quota.current_size(), b(106));
+        reservation.finalize(b(10));
+        assert_eq!(quota.current_size(), b(106));
     }
 
     #[test]
     fn reconcile_in_flight_overwrite_is_not_a_discrepancy() {
         // A stale volatile re-fetch in flight: on disk the 20-byte previous
         // file still exists, the reservation holds 30 for the replacement.
-        let quota = CacheQuota::new(80, Some(nz(1000)));
+        let quota = CacheQuota::new(b(80), Some(nz(1000)));
         let reservation = quota
-            .try_acquire(exact(30), 20, None, "index")
+            .try_acquire(exact(30), b(20), None, "index")
             .ok()
             .expect("must accept");
-        assert_eq!(quota.current_size(), 90);
+        assert_eq!(quota.current_size(), b(90));
         let window = quota.begin_reconcile_window();
         // The scan still sees the old 20-byte file among the 80 on disk.
-        let r = quota.subtract_and_reconcile(0, 80, window);
-        assert_eq!(r.difference, 0, "in-flight net must explain the gap");
-        assert_eq!(quota.current_size(), 90);
-        reservation.finalize(30);
-        assert_eq!(quota.current_size(), 90);
+        let r = quota.subtract_and_reconcile(b(0), b(80), window);
+        assert_eq!(r.difference, b(0), "in-flight net must explain the gap");
+        assert_eq!(quota.current_size(), b(90));
+        reservation.finalize(b(30));
+        assert_eq!(quota.current_size(), b(90));
     }
 
     #[test]
     fn reconcile_shrinking_in_flight_overwrite_is_not_a_discrepancy() {
-        let quota = CacheQuota::new(80, Some(nz(1000)));
+        let quota = CacheQuota::new(b(80), Some(nz(1000)));
         let reservation = quota
-            .try_acquire(exact(5), 20, None, "index")
+            .try_acquire(exact(5), b(20), None, "index")
             .ok()
             .expect("must accept");
-        assert_eq!(quota.current_size(), 65);
+        assert_eq!(quota.current_size(), b(65));
         let window = quota.begin_reconcile_window();
-        let r = quota.subtract_and_reconcile(0, 80, window);
-        assert_eq!(r.difference, 0);
+        let r = quota.subtract_and_reconcile(b(0), b(80), window);
+        assert_eq!(r.difference, b(0));
         drop(reservation);
-        assert_eq!(quota.current_size(), 80);
+        assert_eq!(quota.current_size(), b(80));
     }
 
     #[test]
     fn reconcile_keeps_commit_the_scan_missed() {
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         // During the scan a 30-byte download commits after its directory was
         // walked: the scan reports 50, the accounted size is already 80.
@@ -1101,71 +1212,71 @@ mod tests {
             .try_acquire(exact(30), 0, None, "late")
             .ok()
             .expect("must accept");
-        reservation.finalize(30);
-        assert_eq!(quota.current_size(), 80);
-        let r = quota.subtract_and_reconcile(0, 50, window);
-        assert_eq!(r.difference, 0, "a commit during the scan is not drift");
-        assert_eq!(r.grown_during_scan, 30);
-        assert_eq!(quota.current_size(), 80);
+        reservation.finalize(b(30));
+        assert_eq!(quota.current_size(), b(80));
+        let r = quota.subtract_and_reconcile(b(0), b(50), window);
+        assert_eq!(r.difference, b(0), "a commit during the scan is not drift");
+        assert_eq!(r.grown_during_scan, b(30));
+        assert_eq!(quota.current_size(), b(80));
     }
 
     #[test]
     fn reconcile_accepts_commit_the_scan_saw() {
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(30), 0, None, "early")
             .ok()
             .expect("must accept");
-        reservation.finalize(30);
+        reservation.finalize(b(30));
         // The scan walked the directory after the commit: it reports 80.
-        let r = quota.subtract_and_reconcile(0, 80, window);
-        assert_eq!(r.difference, 0);
-        assert_eq!(quota.current_size(), 80);
+        let r = quota.subtract_and_reconcile(b(0), b(80), window);
+        assert_eq!(r.difference, b(0));
+        assert_eq!(quota.current_size(), b(80));
     }
 
     #[test]
     fn reconcile_repairs_real_drift_beyond_the_window() {
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(exact(30), 0, None, "late")
             .ok()
             .expect("must accept");
-        reservation.finalize(30);
+        reservation.finalize(b(30));
         // Scan reports 40: even if the commit was missed, 80 exceeds
         // 40 + 30, so 10 bytes are genuine drift.
-        let r = quota.subtract_and_reconcile(0, 40, window);
-        assert_eq!(r.difference, 10);
-        assert_eq!(r.corrected, 70);
-        assert_eq!(quota.current_size(), 70);
+        let r = quota.subtract_and_reconcile(b(0), b(40), window);
+        assert_eq!(r.difference, b(10));
+        assert_eq!(r.corrected, b(70));
+        assert_eq!(quota.current_size(), b(70));
     }
 
     #[test]
     fn reconcile_repairs_under_count_upwards() {
-        let quota = CacheQuota::new(10, Some(nz(1000)));
+        let quota = CacheQuota::new(b(10), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
-        let r = quota.subtract_and_reconcile(0, 40, window);
-        assert_eq!(r.difference, 30);
-        assert_eq!(quota.current_size(), 40);
+        let r = quota.subtract_and_reconcile(b(0), b(40), window);
+        assert_eq!(r.difference, b(30));
+        assert_eq!(quota.current_size(), b(40));
     }
 
     #[test]
     fn reconcile_subtracts_removed_first() {
-        let quota = CacheQuota::new(100, Some(nz(1000)));
+        let quota = CacheQuota::new(b(100), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         // Cleanup deleted 40 bytes; the scan after the deletions reports 60.
-        let r = quota.subtract_and_reconcile(40, 60, window);
-        assert_eq!(r.stored, 60);
-        assert_eq!(r.difference, 0);
-        assert_eq!(quota.current_size(), 60);
+        let r = quota.subtract_and_reconcile(b(40), b(60), window);
+        assert_eq!(r.stored, b(60));
+        assert_eq!(r.difference, b(0));
+        assert_eq!(quota.current_size(), b(60));
     }
 
     #[test]
     fn startup_scan_seeds_the_size() {
-        let quota = CacheQuota::new(0, Some(nz(1000)));
-        quota.record_startup_scan(123);
-        assert_eq!(quota.current_size(), 123);
+        let quota = CacheQuota::new(b(0), Some(nz(1000)));
+        quota.record_startup_scan(b(123));
+        assert_eq!(quota.current_size(), b(123));
     }
 
     /// A partial path in a fresh temporary directory; nothing on disk yet.
@@ -1175,29 +1286,31 @@ mod tests {
         (dir, path)
     }
 
-    fn write_len(path: &Path, len: usize) {
+    /// Fill the partial at `path` with `blocks` whole blocks.
+    fn write_len(path: &Path, blocks: u64) {
+        let len = usize::try_from(b(blocks)).expect("small test file");
         std::fs::write(path, vec![0u8; len]).expect("write partial");
     }
 
     #[test]
     fn failed_download_keeps_what_its_partial_holds() {
         let (_dir, path) = partial_path();
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
             .try_acquire(
                 exact(100),
                 0,
-                Some(ReservedPartial::new(path.clone(), 0)),
+                Some(ReservedPartial::new(path.clone(), b(0))),
                 "kept",
             )
             .ok()
             .expect("must accept");
-        assert_eq!(quota.current_size(), 150);
+        assert_eq!(quota.current_size(), b(150));
         write_len(&path, 30);
         drop(reservation);
         assert_eq!(
             quota.current_size(),
-            80,
+            b(80),
             "only the 70 unwritten bytes are reverted"
         );
     }
@@ -1205,13 +1318,18 @@ mod tests {
     #[test]
     fn failed_download_without_a_partial_on_disk_keeps_nothing() {
         let (_dir, path) = partial_path();
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
-            .try_acquire(exact(100), 0, Some(ReservedPartial::new(path, 0)), "none")
+            .try_acquire(
+                exact(100),
+                0,
+                Some(ReservedPartial::new(path, b(0))),
+                "none",
+            )
             .ok()
             .expect("must accept");
         drop(reservation);
-        assert_eq!(quota.current_size(), 50);
+        assert_eq!(quota.current_size(), b(50));
     }
 
     #[test]
@@ -1220,45 +1338,45 @@ mod tests {
         // a 50-byte file only adds 10 bytes, which fits the quota exactly.
         let (_dir, path) = partial_path();
         write_len(&path, 40);
-        let quota = CacheQuota::new(90, Some(nz(100)));
+        let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
             .try_acquire(
                 exact(50),
                 0,
-                Some(ReservedPartial::new(path.clone(), 40)),
+                Some(ReservedPartial::new(path.clone(), b(40))),
                 "resume",
             )
             .ok()
             .expect("a resume adding 10 bytes fits");
-        assert_eq!(quota.current_size(), 100);
-        reservation.finalize(50);
+        assert_eq!(quota.current_size(), b(100));
+        reservation.finalize(b(50));
         assert_eq!(
             quota.current_size(),
-            100,
+            b(100),
             "the partial became the cached file: counted once"
         );
 
         // The same resume failing after 5 more bytes keeps the 45-byte partial.
-        let quota = CacheQuota::new(90, Some(nz(100)));
+        let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
             .try_acquire(
                 exact(50),
                 0,
-                Some(ReservedPartial::new(path.clone(), 40)),
+                Some(ReservedPartial::new(path.clone(), b(40))),
                 "resume",
             )
             .ok()
             .expect("must accept");
         write_len(&path, 45);
         drop(reservation);
-        assert_eq!(quota.current_size(), 95);
+        assert_eq!(quota.current_size(), b(95));
     }
 
     #[test]
     fn a_resume_is_admitted_by_its_remainder_only() {
         let (_dir, path) = partial_path();
         write_len(&path, 40);
-        let quota = CacheQuota::new(90, Some(nz(100)));
+        let quota = CacheQuota::new(b(90), Some(nz(100)));
         assert!(
             quota
                 .try_acquire(exact(50), 0, None, "not-adopted")
@@ -1269,87 +1387,97 @@ mod tests {
 
     #[test]
     fn removed_partial_releases_its_bytes() {
-        let quota = CacheQuota::new(80, Some(nz(1000)));
-        quota.release_removed_partial(30);
-        assert_eq!(quota.current_size(), 50);
+        let quota = CacheQuota::new(b(80), Some(nz(1000)));
+        quota.release_removed_partial(b(30));
+        assert_eq!(quota.current_size(), b(50));
     }
 
     #[test]
     fn reconcile_counts_a_live_partial_at_any_fill_level() {
         let (_dir, path) = partial_path();
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
-            .try_acquire(exact(100), 0, Some(ReservedPartial::new(path, 0)), "live")
+            .try_acquire(
+                exact(100),
+                0,
+                Some(ReservedPartial::new(path, b(0))),
+                "live",
+            )
             .ok()
             .expect("must accept");
         let window = quota.begin_reconcile_window();
         // The scan walked the partial empty, 30 bytes in, or complete.
-        for scanned in [50, 80, 150] {
-            let r = quota.subtract_and_reconcile(0, scanned, window);
-            assert_eq!(r.difference, 0, "scanned {scanned}");
-            assert_eq!(r.inflight_unwritten, 100);
+        for scanned in [b(50), b(80), b(150)] {
+            let r = quota.subtract_and_reconcile(b(0), scanned, window);
+            assert_eq!(r.difference, b(0), "scanned {scanned}");
+            assert_eq!(r.inflight_unwritten, b(100));
         }
-        assert_eq!(quota.current_size(), 150);
+        assert_eq!(quota.current_size(), b(150));
         // Beyond what any fill level explains is drift.
-        let r = quota.subtract_and_reconcile(0, 40, window);
-        assert_eq!(r.difference, 10);
+        let r = quota.subtract_and_reconcile(b(0), b(40), window);
+        assert_eq!(r.difference, b(10));
         drop(reservation);
     }
 
     #[test]
     fn reconcile_tolerates_a_partial_kept_during_the_scan() {
         let (_dir, path) = partial_path();
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
             .try_acquire(
                 exact(100),
                 0,
-                Some(ReservedPartial::new(path.clone(), 0)),
+                Some(ReservedPartial::new(path.clone(), b(0))),
                 "kept",
             )
             .ok()
             .expect("must accept");
         write_len(&path, 30);
         drop(reservation);
-        assert_eq!(quota.current_size(), 80);
+        assert_eq!(quota.current_size(), b(80));
         // The scan walked `tmp/` before the download wrote, or after it ended.
-        for scanned in [50, 80] {
-            let r = quota.subtract_and_reconcile(0, scanned, window);
-            assert_eq!(r.difference, 0, "scanned {scanned}");
+        for scanned in [b(50), b(80)] {
+            let r = quota.subtract_and_reconcile(b(0), scanned, window);
+            assert_eq!(r.difference, b(0), "scanned {scanned}");
         }
     }
 
     #[test]
     fn reconcile_tolerates_a_partial_commit_counted_twice() {
         let (_dir, path) = partial_path();
-        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
-            .try_acquire(exact(30), 0, Some(ReservedPartial::new(path, 0)), "moved")
+            .try_acquire(
+                exact(30),
+                0,
+                Some(ReservedPartial::new(path, b(0))),
+                "moved",
+            )
             .ok()
             .expect("must accept");
-        reservation.finalize(30);
-        assert_eq!(quota.current_size(), 80);
+        reservation.finalize(b(30));
+        assert_eq!(quota.current_size(), b(80));
         // Neither copy seen, one of them, or the complete partial in `tmp/`
         // before the rename and the final file after it.
-        for scanned in [50, 80, 110] {
-            let r = quota.subtract_and_reconcile(0, scanned, window);
-            assert_eq!(r.difference, 0, "scanned {scanned}");
+        for scanned in [b(50), b(80), b(110)] {
+            let r = quota.subtract_and_reconcile(b(0), scanned, window);
+            assert_eq!(r.difference, b(0), "scanned {scanned}");
         }
     }
 
     #[test]
     fn reconcile_tolerates_a_partial_removed_during_the_scan() {
         // 30 of the 80 bytes are a kept partial a discarded resume unlinks.
-        let quota = CacheQuota::new(80, Some(nz(1000)));
+        let quota = CacheQuota::new(b(80), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
-        quota.release_removed_partial(30);
-        for scanned in [50, 80] {
-            let r = quota.subtract_and_reconcile(0, scanned, window);
-            assert_eq!(r.difference, 0, "scanned {scanned}");
+        quota.release_removed_partial(b(30));
+        for scanned in [b(50), b(80)] {
+            let r = quota.subtract_and_reconcile(b(0), scanned, window);
+            assert_eq!(r.difference, b(0), "scanned {scanned}");
         }
-        assert_eq!(quota.current_size(), 50);
+        assert_eq!(quota.current_size(), b(50));
     }
 
     #[test]
@@ -1371,7 +1499,7 @@ mod tests {
                 nz(min_free),
             )),
         );
-        quota.record_disk_free(free);
+        quota.record_disk_free(free.map(b));
         quota
     }
 
@@ -1379,7 +1507,7 @@ mod tests {
     fn low_disk_space_rejects_a_download() {
         let quota = headroom_quota(600, Some(1000));
         assert!(quota.try_acquire(exact(401), 0, None, "big").is_err());
-        assert_eq!(quota.current_size(), 0, "a rejection reserves nothing");
+        assert_eq!(quota.current_size(), b(0), "a rejection reserves nothing");
         let first = quota
             .try_acquire(exact(300), 0, None, "first")
             .ok()
@@ -1388,7 +1516,7 @@ mod tests {
         assert!(quota.try_acquire(exact(200), 0, None, "second").is_err());
         drop(first);
         // A fresh sample starts over.
-        quota.record_disk_free(Some(1000));
+        quota.record_disk_free(Some(b(1000)));
         assert!(quota.try_acquire(exact(400), 0, None, "fresh").is_ok());
     }
 
@@ -1403,7 +1531,7 @@ mod tests {
                 .try_acquire(
                     exact(500),
                     0,
-                    Some(ReservedPartial::new(path, 300)),
+                    Some(ReservedPartial::new(path, b(300))),
                     "resume"
                 )
                 .is_ok()
@@ -1414,7 +1542,7 @@ mod tests {
     fn low_disk_space_admits_cleanup_index_fetches() {
         let quota = headroom_quota(600, Some(1000));
         let reservation = quota.acquire_for_cleanup(exact(900), 0, None, "Packages.xz");
-        assert_eq!(quota.current_size(), 900);
+        assert_eq!(quota.current_size(), b(900));
         drop(reservation);
     }
 
@@ -1442,7 +1570,7 @@ mod tests {
             None,
             Some(DiskHeadroom::new(
                 dir.path().to_path_buf(),
-                nz(u64::MAX / 2),
+                NonZero::new(u64::MAX / 2).expect("non-zero"),
             )),
         );
         quota.refresh_disk_headroom().await;

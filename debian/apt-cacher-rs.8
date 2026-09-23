@@ -80,6 +80,11 @@ Default configuration file.
 .TP
 .I /var/cache/apt\-cacher\-rs/
 Default cache directory.
+The
+.I disk_quota
+configuration option bounds its size, counting every cached file and every
+partial download kept for a resume rounded up to whole 4\ KiB blocks, so
+many small files use up the quota the way they use up the disk.
 .TP
 .I /var/lib/apt\-cacher\-rs/apt\-cacher\-rs.db
 Default database file.

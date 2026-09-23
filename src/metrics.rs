@@ -681,7 +681,8 @@ pub(crate) static DB_MIRROR_CACHE_ENTRIES: StateU64 = StateU64::new();
 
 /// Total cache files evicted across all cleanup runs.
 pub(crate) static CLEANUP_EVICTIONS: Accumulator = Accumulator::new();
-/// Total bytes reclaimed across all cleanup runs.
+/// Total bytes reclaimed across all cleanup runs, each file counted as its
+/// `cache_quota::accounted_size`.
 pub(crate) static CLEANUP_BYTES_RECLAIMED: Accumulator = Accumulator::new();
 /// By-hash files evicted because their digest was absent from the mirror's
 /// current `Release`/`InRelease` set (reference-based reclaim). A subset of
@@ -705,7 +706,7 @@ pub(crate) static CLEANUP_CHECKSUM_SKIPS: Counter = Counter::new();
 pub(crate) static LAST_CLEANUP_DURATION_SECS: StateU64 = StateU64::new();
 /// Last cleanup run: number of files removed.
 pub(crate) static LAST_CLEANUP_FILES_REMOVED: StateU64 = StateU64::new();
-/// Last cleanup run: bytes reclaimed.
+/// Last cleanup run: bytes reclaimed (in `cache_quota::accounted_size` units).
 pub(crate) static LAST_CLEANUP_BYTES_RECLAIMED: StateU64 = StateU64::new();
 
 /// Record a client response status code into the matching class counter plus the

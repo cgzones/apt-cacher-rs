@@ -751,6 +751,7 @@ mod tests {
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;
+    use crate::cache_quota::QUOTA_BLOCK_SIZE;
     use crate::{test_support::structured_mirror, xattr_helpers::tests::plant_raw};
 
     /// `TempPath::drop` unlinks on the blocking pool; wait for it to land.
@@ -1094,8 +1095,9 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, b"stale").expect("write");
         let mirror = structured_mirror("deb.example.org", "debian");
-        // 100 bytes of cached files plus the 5-byte kept partial.
-        let quota = CacheQuota::new(105, None);
+        // Ten blocks of cached files plus the 5-byte kept partial, accounted
+        // as one block.
+        let quota = CacheQuota::new(11 * QUOTA_BLOCK_SIZE, None);
 
         // Without an ETag the partial is discarded.
         let resume = prepare_partial_resume_at(
@@ -1107,7 +1109,7 @@ mod tests {
         )
         .await
         .expect("a discarded partial is a fresh download");
-        assert_eq!(quota.current_size(), 100);
+        assert_eq!(quota.current_size(), 10 * QUOTA_BLOCK_SIZE);
         let PartialDownload::Fresh(guard) = resume.partial else {
             unreachable!("no ETag means no resume")
         };
@@ -1116,7 +1118,11 @@ mod tests {
         let (file, guard) = create_partial_file(guard, 0o640)
             .await
             .expect("create over a leftover");
-        assert_eq!(quota.current_size(), 91, "the 9-byte leftover is released");
+        assert_eq!(
+            quota.current_size(),
+            9 * QUOTA_BLOCK_SIZE,
+            "the 9-byte leftover's block is released"
+        );
         drop(file);
         drop(guard);
     }

@@ -814,7 +814,9 @@ pub(crate) struct Config {
     pub(crate) logstore_capacity: NonZero<usize>,
 
     /// Disk quota (in bytes) for cache: the cached files plus the partial
-    /// downloads kept for a later resume.
+    /// downloads kept for a later resume, each counted rounded up to whole
+    /// 4 KiB blocks (`cache_quota::QUOTA_BLOCK_SIZE`) the way it occupies the
+    /// disk.
     #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) disk_quota: Option<NonZero<u64>>,
 

@@ -6,6 +6,7 @@ use hashbrown::HashMap;
 use tracing::{debug, error, warn};
 
 use crate::cache_layout::{CacheEntryKeyRef, CacheLayout};
+use crate::cache_quota::accounted_size;
 use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker};
 use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::error::ErrorReport;
@@ -212,7 +213,7 @@ pub(super) async fn sweep_candidates(
 
         debug!("Removed cached file `{}`", path.display());
 
-        bytes_removed += size;
+        bytes_removed += accounted_size(size);
         files_removed += 1;
         if matches!(class, SpanClass::ByHashCovered) {
             removed_unreferenced += 1;
@@ -331,7 +332,7 @@ pub(super) async fn sweep_aged_metadata(
 
         debug!("Removed stale metadata file `{}`", path.display());
 
-        result.bytes_removed += size;
+        result.bytes_removed += accounted_size(size);
         result.files_removed += 1;
     }
 

@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use tracing::{debug, error};
 
+use crate::cache_quota::accounted_size;
 use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker};
 use crate::error::ErrorReport;
 use crate::metrics;
@@ -112,7 +113,7 @@ pub(super) async fn cleanup_tmp_dir(
             EntryKind::File => match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
                     debug!("Removed stale tmp entry `{}`", path.display());
-                    reaped.bytes = reaped.bytes.saturating_add(mdata.len());
+                    reaped.bytes = reaped.bytes.saturating_add(accounted_size(mdata.len()));
                     true
                 }
                 Err(err) => {
@@ -187,8 +188,8 @@ mod tests {
 
         assert_eq!(reaped.entries, 2);
         assert_eq!(
-            reaped.bytes, 6,
-            "the aged partial's bytes feed the quota reconcile"
+            reaped.bytes, 4096,
+            "the aged partial's accounted block feeds the quota reconcile"
         );
         assert!(!tmp.join("empty.partial").exists(), "empty partial reaped");
         assert!(tmp.join("young.partial").exists(), "young partial kept");
@@ -210,7 +211,7 @@ mod tests {
         let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
 
         assert_eq!(reaped.entries, 1);
-        assert_eq!(reaped.bytes, 1);
+        assert_eq!(reaped.bytes, 4096);
         assert!(tmp.join("fresh.bin").exists(), "fresh foreign file kept");
         assert!(
             tmp.join("six-days.bin").exists(),

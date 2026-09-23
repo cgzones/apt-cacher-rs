@@ -11,6 +11,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     AppState,
     cache_layout::CacheLayout,
+    cache_quota::accounted_size,
     cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker},
     config::Config,
     database::{MirrorEntry, OriginEntry},
@@ -164,7 +165,7 @@ impl UnitStats {
     /// Account one checksum-mismatch eviction performed during a reduce.
     pub(super) fn record_mismatch(&mut self, bytes: u64) {
         self.removed += 1;
-        self.bytes_removed += bytes;
+        self.bytes_removed += accounted_size(bytes);
     }
 }
 

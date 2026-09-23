@@ -22,6 +22,7 @@ use tracing::{debug, error, trace};
 
 use crate::{
     cache_paths::{CachePaths, KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
+    cache_quota::accounted_size,
     cache_walk::{DirFailure, Entry, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker},
     config::CacheHost,
     database::{Database, MirrorEntry},
@@ -48,6 +49,7 @@ pub(crate) enum CacheScanError {
 /// is directly comparable with cleanup's `retained`/`removed` file counts.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ScanTotals {
+    /// Each file's `cache_quota::accounted_size`, the unit the quota counts in.
     pub(crate) bytes: u64,
     pub(crate) files: u64,
 }
@@ -336,7 +338,7 @@ async fn scan_tree(
                 let Some(mdata) = entry.metadata().await else {
                     continue;
                 };
-                totals.add_file(mdata.len());
+                totals.add_file(accounted_size(mdata.len()));
                 // A mirror directory holds the pool (`.deb`/`.udeb`/`.ddeb`)
                 // directly; any other regular file there is an operator
                 // artefact cleanup will never touch.  Deeper levels take
@@ -421,6 +423,7 @@ fn classify_mirror_subdir(entry: &Entry<'_, Level>, mirror_path: &str, nested: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_quota::QUOTA_BLOCK_SIZE;
 
     /// Kept partials are disk usage the quota counts, so the scan tallies
     /// the `tmp/` below a mirror and the ones inside the flat tree.
@@ -433,13 +436,13 @@ mod tests {
         std::fs::write(mirror.join("tmp/bar_1.0_amd64.deb.partial"), b"123").expect("partial");
         let (_outcome, totals) =
             scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
-        assert_eq!((totals.bytes, totals.files), (8, 2));
+        assert_eq!((totals.bytes, totals.files), (2 * QUOTA_BLOCK_SIZE, 2));
 
         let flat = dir.path().join("flat");
         std::fs::create_dir_all(flat.join("repo/tmp")).expect("mkdir");
         std::fs::write(flat.join("repo/Packages"), b"12").expect("index");
         std::fs::write(flat.join("repo/tmp/x_1_all.deb.partial"), b"1234").expect("partial");
         let (_outcome, totals) = scan_tree(&flat, &FLAT_WALK, Level::Flat, "", &[]).await;
-        assert_eq!((totals.bytes, totals.files), (6, 2));
+        assert_eq!((totals.bytes, totals.files), (2 * QUOTA_BLOCK_SIZE, 2));
     }
 }
