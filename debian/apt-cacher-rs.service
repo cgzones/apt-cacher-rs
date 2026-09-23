@@ -11,13 +11,16 @@ User=apt-cacher-rs
 
 # Hardening
 CacheDirectory=apt-cacher-rs
+CacheDirectoryMode=0750
 CapabilityBoundingSet=
 LimitNOFILE=16384
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
+PrivateIPC=yes
 PrivateTmp=yes
+ProcSubset=pid
 ProtectClock=yes
 ProtectControlGroups=yes
 ProtectHome=yes
@@ -28,10 +31,20 @@ ProtectKernelTunables=yes
 ProtectProc=invisible
 ProtectSystem=strict
 RemoveIPC=yes
+# AF_UNIX for NSS lookups (nscd, systemd-resolved), AF_NETLINK for the
+# interface-address query getaddrinfo() uses to sort its results.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 StateDirectory=apt-cacher-rs
+StateDirectoryMode=0750
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+# splice(2), tee(2), sendfile(2), memfd_create(2) and the xattr calls the
+# zero-copy paths and the cache metadata need are all part of @system-service.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 UMask=0027
 
 [Install]
