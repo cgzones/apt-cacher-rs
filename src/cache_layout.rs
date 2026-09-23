@@ -76,6 +76,7 @@ use crate::{
         valid_component, valid_directory, valid_distribution, valid_filename, valid_mirrorname,
     },
     index_parser::HashAlgo,
+    partial_file::PARTIAL_SUFFIX,
     precise_instant::PreciseInstant,
 };
 
@@ -555,6 +556,18 @@ impl std::fmt::Display for ValidateKind {
         })
     }
 }
+
+/// Linux's `NAME_MAX`: the longest file name, in bytes, a directory entry
+/// can hold.
+const NAME_MAX: usize = 255;
+
+/// The longest `debname` the cache can store: [`NAME_MAX`] less the longest
+/// suffix a download's temporary file appends to it (`.partial`;
+/// `partial_file::tokio_tempfile`'s random `.XXXXXX` extension is a byte
+/// shorter).  Every field of a `dists/` name is within its own cap, but
+/// joined they can exceed this; the dispatcher relays such a request
+/// uncached rather than fail to create its file.
+pub(crate) const MAX_DEBNAME_LEN: usize = NAME_MAX - PARTIAL_SUFFIX.len();
 
 /// Flatten an architecture-scoped `dists/` index into its cache debname.
 ///
@@ -1542,6 +1555,12 @@ mod tests {
             parse_request_path("debian/dists/sid/main/i18n/Translation-en_GB.xz").expect("parses");
         let class = classify_request(&res, &local_client()).expect("classifies");
         assert_eq!(class.debname, "sid_main_Translation-en_GB.xz");
+    }
+
+    #[test]
+    fn name_max_is_the_platform_limit() {
+        assert_eq!(Ok(NAME_MAX), usize::try_from(nix::libc::NAME_MAX));
+        assert_eq!(MAX_DEBNAME_LEN + ".partial".len(), NAME_MAX);
     }
 
     /// [`ValidateKind`] carries both a label and the validator to apply; this

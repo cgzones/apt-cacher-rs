@@ -46,7 +46,7 @@ use tracing::{debug, trace};
 
 use crate::{
     build_info::APP_VIA_PSEUDONYM,
-    cache_layout::{self, ClassifyError, ConnectionDetails},
+    cache_layout::{self, ClassifyError, ConnectionDetails, MAX_DEBNAME_LEN},
     client_info::ClientInfo,
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
     deb_mirror::{
@@ -415,6 +415,9 @@ pub(crate) enum PassthroughReason {
     /// `dists/` cache names use as their field separator (see
     /// [`ClassifyError::JoinedFieldUnderscore`]).
     JoinedFieldUnderscore,
+    /// Every field is valid, but the cache name they join into is longer
+    /// than [`MAX_DEBNAME_LEN`], so the cache file could not be created.
+    NameTooLong,
 }
 
 impl PassthroughReason {
@@ -427,6 +430,7 @@ impl PassthroughReason {
             Self::FlatBlocked => "flat host blocked by structured collision",
             Self::QueryString => "query string on a cacheable path",
             Self::JoinedFieldUnderscore => "`_` in a distribution, component or architecture",
+            Self::NameTooLong => "cache name too long",
         }
     }
 }
@@ -614,6 +618,12 @@ fn decide_request(
                         "Query string on cacheable path {uri_path} from client {client}; forwarding it upstream uncached"
                     );
                     PassthroughReason::QueryString
+                } else if class.debname.len() > MAX_DEBNAME_LEN {
+                    warn_once_or_info!(
+                        "Uncacheable path {uri_path} from client {client} (its {}-byte cache name exceeds {MAX_DEBNAME_LEN} bytes); forwarding it upstream uncached",
+                        class.debname.len()
+                    );
+                    PassthroughReason::NameTooLong
                 } else if layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
                     warn_once_or_info!(
                         "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing {uri_path} through uncached for client {client}"
@@ -1206,6 +1216,54 @@ mod tests {
                 }
             ),
             "expected JoinedFieldUnderscore passthrough, got {decision:?}"
+        );
+    }
+
+    /// A cache name longer than [`MAX_DEBNAME_LEN`] could not be created (its
+    /// `.partial` would pass `NAME_MAX`), so the request is relayed uncached;
+    /// one at the limit still caches.
+    #[test]
+    fn passthrough_cache_name_too_long() {
+        let decide = |path: &str| {
+            decide_request(
+                path,
+                fake_host(),
+                None,
+                &local_client(),
+                &[],
+                true,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            )
+        };
+        // Each field within its own cap, the joined name far past NAME_MAX.
+        let joined = format!(
+            "/debian/dists/{}/{}/binary-{}/Release",
+            "a".repeat(128),
+            "b".repeat(128),
+            "c".repeat(120)
+        );
+        let pool_at = |len: usize| {
+            let stem = "f".repeat(len - "_1_all.deb".len());
+            format!("/debian/pool/main/f/foo/{stem}_1_all.deb")
+        };
+        for path in [joined, pool_at(MAX_DEBNAME_LEN + 1), pool_at(255)] {
+            let decision = decide(&path);
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Passthrough {
+                        reason: PassthroughReason::NameTooLong,
+                        ..
+                    }
+                ),
+                "{path}: expected NameTooLong passthrough, got {decision:?}"
+            );
+        }
+        let decision = decide(&pool_at(MAX_DEBNAME_LEN));
+        assert!(
+            matches!(decision, Decision::Cache { .. }),
+            "expected Cache at the limit, got {decision:?}"
         );
     }
 

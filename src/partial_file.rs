@@ -441,6 +441,10 @@ impl AsRef<Path> for TempPath {
     }
 }
 
+/// Appended to a `debname` to name its resumable download in the mirror's
+/// `tmp/` directory; `cache_layout::MAX_DEBNAME_LEN` reserves room for it.
+pub(crate) const PARTIAL_SUFFIX: &str = ".partial";
+
 /// Create a readable/writable temporary file with a unique extension.
 /// Splice demotion duplicates this descriptor to read the growing file without
 /// reopening its pathname.
@@ -518,7 +522,7 @@ pub(crate) async fn tokio_tempfile(
 /// `apt/arm64/foo.deb`) is implicit in the site's mirror path, which equals
 /// the URL-dir verbatim under the host-anchored flat layout.
 fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier) -> PathBuf {
-    let filename = format!("{debname}.partial", debname = ibarrier.debname());
+    let filename = format!("{debname}{PARTIAL_SUFFIX}", debname = ibarrier.debname());
     paths.partial_file(ibarrier.layout(), ibarrier.site(), Path::new(&filename))
 }
 
