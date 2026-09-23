@@ -18,6 +18,7 @@ use std::{
     os::{fd::AsFd as _, unix::fs::MetadataExt as _},
     path::Path,
     sync::Arc,
+    time::SystemTimeError,
 };
 #[cfg(feature = "hyper")]
 use std::{
@@ -1205,29 +1206,32 @@ async fn try_sendfile_request(
                     let last_modified = md
                         .modified()
                         .expect("Platform should support modification timestamps via setup check");
-                    if let Ok(elapsed) = last_modified.elapsed() {
-                        if elapsed >= VOLATILE_CACHE_MAX_AGE {
-                            break 'cache_lookup Err(CacheMiss::StaleVolatile {
-                                file,
-                                modified: last_modified,
-                                size: md.size(),
-                            });
+                    // A future mtime is stale, as in hyper and the cleanup
+                    // bridge: counting it fresh would serve the copy until
+                    // the clock caught up, freezing the index meanwhile.
+                    let fresh_age = match last_modified.elapsed() {
+                        Ok(elapsed) => Some(elapsed).filter(|e| *e < VOLATILE_CACHE_MAX_AGE),
+                        Err(_future @ SystemTimeError { .. }) => {
+                            warn_once_or_info!(
+                                "Volatile file `{}` was modified in the future; treating it as stale and refetching from upstream",
+                                cache_path.display()
+                            );
+                            None
                         }
-
-                        debug!(
-                            "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
-                            cache_path.display(),
-                            HumanFmt::Time(elapsed),
-                            HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
-                        );
-                    } else {
-                        // Served from cache all the same - keep the
-                        // hit/miss metrics complete via the shared bump below.
-                        warn_once_or_info!(
-                            "Volatile file `{}` was modified in the future; serving the cached copy anyway",
-                            cache_path.display()
-                        );
-                    }
+                    };
+                    let Some(elapsed) = fresh_age else {
+                        break 'cache_lookup Err(CacheMiss::StaleVolatile {
+                            file,
+                            modified: last_modified,
+                            size: md.size(),
+                        });
+                    };
+                    debug!(
+                        "Volatile file `{}` age {} is within the {} freshness window, serving cached version...",
+                        cache_path.display(),
+                        HumanFmt::Time(elapsed),
+                        HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
+                    );
                     metrics::VOLATILE_HIT.increment();
                     break 'cache_lookup Ok((file, Some(md)));
                 }
