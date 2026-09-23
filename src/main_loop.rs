@@ -474,6 +474,12 @@ pub(crate) async fn main_loop(
         });
     }
 
+    // One persistent receiver per signal: a SIGINT that lands while the loop
+    // body runs (or during the accept backoff) is then held for the next
+    // `recv`, where a `ctrl_c()` future re-created per pass would have had no
+    // listener to deliver it to.
+    let mut int_signal =
+        tokio::signal::unix::signal(SignalKind::interrupt()).map_err(MainLoopError::Io)?;
     let mut term_signal =
         tokio::signal::unix::signal(SignalKind::terminate()).map_err(MainLoopError::Io)?;
     let mut usr1_signal =
@@ -562,7 +568,7 @@ pub(crate) async fn main_loop(
         );
 
         let next = tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = int_signal.recv() => {
                 info!("SIGINT received, stopping...");
                 log_shutdown_summary("SIGINT", &appstate.active_downloads);
                 drain_db_task.as_mut().await;
