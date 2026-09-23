@@ -34,21 +34,23 @@ static TMP_WALK: WalkContext = WalkContext {
 ///
 /// Called by the engine's `Partials` unit arm once per mirror per layout
 /// (structured `<cache>/<cache_path>/tmp` and flat `<cache>/flat/<flat_root>/tmp`
-/// — see `model::classify_mirror`'s two `Partials` units). The returned count
-/// is logged only, never folded into `UnitStats::removed`/`bytes_removed`:
-/// partial-download scratch files are not cached content.
+/// — see `model::classify_mirror`'s two `Partials` units). The entry count
+/// is logged only; the unlinked regular files' bytes feed the quota
+/// reconcile (the cache scan counts every regular file in `tmp/`), never
+/// `UnitStats::removed`/`bytes_removed`: partial-download scratch files are
+/// not cached content.
 pub(super) async fn cleanup_tmp_dir(
     tmp_dir: &Path,
     now: SystemTime,
     partial_max_age: Duration,
-) -> u64 {
+) -> TmpReap {
     // `FOREIGN_CONSEQUENCE` spells this out as "a week"; keep them in step.
     const FOREIGN_MAX_AGE: Duration = Duration::from_hours(7 * 24);
 
     let partial_cutoff = now - partial_max_age;
     let foreign_cutoff = now - FOREIGN_MAX_AGE;
 
-    let mut removed = 0u64;
+    let mut reaped = TmpReap::default();
 
     let mut walker = Walker::new(tmp_dir, &TMP_WALK, OnMissing::Tolerate, ());
 
@@ -103,11 +105,14 @@ pub(super) async fn cleanup_tmp_dir(
 
         let path = entry.path();
         let gone = match entry.kind() {
+            // Neither is counted towards the cache size, so neither frees
+            // accounted bytes.
             EntryKind::Dir => remove_stray_dir(&path).await,
             EntryKind::NonRegular => remove_non_regular(&path).await,
             EntryKind::File => match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
                     debug!("Removed stale tmp entry `{}`", path.display());
+                    reaped.bytes = reaped.bytes.saturating_add(mdata.len());
                     true
                 }
                 Err(err) => {
@@ -122,11 +127,20 @@ pub(super) async fn cleanup_tmp_dir(
             },
         };
         if gone {
-            removed += 1;
+            reaped.entries += 1;
         }
     }
 
-    removed
+    reaped
+}
+
+/// What one [`cleanup_tmp_dir`] pass removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TmpReap {
+    /// Entries of every kind.
+    pub(super) entries: u64,
+    /// Sizes of the regular files among them.
+    pub(super) bytes: u64,
 }
 
 #[cfg(test)]
@@ -169,9 +183,13 @@ mod tests {
         plant_file(tmp, "young.partial", b"resume", now, PARTIAL_MAX_AGE / 2);
         plant_file(tmp, "old.partial", b"resume", now, PARTIAL_MAX_AGE * 2);
 
-        let removed = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
 
-        assert_eq!(removed, 2);
+        assert_eq!(reaped.entries, 2);
+        assert_eq!(
+            reaped.bytes, 6,
+            "the aged partial's bytes feed the quota reconcile"
+        );
         assert!(!tmp.join("empty.partial").exists(), "empty partial reaped");
         assert!(tmp.join("young.partial").exists(), "young partial kept");
         assert!(!tmp.join("old.partial").exists(), "aged partial reaped");
@@ -189,9 +207,10 @@ mod tests {
         plant_file(tmp, "six-days.bin", b"x", now, ONE_DAY * 6);
         plant_file(tmp, "eight-days.bin", b"x", now, ONE_DAY * 8);
 
-        let removed = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
 
-        assert_eq!(removed, 1);
+        assert_eq!(reaped.entries, 1);
+        assert_eq!(reaped.bytes, 1);
         assert!(tmp.join("fresh.bin").exists(), "fresh foreign file kept");
         assert!(
             tmp.join("six-days.bin").exists(),
@@ -223,9 +242,13 @@ mod tests {
         )
         .expect("backdate mtime");
 
-        let removed = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(tmp, now, PARTIAL_MAX_AGE).await;
 
-        assert_eq!(removed, 1);
+        assert_eq!(reaped.entries, 1);
+        assert_eq!(
+            reaped.bytes, 0,
+            "a stray directory's contents are never counted"
+        );
         assert!(tmp.join("young.partial").is_dir(), "young stray dir kept");
         assert!(tmp.join("six-days").is_dir(), "six-day stray dir kept");
         assert!(
@@ -239,8 +262,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
 
-        let removed = cleanup_tmp_dir(&dir.path().join("absent"), now, PARTIAL_MAX_AGE).await;
+        let reaped = cleanup_tmp_dir(&dir.path().join("absent"), now, PARTIAL_MAX_AGE).await;
 
-        assert_eq!(removed, 0);
+        assert_eq!(reaped.entries, 0);
     }
 }

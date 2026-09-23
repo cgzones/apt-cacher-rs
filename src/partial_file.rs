@@ -23,9 +23,11 @@ use crate::{
     Never,
     cache_metadata::{TargetFile, UpstreamMetadata},
     cache_paths::CachePaths,
+    cache_quota::{CacheQuota, ReservedPartial},
     deb_mirror,
     error::ErrorReport,
     fs_open::tokio_nofollow_options,
+    global_cache_quota,
     guards::InitBarrier,
     http_etag::ETag,
     http_last_modified::LastModified,
@@ -96,6 +98,22 @@ impl PartialDownload {
                 stored,
             } => Some(stored),
             Self::Fresh(_) | Self::Volatile => None,
+        }
+    }
+
+    /// The partial a quota reservation for this download accounts (see
+    /// `cache_quota`'s module doc): `None` for a volatile scratch file, which
+    /// is never kept; a `Resumable` partial's `resume_offset` bytes are
+    /// adopted from the kept partial.
+    pub(crate) fn reserved_partial(&self, resume_offset: u64) -> Option<ReservedPartial> {
+        match self {
+            Self::Volatile => None,
+            Self::Fresh(guard) => Some(ReservedPartial::new(guard.to_path_buf(), 0)),
+            Self::Resumable {
+                file: _,
+                guard,
+                stored: _,
+            } => Some(ReservedPartial::new(guard.to_path_buf(), resume_offset)),
         }
     }
 
@@ -217,19 +235,22 @@ pub(crate) async fn prepare_partial_resume(
     log_prefix: &'static str,
 ) -> Result<PartialResume, PartialOpenFailure> {
     let path = partial_path_for_barrier(CachePaths::global(), ibarrier);
-    prepare_partial_resume_at(path, debname, mirror, log_prefix).await
+    let quota = Some(global_cache_quota().clone());
+    prepare_partial_resume_at(path, quota, debname, mirror, log_prefix).await
 }
 
-/// [`prepare_partial_resume`] for an already-derived partial `path`: the
-/// pure half, kept free of the `global_config()` lookup so the lifecycle is
-/// unit-testable against a temporary directory.
+/// [`prepare_partial_resume`] for an already-derived partial `path` and the
+/// quota a removal of it releases bytes from: the pure half, kept free of
+/// the global lookups so the lifecycle is unit-testable against a temporary
+/// directory.
 async fn prepare_partial_resume_at(
     path: PathBuf,
+    quota: Option<CacheQuota>,
     debname: &str,
     mirror: &deb_mirror::Mirror,
     log_prefix: &'static str,
 ) -> Result<PartialResume, PartialOpenFailure> {
-    match open_partial_file(path).await {
+    match open_partial_file(path, quota).await {
         Ok((file, size, guard)) if size > 0 => {
             if let Some(if_range) =
                 xattr_helpers::read::<ETag>(&file, &guard).filter(ETag::is_strong)
@@ -333,19 +354,23 @@ enum OnDrop {
 /// [`TempPath::scratch`]; which one a path is depends on whether anything can
 /// find it again, so the choice belongs to the constructor rather than to a
 /// flag a caller sets.
-#[derive(Debug)]
 pub(crate) struct TempPath {
     path: Option<PathBuf>,
     on_drop: OnDrop,
+    /// The quota a kept `.partial` is accounted in (see `cache_quota`'s
+    /// module doc): an explicit removal releases its bytes there. `None` for
+    /// a scratch file, which is never accounted, and in unit tests.
+    quota: Option<CacheQuota>,
 }
 
 impl TempPath {
     /// Guard the deterministic `.partial` path: `Drop` leaves the file for a
     /// later resume.
-    fn keeping(path: PathBuf) -> Self {
+    fn keeping(path: PathBuf, quota: Option<CacheQuota>) -> Self {
         Self {
             path: Some(path),
             on_drop: OnDrop::Keep,
+            quota,
         }
     }
 
@@ -355,6 +380,7 @@ impl TempPath {
         Self {
             path: Some(path),
             on_drop: OnDrop::Remove,
+            quota: None,
         }
     }
 
@@ -363,7 +389,8 @@ impl TempPath {
         std::mem::take(&mut self.path).expect("path has not been taken yet")
     }
 
-    /// Force deletion of the underlying file regardless of [`OnDrop`].
+    /// Force deletion of the underlying file regardless of [`OnDrop`],
+    /// releasing a kept partial's bytes from the quota.
     ///
     /// Used for a partial whose content is known to be bad (checksum
     /// mismatch): keeping it would only feed a resume of the same wrong
@@ -371,26 +398,21 @@ impl TempPath {
     /// unlink.
     pub(crate) async fn remove(mut self) -> PathBuf {
         let path = std::mem::take(&mut self.path).expect("path has not been taken yet");
+        let quota = self.quota.take();
 
-        if let Err(err) = tokio::fs::remove_file(&path).await {
-            // NotFound is still a WARN here: the path is supposed to exist for the
-            // lifetime of the TempPath guard, so a missing file means something
-            // outside us deleted it (operator, racing cleanup, FS issue).
-            if err.kind() == std::io::ErrorKind::NotFound {
-                warn!(
-                    "Failed to remove partial file `{}`; continuing without it:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                );
-            } else {
-                error!(
-                    "Failed to remove partial file `{}`; it stays on disk:  {}",
-                    path.display(),
-                    ErrorReport(&err)
-                );
-            }
-        }
+        let unlink = path.clone();
+        tokio::task::spawn_blocking(move || remove_and_release(&unlink, quota.as_ref()))
+            .await
+            .expect("partial removal should not panic");
 
+        path
+    }
+
+    /// [`Self::remove`] on the current thread, for a caller already running
+    /// in a blocking job.
+    pub(crate) fn remove_blocking(mut self) -> PathBuf {
+        let path = std::mem::take(&mut self.path).expect("path has not been taken yet");
+        remove_and_release(&path, self.quota.as_ref());
         path
     }
 
@@ -398,7 +420,63 @@ impl TempPath {
     /// path, still `OnDrop::Keep` so a retried download can be resumed on
     /// failure.
     async fn renew(self) -> Self {
-        Self::keeping(self.remove().await)
+        let quota = self.quota.clone();
+        Self::keeping(self.remove().await, quota)
+    }
+}
+
+/// Unlink the partial at `path` and release the bytes it held from `quota`.
+///
+/// The size is read right before the unlink; the download's registry lease
+/// keeps every other writer off the path in between.
+fn unlink_and_release(path: &Path, quota: Option<&CacheQuota>) -> std::io::Result<()> {
+    let len = match std::fs::symlink_metadata(path) {
+        Ok(mdata) if mdata.file_type().is_file() => mdata.len(),
+        // Not a regular file, which the scan does not count either; a
+        // missing one fails the unlink below.
+        Ok(_) | Err(_) => 0,
+    };
+    std::fs::remove_file(path)?;
+    if let Some(quota) = quota {
+        quota.release_removed_partial(len);
+    }
+    Ok(())
+}
+
+/// [`unlink_and_release`] for an explicit removal, logging a failure.
+fn remove_and_release(path: &Path, quota: Option<&CacheQuota>) {
+    if let Err(err) = unlink_and_release(path, quota) {
+        // NotFound is still a WARN here: the path is supposed to exist for the
+        // lifetime of the TempPath guard, so a missing file means something
+        // outside us deleted it (operator, racing cleanup, FS issue).
+        if err.kind() == std::io::ErrorKind::NotFound {
+            warn!(
+                "Failed to remove partial file `{}`; continuing without it:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+        } else {
+            error!(
+                "Failed to remove partial file `{}`; it stays on disk:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for TempPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            path,
+            on_drop,
+            quota,
+        } = self;
+        f.debug_struct("TempPath")
+            .field("path", path)
+            .field("on_drop", on_drop)
+            .field("accounted", &quota.is_some())
+            .finish()
     }
 }
 
@@ -536,6 +614,7 @@ fn partial_path_for_barrier(paths: CachePaths<'_>, ibarrier: &InitBarrier) -> Pa
 /// TOCTOU races between a separate `metadata()` check and a later `open()`.
 async fn open_partial_file(
     path: PathBuf,
+    quota: Option<CacheQuota>,
 ) -> Result<(tokio::fs::File, u64, TempPath), PartialOpenError> {
     use tokio::io::AsyncSeekExt as _;
 
@@ -585,7 +664,7 @@ async fn open_partial_file(
         Ok((file, size))
     }
 
-    let guard = TempPath::keeping(path);
+    let guard = TempPath::keeping(path, quota);
     match file_ops(&guard).await {
         Ok((file, size)) => Ok((file, size, guard)),
         Err(FileOpsError::NotFound) => Err(PartialOpenError::NotFound(guard)),
@@ -616,7 +695,11 @@ pub(crate) async fn create_partial_file(
             .await
     }
 
-    async fn file_ops(path: &Path, mode: u32) -> Result<tokio::fs::File, CacheError> {
+    async fn file_ops(
+        path: &Path,
+        mode: u32,
+        quota: Option<CacheQuota>,
+    ) -> Result<tokio::fs::File, CacheError> {
         let create = |err| CacheError::counted_io("create partial cache file", path, err);
         // Open first and create the parent only on `ENOENT`: with `O_CREAT`
         // set, a missing directory is the sole source of that errno here,
@@ -625,8 +708,8 @@ pub(crate) async fn create_partial_file(
         // round trip of its own, so the steady state now costs one hop
         // rather than two.
         // A leftover file costs the same extra hop: unlink it (a symlink
-        // planted there included -- `O_EXCL` does not follow it) and create
-        // afresh.
+        // planted there included -- `O_EXCL` does not follow it), releasing
+        // whatever it held from the quota, and create afresh.
         match open(path, mode).await {
             Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
@@ -636,7 +719,13 @@ pub(crate) async fn create_partial_file(
                 }
             }
             Err(err) if err.kind() == tokio::io::ErrorKind::AlreadyExists => {
-                match tokio::fs::remove_file(path).await {
+                let leftover = path.to_path_buf();
+                let unlinked = tokio::task::spawn_blocking(move || {
+                    unlink_and_release(&leftover, quota.as_ref())
+                })
+                .await
+                .expect("partial removal should not panic");
+                match unlinked {
                     Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {}
                     result => result.map_err(|err| {
                         CacheError::counted_io("remove leftover partial cache file", path, err)
@@ -649,9 +738,10 @@ pub(crate) async fn create_partial_file(
         open(path, mode).await.map_err(create)
     }
 
+    let quota = guard.quota.clone();
     let path = guard.defuse();
-    let file = file_ops(&path, mode).await?;
-    Ok((file, TempPath::keeping(path)))
+    let file = file_ops(&path, mode, quota.clone()).await?;
+    Ok((file, TempPath::keeping(path, quota)))
 }
 
 #[cfg(test)]
@@ -685,7 +775,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("x.partial");
         tokio::fs::write(&path, b"12345").await.expect("seed");
-        let (file, _size, guard) = open_partial_file(path).await.expect("reopen");
+        let (file, _size, guard) = open_partial_file(path, None).await.expect("reopen");
         let before = metrics::CACHE_IO_FAILURE.get();
         let err = PartialDownload::Resumable {
             file,
@@ -754,7 +844,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = partial_path(&dir);
 
-        let guard = match open_partial_file(path.clone()).await {
+        let guard = match open_partial_file(path.clone(), None).await {
             Err(PartialOpenError::NotFound(guard)) => guard,
             Ok(_) | Err(PartialOpenError::Failed { .. }) => {
                 unreachable!("no partial exists yet")
@@ -775,7 +865,7 @@ mod tests {
         assert!(path.is_file(), "a partial survives its guard");
 
         // Reopening lands at the end of the existing bytes.
-        let (file, size, guard) = open_partial_file(path.clone())
+        let (file, size, guard) = open_partial_file(path.clone(), None)
             .await
             .expect("partial reopens");
         assert_eq!(size, 5);
@@ -805,7 +895,7 @@ mod tests {
         let planted = plant_raw::<ETag>(&leftover, b"\"old\"");
         let old_ino = leftover.metadata().expect("stat leftover").ino();
 
-        let (file, guard) = create_partial_file(TempPath::keeping(path.clone()), 0o640)
+        let (file, guard) = create_partial_file(TempPath::keeping(path.clone(), None), 0o640)
             .await
             .expect("create over a leftover");
         assert_eq!(&*guard, path.as_path());
@@ -831,7 +921,7 @@ mod tests {
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
 
         let before = metrics::CACHE_NON_REGULAR.get();
-        let guard = match open_partial_file(path.clone()).await {
+        let guard = match open_partial_file(path.clone(), None).await {
             Err(PartialOpenError::Failed { failure: _, guard }) => guard,
             Ok(_) | Err(PartialOpenError::NotFound(_)) => {
                 unreachable!("a FIFO is not a partial")
@@ -856,9 +946,10 @@ mod tests {
         std::fs::write(&path, b"stale").expect("write");
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
-            .await
-            .expect("a discarded partial is a fresh download");
+        let resume =
+            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
+                .await
+                .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert_eq!(resume.expected_total, None);
         assert_eq!(resume.if_range, None);
@@ -885,9 +976,10 @@ mod tests {
         drop(std_file);
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
-            .await
-            .expect("a discarded partial is a fresh download");
+        let resume =
+            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
+                .await
+                .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert_eq!(
             resume.if_range, None,
@@ -922,9 +1014,10 @@ mod tests {
         drop(std_file);
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let mut resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
-            .await
-            .expect("the partial reopens");
+        let mut resume =
+            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
+                .await
+                .expect("the partial reopens");
         assert_eq!(resume.offset, 13);
         assert_eq!(resume.expected_total, None, "no expected-size xattr");
         assert_eq!(resume.if_range.as_deref(), Some("\"strong\""));
@@ -977,7 +1070,7 @@ mod tests {
         drop(std_file);
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(path, "foo_1.0_amd64.deb", &mirror, "")
+        let resume = prepare_partial_resume_at(path, None, "foo_1.0_amd64.deb", &mirror, "")
             .await
             .expect("the partial reopens");
         assert_eq!(resume.offset, 13);
@@ -989,6 +1082,45 @@ mod tests {
         assert_eq!(resume.if_range.as_deref(), Some("\"strong\""));
     }
 
+    /// Every explicit unlink of a kept partial releases its bytes from the
+    /// quota it is accounted in: a discarded resume and a replaced leftover
+    /// alike.
+    // The xattr read runs through `block_in_place`, which needs the
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_kept_partial_releases_its_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = partial_path(&dir);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"stale").expect("write");
+        let mirror = structured_mirror("deb.example.org", "debian");
+        // 100 bytes of cached files plus the 5-byte kept partial.
+        let quota = CacheQuota::new(105, None);
+
+        // Without an ETag the partial is discarded.
+        let resume = prepare_partial_resume_at(
+            path.clone(),
+            Some(quota.clone()),
+            "foo_1.0_amd64.deb",
+            &mirror,
+            "",
+        )
+        .await
+        .expect("a discarded partial is a fresh download");
+        assert_eq!(quota.current_size(), 100);
+        let PartialDownload::Fresh(guard) = resume.partial else {
+            unreachable!("no ETag means no resume")
+        };
+
+        std::fs::write(&path, b"leftover!").expect("plant leftover");
+        let (file, guard) = create_partial_file(guard, 0o640)
+            .await
+            .expect("create over a leftover");
+        assert_eq!(quota.current_size(), 91, "the 9-byte leftover is released");
+        drop(file);
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn prepare_partial_resume_treats_an_empty_partial_as_fresh() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -997,9 +1129,10 @@ mod tests {
         std::fs::write(&path, b"").expect("write");
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(path.clone(), "foo_1.0_amd64.deb", &mirror, "")
-            .await
-            .expect("an empty partial is a fresh download");
+        let resume =
+            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
+                .await
+                .expect("an empty partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert!(matches!(resume.partial, PartialDownload::Fresh(_)));
     }

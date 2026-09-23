@@ -4,37 +4,107 @@
 //! its reservation, a finalisation and the cleanup reconcile can never
 //! interleave inconsistently:
 //!
-//! - `size`: the accounted cache size. Files below the mirror directories
-//!   plus the full reservation of every download in flight. Partials and
-//!   `tmp/` scratch files are never counted (neither by the startup scan nor
-//!   here), so an abandoned partial is disk usage outside the quota.
+//! - `size`: the accounted cache size. Files below the mirror directories --
+//!   the `.partial` files in their `tmp/` subdirectories included -- plus the
+//!   reservation of every download in flight. Kept partials are disk usage a
+//!   failing upstream can grow at will (a partial survives its download for a
+//!   later resume), so they count like cached files: a reservation that
+//!   resumes a partial *adopts* its bytes (they move from the kept partial
+//!   into the reservation), a download that ends without a commit hands back
+//!   what its partial then holds (only the unwritten remainder is reverted),
+//!   and every removal of a partial releases its bytes exactly once --
+//!   cleanup's `tmp/` reap through the reconcile's `removed`, every other
+//!   unlink (a discarded resume, a checksum mismatch, a replaced leftover)
+//!   through [`CacheQuota::release_removed_partial`]. The random scratch
+//!   files of volatile downloads live in the cache root's `tmp/`, are
+//!   unlinked with their download and purged at startup, and are never
+//!   counted.
 //! - `inflight_reserved` / `inflight_replaced`: what the live reservations
-//!   added to and subtracted from `size`. The reconcile adds their net to the
-//!   scanned on-disk total instead of asking the active-downloads registry,
-//!   so the comparison is taken under the same lock as `size`.
-//! - `committed_grown` / `committed_shrunk`: monotonic on-disk deltas of
-//!   finished commits (renames). A reconcile snapshots them before its scan
-//!   and treats commits that landed during the scan as unknown-to-the-scan:
-//!   the accounted size is only "repaired" when it lies outside the interval
-//!   those commits could explain. Without that, a download committed after
-//!   the scan had walked its directory was repaired away, under-counting the
-//!   cache until the next cleanup.
+//!   added to and subtracted from `size` (`replaced` includes the adopted
+//!   partials). The reconcile adds their net to the scanned on-disk total
+//!   instead of asking the active-downloads registry, so the comparison is
+//!   taken under the same lock as `size`.
+//! - `inflight_unwritten`: the bytes the live reservations writing a partial
+//!   may still add to it (`reserved - adopted`). The scan counts such a
+//!   partial at whatever size it had when walked, anywhere between adopted
+//!   and complete, so the reconcile's lower bound is widened by this much.
+//! - `committed_grown` / `committed_shrunk`: monotonic on-disk deltas the
+//!   scan may have seen on either side of: finished commits (renames; a
+//!   partial's rename out of `tmp/` can be counted in both places), partials
+//!   kept by an unfinished download, and partial removals. A reconcile
+//!   snapshots them before its scan and treats the changes that landed
+//!   during the scan as unknown-to-the-scan: the accounted size is only
+//!   "repaired" when it lies outside the interval those changes could
+//!   explain. Without that, a download committed after the scan had walked
+//!   its directory was repaired away, under-counting the cache until the
+//!   next cleanup.
 //!
 //! A [`QuotaReservation`] is minted only by [`CacheQuota::try_acquire`] /
 //! [`CacheQuota::acquire_for_cleanup`], is required to build a download
 //! barrier (`guards.rs`), is finalised inside the rename step
 //! (`integrity::verify_and_rename`, in the same blocking closure as the
 //! `rename(2)`, so a cancelled commit future cannot land the file and revert
-//! the reservation), and reverts itself on drop.
+//! the reservation), and reverts itself on drop -- keeping the bytes its
+//! [`ReservedPartial`] then holds.
 
-use std::{cmp::Ordering, num::NonZero, sync::Arc};
+use std::{
+    cmp::Ordering,
+    num::NonZero,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 
-use crate::{humanfmt::HumanFmt, metrics, sticky, upstream_head::ContentLength, warn_once_or_info};
+use crate::{
+    error::ErrorReport, humanfmt::HumanFmt, metrics, sticky, upstream_head::ContentLength,
+    warn_once_or_info,
+};
 
 /// Represents a quota violation.
 pub(crate) struct QuotaExceeded;
+
+/// The `.partial` file a permanent download writes into, handed to the quota
+/// so the bytes a failed download leaves behind stay accounted.
+#[derive(Debug)]
+pub(crate) struct ReservedPartial {
+    path: PathBuf,
+    /// Bytes the partial held when the download took it over: the resume
+    /// offset, 0 for a fresh download. Accounted as a kept partial until
+    /// then, they move into the reservation.
+    adopted: u64,
+}
+
+impl ReservedPartial {
+    #[must_use]
+    pub(crate) const fn new(path: PathBuf, adopted: u64) -> Self {
+        Self { path, adopted }
+    }
+}
+
+/// The size of the regular file at `path`, 0 when there is none (or it is
+/// not a regular file, which the scan does not count either).
+///
+/// A direct `lstat(2)` rather than `block_in_place`: it runs from
+/// [`QuotaReservation`]'s `Drop`, which also fires on current-thread
+/// runtimes and inside blocking closures, and it stats a file its own
+/// download has just written, so the inode is cached.
+fn partial_len(path: &Path) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(mdata) if mdata.file_type().is_file() => mdata.len(),
+        Ok(_) => 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            error!(
+                "Failed to stat partial file `{}`; not counting it towards the cache size until the next cleanup reconcile:  {}",
+                path.display(),
+                ErrorReport(&err)
+            );
+            0
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct Accounting {
@@ -42,13 +112,17 @@ struct Accounting {
     size: u64,
     /// Sum of `reserved` over live reservations.
     inflight_reserved: u64,
-    /// Sum of `prev_file_size` over live reservations.
+    /// Sum of `prev_file_size` plus the adopted partial over live
+    /// reservations.
     inflight_replaced: u64,
-    /// Monotonic sum of `bytes_received - prev_file_size` over commits that
-    /// grew the on-disk size.
+    /// Sum of `reserved - adopted` over live reservations writing a partial.
+    inflight_unwritten: u64,
+    /// Monotonic sum of the on-disk growth the scan may have missed: commits
+    /// that grew the cache, partials kept past their adopted size.
     committed_grown: u64,
-    /// Monotonic sum of `prev_file_size - bytes_received` over commits that
-    /// shrank the on-disk size.
+    /// Monotonic sum of the on-disk shrinkage (or double counting) the scan
+    /// may have seen: commits that shrank the cache, partials renamed out of
+    /// `tmp/`, removed partials.
     committed_shrunk: u64,
 }
 
@@ -92,15 +166,32 @@ impl Accounting {
     }
 
     /// Remove a reservation's contribution from the in-flight tallies.
-    fn retire(&mut self, reserved: u64, prev_file_size: u64) {
+    fn retire(&mut self, reserved: u64, replaced: u64, unwritten: u64) {
         self.inflight_reserved = self.inflight_reserved.saturating_sub(reserved);
-        self.inflight_replaced = self.inflight_replaced.saturating_sub(prev_file_size);
+        self.inflight_replaced = self.inflight_replaced.saturating_sub(replaced);
+        self.inflight_unwritten = self.inflight_unwritten.saturating_sub(unwritten);
+    }
+
+    /// Record an on-disk change from `before` to `after` bytes the scan may
+    /// have seen either side of.
+    const fn record_change(&mut self, before: u64, after: u64) {
+        if after > before {
+            self.committed_grown = self.committed_grown.wrapping_add(after - before);
+        } else {
+            self.committed_shrunk = self.committed_shrunk.wrapping_add(before - after);
+        }
     }
 }
 
+/// One pointer wide: every [`QuotaReservation`] carries a handle, and it
+/// rides inside the download barriers' failure type.
 #[derive(Clone)]
 pub(crate) struct CacheQuota {
-    accounting: Arc<parking_lot::Mutex<Accounting>>,
+    inner: Arc<QuotaInner>,
+}
+
+struct QuotaInner {
+    accounting: parking_lot::Mutex<Accounting>,
     quota_config: Option<NonZero<u64>>,
 }
 
@@ -123,9 +214,13 @@ pub(crate) struct Reconciled {
     /// Scanned on-disk size plus the net of the live reservations: the value
     /// the accounted size must have if no commit landed during the scan.
     pub(crate) expected: u64,
-    /// On-disk bytes added / removed by commits during the scan window.
+    /// On-disk bytes added / removed by commits, kept and removed partials
+    /// during the scan window.
     pub(crate) grown_during_scan: u64,
     pub(crate) shrunk_during_scan: u64,
+    /// Bytes the in-flight downloads may still write into their partials,
+    /// which the scan counted at an unknown fill level.
+    pub(crate) inflight_unwritten: u64,
     /// Accounted size after the reconcile.
     pub(crate) corrected: u64,
     /// `|corrected - stored|`; 0 when no repair was needed.
@@ -152,16 +247,29 @@ const fn projected_size(current: u64, prev_file_size: u64, reserved: NonZero<u64
         .saturating_add(reserved.get())
 }
 
+/// What a reservation replaces: the previous cache file plus the partial it
+/// adopts.
+fn replaced_size(prev_file_size: u64, partial: Option<&ReservedPartial>) -> u64 {
+    prev_file_size.saturating_add(partial.map_or(0, |p| p.adopted))
+}
+
+/// What a reservation may still write into its partial; 0 without one.
+fn unwritten_size(reserved: NonZero<u64>, partial: Option<&ReservedPartial>) -> u64 {
+    partial.map_or(0, |p| reserved.get().saturating_sub(p.adopted))
+}
+
 impl CacheQuota {
     #[must_use]
     /// Create a new `CacheQuota` with the given initial size and quota configuration.
     pub(crate) fn new(initial: u64, quota_config: Option<NonZero<u64>>) -> Self {
         Self {
-            accounting: Arc::new(parking_lot::Mutex::new(Accounting {
-                size: initial,
-                ..Accounting::default()
-            })),
-            quota_config,
+            inner: Arc::new(QuotaInner {
+                accounting: parking_lot::Mutex::new(Accounting {
+                    size: initial,
+                    ..Accounting::default()
+                }),
+                quota_config,
+            }),
         }
     }
 
@@ -173,18 +281,25 @@ impl CacheQuota {
     /// download overwrites an entry (e.g. a stale-volatile re-fetch): passing
     /// 0 silently over-counts the quota, which only surfaces later as a
     /// `Repaired cache size discrepancy` warn from cleanup.
+    ///
+    /// `partial` is the `.partial` a permanent download writes into (`None`
+    /// for a volatile download's scratch file). Its adopted bytes count as
+    /// replaced here, like `prev_file_size`: `content_length` covers the
+    /// whole file, the resumed prefix included.
     pub(crate) fn try_acquire(
         &self,
         content_length: ContentLength,
         prev_file_size: u64,
+        partial: Option<ReservedPartial>,
         debname: &str,
     ) -> Result<QuotaReservation, QuotaExceeded> {
         let reserved = content_length.upper();
-        let mg = self.accounting.lock();
+        let replaced = replaced_size(prev_file_size, partial.as_ref());
+        let mg = self.inner.accounting.lock();
         let curr = mg.size;
 
-        if let Some(quota) = self.quota_config
-            && projected_size(curr, prev_file_size, reserved) > quota.get()
+        if let Some(quota) = self.inner.quota_config
+            && projected_size(curr, replaced, reserved) > quota.get()
         {
             drop(mg);
             // A cache sitting at its quota rejects on *every* cacheable
@@ -200,7 +315,7 @@ impl CacheQuota {
             return Err(QuotaExceeded);
         }
 
-        Ok(self.reserve_locked(mg, reserved, prev_file_size, debname))
+        Ok(self.reserve_locked(mg, reserved, prev_file_size, partial, debname))
     }
 
     /// Reserve space for one of cleanup's own index fetches without
@@ -219,13 +334,15 @@ impl CacheQuota {
         &self,
         content_length: ContentLength,
         prev_file_size: u64,
+        partial: Option<ReservedPartial>,
         debname: &str,
     ) -> QuotaReservation {
         let reserved = content_length.upper();
-        let mg = self.accounting.lock();
+        let replaced = replaced_size(prev_file_size, partial.as_ref());
+        let mg = self.inner.accounting.lock();
         let curr = mg.size;
-        if let Some(quota) = self.quota_config
-            && projected_size(curr, prev_file_size, reserved) > quota.get()
+        if let Some(quota) = self.inner.quota_config
+            && projected_size(curr, replaced, reserved) > quota.get()
         {
             info!(
                 "Disk quota reached while reserving space for cleanup index fetch {debname} (cache size {}, reserving {}, quota {}); admitting it over quota so cleanup can reconcile and free space",
@@ -234,7 +351,7 @@ impl CacheQuota {
                 HumanFmt::Size(quota.get()),
             );
         }
-        self.reserve_locked(mg, reserved, prev_file_size, debname)
+        self.reserve_locked(mg, reserved, prev_file_size, partial, debname)
     }
 
     /// Apply a reservation to the accounting and mint its token. Takes the
@@ -245,17 +362,23 @@ impl CacheQuota {
         mut mg: parking_lot::MutexGuard<'_, Accounting>,
         reserved: NonZero<u64>,
         prev_file_size: u64,
+        partial: Option<ReservedPartial>,
         debname: &str,
     ) -> QuotaReservation {
+        let replaced = replaced_size(prev_file_size, partial.as_ref());
         trace!(
-            "Adjusting cache size for file {debname} to be downloaded by {reserved} minus previous file size {prev_file_size}"
+            "Adjusting cache size for file {debname} to be downloaded by {reserved} minus previous file size {prev_file_size} and adopted partial size {}",
+            replaced - prev_file_size
         );
 
-        // Reconcile catches any residual drift from `prev_file_size > curr`
+        // Reconcile catches any residual drift from `replaced > curr`
         // caller bugs and emits `Repaired cache size discrepancy`.
-        mg.size = projected_size(mg.size, prev_file_size, reserved);
+        mg.size = projected_size(mg.size, replaced, reserved);
         mg.inflight_reserved = mg.inflight_reserved.saturating_add(reserved.get());
-        mg.inflight_replaced = mg.inflight_replaced.saturating_add(prev_file_size);
+        mg.inflight_replaced = mg.inflight_replaced.saturating_add(replaced);
+        mg.inflight_unwritten = mg
+            .inflight_unwritten
+            .saturating_add(unwritten_size(reserved, partial.as_ref()));
         let new_size = mg.size;
         drop(mg);
 
@@ -265,20 +388,35 @@ impl CacheQuota {
             quota: self.clone(),
             reserved,
             prev_file_size,
+            partial: partial.map(Box::new),
             finalized: sticky::Bool::new(),
         }
+    }
+
+    /// Release the bytes of a `.partial` file that was just unlinked outside
+    /// cleanup's `tmp/` reap (which reports its removals through the
+    /// reconcile's `removed` instead): a discarded resume, a checksum
+    /// mismatch, a leftover replaced by a fresh download. `len` is the size
+    /// the file had when it was removed.
+    pub(crate) fn release_removed_partial(&self, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let mut mg = self.inner.accounting.lock();
+        mg.subtract(len, "partial removal");
+        mg.record_change(len, 0);
     }
 
     /// Return the current cache size.
     #[must_use]
     pub(crate) fn current_size(&self) -> u64 {
-        self.accounting.lock().size
+        self.inner.accounting.lock().size
     }
 
     /// Configured quota limit, if any. `None` means unlimited.
     #[must_use]
-    pub(crate) const fn quota_limit(&self) -> Option<NonZero<u64>> {
-        self.quota_config
+    pub(crate) fn quota_limit(&self) -> Option<NonZero<u64>> {
+        self.inner.quota_config
     }
 
     /// Update `CACHE_QUOTA_UTIL_PEAK_BPS` with the current utilization
@@ -288,7 +426,7 @@ impl CacheQuota {
     /// `current` is taken as a parameter so callers that already hold (or
     /// just released) the accounting lock do not have to re-acquire it.
     pub(crate) fn sample_utilization_peak_with(&self, current: u64) {
-        let Some(quota) = self.quota_config else {
+        let Some(quota) = self.inner.quota_config else {
             return;
         };
         // bps = current * 10000 / quota, computed in u128 to avoid overflow.
@@ -302,7 +440,7 @@ impl CacheQuota {
     /// Seed the accounted size with the startup scan's total. Runs before
     /// the listener accepts, so no reservation can be live yet.
     pub(crate) fn record_startup_scan(&self, scanned: u64) {
-        let mut mg = self.accounting.lock();
+        let mut mg = self.inner.accounting.lock();
         debug_assert_eq!(
             (mg.inflight_reserved, mg.inflight_replaced),
             (0, 0),
@@ -317,7 +455,7 @@ impl CacheQuota {
     /// Snapshot the commit counters. Take it *before* the reconcile's cache
     /// scan starts and hand it to [`Self::subtract_and_reconcile`].
     pub(crate) fn begin_reconcile_window(&self) -> ReconcileWindow {
-        let mg = self.accounting.lock();
+        let mg = self.inner.accounting.lock();
         ReconcileWindow {
             grown: mg.committed_grown,
             shrunk: mg.committed_shrunk,
@@ -332,15 +470,17 @@ impl CacheQuota {
     /// the scan only if its directory had not been walked yet. So the
     /// accounted size is compared against an interval, not a point: the
     /// scanned total plus the live reservations, widened by the on-disk
-    /// deltas of the commits since `window` was taken. A value inside the
-    /// interval is left alone; one outside is moved to the nearest bound.
+    /// deltas recorded since `window` was taken and, downwards, by what the
+    /// live downloads may still write into the partials the scan counted.
+    /// A value inside the interval is left alone; one outside is moved to
+    /// the nearest bound.
     pub(crate) fn subtract_and_reconcile(
         &self,
         removed: u64,
         actual_cache_size: u64,
         window: ReconcileWindow,
     ) -> Reconciled {
-        let mut mg = self.accounting.lock();
+        let mut mg = self.inner.accounting.lock();
         mg.size = mg.size.saturating_sub(removed);
         let stored = mg.size;
 
@@ -357,7 +497,10 @@ impl CacheQuota {
         };
         let grown_during_scan = mg.committed_grown.wrapping_sub(window.grown);
         let shrunk_during_scan = mg.committed_shrunk.wrapping_sub(window.shrunk);
-        let lower = expected.saturating_sub(shrunk_during_scan);
+        let inflight_unwritten = mg.inflight_unwritten;
+        let lower = expected
+            .saturating_sub(shrunk_during_scan)
+            .saturating_sub(inflight_unwritten);
         let upper = expected.saturating_add(grown_during_scan);
 
         let corrected = stored.clamp(lower, upper);
@@ -378,6 +521,7 @@ impl CacheQuota {
             expected,
             grown_during_scan,
             shrunk_during_scan,
+            inflight_unwritten,
             corrected,
             difference,
         }
@@ -387,8 +531,8 @@ impl CacheQuota {
 impl std::fmt::Debug for CacheQuota {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CacheQuota")
-            .field("accounting", &*self.accounting.lock())
-            .field("quota_config", &self.quota_config)
+            .field("accounting", &*self.inner.accounting.lock())
+            .field("quota_config", &self.inner.quota_config)
             .finish()
     }
 }
@@ -398,6 +542,10 @@ pub(crate) struct QuotaReservation {
     quota: CacheQuota,
     reserved: NonZero<u64>,
     prev_file_size: u64,
+    /// The partial the download writes into; `None` for a volatile scratch
+    /// file. What it holds when the reservation ends unfinalised stays
+    /// accounted.
+    partial: Option<Box<ReservedPartial>>,
     finalized: sticky::Bool,
 }
 
@@ -415,11 +563,20 @@ impl QuotaReservation {
     /// Call it right after the `rename(2)` that made the file visible, in
     /// the same non-cancellable step: it also records the commit's on-disk
     /// delta for a concurrent reconcile (see the module doc).
+    ///
+    /// A download that wrote a partial renamed it out of `tmp/`, where the
+    /// scan may have counted it too, so its full size is also recorded as a
+    /// possible shrink.
     pub(crate) fn finalize(mut self, bytes_received: u64) {
         let reserved = self.reserved.get();
         let prev = self.prev_file_size;
-        let mut mg = self.quota.accounting.lock();
-        mg.retire(reserved, prev);
+        let partial = self.partial.as_deref();
+        let mut mg = self.quota.inner.accounting.lock();
+        mg.retire(
+            reserved,
+            replaced_size(prev, partial),
+            unwritten_size(self.reserved, partial),
+        );
         match reserved.cmp(&bytes_received) {
             Ordering::Equal => {}
             Ordering::Greater => {
@@ -437,14 +594,9 @@ impl QuotaReservation {
                 mg.add(diff, "finalize");
             }
         }
-        match bytes_received.cmp(&prev) {
-            Ordering::Equal => {}
-            Ordering::Greater => {
-                mg.committed_grown = mg.committed_grown.wrapping_add(bytes_received - prev);
-            }
-            Ordering::Less => {
-                mg.committed_shrunk = mg.committed_shrunk.wrapping_add(prev - bytes_received);
-            }
+        mg.record_change(prev, bytes_received);
+        if partial.is_some() {
+            mg.record_change(bytes_received, 0);
         }
         let new_size = mg.size;
         drop(mg);
@@ -461,27 +613,54 @@ impl Drop for QuotaReservation {
             return;
         }
 
-        // Revert: remove the reserved amount, add back prev_file_size.
+        // Revert the reservation, but keep what the partial now holds: it
+        // stays on disk for a later resume (a volatile scratch file is
+        // unlinked with its download and keeps nothing).
         let reserved = self.reserved.get();
         let prev = self.prev_file_size;
-        let mut mg = self.quota.accounting.lock();
-        mg.retire(reserved, prev);
-        match reserved.cmp(&prev) {
+        let partial = self.partial.as_deref();
+        let adopted = partial.map_or(0, |p| p.adopted);
+        let kept = partial.map_or(0, |p| partial_len(&p.path));
+        // `reserved` out, `prev_file_size` and the kept partial back in.
+        let restored = prev.saturating_add(kept);
+        // Both trace lines below start with "Reverting quota reservation",
+        // which `kept_partial_counts_against_the_disk_quota` waits on to know
+        // the reservation has ended: keep the wording stable.
+        let mut mg = self.quota.inner.accounting.lock();
+        mg.retire(
+            reserved,
+            replaced_size(prev, partial),
+            unwritten_size(self.reserved, partial),
+        );
+        match reserved.cmp(&restored) {
             Ordering::Equal => {}
             Ordering::Less => {
-                let revert = prev - reserved;
+                let revert = restored - reserved;
                 trace!(
-                    "Reverting quota reservation: reserved={reserved} prev_file_size={prev} revert=+{revert}"
+                    "Reverting quota reservation: reserved={reserved} prev_file_size={prev} kept_partial={kept} revert=+{revert}"
                 );
                 mg.add(revert, "revert");
             }
             Ordering::Greater => {
-                let revert = reserved - prev;
+                let revert = reserved - restored;
                 trace!(
-                    "Reverting quota reservation: reserved={reserved} prev_file_size={prev} revert=-{revert}"
+                    "Reverting quota reservation: reserved={reserved} prev_file_size={prev} kept_partial={kept} revert=-{revert}"
                 );
                 mg.subtract(revert, "revert");
             }
+        }
+        if partial.is_some() {
+            mg.record_change(adopted, kept);
+        }
+        drop(mg);
+        if let Some(partial) = partial
+            && kept > 0
+        {
+            debug!(
+                "Keeping {} of partial `{}` accounted towards the cache size",
+                HumanFmt::Size(kept),
+                partial.path.display()
+            );
         }
     }
 }
@@ -502,7 +681,7 @@ mod tests {
     fn fresh_download_under_quota_accepts() {
         let quota = CacheQuota::new(80, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(10), 0, "fresh-under")
+            .try_acquire(exact(10), 0, None, "fresh-under")
             .ok()
             .expect("fresh download under quota should be accepted");
         assert_eq!(quota.current_size(), 90);
@@ -514,7 +693,7 @@ mod tests {
     #[test]
     fn fresh_download_over_quota_rejects() {
         let quota = CacheQuota::new(100, Some(nz(100)));
-        let res = quota.try_acquire(exact(10), 0, "fresh-over");
+        let res = quota.try_acquire(exact(10), 0, None, "fresh-over");
         assert!(
             res.is_err(),
             "fresh download that would exceed quota must be rejected"
@@ -528,7 +707,7 @@ mod tests {
         // `>=`); one byte past it is refused.
         let quota = CacheQuota::new(90, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(10), 0, "fresh-at")
+            .try_acquire(exact(10), 0, None, "fresh-at")
             .ok()
             .expect("projected size equal to the quota must be accepted");
         assert_eq!(quota.current_size(), 100);
@@ -537,7 +716,7 @@ mod tests {
 
         let quota = CacheQuota::new(91, Some(nz(100)));
         assert!(
-            quota.try_acquire(exact(10), 0, "fresh-past").is_err(),
+            quota.try_acquire(exact(10), 0, None, "fresh-past").is_err(),
             "projected size one byte over the quota must be rejected"
         );
         assert_eq!(quota.current_size(), 91);
@@ -547,7 +726,7 @@ mod tests {
     fn overwrite_same_size_under_quota_accepts() {
         let quota = CacheQuota::new(80, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(10), 10, "overwrite-same")
+            .try_acquire(exact(10), 10, None, "overwrite-same")
             .ok()
             .expect("same-size overwrite under quota should be accepted");
         // Reserve adds 10, subtracts prev 10: net 0.
@@ -562,7 +741,7 @@ mod tests {
         // shrink it: `curr - prev + reserved = 110 - 20 + 5 = 95 <= 100`.
         let quota = CacheQuota::new(110, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(5), 20, "shrink-while-over")
+            .try_acquire(exact(5), 20, None, "shrink-while-over")
             .ok()
             .expect("smaller overwrite must be accepted to allow self-heal");
         assert_eq!(quota.current_size(), 95);
@@ -574,7 +753,7 @@ mod tests {
     fn overwrite_larger_that_would_push_over_rejects() {
         let quota = CacheQuota::new(80, Some(nz(100)));
         // 80 - 10 + 40 = 110 > 100 → reject.
-        let res = quota.try_acquire(exact(40), 10, "grow-over");
+        let res = quota.try_acquire(exact(40), 10, None, "grow-over");
         assert!(
             res.is_err(),
             "overwrite that would push past quota must be rejected"
@@ -586,7 +765,7 @@ mod tests {
     fn release_round_trip_finalize_exact() {
         let quota = CacheQuota::new(50, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(20), 5, "round-trip")
+            .try_acquire(exact(20), 5, None, "round-trip")
             .ok()
             .expect("must accept");
         // 50 - 5 + 20 = 65 in flight.
@@ -600,7 +779,7 @@ mod tests {
     fn release_round_trip_finalize_under_delivers() {
         let quota = CacheQuota::new(50, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(20), 0, "under-deliver")
+            .try_acquire(exact(20), 0, None, "under-deliver")
             .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), 70);
@@ -614,7 +793,7 @@ mod tests {
     fn release_round_trip_finalize_over_delivers() {
         let quota = CacheQuota::new(50, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(20), 0, "over-deliver")
+            .try_acquire(exact(20), 0, None, "over-deliver")
             .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), 70);
@@ -633,7 +812,7 @@ mod tests {
         let quota = CacheQuota::new(50, Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
-            .try_acquire(exact(30), 0, "abandoned")
+            .try_acquire(exact(30), 0, None, "abandoned")
             .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), 80);
@@ -649,7 +828,7 @@ mod tests {
     fn release_round_trip_drop_without_finalize_reverts() {
         let quota = CacheQuota::new(50, Some(nz(100)));
         let reservation = quota
-            .try_acquire(exact(20), 5, "drop-revert")
+            .try_acquire(exact(20), 5, None, "drop-revert")
             .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), 65);
@@ -662,7 +841,7 @@ mod tests {
     fn no_quota_configured_always_accepts() {
         let quota = CacheQuota::new(u64::MAX / 2, None);
         let reservation = quota
-            .try_acquire(exact(1_000), 0, "no-quota")
+            .try_acquire(exact(1_000), 0, None, "no-quota")
             .ok()
             .expect("must accept when quota is unconfigured");
         drop(reservation);
@@ -671,7 +850,7 @@ mod tests {
     #[test]
     fn cleanup_index_fetch_is_admitted_over_quota() {
         let quota = CacheQuota::new(100, Some(nz(100)));
-        let reservation = quota.acquire_for_cleanup(exact(10), 4, "Packages.xz");
+        let reservation = quota.acquire_for_cleanup(exact(10), 4, None, "Packages.xz");
         // Accounted like any other reservation: 100 - 4 + 10.
         assert_eq!(quota.current_size(), 106);
         reservation.finalize(10);
@@ -684,7 +863,7 @@ mod tests {
         // file still exists, the reservation holds 30 for the replacement.
         let quota = CacheQuota::new(80, Some(nz(1000)));
         let reservation = quota
-            .try_acquire(exact(30), 20, "index")
+            .try_acquire(exact(30), 20, None, "index")
             .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), 90);
@@ -701,7 +880,7 @@ mod tests {
     fn reconcile_shrinking_in_flight_overwrite_is_not_a_discrepancy() {
         let quota = CacheQuota::new(80, Some(nz(1000)));
         let reservation = quota
-            .try_acquire(exact(5), 20, "index")
+            .try_acquire(exact(5), 20, None, "index")
             .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), 65);
@@ -719,7 +898,7 @@ mod tests {
         // During the scan a 30-byte download commits after its directory was
         // walked: the scan reports 50, the accounted size is already 80.
         let reservation = quota
-            .try_acquire(exact(30), 0, "late")
+            .try_acquire(exact(30), 0, None, "late")
             .ok()
             .expect("must accept");
         reservation.finalize(30);
@@ -735,7 +914,7 @@ mod tests {
         let quota = CacheQuota::new(50, Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
-            .try_acquire(exact(30), 0, "early")
+            .try_acquire(exact(30), 0, None, "early")
             .ok()
             .expect("must accept");
         reservation.finalize(30);
@@ -750,7 +929,7 @@ mod tests {
         let quota = CacheQuota::new(50, Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
-            .try_acquire(exact(30), 0, "late")
+            .try_acquire(exact(30), 0, None, "late")
             .ok()
             .expect("must accept");
         reservation.finalize(30);
@@ -787,5 +966,189 @@ mod tests {
         let quota = CacheQuota::new(0, Some(nz(1000)));
         quota.record_startup_scan(123);
         assert_eq!(quota.current_size(), 123);
+    }
+
+    /// A partial path in a fresh temporary directory; nothing on disk yet.
+    fn partial_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x_1.0_amd64.deb.partial");
+        (dir, path)
+    }
+
+    fn write_len(path: &Path, len: usize) {
+        std::fs::write(path, vec![0u8; len]).expect("write partial");
+    }
+
+    #[test]
+    fn failed_download_keeps_what_its_partial_holds() {
+        let (_dir, path) = partial_path();
+        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let reservation = quota
+            .try_acquire(
+                exact(100),
+                0,
+                Some(ReservedPartial::new(path.clone(), 0)),
+                "kept",
+            )
+            .ok()
+            .expect("must accept");
+        assert_eq!(quota.current_size(), 150);
+        write_len(&path, 30);
+        drop(reservation);
+        assert_eq!(
+            quota.current_size(),
+            80,
+            "only the 70 unwritten bytes are reverted"
+        );
+    }
+
+    #[test]
+    fn failed_download_without_a_partial_on_disk_keeps_nothing() {
+        let (_dir, path) = partial_path();
+        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let reservation = quota
+            .try_acquire(exact(100), 0, Some(ReservedPartial::new(path, 0)), "none")
+            .ok()
+            .expect("must accept");
+        drop(reservation);
+        assert_eq!(quota.current_size(), 50);
+    }
+
+    #[test]
+    fn resume_adopts_the_kept_partial() {
+        // 50 bytes of cached files plus a kept 40-byte partial; resuming it to
+        // a 50-byte file only adds 10 bytes, which fits the quota exactly.
+        let (_dir, path) = partial_path();
+        write_len(&path, 40);
+        let quota = CacheQuota::new(90, Some(nz(100)));
+        let reservation = quota
+            .try_acquire(
+                exact(50),
+                0,
+                Some(ReservedPartial::new(path.clone(), 40)),
+                "resume",
+            )
+            .ok()
+            .expect("a resume adding 10 bytes fits");
+        assert_eq!(quota.current_size(), 100);
+        reservation.finalize(50);
+        assert_eq!(
+            quota.current_size(),
+            100,
+            "the partial became the cached file: counted once"
+        );
+
+        // The same resume failing after 5 more bytes keeps the 45-byte partial.
+        let quota = CacheQuota::new(90, Some(nz(100)));
+        let reservation = quota
+            .try_acquire(
+                exact(50),
+                0,
+                Some(ReservedPartial::new(path.clone(), 40)),
+                "resume",
+            )
+            .ok()
+            .expect("must accept");
+        write_len(&path, 45);
+        drop(reservation);
+        assert_eq!(quota.current_size(), 95);
+    }
+
+    #[test]
+    fn a_resume_is_admitted_by_its_remainder_only() {
+        let (_dir, path) = partial_path();
+        write_len(&path, 40);
+        let quota = CacheQuota::new(90, Some(nz(100)));
+        assert!(
+            quota
+                .try_acquire(exact(50), 0, None, "not-adopted")
+                .is_err(),
+            "without adoption the partial would be counted twice"
+        );
+    }
+
+    #[test]
+    fn removed_partial_releases_its_bytes() {
+        let quota = CacheQuota::new(80, Some(nz(1000)));
+        quota.release_removed_partial(30);
+        assert_eq!(quota.current_size(), 50);
+    }
+
+    #[test]
+    fn reconcile_counts_a_live_partial_at_any_fill_level() {
+        let (_dir, path) = partial_path();
+        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let reservation = quota
+            .try_acquire(exact(100), 0, Some(ReservedPartial::new(path, 0)), "live")
+            .ok()
+            .expect("must accept");
+        let window = quota.begin_reconcile_window();
+        // The scan walked the partial empty, 30 bytes in, or complete.
+        for scanned in [50, 80, 150] {
+            let r = quota.subtract_and_reconcile(0, scanned, window);
+            assert_eq!(r.difference, 0, "scanned {scanned}");
+            assert_eq!(r.inflight_unwritten, 100);
+        }
+        assert_eq!(quota.current_size(), 150);
+        // Beyond what any fill level explains is drift.
+        let r = quota.subtract_and_reconcile(0, 40, window);
+        assert_eq!(r.difference, 10);
+        drop(reservation);
+    }
+
+    #[test]
+    fn reconcile_tolerates_a_partial_kept_during_the_scan() {
+        let (_dir, path) = partial_path();
+        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let window = quota.begin_reconcile_window();
+        let reservation = quota
+            .try_acquire(
+                exact(100),
+                0,
+                Some(ReservedPartial::new(path.clone(), 0)),
+                "kept",
+            )
+            .ok()
+            .expect("must accept");
+        write_len(&path, 30);
+        drop(reservation);
+        assert_eq!(quota.current_size(), 80);
+        // The scan walked `tmp/` before the download wrote, or after it ended.
+        for scanned in [50, 80] {
+            let r = quota.subtract_and_reconcile(0, scanned, window);
+            assert_eq!(r.difference, 0, "scanned {scanned}");
+        }
+    }
+
+    #[test]
+    fn reconcile_tolerates_a_partial_commit_counted_twice() {
+        let (_dir, path) = partial_path();
+        let quota = CacheQuota::new(50, Some(nz(1000)));
+        let window = quota.begin_reconcile_window();
+        let reservation = quota
+            .try_acquire(exact(30), 0, Some(ReservedPartial::new(path, 0)), "moved")
+            .ok()
+            .expect("must accept");
+        reservation.finalize(30);
+        assert_eq!(quota.current_size(), 80);
+        // Neither copy seen, one of them, or the complete partial in `tmp/`
+        // before the rename and the final file after it.
+        for scanned in [50, 80, 110] {
+            let r = quota.subtract_and_reconcile(0, scanned, window);
+            assert_eq!(r.difference, 0, "scanned {scanned}");
+        }
+    }
+
+    #[test]
+    fn reconcile_tolerates_a_partial_removed_during_the_scan() {
+        // 30 of the 80 bytes are a kept partial a discarded resume unlinks.
+        let quota = CacheQuota::new(80, Some(nz(1000)));
+        let window = quota.begin_reconcile_window();
+        quota.release_removed_partial(30);
+        for scanned in [50, 80] {
+            let r = quota.subtract_and_reconcile(0, scanned, window);
+            assert_eq!(r.difference, 0, "scanned {scanned}");
+        }
+        assert_eq!(quota.current_size(), 50);
     }
 }

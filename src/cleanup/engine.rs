@@ -82,6 +82,8 @@ pub(super) struct CleanupDone {
     /// Subset of `files_removed` reclaimed as unreferenced-but-covered by-hash
     /// files; surfaced by the orchestrator as `CLEANUP_BYHASH_UNREFERENCED`.
     pub(super) removed_unreferenced: u64,
+    /// See [`UnitStats::tmp_bytes_removed`].
+    pub(super) tmp_bytes_removed: u64,
 }
 
 impl CleanupDone {
@@ -94,6 +96,7 @@ impl CleanupDone {
             removed,
             bytes_removed,
             removed_unreferenced,
+            tmp_bytes_removed,
         } = stats;
         Self {
             mirror,
@@ -101,6 +104,7 @@ impl CleanupDone {
             files_removed: removed,
             bytes_removed,
             removed_unreferenced,
+            tmp_bytes_removed,
         }
     }
 }
@@ -121,6 +125,11 @@ pub(super) struct UnitStats {
     /// summed by [`run_mirror_units`] into `CleanupDone::removed_unreferenced`
     /// and surfaced as `CLEANUP_BYHASH_UNREFERENCED` by the orchestrator.
     pub removed_unreferenced: u64,
+    /// Bytes of the regular files a `tmp/` reap unlinked (kept partials and
+    /// foreign files). The quota counts them like cached files, so the
+    /// reconcile subtracts them, but they are not cache evictions: kept out
+    /// of `removed`/`bytes_removed` and the metrics fed from those.
+    pub tmp_bytes_removed: u64,
 }
 
 impl UnitStats {
@@ -143,11 +152,13 @@ impl UnitStats {
             removed,
             bytes_removed,
             removed_unreferenced,
+            tmp_bytes_removed,
         } = unit;
         self.scanned += scanned;
         self.removed += removed;
         self.bytes_removed += bytes_removed;
         self.removed_unreferenced += removed_unreferenced;
+        self.tmp_bytes_removed += tmp_bytes_removed;
     }
 
     /// Account one checksum-mismatch eviction performed during a reduce.
@@ -462,22 +473,28 @@ async fn run_unit(unit: &CleanupUnit, ctx: &MirrorCtx<'_>) -> Result<UnitStats, 
 /// the structured tree, one for the flat tree — see `model::classify_mirror`).
 ///
 /// Delegates to [`cleanup_tmp_dir`] for the actual sweep and logs its count.
-/// That count is deliberately NOT returned in [`UnitStats`] — partial-download
-/// scratch files are not cached content, so they must not inflate
-/// `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED` or the quota reconcile.
+/// Only the reaped bytes reach [`UnitStats`], as `tmp_bytes_removed`: the
+/// quota counts kept partials, so the reconcile must subtract them, but
+/// partial-download scratch files are not cached content and must not
+/// inflate `CLEANUP_EVICTIONS`/`CLEANUP_BYTES_RECLAIMED`.
 async fn run_partials_unit(unit: &PartialsUnit, ctx: &MirrorCtx<'_>) -> UnitStats {
     let mirror = ctx.mirror;
 
-    let removed = cleanup_tmp_dir(&unit.root, ctx.now, unit.span).await;
+    let reaped = cleanup_tmp_dir(&unit.root, ctx.now, unit.span).await;
 
-    if removed > 0 {
+    if reaped.entries > 0 {
         info!(
-            "Removed {removed} stale tmp entries for mirror {mirror} in `{}`",
+            "Removed {} stale tmp entries ({}) for mirror {mirror} in `{}`",
+            reaped.entries,
+            HumanFmt::Size(reaped.bytes),
             unit.root.display()
         );
     }
 
-    UnitStats::default()
+    UnitStats {
+        tmp_bytes_removed: reaped.bytes,
+        ..UnitStats::default()
+    }
 }
 
 /// Age out stale index metadata for a [`MetadataUnit`]: a direct
@@ -514,6 +531,7 @@ async fn run_metadata_unit(unit: &MetadataUnit, ctx: &MirrorCtx<'_>) -> UnitStat
         removed: swept.files_removed,
         bytes_removed: swept.bytes_removed,
         removed_unreferenced: 0,
+        tmp_bytes_removed: 0,
     }
 }
 
@@ -599,6 +617,7 @@ async fn run_byhash_unit(
         removed: outcome.removed,
         bytes_removed: outcome.bytes_removed,
         removed_unreferenced: outcome.removed_unreferenced,
+        tmp_bytes_removed: 0,
     })
 }
 
@@ -741,6 +760,7 @@ async fn run_reconcile_unit(
         removed: 0,
         bytes_removed: 0,
         removed_unreferenced: 0,
+        tmp_bytes_removed: 0,
     };
 
     let ctx = ReconcileCtx {

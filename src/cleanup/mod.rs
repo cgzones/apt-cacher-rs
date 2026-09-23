@@ -313,6 +313,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
     let mut files_removed = 0;
     let mut bytes_removed = 0;
     let mut removed_unreferenced = 0;
+    let mut tmp_bytes_removed = 0;
 
     for res in results {
         // A unit's hard error is logged and swallowed inside `run_mirror_units`,
@@ -345,6 +346,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
         files_removed += cleanup_result.files_removed;
         bytes_removed += cleanup_result.bytes_removed;
         removed_unreferenced += cleanup_result.removed_unreferenced;
+        tmp_bytes_removed += cleanup_result.tmp_bytes_removed;
     }
 
     // The window snapshot must precede the scan: commits landing while the
@@ -355,11 +357,16 @@ async fn task_cleanup_impl(appstate: &AppState) {
     match task_cache_scan(&appstate.database).await {
         Ok(scanned) => {
             let actual_cache_size = scanned.bytes;
-            let reconciled = quota.subtract_and_reconcile(bytes_removed, actual_cache_size, window);
+            // Reaped `tmp/` files were accounted like cached ones.
+            let reconciled = quota.subtract_and_reconcile(
+                bytes_removed.saturating_add(tmp_bytes_removed),
+                actual_cache_size,
+                window,
+            );
 
             if reconciled.difference != 0 {
                 warn!(
-                    "Repaired cache size discrepancy of {}: actual={} ({} files) stored={} expected={} corrected={} committed during scan=+{}/-{}",
+                    "Repaired cache size discrepancy of {}: actual={} ({} files) stored={} expected={} corrected={} committed during scan=+{}/-{} unwritten in-flight partials={}",
                     HumanFmt::Size(reconciled.difference),
                     HumanFmt::Size(actual_cache_size),
                     scanned.files,
@@ -367,16 +374,18 @@ async fn task_cleanup_impl(appstate: &AppState) {
                     HumanFmt::Size(reconciled.expected),
                     HumanFmt::Size(reconciled.corrected),
                     HumanFmt::Size(reconciled.grown_during_scan),
-                    HumanFmt::Size(reconciled.shrunk_during_scan)
+                    HumanFmt::Size(reconciled.shrunk_during_scan),
+                    HumanFmt::Size(reconciled.inflight_unwritten)
                 );
             } else {
                 debug!(
-                    "actual cache size: {actual_cache_size} in {} files; stored cache size: {}; expected: {}; committed during scan: +{}/-{}",
+                    "actual cache size: {actual_cache_size} in {} files; stored cache size: {}; expected: {}; committed during scan: +{}/-{}; unwritten in-flight partials: {}",
                     scanned.files,
                     reconciled.stored,
                     reconciled.expected,
                     reconciled.grown_during_scan,
-                    reconciled.shrunk_during_scan
+                    reconciled.shrunk_during_scan,
+                    reconciled.inflight_unwritten
                 );
             }
         }

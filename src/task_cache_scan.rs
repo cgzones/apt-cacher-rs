@@ -6,8 +6,11 @@
 //! the shared [`Walker`]; this module supplies only the layout knowledge:
 //! what a directory means at each depth ([`Level`]), which subtrees belong to
 //! a *different* mirror row ([`derive_nested_paths`], shared with cleanup so
-//! both agree on where a mirror's tree ends) and which are partial-download
-//! scratch space (`tmp/`), reaped by cleanup rather than tallied here.
+//! both agree on where a mirror's tree ends) and which hold partial
+//! downloads (`tmp/`). Those are tallied like cached files: `cache_quota`
+//! counts the kept partials a failed download leaves behind, which cleanup
+//! reaps only once they age out. The cache root's own `tmp/` (volatile
+//! scratch files, purged at startup) is not counted.
 //!
 //! The scan only counts.  Anything the layout does not allow is reported
 //! through `Entry::report_unexpected` and left on disk.
@@ -69,17 +72,21 @@ impl std::ops::AddAssign for ScanTotals {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Level {
     /// `<host>/<mirror_path>/`: tally every regular file (warning about
-    /// non-deb ones), dispatch `dists/` to [`Level::Structured`], skip
-    /// `tmp/` and nested-mirror directories, warn on anything else.
+    /// non-deb ones), dispatch `dists/` to [`Level::Structured`] and `tmp/`
+    /// to [`Level::Tmp`], skip nested-mirror directories, warn on anything
+    /// else.
     Mirror,
     /// `dists/`-style: tally files, dispatch a `by-hash/` subdir to
     /// [`Level::ByHash`], warn on any other directory.
     Structured,
-    /// Host-level `flat/` subtree: tally files, dispatch `by-hash/`, skip
+    /// Host-level `flat/` subtree: tally files, dispatch `by-hash/` and
     /// `tmp/`, recurse into every other directory (URL-path verbatim).
     Flat,
     /// Content-addressed leaf: tally files only; subdirs are unexpected.
     ByHash,
+    /// Partial-download directory: tally files (the `.partial`s, and any
+    /// foreign file until cleanup reaps it); subdirs are unexpected.
+    Tmp,
 }
 
 /// The mirror rows sharing one `{host[:port]}` cache directory, keyed by that
@@ -303,8 +310,8 @@ async fn scan_mirror_dir(
 }
 
 /// Walk one tree tallying regular-file sizes; the [`Level`] tag decides,
-/// per directory, which subdirectories are descended into (`dists/`,
-/// `by-hash/`, every flat URL-dir), skipped (`tmp/`, nested mirrors), or
+/// per directory, which subdirectories are descended into (`dists/`, `tmp/`,
+/// `by-hash/`, every flat URL-dir), skipped (nested mirrors), or
 /// reported as unexpected.  `mirror_path` / `nested` only matter at
 /// [`Level::Mirror`].
 ///
@@ -344,9 +351,9 @@ async fn scan_tree(
             }
             EntryKind::Dir => match entry.tag() {
                 Level::Mirror => {
-                    // Recognized mirror-level layout subdir (`dists/`) gets
-                    // its size tallied; `tmp/` is skipped (partial-download
-                    // scratch space).  A subdir that is itself a registered
+                    // Recognized mirror-level layout subdirs get their size
+                    // tallied: `dists/` and the partial downloads in `tmp/`.
+                    // A subdir that is itself a registered
                     // mirror path under the same host (e.g. `debian/security`
                     // when scanning `debian`) is silently skipped — it'll be
                     // walked under its own mirror row.  Flat repositories
@@ -357,7 +364,9 @@ async fn scan_tree(
                         .any(|known| entry.name() == *known)
                     {
                         entry.descend(Level::Structured);
-                    } else if entry.name() != SUBDIR_TMP {
+                    } else if entry.name() == SUBDIR_TMP {
+                        entry.descend(Level::Tmp);
+                    } else {
                         classify_mirror_subdir(&entry, mirror_path, nested);
                     }
                 }
@@ -366,14 +375,13 @@ async fn scan_tree(
                 }
                 // Inside the host-level `flat/` subtree, any directory is a
                 // nested URL-dir under a flat repo (the URL path becomes the
-                // on-disk path verbatim) and is recursed into.  `tmp/` is
-                // the partial-download scratch space (flat partials land at
-                // `<host>/flat/<mirror_path>/tmp/`) and is owned by
-                // `cleanup_tmp_dir`, so it is skipped here to avoid
-                // inflating cache-size accounting with short-lived partials.
-                Level::Flat if entry.name() == SUBDIR_TMP => {}
+                // on-disk path verbatim) and is recursed into.  `tmp/` holds
+                // the flat partial downloads (they land at
+                // `<host>/flat/<mirror_path>/tmp/`), tallied like the
+                // structured ones.
+                Level::Flat if entry.name() == SUBDIR_TMP => entry.descend(Level::Tmp),
                 Level::Flat => entry.descend(Level::Flat),
-                Level::Structured | Level::ByHash => entry
+                Level::Structured | Level::ByHash | Level::Tmp => entry
                     .report_unexpected("not counting it or its contents towards the cache size"),
             },
         }
@@ -407,5 +415,31 @@ fn classify_mirror_subdir(entry: &Entry<'_, Level>, mirror_path: &str, nested: &
         NestedMirrorRelation::Unrelated => {
             entry.report_unexpected("not counting it or its contents towards the cache size");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Kept partials are disk usage the quota counts, so the scan tallies
+    /// the `tmp/` below a mirror and the ones inside the flat tree.
+    #[tokio::test]
+    async fn scan_tallies_the_partials_in_tmp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mirror = dir.path().join("debian");
+        std::fs::create_dir_all(mirror.join("tmp")).expect("mkdir");
+        std::fs::write(mirror.join("foo_1.0_amd64.deb"), b"12345").expect("deb");
+        std::fs::write(mirror.join("tmp/bar_1.0_amd64.deb.partial"), b"123").expect("partial");
+        let (_outcome, totals) =
+            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
+        assert_eq!((totals.bytes, totals.files), (8, 2));
+
+        let flat = dir.path().join("flat");
+        std::fs::create_dir_all(flat.join("repo/tmp")).expect("mkdir");
+        std::fs::write(flat.join("repo/Packages"), b"12").expect("index");
+        std::fs::write(flat.join("repo/tmp/x_1_all.deb.partial"), b"1234").expect("partial");
+        let (_outcome, totals) = scan_tree(&flat, &FLAT_WALK, Level::Flat, "", &[]).await;
+        assert_eq!((totals.bytes, totals.files), (6, 2));
     }
 }

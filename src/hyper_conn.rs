@@ -2124,12 +2124,14 @@ async fn serve_new_file_worker(
         global_cache_quota().acquire_for_cleanup(
             total_content_length,
             prev_file_size,
+            partial.reserved_partial(resume_offset),
             &conn_details.debname,
         )
     } else {
         match global_cache_quota().try_acquire(
             total_content_length,
             prev_file_size,
+            partial.reserved_partial(resume_offset),
             &conn_details.debname,
         ) {
             Ok(r) => r,

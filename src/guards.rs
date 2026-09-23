@@ -383,6 +383,12 @@ impl Drop for InitBarrier {
 }
 
 struct DownloadBarrierData {
+    /// Minted only by `CacheQuota::try_acquire`, so holding a barrier proves
+    /// the quota was checked; `commit` finalises it, `Drop` reverts it.
+    /// Declared (so dropped) before `lease`: an unfinalised reservation keeps
+    /// what the partial holds, which it reads while the lease still keeps
+    /// every other writer off the path.
+    quota_reservation: QuotaReservation,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     lease: Arc<DownloadWriteLease>,
     /// The download's `max_upstream_downloads` slot, held until
@@ -393,9 +399,6 @@ struct DownloadBarrierData {
     resource_kind: ResourceKind,
     raw_uri_path: String,
     tx: tokio::sync::watch::Sender<()>,
-    /// Minted only by `CacheQuota::try_acquire`, so holding a barrier proves
-    /// the quota was checked; `commit` finalises it, `Drop` reverts it.
-    quota_reservation: QuotaReservation,
     /// Single-owner via `&mut DownloadBarrier`; no atomic needed.
     bytes_since_ping: u64,
     /// Whether any ping was sent yet — the first one is unbatched.
@@ -617,14 +620,15 @@ impl Drop for FailedDownload {
 }
 
 struct RenameBarrierData {
+    /// `Some` until `commit` hands it to `integrity::verify_and_rename`,
+    /// which finalises it in the rename step; `None` only for the rest of
+    /// that one `commit` call. Reverted by drop on every other path, before
+    /// `lease` (see `DownloadBarrierData::quota_reservation`).
+    quota_reservation: Option<QuotaReservation>,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     lease: Arc<DownloadWriteLease>,
     resource_kind: ResourceKind,
     raw_uri_path: String,
-    /// `Some` until `commit` hands it to `integrity::verify_and_rename`,
-    /// which finalises it in the rename step; `None` only for the rest of
-    /// that one `commit` call. Reverted by drop on every other path.
-    quota_reservation: Option<QuotaReservation>,
 }
 
 #[must_use]
@@ -858,25 +862,12 @@ impl RenameBarrier {
 /// Known-bad bytes cannot be resumed. The blocking unlink owns the registry
 /// lease so cancellation cannot admit a new writer at the same partial path
 /// while that unlink is still queued. Open readers keep their inode as usual.
+/// The reservation already kept the partial's bytes when it dropped, and the
+/// unlink releases them again.
 async fn discard_partial(temp_path: TempPath, lease: Arc<DownloadWriteLease>) {
     lease
         .spawn_blocking(move |_lease| {
-            let path = TempPath::defuse(temp_path);
-            if let Err(err) = std::fs::remove_file(&path) {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    warn!(
-                        "Failed to remove partial file `{}`; continuing without it:  {}",
-                        path.display(),
-                        ErrorReport(&err)
-                    );
-                } else {
-                    error!(
-                        "Failed to remove partial file `{}`; it stays on disk:  {}",
-                        path.display(),
-                        ErrorReport(&err)
-                    );
-                }
-            }
+            temp_path.remove_blocking();
         })
         .await
         .expect("partial removal should not panic");
@@ -1009,7 +1000,7 @@ mod tests {
             if download {
                 let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
                 let quota = crate::cache_quota::CacheQuota::new(0, None)
-                    .try_acquire(length, 0, &key.debname)
+                    .try_acquire(length, 0, None, &key.debname)
                     .ok()
                     .expect("unlimited quota");
                 let mut transition = Box::pin(barrier.download(
@@ -1249,7 +1240,7 @@ mod tests {
         let details = details_for(key);
         let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
         let quota = crate::cache_quota::CacheQuota::new(0, None)
-            .try_acquire(length, 0, &key.debname)
+            .try_acquire(length, 0, None, &key.debname)
             .ok()
             .expect("unlimited quota");
         InitBarrier::new(
@@ -1378,7 +1369,7 @@ mod tests {
         let identity = Arc::clone(&init.key);
         let length = ContentLength::Exact(std::num::NonZero::new(1024).unwrap());
         let quota = CacheQuota::new(0, None)
-            .try_acquire(length, 0, &key.debname)
+            .try_acquire(length, 0, None, &key.debname)
             .ok()
             .expect("unlimited quota");
         let (_settled, download) = init

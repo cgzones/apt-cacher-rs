@@ -813,7 +813,8 @@ pub(crate) struct Config {
     /// Number of stored error and warning log messages.
     pub(crate) logstore_capacity: NonZero<usize>,
 
-    /// Disk quota (in bytes) for cache.
+    /// Disk quota (in bytes) for cache: the cached files plus the partial
+    /// downloads kept for a later resume.
     #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
