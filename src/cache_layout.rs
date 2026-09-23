@@ -40,7 +40,11 @@
 //! `mirror_path`.  The joined fields therefore never hold a `_` of their
 //! own: such a request is relayed uncached
 //! ([`ClassifyError::JoinedFieldUnderscore`]), or `sid_main` + `x` and
-//! `sid` + `main_x` would name one file.
+//! `sid` + `main_x` would name one file.  For the same reason a `Packages`
+//! index is cached only under `binary-<arch>` or a pseudo-architecture
+//! ([`ClassifyError::PackagesOutsideArchitecture`]): its directory sits
+//! where a component-scoped index's filename does, so `Translation-en` +
+//! `Packages` would name the Translation file `Translation-en_Packages`.
 //!
 //! `ByHash` keys on the digest alone, but still carries the
 //! `dists/<dist>/<comp>/<arch>/` scope it was fetched under: an
@@ -72,8 +76,9 @@ use crate::{
     database_task::{DatabaseCommand, send_db_command_nonblocking},
     deb_mirror::{
         ByHashScope, FlatKind, Mirror, MirrorKind, Origin, OriginFields, OriginSighting,
-        ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, valid_architecture,
-        valid_component, valid_directory, valid_distribution, valid_filename, valid_mirrorname,
+        ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, is_packages_directory,
+        valid_architecture, valid_component, valid_directory, valid_distribution, valid_filename,
+        valid_mirrorname,
     },
     index_parser::HashAlgo,
     partial_file::PARTIAL_SUFFIX,
@@ -637,6 +642,15 @@ pub(crate) enum ClassifyError<'a> {
         kind: ValidateKind,
         decoded: Cow<'a, str>,
     },
+    /// A `Packages` index under a directory that is neither `binary-<arch>`
+    /// nor a pseudo-architecture ([`is_packages_directory`]).  Its cache
+    /// name joins that directory where a component-scoped index joins its
+    /// filename, so `dists/sid/main/Translation-en/Packages` would share
+    /// `sid_main_Translation-en_Packages` with the Translation file
+    /// `dists/sid/main/i18n/Translation-en_Packages`.  Relayed uncached like
+    /// [`Self::JoinedFieldUnderscore`]; no archive puts a `Packages` index
+    /// anywhere else.
+    PackagesOutsideArchitecture { architecture: Cow<'a, str> },
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +859,10 @@ pub(crate) fn classify_request<'a>(
             trace!(
                 "Decoded mirror path: `{mirror_path}`; Decoded distribution: `{distribution}`; Decoded component: `{component}`; Decoded architecture: `{architecture}`; Decoded filename: `{filename}` (client {client})"
             );
+
+            if !is_packages_directory(&architecture) {
+                return Err(ClassifyError::PackagesOutsideArchitecture { architecture });
+            }
 
             let debname = dists_debname(&distribution, &component, &architecture, &filename);
 
@@ -1553,6 +1571,60 @@ mod tests {
             parse_request_path("debian/dists/sid/main/i18n/Translation-en_GB.xz").expect("parses");
         let class = classify_request(&res, &local_client()).expect("classifies");
         assert_eq!(class.debname, "sid_main_Translation-en_GB.xz");
+    }
+
+    /// Regression (cache-name collision): a `Packages` index joins its
+    /// directory into the cache name the way a component-scoped index joins
+    /// its filename, so a directory spelled like a Translation or icons
+    /// filename collided with one: `dists/sid/main/Translation-en/Packages`
+    /// and `dists/sid/main/i18n/Translation-en_Packages` both named
+    /// `sid_main_Translation-en_Packages`.  Only `binary-<arch>` and the
+    /// pseudo-architectures may hold a cached `Packages` index.
+    #[test]
+    fn classify_refuses_to_cache_a_packages_index_outside_an_architecture() {
+        for (path, field) in [
+            (
+                "debian/dists/sid/main/Translation-en/Packages",
+                "Translation-en",
+            ),
+            (
+                "debian/dists/sid/main/icons-64x64/Packages.gz",
+                "icons-64x64",
+            ),
+            // Decoded before the check, like every other field.
+            (
+                "debian/dists/sid/main/%54ranslation-en/Packages.xz",
+                "Translation-en",
+            ),
+            ("ubuntu/dists/noble/main/cnf/Packages", "cnf"),
+            ("debian/dists/sid/main/binary-/Packages", "binary-"),
+        ] {
+            let res = parse_request_path(path).expect("parses");
+            let err = classify_request(&res, &local_client()).expect_err(path);
+            assert!(
+                matches!(
+                    &err,
+                    ClassifyError::PackagesOutsideArchitecture { architecture }
+                        if architecture == field
+                ),
+                "{path}: expected a `{field}` refusal, got {err:?}"
+            );
+        }
+
+        // The Translation file the first path collided with still caches.
+        let res = parse_request_path("debian/dists/sid/main/i18n/Translation-en_Packages")
+            .expect("parses");
+        let class = classify_request(&res, &local_client()).expect("classifies");
+        assert_eq!(class.debname, "sid_main_Translation-en_Packages");
+        assert_eq!(class.resource_kind, ResourceKind::Translation);
+
+        for arch in ["binary-amd64", "binary-all", "dep11", "i18n", "source"] {
+            let path = format!("debian/dists/sid/main/{arch}/Packages.xz");
+            let res = parse_request_path(&path).expect("parses");
+            let class = classify_request(&res, &local_client()).expect(&path);
+            assert_eq!(class.debname, format!("sid_main_{arch}_Packages.xz"));
+            assert_eq!(class.resource_kind, ResourceKind::Packages);
+        }
     }
 
     #[test]

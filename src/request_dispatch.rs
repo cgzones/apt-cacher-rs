@@ -415,6 +415,11 @@ pub(crate) enum PassthroughReason {
     /// `dists/` cache names use as their field separator (see
     /// [`ClassifyError::JoinedFieldUnderscore`]).
     JoinedFieldUnderscore,
+    /// A `Packages` index under a directory that is neither `binary-<arch>`
+    /// nor a pseudo-architecture, whose cache name could spell a
+    /// component-scoped index's (see
+    /// [`ClassifyError::PackagesOutsideArchitecture`]).
+    PackagesOutsideArchitecture,
     /// Every field is valid, but the cache name they join into is longer
     /// than [`MAX_DEBNAME_LEN`], so the cache file could not be created.
     NameTooLong,
@@ -430,6 +435,7 @@ impl PassthroughReason {
             Self::FlatBlocked => "flat host blocked by structured collision",
             Self::QueryString => "query string on a cacheable path",
             Self::JoinedFieldUnderscore => "`_` in a distribution, component or architecture",
+            Self::PackagesOutsideArchitecture => "Packages index outside an architecture directory",
             Self::NameTooLong => "cache name too long",
         }
     }
@@ -676,6 +682,13 @@ fn decide_request(
                     decoded.escape_debug()
                 );
                 PassthroughReason::JoinedFieldUnderscore
+            }
+            Err(ClassifyError::PackagesOutsideArchitecture { architecture }) => {
+                warn_once_or_info!(
+                    "Uncacheable Packages index under `{}` from client {client} (outside an architecture directory); forwarding it upstream uncached",
+                    architecture.escape_debug()
+                );
+                PassthroughReason::PackagesOutsideArchitecture
             }
             Err(ClassifyError::NonDebPool { filename }) => {
                 warn_once_or_info!(
@@ -1216,6 +1229,30 @@ mod tests {
                 }
             ),
             "expected JoinedFieldUnderscore passthrough, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_packages_index_outside_an_architecture() {
+        let decision = decide_request(
+            "/debian/dists/sid/main/Translation-en/Packages",
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        assert!(
+            matches!(
+                decision,
+                Decision::Passthrough {
+                    reason: PassthroughReason::PackagesOutsideArchitecture,
+                    ..
+                }
+            ),
+            "expected PackagesOutsideArchitecture passthrough, got {decision:?}"
         );
     }
 

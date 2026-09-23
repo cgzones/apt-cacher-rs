@@ -237,6 +237,26 @@ pub(crate) fn is_binary_arch(arch: &str) -> bool {
         .is_some_and(|arch| !arch.is_empty())
 }
 
+/// The metadata trees sitting at the `binary-<arch>` depth of
+/// `dists/<dist>/<comp>/`, which hold no `Packages` index of their own and
+/// therefore mint no origin.
+const PSEUDO_ARCHITECTURES: &[&str] = &["dep11", "i18n", "source"];
+
+/// Whether a `Packages` index under the `dists/<dist>/<comp>/<slot>/`
+/// directory `slot` may be cached: a real architecture ([`is_binary_arch`])
+/// or one of the [`PSEUDO_ARCHITECTURES`].
+///
+/// An allowlist because the slot joins the cache name
+/// (`{dist}_{comp}_{slot}_{filename}`) exactly where a component-scoped
+/// index joins its filename (`{dist}_{comp}_{filename}`): a slot spelled
+/// like a Translation or icons filename (`Translation-en`) would name the
+/// same cache file as `i18n/Translation-en_Packages`.  Neither allowed form
+/// can begin such a filename.
+#[must_use]
+pub(crate) fn is_packages_directory(slot: &str) -> bool {
+    is_binary_arch(slot) || PSEUDO_ARCHITECTURES.contains(&slot)
+}
+
 impl Origin {
     /// The [`Origin`] a request for `path` on `host`/`port` would register
     /// if it were cached: `path` is parsed, normalised, percent-decoded and
