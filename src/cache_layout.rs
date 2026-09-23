@@ -106,8 +106,10 @@ pub(crate) enum CachedFlavor {
 /// picks a verification strategy by it and decides whether to ingest the file
 /// as an index, which `(flavor, layout)` cannot tell (`Packages` vs any other
 /// `Dists`/`Volatile` metadata).  The two by-hash kinds carry the algorithm
-/// the parser validated for their `by-hash/<ALGO>/` directory, so the
-/// verifier never re-reads it from the request path.  Populated by
+/// the parser validated for their `by-hash/<ALGO>/` directory and what the
+/// directory holding that `by-hash/` says about the object
+/// ([`ByHashContent`]), so neither the verifier nor the ingest re-reads the
+/// request path.  Populated by
 /// [`classify_request`]'s
 /// exhaustive match, so a new `ResourceFile` variant compile-errors the
 /// classifier (the existing safety net) and forces a decision here too.
@@ -128,13 +130,43 @@ pub(crate) enum ResourceKind {
     /// `dists/.../dep11/icons-*` / component metadata.
     Icon,
     /// Structured content-addressed `dists/.../by-hash/SHA*/<hex>`.
-    ByHash(HashAlgo),
+    ByHash(HashAlgo, ByHashContent),
     /// Flat-repository metadata file (`Packages*`, `Release`, ...).
     FlatMetadata,
     /// Flat-repository `.deb` pool file.
     FlatPool,
     /// Flat-repository content-addressed `by-hash/SHA*/<hex>`.
-    FlatByHash(HashAlgo),
+    FlatByHash(HashAlgo, ByHashContent),
+}
+
+/// What a content-addressed object may be, judged by the directory its
+/// validated `by-hash/` hangs in: `dists/sid/main/binary-amd64/by-hash/...`
+/// holds the digests of that directory's `Packages*` files, while `dep11`,
+/// `i18n`, a component-level `by-hash/` or `Packages.diff/` hold other
+/// indexes.  Decided once by [`classify_request`] from the parsed, decoded
+/// directory; a re-scan of the raw path could stop at a decoy `by-hash/`
+/// segment in front of the validated one and answer differently.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ByHashContent {
+    /// Under `binary-<arch>` or `source`: may be a `Packages` (or `Sources`)
+    /// index, which the ingest sniffs.  (`Sources` parses like `Packages`;
+    /// its stanzas carry no `Filename:` line, so it registers nothing.)
+    MaybePackages,
+    /// Anything else.
+    Other,
+}
+
+impl ByHashContent {
+    /// The verdict for an object whose `by-hash/` sits in the decoded
+    /// directory `dir` (`None` for one directly under `dists/` or a flat
+    /// repository's base).
+    #[must_use]
+    fn of_directory(dir: Option<&str>) -> Self {
+        match dir {
+            Some(dir) if is_binary_arch(dir) || dir == "source" => Self::MaybePackages,
+            Some(_) | None => Self::Other,
+        }
+    }
 }
 
 impl ResourceKind {
@@ -145,7 +177,7 @@ impl ResourceKind {
     #[must_use]
     pub(crate) const fn cached_flavor(self) -> CachedFlavor {
         match self {
-            Self::Pool | Self::ByHash(_) | Self::FlatPool | Self::FlatByHash(_) => {
+            Self::Pool | Self::ByHash(..) | Self::FlatPool | Self::FlatByHash(..) => {
                 CachedFlavor::Permanent
             }
             Self::Release
@@ -170,9 +202,9 @@ impl ResourceKind {
             | Self::Sources
             | Self::Translation
             | Self::Icon => CacheLayout::Dists,
-            Self::ByHash(_) => CacheLayout::DistsByHash,
+            Self::ByHash(..) => CacheLayout::DistsByHash,
             Self::FlatMetadata | Self::FlatPool => CacheLayout::Flat,
-            Self::FlatByHash(_) => CacheLayout::FlatByHash,
+            Self::FlatByHash(..) => CacheLayout::FlatByHash,
         }
     }
 }
@@ -743,7 +775,7 @@ pub(crate) fn classify_request<'a>(
             // validated here because it reaches the upstream, the database
             // and cleanup's index-fetch URLs.  A run of any other depth
             // reaches only the upstream, and is validated just the same.
-            let origin_fields = if let Some(ByHashScope {
+            let (origin_fields, content) = if let Some(ByHashScope {
                 distribution,
                 component,
                 architecture,
@@ -752,11 +784,12 @@ pub(crate) fn classify_request<'a>(
                 let distribution = decode_validate(distribution, ValidateKind::Distribution)?;
                 let component = decode_validate(component, ValidateKind::Component)?;
                 let architecture = decode_validate(architecture, ValidateKind::Architecture)?;
+                let content = ByHashContent::of_directory(Some(&architecture));
 
                 // Only `binary-<arch>` is a real architecture; the metadata
                 // trees sharing its depth (`dep11`, `i18n`, `source`,
                 // Ubuntu's `cnf`) map to no origin.
-                if is_binary_arch(&architecture) {
+                let origin_fields = if is_binary_arch(&architecture) {
                     Some(OriginFields {
                         distribution: distribution.into_owned(),
                         component: component.into_owned(),
@@ -764,16 +797,17 @@ pub(crate) fn classify_request<'a>(
                     })
                 } else {
                     None
-                }
+                };
+                (origin_fields, content)
             } else {
-                validate_directories(dirs)?;
-                None
+                let innermost = validate_directories(dirs)?;
+                (None, ByHashContent::of_directory(innermost.as_deref()))
             };
 
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: filename.into_owned(),
-                resource_kind: ResourceKind::ByHash(*algorithm),
+                resource_kind: ResourceKind::ByHash(*algorithm, content),
                 origin_fields,
             })
         }
@@ -914,7 +948,11 @@ pub(crate) fn classify_request<'a>(
                     }
                     ResourceKind::FlatPool
                 }
-                FlatKind::ByHash(algorithm) => ResourceKind::FlatByHash(*algorithm),
+                // The `by-hash/` hangs in the flat base itself.
+                FlatKind::ByHash(algorithm) => ResourceKind::FlatByHash(
+                    *algorithm,
+                    ByHashContent::of_directory(mirror_path.rsplit('/').next()),
+                ),
             };
 
             Ok(RequestClass {
@@ -959,14 +997,16 @@ fn classify_component_scoped<'a>(
 /// forwarded upstream but no part of the cache name (the `dirs` of
 /// [`ResourceFile::Pool`] and [`ResourceFile::ByHash`]).  Per segment, so an
 /// encoded `%2F` stays inside the segment it was sent in and fails there.
-fn validate_directories(dirs: &str) -> Result<(), ClassifyError<'_>> {
+/// Returns the decoded innermost segment, `None` for an empty run.
+fn validate_directories(dirs: &str) -> Result<Option<Cow<'_, str>>, ClassifyError<'_>> {
     if dirs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
+    let mut innermost = None;
     for segment in dirs.split('/') {
-        decode_validate(segment, ValidateKind::Directory)?;
+        innermost = Some(decode_validate(segment, ValidateKind::Directory)?);
     }
-    Ok(())
+    Ok(innermost)
 }
 
 /// URL-decode `raw` and check the result with the validator selected by
@@ -1098,7 +1138,10 @@ mod tests {
             class.debname,
             "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
         );
-        assert_eq!(class.resource_kind, ResourceKind::ByHash(HashAlgo::Sha256));
+        assert_eq!(
+            class.resource_kind,
+            ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other)
+        );
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
         assert_eq!(class.resource_kind.layout(), CacheLayout::DistsByHash);
     }
@@ -1143,9 +1186,11 @@ mod tests {
         ] {
             let res = parse_request_path(path).expect("by-hash path parses");
             let class = classify_request(&res, &local_client()).unwrap();
-            assert_eq!(
-                class.resource_kind,
-                ResourceKind::ByHash(HashAlgo::Sha256),
+            assert!(
+                matches!(
+                    class.resource_kind,
+                    ResourceKind::ByHash(HashAlgo::Sha256, _)
+                ),
                 "{path}"
             );
             assert!(class.origin_fields.is_none(), "{path} must mint no origin");
@@ -1165,7 +1210,7 @@ mod tests {
             let class = classify_request(&res, &local_client()).unwrap();
             assert_eq!(
                 class.resource_kind,
-                ResourceKind::ByHash(HashAlgo::Sha256),
+                ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),
                 "{path}"
             );
             assert!(
@@ -1349,19 +1394,19 @@ mod tests {
             (ResourceKind::Translation, Volatile, Dists),
             (ResourceKind::Icon, Volatile, Dists),
             (
-                ResourceKind::ByHash(HashAlgo::Sha256),
+                ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),
                 Permanent,
                 DistsByHash,
             ),
             (
-                ResourceKind::ByHash(HashAlgo::Sha512),
+                ResourceKind::ByHash(HashAlgo::Sha512, ByHashContent::Other),
                 Permanent,
                 DistsByHash,
             ),
             (ResourceKind::FlatMetadata, Volatile, Flat),
             (ResourceKind::FlatPool, Permanent, Flat),
             (
-                ResourceKind::FlatByHash(HashAlgo::Sha256),
+                ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::Other),
                 Permanent,
                 FlatByHash,
             ),

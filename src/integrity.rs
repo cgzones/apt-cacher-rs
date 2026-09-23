@@ -48,7 +48,7 @@ use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_opti
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::{
-    cache_layout::{ConnectionDetails, ResourceKind},
+    cache_layout::{ByHashContent, ConnectionDetails, ResourceKind},
     cache_quota::QuotaReservation,
     deb_mirror::normalize_uri_path,
     guards::DownloadWriteLease,
@@ -356,9 +356,8 @@ pub(crate) struct RenamePlan {
     /// `host/m1/pool/...` vs `host/m2/pool/...`) cannot poison each other's
     /// expected digests via same-named packages.
     pub(crate) mirror_path: String,
-    /// The raw request URI path (pre-normalisation). Used for the by-hash
-    /// ingestion heuristic (segment before `by-hash`), for `Release`
-    /// relative-path resolution, and as the relative-key component of the
+    /// The raw request URI path (pre-normalisation). Used for `Release`
+    /// relative-path resolution and as the relative-key component of the
     /// `Packages` registry lookup (see `verify_and_rename`).
     pub(crate) raw_uri_path: String,
 }
@@ -907,7 +906,7 @@ pub(crate) async fn verify_and_rename(
     // global-free. Skipped entirely when verification is disabled.
     let kind = if verify_enabled {
         match plan.resource_kind {
-            ResourceKind::ByHash(algo) | ResourceKind::FlatByHash(algo) => {
+            ResourceKind::ByHash(algo, _) | ResourceKind::FlatByHash(algo, _) => {
                 byhash_verify_kind(algo, &plan.debname)
             }
             kind @ (ResourceKind::Pool | ResourceKind::Packages) => {
@@ -1310,8 +1309,7 @@ pub(crate) struct IndexFile<'a> {
     pub(crate) resource_kind: ResourceKind,
     /// On-disk leaf name (`_`-joined for structured `Packages`).
     pub(crate) debname: &'a str,
-    /// The raw request URI path (the by-hash heuristic and `Release`'s
-    /// directory come from it).
+    /// The raw request URI path (`Release`'s directory comes from it).
     pub(crate) raw_uri_path: &'a str,
     pub(crate) host: &'a str,
     pub(crate) mirror_path: &'a str,
@@ -1381,34 +1379,23 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
         // section listing Packages files, so parsing it yields nothing useful.
         // Route it to the no-op group rather than wasting a file-open + parse.
         ResourceKind::ComponentRelease => None,
-        // A by-hash file may be a Packages file. The raw URI path's
-        // segment immediately before `by-hash` distinguishes a binary
-        // Packages index from Contents/dep11/i18n by-hash content.
-        ResourceKind::ByHash(_) => {
-            if byhash_path_looks_like_packages(file.raw_uri_path) {
-                Some(IngestKind::PackagesSniff {
-                    format: IndexFormat::Structured,
-                })
-            } else {
-                None
-            }
+        // A by-hash file may be a Packages file. The directory its
+        // validated `by-hash/` hangs in, judged once by the classifier,
+        // distinguishes a binary Packages index from Contents/dep11/i18n
+        // by-hash content.
+        ResourceKind::ByHash(_, ByHashContent::MaybePackages) => Some(IngestKind::PackagesSniff {
+            format: IndexFormat::Structured,
+        }),
+        // Only a flat repository whose base directory is itself named
+        // `binary-*` or `source` gets here.  Flat layer-C ingestion is
+        // deferred (see `verify_and_rename`).
+        ResourceKind::FlatByHash(_, ByHashContent::MaybePackages) => {
+            Some(IngestKind::PackagesSniff {
+                format: IndexFormat::Flat,
+            })
         }
-        ResourceKind::FlatByHash(_) => {
-            // `byhash_path_looks_like_packages` matches a `binary-*` or
-            // `source` segment before `by-hash`, which is a structured-layout
-            // signature.  Flat by-hash URLs anchor at the flat repo's base
-            // directory and never contain those tokens, so this arm is
-            // effectively dead today.  Flat layer-C ingestion is deferred
-            // (see `verify_and_rename`); leave the call in place to keep
-            // the kind exhaustive.
-            if byhash_path_looks_like_packages(file.raw_uri_path) {
-                Some(IngestKind::PackagesSniff {
-                    format: IndexFormat::Flat,
-                })
-            } else {
-                None
-            }
-        }
+        ResourceKind::ByHash(_, ByHashContent::Other)
+        | ResourceKind::FlatByHash(_, ByHashContent::Other) => None,
         ResourceKind::Pool
         | ResourceKind::Sources
         | ResourceKind::Translation
@@ -1459,23 +1446,6 @@ fn release_dir_from_uri_path(raw_uri_path: &str) -> Option<String> {
     Some(dir.to_owned())
 }
 
-/// `true` iff the raw by-hash URI path's segment immediately before `by-hash`
-/// is a `binary-<arch>` or `source` directory - the only by-hash content that
-/// is a `Packages`/`Sources` index. (`Sources` is parsed identically; its
-/// stanzas carry no `Filename:` line so the parser yields nothing - harmless.)
-fn byhash_path_looks_like_packages(raw_uri_path: &str) -> bool {
-    let mut prev: Option<&str> = None;
-    for seg in raw_uri_path.split('/') {
-        if seg == "by-hash" {
-            return matches!(prev, Some(p) if p.starts_with("binary-") || p == "source");
-        }
-        if !seg.is_empty() {
-            prev = Some(seg);
-        }
-    }
-    false
-}
-
 /// The checksum-registry key a download of `resource_kind` is verified
 /// against, or `None` for the kinds that carry their digest in the URL
 /// (a by-hash URL) or have none at all ([`VerifyKind::Unverifiable`]).
@@ -1501,8 +1471,8 @@ fn registry_lookup_key<'a>(
             Cow::Borrowed(path) => Cow::Borrowed(path.trim_start_matches('/')),
             Cow::Owned(path) => Cow::Owned(path.trim_start_matches('/').to_owned()),
         }),
-        ResourceKind::ByHash(_)
-        | ResourceKind::FlatByHash(_)
+        ResourceKind::ByHash(..)
+        | ResourceKind::FlatByHash(..)
         | ResourceKind::Release
         | ResourceKind::ComponentRelease
         | ResourceKind::Sources
@@ -1552,7 +1522,7 @@ pub(crate) fn stream_hash_algo(
     }
     match resource_kind {
         // Self-verifying: the algorithm is named in the URL.
-        ResourceKind::ByHash(algo) | ResourceKind::FlatByHash(algo) => Some(algo),
+        ResourceKind::ByHash(algo, _) | ResourceKind::FlatByHash(algo, _) => Some(algo),
         // Registry-backed, always SHA-256 (`VerifyKind::Registry`) -- but only
         // worth computing when the registry already holds the digest.
         ResourceKind::Pool | ResourceKind::Packages => registry_hit.then_some(HashAlgo::Sha256),
@@ -1884,11 +1854,19 @@ mod tests {
         // By-hash resources carry their digest in the URL, so the registry is
         // not consulted for them at all.
         assert_eq!(
-            stream_hash_algo(ResourceKind::ByHash(HashAlgo::Sha512), false, true),
+            stream_hash_algo(
+                ResourceKind::ByHash(HashAlgo::Sha512, ByHashContent::Other),
+                false,
+                true
+            ),
             Some(HashAlgo::Sha512)
         );
         assert_eq!(
-            stream_hash_algo(ResourceKind::FlatByHash(HashAlgo::Sha256), false, true),
+            stream_hash_algo(
+                ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::Other),
+                false,
+                true
+            ),
             Some(HashAlgo::Sha256)
         );
         assert_eq!(
@@ -1921,7 +1899,11 @@ mod tests {
         // Verification off: nothing is ever hashed.
         assert_eq!(stream_hash_algo(ResourceKind::Pool, true, false), None);
         assert_eq!(
-            stream_hash_algo(ResourceKind::ByHash(HashAlgo::Sha512), true, false),
+            stream_hash_algo(
+                ResourceKind::ByHash(HashAlgo::Sha512, ByHashContent::Other),
+                true,
+                false
+            ),
             None
         );
     }
@@ -1957,8 +1939,8 @@ mod tests {
             Some("debian/dists/sid/main/binary-amd64/Packages.xz")
         );
         for kind in [
-            ResourceKind::ByHash(HashAlgo::Sha256),
-            ResourceKind::FlatByHash(HashAlgo::Sha256),
+            ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),
+            ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::Other),
             ResourceKind::Release,
             ResourceKind::ComponentRelease,
             ResourceKind::Sources,
@@ -2388,20 +2370,65 @@ mod tests {
         assert!(reg.lookup("h", "m", "e").is_some());
     }
 
+    /// Regression: whether a by-hash object is also ingested as a `Packages`
+    /// index used to be re-read from the directory before the raw path's
+    /// *first* `by-hash` segment, while the parser validated the *last*. A
+    /// decoy `by-hash/` run in front flipped the answer either way. The
+    /// directory the parsed object hangs in decides now.
     #[test]
-    fn byhash_packages_heuristic() {
-        assert!(byhash_path_looks_like_packages(
-            "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/abcd"
-        ));
-        assert!(byhash_path_looks_like_packages(
-            "/debian/dists/sid/main/source/by-hash/SHA256/abcd"
-        ));
-        assert!(!byhash_path_looks_like_packages(
-            "/debian/dists/sid/main/dep11/by-hash/SHA256/abcd"
-        ));
-        assert!(!byhash_path_looks_like_packages(
-            "/debian/dists/sid/by-hash/SHA256/abcd"
-        ));
+    fn byhash_ingest_is_decided_by_the_parsed_directory() {
+        use crate::{
+            cache_layout::classify_request, deb_mirror::parse_request_path,
+            test_support::local_client,
+        };
+
+        for (path, expected) in [
+            (
+                "debian/dists/sid/main/binary-amd64",
+                Some(IndexFormat::Structured),
+            ),
+            (
+                "debian/dists/sid/main/source",
+                Some(IndexFormat::Structured),
+            ),
+            // Deeper than the origin scope, still a `Packages` directory.
+            (
+                "debian/dists/sid/main/debian-installer/binary-amd64",
+                Some(IndexFormat::Structured),
+            ),
+            ("debian/dists/sid/main/dep11", None),
+            ("debian/dists/sid/main", None),
+            ("debian/dists", None),
+            ("debian/dists/sid/main/binary-amd64/Packages.diff", None),
+            // Decoys: the directory before the first `by-hash` said otherwise.
+            ("debian/dists/sid/main/binary-amd64/by-hash/MD5Sum", None),
+            (
+                "debian/dists/sid/main/i18n/by-hash/X/binary-amd64",
+                Some(IndexFormat::Structured),
+            ),
+            ("apt/binary-amd64", Some(IndexFormat::Flat)),
+            ("apt", None),
+        ] {
+            let path = format!("{path}/by-hash/SHA256/{HELLO_SHA256}");
+            let resource = parse_request_path(&path).expect("parses as a by-hash object");
+            let class = classify_request(&resource, &local_client()).expect("classifies");
+            let raw_uri_path = format!("/{path}");
+            let kind = ingest_kind(&IndexFile {
+                resource_kind: class.resource_kind,
+                debname: &class.debname,
+                raw_uri_path: &raw_uri_path,
+                host: "h",
+                mirror_path: &class.mirror_path,
+                path: Path::new("/cache/x"),
+            });
+            let format = if let Some(IngestKind::PackagesSniff { format }) = kind {
+                Some(format)
+            } else {
+                assert!(kind.is_none(), "{path}: unexpected ingest kind");
+                None
+            };
+            assert_eq!(format, expected, "{path}");
+        }
     }
 
     /// Regression (verification bypass): the algorithm used to be re-read
@@ -2425,7 +2452,7 @@ mod tests {
         ] {
             let resource = parse_request_path(&path).expect("parses as a by-hash object");
             let class = classify_request(&resource, &local_client()).expect("classifies");
-            let algo = if let ResourceKind::ByHash(algo) = class.resource_kind {
+            let algo = if let ResourceKind::ByHash(algo, _) = class.resource_kind {
                 Some(algo)
             } else {
                 None
@@ -3044,7 +3071,7 @@ mod tests {
         ));
         assert!(matches!(
             ingest_kind(&file(
-                ResourceKind::ByHash(HashAlgo::Sha256),
+                ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::MaybePackages),
                 "abcd",
                 "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/abcd"
             )),
@@ -3052,7 +3079,7 @@ mod tests {
         ));
         assert!(
             ingest_kind(&file(
-                ResourceKind::ByHash(HashAlgo::Sha256),
+                ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),
                 "abcd",
                 "/debian/dists/sid/main/i18n/by-hash/SHA256/abcd"
             ))
