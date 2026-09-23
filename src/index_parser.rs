@@ -12,7 +12,7 @@ use tokio::io::AsyncBufRead;
 
 use crate::{
     limits::{CappedLine, MAX_METADATA_LINE_LEN, read_line_capped},
-    sticky, warn_once, warn_once_or_debug, warn_once_or_info,
+    sticky, warn_once, warn_once_or_debug,
 };
 
 /// Extract the `Filename:` field's relative-path value from a Debian
@@ -453,10 +453,10 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
             return false;
         };
         if let Some(field) = self.stanza.repeated {
-            // Per stanza, like the digest-less warn below, but a repeat is a
-            // malformed (or hostile) index worth correlating, so repeats stay
-            // at info.
-            warn_once_or_info!(
+            // Per stanza, like the digest-less warn below: a malformed (or
+            // hostile) index repeats the fault in every stanza, so the first
+            // occurrence is the signal and the rest degrade to debug.
+            warn_once_or_debug!(
                 "Packages stanza for `{}` from {} repeats its {} field; ignoring the stanza, so the package it names is exempt from checksum verification and loses its cleanup reference",
                 filename.escape_debug(),
                 self.stanza.source_label(),
