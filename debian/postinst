@@ -7,4 +7,15 @@ if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-decon
   adduser --quiet --system --group --comment "$PACKAGE_NAME daemon" --no-create-home --home /nonexistent "$PACKAGE_NAME"
 fi
 
+# systemd creates these with the unit's *DirectoryMode=0750, but releases
+# that predate enforcing the mode on existing directories leave an upgraded
+# install at the old 0755; tighten them here.
+if [ "$1" = "configure" ] ; then
+  for dir in "/var/cache/$PACKAGE_NAME" "/var/lib/$PACKAGE_NAME" ; do
+    if [ -d "$dir" ] && [ ! -L "$dir" ] ; then
+      chmod 0750 "$dir"
+    fi
+  done
+fi
+
 #DEBHELPER#
