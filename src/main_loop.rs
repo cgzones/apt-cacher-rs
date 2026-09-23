@@ -45,10 +45,11 @@ use crate::{
     database_task::{self, db_loop},
     deb_mirror,
     error::ErrorReport,
-    flat_blocklist, global_config,
+    flat_blocklist, global_config, global_webif_hosts,
     healthcheck::{self, filesystem_space},
     humanfmt::HumanFmt,
     metrics,
+    request_dispatch::ClientAcls,
     task_cache_scan::{CacheScanError, task_cache_scan},
     warn_once_or_debug, warn_once_or_info,
 };
@@ -608,6 +609,20 @@ pub(crate) async fn main_loop(
         };
 
         metrics::CONNECTIONS_ACCEPTED.increment();
+
+        // A client no request could be served for is closed before it takes
+        // a slot: otherwise it holds one until `client_idle_timeout` by
+        // sending nothing, and the ACLs would only run on a full request
+        // head.
+        if !ClientAcls::new(config, global_webif_hosts()).admits(&client) {
+            metrics::CONNECTION_REJECTED_ACL.increment();
+            warn_once_or_info!(
+                "Unauthorized client {client}: permitted by neither `allowed_proxy_clients` nor \
+                 `allowed_webif_clients`; closing the socket without a response"
+            );
+            drop(stream);
+            continue;
+        }
 
         let client_counter = match client_counter::ClientCounter::try_new(
             client.ip(),

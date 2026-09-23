@@ -72,11 +72,11 @@ use crate::{
     passthrough_limiter,
     permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
     precise_instant::PreciseInstant,
-    proxy_body::{ProxyCacheBody, full_body, quick_response},
+    proxy_body::{ProxyCacheBody, full_body, quick_response, quick_response_closing},
     rate_checked_body::{ClientBody, MaybeRated, RateCheckedBodyErr},
     rate_log,
     request_dispatch::{
-        ClientAcls, DispatchOutcome, PassthroughReason, RequestKind, RequestTarget,
+        ClientAcls, DispatchOutcome, PassthroughReason, RejectReason, RequestKind, RequestTarget,
         dispatch_request, preflight_method, preflight_target, preflight_via,
     },
     response_head::{ResponseHead, ResponseKind, retry_after_secs},
@@ -2523,6 +2523,19 @@ async fn pre_process_client_request_wrapper(
     Ok(response)
 }
 
+/// The response to a shared pre-flight rejection: an authorization refusal
+/// also ends the connection (`RejectReason::is_authorization_refusal`), as
+/// in the sendfile backend.
+#[must_use]
+fn reject_response(reason: RejectReason) -> Response<ProxyCacheBody> {
+    let (status, msg) = reason.response_parts();
+    if reason.is_authorization_refusal() {
+        quick_response_closing(status, msg)
+    } else {
+        quick_response(status, msg)
+    }
+}
+
 /// Drop the request body (never forwarded) so the rest of the pipeline
 /// handles a bodiless `Request<Empty<()>>`.
 #[must_use]
@@ -2611,10 +2624,7 @@ async fn pre_process_client_request(
         match preflight_method(req.method().as_str(), &client, &acls) {
             Ok(RequestKind::Connect) => return connect_response(client, req, hold),
             Ok(RequestKind::Get) => {}
-            Err(reason) => {
-                let (status, msg) = reason.response_parts();
-                return quick_response(status, msg);
-            }
+            Err(reason) => return reject_response(reason),
         }
 
         let via_values = req
@@ -2640,15 +2650,14 @@ async fn pre_process_client_request(
                     .await
                     .into_hyper_response();
             }
-            Err(reason) => {
-                let (status, msg) = reason.response_parts();
-                return quick_response(status, msg);
-            }
+            Err(reason) => return reject_response(reason),
         };
 
+        // Closing, like the sendfile backend: a refused proxy client must
+        // not keep its connection slot by asking again.
         let requested_host = match authorize_cache_access(&client, requested_host) {
             Ok(rh) => rh,
-            Err((status, msg)) => return quick_response(status, msg),
+            Err((status, msg)) => return quick_response_closing(status, msg),
         };
 
         let req = strip_request_body(client, req);

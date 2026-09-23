@@ -192,6 +192,11 @@ fn build_requests_group(g: &mut Groups) {
             WarnNonzero(metrics::CONNECTION_REJECTED_PER_IP_CAP.get()),
         );
         t.row_tip(
+            "Connections Rejected (client ACL)",
+            "Connections dropped at accept time because the source address is outside both `allowed_proxy_clients` and `allowed_webif_clients`.",
+            WarnNonzero(metrics::CONNECTION_REJECTED_ACL.get()),
+        );
+        t.row_tip(
             "Accept Failures (retried)",
             "accept(2) failures retried after a short pause instead of stopping the daemon: descriptor exhaustion (EMFILE/ENFILE), ENOBUFS/ENOMEM, ECONNABORTED. Climbing values mean the process is at its file-descriptor budget.",
             WarnNonzero(metrics::ACCEPT_TRANSIENT_FAILURES.get()),

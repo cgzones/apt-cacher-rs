@@ -110,9 +110,10 @@ pub(crate) static WEBUI_REQUESTS: Counter = Counter::new();
 /// and `SERVED_TOTAL`).
 pub(crate) static SERVED_WEBUI: Counter = Counter::new();
 /// TCP connections accepted by the listener (counted at `accept()`,
-/// before the per-IP cap check). Connections subsequently rejected by
-/// `max_connections_per_client_ip` are included here and also counted
-/// in `CONNECTION_REJECTED_PER_IP_CAP`.
+/// before the ACL and per-IP cap checks). Connections subsequently rejected
+/// by the client ACLs or `max_connections_per_client_ip` are included here
+/// and also counted in `CONNECTION_REJECTED_ACL` or
+/// `CONNECTION_REJECTED_PER_IP_CAP`.
 pub(crate) static CONNECTIONS_ACCEPTED: Counter = Counter::new();
 /// `accept(2)` failures the listener loop retried instead of stopping the
 /// daemon: EMFILE/ENFILE (descriptor exhaustion), ENOBUFS/ENOMEM, and
@@ -241,6 +242,12 @@ pub(crate) static CONNECTION_REJECTED_PER_IP_CAP: Counter = Counter::new();
 /// its connection budget: either a flood, or a cap sized below the real
 /// client population (raise `max_connections` and `LimitNOFILE` together).
 pub(crate) static CONNECTION_REJECTED_GLOBAL_CAP: Counter = Counter::new();
+/// Connections closed at accept time because the source address passes
+/// neither `allowed_proxy_clients` nor `allowed_webif_clients`, so no
+/// request from it could be served.  Counted instead of (not in addition
+/// to) the per-request `AUTHZ_REJECTED_*` counters, which such a client no
+/// longer reaches.
+pub(crate) static CONNECTION_REJECTED_ACL: Counter = Counter::new();
 /// Requests refused with 508 because their `Via` already named this proxy:
 /// the proxy was asked to fetch from itself.  Any value means an
 /// `allowed_mirrors` wildcard covers the proxy's own name.

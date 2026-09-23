@@ -198,10 +198,25 @@ pub(crate) fn retry_after_secs(remaining: std::time::Duration) -> u32 {
 
 #[cfg(feature = "hyper")]
 impl ResponseHead<'_> {
+    /// [`Self::into_hyper`] for a response after which the connection must
+    /// end: `Connection: close`, which hyper honours by closing the
+    /// connection once the response is written (an authorization refusal,
+    /// whose client must not keep its connection slot by asking again).
+    #[must_use]
+    pub(crate) fn into_hyper_closing<B>(self, body: B) -> http::Response<B> {
+        let mut response = self.into_hyper(body);
+        response.headers_mut().insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+        response
+    }
+
     /// Render the head onto a hyper [`http::Response`] carrying `body`.
     ///
-    /// `Connection:` is always `keep-alive` here; hyper decides the actual
-    /// connection fate from the request.
+    /// `Connection:` is `keep-alive` here (see [`Self::into_hyper_closing`]
+    /// for the exception); hyper decides the actual connection fate from the
+    /// request.
     #[must_use]
     pub(crate) fn into_hyper<B>(self, body: B) -> http::Response<B> {
         use http::{
@@ -471,6 +486,14 @@ mod tests {
             assert!(!headers.contains_key(CONTENT_LENGTH));
             assert!(!headers.contains_key(ALLOW));
             assert!(!headers.contains_key(RETRY_AFTER));
+        }
+
+        #[test]
+        fn closing_head_replaces_keep_alive_with_close() {
+            let response = ResponseHead::error(StatusCode::FORBIDDEN).into_hyper_closing(());
+            let connection: Vec<_> = response.headers().get_all(CONNECTION).iter().collect();
+            assert_eq!(connection, ["close"]);
+            assert_eq!(response.headers().get(SERVER).unwrap(), APP_NAME);
         }
 
         #[test]

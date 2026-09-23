@@ -608,9 +608,10 @@ async fn write_webui_response(
 
 /// Map a shared pre-flight/dispatch rejection onto the sendfile result type.
 ///
-/// Diff-request and web-interface ACL rejections keep the connection alive
-/// (per the request's own `Connection` semantics); the CONNECT ACL rejection
-/// closes it; every other 4xx closes to defend against header smuggling.
+/// A diff-request rejection keeps the connection alive (per the request's
+/// own `Connection` semantics); an authorization refusal (the CONNECT or
+/// web-interface ACL) closes it in both backends, so a refused client
+/// cannot keep its connection slot by asking again; every other 4xx closes to defend against header smuggling.
 /// `conn_action` is a closure because `compute_conn_action` logs a warning
 /// for requests carrying a body, which the closing variants never did.
 #[must_use]
@@ -620,14 +621,14 @@ fn reject_result(
 ) -> ZeroCopyResult {
     let (status, msg) = reason.response_parts();
     match reason {
-        RejectReason::DiffRequest
-        | RejectReason::UnauthorizedWebUi
-        | RejectReason::MisdirectedWebUi => ZeroCopyResult::Rejection {
+        RejectReason::DiffRequest => ZeroCopyResult::Rejection {
             status,
             conn_action: conn_action(),
             msg,
         },
-        RejectReason::UnauthorizedClient => ZeroCopyResult::Rejection {
+        RejectReason::UnauthorizedClient
+        | RejectReason::UnauthorizedWebUi
+        | RejectReason::MisdirectedWebUi => ZeroCopyResult::Rejection {
             status,
             conn_action: ConnectionAction::Close,
             msg,

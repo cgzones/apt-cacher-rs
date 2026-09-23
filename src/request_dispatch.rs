@@ -106,6 +106,32 @@ pub(crate) enum RejectReason {
 }
 
 impl RejectReason {
+    /// Whether this is an authorization refusal (the proxy-client or
+    /// web-interface ACL).  Every backend closes the connection after one,
+    /// so a refused client cannot keep its connection slot by asking again.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "hyper"),
+        expect(
+            dead_code,
+            reason = "the sendfile backend spells the same set out in `reject_result`"
+        )
+    )]
+    pub(crate) const fn is_authorization_refusal(self) -> bool {
+        match self {
+            Self::UnauthorizedClient | Self::UnauthorizedWebUi | Self::MisdirectedWebUi => true,
+            Self::UnsupportedMethod
+            | Self::UnsupportedScheme
+            | Self::MissingHost
+            | Self::InvalidPort
+            | Self::BadEncoding
+            | Self::InvalidValue
+            | Self::UnsafePath
+            | Self::DiffRequest
+            | Self::LoopDetected => false,
+        }
+    }
+
     /// Fixed `(status, body)` pair associated with this reason.
     #[must_use]
     pub(crate) const fn response_parts(self) -> (StatusCode, &'static str) {
@@ -151,6 +177,25 @@ impl<'a> ClientAcls<'a> {
                 .unwrap_or(&config.allowed_proxy_clients),
             webif_hosts,
         }
+    }
+}
+
+impl ClientAcls<'_> {
+    /// Whether any request from `client` could be served: it passes the
+    /// proxy-client or the web-interface list.  The accept loop closes a
+    /// connection that passes neither before it takes a connection slot, so
+    /// a host outside every list cannot hold slots until
+    /// `client_idle_timeout` by sending nothing.
+    #[must_use]
+    pub(crate) fn admits(&self, client: &ClientInfo) -> bool {
+        // The `Host` names only gate the web interface's requests, which
+        // an accept-time check has not seen yet.
+        let Self {
+            proxy_clients,
+            webif_clients,
+            webif_hosts: _,
+        } = self;
+        client_permitted(proxy_clients, client) || client_permitted(webif_clients, client)
     }
 }
 
@@ -617,6 +662,30 @@ mod tests {
         )))],
         webif_hosts: &WebifHosts::NONE,
     };
+
+    #[test]
+    fn acls_admit_a_client_passing_either_list() {
+        let local = [IpNetOrAddr::Addr(IpAddr::V4(Ipv4Addr::LOCALHOST))];
+        let other = OTHER_HOST_ACLS.proxy_clients;
+        for (proxy_clients, webif_clients, admitted) in [
+            (&[][..], &[][..], true),
+            (other, other, false),
+            (&local[..], other, true),
+            (other, &local[..], true),
+            (other, &[][..], true),
+        ] {
+            let acls = ClientAcls {
+                proxy_clients,
+                webif_clients,
+                webif_hosts: &WebifHosts::NONE,
+            };
+            assert_eq!(
+                acls.admits(&local_client()),
+                admitted,
+                "proxy {proxy_clients:?}, webif {webif_clients:?}"
+            );
+        }
+    }
 
     #[test]
     fn preflight_method_accepts_get_and_connect() {
