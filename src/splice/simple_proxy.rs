@@ -246,12 +246,17 @@ pub(crate) async fn splice_simple_proxy(
     metrics::record_client_status(resp.status_code);
     metrics::REQUESTS_PASSTHROUGH.increment();
 
-    // Mirror the hyper simple-proxy passthrough: record an Origin row on
-    // 2xx/3xx responses so the cleanup machinery can find the owning mirror
-    // for uncached resources that happen to carry a pool-style path.
-    if (resp.status_code.is_success() || resp.status_code.is_redirection())
-        && let Some(origin) =
-            Origin::from_path(original_uri_path, mirror.host().clone(), mirror.port())
+    // Mirror the hyper simple-proxy passthrough: record an Origin row on a
+    // 2xx response (only that proves the index exists), for a path the
+    // cache itself would accept, so the cleanup machinery can find the
+    // owning mirror.
+    if resp.status_code.is_success()
+        && let Some(origin) = Origin::from_path(
+            original_uri_path,
+            mirror.host().clone(),
+            mirror.port(),
+            &client,
+        )
     {
         let cmd = DatabaseCommand::Origin(origin, OriginSighting::Upstream);
         send_db_command(cmd).await;

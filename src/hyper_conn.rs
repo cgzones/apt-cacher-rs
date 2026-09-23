@@ -2788,9 +2788,15 @@ async fn pre_process_client_request(
 
     trace!("Forwarded response: {fwd_response:?}");
 
-    if (fwd_response.status().is_success() || fwd_response.status().is_redirection())
-        && let Some(origin) =
-            Origin::from_path(parts.uri.path(), requested_host.clone(), requested_port)
+    // Only a 2xx proves the index exists; `from_path` mints nothing the
+    // cache itself would refuse.
+    if fwd_response.status().is_success()
+        && let Some(origin) = Origin::from_path(
+            parts.uri.path(),
+            requested_host.clone(),
+            requested_port,
+            &client,
+        )
     {
         debug!("Extracted origin: {origin:?}");
 

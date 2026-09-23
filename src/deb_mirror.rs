@@ -2,7 +2,13 @@ use std::{borrow::Cow, num::NonZero, sync::OnceLock};
 
 use tracing::debug;
 
-use crate::{config::ClientHost, database, index_parser::HashAlgo};
+use crate::{
+    cache_layout::{MAX_DEBNAME_LEN, classify_request},
+    client_info::ClientInfo,
+    config::ClientHost,
+    database,
+    index_parser::HashAlgo,
+};
 
 /// On-disk layout family of a mirror.  Stored in the `mirrors_v2.kind`
 /// INTEGER column (added by the `20260512155314_mirror_kind` migration);
@@ -220,10 +226,11 @@ pub(crate) enum OriginSighting {
 /// bails the mirror's whole sweep. (`debian-installer/binary-<arch>` sits a
 /// segment deeper than the three-segment scope both callers accept.)
 ///
-/// Single source of truth, applied in the three places that can mint the
+/// Single source of truth, applied in the two places that can mint the
 /// triple — the `Packages` and `ByHash` arms of
-/// `cache_layout::classify_request` and [`Origin::from_path`] — and in the
-/// per-component `Release` parser, which accepts the same form (or `source`).
+/// `cache_layout::classify_request`, which [`Origin::from_path`] runs too —
+/// and in the per-component `Release` parser, which accepts the same form
+/// (or `source`).
 #[must_use]
 pub(crate) fn is_binary_arch(arch: &str) -> bool {
     arch.strip_prefix("binary-")
@@ -231,92 +238,48 @@ pub(crate) fn is_binary_arch(arch: &str) -> bool {
 }
 
 impl Origin {
-    /// Parse a `dists/.../Packages*` path into an [`Origin`].
+    /// The [`Origin`] a request for `path` on `host`/`port` would register
+    /// if it were cached: `path` is parsed, normalised, percent-decoded and
+    /// validated exactly as `request_dispatch::decide_request` does it for
+    /// a cache request ([`parse_request_path`] and
+    /// [`crate::cache_layout::classify_request`], its unsafe-path gate and
+    /// cache-name length cap), and only the two index shapes that mint an
+    /// origin there do so here:
     ///
-    /// Two URL shapes are recognised, both anchoring on `/dists/`:
-    ///
-    /// * `dists/<dist>/<comp>/<arch>/Packages{,.gz,.xz}` — the
+    /// * `dists/<dist>/<comp>/binary-<arch>/Packages{,.gz,.xz}` — the
     ///   canonical per-architecture index path.
-    /// * `dists/<dist>/<comp>/<arch>/by-hash/<ALGO>/<hex>` — the
-    ///   content-addressed sibling.  The algorithm name and digest length
-    ///   are cross-checked via [`is_valid_byhash_pair`] so a junk pairing
-    ///   like `by-hash/MD5/...` or `by-hash/SHA256/notahex` does NOT mint an
-    ///   Origin row.
+    /// * `dists/<dist>/<comp>/binary-<arch>/by-hash/<ALGO>/<hex>` — the
+    ///   content-addressed sibling (algorithm and digest length
+    ///   cross-checked).
     ///
-    /// **Trailing slash:** tolerated for the `Packages*` and `by-hash`
-    /// shapes — a single trailing `/` (collapsed by [`normalize_uri_path`]
-    /// from any `/+` run) is permitted because callers derive URIs from
-    /// cleanup/database state where trailing slashes can arise from
-    /// upstream `Location` headers or normalisation variants.  Any other
-    /// trailing segment after the recognised filename causes rejection —
-    /// `.../Packages/extra/garbage` returns `None`.  Contrast with
-    /// [`parse_request_path`], which uses a right-to-left `rsplit('/')` and
-    /// rejects even the trailing-slash form by design.
+    /// For the passthrough relays, which forward what the classifier
+    /// declined: an origin row names a mirror, feeds cleanup's index fetches
+    /// and can disable flat caching for a whole host
+    /// ([`crate::flat_blocklist`]), so it must never come from a shape - a
+    /// trailing slash, a reserved or undecoded segment, a `_`-joined field -
+    /// the cache itself refuses.  `client` only labels trace lines.
     #[must_use]
     pub(crate) fn from_path(
         path: &str,
         host: ClientHost,
         port: Option<NonZero<u16>>,
+        client: &ClientInfo,
     ) -> Option<Self> {
-        /* /debian/dists/sid/main/binary-amd64/Packages{,.gz,.xz}
-         * /debian/dists/sid/main/binary-amd64/by-hash/SHA256/<hex>     */
-
-        let path = normalize_uri_path(path);
-        let path = path.trim_start_matches('/');
-
-        let (mirror_path, origin_path) = path.rsplit_once("/dists/")?;
-
-        let mut parts = origin_path.split('/');
-
-        let distribution = parts.next()?;
-
-        let component = parts.next()?;
-
-        let architecture = parts.next()?;
-
-        let filename = parts.next()?;
-        if filename == "by-hash" {
-            // `by-hash/<ALGO>/<hex>` shape: both segments are required and
-            // must validate as a supported (algo, digest) pair.  The pair
-            // check subsumes the digest-shape check, which only tests the
-            // length and hex-ness the pair check already re-tests.
-            let algorithm = parts.next()?;
-            let digest = parts.next()?;
-            if !is_valid_byhash_pair(algorithm, digest) {
-                return None;
-            }
-        } else if !is_packages_filename(filename) {
+        let normalized = normalize_uri_path(path);
+        let resource = parse_request_path(&normalized)?;
+        let class = classify_request(&resource, client).ok()?;
+        if is_unsafe_cache_path(&normalized) || class.debname.len() > MAX_DEBNAME_LEN {
             return None;
         }
-
-        // Trailing-slash tolerance: at most a single empty segment (e.g.
-        // `.../Packages/`).  Anything else — a non-empty trailing segment
-        // like `Packages/Index` or `Packages/extra/garbage`, or any junk
-        // past a digest — is rejected as unrecognised.
-        if let Some(extra) = parts.next()
-            && (!extra.is_empty() || parts.next().is_some())
-        {
-            return None;
-        }
-
-        // Only a `binary-<arch>` slot mints a row.  In practice just the
-        // `by-hash` shape reaches here with anything else — `dep11`, `cnf`
-        // and friends have no `Packages*` file of their own — but the check
-        // covers both, and lives here rather than being repeated at the three
-        // recording backends.
-        if !is_binary_arch(architecture) {
-            return None;
-        }
-
+        let fields = class.origin_fields?;
         Some(Self {
-            // Origin URLs always parse from `<path>/dists/...` paths, which
-            // are exclusively a structured-layout shape.
-            mirror: Mirror::new(host, port, mirror_path.to_owned(), MirrorKind::Structured),
-            fields: OriginFields {
-                distribution: distribution.to_owned(),
-                component: component.to_owned(),
-                architecture: architecture.to_owned(),
-            },
+            mirror: Mirror::new(
+                host,
+                port,
+                class.mirror_path,
+                class.resource_kind.layout().mirror_kind(),
+            ),
+            fields,
         })
     }
 }
@@ -625,9 +588,7 @@ fn byhash_scope<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<ByHashS
 /// (`"Packages" | "Packages.gz" | ...`).  Strictness keeps the cache
 /// keyspace clean — APT never sends a trailing-slash URL, so accepting
 /// one would let an oddly-shaped client request alias to a cached file.
-/// Contrast with [`Origin::from_path`], which tolerates a single trailing
-/// slash on the `Packages*` shape for cleanup/Location-header recovery
-/// callers; both forms reject any non-empty trailing junk.
+/// [`Origin::from_path`] parses through here and so rejects it too.
 #[must_use]
 pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
     let path = path.trim_start_matches('/');
@@ -1067,23 +1028,17 @@ impl ByHashAlgorithm {
 /// Whether `s` has the shape of a by-hash digest tail: a hex string of one
 /// of the supported digest lengths. Used as the fast disambiguator in the
 /// parser, where the algorithm directory has not been read yet; the
-/// cross-check against it lives in [`is_valid_byhash_pair`].
+/// cross-check against it lives in [`byhash_pair`].
 #[must_use]
 fn is_byhash_digest_shape(s: &str) -> bool {
     ByHashAlgorithm::for_digest(s).is_some()
 }
 
-/// Whether `(algo, digest)` is a supported by-hash pair: `algo` names a
-/// [`ByHashAlgorithm`] and `digest` is a hex string of that algorithm's
-/// digest length.
-#[must_use]
-fn is_valid_byhash_pair(algo: &str, digest: &str) -> bool {
-    byhash_pair(algo, digest).is_some()
-}
-
-/// The algorithm of a supported by-hash pair (see [`is_valid_byhash_pair`]):
-/// what the parser hands on, so verification hashes with the algorithm this
-/// check accepted rather than re-reading one from the path.
+/// The algorithm of a supported by-hash pair, `None` for any other: `algo`
+/// names a [`ByHashAlgorithm`] and `digest` is a hex string of that
+/// algorithm's digest length.  What the parser hands on, so verification
+/// hashes with the algorithm this check accepted rather than re-reading one
+/// from the path.
 #[must_use]
 fn byhash_pair(algo: &str, digest: &str) -> Option<HashAlgo> {
     ByHashAlgorithm::from_dir_name(algo)
@@ -1102,10 +1057,10 @@ fn is_release_filename(name: &str) -> bool {
 ///
 /// One of the three index-family predicates ([`is_sources_filename`],
 /// [`is_translation_filename`]) that pin down which compression suffixes
-/// exist as far as the parser is concerned: the structured `dists/` arm,
-/// the flat-repository metadata allowlist and [`Origin::from_path`] all ask
-/// here, so a new suffix (e.g. `.zst`) is one edit rather than three that
-/// can drift apart.
+/// exist as far as the parser is concerned: the structured `dists/` arm
+/// (which [`Origin::from_path`] parses through) and the flat-repository
+/// metadata allowlist both ask here, so a new suffix (e.g. `.zst`) is one
+/// edit rather than two that can drift apart.
 #[must_use]
 fn is_packages_filename(name: &str) -> bool {
     // `limits::PackagesCompression` is the enum of the compressions the
@@ -1430,7 +1385,7 @@ pub(crate) fn valid_architecture(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::nonzero;
+    use crate::{nonzero, test_support::local_client};
 
     use super::*;
 
@@ -1465,6 +1420,7 @@ mod tests {
             PATH,
             ClientHost::new("deb.debian.org".to_string()).unwrap(),
             None,
+            &local_client(),
         )
         .expect("the same URL mints an Origin");
         assert_eq!(origin.fields.distribution, "sid");
@@ -1475,9 +1431,10 @@ mod tests {
     #[test]
     fn test_parse_1() {
         let result = Origin::from_path(
-            "/debian/dists/sid/main/binary-amd64/Packages/",
+            "/debian/dists/sid/main/binary-amd64/Packages",
             ClientHost::new("deb.debian.org".to_string()).unwrap(),
             None,
+            &local_client(),
         )
         .unwrap();
         assert_eq!(
@@ -1509,6 +1466,7 @@ mod tests {
         84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
             ClientHost::new("site.example.com".to_string()).unwrap(),
             Some(nonzero!(80)),
+            &local_client(),
         )
         .unwrap();
         assert_eq!(
@@ -1539,6 +1497,7 @@ mod tests {
             "/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages.gz",
             ClientHost::new("apt.llvm.org".to_string()).unwrap(),
             Some(nonzero!(443)),
+            &local_client(),
         )
         .unwrap();
         assert_eq!(
@@ -1566,9 +1525,10 @@ mod tests {
     #[test]
     fn test_parse_ipv6() {
         let result = Origin::from_path(
-            "/debian/dists/sid/main/binary-amd64/Packages/",
+            "/debian/dists/sid/main/binary-amd64/Packages",
             ClientHost::new("2001:db8::1".to_string()).unwrap(),
             None,
+            &local_client(),
         )
         .unwrap();
         assert_eq!(
@@ -1594,9 +1554,10 @@ mod tests {
 
         // IPv6 with port
         let result = Origin::from_path(
-            "/debian/dists/sid/main/binary-amd64/Packages/",
+            "/debian/dists/sid/main/binary-amd64/Packages",
             ClientHost::new("::1".to_string()).unwrap(),
             Some(nonzero!(8080)),
+            &local_client(),
         )
         .unwrap();
         assert_eq!(
@@ -2489,12 +2450,18 @@ mod tests {
 
         // `//` in the mirror path resolves to the same Origin as the
         // un-doubled form thanks to internal normalisation.
-        let raw = Origin::from_path("/debian/dists/sid/main/binary-amd64/Packages", host(), None)
-            .expect("baseline parse");
+        let raw = Origin::from_path(
+            "/debian/dists/sid/main/binary-amd64/Packages",
+            host(),
+            None,
+            &local_client(),
+        )
+        .expect("baseline parse");
         let doubled = Origin::from_path(
             "/debian//dists/sid/main/binary-amd64/Packages",
             host(),
             None,
+            &local_client(),
         )
         .expect("`//` in mirror path should still parse after normalisation");
         assert_eq!(raw.fields, doubled.fields);
@@ -2504,6 +2471,7 @@ mod tests {
             "/debian///dists/sid/main/binary-amd64/Packages",
             host(),
             None,
+            &local_client(),
         )
         .expect("`///` in mirror path should still parse after normalisation");
         assert_eq!(raw.fields, tripled.fields);
@@ -2521,14 +2489,14 @@ mod tests {
         for arch in ["dep11", "i18n", "source"] {
             let path = format!("/debian/dists/sid/main/{arch}/by-hash/SHA256/{DIGEST}");
             assert_eq!(
-                Origin::from_path(&path, host(), None),
+                Origin::from_path(&path, host(), None, &local_client()),
                 None,
                 "{arch} is a pseudo-architecture"
             );
         }
         let real = format!("/debian/dists/sid/main/binary-amd64/by-hash/SHA256/{DIGEST}");
         assert!(
-            Origin::from_path(&real, host(), None).is_some(),
+            Origin::from_path(&real, host(), None, &local_client()).is_some(),
             "a real architecture still parses"
         );
     }
@@ -2546,7 +2514,7 @@ mod tests {
         for dir in ["cnf", "uefi", "signed", "binary-"] {
             let path = format!("/ubuntu/dists/noble/main/{dir}/by-hash/SHA256/{DIGEST}");
             assert_eq!(
-                Origin::from_path(&path, host(), None),
+                Origin::from_path(&path, host(), None, &local_client()),
                 None,
                 "`{dir}` is not an architecture and has no Packages index"
             );
@@ -2565,6 +2533,7 @@ mod tests {
              84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
             host,
             None,
+            &local_client(),
         )
         .expect("valid by-hash URL must parse");
         assert_eq!(parsed.fields.distribution, "sid");
@@ -2583,7 +2552,7 @@ mod tests {
                              4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
         let path = format!("/debian/dists/sid/main/binary-amd64/by-hash/SHA512/{sha512_digest}");
         assert_eq!(
-            Origin::from_path(&path, host(), None),
+            Origin::from_path(&path, host(), None, &local_client()),
             Some(Origin {
                 mirror: Mirror::new(host(), None, String::from("debian"), MirrorKind::Structured),
                 fields: OriginFields {
@@ -2601,13 +2570,17 @@ mod tests {
                  84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
 
         // SHA256 paired with a 128-char digest: length mismatch → rejected.
         let path = format!("/debian/dists/sid/main/binary-amd64/by-hash/SHA256/{sha512_digest}");
-        assert_eq!(Origin::from_path(&path, host(), None), None);
+        assert_eq!(
+            Origin::from_path(&path, host(), None, &local_client()),
+            None
+        );
 
         // Non-hex digest: rejected.
         assert_eq!(
@@ -2616,6 +2589,7 @@ mod tests {
                  zzz902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
@@ -2626,13 +2600,19 @@ mod tests {
                 "/debian/dists/sid/main/binary-amd64/by-hash/SHA256",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
 
         // Missing both algo and digest segments: rejected.
         assert_eq!(
-            Origin::from_path("/debian/dists/sid/main/binary-amd64/by-hash", host(), None,),
+            Origin::from_path(
+                "/debian/dists/sid/main/binary-amd64/by-hash",
+                host(),
+                None,
+                &local_client(),
+            ),
             None
         );
 
@@ -2643,6 +2623,7 @@ mod tests {
                  84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
@@ -2659,6 +2640,7 @@ mod tests {
                 "/debian/dists/sid/main/binary-amd64/Packages/extra",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
@@ -2667,6 +2649,7 @@ mod tests {
                 "/debian/dists/sid/main/binary-amd64/Packages/extra/garbage",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
@@ -2678,6 +2661,7 @@ mod tests {
                 "/debian/dists/sid/main/binary-amd64/Packages.diff/Index",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
@@ -2689,20 +2673,61 @@ mod tests {
                  84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83/extra",
                 host(),
                 None,
+                &local_client(),
             ),
             None
         );
 
-        // The single-trailing-slash tolerance still holds for `Packages*`
-        // (regression-protects `test_parse_1`).
-        assert!(
+        // A trailing slash is no index either: the cache refuses the shape,
+        // so no passthrough of it may mint a row.
+        assert_eq!(
             Origin::from_path(
                 "/debian/dists/sid/main/binary-amd64/Packages/",
                 host(),
                 None,
-            )
-            .is_some()
+                &local_client(),
+            ),
+            None
         );
+    }
+
+    /// Regression: a passthrough minted origins from shapes the cache itself
+    /// refuses. `flat/dists/a/b/binary-x/Packages/` registered a structured
+    /// mirror named `flat`, which disables flat caching for the host.
+    /// `from_path` now accepts exactly what `classify_request` caches.
+    #[test]
+    fn test_origin_from_path_validates_like_the_classifier() {
+        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let from = |path: &str| Origin::from_path(path, host(), None, &local_client());
+
+        for path in [
+            // Trailing slash.
+            "/flat/dists/a/b/binary-x/Packages/",
+            "/debian/dists/sid/main/binary-amd64/Packages.xz/",
+            // Reserved mirror-path segments.
+            "/tmp/dists/sid/main/binary-amd64/Packages",
+            "/debian/by-hash/dists/sid/main/binary-amd64/Packages",
+            "/x/dists/dists/sid/main/binary-amd64/Packages",
+            // Dot segments, raw or encoded.
+            "/debian/../dists/sid/main/binary-amd64/Packages",
+            "/debian/dists/%2e%2e/main/binary-amd64/Packages",
+            // Fields that fail their validator once decoded.
+            "/debian/dists/si%2Fd/main/binary-amd64/Packages",
+            "/debian/dists/sid/ma%00in/binary-amd64/Packages",
+            "/debian/dists/_sid/main/binary-amd64/Packages",
+            "/debian/dists/sid/main/binary-amd64/Packages%ff",
+            // A `_` in a field the cache names join with `_`.
+            "/debian/dists/s_id/main/binary-amd64/Packages",
+            "/debian/dists/sid/ma_in/binary-amd64/by-hash/SHA256/84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
+        ] {
+            assert_eq!(from(path), None, "{path}");
+        }
+
+        // Fields are percent-decoded, each on its own.
+        let decoded = from("/deb%69an/dists/s%69d/main/binary-amd64/Packages.gz")
+            .expect("an encoded letter is still the same index");
+        assert_eq!(decoded.mirror.path(), "debian");
+        assert_eq!(decoded.fields.distribution, "sid");
     }
 
     #[test]
@@ -3270,8 +3295,8 @@ mod tests {
         assert!(!is_byhash_digest_shape(&sha256.replace('4', "z")));
         assert!(is_byhash_digest_shape(sha256));
         assert!(is_byhash_digest_shape(sha512));
-        assert!(is_valid_byhash_pair("SHA256", sha256));
-        assert!(!is_valid_byhash_pair("SHA512", sha256));
+        assert_eq!(byhash_pair("SHA256", sha256), Some(HashAlgo::Sha256));
+        assert_eq!(byhash_pair("SHA512", sha256), None);
     }
 
     /// The recognised index leaves, i.e. exactly which compression suffixes
