@@ -880,13 +880,49 @@ impl Consumed {
     }
 }
 
+/// Parse a chunk-size line (its CRLF already stripped) as RFC 9112 §7.1's
+/// `chunk-size [ chunk-ext ]`: `1*HEXDIG`, then optionally `BWS ";"` and the
+/// extensions, which are ignored.
+///
+/// The relay forwards the raw encoding, so any leniency here is a chunk
+/// boundary a stricter (or differently lenient) client may place elsewhere.
+/// Refused: a sign or `0x` prefix, whitespace other than the `BWS` before
+/// `;` (so `5 ` and ` 5` are refused, as is any Unicode space), and a
+/// control character in the extensions -- a bare CR or LF there is a line
+/// end to some parsers. The extension grammar (`token` / `quoted-string`) is
+/// deliberately not checked further: without CR/LF it cannot move a
+/// boundary, and the extensions are dropped unread.
+fn parse_chunk_size_line(line: &[u8]) -> Result<usize, &'static str> {
+    let digits = line.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+    let (hex, rest) = line.split_at(digits);
+    if hex.is_empty() {
+        return Err("chunked encoding: invalid chunk-size hex");
+    }
+    if !rest.is_empty() {
+        let bws = rest
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        let Some(ext) = rest[bws..].strip_prefix(b";") else {
+            return Err("chunked encoding: invalid chunk-size line");
+        };
+        if ext.iter().any(|&b| b.is_ascii_control() && b != b'\t') {
+            return Err("chunked encoding: invalid chunk extension");
+        }
+    }
+    let hex = std::str::from_utf8(hex).expect("ASCII hex digits are UTF-8");
+    usize::from_str_radix(hex, 16)
+        .map_err(|_err @ ParseIntError { .. }| "chunked encoding: chunk size overflows")
+}
+
 /// Incremental decoder for the chunked transfer coding (RFC 9112 section 7.1).
 ///
 /// The single framing implementation behind both the streaming relay
 /// [`forward_upstream_chunked_body`] (which forwards the raw encoding
 /// unchanged and only needs to know where the body ends) and the buffered
 /// reader [`read_dechunk_body_to_vec`] (which collects the decoded payload).
-/// Chunk extensions after `;` are ignored; trailer fields between `0\r\n`
+/// Chunk-size lines are held to RFC 9112's grammar ([`parse_chunk_size_line`])
+/// and chunk extensions after `;` are ignored; trailer fields between `0\r\n`
 /// and the final `\r\n` are rejected as a framing sanity check rather than
 /// skipped, to catch truncation and smuggling. The declared payload total is
 /// checked against `max_bytes` at every chunk-size line.
@@ -937,21 +973,17 @@ impl ChunkDecoder {
                     let b = data[i];
                     i += 1;
                     self.size_buf.push(b);
-                    if b == b'\n'
-                        && self.size_buf.len() >= 2
-                        && self.size_buf[self.size_buf.len() - 2] == b'\r'
-                    {
-                        // Parse the hex chunk size; ignore optional chunk
-                        // extensions after ';'.
-                        let line = &self.size_buf[..self.size_buf.len() - 2];
-                        let hex_end = line.iter().position(|&c| c == b';').unwrap_or(line.len());
-                        let hex_str = std::str::from_utf8(&line[..hex_end]).map_err(|_err| {
-                            framing_violation("chunked encoding: invalid chunk-size line")
-                        })?;
-                        let chunk_size =
-                            usize::from_str_radix(hex_str.trim(), 16).map_err(|_err| {
-                                framing_violation("chunked encoding: invalid chunk-size hex")
-                            })?;
+                    if b == b'\n' {
+                        // Only CRLF ends the line. A bare LF is refused on
+                        // sight: a client treating it as the terminator
+                        // (RFC 9112 §2.2 lets it) would read what follows
+                        // as chunk data, a different boundary than ours.
+                        let Some(line) = self.size_buf.strip_suffix(b"\r\n") else {
+                            return Err(framing_violation(
+                                "chunked encoding: bare LF in chunk-size line",
+                            ));
+                        };
+                        let chunk_size = parse_chunk_size_line(line).map_err(framing_violation)?;
                         self.size_buf.clear();
                         if chunk_size == 0 {
                             // Terminal chunk; still need to consume the
@@ -1979,6 +2011,87 @@ mod tests {
                 done: true
             }
         );
+    }
+
+    /// The chunk-size line is RFC 9112 §7.1's `1*HEXDIG [ BWS ";" chunk-ext ]
+    /// CRLF` and nothing more lenient: a sign, surrounding whitespace, a hex
+    /// prefix, or a bare CR/LF anywhere in the line would let a client that
+    /// parses the line differently find a different chunk boundary than the
+    /// relay did.
+    #[test]
+    fn chunk_size_line_accepts_only_the_rfc_grammar() {
+        for line in [
+            &b"5"[..],
+            b"05",
+            b"0000000000000005",
+            b"5;ext",
+            b"5;ext=foo",
+            b"5 ;ext",
+            b"5\t; ext = \"v\"",
+            b"5;ext=\"a;b\"",
+            b"5;ext=\xc3\xa9",
+        ] {
+            let mut input = line.to_vec();
+            input.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+            let result = dechunk_once(&input, 1024);
+            assert!(
+                result.is_ok(),
+                "{:?} must be accepted, got {result:?}",
+                line.escape_ascii().to_string()
+            );
+            let (body, consumed) = result.expect("asserted above");
+            assert_eq!(body, b"hello", "{:?}", line.escape_ascii().to_string());
+            assert!(consumed.done, "{:?}", line.escape_ascii().to_string());
+        }
+        let (body, _) = dechunk_once(b"A\r\n0123456789\r\n0\r\n\r\n", 1024).expect("upper hex");
+        assert_eq!(body, b"0123456789");
+        let (body, _) = dechunk_once(b"a\r\n0123456789\r\n0\r\n\r\n", 1024).expect("lower hex");
+        assert_eq!(body, b"0123456789");
+
+        for line in [
+            &b"+5"[..],
+            b"-5",
+            b" 5",
+            b"\t5",
+            b"5 ",
+            b"5\t",
+            b"5 5",
+            b"\xc2\xa05",
+            b"5\xc2\xa0",
+            b"0x5",
+            b"",
+            b";ext",
+            b"5;a\rb",
+            b"5;\x00",
+            b"5;\x7f",
+            b"5\r",
+            b"ffffffffffffffffff",
+        ] {
+            let mut input = line.to_vec();
+            input.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+            let err = dechunk_once(&input, 1024).expect_err(&format!(
+                "{:?} must be rejected",
+                line.escape_ascii().to_string()
+            ));
+            assert_framing_error(&err);
+        }
+
+        // A bare LF ends no chunk-size line, not even inside an extension:
+        // a lenient client would take the bytes after it as chunk data.
+        for input in [
+            &b"5\nhello\r\n0\r\n\r\n"[..],
+            b"5;ext\nhello\r\n0\r\n\r\n",
+            b"5;ext\n0\r\n\r\nX\r\n",
+        ] {
+            let err = dechunk_once(input, 1024).expect_err(&format!(
+                "{:?} must be rejected",
+                input.escape_ascii().to_string()
+            ));
+            assert_framing_error(&err);
+        }
+        // Rejected on sight, without waiting for a CRLF that may never come.
+        let err = dechunk_once(b"5;ext\n", 1024).expect_err("bare LF rejected on sight");
+        assert_framing_error(&err);
     }
 
     #[test]
