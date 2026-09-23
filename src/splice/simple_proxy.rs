@@ -9,6 +9,7 @@ use http::StatusCode;
 use tokio::net::TcpStream;
 use tracing::{debug, info, trace};
 
+use crate::config::ClientHost;
 use crate::database_task::{DatabaseCommand, send_db_command};
 use crate::deb_mirror::{Mirror, Origin, OriginSighting};
 use crate::error::ErrorReport;
@@ -146,11 +147,20 @@ pub(super) fn rewrite_simple_proxy_headers(
 ///
 /// Returns what becomes of the client connection: `conn_action`, unless the
 /// relayed body was close-delimited and the connection has to close.
+///
+/// `mirror` is the upstream the client named and is dialled; a 2xx answer's
+/// `Origin` row is recorded under `canonical_host`, the alias' main host the
+/// dispatcher resolved.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single call site; the dialled mirror and the canonical host are distinct on purpose"
+)]
 pub(crate) async fn splice_simple_proxy(
     client_stream: &TcpStream,
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     mirror: &Mirror,
+    canonical_host: ClientHost,
     upstream_path: &str,
     client: ClientInfo,
     request_received_at: PreciseInstant,
@@ -249,14 +259,11 @@ pub(crate) async fn splice_simple_proxy(
     // Mirror the hyper simple-proxy passthrough: record an Origin row on a
     // 2xx response (only that proves the index exists), for a path the
     // cache itself would accept, so the cleanup machinery can find the
-    // owning mirror.
+    // owning mirror. The row names the alias' main host the dispatcher
+    // resolved, not the dialled `mirror`.
     if resp.status_code.is_success()
-        && let Some(origin) = Origin::from_path(
-            original_uri_path,
-            mirror.host().clone(),
-            mirror.port(),
-            &client,
-        )
+        && let Some(origin) =
+            Origin::from_path(original_uri_path, canonical_host, mirror.port(), &client)
     {
         let cmd = DatabaseCommand::Origin(origin, OriginSighting::Upstream);
         send_db_command(cmd).await;

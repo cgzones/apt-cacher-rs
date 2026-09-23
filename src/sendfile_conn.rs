@@ -1065,6 +1065,7 @@ async fn try_sendfile_request(
             DispatchOutcome::Passthrough {
                 reason,
                 requested_host,
+                canonical_host,
                 request_received_at,
             } => {
                 use crate::{
@@ -1104,6 +1105,7 @@ async fn try_sendfile_request(
                     *conn_version,
                     conn_action,
                     &mirror,
+                    canonical_host,
                     path_and_query,
                     client,
                     request_received_at,
@@ -1122,6 +1124,7 @@ async fn try_sendfile_request(
             DispatchOutcome::Passthrough {
                 reason,
                 requested_host,
+                canonical_host,
                 request_received_at,
             } => {
                 // Without splice this backend has no uncached forwarder; hyper
@@ -1131,6 +1134,7 @@ async fn try_sendfile_request(
                     plan: HandoffPlan::Passthrough {
                         reason,
                         requested_host,
+                        canonical_host,
                         requested_port,
                         request_received_at,
                     },

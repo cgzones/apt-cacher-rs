@@ -2578,6 +2578,7 @@ pub(crate) enum HandoffPlan {
     Passthrough {
         reason: PassthroughReason,
         requested_host: ClientHost,
+        canonical_host: ClientHost,
         requested_port: Option<NonZero<u16>>,
         request_received_at: PreciseInstant,
     },
@@ -2633,6 +2634,9 @@ fn strip_request_body(client: ClientInfo, req: Request<Incoming>) -> Request<Emp
 struct PassthroughRequest {
     reason: PassthroughReason,
     requested_host: ClientHost,
+    /// The host the passthrough's `Origin` row is recorded under, resolved
+    /// by the dispatcher (`DispatchOutcome::Passthrough`).
+    canonical_host: ClientHost,
     requested_port: Option<NonZero<u16>>,
     request_received_at: PreciseInstant,
 }
@@ -2676,11 +2680,13 @@ async fn pre_process_client_request(
         Some(HandoffPlan::Passthrough {
             reason,
             requested_host,
+            canonical_host,
             requested_port,
             request_received_at,
         }) => Some(PassthroughRequest {
             reason,
             requested_host,
+            canonical_host,
             requested_port,
             request_received_at,
         }),
@@ -2750,12 +2756,14 @@ async fn pre_process_client_request(
             DispatchOutcome::Passthrough {
                 reason,
                 requested_host,
+                canonical_host,
                 request_received_at,
             } => (
                 req,
                 PassthroughRequest {
                     reason,
                     requested_host,
+                    canonical_host,
                     requested_port,
                     request_received_at,
                 },
@@ -2766,6 +2774,7 @@ async fn pre_process_client_request(
     let PassthroughRequest {
         reason: passthrough_reason,
         requested_host,
+        canonical_host,
         requested_port,
         request_received_at: passthrough_request_received_at,
     } = passthrough;
@@ -2826,14 +2835,11 @@ async fn pre_process_client_request(
     trace!("Forwarded response: {fwd_response:?}");
 
     // Only a 2xx proves the index exists; `from_path` mints nothing the
-    // cache itself would refuse.
+    // cache itself would refuse. The row names the alias' main host, like a
+    // cached request's.
     if fwd_response.status().is_success()
-        && let Some(origin) = Origin::from_path(
-            parts.uri.path(),
-            requested_host.clone(),
-            requested_port,
-            &client,
-        )
+        && let Some(origin) =
+            Origin::from_path(parts.uri.path(), canonical_host, requested_port, &client)
     {
         debug!("Extracted origin: {origin:?}");
 

@@ -462,6 +462,12 @@ pub(crate) enum DispatchOutcome {
         // and in sendfile's `NotApplicable` handoff.
         reason: PassthroughReason,
         requested_host: ClientHost,
+        /// The alias' main host, or `requested_host` when it names none: the
+        /// host a passthrough's `Origin` row is recorded under
+        /// (`Origin::from_path` in both relays), resolved here like a cached
+        /// request's `ConnectionDetails::mirror`.  The upstream is still
+        /// dialled at `requested_host`.
+        canonical_host: ClientHost,
         // Consumed by both backends: `splice_simple_proxy` (`splice/simple_proxy.rs`,
         // via the sendfile dispatch) and `PassthroughBody` (`hyper_conn.rs`).
         request_received_at: PreciseInstant,
@@ -485,6 +491,7 @@ enum Decision {
     Passthrough {
         reason: PassthroughReason,
         requested_host: ClientHost,
+        canonical_host: ClientHost,
         request_received_at: PreciseInstant,
     },
 }
@@ -533,6 +540,7 @@ pub(crate) async fn dispatch_request(
         Decision::Passthrough {
             reason,
             requested_host,
+            canonical_host,
             request_received_at,
         } => {
             // Exactly-once: the dispatcher runs once per request (see the
@@ -543,6 +551,7 @@ pub(crate) async fn dispatch_request(
             DispatchOutcome::Passthrough {
                 reason,
                 requested_host,
+                canonical_host,
                 request_received_at,
             }
         }
@@ -591,6 +600,13 @@ fn decide_request(
         return Decision::Reject(RejectReason::DiffRequest);
     }
 
+    // Resolve the alias exactly once, for both verdicts: the `Mirror` every
+    // store keys on, and a passthrough's `Origin` row, name the alias' main
+    // host, while the upstream fetch still dials the host the client named.
+    let aliased_host = resolve_alias(aliases, &requested_host);
+    let canonical_host =
+        || aliased_host.map_or_else(|| requested_host.clone(), CacheHost::to_client_host);
+
     let normalized = normalize_uri_path(uri_path);
     let passthrough_reason: PassthroughReason = match parse_request_path(&normalized) {
         None => {
@@ -615,8 +631,6 @@ fn decide_request(
                     return Decision::Reject(RejectReason::UnsafePath);
                 }
 
-                let aliased_host = resolve_alias(aliases, &requested_host);
-
                 let cache_id = aliased_host.unwrap_or_else(|| requested_host.as_cache_host());
                 let layout = class.resource_kind.layout();
                 if query.is_some() {
@@ -636,13 +650,8 @@ fn decide_request(
                     );
                     PassthroughReason::FlatBlocked
                 } else {
-                    // Resolve the alias exactly once: the `Mirror` every
-                    // store keys on names the alias' main host, while the
-                    // upstream fetch still dials the host the client named.
-                    let canonical_host = aliased_host
-                        .map_or_else(|| requested_host.clone(), CacheHost::to_client_host);
                     let mirror = Mirror::new(
-                        canonical_host,
+                        canonical_host(),
                         requested_port,
                         class.mirror_path,
                         layout.mirror_kind(),
@@ -719,6 +728,7 @@ fn decide_request(
     // for the unit tests.
     Decision::Passthrough {
         reason: passthrough_reason,
+        canonical_host: canonical_host(),
         requested_host,
         request_received_at,
     }
@@ -1128,6 +1138,42 @@ mod tests {
         // ... while the dial still goes to the mirror the client named.
         assert_eq!(conn_details.upstream_host, alias);
         assert_eq!(conn_details.upstream_authority(), "ftp.ca.debian.org");
+    }
+
+    /// A passthrough's `Origin` row is canonical too: the verdict carries the
+    /// alias' main host for it, next to the host the relay dials.
+    #[test]
+    fn passthrough_outcome_resolves_alias_once_and_keeps_the_upstream_host() {
+        use crate::config::Alias;
+        let main = ClientHost::new("deb.debian.org".to_owned()).expect("valid host");
+        let alias = ClientHost::new("ftp.ca.debian.org".to_owned()).expect("valid host");
+        let aliases = [Alias {
+            main: main.clone().into_cache_host(),
+            aliases: vec![alias.clone()],
+        }];
+        for (host, canonical) in [(&alias, &main), (&main, &main)] {
+            let decision = decide_request(
+                "/debian/dists/sid/main/binary-amd64/Packages?x=1",
+                host.clone(),
+                None,
+                &local_client(),
+                &aliases,
+                true,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            );
+            let Decision::Passthrough {
+                reason: PassthroughReason::QueryString,
+                requested_host,
+                canonical_host,
+                request_received_at: _,
+            } = decision
+            else {
+                unreachable!("expected a QueryString passthrough")
+            };
+            assert_eq!(&requested_host, host);
+            assert_eq!(&canonical_host, canonical);
+        }
     }
 
     #[test]
