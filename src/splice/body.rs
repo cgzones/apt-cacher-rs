@@ -353,6 +353,18 @@ impl CacheWriter {
             .await
     }
 
+    /// [`Self::write_prefix`] for a buffer the caller owns: it moves into the
+    /// blocking job and back instead of being copied, so a fully buffered
+    /// body is still the caller's to serve once this returns -- on failure
+    /// too.
+    pub(super) async fn write_owned(&mut self, buf: &mut Vec<u8>) -> Result<(), DownloadFailure> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let len = buf.len();
+        self.write_cache_chunk(buf, len).await
+    }
+
     /// Only a drained writer can hand its file and whole-file digest to commit.
     pub(super) fn finish(self) -> (tokio::fs::File, Option<StreamedDigest>) {
         assert!(

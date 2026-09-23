@@ -29,9 +29,10 @@
 //! No backend commits on its connection task -- hyper spawns
 //! `download_file`, splice spawns `splice/commit.rs::CommitTail`, and
 //! `splice/detached.rs` is already off-connection -- so a completed response
-//! never proves the cache file exists. The one exception is
-//! `splice/volatile.rs`, which commits before serving because its body is
-//! already buffered.
+//! never proves the cache file exists. That includes `splice/volatile.rs`:
+//! it lands its buffered body in the temp file before the response, but
+//! spawns the tail (`CommitTail::spawn_before_serving`) and serves from
+//! memory while it commits.
 
 use std::{
     fmt,

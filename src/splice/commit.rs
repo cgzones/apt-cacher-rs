@@ -13,13 +13,13 @@
 //!   own task as soon as upstream finishes. The returned [`ClientSettlement`]
 //!   awaits any demoted writer on the connection task and sends its verdict
 //!   for reporting; neither the commit nor the client waits for the other.
+//! - [`CommitTail::spawn_before_serving`]: the buffered volatile path
+//!   ([`super::volatile`]), which spawns the same task *before* it writes the
+//!   response -- its body is already on disk, so the commit must not depend
+//!   on the client write -- and hands the client's fate to the returned
+//!   [`ClientVerdict`] once it has served it from memory.
 //! - [`CommitTail::finish`]: the detached download ([`super::detached`]),
 //!   already off the connection, which runs the same steps in place.
-//! - [`CommitTail::commit`] then [`Committed::report`]: the buffered volatile
-//!   path ([`super::volatile`]), which commits *before* it serves -- its body
-//!   is already in memory, so caching it costs the client nothing and must
-//!   not depend on the client write -- and so only knows the client's fate
-//!   afterwards.
 //!
 //! A demoted client (`body::PreparedFileServe::spawn`) is still writing this
 //! response through a `dup(2)` of the connection's socket, so the connection
@@ -179,7 +179,29 @@ pub(super) struct ClientSettlement {
     end: ClientEnd,
     served: Served,
     rates: RateTimestamps,
+    verdict: ClientVerdict,
+}
+
+/// Where a spawned tail's client verdict goes: the tail commits first, then
+/// waits for this before it reports. Dropping it unsent (a cancelled
+/// connection) makes the tail report the delivery as lost.
+#[must_use = "the tail reports the delivery as lost unless the verdict is sent"]
+pub(super) struct ClientVerdict {
     report: oneshot::Sender<ClientReport>,
+}
+
+impl ClientVerdict {
+    /// Hand the client's fate to the tail. A synchronous send: a slow or
+    /// failed commit cannot delay the client.
+    pub(super) fn send(self, rates: RateTimestamps, client: CompletionClient) {
+        // The receiver is gone when committing failed; the client must still
+        // finish even though there is no cached download to report.
+        if let Err(ClientReport {
+            rates: _,
+            client: _,
+        }) = self.report.send(ClientReport { rates, client })
+        {}
+    }
 }
 
 struct ClientReport {
@@ -199,17 +221,11 @@ impl ClientSettlement {
             end,
             served,
             mut rates,
-            report,
+            verdict,
         } = self;
         let client = settle(end, served, &mut rates).await;
         let succeeded = matches!(client, CompletionClient::Served(_));
-        // The receiver is gone when committing failed; the client must still
-        // finish even though there is no cached download to report.
-        if let Err(ClientReport {
-            rates: _,
-            client: _,
-        }) = report.send(ClientReport { rates, client })
-        {}
+        verdict.send(rates, client);
         succeeded
     }
 }
@@ -269,6 +285,18 @@ impl CommitTail {
         end: ClientEnd,
         served: Served,
     ) -> ClientSettlement {
+        ClientSettlement {
+            end,
+            served,
+            rates,
+            verdict: self.spawn_before_serving(rates),
+        }
+    }
+
+    /// [`Self::spawn`] for a caller that has not served its client yet: the
+    /// tail commits right away and reports once the returned verdict is sent.
+    /// `rates` is only the fallback for a verdict that never comes.
+    pub(super) fn spawn_before_serving(self, rates: RateTimestamps) -> ClientVerdict {
         let (report, receiver) = oneshot::channel();
         tokio::task::spawn(async move {
             // Commit before receiving the verdict: awaiting it first would
@@ -278,12 +306,7 @@ impl CommitTail {
                 committed.report(&rates, client).await;
             }
         });
-        ClientSettlement {
-            end,
-            served,
-            rates,
-            report,
-        }
+        ClientVerdict { report }
     }
 
     /// Commit, then report: the completion line and, for a client that got
@@ -304,7 +327,7 @@ impl CommitTail {
     /// failed: it logged the cause and dropped the barrier, the temp-file
     /// guard removed the partial, and nothing is cached (future requests
     /// re-download), so no DB row is written.
-    pub(super) async fn commit(self) -> Option<Committed> {
+    async fn commit(self) -> Option<Committed> {
         let Self {
             target,
             conn_details,
@@ -429,11 +452,11 @@ impl Committed {
     /// The completion line, then the `Delivery` row.
     ///
     /// Kept together on purpose: which arms write a `Delivery` row is a
-    /// decision that must not drift between the streaming tail and the
-    /// volatile path. A `Delivery` row is exactly "this client received the
-    /// whole body", which is exactly the `Served` arm: `Aborted` did not receive it and
-    /// `Absent` never had a client.
-    pub(super) async fn report(self, rates: &RateTimestamps, client: CompletionClient) {
+    /// decision that must not drift between the tail's callers. A `Delivery`
+    /// row is exactly "this client received the whole body", which is
+    /// exactly the `Served` arm: `Aborted` did not receive it and `Absent`
+    /// never had a client.
+    async fn report(self, rates: &RateTimestamps, client: CompletionClient) {
         let Self {
             conn_details,
             conn_label,
@@ -611,7 +634,7 @@ mod tests {
             end: ClientEnd::Demoted(tokio::task::spawn(async { TransferOutcome::complete(7) })),
             served: SERVED,
             rates: rates(),
-            report,
+            verdict: ClientVerdict { report },
         };
         // No receiver is polled until settlement completes, like a commit
         // still waiting for fsync. The client must not wait for reporting.
@@ -635,7 +658,7 @@ mod tests {
             end: ClientEnd::Demoted(handle),
             served: SERVED,
             rates,
-            report,
+            verdict: ClientVerdict { report },
         };
         let task = tokio::task::spawn(settlement.settle());
         task.abort();
@@ -653,7 +676,7 @@ mod tests {
             end: ClientEnd::Demoted(tokio::task::spawn(async { TransferOutcome::complete(7) })),
             served: SERVED,
             rates: rates(),
-            report,
+            verdict: ClientVerdict { report },
         };
         // A failed commit drops the receiver. The socket must still finish
         // its response before the connection can be reused.

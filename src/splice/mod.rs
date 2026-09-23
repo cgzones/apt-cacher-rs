@@ -1217,9 +1217,10 @@ async fn send_resumed_prefix<'a>(
 /// [`write_body_prefix`], split out so the client-less detached download
 /// ([`detached::DetachedDownload`]) shares exactly these bytes and this one
 /// error line -- `consequence` is what differs between the callers: the
-/// connected drive closes its connection, while the detached download and the
-/// buffered volatile path (which serves its client from memory either way)
-/// abandon the download.
+/// connected drive closes its connection, while the detached download
+/// abandons the download (as does the buffered volatile path, which serves
+/// its client from memory either way, through the owned-buffer sibling
+/// [`write_buffered_body_to_cache`]).
 ///
 /// The owning download runner concludes any failure before return, and the
 /// failed download publishes it; the target is gone with it.
@@ -1228,7 +1229,37 @@ async fn write_body_prefix_to_cache(
     body_prefix: &[u8],
     consequence: Consequence,
 ) -> Result<CacheTarget, ReportedDownloadFailure> {
-    if body_prefix.is_empty() {
+    land_in_cache(target, body_prefix.len(), consequence, async |writer| {
+        writer.write_prefix(body_prefix).await
+    })
+    .await
+}
+
+/// [`write_body_prefix_to_cache`] for the buffered volatile path's whole
+/// body, which moves into the blocking write and back
+/// ([`body::CacheWriter::write_owned`]) instead of being copied: `body` is
+/// intact for the client once this returns, whatever the outcome.
+async fn write_buffered_body_to_cache(
+    target: CacheTarget,
+    body: &mut Vec<u8>,
+    consequence: Consequence,
+) -> Result<CacheTarget, ReportedDownloadFailure> {
+    let len = body.len();
+    land_in_cache(target, len, consequence, async |writer| {
+        writer.write_owned(body).await
+    })
+    .await
+}
+
+/// The shared half of the two writers above: run `write` (which lands `len`
+/// bytes) under the download runner, then notify the late joiners.
+async fn land_in_cache(
+    target: CacheTarget,
+    len: usize,
+    consequence: Consequence,
+    write: impl AsyncFnOnce(&mut CacheWriter) -> Result<(), DownloadFailure>,
+) -> Result<CacheTarget, ReportedDownloadFailure> {
+    if len == 0 {
         return Ok(target);
     }
     let CacheTarget {
@@ -1240,8 +1271,8 @@ async fn write_body_prefix_to_cache(
     } = target;
     let (dbarrier, ()) = dbarrier
         .run(consequence, async |barrier| {
-            writer.write_prefix(body_prefix).await?;
-            barrier.ping_batched(body_prefix.len() as u64);
+            write(&mut writer).await?;
+            barrier.ping_batched(len as u64);
             Ok(())
         })
         .await
