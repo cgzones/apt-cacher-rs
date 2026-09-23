@@ -167,8 +167,9 @@ pub(super) async fn standard_upstream_connect(
     scheme_override: Option<Scheme>,
 ) -> Result<UpstreamExchange, UpstreamError> {
     // Resolve the scheme decision ONCE per connect: it drives the pool-lookup
-    // key, the HTTPS-upgrade accounting, and the connect itself. A per-request
-    // redirect forcing the scheme carries no decision, and so does none of the
+    // key, the HTTPS-upgrade accounting, and the connect itself. A forced
+    // scheme (an `https://` redirect target, a refetch keeping its discarded
+    // connection's scheme) carries no decision, and so does none of the
     // scheme-cache / upgrade-metric bookkeeping below.
     let (resolved_scheme, decision) = if let Some(scheme) = scheme_override {
         (Some(scheme), None)
@@ -469,6 +470,15 @@ pub(super) async fn follow_redirect(
     );
     let redirect_authority = redirect_mirror.format_authority();
 
+    // An `https://` target is fetched over TLS whatever the policy says. An
+    // `http://` one is decided like any upstream (scheme cache,
+    // `http_only_mirrors`, `https_upgrade_mode`), as hyper's
+    // `request_with_retry` does: forcing plaintext would let a redirect
+    // downgrade a mirror the operator requires TLS for.
+    let redirect_override = match redirect_scheme {
+        Scheme::Https => Some(Scheme::Https),
+        Scheme::Http => None,
+    };
     let exchange = standard_upstream_connect(
         &redirect_mirror,
         redirect_authority,
@@ -476,7 +486,7 @@ pub(super) async fn follow_redirect(
         resume_offset,
         resume_if_range,
         volatile_cond,
-        Some(redirect_scheme),
+        redirect_override,
     )
     .await
     .inspect_err(|_err| {
@@ -529,11 +539,10 @@ pub(super) async fn discard_partial_and_retry(
     conn_details: &ConnectionDetails,
 ) -> Result<UpstreamExchange, UpstreamError> {
     // Try a bounded drain before refetching. Preserve the scheme used by
-    // the discarded connection --
-    // after a redirect it was fixed by the `Location` URL and never cached
-    // for the target host, so re-deciding it (under `Auto`, an HTTPS probe
-    // against a target the redirect named as `http://`) would look the
-    // pooled connection up under the wrong key.
+    // the discarded connection -- after a redirect to an `https://` target
+    // it was fixed by the `Location` URL and never cached for the target
+    // host, so re-deciding it (an HTTP decision for an `http_only_mirrors`
+    // target) would look the pooled connection up under the wrong key.
     let scheme = exchange.conn.scheme();
     exchange.dispose("splice proxy:").await;
     partial.discard_resume().await;
