@@ -340,7 +340,10 @@ impl ResponseHead<'_> {
             retry_after,
         } = self;
 
-        let mut out = String::with_capacity(256);
+        // A cache-hit 200 carrying every optional validator renders to
+        // ~300 bytes and a 206 adds a ~50-byte `Content-Range`; 512 holds
+        // either (and an inline error body) without a regrow.
+        let mut out = String::with_capacity(512);
         match kind {
             ResponseKind::TunnelEstablished => {
                 swrite!(out, "{conn_version} 200 Connection Established\r\n");
