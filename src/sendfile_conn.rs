@@ -119,6 +119,12 @@ const MAX_HEADER_SIZE: usize = 8192;
 const SMALL_SERVE_INLINE_MAX: u64 = 256 * 1024;
 /// Initial size for HTTP request headers buffer.
 const INITIAL_HEADER_SIZE: usize = 2048;
+/// Spare room guaranteed before each request-header read. `BytesMut`
+/// reclaims the space of requests already advanced past only once its spare
+/// capacity is exactly zero, so without this a read on a keep-alive
+/// connection regularly got the few bytes left at the end of the buffer and
+/// cost an extra `recvfrom` and loop pass; `reserve` reclaims in place.
+const MIN_HEADER_READ_ROOM: usize = INITIAL_HEADER_SIZE / 2;
 /// Maximum number of HTTP headers to parse (matches hyper's default of 100).
 const MAX_HEADERS: usize = 100;
 
@@ -468,6 +474,7 @@ async fn read_request_headers(
             biased;
             ready = stream.readable() => {
                 ready?;
+                buf.reserve(MIN_HEADER_READ_ROOM);
                 match stream.try_read_buf(buf) {
                     Ok(0) => {
                         if buf.is_empty() {
