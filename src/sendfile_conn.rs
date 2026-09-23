@@ -2,14 +2,18 @@
 //! files via sendfile(2), fetches misses through `splice` (with
 //! `splice`) and hands everything else to hyper.
 //!
-//! Handoff contract: `ZeroCopyResult::NotApplicable` gives the connection to
-//! hyper for the current and every later request.  The buffered bytes are
-//! prepended to hyper's stream (`MaybePrependedStream`) and the work already
-//! done for that first request travels alongside as `hyper_conn::HandoffPlan`,
-//! so hyper resumes the pipeline (`serve_cache_miss`,
-//! `serve_downloading_file` or the simple proxy) instead of re-parsing,
-//! re-dispatching and re-looking up.  Every `NotApplicable` site builds the
-//! plan variant matching what it has already run and accounted for; the
+//! Handoff contract: `ZeroCopyResult::NotApplicable` gives the current
+//! request to hyper.  The work already done for it travels alongside as
+//! `hyper_conn::HandoffPlan`, so hyper resumes the pipeline
+//! (`serve_cache_miss`, `serve_downloading_file` or the simple proxy) instead
+//! of re-parsing, re-dispatching and re-looking up.  A bodiless HTTP/1.1
+//! keep-alive request is handed over alone: hyper reads only its head
+//! (`MaybePrependedStream::single_request`), and the connection, with any
+//! pipelined requests held back behind it, returns to this loop
+//! (`hyper_conn::serve_handoff_request`).  Any other request takes the
+//! connection with it: the buffered bytes are prepended to hyper's stream
+//! and hyper serves every later request.  Every `NotApplicable` site builds
+//! the plan variant matching what it has already run and accounted for; the
 //! accounting rules are on `HandoffPlan` and `cache_layout::CacheMiss`.
 
 use std::{
@@ -40,7 +44,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace};
 
 #[cfg(feature = "hyper")]
-use crate::hyper_conn::{HandoffPlan, handle_hyper_connection};
+use crate::hyper_conn::{HandoffPlan, handle_hyper_connection, serve_handoff_request};
 #[cfg(feature = "splice")]
 #[cfg(feature = "splice")]
 use crate::splice::SpliceProxyError;
@@ -149,6 +153,11 @@ pub(crate) enum ZeroCopyResult {
         reason: &'static str,
         #[cfg(feature = "hyper")]
         plan: HandoffPlan,
+        /// What the request asked for the connection: a bodiless HTTP/1.1
+        /// keep-alive request is served by hyper alone and the connection
+        /// returns to this backend (`hyper_conn::serve_handoff_request`).
+        #[cfg(feature = "hyper")]
+        conn_action: ConnectionAction,
     },
 
     /// Request is invalid, reject and close the connection
@@ -206,6 +215,9 @@ pub(crate) async fn handle_sendfile_connection(
     client: ClientInfo,
     appstate: AppState,
 ) {
+    // A single-request handoff to hyper hands the stream back.
+    #[cfg(feature = "hyper")]
+    let mut stream = stream;
     let mut buf = BytesMut::with_capacity(INITIAL_HEADER_SIZE);
 
     trace!("Using sendfile(2) backend to handle request from client {client}...");
@@ -295,9 +307,36 @@ pub(crate) async fn handle_sendfile_connection(
                 reason,
                 #[cfg(feature = "hyper")]
                 plan,
+                #[cfg(feature = "hyper")]
+                conn_action,
             } => {
                 #[cfg(feature = "hyper")]
                 {
+                    // A bodiless HTTP/1.1 keep-alive request (a body forces
+                    // `Close`, see `compute_conn_action`): hyper serves it
+                    // alone and the connection comes back here, so the
+                    // requests behind a miss keep the sendfile path. hyper
+                    // sees only this request's head; the pipelined bytes
+                    // behind it wait here.
+                    if conn_action == ConnectionAction::KeepAlive
+                        && conn_version == ConnectionVersion::Http11
+                    {
+                        debug!(
+                            "Handing request #{req_num} from client {client} to hyper due to: {reason}"
+                        );
+                        let pipelined = buf.split_off(next_header_index);
+                        let single = MaybePrependedStream::single_request(buf, stream);
+                        let Some((single, unparsed)) =
+                            serve_handoff_request(single, client, appstate.clone(), plan).await
+                        else {
+                            return;
+                        };
+                        let (reclaimed, unread) = single.into_parts();
+                        stream = reclaimed;
+                        buf = reassemble_unparsed(&unparsed, unread, pipelined);
+                        continue;
+                    }
+
                     // Fall back to hyper for this and all subsequent requests.
                     // `buf` starts with the request `plan` describes; any
                     // pipelined successors behind it are hyper's to parse.
@@ -1138,6 +1177,7 @@ async fn try_sendfile_request(
                         requested_port,
                         request_received_at,
                     },
+                    conn_action,
                 };
             }
         };
@@ -1368,6 +1408,7 @@ async fn try_sendfile_request(
                 cache_path,
                 miss,
             },
+            conn_action,
         }
     }
 }
@@ -2519,6 +2560,8 @@ async fn serve_unfinished_sendfile(
                 conn_details,
                 status: dl_status,
             },
+            #[cfg(feature = "hyper")]
+            conn_action,
         };
     };
 
@@ -2631,24 +2674,72 @@ async fn serve_unfinished_sendfile(
 
 /// A stream that may have prepended data from a previous read.
 /// When all prepended data is consumed, the buffer is dropped and
-/// subsequent reads go straight to the inner TCP stream.
+/// subsequent reads go straight to the inner TCP stream -- unless the
+/// stream is gated ([`Self::single_request`]), in which case they stay
+/// pending.
 #[cfg(feature = "hyper")]
 struct MaybePrependedStream {
     prepend: Option<BytesMut>,
     stream: TcpStream,
+    /// Reads past `prepend` never reach `stream`.
+    gated: bool,
 }
 
 #[cfg(feature = "hyper")]
 impl MaybePrependedStream {
     fn new(prepend: BytesMut, stream: TcpStream) -> Self {
+        Self::with_gate(prepend, stream, false)
+    }
+
+    /// A stream that yields `request` and then nothing: a read past it
+    /// stays pending, so hyper, which parses whatever it reads, can serve
+    /// that one request and never start on the next
+    /// (`hyper_conn::serve_handoff_request`). The pending read registers no
+    /// wake-up; nothing but the hand-back ends it.
+    fn single_request(request: BytesMut, stream: TcpStream) -> Self {
+        Self::with_gate(request, stream, true)
+    }
+
+    fn with_gate(prepend: BytesMut, stream: TcpStream, gated: bool) -> Self {
         let prepend = if prepend.is_empty() {
             None
         } else {
             Some(prepend)
         };
 
-        Self { prepend, stream }
+        Self {
+            prepend,
+            stream,
+            gated,
+        }
     }
+
+    /// The socket back, with the prepended bytes nothing read.
+    fn into_parts(self) -> (TcpStream, Option<BytesMut>) {
+        let Self {
+            prepend,
+            stream,
+            gated: _,
+        } = self;
+        (stream, prepend)
+    }
+}
+
+/// The connection's read buffer after a single-request handoff: what hyper
+/// read but did not parse, then the prepended bytes it never read, then the
+/// pipelined requests held back from it -- stream order. All but the last
+/// are empty unless hyper stopped short of the request it was given.
+#[cfg(feature = "hyper")]
+fn reassemble_unparsed(unparsed: &[u8], unread: Option<BytesMut>, pipelined: BytesMut) -> BytesMut {
+    if unparsed.is_empty() && unread.as_ref().is_none_or(BytesMut::is_empty) {
+        return pipelined;
+    }
+    let mut buf = BytesMut::from(unparsed);
+    if let Some(unread) = unread {
+        buf.unsplit(unread);
+    }
+    buf.unsplit(pipelined);
+    buf
 }
 
 #[cfg(feature = "hyper")]
@@ -2669,6 +2760,9 @@ impl AsyncRead for MaybePrependedStream {
             }
             return Poll::Ready(Ok(()));
         }
+        if this.gated {
+            return Poll::Pending;
+        }
         Pin::new(&mut this.stream).poll_read(cx, buf)
     }
 }
@@ -2682,6 +2776,20 @@ impl AsyncWrite for MaybePrependedStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    #[inline]
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    #[inline]
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
     }
 
     #[inline]

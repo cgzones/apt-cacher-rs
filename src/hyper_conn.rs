@@ -3,11 +3,13 @@
 //! itself, and the resumption point for requests the sendfile backend has
 //! already classified.
 //!
-//! `handle_hyper_connection` takes an `Option<HandoffPlan>` from
-//! `sendfile_conn`; the plan applies to the first request on the connection
-//! only (see [`HandoffPlan`] for the pairing invariant and the pipeline stage
-//! each variant enters).  Later keep-alive requests run the full pipeline
-//! here.
+//! A `HandoffPlan` from `sendfile_conn` enters through one of two doors:
+//! `serve_handoff_request` serves that one request and gives the connection
+//! back to the sendfile backend (a bodiless HTTP/1.1 keep-alive request);
+//! `handle_hyper_connection` keeps the connection, the plan applying to its
+//! first request only and later keep-alive requests running the full
+//! pipeline here (see [`HandoffPlan`] for the pairing invariant and the
+//! pipeline stage each variant enters).
 
 use std::{
     borrow::Cow, convert::Infallible, fmt, num::NonZero, os::unix::fs::MetadataExt as _,
@@ -3053,6 +3055,17 @@ fn client_max_buf_size(buffer_size: usize) -> usize {
     CLIENT_HEAD_ALLOWANCE.max(buffer_size.saturating_add(CLIENT_HEAD_ALLOWANCE))
 }
 
+/// The client-facing HTTP/1 server settings every hyper-served connection
+/// shares.
+fn client_http1_builder() -> http1::Builder {
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(global_config().client_idle_timeout)
+        .max_buf_size(client_max_buf_size(global_config().buffer_size));
+    builder
+}
+
 /// Serve every request on `stream` through hyper.
 ///
 /// `handoff` is `Some` when the sendfile backend hands over a connection
@@ -3067,18 +3080,6 @@ pub(crate) async fn handle_hyper_connection<T>(
 ) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    #[must_use]
-    fn hyper_is_peer_disconnect(err: &hyper::Error) -> bool {
-        if let Some(err) = std::error::Error::source(&err)
-            && let Some(ioerr) = err.downcast_ref::<std::io::Error>()
-            && is_peer_disconnect(ioerr)
-        {
-            return true;
-        }
-
-        false
-    }
-
     // The plan pairs with the first service invocation only: the stream's
     // prepended bytes are exactly the request sendfile parsed (with any
     // pipelined successors behind it), hyper invokes the service once per
@@ -3094,10 +3095,7 @@ pub(crate) async fn handle_hyper_connection<T>(
     let (sender, mut tunnels_done) = tokio::sync::mpsc::channel::<Never>(1);
     let hold = ConnectionHold { _sender: sender };
 
-    let served = http1::Builder::new()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(global_config().client_idle_timeout)
-        .max_buf_size(client_max_buf_size(global_config().buffer_size))
+    if let Err(err) = client_http1_builder()
         .serve_connection(
             TokioIo::new(stream),
             service_fn(move |req| {
@@ -3111,41 +3109,9 @@ pub(crate) async fn handle_hyper_connection<T>(
             }),
         )
         .with_upgrades()
-        .await;
-
-    if let Err(err) = served {
-        if let Some(failure) = accounted_body_failure(&err) {
-            debug!(
-                "Closing connection to client {client} after accounted body failure:  {}",
-                ErrorReport(failure)
-            );
-        } else if err.is_incomplete_message() || hyper_is_peer_disconnect(&err) {
-            // Hyper does not expose per-frame write errors, so we cannot
-            // tell whether the disconnect happened mid-body, between
-            // pipelined requests, or before any response was started. Bump
-            // on the full outer guard — both peer-disconnect and incomplete-
-            // message framing breaks indicate the client went away — since
-            // the alternative (silently dropping these) gives the operator
-            // a worse signal. See the docstring on
-            // CLIENT_DISCONNECTED_MID_BODY for the scope caveat.
-            metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
-            info!(
-                "Connection to client {client} disconnected:  {}",
-                ErrorReport(&err)
-            );
-        } else if err.is_timeout() {
-            // hyper's `header_read_timeout` (driven by `client_idle_timeout`)
-            // fires on idle keep-alive and slowloris-shaped clients. This is
-            // benign disconnect behaviour, not a server fault — log at debug
-            // and leave HTTP_TIMEOUT_CLIENT_HEADER untouched (the sendfile
-            // backend is the sole owner of that counter).
-            debug!("Client {client} idle-timed out before sending request headers");
-        } else {
-            error!(
-                "Failed to serve connection for client {client}; closing the connection:  {}",
-                ErrorReport(&err)
-            );
-        }
+        .await
+    {
+        log_client_connection_error(client, &err);
     }
 
     // Return (and so release the connection's slot) only once every tunnel
@@ -3153,6 +3119,182 @@ pub(crate) async fn handle_hyper_connection<T>(
     match tunnels_done.recv().await {
         None => {}
         Some(never) => match never {},
+    }
+}
+
+/// Serve exactly the one request `plan` describes through hyper, then hand
+/// the connection back to the sendfile backend.
+///
+/// `stream` must yield that request's head and nothing after it: its reads
+/// past the head stay pending (`sendfile_conn::MaybePrependedStream::single_request`),
+/// so hyper can never parse a second request, pipelined or not. The caller
+/// only hands over a bodiless HTTP/1.1 keep-alive request.
+///
+/// Once the service has produced the response, keep-alive is disabled. That
+/// is after hyper wrote the response head -- it writes the head in the same
+/// poll that resolves the service future -- so the head carries no
+/// `Connection: close`, and the connection ends as soon as hyper has
+/// flushed the response instead of waiting for the next request. hyper then
+/// returns the stream and whatever it read but did not parse.
+///
+/// Returns `None` when the connection must end instead: a hyper error
+/// (logged here), or a response after which it must not be handed back (see
+/// [`response_keeps_alive`]), whose write side is shut down here.
+#[cfg(feature = "sendfile")]
+pub(crate) async fn serve_handoff_request<T>(
+    stream: T,
+    client: ClientInfo,
+    appstate: AppState,
+    plan: HandoffPlan,
+) -> Option<(T, bytes::Bytes)>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    type ServiceFuture = std::pin::Pin<
+        Box<dyn Future<Output = Result<Response<ProxyCacheBody>, Infallible>> + Send>,
+    >;
+
+    // Set once, when the service has the response: whether it keeps the
+    // connection alive.
+    let keep_alive = Arc::new(std::sync::OnceLock::new());
+    let plan = parking_lot::Mutex::new(Some(plan));
+    // A handed-off request is never a CONNECT (the sendfile backend runs
+    // every tunnel itself) and this connection is served without upgrades,
+    // so no tunnel can borrow the hold: nothing waits on its receiver.
+    let (sender, _tunnels_done) = tokio::sync::mpsc::channel::<Never>(1);
+    let hold = ConnectionHold { _sender: sender };
+    let service = {
+        let keep_alive = Arc::clone(&keep_alive);
+        service_fn(move |req| -> ServiceFuture {
+            let plan = plan.lock().take();
+            let keep_alive = Arc::clone(&keep_alive);
+            let appstate = appstate.clone();
+            let hold = hold.clone();
+            Box::pin(async move {
+                let response =
+                    pre_process_client_request_wrapper(client, req, appstate, plan, hold).await;
+                if let Ok(response) = &response {
+                    // Ignored when already set: the gated stream admits one
+                    // request, so there is no second invocation to record.
+                    if keep_alive.set(response_keeps_alive(response)).is_err() {}
+                }
+                response
+            })
+        })
+    };
+
+    let mut conn = client_http1_builder().serve_connection(TokioIo::new(stream), service);
+    // Every response gets the shutdown, not only one handed back: hyper takes
+    // keep-alive from the HTTP/1.1 request, so after a response the handoff
+    // will not hand back (an HTTP/1.0 one with a length) it can go idle on
+    // the gated read, which never wakes it, until `header_read_timeout`.
+    let mut shutting_down = false;
+    let result = std::future::poll_fn(|cx| {
+        let polled = conn.poll_without_shutdown(cx);
+        if polled.is_pending() && !shutting_down && keep_alive.get().is_some() {
+            std::pin::Pin::new(&mut conn).graceful_shutdown();
+            shutting_down = true;
+            // Idle already (the response is flushed and hyper waits on the
+            // gated read): the shutdown closes at once, on the next poll.
+            cx.waker().wake_by_ref();
+        }
+        polled
+    })
+    .await;
+
+    if let Err(err) = result {
+        log_client_connection_error(client, &err);
+        return None;
+    }
+    let parts = conn.into_parts();
+    let read_buf = parts.read_buf;
+    let mut stream = parts.io.into_inner();
+    if shutting_down && keep_alive.get() == Some(&true) {
+        return Some((stream, read_buf));
+    }
+    // The response ends the connection (see `response_keeps_alive`), or
+    // hyper ended it before there was one. Finish it the way hyper's own
+    // shutdown would -- for a close-delimited body the FIN is the end of the
+    // response.
+    match tokio::io::AsyncWriteExt::shutdown(&mut stream).await {
+        Ok(()) => {}
+        Err(err) => debug!(
+            "Failed to shut down the connection to client {client} after a closing response:  {}",
+            ErrorReport(&err)
+        ),
+    }
+    None
+}
+
+/// Whether a single-request handoff may hand the connection back after
+/// `response`; otherwise the connection ends with it.
+///
+/// Not when any `Connection` header carries `close`, and not for a response
+/// that is not HTTP/1.1: a relayed passthrough keeps the upstream's version
+/// (`passthrough_response`). hyper frames an HTTP/1.0 response of unknown
+/// length by closing the connection, and handing that connection back would
+/// leave the client waiting for the EOF that ends its body until the idle
+/// timeout. One with a known length hyper would keep open for the HTTP/1.1
+/// request, but its client, seeing an HTTP/1.0 response without
+/// `keep-alive`, is entitled to treat the connection as closing (RFC 9112
+/// section 9.3), so ending it loses nothing.
+#[cfg(feature = "sendfile")]
+fn response_keeps_alive(response: &Response<ProxyCacheBody>) -> bool {
+    response.version() == http::Version::HTTP_11
+        && !response.headers().get_all(CONNECTION).iter().any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+            })
+        })
+}
+
+/// Log how a hyper-served client connection ended in error.
+fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
+    #[must_use]
+    fn hyper_is_peer_disconnect(err: &hyper::Error) -> bool {
+        if let Some(err) = std::error::Error::source(&err)
+            && let Some(ioerr) = err.downcast_ref::<std::io::Error>()
+            && is_peer_disconnect(ioerr)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    if let Some(failure) = accounted_body_failure(err) {
+        debug!(
+            "Closing connection to client {client} after accounted body failure:  {}",
+            ErrorReport(failure)
+        );
+    } else if err.is_incomplete_message() || hyper_is_peer_disconnect(err) {
+        // Hyper does not expose per-frame write errors, so we cannot
+        // tell whether the disconnect happened mid-body, between
+        // pipelined requests, or before any response was started. Bump
+        // on the full outer guard — both peer-disconnect and incomplete-
+        // message framing breaks indicate the client went away — since
+        // the alternative (silently dropping these) gives the operator
+        // a worse signal. See the docstring on
+        // CLIENT_DISCONNECTED_MID_BODY for the scope caveat.
+        metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+        info!(
+            "Connection to client {client} disconnected:  {}",
+            ErrorReport(err)
+        );
+    } else if err.is_timeout() {
+        // hyper's `header_read_timeout` (driven by `client_idle_timeout`)
+        // fires on idle keep-alive and slowloris-shaped clients. This is
+        // benign disconnect behaviour, not a server fault — log at debug
+        // and leave HTTP_TIMEOUT_CLIENT_HEADER untouched (the sendfile
+        // backend is the sole owner of that counter).
+        debug!("Client {client} idle-timed out before sending request headers");
+    } else {
+        error!(
+            "Failed to serve connection for client {client}; closing the connection:  {}",
+            ErrorReport(err)
+        );
     }
 }
 
