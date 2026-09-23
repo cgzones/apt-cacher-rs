@@ -1054,7 +1054,11 @@ impl Database {
                       (SELECT ts FROM new_seen WHERE new_seen.id = mirrors_v2.id)) \
                   WHERE id IN (SELECT id FROM new_seen)",
             );
-            let res = qb.build().execute(&mut *tx).await?;
+            // Not persistent: the SQL text changes with the chunk's row
+            // count, so caching it would park up to one prepared statement
+            // per distinct batch size in the connection's LRU (capacity
+            // 100) and evict the fixed `query!` statements.
+            let res = qb.build().persistent(false).execute(&mut *tx).await?;
             affected = affected.saturating_add(res.rows_affected());
         }
         tx.commit().await?;
@@ -1087,7 +1091,8 @@ impl Database {
                     .push_bind(row.partial)
                     .push_bind(&row.client_ip[..]);
             });
-            qb.build().execute(&mut *tx).await?;
+            // Not persistent; see `batch_update_mirror_last_seen`.
+            qb.build().persistent(false).execute(&mut *tx).await?;
         }
         tx.commit().await
     }
@@ -1114,7 +1119,8 @@ impl Database {
                     .push_bind(row.duration)
                     .push_bind(&row.client_ip[..]);
             });
-            qb.build().execute(&mut *tx).await?;
+            // Not persistent; see `batch_update_mirror_last_seen`.
+            qb.build().persistent(false).execute(&mut *tx).await?;
         }
         tx.commit().await
     }
