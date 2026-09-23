@@ -57,13 +57,15 @@ use std::{
 
 use ::http::StatusCode;
 use tokio::net::TcpStream;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
 
 use crate::cache_conditional::{RangeRequestHeaders, ServeParams};
 use crate::cache_layout::{CachedFlavor, ConnectionDetails};
 use crate::cache_quota::QuotaExceeded;
 use crate::error::ErrorReport;
-use crate::fs_open::{regular_file_metadata_typed, tokio_nofollow_options, touch_volatile_mtime};
+use crate::fs_open::{
+    regular_file_metadata_typed, tokio_nofollow_options, touch_volatile_mtime_with,
+};
 use crate::guards::{Consequence, DownloadBarrier, FailedDownload, InitBarrier};
 use crate::http_helpers::{
     ConnectionAction, ConnectionVersion, OptHeader, WritePhase, write_416_response,
@@ -222,43 +224,43 @@ pub(crate) async fn splice_proxy(
 }
 
 /// Serve a cached volatile file after an upstream `304 Not Modified`: refresh
-/// the freshness window via `touch_volatile_mtime`, release the init barrier,
-/// then deliver the file with `sendfile(2)`. The per-path bits (status
-/// recording, upstream-connection pooling, `debug!` wording) stay at the
-/// call site, and `invalid_tag` carries the call-site location tag for
-/// `SpliceProxyError::Client`.
+/// the freshness window via `touch_volatile_mtime_with`, release the init
+/// barrier, then deliver the file with `sendfile(2)`. The file is the
+/// descriptor [`read_volatile_validators`] opened and stat-ed for the
+/// conditional request, so this opens and stats nothing: the registry entry
+/// held since `originate()` keeps any commit of the same key -- the only way
+/// a cache file is replaced -- from renaming a newer copy in meanwhile. The
+/// per-path bits (status recording, upstream-connection pooling, `debug!`
+/// wording) stay at the call site, and `invalid_tag` carries the call-site
+/// location tag for `SpliceProxyError::Client`.
 async fn serve_volatile_304_via_sendfile(
     client: ClientConn<'_>,
     conn_details: &ConnectionDetails,
-    cache_path: &Path,
+    stale: StaleCopy,
     client_range: RangeRequestHeaders<'_>,
-    ibarrier: InitBarrier,
+    mut ibarrier: InitBarrier,
     invalid_tag: &'static str,
 ) -> Result<(), SpliceProxyError> {
     if !conn_details.client.is_cleanup_synthetic() {
         metrics::VOLATILE_REFETCHED_UPTODATE.increment();
     }
 
-    let (mut ibarrier, file) = ibarrier
-        .run(async |_barrier| {
-            tokio_nofollow_options()
-                .read(true)
-                .open(cache_path)
-                .await
-                .map_err(|err| {
-                    CacheError::counted_io("open cached file after 304", cache_path, err).into()
-                })
-        })
-        .await
-        .map_err(SpliceProxyError::ReportedBeforeHeader)?;
-    let file = touch_volatile_mtime(file, cache_path).await;
-    let _settled = ibarrier.finished(cache_path.to_path_buf()).await;
+    let StaleCopy {
+        file,
+        path,
+        metadata,
+    } = stale;
+    let file = touch_volatile_mtime_with(file, &metadata, &path).await;
+    let _settled = ibarrier.finished(path.clone()).await;
 
+    // The pre-touch metadata serves as well as a fresh stat: the head's
+    // timestamps come from `cache_file_http_date`, which reads btime, and
+    // the touch only moves mtime when btime exists.
     match serve_file_via_sendfile(
         client.stream,
         conn_details,
         "",
-        (file, None, cache_path),
+        (file, Some(metadata), &path),
         (client.version, client.action),
         client_range,
         None,
@@ -448,11 +450,17 @@ struct HeadValidators {
 }
 
 /// Reserve the cache quota and open the file the body is written into: the
-/// cache directory, the previous volatile copy's size (freed by the
-/// overwrite), the quota reservation, the temp/partial file per `partial`,
-/// the validator and expected-size xattrs, and the `InitBarrier ->
+/// cache directory, the quota reservation, the temp/partial file per
+/// `partial`, the validator and expected-size xattrs, and the `InitBarrier ->
 /// DownloadBarrier` transition. Shared by the streaming drive and the
 /// buffered volatile path (which always passes `PartialDownload::Volatile`).
+///
+/// `prev_file_size` is the size of the cached copy the commit replaces (the
+/// bytes the overwrite frees), `0` when there is none: the size
+/// [`read_volatile_validators`] stat-ed before the upstream round trip, not
+/// a fresh stat. Should cleanup delete that copy meanwhile, the reservation
+/// counts bytes already freed -- the same drift a deletion during the body
+/// transfer already causes, which the post-cleanup quota reconcile repairs.
 ///
 /// The client's `Range` is resolved here too, once the file exists: an
 /// `If-Range` date is compared against the very `Last-Modified` the head
@@ -482,16 +490,16 @@ async fn prepare_cache_target(
     partial: partial_file::PartialDownload,
     resume_offset: u64,
     total_content_length: NonZero<u64>,
-    ibarrier: InitBarrier,
+    prev_file_size: u64,
+    mut ibarrier: InitBarrier,
     quota_phase: &'static str,
     client_range: RangeRequestHeaders<'_>,
     phase_416: &'static str,
     mode: CacheWriteMode,
 ) -> Result<Option<(CacheTarget, ServeParams)>, SpliceProxyError> {
     // Not created here: `integrity::rename_into_cache` creates it at commit
-    // time, and only on `ENOENT`. Everything below tolerates its absence --
-    // the volatile `prev_path` stat treats `NotFound` as "nothing to free",
-    // and `dest_path` is pure path construction.
+    // time, and only on `ENOENT`. Everything below tolerates its absence:
+    // `dest_path` is pure path construction.
     let dest_dir = conn_details.cache_dir_path();
 
     let filename = Path::new(&conn_details.debname);
@@ -501,21 +509,6 @@ async fn prepare_cache_target(
     );
 
     let dest_path = dest_dir.join(filename);
-    let (mut ibarrier, prev_file_size) = ibarrier.run(async |_barrier| {
-        if conn_details.cached_flavor() == CachedFlavor::Permanent { return Ok(0); }
-        let prev_path = dest_dir.join(filename);
-        match tokio::fs::symlink_metadata(&prev_path).await {
-            Ok(metadata) if metadata.file_type().is_file() => Ok(metadata.len()),
-            Ok(_) => {
-                metrics::CACHE_NON_REGULAR.increment();
-                error!("splice proxy: previous cache file `{}` is not regular; counting it as zero bytes for quota and overwriting it", prev_path.display());
-                Ok(0)
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(0),
-            Err(err) => Err(CacheError::counted_io("stat existing volatile file", &prev_path, err).into()),
-        }
-    }).await.map_err(SpliceProxyError::ReportedBeforeHeader)?;
-
     let reservation = if conn_details.client.is_cleanup_synthetic() {
         // Mirrors the hyper gate: cleanup's own index fetches are admitted
         // over quota (`CacheQuota::acquire_for_cleanup`).
@@ -764,15 +757,32 @@ async fn open_partial_resume(
     }
 }
 
+/// The stale cached copy a volatile revalidation was sent for, opened and
+/// stat-ed once by [`read_volatile_validators`]. It travels through the
+/// planner as `DownloadPlan`'s cached copy, so an upstream `304` serves this
+/// very descriptor ([`serve_volatile_304_via_sendfile`]); its size is the
+/// `prev_file_size` a download's quota reservation frees. Holding the
+/// descriptor across the upstream round trip is safe because the caller's
+/// `InitBarrier` owns the key's registry entry from `originate()` until it
+/// settles, and a cache file is only ever replaced by the rename of that
+/// key's commit.
+struct StaleCopy {
+    file: tokio::fs::File,
+    path: PathBuf,
+    /// Taken before the request went upstream, and so before the freshness
+    /// touch a `304` applies.
+    metadata: std::fs::Metadata,
+}
+
 /// Volatile revalidation: read the cached file's metadata for the
 /// conditional headers. When a stale volatile file exists in cache, prepare
 /// If-Modified-Since / If-None-Match headers so the upstream can respond
 /// with 304 Not Modified if the content hasn't changed. Returns the headers
-/// and the cached file's path; `None` for a permanent file and for a
-/// volatile file that is not in the cache yet.
+/// and the open cached copy; `None` for a permanent file and for a volatile
+/// file that is not in the cache yet.
 async fn read_volatile_validators(
     conn_details: &ConnectionDetails,
-) -> Result<Option<(VolatileCondHeaders, PathBuf)>, DownloadFailure> {
+) -> Result<Option<(VolatileCondHeaders, StaleCopy)>, DownloadFailure> {
     if conn_details.cached_flavor() != CachedFlavor::Volatile {
         return Ok(None);
     }
@@ -787,8 +797,9 @@ async fn read_volatile_validators(
             );
         }
     };
-    // Only the regular-file check is needed; the mtime is no validator.
-    regular_file_metadata_typed(&file, &cache_path, "stat volatile cached file")?;
+    // The mtime is no validator (see below); the stat is the regular-file
+    // check and the size and timestamps the `StaleCopy` carries on.
+    let mdata = regular_file_metadata_typed(&file, &cache_path, "stat volatile cached file")?;
 
     // The stored upstream `Last-Modified`, never the local mtime, matching
     // the hyper backend: the mtime only dates the last fetch or
@@ -807,7 +818,11 @@ async fn read_volatile_validators(
             if_modified_since,
             if_none_match,
         },
-        cache_path,
+        StaleCopy {
+            file,
+            path: cache_path,
+            metadata: mdata,
+        },
     )))
 }
 
@@ -829,8 +844,8 @@ async fn plan_upstream_response(
     upstream_path: &str,
     resume: &mut partial_file::PartialResume,
     volatile_cond: Option<&VolatileCondHeaders>,
-    volatile_cache_path: Option<PathBuf>,
-) -> Result<(UpstreamExchange, DownloadPlan<PathBuf>), UpstreamError> {
+    stale: Option<StaleCopy>,
+) -> Result<(UpstreamExchange, DownloadPlan<StaleCopy>), UpstreamError> {
     let (mut exchange, redirect) = if exchange.response.is_redirect() {
         // Keep the uncommon redirect future's owned TLS state off the
         // stack of every download.
@@ -851,9 +866,8 @@ async fn plan_upstream_response(
     // Volatile stale-but-present revalidation that returned a fresh body
     // (200 or 206): counterpart to the 304 / UPTODATE case in
     // `serve_volatile_304_via_sendfile`. The volatile-not-found path leaves
-    // `volatile_cache_path` as None and is intentionally not split into
-    // UPTODATE/OUTOFDATE.
-    if volatile_cache_path.is_some()
+    // `stale` as None and is intentionally not split into UPTODATE/OUTOFDATE.
+    if stale.is_some()
         && (exchange.response.status_code == 200 || exchange.response.status_code == 206)
         && !conn_details.client.is_cleanup_synthetic()
     {
@@ -868,7 +882,7 @@ async fn plan_upstream_response(
             resume.if_range.as_deref(),
         ),
         conn_details.cached_flavor(),
-        volatile_cache_path,
+        stale,
         global_config().max_object_size,
     ) {
         Ok(plan) => Ok((exchange, plan)),
@@ -1440,11 +1454,13 @@ async fn splice_proxy_drive(
         return Ok(SpliceProxyOutcome::Served);
     }
 
-    let (mut ibarrier, (resume, exchange, plan)) = ibarrier
+    let (mut ibarrier, (resume, exchange, plan, prev_file_size)) = ibarrier
         .run(async |barrier| {
             let mut resume = open_partial_resume(barrier, conn_details).await?;
-            let (volatile_cond, volatile_cache_path) =
-                read_volatile_validators(conn_details).await?.unzip();
+            let (volatile_cond, stale) = read_volatile_validators(conn_details).await?.unzip();
+            // The size a download's commit frees by replacing the stale copy,
+            // read before the planner takes the copy.
+            let prev_file_size = stale.as_ref().map_or(0, |copy| copy.metadata.len());
             let exchange = standard_upstream_connect(
                 &conn_details.upstream_mirror(),
                 &host_authority,
@@ -1462,10 +1478,10 @@ async fn splice_proxy_drive(
                 upstream_path,
                 &mut resume,
                 volatile_cond.as_ref(),
-                volatile_cache_path,
+                stale,
             )
             .await?;
-            Ok((resume, exchange, plan))
+            Ok((resume, exchange, plan, prev_file_size))
         })
         .await
         .map_err(SpliceProxyError::ReportedBeforeHeader)?;
@@ -1488,8 +1504,8 @@ async fn splice_proxy_drive(
     }
 
     let (total_content_length, body_content_length, resume_offset) = match plan {
-        DownloadPlan::NotModified(cache_path) => {
-            note_cached_index_touch(conn_details, original_uri_path, &cache_path);
+        DownloadPlan::NotModified(stale) => {
+            note_cached_index_touch(conn_details, original_uri_path, &stale.path);
             // Upstream confirms the cached copy is still current: refresh the
             // freshness window and serve the cached file via sendfile.
             debug!(
@@ -1518,7 +1534,7 @@ async fn splice_proxy_drive(
             return serve_volatile_304_via_sendfile(
                 client,
                 conn_details,
-                &cache_path,
+                stale,
                 client_range,
                 ibarrier,
                 "post-304 invalid response",
@@ -1599,6 +1615,7 @@ async fn splice_proxy_drive(
                 conn_details,
                 &upstream_resp,
                 &header_buf[header_end..],
+                prev_file_size,
                 ibarrier,
                 client_range,
                 conn_label,
@@ -1643,6 +1660,7 @@ async fn splice_proxy_drive(
         resume.partial,
         resume_offset,
         total_content_length,
+        prev_file_size,
         ibarrier,
         "quota 503",
         client_range,

@@ -116,9 +116,9 @@ pub(crate) struct CacheAccessFailure(pub(crate) Logged);
 ///
 /// It must stay a `statx`, not an `fstat`: `cache_file_http_date` reads
 /// `Metadata::created()` (btime) and only falls back to mtime, while
-/// [`touch_volatile_mtime`] repurposes mtime as "last revalidated". `fstat(2)`
-/// carries no btime and nix 0.31 wraps no `statx`, so the fd is borrowed into
-/// a `std::fs::File` and std's own `statx` is used.
+/// [`touch_volatile_mtime_with`] repurposes mtime as "last revalidated".
+/// `fstat(2)` carries no btime and nix 0.31 wraps no `statx`, so the fd is
+/// borrowed into a `std::fs::File` and std's own `statx` is used.
 fn borrowed_metadata(file: &tokio::fs::File) -> std::io::Result<std::fs::Metadata> {
     use std::mem::ManuallyDrop;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -190,11 +190,10 @@ pub(crate) fn regular_file_metadata(
     })
 }
 
-/// Update a volatile file's mtime to `now` to reset the 30-second freshness window.
-/// Only updates mtime when the filesystem supports birth time (btime), so mtime can
-/// serve as a "last revalidated" timestamp separate from the content creation time.
-/// Takes ownership of the file handle (for the `into_std()` / `from_std()` conversion
-/// needed by `set_modified()`) and returns it for continued use.
+/// Update a volatile file's mtime to `now` to reset the 30-second freshness window,
+/// stat-ing the open file first; see [`touch_volatile_mtime_with`] for a caller that
+/// already holds the file's metadata.
+#[cfg(feature = "hyper")]
 pub(crate) async fn touch_volatile_mtime(
     file: tokio::fs::File,
     display_path: &Path,
@@ -211,11 +210,26 @@ pub(crate) async fn touch_volatile_mtime(
             return file;
         }
     };
+    touch_volatile_mtime_with(file, &mdata, display_path).await
+}
+
+/// Update a volatile file's mtime to `now` to reset the 30-second freshness window.
+/// Only updates mtime when the filesystem supports birth time (btime), so mtime can
+/// serve as a "last revalidated" timestamp separate from the content creation time.
+/// `metadata` is the open file's own, taken by the caller; only its btime support is
+/// read, so a stat from before an earlier touch is as good as a fresh one.
+/// Takes ownership of the file handle (for the `into_std()` / `from_std()` conversion
+/// needed by `set_modified()`) and returns it for continued use.
+pub(crate) async fn touch_volatile_mtime_with(
+    file: tokio::fs::File,
+    metadata: &std::fs::Metadata,
+    display_path: &Path,
+) -> tokio::fs::File {
     // Cache entries are replaced on update, not overwritten, so the creation time (btime)
     // represents the actual content age.  Mtime is repurposed as a "last revalidated"
     // timestamp.  If the filesystem does not support btime, updating mtime would destroy
     // the only content-age signal, so skip the update in that case.
-    if mdata.created().is_err() {
+    if metadata.created().is_err() {
         return file;
     }
 
