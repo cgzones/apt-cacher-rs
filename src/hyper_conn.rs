@@ -2761,18 +2761,23 @@ async fn pre_process_client_request(
         passthrough_reason.label()
     );
 
-    let (mut parts, _body) = req.into_parts();
-    parts
-        .headers
-        .insert(USER_AGENT, HeaderValue::from_static(APP_USER_AGENT));
-    // Same rule as the cache-fetch path: the upstream `Host` is the
-    // request-target authority, never the client's own header.
+    // Built from scratch like the cache fetch (and the splice passthrough):
+    // no client header is forwarded. Client credentials
+    // (`Proxy-Authorization`), hop-by-hop fields and a `Content-Length` for
+    // the body `strip_request_body` dropped must never reach the shared
+    // upstream pool. The upstream `Host` is the request-target authority,
+    // never the client's own header.
+    let (parts, _body) = req.into_parts();
+    let mut fwd_request = Request::builder()
+        .method(Method::GET)
+        .header(USER_AGENT, APP_USER_AGENT);
     if let Some(authority) = parts.uri.authority() {
-        parts.headers.insert(HOST, host_header_from_uri(authority));
+        fwd_request = fwd_request.header(HOST, host_header_from_uri(authority));
     }
-
-    // TODO: tweak http version?
-    let fwd_request = Request::from_parts(parts, Empty::new());
+    let fwd_request = fwd_request
+        .uri(parts.uri)
+        .body(Empty::new())
+        .expect("request should be valid");
 
     trace!("Forwarded request: {fwd_request:?}");
 
