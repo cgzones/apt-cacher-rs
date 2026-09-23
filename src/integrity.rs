@@ -1743,7 +1743,8 @@ async fn ingest_packages_file(
         compression,
         limits::decompressed_limit(NonZero::new(compressed_size)),
         buffer_size,
-    );
+    )
+    .await;
 
     let mut stanzas = StanzaStream::new(
         reader,

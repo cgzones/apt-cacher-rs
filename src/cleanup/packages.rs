@@ -367,7 +367,8 @@ pub(super) async fn reduce_file_list(
         compression,
         decompressed_limit(Some(compressed_size)),
         buffer_size,
-    );
+    )
+    .await;
 
     // `filename` is the synthetic memfd name, so name the mirror as well.
     let mut stanzas = StanzaStream::new(

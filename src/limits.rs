@@ -354,10 +354,12 @@ pub(crate) fn decompressed_limit(compressed_size: Option<NonZero<u64>>) -> NonZe
 /// decompression-bomb guard applied, ready for [`read_line_capped`].
 ///
 /// `limit` bounds the *decompressed* byte count (see [`decompressed_limit`]), so
-/// the [`LimitedReader`] sits above the decoder, not below it. A compression
-/// layer is fed from its own [`BufReader`](tokio::io::BufReader) because it
-/// benefits from amortising reads of its compressed input; raw bytes need no
-/// such inner buffer.
+/// the [`LimitedReader`] sits above the decoder, not below it. The gzip layer
+/// is fed from its own [`BufReader`](tokio::io::BufReader) because it benefits
+/// from amortising reads of its compressed input; raw bytes need no such inner
+/// buffer, and the xz decoder reads the file as a `std::fs::File` on its own
+/// blocking thread, in 64 KiB chunks (see `xz_stream`), so it waits for any
+/// in-flight operation on `file` before taking it over.
 ///
 /// Shared by cleanup's candidate reduce (`cleanup::packages`) and checksum
 /// registry ingest (`integrity`) — the two differ in how they *derive* the
@@ -365,7 +367,7 @@ pub(crate) fn decompressed_limit(compressed_size: Option<NonZero<u64>>) -> NonZe
 /// bytes are decoded or bounded. The returned reader is boxed: one allocation on
 /// a path that then streams the whole index through it, in exchange for the
 /// three branches having one home.
-pub(crate) fn packages_reader(
+pub(crate) async fn packages_reader(
     file: tokio::fs::File,
     compression: PackagesCompression,
     limit: NonZero<u64>,
@@ -385,8 +387,7 @@ pub(crate) fn packages_reader(
             ))
         }
         PackagesCompression::Xz => {
-            let file_reader = tokio::io::BufReader::with_capacity(buffer_size, file);
-            let decoder = xz_decoder(file_reader);
+            let decoder = xz_decoder(file.into_std().await);
             Box::new(tokio::io::BufReader::with_capacity(
                 buffer_size,
                 LimitedReader::new(decoder, limit),

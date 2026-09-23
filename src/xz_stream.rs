@@ -2,7 +2,10 @@
 //!
 //! Drives `lzma_rust2::XzStream` (the push-style decoder) in a tokio blocking
 //! task feeding a `tokio::io::duplex` pipe, so callers can treat it as any
-//! other `AsyncRead`. Replaces `async_compression::tokio::bufread::XzDecoder`
+//! other `AsyncRead`. The task reads its input synchronously, so the input is
+//! a blocking reader (the `Packages.xz` file as a `std::fs::File`): a
+//! `tokio::fs::File` behind a `SyncIoBridge` would run every read as a second
+//! blocking-pool task that the decode thread sits blocked on. Replaces `async_compression::tokio::bufread::XzDecoder`
 //! to remove the C `liblzma`/`liblzma-sys` dependency.
 //!
 //! The decoder is built through `new_mem_limit`: the LZMA2 dictionary size
@@ -87,19 +90,20 @@ pub(crate) struct XzDecoderStream {
     tail: Option<oneshot::Receiver<io::Result<()>>>,
 }
 
-/// Construct an `AsyncRead` that yields the xz-decompressed bytes of `reader`.
+/// Construct an `AsyncRead` that yields the xz-decompressed bytes of `reader`,
+/// which the blocking decode task reads directly (see the module doc).
 ///
 /// Multi-stream xz files are accepted (matches the `xz` CLI default and what
 /// `async_compression`'s `XzDecoder` did before).
 pub(crate) fn xz_decoder<R>(reader: R) -> XzDecoderStream
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    R: io::Read + Send + 'static,
 {
     let (read_half, write_half) = tokio::io::duplex(PIPE_CAPACITY);
     let (err_tx, err_rx) = oneshot::channel::<io::Result<()>>();
 
     tokio::task::spawn_blocking(move || {
-        let mut bridge_in = SyncIoBridge::new(reader);
+        let mut input = reader;
         // Buffer up to the duplex capacity: writing straight through would
         // cross the bridge in small pieces, each a block_on round-trip
         // between the blocking thread and the runtime — the BufWriter cuts
@@ -107,7 +111,7 @@ where
         // the result send (BufWriter's Drop swallows them).
         let mut bridge_out =
             io::BufWriter::with_capacity(PIPE_CAPACITY, SyncIoBridge::new(write_half));
-        let result = decode_stream(&mut bridge_in, &mut bridge_out, MAX_XZ_DECODE_CPU, || {
+        let result = decode_stream(&mut input, &mut bridge_out, MAX_XZ_DECODE_CPU, || {
             err_tx.is_closed()
         })
         .and_then(|()| io::Write::flush(&mut bridge_out));
@@ -162,8 +166,8 @@ fn decode_stream(
     // untrusted record count before the count-vs-blocks check).
     let mut stream =
         XzStream::new_mem_limit(/* allow_multiple_streams = */ true, xz_mem_limit_kb());
-    // Input is read in `PIPE_CAPACITY` chunks, so the bridge is crossed once
-    // per chunk, not once per header field.
+    // Input is read in `PIPE_CAPACITY` chunks: one read per 64 KiB, not one
+    // per header field.
     let mut in_buf = vec![0u8; PIPE_CAPACITY];
     let mut out_buf = vec![0u8; PIPE_CAPACITY];
     let mut in_len = 0;
@@ -604,13 +608,9 @@ mod tests {
         _dropped: oneshot::Sender<()>,
     }
 
-    impl<R: AsyncRead + Unpin> AsyncRead for DropSignal<R> {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.inner).poll_read(cx, buf)
+    impl<R: io::Read> io::Read for DropSignal<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buf)
         }
     }
 
