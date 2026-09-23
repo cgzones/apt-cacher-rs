@@ -32,15 +32,32 @@
 //! Entries are classified from the directory listing's `d_type`, so a walk
 //! that only needs names and kinds costs no per-entry syscall; sizes and
 //! timestamps are fetched on demand through [`Entry::metadata`] (lstat, so a
-//! planted symlink is seen as itself and never followed).
+//! planted symlink is seen as itself and never followed; relative to the
+//! open directory, like the listing, so it costs no full-path walk and
+//! follows the entry if an ancestor is renamed mid-walk).
+//!
+//! A directory is listed in batches of [`LIST_BATCH`] entries, one
+//! blocking-pool hop per batch (the first rides along with the `opendir`).
+//! A walk that only tallies sizes (the startup / reconcile scan, the
+//! dashboard) opts in with [`Walker::stat_files`]: the lstat of each
+//! regular file then runs inside the listing hop, relative to the open
+//! directory, instead of costing one hop per file, and [`Entry::metadata`]
+//! hands out that result - including a failure, reported exactly as an
+//! on-demand one would be, when the caller asks.  The stat is then as old
+//! as the batch, not as the caller's use of it, so a walk that acts on the
+//! file afterwards (cleanup's reaps, which report a failed unlink) keeps
+//! the on-demand stat.  Name-only walks never set it and so still stat
+//! nothing.
 
 use std::{
+    collections::VecDeque,
     ffi::{OsStr, OsString},
+    fs::{DirEntry, FileType, Metadata, ReadDir},
     io::{self, ErrorKind},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use tokio::fs::{DirEntry, ReadDir};
 use tracing::{debug, error, warn};
 
 use crate::{error::ErrorReport, log_once::Logged, metrics};
@@ -152,20 +169,97 @@ struct Frame<T> {
     tag: T,
 }
 
+/// Entries listed per blocking-pool hop.  Bounds the memory a huge pool
+/// directory holds in flight (a few hundred bytes per entry with its
+/// metadata) while cutting its hops by that factor.
+const LIST_BATCH: usize = 256;
+
+/// One listed entry, as read inside the blocking hop.
+#[derive(Debug)]
+struct Listed {
+    name: OsString,
+    /// The listing's entry, holding the open directory: the on-demand
+    /// [`Entry::metadata`] lstats relative to it (`DirEntry::metadata`, a
+    /// `statx`/`fstatat` on the directory descriptor) rather than walking
+    /// the entry's full path again.
+    listing: Arc<DirEntry>,
+    /// The listing's `d_type`, or an lstat where the filesystem leaves it
+    /// unknown.
+    file_type: io::Result<FileType>,
+    /// The lstat of a regular file, taken in the same hop when the walk
+    /// asked for it ([`Walker::stat_files`]); `None` otherwise.
+    metadata: Option<io::Result<Metadata>>,
+}
+
+/// A directory's listing so far, as one blocking hop returns it.
+#[derive(Debug)]
+struct Batch {
+    entries: VecDeque<Listed>,
+    /// The open handle while entries remain unread; `None` once the end of
+    /// the directory or `failed` was reached.
+    reader: Option<ReadDir>,
+    /// Iteration failed after `entries`; reported once they are yielded.
+    failed: Option<io::Error>,
+}
+
+impl Batch {
+    /// Read up to [`LIST_BATCH`] entries from `reader`.  Blocking.
+    fn read(mut reader: ReadDir, stat_files: bool) -> Self {
+        let mut entries = VecDeque::with_capacity(LIST_BATCH);
+        while entries.len() < LIST_BATCH {
+            match reader.next() {
+                Some(Ok(dir_entry)) => {
+                    let file_type = dir_entry.file_type();
+                    // `DirEntry::metadata` is an lstat relative to the open
+                    // directory, like the on-demand one.
+                    let metadata = (stat_files && file_type.as_ref().is_ok_and(FileType::is_file))
+                        .then(|| dir_entry.metadata());
+                    entries.push_back(Listed {
+                        name: dir_entry.file_name(),
+                        listing: Arc::new(dir_entry),
+                        file_type,
+                        metadata,
+                    });
+                }
+                None => {
+                    return Self {
+                        entries,
+                        reader: None,
+                        failed: None,
+                    };
+                }
+                Some(Err(err)) => {
+                    return Self {
+                        entries,
+                        reader: None,
+                        failed: Some(err),
+                    };
+                }
+            }
+        }
+        Self {
+            entries,
+            reader: Some(reader),
+            failed: None,
+        }
+    }
+}
+
 /// The directory currently being iterated.
 #[derive(Debug)]
 struct Open<T> {
     frame: Frame<T>,
-    reader: ReadDir,
+    batch: Batch,
 }
 
 /// The entry most recently yielded, kept so the [`Entry`] handed out can
 /// borrow it.
 #[derive(Debug)]
 struct Yielded {
-    dir_entry: DirEntry,
     name: OsString,
+    listing: Arc<DirEntry>,
     kind: EntryKind,
+    metadata: Option<io::Result<Metadata>>,
 }
 
 /// An iterative depth-first walk over one cache tree.  See the module doc.
@@ -173,6 +267,8 @@ struct Yielded {
 pub(crate) struct Walker<T> {
     ctx: &'static WalkContext,
     missing: OnMissing,
+    /// Set by [`Walker::stat_files`].
+    stat_files: bool,
     pending: Vec<Frame<T>>,
     current: Option<Open<T>>,
     yielded: Option<Yielded>,
@@ -197,6 +293,7 @@ impl<T: Copy + Send + Sync> Walker<T> {
         Self {
             ctx,
             missing,
+            stat_files: false,
             pending: vec![Frame {
                 path: root.to_path_buf(),
                 rel: PathBuf::new(),
@@ -210,6 +307,17 @@ impl<T: Copy + Send + Sync> Walker<T> {
         }
     }
 
+    /// Lstat every regular file while its directory is listed, in the
+    /// listing's blocking hop, so [`Entry::metadata`] costs no hop of its
+    /// own.  For a walk that only tallies (nearly) every regular file's
+    /// size; not for one that skips files by name before the stat, or acts
+    /// on a file after it (see the module doc).
+    #[must_use]
+    pub(crate) const fn stat_files(mut self) -> Self {
+        self.stat_files = true;
+        self
+    }
+
     /// Yield the next entry, or `None` once every directory the caller
     /// descended into has been read (or the walk aborted).
     pub(crate) async fn next(&mut self) -> Option<Entry<'_, T>> {
@@ -217,7 +325,7 @@ impl<T: Copy + Send + Sync> Walker<T> {
             && let (Some(open), Some(yielded)) = (&self.current, &self.yielded)
         {
             self.pending.push(Frame {
-                path: yielded.dir_entry.path(),
+                path: open.frame.path.join(&yielded.name),
                 rel: open.frame.rel.join(&yielded.name),
                 tag,
             });
@@ -233,39 +341,62 @@ impl<T: Copy + Send + Sync> Walker<T> {
                 self.open(frame).await;
                 continue;
             };
-            match open.reader.next_entry().await {
-                Ok(Some(dir_entry)) => {
-                    if let Some(kind) = classify(self.ctx, &dir_entry).await {
-                        let name = dir_entry.file_name();
-                        break Yielded {
-                            dir_entry,
-                            name,
-                            kind,
-                        };
-                    }
+            if let Some(listed) = open.batch.entries.pop_front() {
+                let Listed {
+                    name,
+                    listing,
+                    file_type,
+                    metadata,
+                } = listed;
+                if let Some(kind) = classify(self.ctx, &open.frame.path, &name, file_type) {
+                    break Yielded {
+                        name,
+                        listing,
+                        kind,
+                        metadata,
+                    };
                 }
-                Ok(None) => self.current = None,
-                Err(err) => {
-                    let open = self.current.take()?;
-                    self.dir_failed("iterate", &open.frame.path, err);
-                }
+            } else if let Some(err) = open.batch.failed.take() {
+                let open = self.current.take()?;
+                self.dir_failed("iterate", &open.frame.path, err);
+            } else if let Some(reader) = open.batch.reader.take() {
+                let stat_files = self.stat_files;
+                open.batch = match tokio::task::spawn_blocking(move || {
+                    Batch::read(reader, stat_files)
+                })
+                .await
+                {
+                    Ok(batch) => batch,
+                    // The hop panicked: the reader went with it, so the
+                    // rest of the directory is unreadable.
+                    Err(err) => Batch {
+                        entries: VecDeque::new(),
+                        reader: None,
+                        failed: Some(io::Error::other(err)),
+                    },
+                };
+            } else {
+                self.current = None;
             }
         };
 
         self.yielded = Some(yielded);
         let Yielded {
-            dir_entry,
             name,
+            listing,
             kind,
+            metadata,
         } = self.yielded.as_ref()?;
         let open = self.current.as_ref()?;
         Some(Entry {
             ctx: self.ctx,
-            dirent: dir_entry,
+            dir: &open.frame.path,
             name,
+            listing,
             rel_dir: &open.frame.rel,
             tag: open.frame.tag,
             kind: *kind,
+            prefetched: metadata.as_ref(),
             descend: &mut self.descend,
         })
     }
@@ -283,10 +414,18 @@ impl<T: Copy + Send + Sync> Walker<T> {
         }
     }
 
+    /// Open `frame`'s directory and read its first batch in the same hop.
     async fn open(&mut self, frame: Frame<T>) {
         let is_root = frame.rel.as_os_str().is_empty();
-        match tokio::fs::read_dir(&frame.path).await {
-            Ok(reader) => self.current = Some(Open { frame, reader }),
+        let path = frame.path.clone();
+        let stat_files = self.stat_files;
+        let opened = tokio::task::spawn_blocking(move || {
+            std::fs::read_dir(path).map(|reader| Batch::read(reader, stat_files))
+        })
+        .await
+        .unwrap_or_else(|err| Err(io::Error::other(err)));
+        match opened {
+            Ok(batch) => self.current = Some(Open { frame, batch }),
             Err(err) if err.kind() == ErrorKind::NotFound && is_root => match self.missing {
                 OnMissing::Tolerate => self.root_missing = true,
                 OnMissing::Fail => self.dir_failed("read", &frame.path, err),
@@ -318,11 +457,16 @@ impl<T: Copy + Send + Sync> Walker<T> {
     }
 }
 
-/// Classify one listed entry, reporting a non-regular one on sight.  `None`
-/// means the entry dropped out of the walk (vanished, or its type could not
-/// be read - logged and counted here).
-async fn classify(ctx: &'static WalkContext, dir_entry: &DirEntry) -> Option<EntryKind> {
-    match dir_entry.file_type().await {
+/// Classify one listed entry of directory `dir`, reporting a non-regular
+/// one on sight.  `None` means the entry dropped out of the walk (vanished,
+/// or its type could not be read - logged and counted here).
+fn classify(
+    ctx: &'static WalkContext,
+    dir: &Path,
+    name: &OsStr,
+    file_type: io::Result<FileType>,
+) -> Option<EntryKind> {
+    match file_type {
         Ok(ft) if ft.is_file() => Some(EntryKind::File),
         Ok(ft) if ft.is_dir() => Some(EntryKind::Dir),
         Ok(ft) => {
@@ -332,7 +476,7 @@ async fn classify(ctx: &'static WalkContext, dir_entry: &DirEntry) -> Option<Ent
             } else {
                 "non-regular"
             };
-            let path = dir_entry.path();
+            let path = dir.join(name);
             match ctx.anomalies {
                 AnomalyLevel::Warn => warn!(
                     "Unrecognized {kind} entry `{}` in {}; {}",
@@ -352,7 +496,7 @@ async fn classify(ctx: &'static WalkContext, dir_entry: &DirEntry) -> Option<Ent
         Err(err) if err.kind() == ErrorKind::NotFound => {
             debug!(
                 "Cache entry `{}` vanished before it could be inspected; skipping it",
-                dir_entry.path().display()
+                dir.join(name).display()
             );
             None
         }
@@ -360,7 +504,7 @@ async fn classify(ctx: &'static WalkContext, dir_entry: &DirEntry) -> Option<Ent
             metrics::CACHE_IO_FAILURE.increment();
             error!(
                 "Failed to get the file type of `{}`; {}:  {}",
-                dir_entry.path().display(),
+                dir.join(name).display(),
                 ctx.entry_failure,
                 ErrorReport(&err)
             );
@@ -374,11 +518,16 @@ async fn classify(ctx: &'static WalkContext, dir_entry: &DirEntry) -> Option<Ent
 #[derive(Debug)]
 pub(crate) struct Entry<'w, T> {
     ctx: &'static WalkContext,
-    dirent: &'w DirEntry,
+    /// Full path of the directory holding the entry.
+    dir: &'w Path,
     name: &'w OsStr,
+    /// The listing's entry, for the on-demand lstat (see [`Listed`]).
+    listing: &'w Arc<DirEntry>,
     rel_dir: &'w Path,
     tag: T,
     kind: EntryKind,
+    /// The lstat taken while listing, in a [`Walker::stat_files`] walk.
+    prefetched: Option<&'w io::Result<Metadata>>,
     descend: &'w mut Option<T>,
 }
 
@@ -403,7 +552,7 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
     /// Full path of the entry.
     #[must_use]
     pub(crate) fn path(&self) -> PathBuf {
-        self.dirent.path()
+        self.dir.join(self.name)
     }
 
     /// Path of the entry relative to the walk root (`"a.deb"` for a root
@@ -461,12 +610,23 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
         }
     }
 
-    /// `lstat` the entry.  `None` means it dropped out of the walk: it
-    /// vanished or changed type since it was listed (`debug!`), or the stat
-    /// failed (`error!` + `CACHE_IO_FAILURE`, with the walk's
+    /// `lstat` the entry, or hand out the lstat a [`Walker::stat_files`]
+    /// walk took while listing it.  `None` means it dropped out of the walk:
+    /// it vanished or changed type since it was listed (`debug!`), or the
+    /// stat failed (`error!` + `CACHE_IO_FAILURE`, with the walk's
     /// [`WalkContext::entry_failure`] clause).
-    pub(crate) async fn metadata(&self) -> Option<std::fs::Metadata> {
-        match self.dirent.metadata().await {
+    pub(crate) async fn metadata(&self) -> Option<Metadata> {
+        let on_demand;
+        let result = if let Some(prefetched) = self.prefetched {
+            prefetched.as_ref()
+        } else {
+            let listing = Arc::clone(self.listing);
+            on_demand = tokio::task::spawn_blocking(move || listing.metadata())
+                .await
+                .unwrap_or_else(|err| Err(io::Error::other(err)));
+            on_demand.as_ref()
+        };
+        match result {
             Ok(meta) => {
                 let same_kind = match self.kind {
                     EntryKind::File => meta.is_file(),
@@ -474,7 +634,7 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
                     EntryKind::NonRegular => !meta.is_file() && !meta.is_dir(),
                 };
                 if same_kind {
-                    Some(meta)
+                    Some(meta.clone())
                 } else {
                     debug!(
                         "Cache entry `{}` changed type before it could be inspected; skipping it",
@@ -617,6 +777,68 @@ mod tests {
         );
     }
 
+    /// A directory larger than one listing batch is read across several
+    /// hops without losing or repeating an entry, in either mode.
+    #[tokio::test]
+    async fn a_directory_spanning_several_batches_is_listed_completely() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let count = LIST_BATCH * 2 + 7;
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("f{i}")), vec![b'x'; i % 5]).expect("file");
+        }
+        let expected_bytes = u64::try_from((0..count).map(|i| i % 5).sum::<usize>()).unwrap();
+
+        for stat_files in [false, true] {
+            let walker = Walker::new(dir.path(), &CONTINUE, OnMissing::Fail, ());
+            let mut walker = if stat_files {
+                walker.stat_files()
+            } else {
+                walker
+            };
+            let mut names = Vec::new();
+            let mut bytes = 0;
+            while let Some(entry) = walker.next().await {
+                assert_eq!(entry.kind(), EntryKind::File);
+                bytes += entry.metadata().await.expect("stat").len();
+                names.push(entry.name().to_os_string());
+            }
+            assert!(matches!(walker.finish(), WalkOutcome::Complete));
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), count, "stat_files: {stat_files}");
+            assert_eq!(bytes, expected_bytes, "stat_files: {stat_files}");
+        }
+    }
+
+    /// A `stat_files` walk lstats regular files in the listing hop:
+    /// `metadata` hands out that result, so it no longer sees a removal
+    /// after the listing, and it still lstats a non-file on demand.
+    #[tokio::test]
+    async fn stat_files_serves_the_lstat_taken_while_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a"), b"abcde").expect("a");
+        std::fs::create_dir(dir.path().join("d")).expect("d");
+
+        let mut walker = Walker::new(dir.path(), &CONTINUE, OnMissing::Fail, ()).stat_files();
+        let mut seen = 0;
+        while let Some(entry) = walker.next().await {
+            seen += 1;
+            match entry.kind() {
+                EntryKind::File => {
+                    std::fs::remove_file(entry.path()).expect("unlink");
+                    let meta = entry.metadata().await.expect("prefetched stat");
+                    assert_eq!(meta.len(), 5);
+                    assert!(meta.is_file());
+                }
+                EntryKind::Dir | EntryKind::NonRegular => {
+                    assert_eq!(entry.kind(), EntryKind::Dir, "no non-regular entry exists");
+                    assert!(entry.metadata().await.expect("on-demand stat").is_dir());
+                }
+            }
+        }
+        assert_eq!(seen, 2);
+    }
+
     /// `metadata` is the walker's only per-entry syscall and runs after the
     /// listing, so it has to absorb both races the listing cannot see.
     #[tokio::test]
@@ -644,6 +866,31 @@ mod tests {
             entry.metadata().await.is_none(),
             "an entry whose type changed after the listing drops out of the walk"
         );
+    }
+
+    /// The on-demand lstat is relative to the listed directory, as the
+    /// listing itself is: it neither re-walks the entry's full path nor
+    /// loses the entry when an ancestor is renamed mid-walk.
+    #[tokio::test]
+    async fn metadata_is_anchored_to_the_listed_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(root.path().join("sub")).expect("sub");
+        std::fs::write(root.path().join("sub").join("f"), b"abc").expect("f");
+
+        let mut walker = Walker::new(root.path(), &CONTINUE, OnMissing::Fail, ());
+        {
+            let mut entry = walker.next().await.expect("sub");
+            assert_eq!(entry.kind(), EntryKind::Dir);
+            entry.descend(());
+        }
+        let entry = walker.next().await.expect("f");
+        assert_eq!(entry.name(), "f");
+        std::fs::rename(root.path().join("sub"), root.path().join("moved")).expect("rename sub");
+        let meta = entry
+            .metadata()
+            .await
+            .expect("the lstat follows the open directory, not the stale path");
+        assert_eq!(meta.len(), 3);
     }
 
     #[tokio::test]

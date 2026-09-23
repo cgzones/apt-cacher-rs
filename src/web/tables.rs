@@ -201,7 +201,7 @@ static DASHBOARD_WALK: WalkContext = WalkContext {
 /// about the same entry.
 async fn mirror_directory_size(path: &Path) -> DirStats {
     let mut stats = DirStats::default();
-    let mut walker = Walker::new(path, &DASHBOARD_WALK, OnMissing::Tolerate, false);
+    let mut walker = Walker::new(path, &DASHBOARD_WALK, OnMissing::Tolerate, false).stat_files();
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {

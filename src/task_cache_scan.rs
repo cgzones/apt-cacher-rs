@@ -334,7 +334,7 @@ async fn scan_tree(
     nested: &[String],
 ) -> (WalkOutcome, ScanTotals) {
     let mut totals = ScanTotals::default();
-    let mut walker = Walker::new(root, ctx, OnMissing::Tolerate, root_level);
+    let mut walker = Walker::new(root, ctx, OnMissing::Tolerate, root_level).stat_files();
 
     while let Some(mut entry) = walker.next().await {
         match entry.kind() {
