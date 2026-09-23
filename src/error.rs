@@ -84,6 +84,63 @@ pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) 
     false
 }
 
+/// Whether `err`'s chain holds a TLS client's rejection of the upstream's
+/// certificate (untrusted issuer, expired, wrong name, none presented), as
+/// opposed to a TLS failure that proves nothing about the peer (refused
+/// connection, timeout, no TLS on the port). Auto mode may fall back to
+/// plain HTTP after the latter, never after a rejection: presenting a bad
+/// certificate is what an interceptor does. Decided on the TLS library's
+/// typed error, never its message, for every TLS backend and both the hyper
+/// and the splice connector.
+///
+/// An `io::Error`'s `source()` is its wrapped error's *source*, skipping the
+/// wrapped error itself (`tokio-rustls` wraps the `rustls::Error` that way),
+/// so the walk steps into an `io::Error` through `get_ref`.
+#[must_use]
+pub(crate) fn is_tls_certificate_rejection(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if is_certificate_rejection_error(e) {
+            return true;
+        }
+        cur = match e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(inner) => Some(inner),
+            None => e.source(),
+        };
+    }
+    false
+}
+
+/// One link of [`is_tls_certificate_rejection`]'s walk, for rustls.
+#[cfg(feature = "tls_rustls")]
+fn is_certificate_rejection_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(
+        err.downcast_ref::<rustls::Error>(),
+        Some(rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
+    )
+}
+
+/// One link of [`is_tls_certificate_rejection`]'s walk, for native-tls: on
+/// Linux its handshake failure's source is OpenSSL's error queue, where a
+/// failed chain verification is `SSL_R_CERTIFICATE_VERIFY_FAILED`.
+#[cfg(feature = "tls_hyper")]
+fn is_certificate_rejection_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    // From OpenSSL's `err.h` and `sslerr.h`, which `openssl-sys` does not
+    // bind; unchanged since OpenSSL 1.0 and identical in LibreSSL.
+    const ERR_LIB_SSL: std::ffi::c_int = 20;
+    const SSL_R_CERTIFICATE_VERIFY_FAILED: std::ffi::c_int = 134;
+    err.downcast_ref::<openssl::error::ErrorStack>()
+        .is_some_and(|stack| {
+            stack.errors().iter().any(|e| {
+                e.library_code() == ERR_LIB_SSL
+                    && e.reason_code() == SSL_R_CERTIFICATE_VERIFY_FAILED
+            })
+        })
+}
+
 #[cfg(feature = "splice")]
 pub(crate) fn errno_to_io_error(errno: nix::errno::Errno, msg: &'static str) -> std::io::Error {
     // `Display` prints only the context message; the errno text lives on the
@@ -191,6 +248,44 @@ mod tests {
         // A chain that holds no io::Error at all.
         let no_io = Outer(Middle(Leaf));
         assert!(!is_io_timed_out_in_chain(&no_io));
+    }
+
+    /// The shapes the connectors produce: `tokio-rustls` wraps the
+    /// `rustls::Error` in an `io::Error` (whose `source()` skips it), and
+    /// hyper boxes that again behind its own error.
+    #[cfg(feature = "tls_rustls")]
+    #[test]
+    fn tls_certificate_rejection_is_found_through_io_error_wrappers() {
+        use std::io::{Error, ErrorKind};
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("connect")]
+        struct Outer(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+        let rejected = || {
+            Error::new(
+                ErrorKind::InvalidData,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            )
+        };
+        assert!(is_tls_certificate_rejection(&rejected()));
+        assert!(is_tls_certificate_rejection(&Outer(Box::new(rejected()))));
+        assert!(is_tls_certificate_rejection(&Error::new(
+            ErrorKind::InvalidData,
+            rustls::Error::NoCertificatesPresented,
+        )));
+
+        // No TLS on the port: a protocol failure proving nothing about the
+        // peer's identity, so Auto mode may still fall back.
+        let not_tls = Error::new(
+            ErrorKind::InvalidData,
+            rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType),
+        );
+        assert!(!is_tls_certificate_rejection(&not_tls));
+        assert!(!is_tls_certificate_rejection(&Outer(Box::new(not_tls))));
+        assert!(!is_tls_certificate_rejection(&Error::from(
+            ErrorKind::ConnectionRefused
+        )));
     }
 
     #[test]

@@ -302,8 +302,13 @@ pub(super) async fn standard_upstream_connect(
             )
             .with_target(format!(
                 "{}://{host_authority}{upstream_path}",
-                // Auto mode only returns a failure after its HTTP fallback.
-                resolved_scheme.unwrap_or(Scheme::Http)
+                // Auto mode fails on its HTTP fallback, or on the HTTPS
+                // probe itself when it refused to fall back.
+                resolved_scheme.unwrap_or(if err.certificate_rejected {
+                    Scheme::Https
+                } else {
+                    Scheme::Http
+                })
             )));
         };
         debug!(

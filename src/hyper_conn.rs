@@ -55,7 +55,10 @@ use crate::{
     database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
     deb_mirror::{Origin, OriginSighting},
     delivery::{Mechanism, Role},
-    error::{ErrorReport, UpstreamFetchError, is_io_timed_out_in_chain, is_peer_disconnect},
+    error::{
+        ErrorReport, UpstreamFetchError, is_io_timed_out_in_chain, is_peer_disconnect,
+        is_tls_certificate_rejection,
+    },
     fs_open::{
         CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
         touch_volatile_mtime,
@@ -87,7 +90,7 @@ use crate::{
         ContentLength, DownloadPlan, RejectGates, ResumeAnomaly, ResumeState, UpstreamHead,
         plan_download, plan_fresh_download,
     },
-    upstream_retry::{self, RetryLimit},
+    upstream_retry::{self, RetryStop},
     warn_once_or_debug, warn_once_or_info,
     web::serve_web_interface,
 };
@@ -138,7 +141,7 @@ struct FailedRequest {
     /// caller-side copy would name a URL the proxy never dialled.
     uri: Uri,
     attempts: u32,
-    limit: Option<RetryLimit>,
+    limit: Option<RetryStop>,
 }
 
 /// A terminal [`request_with_retry`] failure carrying the retry context and
@@ -215,12 +218,9 @@ impl RequestFailure {
             limit,
         } = *self.0;
         match limit {
-            Some(limit) => UpstreamError::connect(
-                operation,
-                std::io::Error::other(error),
-                attempts,
-                limit.into(),
-            ),
+            Some(limit) => {
+                UpstreamError::connect(operation, std::io::Error::other(error), attempts, limit)
+            }
             None => UpstreamError::head_transport(operation, error),
         }
         .with_target(uri.to_string())
@@ -365,7 +365,12 @@ pub(crate) async fn request_with_retry(
                         metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
                     }
                     let attempt = backoff.attempt();
-                    if attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
+                    // A rejected certificate is what an interceptor presents:
+                    // never a reason to revert to plain HTTP, and repeated
+                    // identically by every retry, so it ends the loop at once.
+                    let certificate_rejected = is_tls_certificate_rejection(&err);
+                    if !certificate_rejected
+                        && attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
                         && probe == UpgradeProbe::Revertible
                     {
                         debug!(
@@ -397,7 +402,12 @@ pub(crate) async fn request_with_retry(
                         continue;
                     }
 
-                    let Some(delay) = backoff.next_retry(coarsetime::Instant::now()) else {
+                    let next = if certificate_rejected {
+                        None
+                    } else {
+                        backoff.next_retry(coarsetime::Instant::now())
+                    };
+                    let Some(delay) = next else {
                         metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
                         if probe.is_probing() {
                             // Terminal connect failure while still probing:
@@ -420,7 +430,11 @@ pub(crate) async fn request_with_retry(
                             );
                         }
 
-                        let limit = backoff.limit();
+                        let limit = if certificate_rejected {
+                            RetryStop::Permanent
+                        } else {
+                            backoff.limit().into()
+                        };
                         debug!(
                             "Upstream retries ended after {attempt} connection attempts ({limit})"
                         );
@@ -503,7 +517,8 @@ enum UpgradeProbe {
     /// the one the client asked for).
     NotProbing,
     /// `Auto` mode with no cached scheme: revert to the original scheme once
-    /// the connect attempts cross `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS`.
+    /// the connect attempts cross `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS`,
+    /// unless the upstream's certificate was rejected, which is terminal.
     /// `scheme_cache::decide` only reaches it when no cached scheme exists,
     /// so nothing is lost by reverting.
     Revertible,

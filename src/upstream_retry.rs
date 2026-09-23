@@ -41,7 +41,6 @@ impl fmt::Display for RetryLimit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetryStop {
     Exhausted(RetryLimit),
-    #[cfg(feature = "splice")]
     Permanent,
 }
 
@@ -49,7 +48,6 @@ impl fmt::Display for RetryStop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Exhausted(limit) => limit.fmt(f),
-            #[cfg(feature = "splice")]
             Self::Permanent => f.write_str("permanent failure; not retrying"),
         }
     }

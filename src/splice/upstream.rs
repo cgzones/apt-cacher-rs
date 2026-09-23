@@ -29,7 +29,7 @@ use tracing::debug;
 
 use crate::config::ClientHost;
 use crate::deb_mirror::Mirror;
-use crate::error::{ErrorReport, is_peer_disconnect};
+use crate::error::{ErrorReport, is_peer_disconnect, is_tls_certificate_rejection};
 use crate::humanfmt::HumanFmt;
 use crate::limits::UPSTREAM_POOL_MAX_IDLE_PER_HOST;
 use crate::{Scheme, global_config, metrics, warn_once_or_debug, warn_once_or_info};
@@ -573,12 +573,30 @@ pub(super) enum Transience {
 pub(super) struct ConnectError {
     pub(super) transience: Transience,
     pub(super) err: std::io::Error,
+    /// The TLS handshake failed because the upstream's certificate was
+    /// rejected (`error::is_tls_certificate_rejection`): permanent, and the
+    /// one TLS failure Auto mode must not answer with its HTTP fallback.
+    pub(super) certificate_rejected: bool,
 }
 
 impl ConnectError {
     /// Pair an already-classified failure with the error it was derived from.
     fn new(transience: Transience, err: std::io::Error) -> Self {
-        Self { transience, err }
+        Self {
+            transience,
+            err,
+            certificate_rejected: false,
+        }
+    }
+
+    /// The upstream's certificate was rejected; retrying re-runs the same
+    /// verification against the same chain.
+    fn certificate_rejection(err: std::io::Error) -> Self {
+        Self {
+            transience: Transience::Permanent,
+            err,
+            certificate_rejected: true,
+        }
     }
 
     /// DNS/TCP failure, timeout, or a network error mid-handshake -- retry may help.
@@ -620,7 +638,9 @@ const fn classify_tls_error(kind: ErrorKind) -> Transience {
 /// `scheme` is resolved by the caller: `Some(_)` connects with that scheme
 /// directly, `None` is the Auto-upgrade case -- try HTTPS first, fall back to HTTP.
 /// Only the error that escapes here is classified for the caller's retry loop;
-/// a permanent TLS failure inside the Auto branch still falls back to HTTP.
+/// a permanent TLS failure inside the Auto branch still falls back to HTTP,
+/// except a rejected certificate: that is what an interceptor presents, so it
+/// escapes as the terminal failure instead of downgrading the download.
 ///
 /// Times out after the configured HTTP timeout.
 pub(super) async fn connect_upstream(
@@ -657,10 +677,19 @@ pub(super) async fn connect_upstream(
                         );
                         return Ok((UpstreamConn::Tls(tls), Scheme::Https));
                     }
+                    Err(err) if err.certificate_rejected => {
+                        metrics::UPSTREAM_TLS_FAILED.increment();
+                        debug!(
+                            "splice proxy: TLS certificate of {} rejected; not falling back to HTTP",
+                            mirror.format_authority()
+                        );
+                        return Err(err);
+                    }
                     Err(err) => {
                         // Deliberately not propagated: the HTTP fallback below is
                         // the point of Auto mode, so even a permanent TLS failure
-                        // must not abort it.
+                        // (no TLS on the port, an unparsable server name) must
+                        // not abort it.
                         metrics::UPSTREAM_TLS_FAILED.increment();
                         debug!(
                             "splice proxy: TLS handshake failed for {}, trying HTTP:  {}",
@@ -785,16 +814,20 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| handshake_timed_out(http_timeout))?
         .map_err(|err| {
-            // Classify before wrapping: the wrapper keeps the cause on
-            // `source()`, and only the original kind tells a certificate
-            // rejection (`InvalidData`) from a transport error.
-            ConnectError::new(
-                classify_tls_error(err.kind()),
-                std::io::Error::new(
-                    err.kind(),
-                    format!("failed to complete TLS handshake:  {err}"),
-                ),
-            )
+            // Classify before wrapping: the wrapper renders the cause into
+            // its message, and only the original error tells a certificate
+            // rejection or another deterministic failure (`InvalidData`)
+            // from a transport error.
+            let certificate_rejected = is_tls_certificate_rejection(&err);
+            let wrapped = std::io::Error::new(
+                err.kind(),
+                format!("failed to complete TLS handshake:  {err}"),
+            );
+            if certificate_rejected {
+                ConnectError::certificate_rejection(wrapped)
+            } else {
+                ConnectError::new(classify_tls_error(err.kind()), wrapped)
+            }
         })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
@@ -838,11 +871,17 @@ async fn tls_connect(tcp: TcpStream, host: &str) -> Result<TlsStream, ConnectErr
     let tls_stream = tokio::time::timeout(http_timeout, connector.connect(host, tcp))
         .await
         .map_err(|_timeout @ tokio::time::error::Elapsed { .. }| handshake_timed_out(http_timeout))?
-        // `native_tls::Error` is opaque: it carries no `io::ErrorKind`, so a
-        // certificate rejection is indistinguishable from a transport error.
-        // Classify conservatively (transient, keep retrying) rather than
-        // guess from the message.
-        .map_err(|err| ConnectError::transient(std::io::Error::other(err)))?;
+        // `native_tls::Error` carries no `io::ErrorKind`; only a certificate
+        // rejection is recognisable (through OpenSSL's error queue). Every
+        // other failure is classified conservatively (transient, keep
+        // retrying) rather than guessed from the message.
+        .map_err(|err| {
+            if is_tls_certificate_rejection(&err) {
+                ConnectError::certificate_rejection(std::io::Error::other(err))
+            } else {
+                ConnectError::transient(std::io::Error::other(err))
+            }
+        })?;
     debug!("splice proxy: TLS handshake completed with {host}");
     Ok(tls_stream)
 }

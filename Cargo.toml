@@ -34,7 +34,7 @@ hyper = [
 webpki-roots = ["tls_rustls", "dep:webpki-roots"]
 sendfile = ["dep:httparse", "nix/zerocopy", "nix/socket"]
 splice = ["sendfile", "nix/socket"]
-tls_hyper = ["dep:hyper-tls", "dep:tokio-native-tls"]
+tls_hyper = ["dep:hyper-tls", "dep:openssl", "dep:tokio-native-tls"]
 tls_rustls = ["dep:hyper-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
 
 
@@ -60,6 +60,7 @@ lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "x
 memfd = "0.6.4"
 memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
 nix = { version = "0.31", features = ["fs", "hostname", "resource", "user"] }
+openssl = { version = "0.10", optional = true }
 parking_lot = "0.12.5"
 pin-project = "1.1.11"
 rand = "0.10.1"

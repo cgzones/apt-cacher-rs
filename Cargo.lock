@@ -47,6 +47,7 @@ dependencies = [
  "memory-stats",
  "mimalloc",
  "nix",
+ "openssl",
  "parking_lot",
  "pin-project",
  "rand",
