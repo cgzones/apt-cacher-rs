@@ -257,6 +257,26 @@ pub(crate) async fn request_with_retry(
 
     let (mut parts, _body) = request.into_parts();
 
+    // Host names are case-insensitive: key the scheme cache, and the
+    // `http_only_mirrors` match `scheme_cache::resolve` does, on the lowercase
+    // host every other part of the proxy uses (`ClientHost`), as the splice
+    // backend's `Mirror` key already is. The raw spelling of a client URI or
+    // a redirect `Location` would miss an http-only entry and grow one cache
+    // entry per casing.
+    if let Some(auth) = parts.uri.authority()
+        && auth.host().bytes().any(|b| b.is_ascii_uppercase())
+    {
+        let host = auth.host().to_ascii_lowercase();
+        let lowered = match auth.port_u16() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+        let mut uri_parts = parts.uri.into_parts();
+        uri_parts.authority =
+            Some(Authority::try_from(lowered).expect("lowercasing keeps the authority valid"));
+        parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
+    }
+
     let orig_scheme = parts.uri.scheme().cloned();
 
     let mut probe = UpgradeProbe::NotProbing;
