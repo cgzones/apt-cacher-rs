@@ -1833,22 +1833,22 @@ async fn ingest_release_file(
 ) -> std::io::Result<()> {
     let content = read_release_to_string(path).await?;
     let date = clamp_future_release_date(index_parser::parse_release_date(&content));
-    let entries: Vec<(String, [u8; 32])> = index_parser::parse_release_checksums(&content)
-        .filter_map(|(rel, digest)| {
-            // Only Packages files are verified at layer C.
-            let leaf = rel
-                .rsplit('/')
-                .next()
-                .expect("rsplit yields at least one element");
-            PackagesCompression::from_filename(leaf)?;
-            // Resolve to the host-relative key (matches the Packages
-            // lookup key): <release_dir>/<rel>.
-            Some((
-                format!("{}/{}", release_dir.trim_end_matches('/'), rel),
-                digest,
-            ))
-        })
-        .collect();
+    let dir = release_dir.trim_end_matches('/');
+    let entries: Vec<(String, [u8; 32])> = index_parser::parse_release_checksums(&content, |rel| {
+        // Only Packages files are verified at layer C.
+        let leaf = rel.rsplit_once('/').map_or(rel, |(_, leaf)| leaf);
+        PackagesCompression::from_filename(leaf).is_some()
+    })
+    .map(|(rel, digest)| {
+        // Resolve to the host-relative key (matches the Packages lookup
+        // key): <release_dir>/<rel>.
+        let mut key = String::with_capacity(dir.len() + 1 + rel.len());
+        key.push_str(dir);
+        key.push('/');
+        key.push_str(rel);
+        (key, digest)
+    })
+    .collect();
     if !registry.insert_release(host, mirror_path, release_dir, date, &entries) {
         debug!(
             "Not registering index `{}` for host {host} mirror {mirror_path}; a newer Release/InRelease of `{release_dir}` is already registered",

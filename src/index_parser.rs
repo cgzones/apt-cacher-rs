@@ -569,9 +569,11 @@ enum ReleaseHashSection {
 /// is signed, so a later section header in the (unsigned) signature block must
 /// not re-open a section. Entry lines are indented with spaces or tabs (tabs
 /// accepted for non-canonical mirrors); a non-indented, non-empty line switches
-/// section (`MD5Sum:`, `SHA1:`, ... switch out). A 4th whitespace-separated
-/// token means the path contained a space, so the entry is rejected. The
-/// `<size>` field and the algorithm/length of `hex` are validated by the callers.
+/// section (`MD5Sum:`, `SHA1:`, ... switch out). Tokens are separated by
+/// ASCII whitespace only -- the format never uses anything else, and the
+/// Unicode-aware split walks every line char by char. A 4th token means the
+/// path contained a space, so the entry is rejected. The `<size>` field and
+/// the algorithm/length of `hex` are validated by the callers.
 fn release_hash_entries(
     content: &str,
 ) -> impl Iterator<Item = (ReleaseHashSection, &str, &str)> + '_ {
@@ -596,7 +598,7 @@ fn release_hash_entries(
         }
         let section = section?;
         // Indented entry: " <hex> <size> <path>".
-        let mut parts = line.split_whitespace();
+        let mut parts = line.split_ascii_whitespace();
         let hex = parts.next()?;
         let _size = parts.next()?;
         let path = parts.next()?;
@@ -608,25 +610,32 @@ fn release_hash_entries(
 }
 
 /// Iterate the `(repo-relative path, SHA256 digest)` entries from a Debian
-/// `Release` / `InRelease` file's `SHA256:` section.
+/// `Release` / `InRelease` file's `SHA256:` section whose path `wanted`
+/// accepts.
 ///
 /// Handles the `InRelease` clearsigned wrapper by stopping at the PGP
 /// signature boundary. Leading `./` segments are stripped
 /// ([`strip_leading_dot_segments`]) so the key matches the request's URI
 /// path; paths failing `is_safe_filename_relpath` are skipped.
-pub(crate) fn parse_release_checksums(
-    content: &str,
-) -> impl Iterator<Item = (String, [u8; 32])> + '_ {
-    release_hash_entries(content).filter_map(|(section, hex, path)| {
+///
+/// `wanted` sees that stripped, validated path and runs before the digest is
+/// decoded: the registry ingest keeps only the `Packages` leaves, about a
+/// fifth of a Debian `InRelease`, and decoding every entry first cost more
+/// than the rest of the parse. The path is borrowed from `content`, so the
+/// caller allocates only the entries it keeps.
+pub(crate) fn parse_release_checksums<'a>(
+    content: &'a str,
+    mut wanted: impl FnMut(&str) -> bool + 'a,
+) -> impl Iterator<Item = (&'a str, [u8; 32])> + 'a {
+    release_hash_entries(content).filter_map(move |(section, hex, path)| {
         if section != ReleaseHashSection::Sha256 {
             return None;
         }
-        let digest = hex_decode_exact::<32>(hex)?;
         let path = strip_leading_dot_segments(path);
-        if !is_safe_filename_relpath(path) {
+        if !is_safe_filename_relpath(path) || !wanted(path) {
             return None;
         }
-        Some((path.to_owned(), digest))
+        Some((path, hex_decode_exact::<32>(hex)?))
     })
 }
 
@@ -1214,6 +1223,19 @@ mod tests {
     }
 
     #[test]
+    fn release_entries_split_on_ascii_whitespace_only() {
+        // A no-break space is not a separator: the path keeps it and stays
+        // the 3rd token (the Unicode-aware split used to make it a 4th and
+        // drop the entry).
+        let d = hex_encode(&[0x77; 32]);
+        let content = format!("SHA256:\n {d} 10 main/a\u{a0}b/Packages\n");
+        assert_eq!(
+            parse_release_byhash_digests(&content).collect::<Vec<_>>(),
+            vec![ByHashRef::Sha256([0x77; 32])]
+        );
+    }
+
+    #[test]
     fn registry_key_for_structured_pool_uses_basename() {
         assert_eq!(
             registry_key_from_filename_field(
@@ -1318,7 +1340,7 @@ SHA256:
 SHA512:
  3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333 1234 main/binary-amd64/Packages
 ";
-        let entries: Vec<_> = parse_release_checksums(release).collect();
+        let entries: Vec<_> = parse_release_checksums(release, |_| true).collect();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, "main/binary-amd64/Packages");
         assert_eq!(entries[0].1, [0x11u8; 32]);
@@ -1340,7 +1362,7 @@ SHA256:
 iQIzBAEBCgAd...
 -----END PGP SIGNATURE-----
 ";
-        let entries: Vec<_> = parse_release_checksums(inrelease).collect();
+        let entries: Vec<_> = parse_release_checksums(inrelease, |_| true).collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "main/binary-amd64/Packages");
     }
@@ -1351,7 +1373,7 @@ iQIzBAEBCgAd...
 SHA256:
  1111111111111111111111111111111111111111111111111111111111111111 1 ../../etc/passwd
 ";
-        assert!(parse_release_checksums(release).next().is_none());
+        assert!(parse_release_checksums(release, |_| true).next().is_none());
     }
 
     #[test]
@@ -1363,10 +1385,35 @@ SHA256:
  1111111111111111111111111111111111111111111111111111111111111111 10 ./Packages
  2222222222222222222222222222222222222222222222222222222222222222 10 ../evil
 ";
-        let entries: Vec<_> = parse_release_checksums(release).collect();
+        let entries: Vec<_> = parse_release_checksums(release, |_| true).collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "Packages");
         assert_eq!(entries[0].1, [0x11u8; 32]);
+    }
+
+    #[test]
+    fn parse_release_checksums_filters_on_the_stripped_path() {
+        let release = "\
+SHA256:
+ 1111111111111111111111111111111111111111111111111111111111111111 10 ./main/binary-amd64/Packages.xz
+ 2222222222222222222222222222222222222222222222222222222222222222 10 main/Contents-amd64
+ 3333333333333333333333333333333333333333333333333333333333333333 10 ../main/binary-amd64/Packages
+";
+        let mut seen = Vec::new();
+        let entries: Vec<_> = parse_release_checksums(release, |path| {
+            seen.push(path.to_owned());
+            path.ends_with("/Packages.xz")
+        })
+        .collect();
+        assert_eq!(
+            entries,
+            vec![("main/binary-amd64/Packages.xz", [0x11u8; 32])]
+        );
+        // An unsafe path never reaches the filter.
+        assert_eq!(
+            seen,
+            ["main/binary-amd64/Packages.xz", "main/Contents-amd64"]
+        );
     }
 
     #[test]
@@ -1385,7 +1432,7 @@ SHA256:
  2222222222222222222222222222222222222222222222222222222222222222 10 evil/Packages
 -----END PGP SIGNATURE-----
 ";
-        let entries: Vec<_> = parse_release_checksums(inrelease).collect();
+        let entries: Vec<_> = parse_release_checksums(inrelease, |_| true).collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "main/binary-amd64/Packages");
         assert_eq!(entries[0].1, [0x11u8; 32]);
