@@ -21,7 +21,7 @@ use http::{
         ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ETAG, HOST, IF_MODIFIED_SINCE,
         IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT, VIA,
     },
-    uri::Authority,
+    uri::{Authority, PathAndQuery},
 };
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
@@ -2705,7 +2705,11 @@ async fn pre_process_client_request(
 
         let req = strip_request_body(client, req);
 
-        match dispatch_request(req.uri().path(), requested_host, requested_port, &client).await {
+        let path_and_query = req
+            .uri()
+            .path_and_query()
+            .map_or_else(|| req.uri().path(), PathAndQuery::as_str);
+        match dispatch_request(path_and_query, requested_host, requested_port, &client).await {
             DispatchOutcome::Cache(conn_details) => {
                 return process_cache_request(conn_details, req, appstate).await;
             }

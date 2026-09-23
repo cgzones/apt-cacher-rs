@@ -407,6 +407,10 @@ pub(crate) enum PassthroughReason {
     /// anchor.  Flat caching is disabled for the host
     /// (see [`crate::flat_blocklist`]).
     FlatBlocked,
+    /// An otherwise cacheable request carries a query string.  The query is
+    /// forwarded upstream but no part of the cache name, so caching the
+    /// answer would serve the query variant to every later plain request.
+    QueryString,
 }
 
 impl PassthroughReason {
@@ -417,6 +421,7 @@ impl PassthroughReason {
             Self::Unrecognized => "unrecognized resource path",
             Self::NonDebPool => "unsupported pool filename",
             Self::FlatBlocked => "flat host blocked by structured collision",
+            Self::QueryString => "query string on a cacheable path",
         }
     }
 }
@@ -469,15 +474,24 @@ enum Decision {
     },
 }
 
+/// Split a request target's path-and-query at its first `?`, which RFC 3986
+/// reserves as the query delimiter (a literal `?` in the path is `%3F`).
+fn split_query(path_and_query: &str) -> (&str, Option<&str>) {
+    match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    }
+}
+
 /// Classify an incoming request URL and decide how to route it.
 ///
-/// `uri_path` is the **raw** request-line path (not yet normalised); the
-/// dispatcher normalises internally for parsing while keeping the raw form
-/// for logs and the simple-proxy passthrough.  `client` is borrowed for log
-/// inclusion only; nothing about the classification depends on caller
-/// identity.
+/// `path_and_query` is the **raw** request-line path (not yet normalised)
+/// with its query string, if any; the dispatcher normalises the path
+/// internally for parsing while keeping the raw form for logs and the
+/// uncacheables ring.  `client` is borrowed for log inclusion only; nothing
+/// about the classification depends on caller identity.
 pub(crate) async fn dispatch_request(
-    uri_path: &str,
+    path_and_query: &str,
     requested_host: ClientHost,
     requested_port: Option<NonZero<u16>>,
     client: &ClientInfo,
@@ -485,7 +499,7 @@ pub(crate) async fn dispatch_request(
     let request_received_at = PreciseInstant::now();
     let cfg = global_config();
     let decision = decide_request(
-        uri_path,
+        path_and_query,
         requested_host,
         requested_port,
         client,
@@ -510,7 +524,7 @@ pub(crate) async fn dispatch_request(
             // module docs), so the uncacheables ring buffer and its
             // `UNCACHEABLE` counter are fed here rather than at each
             // backend's forwarding step.
-            record_uncacheable(&requested_host, uri_path);
+            record_uncacheable(&requested_host, split_query(path_and_query).0);
             DispatchOutcome::Passthrough {
                 reason,
                 requested_host,
@@ -533,7 +547,7 @@ pub(crate) async fn dispatch_request(
     reason = "single production call site; grouping the params would not aid clarity"
 )]
 fn decide_request(
-    uri_path: &str,
+    path_and_query: &str,
     requested_host: ClientHost,
     requested_port: Option<NonZero<u16>>,
     client: &ClientInfo,
@@ -542,6 +556,7 @@ fn decide_request(
     is_flat_blocked: impl FnOnce(&CacheHost, Option<NonZero<u16>>) -> bool,
     request_received_at: PreciseInstant,
 ) -> Decision {
+    let (uri_path, query) = split_query(path_and_query);
     trace!("Dispatching request from client {client}: host=`{requested_host}` path=`{uri_path}`");
 
     // pdiff URLs have a known shape (`/Packages.diff/T-...`, `/Sources.diff/T-...`,
@@ -589,7 +604,12 @@ fn decide_request(
 
                 let cache_id = aliased_host.unwrap_or_else(|| requested_host.as_cache_host());
                 let layout = class.resource_kind.layout();
-                if layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
+                if query.is_some() {
+                    warn_once_or_info!(
+                        "Query string on cacheable path {uri_path} from client {client}; forwarding it upstream uncached"
+                    );
+                    PassthroughReason::QueryString
+                } else if layout.is_flat() && is_flat_blocked(cache_id, requested_port) {
                     warn_once_or_info!(
                         "Flat caching disabled for host `{requested_host}` due to colliding structured mirror; passing {uri_path} through uncached for client {client}"
                     );
@@ -1079,6 +1099,60 @@ mod tests {
     fn passthrough_unrecognized_when_parser_declines() {
         let decision = decide_request(
             "/foo/bar.txt",
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        assert!(
+            matches!(
+                decision,
+                Decision::Passthrough {
+                    reason: PassthroughReason::Unrecognized,
+                    ..
+                }
+            ),
+            "expected Unrecognized passthrough, got {decision:?}"
+        );
+    }
+
+    /// The query is no part of the cache name, so a cacheable path carrying
+    /// one is relayed uncached rather than cached under the plain name.
+    #[test]
+    fn passthrough_query_string_on_a_cacheable_path() {
+        for target in [
+            "/debian/pool/main/f/firefox/firefox_1.0_amd64.deb?x=1",
+            "/debian/dists/sid/main/binary-amd64/Packages.gz?",
+            "/apt/Packages.gz?a=b&c=d",
+        ] {
+            let decision = decide_request(
+                target,
+                fake_host(),
+                None,
+                &local_client(),
+                &[],
+                true,
+                never_flat_blocked,
+                PreciseInstant::now(),
+            );
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Passthrough {
+                        reason: PassthroughReason::QueryString,
+                        ..
+                    }
+                ),
+                "{target}: expected QueryString passthrough, got {decision:?}"
+            );
+        }
+
+        // The query does not change the verdict for anything uncacheable.
+        let decision = decide_request(
+            "/foo/bar.txt?x=1",
             fake_host(),
             None,
             &local_client(),
