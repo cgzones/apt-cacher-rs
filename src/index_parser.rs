@@ -550,6 +550,32 @@ pub(crate) fn parse_release_checksums(
     })
 }
 
+/// The `Date:` of a `Release`/`InRelease`, as unix seconds, read from the
+/// header paragraph only (it ends at the first checksum section; the
+/// clearsigned wrapper's `Hash:` line is not a field of interest). Debian
+/// writes the zone as `UTC`, which RFC 2822 lacks, so a trailing `UTC` is
+/// read as `+0000`. `None` when the field is missing or unparsable.
+pub(crate) fn parse_release_date(content: &str) -> Option<i64> {
+    use time::format_description::well_known::Rfc2822;
+    for line in content.lines() {
+        if matches!(line, "MD5Sum:" | "SHA1:" | "SHA256:" | "SHA512:")
+            || line.starts_with("-----BEGIN PGP SIGNATURE")
+        {
+            return None;
+        }
+        if let Some(value) = line.strip_prefix("Date:") {
+            let value = value.trim();
+            let normalized = value
+                .strip_suffix(" UTC")
+                .map_or_else(|| value.to_owned(), |head| format!("{head} +0000"));
+            return time::OffsetDateTime::parse(&normalized, &Rfc2822)
+                .ok()
+                .map(time::OffsetDateTime::unix_timestamp);
+        }
+    }
+    None
+}
+
 /// A content-addressed digest referenced by a `Release`/`InRelease`, tagged by
 /// the algorithm of the section it appeared in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1191,6 +1217,27 @@ SHA256:
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "main/binary-amd64/Packages");
         assert_eq!(entries[0].1, [0x11u8; 32]);
+    }
+
+    #[test]
+    fn release_date_is_parsed_from_the_header_paragraph() {
+        let release = "Origin: Debian\nDate: Sun, 20 Sep 2026 08:53:33 UTC\nSHA256:\n 00 1 main/binary-amd64/Packages\n";
+        assert_eq!(parse_release_date(release), Some(1_789_894_413));
+        let offset = "Date: Sun, 20 Sep 2026 08:53:33 +0000\n";
+        assert_eq!(parse_release_date(offset), Some(1_789_894_413));
+        let inrelease = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nOrigin: Debian\nDate: Sun, 20 Sep 2026 08:53:33 UTC\nSHA256:\n";
+        assert_eq!(parse_release_date(inrelease), Some(1_789_894_413));
+        assert_eq!(parse_release_date("Origin: Debian\nSHA256:\n"), None);
+        assert_eq!(parse_release_date("Date: yesterday\n"), None);
+        // A `Date:`-looking line after a checksum section header is not the
+        // header paragraph's `Date:`. Unindented (unlike an entry line under
+        // the section) so that, absent the section cutoff, it would parse
+        // successfully -- the case actually exercises the cutoff rather than
+        // passing on `Date:`'s own indentation requirement.
+        assert_eq!(
+            parse_release_date("SHA256:\nDate: Sun, 20 Sep 2026 08:53:33 UTC\n"),
+            None
+        );
     }
 
     #[test]

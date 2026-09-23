@@ -432,6 +432,12 @@ struct ScopeState {
     /// was re-inserted later); the eviction loop skips them and
     /// `compact_order` periodically removes them.
     order: VecDeque<(Arc<str>, u64)>,
+    /// Per `Release` directory, the `Date:` (unix seconds; `None` when the
+    /// file had none) of the newest `Release`/`InRelease` whose entries were
+    /// registered. The two files of one directory write the same keys, so
+    /// an older one ingested later must not overwrite the newer digests.
+    /// Dropped with the scope when eviction drains it.
+    release_dates: HashMap<Box<str>, Option<i64>>,
 }
 
 impl ScopeState {
@@ -474,53 +480,52 @@ impl ChecksumRegistry {
     /// eviction-order position to most-recent.
     fn insert(&self, host: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
         let mut inner = self.inner.lock();
-        let generation = inner.next_gen;
-        inner.next_gen += 1;
+        insert_locked(&mut inner, self.cap, host, mirror_path, relpath, digest);
+    }
 
-        let scope_ref = RegistryScopeRef { host, mirror_path };
-        let scope = if let Some((scope, _)) = inner.map.get_key_value(&scope_ref) {
-            Arc::clone(scope)
-        } else {
-            let scope = Arc::new(RegistryScope {
-                host: host.to_owned(),
-                mirror_path: mirror_path.to_owned(),
-            });
-            inner.map.insert(Arc::clone(&scope), ScopeState::default());
-            scope
-        };
-
-        let state = inner
+    /// Register a `Release`/`InRelease`'s `Packages` entries unless a newer
+    /// source for the same directory already did; `false` when superseded.
+    /// Decided and written under one lock, so a concurrently ingested
+    /// sibling cannot interleave its inserts. Ordering: a dated source
+    /// beats an undated one; between dated ones the later `Date:` wins
+    /// (equal dates overwrite, harmlessly); two undated ones keep
+    /// last-writer-wins. An archive whose `Date:` legitimately goes
+    /// backwards (restored from backup) is therefore pinned to the newer
+    /// date already recorded until this process restarts or the scope
+    /// drains from eviction -- `date` here has already been clamped by
+    /// [`clamp_future_release_date`], so this rule only ever sees a date
+    /// that was not implausibly far in the future when ingested.
+    fn insert_release(
+        &self,
+        host: &str,
+        mirror_path: &str,
+        release_dir: &str,
+        date: Option<i64>,
+        entries: &[(String, [u8; 32])],
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        let recorded = inner
             .map
-            .get_mut(&scope)
-            .expect("scope was just looked up or inserted");
-        // Reuse the existing relpath allocation on refresh; `Arc<str>:
-        // Borrow<str>` makes the borrowed lookup allocation-free.
-        let rel = match state.entries.get_key_value(relpath) {
-            Some((rel, _)) => Arc::clone(rel),
-            None => Arc::from(relpath),
+            .get(&RegistryScopeRef { host, mirror_path })
+            .and_then(|state| state.release_dates.get(release_dir).copied());
+        let supersedes = match (recorded, date) {
+            (None | Some(None), _) => true,
+            (Some(Some(_)), None) => false,
+            (Some(Some(recorded)), Some(date)) => date >= recorded,
         };
-        let inserted = state
-            .entries
-            .insert(Arc::clone(&rel), (digest, generation))
-            .is_none();
-        state.order.push_back((rel, generation));
-        if state.order.len() > 2 * state.entries.len() + 16 {
-            compact_order(state);
+        if !supersedes {
+            return false;
         }
-        if inserted {
-            inner.len += 1;
+        for (key, digest) in entries {
+            insert_locked(&mut inner, self.cap, host, mirror_path, key, *digest);
         }
-
-        if inner.len > self.cap {
-            // The dashboard only ever shows the post-eviction count, so a
-            // registry permanently sized below its working set looks idle
-            // while verification coverage quietly drops.
-            info_once!(
-                "Checksum registry reached its {} entry cap; evicting the oldest entries of the largest mirror scope (verification coverage drops for evicted keys)",
-                self.cap
-            );
-            evict(&mut inner, self.cap);
+        // Eviction may have drained this scope; record the date only if it
+        // still exists (a drained scope rebuilds its dates on re-ingest).
+        if let Some(state) = inner.map.get_mut(&RegistryScopeRef { host, mirror_path }) {
+            state.release_dates.insert(release_dir.into(), date);
         }
+        drop(inner);
+        true
     }
 
     /// Look up an expected digest by `(host, mirror_path, relpath)`.
@@ -562,6 +567,68 @@ impl ChecksumRegistry {
     #[cfg(test)]
     fn order_len(&self) -> usize {
         self.inner.lock().map.values().map(|s| s.order.len()).sum()
+    }
+}
+
+/// Insert (or refresh) one expected digest under an already-locked
+/// `RegistryInner`, evicting at `cap` when the insert pushes the registry
+/// over it. Shared by `ChecksumRegistry::insert` (one entry) and
+/// `ChecksumRegistry::insert_release` (a whole `Release`/`InRelease` batch
+/// under one lock).
+fn insert_locked(
+    inner: &mut RegistryInner,
+    cap: usize,
+    host: &str,
+    mirror_path: &str,
+    relpath: &str,
+    digest: [u8; 32],
+) {
+    let generation = inner.next_gen;
+    inner.next_gen += 1;
+
+    let scope_ref = RegistryScopeRef { host, mirror_path };
+    let scope = if let Some((scope, _)) = inner.map.get_key_value(&scope_ref) {
+        Arc::clone(scope)
+    } else {
+        let scope = Arc::new(RegistryScope {
+            host: host.to_owned(),
+            mirror_path: mirror_path.to_owned(),
+        });
+        inner.map.insert(Arc::clone(&scope), ScopeState::default());
+        scope
+    };
+
+    let state = inner
+        .map
+        .get_mut(&scope)
+        .expect("scope was just looked up or inserted");
+    // Reuse the existing relpath allocation on refresh; `Arc<str>:
+    // Borrow<str>` makes the borrowed lookup allocation-free.
+    let rel = match state.entries.get_key_value(relpath) {
+        Some((rel, _)) => Arc::clone(rel),
+        None => Arc::from(relpath),
+    };
+    let inserted = state
+        .entries
+        .insert(Arc::clone(&rel), (digest, generation))
+        .is_none();
+    state.order.push_back((rel, generation));
+    if state.order.len() > 2 * state.entries.len() + 16 {
+        compact_order(state);
+    }
+    if inserted {
+        inner.len += 1;
+    }
+
+    if inner.len > cap {
+        // The dashboard only ever shows the post-eviction count, so a
+        // registry permanently sized below its working set looks idle
+        // while verification coverage quietly drops.
+        info_once!(
+            "Checksum registry reached its {} entry cap; evicting the oldest entries of the largest mirror scope (verification coverage drops for evicted keys)",
+            cap
+        );
+        evict(inner, cap);
     }
 }
 
@@ -637,8 +704,8 @@ fn largest_scope(inner: &RegistryInner) -> Option<Arc<RegistryScope>> {
 
 /// Rebuild a scope's `order` keeping only entries whose generation matches
 /// the current live entry. Preserves FIFO order of live entries. Triggered
-/// from `insert` when the log outgrows twice the live count, so amortized
-/// O(1) per insert.
+/// from `insert_locked` when the log outgrows twice the live count, so
+/// amortized O(1) per insert.
 fn compact_order(state: &mut ScopeState) {
     let mut compacted = VecDeque::with_capacity(state.entries.len());
     while let Some(entry) = state.order.pop_front() {
@@ -1359,6 +1426,33 @@ pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<Strin
     Ok(buf)
 }
 
+/// How far ahead of the wall clock a parsed `Date:` may be before
+/// [`clamp_future_release_date`] treats it as absent. One day tolerates
+/// ordinary clock skew between this host and the mirror while still
+/// rejecting a repository clock error or a one-time MITM that pushed the
+/// date forward on plaintext HTTP: without a clamp such a date would never
+/// be superseded (an undated source never overwrites a dated one), so the
+/// corrected `Release` a mirror serves later would keep being refused and
+/// its named `Packages` downloads kept unverified and throttled.
+const FUTURE_RELEASE_DATE_TOLERANCE_SECS: i64 = 24 * 60 * 60;
+
+/// Treat a parsed `Date:` more than [`FUTURE_RELEASE_DATE_TOLERANCE_SECS`]
+/// ahead of now as if the field were absent. APT itself rejects a
+/// future-dated `Release`; here the effect is milder -- an undated source
+/// never overwrites a dated one and is itself overwritten by the next dated
+/// one, which is the recovery this guards: the implausible date registers
+/// its entries (so a cold cache still verifies against them) but can never
+/// pin the directory against a later, honestly-dated `Release`.
+fn clamp_future_release_date(date: Option<i64>) -> Option<i64> {
+    let date = date?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    if date > now.saturating_add(FUTURE_RELEASE_DATE_TOLERANCE_SECS) {
+        None
+    } else {
+        Some(date)
+    }
+}
+
 /// Parse a `Release` / `InRelease` file and insert its `Packages*` entries
 /// into the registry. `release_dir` is the host-relative directory the
 /// `Release` file lives in (`Release`'s entry paths are relative to it).
@@ -1366,6 +1460,11 @@ pub(crate) async fn read_release_to_string(path: &Path) -> std::io::Result<Strin
 /// Only entries whose leaf matches a `Packages` file are inserted - those are
 /// the only `Release`-listed resources the proxy verifies (layer C). Other
 /// entries (`Contents-*`, `Translation-*`, ...) are skipped.
+///
+/// An older `Date:` than the directory's registered one registers nothing
+/// (see `ChecksumRegistry::insert_release`) and still returns `Ok`. A
+/// far-future `Date:` is clamped to absent first (see
+/// [`clamp_future_release_date`]).
 async fn ingest_release_file(
     registry: &ChecksumRegistry,
     host: &str,
@@ -1374,20 +1473,28 @@ async fn ingest_release_file(
     release_dir: &str,
 ) -> std::io::Result<()> {
     let content = read_release_to_string(path).await?;
-
-    for (rel, digest) in index_parser::parse_release_checksums(&content) {
-        // Only Packages files are verified at layer C.
-        let leaf = rel
-            .rsplit('/')
-            .next()
-            .expect("rsplit yields at least one element");
-        if PackagesCompression::from_filename(leaf).is_none() {
-            continue;
-        }
-        // Resolve to the host-relative key (matches the Packages lookup key):
-        // <release_dir>/<rel>.
-        let key = format!("{}/{}", release_dir.trim_end_matches('/'), rel);
-        registry.insert(host, mirror_path, &key, digest);
+    let date = clamp_future_release_date(index_parser::parse_release_date(&content));
+    let entries: Vec<(String, [u8; 32])> = index_parser::parse_release_checksums(&content)
+        .filter_map(|(rel, digest)| {
+            // Only Packages files are verified at layer C.
+            let leaf = rel
+                .rsplit('/')
+                .next()
+                .expect("rsplit yields at least one element");
+            PackagesCompression::from_filename(leaf)?;
+            // Resolve to the host-relative key (matches the Packages
+            // lookup key): <release_dir>/<rel>.
+            Some((
+                format!("{}/{}", release_dir.trim_end_matches('/'), rel),
+                digest,
+            ))
+        })
+        .collect();
+    if !registry.insert_release(host, mirror_path, release_dir, date, &entries) {
+        debug!(
+            "Not registering index `{}` for host {host} mirror {mirror_path}; a newer Release/InRelease of `{release_dir}` is already registered",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -2137,6 +2244,124 @@ mod tests {
                 "debian/dists/sid/main/binary-amd64/Packages.xz"
             ),
             Some(pkg_sha),
+        );
+    }
+
+    fn release_file(
+        dir: &tempfile::TempDir,
+        name: &str,
+        date: Option<&str>,
+        digest_hex: &str,
+    ) -> PathBuf {
+        let date_line = date.map_or(String::new(), |d| format!("Date: {d}\n"));
+        let body = format!(
+            "Origin: Test\n{date_line}SHA256:\n {digest_hex} 10 main/binary-amd64/Packages.xz\n"
+        );
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).expect("write release");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_newer_release_date_wins_whatever_the_ingest_order() {
+        use std::num::NonZero;
+        let newer = "Sun, 20 Sep 2026 08:53:33 UTC";
+        let older = "Sat, 19 Sep 2026 08:53:33 UTC";
+        let new_hex = "11".repeat(32);
+        let old_hex = "22".repeat(32);
+        let key = "debian/dists/sid/main/binary-amd64/Packages.xz";
+        for newer_first in [true, false] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let inrelease = release_file(&dir, "InRelease", Some(newer), &new_hex);
+            let release = release_file(&dir, "Release", Some(older), &old_hex);
+            let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+            let ingest_order = if newer_first {
+                [&inrelease, &release]
+            } else {
+                [&release, &inrelease]
+            };
+            for path in ingest_order {
+                ingest_release_file(&reg, "h", "debian", path, "debian/dists/sid")
+                    .await
+                    .expect("a superseded source is still a success");
+            }
+            assert_eq!(
+                reg.lookup("h", "debian", key),
+                Some([0x11; 32]),
+                "newer_first={newer_first}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_undated_release_never_overwrites_a_dated_one() {
+        use std::num::NonZero;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dated = release_file(
+            &dir,
+            "InRelease",
+            Some("Sun, 20 Sep 2026 08:53:33 UTC"),
+            &"11".repeat(32),
+        );
+        let undated = release_file(&dir, "Release", None, &"22".repeat(32));
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+        ingest_release_file(&reg, "h", "debian", &dated, "debian/dists/sid")
+            .await
+            .expect("ingest");
+        ingest_release_file(&reg, "h", "debian", &undated, "debian/dists/sid")
+            .await
+            .expect("ingest");
+        assert_eq!(
+            reg.lookup(
+                "h",
+                "debian",
+                "debian/dists/sid/main/binary-amd64/Packages.xz"
+            ),
+            Some([0x11; 32])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_future_dated_release_is_treated_as_undated() {
+        use std::num::NonZero;
+        use time::format_description::well_known::Rfc2822;
+
+        let now = time::OffsetDateTime::now_utc();
+        let far_future = (now + time::Duration::days(400))
+            .format(&Rfc2822)
+            .expect("format far-future date");
+        let later_dated = (now - time::Duration::days(1))
+            .format(&Rfc2822)
+            .expect("format dated");
+        let future_hex = "11".repeat(32);
+        let dated_hex = "22".repeat(32);
+        let key = "debian/dists/sid/main/binary-amd64/Packages.xz";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let future_release = release_file(&dir, "Release", Some(&far_future), &future_hex);
+        let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
+
+        ingest_release_file(&reg, "h", "debian", &future_release, "debian/dists/sid")
+            .await
+            .expect("a clamped date is still a successful ingest");
+        // The far-future date registers its entries (a cold cache still
+        // verifies against them) but as undated, per `clamp_future_release_date`.
+        assert_eq!(
+            reg.lookup("h", "debian", key),
+            Some([0x11; 32]),
+            "the future-dated source still registers its digests"
+        );
+
+        // A later, honestly-dated Release must still overwrite it: an
+        // undated source never blocks a dated one from superseding it.
+        let dated_release = release_file(&dir, "InRelease", Some(&later_dated), &dated_hex);
+        ingest_release_file(&reg, "h", "debian", &dated_release, "debian/dists/sid")
+            .await
+            .expect("ingest ok");
+        assert_eq!(
+            reg.lookup("h", "debian", key),
+            Some([0x22; 32]),
+            "a correctly-dated Release must overwrite the clamped future one"
         );
     }
 
