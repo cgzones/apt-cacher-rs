@@ -35,7 +35,11 @@
 //! output-free stream never does), or the thread's CPU time exceeds
 //! [`MAX_XZ_DECODE_CPU`]. CPU time rather than wall time, so neither a
 //! consumer that is slow to drain the pipe nor a loaded host counts against
-//! the budget.
+//! the budget. Reading the CPU clock is a syscall (`getrusage`), so the loop
+//! reads it only once [`CPU_CHECK_INTERVAL`] of (vDSO, syscall-free) wall
+//! time has passed since the last reading: a thread cannot burn more CPU
+//! time than wall time passes, so the budget is still caught within that
+//! interval and one slice of crossing it.
 
 use std::future::Future as _;
 use std::io;
@@ -43,6 +47,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use coarsetime::Instant;
 use lzma_rust2::{Action, Status, XzStream};
 use nix::sys::resource::{UsageWho, getrusage};
 use nix::sys::time::TimeValLike as _;
@@ -65,6 +70,13 @@ const PIPE_CAPACITY: usize = 64 * 1024;
 /// nothing measurable (a 15 MiB `Packages.xz`: same CPU time at 1 KiB as at
 /// 64 KiB slices).
 const PROCESS_SLICE: usize = 1024;
+
+/// Least wall time between two readings of the decode thread's CPU time (see
+/// the module doc). Reading it per slice cost ~10k `getrusage` calls per
+/// 10 MiB `Packages.xz`; at 10 ms it is ~50 per 500 ms decode, while a
+/// decode overrunning [`MAX_XZ_DECODE_CPU`] is still stopped within 10 ms
+/// (plus the coarse clock's tick and one slice) of crossing it.
+const CPU_CHECK_INTERVAL: coarsetime::Duration = coarsetime::Duration::from_millis(10);
 
 /// Async wrapper over a blocking [`XzStream`] decode.
 ///
@@ -158,6 +170,7 @@ fn decode_stream(
     let mut in_pos = 0;
     let mut eof = false;
     let cpu_start = thread_cpu_time()?;
+    let mut last_cpu_check = Instant::now();
 
     loop {
         if abandoned() {
@@ -166,14 +179,18 @@ fn decode_stream(
                 "xz consumer went away; abandoning the decode",
             ));
         }
-        if thread_cpu_time()?.saturating_sub(cpu_start) > cpu_budget {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "xz stream exceeded the decoding CPU budget of {}",
-                    HumanFmt::Time(cpu_budget)
-                ),
-            ));
+        let now = Instant::now();
+        if now.duration_since(last_cpu_check) >= CPU_CHECK_INTERVAL {
+            last_cpu_check = now;
+            if thread_cpu_time()?.saturating_sub(cpu_start) > cpu_budget {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "xz stream exceeded the decoding CPU budget of {}",
+                        HumanFmt::Time(cpu_budget)
+                    ),
+                ));
+            }
         }
         if in_pos == in_len && !eof {
             in_len = input.read(&mut in_buf)?;
