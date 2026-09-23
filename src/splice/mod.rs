@@ -1340,13 +1340,8 @@ async fn transfer_body(
 
     // The runner owns the barrier while workers borrow writer and progress.
     // A failure is concluded before the first salvage await, including TLS
-    // bytes consumed into a buffer but not yet appended to the partial.
-    let zero_copy = upstream.zero_copy().is_some();
-    let mut read_buf = if zero_copy {
-        Vec::new()
-    } else {
-        Vec::with_capacity(upstream::TLS_READ_BUF_SIZE)
-    };
+    // bytes consumed into the writer's batch but not yet appended to the
+    // partial.
     let CacheTarget {
         mut writer,
         dbarrier,
@@ -1368,7 +1363,7 @@ async fn transfer_body(
             if let Some(tcp) = upstream.zero_copy() {
                 splice_proxy_body(xfer, tcp).await
             } else {
-                splice_proxy_body_tls(xfer, upstream, &mut read_buf).await
+                splice_proxy_body_tls(xfer, upstream).await
             }
         })
         .await;
@@ -1382,10 +1377,7 @@ async fn transfer_body(
         Ok(outcome) => outcome,
         Err(failed) => {
             return Err(failed
-                .salvage(async || {
-                    writer.salvage(&temppath).await;
-                    writer.salvage_read_buf(&mut read_buf, &temppath).await;
-                })
+                .salvage(async || writer.salvage(&temppath).await)
                 .await);
         }
     };

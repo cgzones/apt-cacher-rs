@@ -42,12 +42,10 @@ pub(crate) static TLS_CLIENT_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceL
 /// How long an idle pooled connection is kept before eviction.
 const POOL_IDLE_TIMEOUT: coarsetime::Duration = coarsetime::Duration::from_secs(90);
 
-/// Buffer size for TLS upstream reads: the `super::http` head scanners and
-/// buffered-body collectors, and the userspace-TLS body loop
-/// (`super::body::splice_proxy_body_tls`).  One `poll_read` on a `TlsStream`
-/// yields about one 16 KiB TLS record however much capacity is offered, so
-/// the body loop accumulates several reads into this buffer before each
-/// `pwrite` and client write; 256 KiB costs one allocation per read site.
+/// Buffer size for TLS upstream reads by the `super::http` head scanners and
+/// buffered-body collectors; 256 KiB costs one allocation per read site. The
+/// userspace-TLS body loop (`super::body::splice_proxy_body_tls`) reads into
+/// its cache batch instead, which is sized by the batch policy.
 pub(super) const TLS_READ_BUF_SIZE: usize = 256 * 1024;
 
 #[cfg_attr(
