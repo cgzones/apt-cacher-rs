@@ -627,7 +627,11 @@ pub(crate) async fn main_loop(
         // head.
         if !ClientAcls::new(config, global_webif_hosts()).admits(&client) {
             metrics::CONNECTION_REJECTED_ACL.increment();
-            warn_once_or_info!(
+            // Unlike the per-request authorization refusals, repeats drop to
+            // debug: nothing but the connect reaches the daemon, so a connect
+            // flood would be one info line per connection, and the counter
+            // above already carries every repeat.
+            warn_once_or_debug!(
                 "Unauthorized client {client}: permitted by neither `allowed_proxy_clients` nor \
                  `allowed_webif_clients`; closing the socket without a response"
             );
