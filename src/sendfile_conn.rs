@@ -640,6 +640,7 @@ fn reject_result(
         | RejectReason::UnsupportedScheme
         | RejectReason::MissingHost
         | RejectReason::InvalidPort
+        | RejectReason::InvalidTarget
         | RejectReason::LoopDetected => ZeroCopyResult::Invalid { status, msg },
     }
 }

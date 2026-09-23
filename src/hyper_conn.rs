@@ -117,11 +117,22 @@ fn cache_access_failure() -> Response<ProxyCacheBody> {
     quick_response(StatusCode::INTERNAL_SERVER_ERROR, "Cache Access Failure")
 }
 
+/// Why a [`request_with_retry`] call failed.
+#[derive(Debug, thiserror::Error)]
+enum RequestError {
+    /// The client's transport error.
+    #[error(transparent)]
+    Transport(#[from] hyper_util::client::legacy::Error),
+    /// A scheme rewrite produced parts `Uri::from_parts` refuses.
+    #[error("failed to rebuild the request URI for a scheme change")]
+    InvalidUri(#[source] http::uri::InvalidUriParts),
+}
+
 /// The fields of a [`RequestFailure`], separated only so the payload can be
 /// boxed behind it.
 #[derive(Debug)]
 struct FailedRequest {
-    error: hyper_util::client::legacy::Error,
+    error: RequestError,
     /// The URI of the *last* attempt, not the one the caller handed in: the
     /// scheme cache rewrites the scheme inside the retry loop (the https
     /// upgrade probe, and the revert back to the original scheme), so a
@@ -173,6 +184,20 @@ impl std::error::Error for RequestFailure {
 impl RequestFailure {
     fn new(failed: FailedRequest) -> Self {
         Self(Box::new(failed))
+    }
+
+    /// A scheme rewrite produced parts `Uri::from_parts` refuses.  The
+    /// pre-flight admits only targets with an absolute path, so this is a
+    /// defensive answer rather than a reachable one: it fails the request
+    /// instead of panicking the task, which the release profile's
+    /// `panic = 'abort'` turns into a daemon exit.
+    fn invalid_uri(error: http::uri::InvalidUriParts, uri: Uri, attempts: u32) -> Self {
+        Self::new(FailedRequest {
+            error: RequestError::InvalidUri(error),
+            uri,
+            attempts,
+            limit: None,
+        })
     }
 
     /// The URI of the attempt that failed, after any scheme rewrite.
@@ -245,12 +270,11 @@ pub(crate) async fn request_with_retry(
         debug!("Not altering {os} scheme for request {}", parts.uri);
     } else if let Some(auth) = parts.uri.authority() {
         let decision = scheme_cache::resolve(auth.into(), global_config());
-        probe = UpgradeProbe::of(decision);
-        let scheme = if probe.is_probing() {
+        let upgrade = UpgradeProbe::of(decision);
+        let scheme = if upgrade.is_probing() {
             debug!(
                 "No cached scheme for host {auth}, trying https upgrade from original scheme {orig_scheme:?}..."
             );
-            metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
             http::uri::Scheme::HTTPS
         } else {
             let scheme = decision
@@ -259,10 +283,22 @@ pub(crate) async fn request_with_retry(
             debug!("Using {scheme} scheme for host {auth}, original scheme is {orig_scheme:?}");
             scheme.into()
         };
-        // `auth` is last used above; NLL ends its borrow so `parts.uri` can be consumed.
-        let mut uri_parts = parts.uri.into_parts();
+        let mut uri_parts = parts.uri.clone().into_parts();
         uri_parts.scheme = Some(scheme);
-        parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
+        // `auth` is last used above; NLL ends its borrow so `parts.uri` can be replaced.
+        parts.uri = match Uri::from_parts(uri_parts) {
+            Ok(uri) => uri,
+            Err(err) => {
+                metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
+                return Err(RequestFailure::invalid_uri(err, parts.uri, 0));
+            }
+        };
+        // Counted only once the upgrade is really attempted, so the
+        // ATTEMPTED == SUCCEEDED + REVERTED + FAILED identity holds.
+        if upgrade.is_probing() {
+            metrics::HTTPS_UPGRADE_ATTEMPTED.increment();
+        }
+        probe = upgrade;
     }
 
     #[expect(
@@ -319,7 +355,7 @@ pub(crate) async fn request_with_retry(
                         metrics::HTTPS_UPGRADE_FAILED.increment();
                     }
                     return Err(RequestFailure::new(FailedRequest {
-                        error: err,
+                        error: err.into(),
                         uri: parts.uri,
                         attempts: backoff.attempt(),
                         limit: None,
@@ -341,11 +377,18 @@ pub(crate) async fn request_with_retry(
                                 .expect("authority must exist for a https upgrade")
                         );
 
-                        metrics::HTTPS_UPGRADE_REVERTED.increment();
                         // reset https upgrade
-                        let mut uri_parts = parts.uri.into_parts();
+                        let mut uri_parts = parts.uri.clone().into_parts();
                         uri_parts.scheme.clone_from(&orig_scheme);
-                        parts.uri = Uri::from_parts(uri_parts).expect("valid parts");
+                        parts.uri = match Uri::from_parts(uri_parts) {
+                            Ok(uri) => uri,
+                            Err(err) => {
+                                metrics::UPSTREAM_HYPER_REQUEST_FAILED.increment();
+                                metrics::HTTPS_UPGRADE_FAILED.increment();
+                                return Err(RequestFailure::invalid_uri(err, parts.uri, attempt));
+                            }
+                        };
+                        metrics::HTTPS_UPGRADE_REVERTED.increment();
                         probe = UpgradeProbe::NotProbing;
                         backoff.reset_delay();
                         // The revert iteration is another upstream attempt
@@ -383,7 +426,7 @@ pub(crate) async fn request_with_retry(
                             "Upstream retries ended after {attempt} connection attempts ({limit})"
                         );
                         return Err(RequestFailure::new(FailedRequest {
-                            error: err,
+                            error: err.into(),
                             uri: parts.uri,
                             attempts: attempt,
                             limit: Some(limit),

@@ -4,13 +4,14 @@
 //!
 //! The pre-flight ([`preflight_method`] + [`preflight_target`]) is the
 //! backend-independent part of "is this a request we serve at all": method
-//! gate, proxy-client ACL for `CONNECT`, URI scheme gate, the HTTP/1.1
-//! `Host` requirement, the web-interface ACL and `Host` name gate, and the
-//! port sanity check.  Both functions are pure over their parameters (no
-//! `global_config()`); the backends feed them the already-parsed request
-//! line and map the shared [`RejectReason`] onto their response type.  The
-//! host allowlist stays in `permitted_host_cache::authorize_cache_access`,
-//! which the backends call on the returned [`RequestTarget::Proxy`] host.
+//! gate, proxy-client ACL for `CONNECT`, URI scheme and target-form gates,
+//! the HTTP/1.1 `Host` requirement, the web-interface ACL and `Host` name
+//! gate, and the port sanity check.  Both functions are pure over their
+//! parameters (no `global_config()`); the backends feed them the
+//! already-parsed request line and map the shared [`RejectReason`] onto their
+//! response type.  The host allowlist stays in
+//! `permitted_host_cache::authorize_cache_access`, which the backends call on
+//! the returned [`RequestTarget::Proxy`] host.
 //!
 //! Owns the request-classification pipeline that previously appeared inline
 //! in both dispatchers:
@@ -86,6 +87,10 @@ pub(crate) enum RejectReason {
     MisdirectedWebUi,
     /// Absolute-form `GET` naming port 0.
     InvalidPort,
+    /// A `GET` whose request target carries no absolute path: the
+    /// authority-form (`host:port`, the shape of a `CONNECT` target) or the
+    /// asterisk-form.
+    InvalidTarget,
     /// URL-decoding a request field produced invalid UTF-8.
     BadEncoding,
     /// A decoded field failed its allowlist validator
@@ -124,6 +129,7 @@ impl RejectReason {
             | Self::UnsupportedScheme
             | Self::MissingHost
             | Self::InvalidPort
+            | Self::InvalidTarget
             | Self::BadEncoding
             | Self::InvalidValue
             | Self::UnsafePath
@@ -144,6 +150,7 @@ impl RejectReason {
             Self::MissingHost => (StatusCode::BAD_REQUEST, "Missing Host header"),
             Self::MisdirectedWebUi => (StatusCode::MISDIRECTED_REQUEST, "Misdirected request"),
             Self::InvalidPort => (StatusCode::BAD_REQUEST, "Invalid port"),
+            Self::InvalidTarget => (StatusCode::BAD_REQUEST, "Invalid request target"),
             Self::BadEncoding => (StatusCode::BAD_REQUEST, "Unsupported URL encoding"),
             Self::InvalidValue | Self::UnsafePath => {
                 (StatusCode::BAD_REQUEST, "Unsupported request")
@@ -290,8 +297,9 @@ pub(crate) enum RequestTarget<'a> {
 }
 
 /// Target gate shared by both backends for a `GET`: scheme check, the
-/// HTTP/1.1 `Host` requirement, web-interface ACL and `Host` name gate for
-/// origin-form requests, and the port sanity check for absolute-form ones.
+/// absolute-path requirement, the HTTP/1.1 `Host` requirement, web-interface
+/// ACL and `Host` name gate for origin-form requests, and the port sanity
+/// check for absolute-form ones.
 ///
 /// `host_header` yields the raw value of the request's `Host` header, if
 /// any.  It is only consulted for origin-form requests, so the sendfile
@@ -311,6 +319,17 @@ pub(crate) fn preflight_target<'a, 'h>(
     {
         warn_once_or_info!("Unsupported URI scheme `{scheme}` from client {client}; returning 400");
         return Err(RejectReason::UnsupportedScheme);
+    }
+
+    // Only the origin-form and the absolute-form name a resource path.  An
+    // authority-form target (`GET host:port`) parses into a URI with an
+    // authority but no path, which neither the dispatcher nor the upstream
+    // relay can forward.
+    if uri.path_and_query().is_none() || !uri.path().starts_with('/') {
+        warn_once_or_info!(
+            "Unsupported request target `{uri}` from client {client}; returning 400"
+        );
+        return Err(RejectReason::InvalidTarget);
     }
 
     let Some(authority) = uri.authority() else {
@@ -864,6 +883,33 @@ mod tests {
     }
 
     #[test]
+    fn preflight_target_rejects_a_target_without_an_absolute_path() {
+        // Authority-form (the shape of a `CONNECT` target) and asterisk-form
+        // name no resource path; a `GET` carrying one must not reach the
+        // dispatcher or the upstream relay.
+        for target in [
+            "deb.example.com:80",
+            "deb.example.com:8080",
+            "127.0.0.1:3142",
+            "*",
+        ] {
+            let uri: Uri = target.parse().unwrap();
+            assert_eq!(
+                preflight_target(&uri, true, || LOCALHOST, &local_client(), &OPEN_ACLS)
+                    .unwrap_err(),
+                RejectReason::InvalidTarget,
+                "{target}"
+            );
+        }
+        // An absolute-form target without a path still names the root.
+        let uri: Uri = "http://deb.example.com".parse().unwrap();
+        assert!(matches!(
+            preflight_target(&uri, true, || None, &local_client(), &OPEN_ACLS),
+            Ok(RequestTarget::Proxy { .. })
+        ));
+    }
+
+    #[test]
     fn preflight_target_rejects_port_zero() {
         let uri: Uri = "http://deb.example.com:0/debian/dists/sid/Release"
             .parse()
@@ -903,6 +949,10 @@ mod tests {
         assert_eq!(
             RejectReason::InvalidPort.response_parts(),
             (StatusCode::BAD_REQUEST, "Invalid port")
+        );
+        assert_eq!(
+            RejectReason::InvalidTarget.response_parts(),
+            (StatusCode::BAD_REQUEST, "Invalid request target")
         );
         assert_eq!(
             RejectReason::BadEncoding.response_parts(),
