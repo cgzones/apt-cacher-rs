@@ -68,6 +68,7 @@ use crate::{
     guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
     http_range::HttpDate,
     humanfmt::HumanFmt,
+    integrity::note_cached_index_touch,
     limits::VOLATILE_CACHE_MAX_AGE,
     log_once, metrics,
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
@@ -1184,6 +1185,7 @@ async fn serve_volatile_file(
                 metrics::VOLATILE_HIT.increment();
             }
 
+            note_cached_index_touch(&conn_details, req.uri().path(), &file_path);
             return serve_cached_file(conn_details, &req, file, file_path, None, Some(mdata)).await;
         }
     } else {
@@ -2027,6 +2029,7 @@ async fn serve_new_file_worker(
 
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified((file, file_path)) => {
+            note_cached_index_touch(conn_details, req.uri().path(), &file_path);
             if !conn_details.client.is_cleanup_synthetic() {
                 metrics::VOLATILE_REFETCHED_UPTODATE.increment();
             }
@@ -2439,6 +2442,7 @@ pub(crate) async fn process_cache_request(
                     serve_volatile_file(conn_details, req, file, cache_path, appstate).await
                 }
                 CachedFlavor::Permanent => {
+                    note_cached_index_touch(&conn_details, req.uri().path(), &cache_path);
                     serve_cached_file(conn_details, &req, file, cache_path, None, None).await
                 }
             }

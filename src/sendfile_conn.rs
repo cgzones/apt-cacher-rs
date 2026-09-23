@@ -77,6 +77,7 @@ use crate::{
     http_range::format_http_date,
     humanfmt::HumanFmt,
     info_or_warn,
+    integrity::note_cached_index_touch,
     limits::VOLATILE_CACHE_MAX_AGE,
     metrics,
     permitted_host_cache::authorize_cache_access,
@@ -1226,6 +1227,7 @@ async fn try_sendfile_request(
                 metrics::CACHE_HITS.increment();
             }
             conn_details.refresh_origin();
+            note_cached_index_touch(&conn_details, uri_path, &cache_path);
 
             return serve_file_via_sendfile(
                 stream,

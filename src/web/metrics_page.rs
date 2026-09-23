@@ -413,6 +413,21 @@ fn build_integrity_group(g: &mut Groups) {
             global_checksum_registry().len(),
         );
         t.row_tip(
+            "Re-ingests (touch)",
+            "Cached indexes re-ingested because a request answered from cache found their digests missing (restart, eviction, an earlier skip). Climbing on every apt update means the registry cap is below the live working set.",
+            metrics::INGEST_TOUCH_TRIGGERED.get(),
+        );
+        t.row_tip(
+            "Ingests Skipped (queue full)",
+            "Index ingests skipped because the ingest line was full; each is retried on the index's next request.",
+            metrics::INGEST_SKIPPED_QUEUE_FULL.get(),
+        );
+        t.row_tip(
+            "Ingests Failed (not retried)",
+            "Index files that can never ingest (too large, corrupt, over the decode CPU budget); retried only once the file is replaced.",
+            AlertNonzero(metrics::INGEST_FAILED_MARKED.get()),
+        );
+        t.row_tip(
             "Throttled Resources",
             "Resources currently rejected with 503 because a recent download failed checksum verification (exponential backoff; cleared by a successfully verified download).",
             WarnNonzero(global_verify_throttle().active_len() as u64),

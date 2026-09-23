@@ -20,11 +20,23 @@
 //! acceptable precisely because this is defence in depth: the concurrent
 //! client's own APT GPG check is the backstop. So a reader path serving an
 //! unverified `Verifying`/`Download` file is by design, not a bug to "fix".
+//!
+//! The registry learns an index's digests when the index is committed, and
+//! again whenever a request for it is answered without a commit (a cache
+//! hit, a client or upstream 304) while its digests are missing: after a
+//! restart, an eviction from its scope, or a skipped or transiently failed
+//! ingest. `ingest_ledger` records which cache files are ingested (or failed
+//! for good), so a warm index costs `schedule_ingest` classifying the file
+//! and reading its registry scope's eviction epoch under the registry mutex,
+//! then one `ingest_ledger` map lookup that finds it already marked and
+//! returns; every backend calls [`note_cached_index_touch`] where it answers
+//! an index from cache.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use hashbrown::{Equivalent, HashMap};
 use parking_lot::Mutex;
@@ -33,10 +45,12 @@ use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
 use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
+use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::{
-    cache_layout::ResourceKind,
+    cache_layout::{ConnectionDetails, ResourceKind},
     cache_quota::QuotaReservation,
+    deb_mirror::normalize_uri_path,
     guards::DownloadWriteLease,
     index_parser::{self, HashAlgo, IndexFormat, StanzaStream, StreamedDigest},
     metrics, verified_marker,
@@ -398,8 +412,9 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 /// Bounded in-memory map from `(host, mirror_path)` scope and per-scope
 /// resource lookup key to an expected SHA256 digest, populated by parsing
 /// `Packages` / `Release` index files as they flow through. In-memory only
-/// (lost on restart, re-populated by the next `apt update`). FIFO bulk
-/// eviction at the configured cap.
+/// (lost on restart; an index answered from cache is re-ingested when its
+/// digests are missing, see the module doc). FIFO bulk eviction at the
+/// configured cap.
 ///
 /// Two-level layout: essentially all entries of one mirror share the same
 /// `(host, mirror_path)` pair, so a flat per-entry key would store those
@@ -407,14 +422,20 @@ impl Equivalent<Arc<RegistryScope>> for RegistryScopeRef<'_> {
 /// default 500k cap). The scope is allocated once per mirror; entries only
 /// own their relpath.
 ///
-/// `insert` and `lookup` are module-private on purpose: the only writer is
-/// the post-commit ingest below and the only reader is `verify_and_rename`,
-/// so nothing outside this module can seed or consult expected digests.
+/// `insert` and `lookup` are module-private on purpose: the only writers are
+/// the ingests `schedule_ingest` runs (on commit or on a cache-hit touch)
+/// and the only reader is `verify_and_rename`, so nothing outside this
+/// module can seed or consult expected digests.
 /// `new` (from `main`) and `len` (the dashboard gauge) are the whole
 /// crate-visible surface.
 #[derive(Debug)]
 pub(crate) struct ChecksumRegistry {
     inner: Mutex<RegistryInner>,
+    /// Behind a lock of its own: every index cache-hit touch reads an epoch
+    /// ([`Self::scope_epoch`]), and must not wait out an eviction pass,
+    /// which runs under `inner`. Lock order: `inner`, then `epochs` (only
+    /// `evict` takes both).
+    epochs: Mutex<EvictionEpochs>,
     cap: usize,
 }
 
@@ -461,6 +482,59 @@ struct RegistryInner {
     next_gen: u64,
 }
 
+/// Scopes [`EvictionEpochs`] remembers before it forgets them all at once.
+/// `mirror_path` is free-form under an allowed host, so without a bound
+/// every scope ever evicted from would stay mapped for the process lifetime.
+const MAX_EPOCH_SCOPES: usize = 4096;
+
+/// Per-scope eviction epochs: a scope's epoch changes with every `evict`
+/// pass that removes at least one live entry of it, and an ingest ledger
+/// mark taken under another epoch reads as stale. Kept apart from the
+/// scope's entries, so a scope drained empty and removed keeps its epoch.
+///
+/// Epochs come from one counter, so a value is never handed out twice. At
+/// [`MAX_EPOCH_SCOPES`] the map is cleared and `floor` (every unmapped
+/// scope's epoch) is raised above every value handed out so far: every
+/// existing mark then reads stale once -- its index re-ingests on its next
+/// touch -- and none can match by accident.
+#[derive(Debug)]
+struct EvictionEpochs {
+    by_scope: HashMap<Arc<RegistryScope>, u64>,
+    /// The epoch of every scope not in `by_scope`.
+    floor: u64,
+    /// The last epoch handed out.
+    last: u64,
+    cap: usize,
+}
+
+impl EvictionEpochs {
+    fn new(cap: usize) -> Self {
+        Self {
+            by_scope: HashMap::new(),
+            floor: 0,
+            last: 0,
+            cap,
+        }
+    }
+
+    fn get(&self, host: &str, mirror_path: &str) -> u64 {
+        self.by_scope
+            .get(&RegistryScopeRef { host, mirror_path })
+            .copied()
+            .unwrap_or(self.floor)
+    }
+
+    fn bump(&mut self, scope: &Arc<RegistryScope>) {
+        if self.by_scope.len() >= self.cap && !self.by_scope.contains_key(scope) {
+            self.by_scope.clear();
+            self.floor = self.last + 1;
+            self.last = self.floor;
+        }
+        self.last += 1;
+        self.by_scope.insert(Arc::clone(scope), self.last);
+    }
+}
+
 impl ChecksumRegistry {
     pub(crate) fn new(cap: NonZero<usize>) -> Self {
         Self {
@@ -469,6 +543,7 @@ impl ChecksumRegistry {
                 len: 0,
                 next_gen: 0,
             }),
+            epochs: Mutex::new(EvictionEpochs::new(MAX_EPOCH_SCOPES)),
             cap: cap.get(),
         }
     }
@@ -480,7 +555,7 @@ impl ChecksumRegistry {
     /// eviction-order position to most-recent.
     fn insert(&self, host: &str, mirror_path: &str, relpath: &str, digest: [u8; 32]) {
         let mut inner = self.inner.lock();
-        insert_locked(&mut inner, self.cap, host, mirror_path, relpath, digest);
+        self.insert_locked(&mut inner, host, mirror_path, relpath, digest);
     }
 
     /// Register a `Release`/`InRelease`'s `Packages` entries unless a newer
@@ -517,7 +592,7 @@ impl ChecksumRegistry {
             return false;
         }
         for (key, digest) in entries {
-            insert_locked(&mut inner, self.cap, host, mirror_path, key, *digest);
+            self.insert_locked(&mut inner, host, mirror_path, key, *digest);
         }
         // Eviction may have drained this scope; record the date only if it
         // still exists (a drained scope rebuilds its dates on re-ingest).
@@ -568,67 +643,75 @@ impl ChecksumRegistry {
     fn order_len(&self) -> usize {
         self.inner.lock().map.values().map(|s| s.order.len()).sum()
     }
-}
 
-/// Insert (or refresh) one expected digest under an already-locked
-/// `RegistryInner`, evicting at `cap` when the insert pushes the registry
-/// over it. Shared by `ChecksumRegistry::insert` (one entry) and
-/// `ChecksumRegistry::insert_release` (a whole `Release`/`InRelease` batch
-/// under one lock).
-fn insert_locked(
-    inner: &mut RegistryInner,
-    cap: usize,
-    host: &str,
-    mirror_path: &str,
-    relpath: &str,
-    digest: [u8; 32],
-) {
-    let generation = inner.next_gen;
-    inner.next_gen += 1;
-
-    let scope_ref = RegistryScopeRef { host, mirror_path };
-    let scope = if let Some((scope, _)) = inner.map.get_key_value(&scope_ref) {
-        Arc::clone(scope)
-    } else {
-        let scope = Arc::new(RegistryScope {
-            host: host.to_owned(),
-            mirror_path: mirror_path.to_owned(),
-        });
-        inner.map.insert(Arc::clone(&scope), ScopeState::default());
-        scope
-    };
-
-    let state = inner
-        .map
-        .get_mut(&scope)
-        .expect("scope was just looked up or inserted");
-    // Reuse the existing relpath allocation on refresh; `Arc<str>:
-    // Borrow<str>` makes the borrowed lookup allocation-free.
-    let rel = match state.entries.get_key_value(relpath) {
-        Some((rel, _)) => Arc::clone(rel),
-        None => Arc::from(relpath),
-    };
-    let inserted = state
-        .entries
-        .insert(Arc::clone(&rel), (digest, generation))
-        .is_none();
-    state.order.push_back((rel, generation));
-    if state.order.len() > 2 * state.entries.len() + 16 {
-        compact_order(state);
-    }
-    if inserted {
-        inner.len += 1;
+    /// The eviction epoch of `(host, mirror_path)`: bumped by every
+    /// eviction that takes entries from the scope, so an ingest ledger mark
+    /// taken under an older epoch knows its digests may be gone.
+    fn scope_epoch(&self, host: &str, mirror_path: &str) -> u64 {
+        self.epochs.lock().get(host, mirror_path)
     }
 
-    if inner.len > cap {
-        // The dashboard only ever shows the post-eviction count, so a
-        // registry permanently sized below its working set looks idle
-        // while verification coverage quietly drops.
-        info_once!(
-            "Checksum registry reached its {} entry cap; evicting the oldest entries of the largest mirror scope (verification coverage drops for evicted keys)",
-            cap
-        );
-        evict(inner, cap);
+    /// Insert (or refresh) one expected digest under an already-locked
+    /// `RegistryInner`, evicting when the insert pushes the registry over its
+    /// cap. Shared by `ChecksumRegistry::insert` (one entry) and
+    /// `ChecksumRegistry::insert_release` (a whole `Release`/`InRelease` batch
+    /// under one lock).
+    fn insert_locked(
+        &self,
+        inner: &mut RegistryInner,
+        host: &str,
+        mirror_path: &str,
+        relpath: &str,
+        digest: [u8; 32],
+    ) {
+        let cap = self.cap;
+        let generation = inner.next_gen;
+        inner.next_gen += 1;
+
+        let scope_ref = RegistryScopeRef { host, mirror_path };
+        let scope = if let Some((scope, _)) = inner.map.get_key_value(&scope_ref) {
+            Arc::clone(scope)
+        } else {
+            let scope = Arc::new(RegistryScope {
+                host: host.to_owned(),
+                mirror_path: mirror_path.to_owned(),
+            });
+            inner.map.insert(Arc::clone(&scope), ScopeState::default());
+            scope
+        };
+
+        let state = inner
+            .map
+            .get_mut(&scope)
+            .expect("scope was just looked up or inserted");
+        // Reuse the existing relpath allocation on refresh; `Arc<str>:
+        // Borrow<str>` makes the borrowed lookup allocation-free.
+        let rel = match state.entries.get_key_value(relpath) {
+            Some((rel, _)) => Arc::clone(rel),
+            None => Arc::from(relpath),
+        };
+        let inserted = state
+            .entries
+            .insert(Arc::clone(&rel), (digest, generation))
+            .is_none();
+        state.order.push_back((rel, generation));
+        if state.order.len() > 2 * state.entries.len() + 16 {
+            compact_order(state);
+        }
+        if inserted {
+            inner.len += 1;
+        }
+
+        if inner.len > cap {
+            // The dashboard only ever shows the post-eviction count, so a
+            // registry permanently sized below its working set looks idle
+            // while verification coverage quietly drops.
+            info_once!(
+                "Checksum registry reached its {} entry cap; evicting the oldest entries of the largest mirror scope (verification coverage drops for evicted keys)",
+                cap
+            );
+            evict(inner, cap, &self.epochs);
+        }
     }
 }
 
@@ -638,7 +721,7 @@ fn insert_locked(
 /// entries pop from the front of its `order`; stale ones (re-inserted keys
 /// whose live generation is newer) are skipped and do not count against the
 /// quota.
-fn evict(inner: &mut RegistryInner, cap: usize) {
+fn evict(inner: &mut RegistryInner, cap: usize, epochs: &Mutex<EvictionEpochs>) {
     let quota = (cap / 4).max(1);
     let mut live = 0usize;
     while live < quota {
@@ -648,6 +731,7 @@ fn evict(inner: &mut RegistryInner, cap: usize) {
         let Some(state) = inner.map.get_mut(&scope) else {
             break;
         };
+        let before = live;
         while live < quota {
             let Some((rel, generation)) = state.order.pop_front() else {
                 break;
@@ -663,6 +747,9 @@ fn evict(inner: &mut RegistryInner, cap: usize) {
                     // or already evicted. Drop it; no eviction quota consumed.
                 }
             }
+        }
+        if live > before {
+            epochs.lock().bump(&scope);
         }
         if state.entries.is_empty() {
             inner.map.remove(&scope);
@@ -825,7 +912,7 @@ pub(crate) async fn verify_and_rename(
             kind @ (ResourceKind::Pool | ResourceKind::Packages) => {
                 let key = registry_lookup_key(kind, &plan.debname, &plan.raw_uri_path)
                     .expect("Pool and Packages are the registry-backed kinds");
-                registry_verify_kind(plan, key)
+                registry_verify_kind(plan, &key)
             }
             ResourceKind::Release
             | ResourceKind::ComponentRelease
@@ -883,6 +970,12 @@ pub(crate) async fn verify_and_rename(
             rename_into_cache(&temp_path, &dest_path).map(|()| {
                 reservation.finalize(bytes_received);
                 lease.invalidate_metadata();
+                // Here, not after the await: a commit future cancelled
+                // between the rename and the scheduling below would
+                // otherwise leave the replaced file's mark on the new one.
+                if verify_enabled {
+                    INGEST_LEDGER.invalidate(&dest_path);
+                }
             })
         })
         .await
@@ -907,109 +1000,354 @@ pub(crate) async fn verify_and_rename(
     // the registry it populates is read only by `verify_temp_file`, so parsing
     // (and decompressing) every index file would be pure waste.
     if verify_enabled {
-        spawn_ingest(plan);
+        schedule_ingest(&IndexFile::from(plan), IngestTrigger::Commit);
     }
 
     Ok(())
 }
 
-/// How many `Packages` ingests decode at once. Every committed index spawns
+/// How many `Packages` ingests decode at once. A commit or a touch schedules
 /// one, and by-hash indexes are distinct resources, so an upstream serving
 /// many small hostile `.xz` files would otherwise hold one blocking-pool
 /// thread each for up to [`limits::MAX_XZ_DECODE_CPU`] and starve every
 /// other `spawn_blocking` user (`tokio::fs`, verification). Two keep an
 /// `apt update` over several components flowing while bounding that.
-/// `Release` ingest reads a capped, uncompressed file and is not gated.
+/// `Release` ingest reads a capped, uncompressed file and takes no decode
+/// permit; it is admitted from the separate [`RELEASE_INGEST_SLOTS`] line
+/// instead of [`INGEST_SLOTS`].
 const PACKAGES_INGEST_CONCURRENCY: usize = 2;
 
 static PACKAGES_INGEST_PERMITS: Semaphore = Semaphore::const_new(PACKAGES_INGEST_CONCURRENCY);
 
-/// Named `Packages*` ingests that may wait for a permit at once. The permits
-/// alone bound the CPU, not the line in front of them: a mirror serving
-/// budget-burning indexes would otherwise queue one task per committed index
-/// and push every later ingest back by one [`limits::MAX_XZ_DECODE_CPU`]
-/// turn each. Eight covers an `apt update` over several suites and
-/// components landing at once.
-const NAMED_INGEST_QUEUE: usize = 8;
+/// `Packages`/`PackagesSniff` ingests that may wait for a decode permit at
+/// once. The permits bound the CPU, not the line in front of them: without a
+/// bound, a mirror serving budget-burning indexes would queue one task per
+/// committed or touched index and push every later ingest back by one
+/// [`limits::MAX_XZ_DECODE_CPU`] turn each. Sixty-four holds the burst the
+/// first `apt update` after a restart touches (every live index at once:
+/// tens for a multi-suite, multi-arch Debian mirror).
+const INGEST_QUEUE: usize = 64;
 
-/// By-hash `Packages` ingests that may wait for a permit at once. By-hash
-/// digests are the cheap way to commit many distinct hostile indexes, so
-/// their line is shorter than [`NAMED_INGEST_QUEUE`]; it is not zero because
-/// by-hash is also how `apt` fetches every index from an `Acquire-By-Hash:
-/// yes` archive (Debian, Ubuntu), so a legitimate burst lands here too.
-const BYHASH_INGEST_QUEUE: usize = 4;
+/// One slot per scheduled `Packages`/`PackagesSniff` ingest, from before its
+/// spawn to its end: the decode permits plus the line. Taken synchronously
+/// in [`admit`], so a burst of touches can never hold more `Packages`-kind
+/// paths `Running` in the ingest ledger than this (the ledger cap never
+/// drops `Running` entries). `Release` jobs draw from their own pool,
+/// [`RELEASE_INGEST_SLOTS`], so the two pools together bound `Running`
+/// ledger entries at `INGEST_SLOTS` + `RELEASE_INGEST_SLOTS` (66 + 16 = 82).
+static INGEST_SLOTS: Semaphore = Semaphore::const_new(PACKAGES_INGEST_CONCURRENCY + INGEST_QUEUE);
 
-static NAMED_INGEST_WAITERS: IngestQueue = IngestQueue::new(NAMED_INGEST_QUEUE);
-static BYHASH_INGEST_WAITERS: IngestQueue = IngestQueue::new(BYHASH_INGEST_QUEUE);
+/// How many `Release`/`InRelease` ingests may be admitted at once, in a pool
+/// separate from [`INGEST_SLOTS`]: a hostile permitted mirror committing
+/// budget-burning `.xz` `Packages` indexes can hold every slot of that
+/// shared line, and without a pool of its own every other mirror's
+/// `Release` ingest would then be refused too. `Release` jobs take no
+/// decode permit (a capped, uncompressed read), so this pool only bounds
+/// the line, not CPU; sixteen comfortably covers every live suite's
+/// `Release`/`InRelease` across a multi-suite, multi-arch mirror set.
+const RELEASE_INGEST_QUEUE: usize = 16;
 
-/// A bounded line of ingests waiting for an ingest permit: each waiter
-/// holds one of `places`.
-struct IngestQueue {
-    places: Semaphore,
+static RELEASE_INGEST_SLOTS: Semaphore = Semaphore::const_new(RELEASE_INGEST_QUEUE);
+
+/// The admission pool a job of `kind` draws its slot from: `Release` jobs
+/// get their own pool ([`RELEASE_INGEST_SLOTS`]); `Packages`/`PackagesSniff`
+/// share [`INGEST_SLOTS`] (see both statics' docs for why they are split).
+fn ingest_pool(kind: &IngestKind) -> &'static Semaphore {
+    match kind {
+        IngestKind::Release { release_dir: _ } => &RELEASE_INGEST_SLOTS,
+        IngestKind::Packages { .. } | IngestKind::PackagesSniff { .. } => &INGEST_SLOTS,
+    }
 }
 
-impl IngestQueue {
-    const fn new(max_waiting: usize) -> Self {
-        Self {
-            places: Semaphore::const_new(max_waiting),
+/// What [`admit`] decided for one path.
+enum Admission<'l, 's> {
+    /// Ingested under the current epoch, failed for good, or already running.
+    Nothing,
+    /// No slot free; the path stays unmarked for its next touch.
+    Refused,
+    /// Run it: the ledger claim and the slot, both held by the job.
+    Admitted(Claim<'l>, SemaphorePermit<'s>),
+}
+
+/// Claim `path` in `ledger`, then take a slot. A refused claim is dropped,
+/// which leaves the path unmarked (the `Claim` drop guard). Pure over its
+/// arguments; [`schedule_ingest`] passes the globals.
+fn admit<'l, 's>(
+    ledger: &'l IngestLedger,
+    slots: &'s Semaphore,
+    path: &Path,
+    epoch: u64,
+) -> Admission<'l, 's> {
+    let Some(claim) = ledger.claim(path, epoch) else {
+        return Admission::Nothing;
+    };
+    match slots.try_acquire() {
+        Ok(slot) => Admission::Admitted(claim, slot),
+        Err(_err @ (TryAcquireError::NoPermits | TryAcquireError::Closed)) => {
+            drop(claim);
+            Admission::Refused
         }
     }
+}
 
-    /// A permit from `permits`, taken at once if one is free, else after
-    /// waiting in this line; `None` when the line is already full, in which
-    /// case the caller skips its ingest. Cancel-safe: a dropped waiter gives
-    /// its place back.
-    async fn acquire<'a>(&self, permits: &'a Semaphore) -> Option<SemaphorePermit<'a>> {
-        if let Ok(permit) = permits.try_acquire() {
-            return Some(permit);
+/// Run `ingest` under one of the [`PACKAGES_INGEST_PERMITS`].
+async fn with_decode_permit<F: Future>(ingest: F) -> F::Output {
+    let _permit = PACKAGES_INGEST_PERMITS
+        .acquire()
+        .await
+        .expect("the ingest semaphore is never closed");
+    ingest.await
+}
+
+/// Paths the ledger tracks at most; see [`IngestLedger::claim`].
+#[expect(
+    clippy::decimal_literal_representation,
+    reason = "16384 reads as a round entry-count cap, not a bit-width constant"
+)]
+const INGEST_LEDGER_CAP: usize = 16_384;
+
+static INGEST_LEDGER: LazyLock<IngestLedger> =
+    LazyLock::new(|| IngestLedger::new(INGEST_LEDGER_CAP));
+
+/// Why an ingest is scheduled (only the counters differ).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IngestTrigger {
+    Commit,
+    Touch,
+}
+
+/// Queue the ingest of `file` unless the ledger says its digests are
+/// already registered, it failed for good, or an ingest of it is running.
+fn schedule_ingest(file: &IndexFile<'_>, trigger: IngestTrigger) {
+    let Some(kind) = ingest_kind(file) else {
+        return;
+    };
+    let registry = global_checksum_registry();
+    let epoch = registry.scope_epoch(file.host, file.mirror_path);
+    let (claim, slot) = match admit(&INGEST_LEDGER, ingest_pool(&kind), file.path, epoch) {
+        Admission::Nothing => return,
+        Admission::Refused => {
+            metrics::INGEST_SKIPPED_QUEUE_FULL.increment();
+            warn_once_or_debug!(
+                "Skipping registry ingest of index `{}` for host {} mirror {} (ingest queue full); retrying on its next request",
+                file.path.display(),
+                file.host,
+                file.mirror_path,
+            );
+            return;
         }
-        let _place = match self.places.try_acquire() {
-            Ok(place) => place,
-            Err(_err @ (TryAcquireError::NoPermits | TryAcquireError::Closed)) => return None,
-        };
-        Some(
-            permits
-                .acquire()
+        Admission::Admitted(claim, slot) => (claim, slot),
+    };
+    if trigger == IngestTrigger::Touch {
+        metrics::INGEST_TOUCH_TRIGGERED.increment();
+    }
+    let host = file.host.to_owned();
+    let mirror_path = file.mirror_path.to_owned();
+    let dest = file.path.to_path_buf();
+    let buffer_size = global_config().buffer_size;
+    tokio::spawn(run_ingest_job(
+        claim,
+        slot,
+        kind,
+        host,
+        mirror_path,
+        dest,
+        buffer_size,
+    ));
+}
+
+/// Answer a request for a cached index without a commit (a cache hit, a
+/// client or upstream 304): re-ingest it if the registry lacks its digests.
+/// `raw_uri_path` is the request path as received; `cache_path` the file
+/// served.
+pub(crate) fn note_cached_index_touch(
+    conn_details: &ConnectionDetails,
+    raw_uri_path: &str,
+    cache_path: &Path,
+) {
+    if !global_config().verify_checksums {
+        return;
+    }
+    schedule_ingest(
+        &IndexFile {
+            resource_kind: conn_details.resource_kind,
+            debname: &conn_details.debname,
+            raw_uri_path,
+            host: conn_details.mirror.host().as_str(),
+            mirror_path: conn_details.mirror.path(),
+            path: cache_path,
+        },
+        IngestTrigger::Touch,
+    );
+}
+
+/// One claimed path's ingest, run again while commits keep replacing the
+/// file under it.
+async fn run_ingest_job(
+    mut claim: Claim<'static>,
+    // Held for the whole job, reruns included; see `INGEST_SLOTS`.
+    _slot: SemaphorePermit<'static>,
+    kind: IngestKind,
+    host: String,
+    mirror_path: String,
+    dest: PathBuf,
+    buffer_size: usize,
+) {
+    let registry = global_checksum_registry();
+    loop {
+        let result = ingest_once(registry, &kind, &host, &mirror_path, &dest, buffer_size).await;
+        let outcome = result.outcome();
+        log_ingest_result(&result, outcome, &host, &mirror_path, &dest);
+        if !claim.finish(outcome, registry.scope_epoch(&host, &mirror_path)) {
+            return;
+        }
+    }
+}
+
+/// One ingest of `dest`: dispatches on `kind` to the matching parse
+/// (`Packages`, sniffed-compression `Packages`, or `Release`), under a
+/// decode permit for the two `Packages` variants.
+async fn ingest_once(
+    registry: &ChecksumRegistry,
+    kind: &IngestKind,
+    host: &str,
+    mirror_path: &str,
+    dest: &Path,
+    buffer_size: usize,
+) -> IngestResult {
+    let result = match kind {
+        IngestKind::Packages {
+            compression,
+            format,
+        } => {
+            with_decode_permit(ingest_packages_file(
+                registry,
+                host,
+                mirror_path,
+                dest,
+                *compression,
+                *format,
+                buffer_size,
+            ))
+            .await
+        }
+        IngestKind::PackagesSniff { format } => {
+            with_decode_permit(async {
+                let compression = sniff_packages_compression(dest).await?;
+                ingest_packages_file(
+                    registry,
+                    host,
+                    mirror_path,
+                    dest,
+                    compression,
+                    *format,
+                    buffer_size,
+                )
                 .await
-                .expect("the ingest semaphore is never closed"),
-        )
+            })
+            .await
+        }
+        IngestKind::Release { release_dir } => {
+            ingest_release_file(registry, host, mirror_path, dest, release_dir).await
+        }
+    };
+    match result {
+        Ok(()) => IngestResult::Done,
+        Err(err) => IngestResult::Failed(err),
     }
 }
 
-/// Run one `Packages` ingest under [`PACKAGES_INGEST_PERMITS`], waiting in
-/// `queue`; `None` when the line was full and the ingest was skipped.
-async fn with_packages_ingest_permit<F: Future>(
-    queue: &IngestQueue,
-    ingest: F,
-) -> Option<F::Output> {
-    let _permit = queue.acquire(&PACKAGES_INGEST_PERMITS).await?;
-    Some(ingest.await)
+fn log_ingest_result(
+    result: &IngestResult,
+    outcome: Outcome,
+    host: &str,
+    mirror_path: &str,
+    dest: &Path,
+) {
+    match (result, outcome) {
+        (IngestResult::Failed(err), Outcome::Failed) => {
+            metrics::INGEST_FAILED_MARKED.increment();
+            warn_once_or_debug!(
+                "Failed to ingest index `{}` for host {host} mirror {mirror_path}; not retried until the file changes:  {}",
+                dest.display(),
+                ErrorReport(err),
+            );
+        }
+        (IngestResult::Failed(err), Outcome::Ingested | Outcome::Retry) => warn_once_or_debug!(
+            "Failed to ingest index `{}` for host {host} mirror {mirror_path}; retrying on its next request:  {}",
+            dest.display(),
+            ErrorReport(err),
+        ),
+        // Sync point for `wait_for_log("Index ingestion completed")`; keep the wording stable.
+        (IngestResult::Done, _) => debug!("Index ingestion completed for `{}`", dest.display()),
+    }
 }
 
-/// Spawn a detached best-effort task to parse a just-committed index file into
-/// the registry. No-op for non-index resources.
-fn spawn_ingest(plan: &RenamePlan) {
-    enum IngestKind {
-        Packages {
-            compression: PackagesCompression,
-            format: IndexFormat,
-        },
-        /// Compression unknown (by-hash URL leaf is a hex digest); the
-        /// spawned task sniffs magic bytes before parsing. Required because
-        /// modern APT with `Acquire::By-Hash: yes` fetches `Packages.xz`
-        /// (typically) via `/by-hash/SHA256/<hex>` URLs that carry no
-        /// extension, so the filename-based detection used elsewhere fails.
-        PackagesSniff {
-            format: IndexFormat,
-        },
-        Release {
-            release_dir: String,
-        },
-    }
+/// How a cached file is ingested into the registry, or no-op for a resource
+/// that feeds no registry entries.
+enum IngestKind {
+    Packages {
+        compression: PackagesCompression,
+        format: IndexFormat,
+    },
+    /// Compression unknown (by-hash URL leaf is a hex digest); the spawned
+    /// task sniffs magic bytes before parsing. Required because modern APT
+    /// with `Acquire::By-Hash: yes` fetches `Packages.xz` (typically) via
+    /// `/by-hash/SHA256/<hex>` URLs that carry no extension, so the
+    /// filename-based detection used elsewhere fails.
+    PackagesSniff {
+        format: IndexFormat,
+    },
+    Release {
+        release_dir: String,
+    },
+}
 
-    // For Packages/FlatMetadata, `plan.debname` is `_`-joined for structured
+/// The facts that decide whether and how a cached file is ingested, taken
+/// from a commit's `RenamePlan` or from a request answered from cache.
+pub(crate) struct IndexFile<'a> {
+    pub(crate) resource_kind: ResourceKind,
+    /// On-disk leaf name (`_`-joined for structured `Packages`).
+    pub(crate) debname: &'a str,
+    /// The raw request URI path (the by-hash heuristic and `Release`'s
+    /// directory come from it).
+    pub(crate) raw_uri_path: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) mirror_path: &'a str,
+    /// The cache file the ingest reads; the ledger key.
+    pub(crate) path: &'a Path,
+}
+
+impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
+    fn from(plan: &'a RenamePlan) -> Self {
+        let RenamePlan {
+            temp_path: _,
+            dest_path,
+            bytes_received: _,
+            streamed_digest: _,
+            resource_kind,
+            debname,
+            host,
+            mirror_path,
+            raw_uri_path,
+        } = plan;
+        Self {
+            resource_kind: *resource_kind,
+            debname,
+            raw_uri_path,
+            host,
+            mirror_path,
+            path: dest_path,
+        }
+    }
+}
+
+/// How `file` is ingested, or `None` for a resource that feeds no registry
+/// entries. One table for the commit and the touch path.
+fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
+    // For Packages/FlatMetadata, `file.debname` is `_`-joined for structured
     // resources; extract the leaf filename (the part after the last `_`).
-    let leaf = plan
+    let leaf = file
         .debname
         .rsplit('_')
         .next()
@@ -1020,7 +1358,7 @@ fn spawn_ingest(plan: &RenamePlan) {
     let packages_kind = |format: IndexFormat| {
         let compression = PackagesCompression::from_filename(leaf);
         if compression.is_none() {
-            log_unsupported_packages_compression(leaf, &plan.host);
+            log_unsupported_packages_compression(leaf, file.host);
         }
         compression.map(|compression| IngestKind::Packages {
             compression,
@@ -1029,14 +1367,14 @@ fn spawn_ingest(plan: &RenamePlan) {
     };
 
     #[expect(clippy::match_same_arms, reason = "prefer clarity")]
-    let kind = match plan.resource_kind {
+    let kind = match file.resource_kind {
         ResourceKind::Packages => packages_kind(IndexFormat::Structured),
         // Flat Packages files are ingested into the registry (layer-B deb
         // verification).  Flat-layer-C (verifying a flat Packages file against
         // a flat Release) is not implemented - consistent with flat-pool layer-B
         // also being deferred.
         ResourceKind::FlatMetadata => packages_kind(IndexFormat::Flat),
-        ResourceKind::Release => release_dir_from_uri_path(&plan.raw_uri_path)
+        ResourceKind::Release => release_dir_from_uri_path(file.raw_uri_path)
             .map(|d| IngestKind::Release { release_dir: d }),
         // A per-component Release (`binary-<arch>/Release`) carries no SHA256:
         // section listing Packages files, so parsing it yields nothing useful.
@@ -1046,7 +1384,7 @@ fn spawn_ingest(plan: &RenamePlan) {
         // segment immediately before `by-hash` distinguishes a binary
         // Packages index from Contents/dep11/i18n by-hash content.
         ResourceKind::ByHash => {
-            if byhash_path_looks_like_packages(&plan.raw_uri_path) {
+            if byhash_path_looks_like_packages(file.raw_uri_path) {
                 Some(IngestKind::PackagesSniff {
                     format: IndexFormat::Structured,
                 })
@@ -1062,7 +1400,7 @@ fn spawn_ingest(plan: &RenamePlan) {
             // effectively dead today.  Flat layer-C ingestion is deferred
             // (see `verify_and_rename`); leave the call in place to keep
             // the kind exhaustive.
-            if byhash_path_looks_like_packages(&plan.raw_uri_path) {
+            if byhash_path_looks_like_packages(file.raw_uri_path) {
                 Some(IngestKind::PackagesSniff {
                     format: IndexFormat::Flat,
                 })
@@ -1076,81 +1414,43 @@ fn spawn_ingest(plan: &RenamePlan) {
         | ResourceKind::Icon
         | ResourceKind::FlatPool => None,
     };
-    let Some(kind) = kind else { return };
+    kind
+}
 
-    let host = plan.host.clone();
-    let mirror_path = plan.mirror_path.clone();
-    let dest = plan.dest_path.clone();
-    let buffer_size = global_config().buffer_size;
-    tokio::spawn(async move {
-        let registry = global_checksum_registry();
-        let result = match kind {
-            IngestKind::Packages {
-                compression,
-                format,
-            } => {
-                with_packages_ingest_permit(
-                    &NAMED_INGEST_WAITERS,
-                    ingest_packages_file(
-                        registry,
-                        &host,
-                        &mirror_path,
-                        &dest,
-                        compression,
-                        format,
-                        buffer_size,
-                    ),
-                )
-                .await
-            }
-            IngestKind::PackagesSniff { format } => {
-                with_packages_ingest_permit(&BYHASH_INGEST_WAITERS, async {
-                    let compression = sniff_packages_compression(&dest).await?;
-                    ingest_packages_file(
-                        registry,
-                        &host,
-                        &mirror_path,
-                        &dest,
-                        compression,
-                        format,
-                        buffer_size,
-                    )
-                    .await
-                })
-                .await
-            }
-            IngestKind::Release { release_dir } => {
-                Some(ingest_release_file(registry, &host, &mirror_path, &dest, &release_dir).await)
-            }
-        };
-        match result {
-            // Ingest's failure policy: degrade to a less-populated registry.
-            None => warn_once_or_debug!(
-                "Skipping registry ingest of index `{}` for host {host} mirror {mirror_path} (ingest queue full); its debs stay unverified until a later ingest succeeds",
-                dest.display(),
-            ),
-            // A persistent ingest failure leaves the registry empty, so every
-            // deb from this mirror is committed unverified -- so far visible
-            // only as a climbing CHECKSUM_UNVERIFIED.
-            Some(Err(err)) => warn_once_or_debug!(
-                "Failed to ingest index `{}` for host {host} mirror {mirror_path}; debs from this mirror stay unverified until an ingest succeeds:  {}",
-                dest.display(),
-                ErrorReport(&err),
-            ),
-            // Sync point for `wait_for_log("Index ingestion completed")`; keep the wording stable.
-            Some(Ok(())) => debug!("Index ingestion completed for `{}`", dest.display()),
+/// How one ingest run ended (a run is only started once admitted, so
+/// "no slot" is not a result; see [`admit`]).
+enum IngestResult {
+    Done,
+    Failed(std::io::Error),
+}
+
+impl IngestResult {
+    /// The ledger outcome. An error carrying an OS errno is the file system
+    /// failing (or cleanup removing the file) and may pass; every other
+    /// error was built by the decode pipeline itself -- a size or bomb cap,
+    /// a corrupt stream, the xz CPU budget, an over-cap or non-UTF-8
+    /// `Release` -- and repeats on the same bytes.
+    fn outcome(&self) -> Outcome {
+        match self {
+            Self::Done => Outcome::Ingested,
+            Self::Failed(err) if err.raw_os_error().is_some() => Outcome::Retry,
+            Self::Failed(_) => Outcome::Failed,
         }
-    });
+    }
 }
 
 /// The host-relative directory a `dists/.../Release` file lives in, derived
-/// from the raw URI path (the parent directory of the `Release` leaf).
+/// from the raw URI path (the parent directory of the `Release` leaf),
+/// normalized like the cache path (`//` runs and `.` segments collapse), so
+/// every spelling of one `Release` registers the keys
+/// [`registry_lookup_key`] looks up.
 ///
 /// `Release.gpg` is a detached binary PGP signature with no SHA256 section to
 /// ingest, so it's excluded — routing it here would just waste a file open
 /// and a `read_to_string` of opaque bytes.
 fn release_dir_from_uri_path(raw_uri_path: &str) -> Option<String> {
-    let trimmed = raw_uri_path.trim_start_matches('/');
+    let normalized = normalize_uri_path(raw_uri_path);
+    let trimmed = normalized.trim_start_matches('/');
     let (dir, leaf) = trimmed.rsplit_once('/')?;
     if !matches!(leaf, "Release" | "InRelease") {
         return None;
@@ -1187,15 +1487,19 @@ fn registry_lookup_key<'a>(
     resource_kind: ResourceKind,
     debname: &'a str,
     raw_uri_path: &'a str,
-) -> Option<&'a str> {
+) -> Option<Cow<'a, str>> {
     match resource_kind {
         // Layer B: a pool .deb's key is its bare basename, the form
         // `ingest_stanza_into_registry` inserted. Flat-pool downloads are
         // not verified this way, so no flat variant is needed.
-        ResourceKind::Pool => Some(debname),
-        // Layer C: the full host-relative URI path, as `ingest_release_file`
-        // inserted it ("<release_dir>/<rel>").
-        ResourceKind::Packages => Some(raw_uri_path.trim_start_matches('/')),
+        ResourceKind::Pool => Some(Cow::Borrowed(debname)),
+        // Layer C: the full host-relative URI path, normalized like the
+        // `release_dir` `ingest_release_file` inserted it under
+        // ("<release_dir>/<rel>").
+        ResourceKind::Packages => Some(match normalize_uri_path(raw_uri_path) {
+            Cow::Borrowed(path) => Cow::Borrowed(path.trim_start_matches('/')),
+            Cow::Owned(path) => Cow::Owned(path.trim_start_matches('/').to_owned()),
+        }),
         ResourceKind::ByHash
         | ResourceKind::FlatByHash
         | ResourceKind::Release
@@ -1279,7 +1583,7 @@ pub(crate) fn stream_hash_algo_for_download(
     let registry_hit =
         registry_lookup_key(resource_kind, debname, raw_uri_path).is_some_and(|key| {
             global_checksum_registry()
-                .lookup(host, mirror_path, key)
+                .lookup(host, mirror_path, &key)
                 .is_some()
         });
     stream_hash_algo(
@@ -1398,7 +1702,7 @@ async fn ingest_packages_file(
             }
             Ok(None) => return Ok(()),
             Err(err) => {
-                warn!(
+                warn_once_or_debug!(
                     "Failed to read `{}` during Packages ingestion (may exceed size/line limits); aborting the ingest of this index:  {}",
                     path.display(),
                     ErrorReport(&err),
@@ -1566,7 +1870,7 @@ mod tests {
         static RUNNING: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         let tasks: Vec<_> = std::iter::repeat_with(|| {
-            tokio::spawn(with_packages_ingest_permit(&NAMED_INGEST_WAITERS, async {
+            tokio::spawn(with_decode_permit(async {
                 let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
                 PEAK.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1576,70 +1880,9 @@ mod tests {
         .take(6)
         .collect();
         for task in tasks {
-            assert!(
-                task.await.expect("ingest task").is_some(),
-                "six ingests fit two permits plus the named line"
-            );
+            task.await.expect("ingest task");
         }
         assert_eq!(PEAK.load(Ordering::SeqCst), PACKAGES_INGEST_CONCURRENCY);
-    }
-
-    /// With every permit held, an ingest joins the line while it has room
-    /// and is skipped once it is full; a cancelled waiter leaves the line,
-    /// and a queued waiter gets the next released permit.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingest_queue_skips_once_full() {
-        fn noop_cx() -> std::task::Context<'static> {
-            std::task::Context::from_waker(std::task::Waker::noop())
-        }
-
-        let permits = Semaphore::new(1);
-        let queue = IngestQueue::new(1);
-        let held = permits.try_acquire().expect("the only permit");
-
-        let mut waiter = std::pin::pin!(queue.acquire(&permits));
-        assert!(
-            waiter.as_mut().poll(&mut noop_cx()).is_pending(),
-            "the first ingest waits in the line"
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), queue.acquire(&permits))
-                .await
-                .expect("a full line answers at once")
-                .is_none(),
-            "a full line skips the ingest"
-        );
-
-        drop(held);
-        let permit = waiter.await.expect("the queued ingest gets the permit");
-        assert_eq!(queue.places.available_permits(), 1);
-        drop(permit);
-
-        let held = permits.try_acquire().expect("the permit is back");
-        {
-            let mut cancelled = std::pin::pin!(queue.acquire(&permits));
-            assert!(cancelled.as_mut().poll(&mut noop_cx()).is_pending());
-            assert_eq!(queue.places.available_permits(), 0);
-        }
-        assert_eq!(
-            queue.places.available_permits(),
-            1,
-            "a cancelled waiter leaves the line"
-        );
-        drop(held);
-    }
-
-    /// A zero-length line is try-acquire-or-skip.
-    #[tokio::test]
-    async fn empty_ingest_queue_only_takes_a_free_permit() {
-        let permits = Semaphore::new(1);
-        let queue = IngestQueue::new(0);
-        let held = queue
-            .acquire(&permits)
-            .await
-            .expect("a free permit is taken");
-        assert!(queue.acquire(&permits).await.is_none());
-        drop(held);
     }
 
     #[test]
@@ -1732,7 +1975,7 @@ mod tests {
         const POOL: &str = "/debian/pool/main/h/hello/hello_1.0_amd64.deb";
 
         assert_eq!(
-            registry_lookup_key(ResourceKind::Pool, "hello_1.0_amd64.deb", POOL),
+            registry_lookup_key(ResourceKind::Pool, "hello_1.0_amd64.deb", POOL).as_deref(),
             Some("hello_1.0_amd64.deb")
         );
         assert_eq!(
@@ -1740,8 +1983,20 @@ mod tests {
                 ResourceKind::Packages,
                 "Packages.xz",
                 "/dists/sid/main/binary-amd64/Packages.xz"
-            ),
+            )
+            .as_deref(),
             Some("dists/sid/main/binary-amd64/Packages.xz")
+        );
+        // Every spelling of one URL looks up the key a normalized
+        // `release_dir` registered.
+        assert_eq!(
+            registry_lookup_key(
+                ResourceKind::Packages,
+                "Packages.xz",
+                "/debian//dists/./sid/main/binary-amd64/Packages.xz"
+            )
+            .as_deref(),
+            Some("debian/dists/sid/main/binary-amd64/Packages.xz")
         );
         for kind in [
             ResourceKind::ByHash,
@@ -2071,6 +2326,75 @@ mod tests {
     }
 
     #[test]
+    fn a_full_epoch_map_forgets_every_scope_and_stales_every_mark() {
+        let scope = |host: &str| {
+            Arc::new(RegistryScope {
+                host: host.to_owned(),
+                mirror_path: "m".to_owned(),
+            })
+        };
+        let mut epochs = EvictionEpochs::new(2);
+        let untouched_mark = epochs.get("d", "m");
+        epochs.bump(&scope("a"));
+        epochs.bump(&scope("b"));
+        let (mark_a, mark_b) = (epochs.get("a", "m"), epochs.get("b", "m"));
+        assert_ne!(mark_a, untouched_mark);
+        assert_ne!(mark_a, mark_b);
+        epochs.bump(&scope("a"));
+        assert_ne!(epochs.get("a", "m"), mark_a, "a re-bump changes the epoch");
+        assert_eq!(
+            epochs.by_scope.len(),
+            2,
+            "a mapped scope is not a new entry"
+        );
+        let mark_a = epochs.get("a", "m");
+
+        epochs.bump(&scope("c"));
+        assert_eq!(epochs.by_scope.len(), 1, "the full map was cleared");
+        for (host, mark) in [("a", mark_a), ("b", mark_b), ("d", untouched_mark)] {
+            assert_ne!(
+                epochs.get(host, "m"),
+                mark,
+                "{host}'s old mark must read stale"
+            );
+        }
+        assert_ne!(epochs.get("c", "m"), epochs.get("a", "m"));
+    }
+
+    #[test]
+    fn eviction_bumps_the_epoch_of_each_drained_scope() {
+        use std::num::NonZero;
+        let reg = ChecksumRegistry::new(NonZero::new(8).unwrap());
+        for i in 0..8u32 {
+            reg.insert("big", "m", &format!("b{i}"), [0; 32]);
+        }
+        reg.insert("small", "m", "s0", [0; 32]);
+        assert_eq!(reg.scope_epoch("small", "m"), 0);
+        assert_eq!(reg.scope_epoch("never", "m"), 0);
+        // The ninth insert crossed the cap: `big` (the largest scope) paid.
+        assert_eq!(reg.scope_epoch("big", "m"), 1);
+
+        // Fully drain `big` (6 live entries left: b2..b7). Each retrigger
+        // cycle needs `quota` (2) new entries; parking them in brand-new,
+        // never-grown, one-entry scopes keeps every one of them below
+        // `big`'s shrinking count (6, then 4, then 2), so `big` stays the
+        // largest scope -- and so eviction's target -- through all three
+        // passes, until it empties and is dropped from `map`.
+        for i in 0..6u32 {
+            reg.insert(&format!("p{i}"), "m", "x", [0; 32]);
+        }
+        for i in 0..8u32 {
+            assert_eq!(
+                reg.lookup("big", "m", &format!("b{i}")),
+                None,
+                "big must be fully drained, b{i} still present"
+            );
+        }
+        // A scope drained empty and removed from `map` keeps its epoch.
+        assert!(reg.scope_epoch("big", "m") > 0);
+    }
+
+    #[test]
     fn registry_reinsert_refreshes_value() {
         use std::num::NonZero;
         let reg = ChecksumRegistry::new(NonZero::new(100).unwrap());
@@ -2200,6 +2524,11 @@ mod tests {
         assert_eq!(
             release_dir_from_uri_path("/debian/dists/sid/InRelease"),
             Some("debian/dists/sid".to_string())
+        );
+        assert_eq!(
+            release_dir_from_uri_path("/debian//dists/./sid/InRelease"),
+            Some("debian/dists/sid".to_string()),
+            "normalized like the Packages lookup key"
         );
         assert_eq!(release_dir_from_uri_path("/debian/pool/x/foo.deb"), None);
         // Release.gpg is a detached binary PGP signature with no SHA256
@@ -2646,6 +2975,137 @@ mod tests {
             std::fs::read(&dest).expect("read destination"),
             b"payload",
             "the destination must hold the source's bytes"
+        );
+    }
+
+    #[test]
+    fn ingest_errors_with_an_errno_are_retried_and_synthetic_ones_are_not() {
+        use crate::ingest_ledger::Outcome;
+        let os = std::io::Error::from_raw_os_error(nix::libc::EIO);
+        let gone = std::io::Error::from_raw_os_error(nix::libc::ENOENT);
+        let cap = limits::check_packages_file_size(PackagesCompression::Xz, u64::MAX)
+            .expect_err("over the cap");
+        let budget = std::io::Error::new(std::io::ErrorKind::TimedOut, "xz budget");
+        assert_eq!(IngestResult::Failed(os).outcome(), Outcome::Retry);
+        assert_eq!(IngestResult::Failed(gone).outcome(), Outcome::Retry);
+        assert_eq!(IngestResult::Failed(cap).outcome(), Outcome::Failed);
+        assert_eq!(IngestResult::Failed(budget).outcome(), Outcome::Failed);
+        assert_eq!(IngestResult::Done.outcome(), Outcome::Ingested);
+    }
+
+    /// Admission happens before the spawn: with every slot taken a claim is
+    /// refused and the path stays claimable; a burst of distinct paths never
+    /// holds more `Running` entries than there are slots.
+    #[test]
+    fn admission_is_bounded_by_the_slots_and_refusal_is_retryable() {
+        use crate::ingest_ledger::{IngestLedger, Outcome};
+        let ledger = IngestLedger::new(1024);
+        let slots = Semaphore::new(2);
+        let path = |i: usize| PathBuf::from(format!("/cache/idx{i}"));
+        let admitted: Vec<_> = (0..100)
+            .filter_map(|i| match admit(&ledger, &slots, &path(i), 0) {
+                Admission::Admitted(claim, slot) => Some((claim, slot)),
+                Admission::Refused | Admission::Nothing => None,
+            })
+            .collect();
+        assert_eq!(admitted.len(), 2, "no more jobs than slots");
+        assert!(matches!(
+            admit(&ledger, &slots, &path(50), 0),
+            Admission::Refused
+        ));
+        let mut done = admitted;
+        let (mut claim, slot) = done.pop().expect("two admitted");
+        assert!(!claim.finish(Outcome::Ingested, 0));
+        drop((claim, slot));
+        let again = admit(&ledger, &slots, &path(50), 0);
+        assert!(
+            matches!(again, Admission::Admitted(..)),
+            "a refused path is admitted once a slot frees"
+        );
+        assert!(
+            matches!(admit(&ledger, &slots, &path(99), 0), Admission::Refused),
+            "slots are full again"
+        );
+        drop(again);
+    }
+
+    /// A hostile mirror saturating the shared `Packages` line must not be
+    /// able to refuse every other mirror's `Release` admission too.
+    #[test]
+    fn release_ingests_use_their_own_admission_pool() {
+        let release = IngestKind::Release {
+            release_dir: "debian/dists/sid".to_owned(),
+        };
+        let packages = IngestKind::Packages {
+            compression: PackagesCompression::Xz,
+            format: IndexFormat::Structured,
+        };
+        let sniff = IngestKind::PackagesSniff {
+            format: IndexFormat::Structured,
+        };
+        assert!(std::ptr::eq(
+            ingest_pool(&release),
+            &raw const RELEASE_INGEST_SLOTS
+        ));
+        assert!(std::ptr::eq(
+            ingest_pool(&packages),
+            &raw const INGEST_SLOTS
+        ));
+        assert!(std::ptr::eq(ingest_pool(&sniff), &raw const INGEST_SLOTS));
+    }
+
+    #[test]
+    fn index_kinds_are_classified_once_for_commit_and_touch() {
+        let file = |resource_kind, debname, raw_uri_path| IndexFile {
+            resource_kind,
+            debname,
+            raw_uri_path,
+            host: "h",
+            mirror_path: "debian",
+            path: Path::new("/cache/x"),
+        };
+        assert!(matches!(
+            ingest_kind(&file(
+                ResourceKind::Packages,
+                "sid_main_binary-amd64_Packages.xz",
+                "/debian/dists/sid/main/binary-amd64/Packages.xz"
+            )),
+            Some(IngestKind::Packages {
+                compression: PackagesCompression::Xz,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ingest_kind(&file(
+                ResourceKind::ByHash,
+                "abcd",
+                "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/abcd"
+            )),
+            Some(IngestKind::PackagesSniff { .. })
+        ));
+        assert!(
+            ingest_kind(&file(
+                ResourceKind::ByHash,
+                "abcd",
+                "/debian/dists/sid/main/i18n/by-hash/SHA256/abcd"
+            ))
+            .is_none()
+        );
+        assert!(matches!(
+            ingest_kind(&file(
+                ResourceKind::Release,
+                "sid_InRelease",
+                "/debian/dists/sid/InRelease"
+            )),
+            Some(IngestKind::Release { .. })
+        ));
+        assert!(
+            ingest_kind(&file(
+                ResourceKind::Pool,
+                "foo_1.0_amd64.deb",
+                "/debian/pool/main/f/foo/foo_1.0_amd64.deb"
+            ))
+            .is_none()
         );
     }
 

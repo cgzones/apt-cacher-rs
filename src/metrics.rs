@@ -173,6 +173,18 @@ pub(crate) static CHECKSUM_MISMATCH: Counter = Counter::new();
 /// digest (best-effort coverage gap).
 pub(crate) static CHECKSUM_UNVERIFIED: Counter = Counter::new();
 
+/// Cached indexes re-ingested because a request answered from cache found
+/// the registry without their digests (restart, eviction, an earlier skip
+/// or transient failure). Climbing with every `apt update` means the live
+/// working set exceeds `verify_checksums_max_entries`.
+pub(crate) static INGEST_TOUCH_TRIGGERED: Counter = Counter::new();
+/// Index ingests skipped because the line in front of the ingest permits
+/// was full; each is retried on the index's next request.
+pub(crate) static INGEST_SKIPPED_QUEUE_FULL: Counter = Counter::new();
+/// Index files whose ingest failed for good (too large, corrupt, over the
+/// CPU budget); not retried until a commit replaces the file.
+pub(crate) static INGEST_FAILED_MARKED: Counter = Counter::new();
+
 /// Body-write failures attributed to the client (`BrokenPipe` /
 /// `ConnectionReset` / `ConnectionAborted`).
 ///

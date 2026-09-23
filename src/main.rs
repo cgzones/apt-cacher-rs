@@ -52,6 +52,7 @@ mod humanfmt;
 #[cfg(feature = "hyper")]
 mod hyper_conn;
 mod index_parser;
+mod ingest_ledger;
 mod integrity;
 mod limits;
 mod log_once;

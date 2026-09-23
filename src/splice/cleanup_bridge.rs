@@ -18,6 +18,7 @@ use crate::fs_open::{
     CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
 };
 use crate::humanfmt::HumanFmt;
+use crate::integrity::note_cached_index_touch;
 use crate::limits::{self, PackagesCompression};
 use crate::log_once::Logged;
 use crate::metrics;
@@ -160,6 +161,7 @@ async fn splice_cleanup_request(
     match tokio_nofollow_options().read(true).open(&cache_path).await {
         Ok(file) => {
             if let Some(resp) = serve_cached_cleanup_file(file, &cache_path, req).await {
+                note_cached_index_touch(conn_details, req.uri().path(), &cache_path);
                 return resp;
             }
         }
