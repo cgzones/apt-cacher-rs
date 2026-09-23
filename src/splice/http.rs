@@ -43,7 +43,7 @@ use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::transfer_error::{ClientError, DeliveryFailure, UpstreamError};
 use crate::upstream_head::{RejectReason, UpstreamHead, well_formed_etag};
 use crate::{
-    build_info::APP_USER_AGENT,
+    build_info::{APP_USER_AGENT, APP_VIA},
     cache_metadata::{self, InvalidValidator},
     global_config, metrics, warn_once_or_info,
 };
@@ -81,7 +81,8 @@ impl HeadError {
 
 /// Format an HTTP GET request for the upstream mirror. Always keep-alive:
 /// whether the connection is pooled afterwards is the response's say
-/// (`UpstreamResponse::connection_close`).
+/// (`UpstreamResponse::connection_close`). `Via` names this proxy, so a
+/// request looping back into it is refused by `preflight_via`.
 pub(super) fn format_http_request(
     path: &str,
     host_authority: &str,
@@ -111,6 +112,7 @@ pub(super) fn format_http_request(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_authority}\r\n\
          User-Agent: {APP_USER_AGENT}\r\n\
+         Via: {APP_VIA}\r\n\
          Connection: keep-alive\r\n\
          {range_header}\
          {volatile_headers}\

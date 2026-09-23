@@ -19,7 +19,10 @@ use coarsetime::Instant;
 #[cfg(feature = "hyper")]
 use futures_util::StreamExt as _;
 #[cfg(feature = "hyper")]
-use http::{Method, Request, Uri, header::USER_AGENT};
+use http::{
+    Method, Request, Uri,
+    header::{USER_AGENT, VIA},
+};
 #[cfg(feature = "hyper")]
 use http_body_util::Empty;
 use tokio::{net::TcpListener, signal::unix::SignalKind};
@@ -54,7 +57,10 @@ use crate::{
     warn_once_or_debug, warn_once_or_info,
 };
 #[cfg(feature = "hyper")]
-use crate::{build_info::APP_USER_AGENT, scheme_cache};
+use crate::{
+    build_info::{APP_USER_AGENT, APP_VIA},
+    scheme_cache,
+};
 
 /// One-line accounting emitted on every shutdown path: what the process did
 /// over its lifetime, and what it is dropping on the floor. Without it a
@@ -427,6 +433,7 @@ pub(crate) async fn main_loop(
                             .method(Method::HEAD)
                             .uri(uri)
                             .header(USER_AGENT, APP_USER_AGENT)
+                            .header(VIA, APP_VIA)
                             .body(Empty::new())
                             .expect("Valid request");
 

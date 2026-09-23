@@ -1586,11 +1586,15 @@ async fn serve_new_file_worker(
          * }
          */
 
+        // `Via` names this proxy so a request looping back into it (an
+        // `allowed_mirrors` entry covering the proxy's own name) is refused
+        // by `preflight_via` instead of served.
         let mut request = Request::builder()
             .method(Method::GET)
             .uri(uri)
             .header(USER_AGENT, APP_USER_AGENT)
             .header(HOST, host)
+            .header(VIA, APP_VIA)
             .body(Empty::new())
             .expect("request should be valid");
 
@@ -2766,11 +2770,13 @@ async fn pre_process_client_request(
     // (`Proxy-Authorization`), hop-by-hop fields and a `Content-Length` for
     // the body `strip_request_body` dropped must never reach the shared
     // upstream pool. The upstream `Host` is the request-target authority,
-    // never the client's own header.
+    // never the client's own header; `Via` closes proxy loops as in
+    // `build_fwd_request`. The redirect follow below reuses these headers.
     let (parts, _body) = req.into_parts();
     let mut fwd_request = Request::builder()
         .method(Method::GET)
-        .header(USER_AGENT, APP_USER_AGENT);
+        .header(USER_AGENT, APP_USER_AGENT)
+        .header(VIA, APP_VIA);
     if let Some(authority) = parts.uri.authority() {
         fwd_request = fwd_request.header(HOST, host_header_from_uri(authority));
     }
