@@ -71,8 +71,8 @@ use crate::{
     global_config, global_webif_hosts,
     http_helpers::{
         ConnectionAction, ConnectionVersion, WritePhase, find_header, find_header_end,
-        write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
-        write_response_headers,
+        leading_empty_lines, write_304_response, write_416_response, write_all_to_stream,
+        write_invalid_response, write_response_headers,
     },
     http_range::format_http_date,
     humanfmt::HumanFmt,
@@ -398,11 +398,23 @@ pub(crate) async fn handle_sendfile_connection(
 
 /// Read HTTP request headers from the stream into the buffer.
 /// Returns when a complete set of headers has been received (terminated by \r\n\r\n) or there is no more data to read.
+///
+/// Empty lines before the request line are dropped from `buf` as they
+/// arrive, so `buf` starts with the request line and the returned index is
+/// the byte count httparse consumes for it (see [`find_header_end`]): the
+/// caller's `advance` by that index then moves past the request exactly
+/// once.
 async fn read_request_headers(
     stream: &TcpStream,
     buf: &mut BytesMut,
 ) -> std::io::Result<Option<usize>> {
-    if let Some(next_index) = find_header_end(buf) {
+    /// Drop the leading empty lines, then look for the end of the head.
+    fn header_end(buf: &mut BytesMut) -> Option<usize> {
+        buf.advance(leading_empty_lines(buf));
+        find_header_end(buf)
+    }
+
+    if let Some(next_index) = header_end(buf) {
         return Ok(Some(next_index));
     }
 
@@ -431,7 +443,7 @@ async fn read_request_headers(
                         ));
                     }
                     Ok(n) => {
-                        if let Some(next_index) = find_header_end(buf) {
+                        if let Some(next_index) = header_end(buf) {
                             trace!("Read {n} bytes from client, found header end at {next_index}");
                             return Ok(Some(next_index));
                         }

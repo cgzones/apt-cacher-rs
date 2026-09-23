@@ -63,6 +63,13 @@ impl std::fmt::Display for ConnectionVersion {
 /// parser (and with the hyper backend, which parses via the same `httparse`).
 /// A CRLF-only scan desyncs on a bare-LF-terminated pipelined request,
 /// advancing past the *following* request and dropping it.
+///
+/// The lockstep holds only for a `buf` that starts with the request line:
+/// httparse skips empty lines *before* the request line (RFC 9112 §2.2),
+/// while this scan takes a leading `LF LF` for the end of the header block.
+/// A request reader strips them first with [`leading_empty_lines`];
+/// advancing by this index over a buffer still carrying them would leave the
+/// request in the buffer to be parsed, and answered, once more per pair.
 #[must_use]
 #[inline]
 pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -83,6 +90,22 @@ pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// The length of the complete empty lines (`CRLF` or a bare `LF`) at the
+/// start of `buf`, which a server ignores before a request line (RFC 9112
+/// §2.2) -- as httparse does, any number of them. A trailing lone `CR` is not
+/// counted: it may be the first half of a `CRLF` still in flight.
+#[must_use]
+pub(crate) fn leading_empty_lines(buf: &[u8]) -> usize {
+    let mut pos = 0;
+    loop {
+        match &buf[pos..] {
+            [b'\n', ..] => pos += 1,
+            [b'\r', b'\n', ..] => pos += 2,
+            _ => return pos,
+        }
+    }
 }
 
 /// Find a header value by name (case-insensitive).
@@ -344,6 +367,47 @@ mod tests {
             find_header_end(b"GET /a HTTP/1.1\nHost: x\n\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
             Some(25)
         );
+    }
+
+    #[test]
+    fn leading_empty_lines_counts_only_complete_empty_lines() {
+        assert_eq!(leading_empty_lines(b""), 0);
+        assert_eq!(leading_empty_lines(b"GET / HTTP/1.1\r\n\r\n"), 0);
+        assert_eq!(leading_empty_lines(b"\n\n\n\n\n\nGET /"), 6);
+        assert_eq!(leading_empty_lines(b"\r\n\n\r\nGET /"), 5);
+        assert_eq!(leading_empty_lines(b"\r\n\r\n"), 4);
+        // A trailing CR may be the first half of a CRLF still in flight.
+        assert_eq!(leading_empty_lines(b"\n\r"), 1);
+        // A CR that is not part of a CRLF is not an empty line.
+        assert_eq!(leading_empty_lines(b"\rGET /"), 0);
+        assert_eq!(leading_empty_lines(b" \r\nGET /"), 0);
+    }
+
+    /// The read/advance boundary must stay in lockstep with the byte count
+    /// httparse consumes, including the empty lines httparse skips before
+    /// the request line: advancing by a leading `LF LF` instead would leave
+    /// the request in the buffer to be parsed and answered again.
+    #[test]
+    fn header_end_after_leading_empty_lines_matches_httparse() {
+        for raw in [
+            &b"\n\n\n\n\n\nGET / HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\n\r\n"[..],
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"\r\n\n\r\nGET / HTTP/1.1\nHost: x\n\nGET /b HTTP/1.1\n\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        ] {
+            let mut headers = [httparse::EMPTY_HEADER; 4];
+            let consumed = httparse::Request::new(&mut headers)
+                .parse(raw)
+                .expect("a valid request")
+                .unwrap();
+            let skip = leading_empty_lines(raw);
+            assert_eq!(
+                find_header_end(&raw[skip..]).map(|end| skip + end),
+                Some(consumed),
+                "{:?}",
+                raw.escape_ascii().to_string()
+            );
+        }
     }
 
     #[test]
