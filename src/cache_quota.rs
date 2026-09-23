@@ -46,19 +46,32 @@
 //! `rename(2)`, so a cancelled commit future cannot land the file and revert
 //! the reservation), and reverts itself on drop -- keeping the bytes its
 //! [`ReservedPartial`] then holds.
+//!
+//! The same admission also keeps `min_disk_free` free on the cache
+//! filesystem ([`DiskHeadroom`], with or without a `disk_quota`): the quota
+//! bounds what this daemon accounts, but the filesystem is what runs out,
+//! and it may be shared or already fuller than the cache. The decision reads
+//! a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old, minus everything
+//! admitted since it was taken -- the sample cannot see those yet, and a
+//! burst of misses within one sample must not all pass on the same free
+//! figure. Cleanup's index fetches are admitted past this floor for the
+//! reason they are admitted past the quota.
 
 use std::{
     cmp::Ordering,
     num::NonZero,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{self, AtomicBool},
+    },
 };
 
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    error::ErrorReport, humanfmt::HumanFmt, metrics, sticky, upstream_head::ContentLength,
-    warn_once_or_info,
+    error::ErrorReport, healthcheck::filesystem_space, humanfmt::HumanFmt, metrics, sticky,
+    upstream_head::ContentLength, warn_once_or_info,
 };
 
 /// Represents a quota violation.
@@ -124,9 +137,34 @@ struct Accounting {
     /// may have seen: commits that shrank the cache, partials renamed out of
     /// `tmp/`, removed partials.
     committed_shrunk: u64,
+    /// Monotonic sum of the disk bytes every admitted reservation may still
+    /// write ([`disk_needed`]); what a free-space sample taken earlier cannot
+    /// reflect yet.
+    admitted_total: u64,
+    /// The latest free-space sample of the cache filesystem; `None` until
+    /// the first one (or without a [`DiskHeadroom`]).
+    disk: Option<DiskSample>,
+}
+
+/// One `statvfs(3)` reading for the `min_disk_free` admission check.
+#[derive(Clone, Copy, Debug)]
+struct DiskSample {
+    taken: coarsetime::Instant,
+    /// Bytes available; `None` when the probe failed, which admits.
+    free: Option<u64>,
+    /// `admitted_total` when the probe started.
+    admitted_at: u64,
 }
 
 impl Accounting {
+    /// The free space the admission check works with: the sample minus what
+    /// was admitted since it was taken. `None` without a usable sample.
+    fn disk_free_now(&self) -> Option<u64> {
+        let sample = self.disk?;
+        let free = sample.free?;
+        Some(free.saturating_sub(self.admitted_total.wrapping_sub(sample.admitted_at)))
+    }
+
     /// Net of the live reservations (`reserved - replaced`); what the
     /// reservations currently contribute to `size` on top of the on-disk
     /// files. Signed as `(add, sub)` because a shrinking overwrite
@@ -193,6 +231,49 @@ pub(crate) struct CacheQuota {
 struct QuotaInner {
     accounting: parking_lot::Mutex<Accounting>,
     quota_config: Option<NonZero<u64>>,
+    headroom: Option<DiskHeadroom>,
+}
+
+/// The `min_disk_free` floor downloads may not dig into, and where to
+/// measure it.
+pub(crate) struct DiskHeadroom {
+    cache_dir: PathBuf,
+    min_free: NonZero<u64>,
+    /// Single flight for [`CacheQuota::refresh_disk_headroom`].
+    refreshing: AtomicBool,
+}
+
+impl DiskHeadroom {
+    #[must_use]
+    pub(crate) const fn new(cache_dir: PathBuf, min_free: NonZero<u64>) -> Self {
+        Self {
+            cache_dir,
+            min_free,
+            refreshing: AtomicBool::new(false),
+        }
+    }
+}
+
+/// How long a free-space sample serves admissions before
+/// [`CacheQuota::refresh_disk_headroom`] takes a new one.
+const DISK_SAMPLE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1);
+
+/// Upper bound for one refresh's `statvfs(3)`: a hung filesystem keeps the
+/// previous sample instead of stalling the request that asked.
+const DISK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether `needed` more bytes on a filesystem with `free` bytes available
+/// still leave `min_free` of them free.
+const fn headroom_allows(free: u64, needed: u64, min_free: u64) -> bool {
+    free >= min_free.saturating_add(needed)
+}
+
+/// The disk space a reservation may still consume: all of it, except the
+/// bytes its adopted partial already holds.
+fn disk_needed(reserved: NonZero<u64>, partial: Option<&ReservedPartial>) -> u64 {
+    reserved
+        .get()
+        .saturating_sub(partial.map_or(0, |p| p.adopted))
 }
 
 /// Snapshot of the commit counters taken before a reconcile's scan; see the
@@ -259,9 +340,25 @@ fn unwritten_size(reserved: NonZero<u64>, partial: Option<&ReservedPartial>) -> 
 }
 
 impl CacheQuota {
+    /// A `CacheQuota` with the given initial size and quota configuration and
+    /// no `min_disk_free` floor; the daemon builds its one quota with
+    /// [`Self::with_disk_headroom`].
+    #[cfg(test)]
     #[must_use]
-    /// Create a new `CacheQuota` with the given initial size and quota configuration.
     pub(crate) fn new(initial: u64, quota_config: Option<NonZero<u64>>) -> Self {
+        Self::with_disk_headroom(initial, quota_config, None)
+    }
+
+    /// A `CacheQuota` with the given initial size and quota configuration
+    /// that also keeps `headroom`'s `min_disk_free` on the
+    /// cache filesystem: [`Self::try_acquire`] refuses a download that would
+    /// dig into it.
+    #[must_use]
+    pub(crate) fn with_disk_headroom(
+        initial: u64,
+        quota_config: Option<NonZero<u64>>,
+        headroom: Option<DiskHeadroom>,
+    ) -> Self {
         Self {
             inner: Arc::new(QuotaInner {
                 accounting: parking_lot::Mutex::new(Accounting {
@@ -269,8 +366,69 @@ impl CacheQuota {
                     ..Accounting::default()
                 }),
                 quota_config,
+                headroom,
             }),
         }
+    }
+
+    /// Store a free-space sample of the cache filesystem (`None`: the probe
+    /// failed). The startup scan seeds one; [`Self::refresh_disk_headroom`]
+    /// keeps it fresh.
+    pub(crate) fn record_disk_free(&self, free: Option<u64>) {
+        let mut mg = self.inner.accounting.lock();
+        let admitted_at = mg.admitted_total;
+        mg.disk = Some(DiskSample {
+            taken: coarsetime::Instant::now(),
+            free,
+            admitted_at,
+        });
+    }
+
+    /// Take a new free-space sample for the `min_disk_free` admission check
+    /// when the current one is older than [`DISK_SAMPLE_TTL`]. The quota
+    /// gates await it right before [`Self::try_acquire`], which is
+    /// synchronous and only reads the sample.
+    ///
+    /// Single flight: a request arriving while another refreshes goes on
+    /// with the current sample, which still charges everything admitted
+    /// since it was taken. A probe that fails or times out keeps the
+    /// previous sample (a failed one admits).
+    pub(crate) async fn refresh_disk_headroom(&self) {
+        /// Clears the single-flight flag even when the refresh is cancelled.
+        struct Refreshing<'a>(&'a AtomicBool);
+        impl Drop for Refreshing<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, atomic::Ordering::Release);
+            }
+        }
+
+        let Some(headroom) = &self.inner.headroom else {
+            return;
+        };
+        let admitted_at = {
+            let mg = self.inner.accounting.lock();
+            if mg.disk.is_some_and(|s| {
+                coarsetime::Instant::now().duration_since(s.taken) < DISK_SAMPLE_TTL
+            }) {
+                return;
+            }
+            mg.admitted_total
+        };
+        if headroom.refreshing.swap(true, atomic::Ordering::AcqRel) {
+            return;
+        }
+        let _refreshing = Refreshing(&headroom.refreshing);
+        let Ok(space) =
+            tokio::time::timeout(DISK_PROBE_TIMEOUT, filesystem_space(&headroom.cache_dir)).await
+        else {
+            return;
+        };
+        let mut mg = self.inner.accounting.lock();
+        mg.disk = Some(DiskSample {
+            taken: coarsetime::Instant::now(),
+            free: space.map(|s| s.free_bytes),
+            admitted_at,
+        });
     }
 
     /// Atomically check quota and reserve space for a download.
@@ -286,6 +444,13 @@ impl CacheQuota {
     /// for a volatile download's scratch file). Its adopted bytes count as
     /// replaced here, like `prev_file_size`: `content_length` covers the
     /// whole file, the resumed prefix included.
+    ///
+    /// With a [`DiskHeadroom`], the download is also refused when the bytes
+    /// it may still write (all but the adopted prefix) would leave less than
+    /// `min_disk_free` on the cache filesystem, judged from the latest
+    /// sample minus everything admitted since ([`Self::refresh_disk_headroom`]).
+    /// Both refusals are the same [`QuotaExceeded`]: the client sees one
+    /// "Disk quota reached" 503 either way.
     pub(crate) fn try_acquire(
         &self,
         content_length: ContentLength,
@@ -315,11 +480,30 @@ impl CacheQuota {
             return Err(QuotaExceeded);
         }
 
+        if let Some(headroom) = &self.inner.headroom
+            && let Some(free) = mg.disk_free_now()
+        {
+            let needed = disk_needed(reserved, partial.as_ref());
+            if !headroom_allows(free, needed, headroom.min_free.get()) {
+                drop(mg);
+                // Like the quota: a nearly full disk rejects every cacheable
+                // miss until space is freed.
+                warn_once_or_info!(
+                    "Low disk space while reserving space for {debname} ({} free on the cache filesystem, needing {}, min_disk_free {}); rejecting the download with 503",
+                    HumanFmt::Size(free),
+                    HumanFmt::Size(needed),
+                    HumanFmt::Size(headroom.min_free.get()),
+                );
+                metrics::DOWNLOAD_REJECTED_QUOTA.increment();
+                return Err(QuotaExceeded);
+            }
+        }
+
         Ok(self.reserve_locked(mg, reserved, prev_file_size, partial, debname))
     }
 
     /// Reserve space for one of cleanup's own index fetches without
-    /// enforcing the limit.
+    /// enforcing the limits (`disk_quota` and `min_disk_free`).
     ///
     /// Cleanup can only free space after reconciling against the current
     /// `Release`/`Packages` indexes, and it fetches them through the regular
@@ -351,6 +535,19 @@ impl CacheQuota {
                 HumanFmt::Size(quota.get()),
             );
         }
+        if let Some(headroom) = &self.inner.headroom
+            && let Some(free) = mg.disk_free_now()
+        {
+            let needed = disk_needed(reserved, partial.as_ref());
+            if !headroom_allows(free, needed, headroom.min_free.get()) {
+                info!(
+                    "Low disk space while reserving space for cleanup index fetch {debname} ({} free on the cache filesystem, needing {}, min_disk_free {}); admitting it so cleanup can reconcile and free space",
+                    HumanFmt::Size(free),
+                    HumanFmt::Size(needed),
+                    HumanFmt::Size(headroom.min_free.get()),
+                );
+            }
+        }
         self.reserve_locked(mg, reserved, prev_file_size, partial, debname)
     }
 
@@ -379,6 +576,9 @@ impl CacheQuota {
         mg.inflight_unwritten = mg
             .inflight_unwritten
             .saturating_add(unwritten_size(reserved, partial.as_ref()));
+        mg.admitted_total = mg
+            .admitted_total
+            .wrapping_add(disk_needed(reserved, partial.as_ref()));
         let new_size = mg.size;
         drop(mg);
 
@@ -1150,5 +1350,102 @@ mod tests {
             assert_eq!(r.difference, 0, "scanned {scanned}");
         }
         assert_eq!(quota.current_size(), 50);
+    }
+
+    #[test]
+    fn headroom_keeps_min_disk_free_after_the_reservation() {
+        // 1000 bytes free, 600 must stay free: 400 may still be written.
+        assert!(headroom_allows(1000, 400, 600));
+        assert!(!headroom_allows(1000, 401, 600));
+        assert!(!headroom_allows(500, 0, 600), "already below the floor");
+        assert!(!headroom_allows(1000, u64::MAX, 600), "saturates");
+    }
+
+    /// No `disk_quota`, `min_disk_free` of `min_free`, a sample of `free`.
+    fn headroom_quota(min_free: u64, free: Option<u64>) -> CacheQuota {
+        let quota = CacheQuota::with_disk_headroom(
+            0,
+            None,
+            Some(DiskHeadroom::new(
+                PathBuf::from("/nonexistent"),
+                nz(min_free),
+            )),
+        );
+        quota.record_disk_free(free);
+        quota
+    }
+
+    #[test]
+    fn low_disk_space_rejects_a_download() {
+        let quota = headroom_quota(600, Some(1000));
+        assert!(quota.try_acquire(exact(401), 0, None, "big").is_err());
+        assert_eq!(quota.current_size(), 0, "a rejection reserves nothing");
+        let first = quota
+            .try_acquire(exact(300), 0, None, "first")
+            .ok()
+            .expect("300 of the 400 spare bytes");
+        // The sample predates the first reservation and cannot reflect it.
+        assert!(quota.try_acquire(exact(200), 0, None, "second").is_err());
+        drop(first);
+        // A fresh sample starts over.
+        quota.record_disk_free(Some(1000));
+        assert!(quota.try_acquire(exact(400), 0, None, "fresh").is_ok());
+    }
+
+    #[test]
+    fn low_disk_space_charges_a_resume_its_remainder_only() {
+        let (_dir, path) = partial_path();
+        write_len(&path, 300);
+        let quota = headroom_quota(600, Some(1000));
+        // 500 bytes in total, 300 already on disk.
+        assert!(
+            quota
+                .try_acquire(
+                    exact(500),
+                    0,
+                    Some(ReservedPartial::new(path, 300)),
+                    "resume"
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn low_disk_space_admits_cleanup_index_fetches() {
+        let quota = headroom_quota(600, Some(1000));
+        let reservation = quota.acquire_for_cleanup(exact(900), 0, None, "Packages.xz");
+        assert_eq!(quota.current_size(), 900);
+        drop(reservation);
+    }
+
+    #[test]
+    fn unknown_free_space_admits() {
+        let quota = headroom_quota(600, None);
+        assert!(quota.try_acquire(exact(5000), 0, None, "unknown").is_ok());
+        let quota = CacheQuota::with_disk_headroom(
+            0,
+            None,
+            Some(DiskHeadroom::new(PathBuf::from("/nonexistent"), nz(600))),
+        );
+        assert!(
+            quota.try_acquire(exact(5000), 0, None, "unsampled").is_ok(),
+            "no sample yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_samples_the_cache_filesystem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // More free space than any filesystem has.
+        let quota = CacheQuota::with_disk_headroom(
+            0,
+            None,
+            Some(DiskHeadroom::new(
+                dir.path().to_path_buf(),
+                nz(u64::MAX / 2),
+            )),
+        );
+        quota.refresh_disk_headroom().await;
+        assert!(quota.try_acquire(exact(1), 0, None, "tiny").is_err());
     }
 }

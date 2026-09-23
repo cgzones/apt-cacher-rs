@@ -323,6 +323,10 @@ pub(crate) async fn main_loop(
                 // a byte figure alone. A failed statvfs is already
                 // warned about inside `filesystem_space`.
                 let space = filesystem_space(&rd.config.cache_directory).await;
+                // Seeds the `min_disk_free` admission check, so the first
+                // download needs no probe of its own.
+                rd.cache_quota
+                    .record_disk_free(space.map(|space| space.free_bytes));
                 let free = match space {
                     Some(space) => format!(
                         "free disk space: {}, free inodes: {}",

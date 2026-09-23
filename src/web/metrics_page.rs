@@ -283,7 +283,7 @@ fn build_requests_group(g: &mut Groups) {
         );
         t.row_tip(
             "Rejected (quota reached)",
-            "Downloads denied because the configured disk quota is exhausted.",
+            "Downloads denied because the configured disk quota is exhausted or the cache filesystem is down to `min_disk_free`.",
             WarnNonzero(metrics::DOWNLOAD_REJECTED_QUOTA.get()),
         );
         t.row_tip(

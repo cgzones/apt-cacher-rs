@@ -657,7 +657,13 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     RUNTIMEDETAILS
         .set(RuntimeDetails {
             start_time: time::OffsetDateTime::now_utc(),
-            cache_quota: cache_quota::CacheQuota::new(0, config.disk_quota),
+            cache_quota: cache_quota::CacheQuota::with_disk_headroom(
+                0,
+                config.disk_quota,
+                config.min_disk_free.map(|min_free| {
+                    cache_quota::DiskHeadroom::new(config.cache_directory.clone(), min_free)
+                }),
+            ),
             config,
             checksum_registry,
             verify_throttle,

@@ -9,7 +9,9 @@
 //!
 //! [`filesystem_space`] is the single `statvfs(3)` entry for both the
 //! disk-space and inode checks (and for the main loop's periodic disk-free
-//! check) (`inodes: None` means a filesystem without
+//! check, and the download admission's `min_disk_free` floor in
+//! `cache_quota::CacheQuota::refresh_disk_headroom`, which keeps its own
+//! sample) (`inodes: None` means a filesystem without
 //! an inode limit, not "none left"). Probing runs even without
 //! `min_disk_free`: inode exhaustion is invisible to that setting.
 

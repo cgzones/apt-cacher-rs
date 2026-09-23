@@ -2128,6 +2128,8 @@ async fn serve_new_file_worker(
             &conn_details.debname,
         )
     } else {
+        // The `min_disk_free` half of the gate reads a cached sample.
+        global_cache_quota().refresh_disk_headroom().await;
         match global_cache_quota().try_acquire(
             total_content_length,
             prev_file_size,

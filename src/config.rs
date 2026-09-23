@@ -818,9 +818,11 @@ pub(crate) struct Config {
     #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
-    /// Minimum free disk space (in bytes) on the cache filesystem for the
-    /// `/healthcheck` endpoint to report healthy. `None` (config value `0`)
-    /// disables the check.
+    /// Minimum free disk space (in bytes) to keep on the cache filesystem:
+    /// a download that would leave less is refused with 503 "Disk quota
+    /// reached" (like one over `disk_quota`, which it applies without), and
+    /// the `/healthcheck` endpoint reports unhealthy below it. `None`
+    /// (config value `0`) disables both checks.
     #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
     pub(crate) min_disk_free: Option<NonZero<u64>>,
 
