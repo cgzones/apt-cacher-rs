@@ -2342,10 +2342,30 @@ pub(crate) async fn process_cache_request(
     }
 }
 
+/// Keeps [`handle_hyper_connection`] -- and with it the connection's
+/// admission slot (`client_counter::ClientCounter`, owned by the task that
+/// runs the handler) -- alive while a tunnel upgraded from the connection
+/// runs.
+///
+/// hyper finishes serving a connection as soon as it has handed the upgraded
+/// socket to the tunnel task, so without this the slot was released while
+/// the tunnel still held the client socket, and every hyper tunnel escaped
+/// `max_connections` and `max_connections_per_client_ip`. Each tunnel task
+/// holds a clone; the handler waits until every clone is gone.
+#[derive(Clone)]
+struct ConnectionHold {
+    /// Never sends: the receiver only waits for every clone to drop.
+    _sender: tokio::sync::mpsc::Sender<Never>,
+}
+
 /// Answer a `CONNECT` whose client already passed the proxy-client ACL in
 /// `preflight_method`.
 #[must_use]
-fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<ProxyCacheBody> {
+fn connect_response(
+    client: ClientInfo,
+    req: Request<Incoming>,
+    hold: ConnectionHold,
+) -> Response<ProxyCacheBody> {
     let config = global_config();
 
     /*
@@ -2399,6 +2419,7 @@ fn connect_response(client: ClientInfo, req: Request<Incoming>) -> Response<Prox
     tokio::task::spawn(async move {
         let _tunnel_guard = tunnel_guard;
         let _active_tunnel_guard = active_tunnel_guard;
+        let _hold = hold;
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 // The relay outcome is reported inside `tunnel`; only the
@@ -2495,8 +2516,9 @@ async fn pre_process_client_request_wrapper(
     req: Request<Incoming>,
     appstate: AppState,
     handoff: Option<HandoffPlan>,
+    hold: ConnectionHold,
 ) -> Result<Response<ProxyCacheBody>, Infallible> {
-    let response = pre_process_client_request(client, req, appstate, handoff).await;
+    let response = pre_process_client_request(client, req, appstate, handoff, hold).await;
     metrics::record_client_status(response.status());
     Ok(response)
 }
@@ -2539,6 +2561,7 @@ async fn pre_process_client_request(
     req: Request<Incoming>,
     appstate: AppState,
     handoff: Option<HandoffPlan>,
+    hold: ConnectionHold,
 ) -> Response<ProxyCacheBody> {
     trace!("Incoming request: {req:?}");
 
@@ -2586,7 +2609,7 @@ async fn pre_process_client_request(
         let acls = ClientAcls::new(global_config(), global_webif_hosts());
 
         match preflight_method(req.method().as_str(), &client, &acls) {
-            Ok(RequestKind::Connect) => return connect_response(client, req),
+            Ok(RequestKind::Connect) => return connect_response(client, req, hold),
             Ok(RequestKind::Get) => {}
             Err(reason) => {
                 let (status, msg) = reason.response_parts();
@@ -2881,7 +2904,13 @@ pub(crate) async fn handle_hyper_connection<T>(
     // every later invocation run the full pipeline.
     let handoff = parking_lot::Mutex::new(handoff);
 
-    if let Err(err) = http1::Builder::new()
+    // Lent to every tunnel this connection upgrades into; see
+    // `ConnectionHold`. The service owns the sender, so it is dropped with
+    // the connection future below.
+    let (sender, mut tunnels_done) = tokio::sync::mpsc::channel::<Never>(1);
+    let hold = ConnectionHold { _sender: sender };
+
+    let served = http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(global_config().client_idle_timeout)
         .max_buf_size(client_max_buf_size(global_config().buffer_size))
@@ -2893,12 +2922,14 @@ pub(crate) async fn handle_hyper_connection<T>(
                     req,
                     appstate.clone(),
                     handoff.lock().take(),
+                    hold.clone(),
                 )
             }),
         )
         .with_upgrades()
-        .await
-    {
+        .await;
+
+    if let Err(err) = served {
         if let Some(failure) = accounted_body_failure(&err) {
             debug!(
                 "Closing connection to client {client} after accounted body failure:  {}",
@@ -2931,6 +2962,13 @@ pub(crate) async fn handle_hyper_connection<T>(
                 ErrorReport(&err)
             );
         }
+    }
+
+    // Return (and so release the connection's slot) only once every tunnel
+    // upgraded from this connection has ended.
+    match tunnels_done.recv().await {
+        None => {}
+        Some(never) => match never {},
     }
 }
 
