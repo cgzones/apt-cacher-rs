@@ -35,7 +35,12 @@ const METADATA_KEEP_SPAN: Duration = Duration::from_hours(90 * 24);
 /// Age threshold for a `.partial` scratch file, carried as the [`PartialsUnit`]
 /// span and applied by `partials::cleanup_tmp_dir` (which keeps its own, longer
 /// backstop for foreign entries).
-const PARTIALS_KEEP_SPAN: Duration = Duration::from_hours(3 * 24);
+///
+/// One day: a kept partial only pays off for a client retrying soon, while
+/// every failed download leaves one behind that an unreliable (or hostile)
+/// upstream can make as large as `max_object_size` -- disk usage that also
+/// counts against the quota until it is reaped.
+const PARTIALS_KEEP_SPAN: Duration = Duration::from_hours(24);
 
 /// Which candidate-reconcile tree a [`ReconcileUnit`] targets. Both shapes run
 /// the same engine and differ only in where they anchor and how their
