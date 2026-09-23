@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
+use super::http::BodyFraming;
 use super::{SpliceProxyError, VOLATILE_BODY_MAX};
 use crate::transfer_error::UpstreamError;
 
@@ -40,13 +41,24 @@ const HOP_BY_HOP: &[&str] = &[
     "proxy-authorization",
 ];
 
+/// Body-framing headers: replaced by the framing the relay applies, never
+/// forwarded (see [`rewrite_simple_proxy_headers`]).
+const FRAMING: &[&str] = &["content-length", "transfer-encoding"];
+
 /// Rewrite upstream response headers for the simple-proxy pass-through.
 ///
-/// Strips hop-by-hop headers, drops `Content-Length` if `Transfer-Encoding:
-/// chunked` is also present (RFC 9112 §6.1 defense against smuggling), and
-/// emits exactly one `Connection:` header matching the client's keep-alive
-/// decision regardless of how many `Connection:` headers the upstream sent
-/// (they're hop-by-hop and therefore all dropped during the filter pass).
+/// Strips hop-by-hop headers and emits exactly one `Connection:` header
+/// matching the client's keep-alive decision regardless of how many
+/// `Connection:` headers the upstream sent (they're hop-by-hop and therefore
+/// all dropped during the filter pass).
+///
+/// The upstream's `Content-Length` / `Transfer-Encoding` lines are never
+/// forwarded either: the head announces `framing`, the framing the relay
+/// applies (`BodyFraming::header_line`). Forwarding them would let a client
+/// frame the body by a line the relay ignored (a second `Transfer-Encoding`,
+/// a conflicting `Content-Length`) or lose it to a `Connection:` nomination,
+/// and read the body's tail as a forged next response. `conn_action` must
+/// already be `framing`'s verdict (`BodyFraming::client_action`).
 ///
 /// Extracted from `splice_simple_proxy` so the filtering invariants can be
 /// unit-tested without requiring a live upstream socket.
@@ -55,6 +67,7 @@ pub(super) fn rewrite_simple_proxy_headers(
     conn_version: ConnectionVersion,
     conn_action: ConnectionAction,
     status_code: StatusCode,
+    framing: BodyFraming,
 ) -> std::io::Result<String> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut parsed = httparse::Response::new(&mut headers);
@@ -64,13 +77,6 @@ pub(super) fn rewrite_simple_proxy_headers(
             "failed to re-parse upstream headers for rewrite",
         ));
     }
-    let has_chunked_te = parsed.headers.iter().any(|h| {
-        h.name.eq_ignore_ascii_case("transfer-encoding")
-            && std::str::from_utf8(h.value).is_ok_and(|v| {
-                v.split(',')
-                    .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
-            })
-    });
 
     // RFC 9110 §7.6.1: the Connection header nominates further connection-specific
     // field names that an intermediary must remove before forwarding.
@@ -86,19 +92,21 @@ pub(super) fn rewrite_simple_proxy_headers(
     }
 
     let mut buf = format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n");
+    if let Some(line) = framing.header_line(status_code) {
+        buf.push_str(&line);
+    }
     for h in parsed.headers.iter() {
-        if HOP_BY_HOP.iter().any(|n| h.name.eq_ignore_ascii_case(n)) {
+        if HOP_BY_HOP
+            .iter()
+            .chain(FRAMING)
+            .any(|n| h.name.eq_ignore_ascii_case(n))
+        {
             continue;
         }
         if connection_nominated
             .iter()
             .any(|n| h.name.eq_ignore_ascii_case(n))
         {
-            continue;
-        }
-        if has_chunked_te && h.name.eq_ignore_ascii_case("content-length") {
-            // RFC 9112 §6.1: drop Content-Length when Transfer-Encoding:
-            // chunked is also present (defense against smuggling).
             continue;
         }
         // Reject non-ASCII header values: HTTP headers are ASCII per RFC
@@ -135,6 +143,9 @@ pub(super) fn rewrite_simple_proxy_headers(
 /// Connects to upstream, sends a GET request, and forwards the complete response
 /// (headers + body) to the client.  No caching, no active-download tracking,
 /// no resume handling — just a transparent relay.
+///
+/// Returns what becomes of the client connection: `conn_action`, unless the
+/// relayed body was close-delimited and the connection has to close.
 pub(crate) async fn splice_simple_proxy(
     client_stream: &TcpStream,
     conn_version: ConnectionVersion,
@@ -143,7 +154,7 @@ pub(crate) async fn splice_simple_proxy(
     upstream_path: &str,
     client: ClientInfo,
     request_received_at: PreciseInstant,
-) -> Result<(), SpliceProxyError> {
+) -> Result<ConnectionAction, SpliceProxyError> {
     let host_authority = mirror.format_authority();
     // Strip the query so cache identity (registry keys, Origin rows) stays
     // path-only; the query still rides on the upstream GET line via
@@ -203,16 +214,20 @@ pub(crate) async fn splice_simple_proxy(
             None,
         )
         .await
+        .map(|()| conn_action)
         .map_err(SpliceProxyError::client("simple-proxy reject 502"));
     }
 
     // Rewrite response headers: adjust HTTP version and Connection header
-    // to match the client's protocol version and keep-alive strategy.
+    // to match the client's protocol version and keep-alive strategy, which
+    // a close-delimited body overrides.
+    let conn_action = resp.framing.client_action(conn_action);
     let rewritten_headers = match rewrite_simple_proxy_headers(
         &hdr_buf[..hdr_end],
         conn_version,
         conn_action,
         resp.status_code,
+        resp.framing,
     ) {
         Ok(s) => s,
         Err(err) => {
@@ -252,10 +267,9 @@ pub(crate) async fn splice_simple_proxy(
     .map_err(SpliceProxyError::client("simple-proxy headers"))?;
 
     // Forward the body that arrived with the headers plus the rest, framed
-    // per the upstream's framing. Chunked precedence over Content-Length is
-    // already resolved in the parser (RFC 9112 §6.1), and
-    // `rewrite_simple_proxy_headers` above stripped the ignored
-    // Content-Length, so the headers and the body framing agree.
+    // per the upstream's framing. The parser resolved it (or refused an
+    // ambiguous head), and `rewrite_simple_proxy_headers` above announced
+    // exactly that framing, so the headers and the body framing agree.
     let forwarded: u64 = resp
         .framing
         .relay_to_client(upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
@@ -277,7 +291,7 @@ pub(crate) async fn splice_simple_proxy(
     metrics::SERVED_PASSTHROUGH.increment();
     metrics::SERVED_TOTAL.increment();
 
-    Ok(())
+    Ok(conn_action)
 }
 
 #[cfg(test)]
@@ -299,6 +313,7 @@ mod tests {
             ConnectionVersion::Http11,
             ConnectionAction::KeepAlive,
             StatusCode::OK,
+            BodyFraming::ContentLength(5),
         )
         .expect("rewrite should succeed");
 
@@ -313,9 +328,96 @@ mod tests {
         assert!(out.contains("Connection: keep-alive\r\n"));
         // Upstream's Connection values must not be forwarded.
         assert!(!out.contains("Connection: close"));
-        // Content-Length passes through when no chunked TE is present.
+        // The relay's own Content-Length announces the framing.
         assert!(out.contains("Content-Length: 5\r\n"));
         assert!(out.contains("Via: "));
+    }
+
+    /// The upstream's framing lines never reach the client, however many
+    /// there are or whichever `Connection:` nominates: the head announces the
+    /// framing the relay applies, once, and nothing for a bodyless status.
+    #[test]
+    fn rewrite_simple_proxy_headers_announces_only_the_relay_framing() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Connection: Content-Length, Transfer-Encoding\r\n\
+                    Transfer-Encoding: gzip\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    Content-Length: 5\r\n\
+                    Content-Length: 7\r\n\
+                    \r\n";
+        let framing_lines = |out: &str| -> Vec<String> {
+            out.split("\r\n")
+                .filter(|line| {
+                    let line = line.to_ascii_lowercase();
+                    line.starts_with("content-length:") || line.starts_with("transfer-encoding:")
+                })
+                .map(str::to_owned)
+                .collect()
+        };
+        for (status, framing, expected) in [
+            (
+                StatusCode::OK,
+                BodyFraming::ContentLength(5),
+                vec!["Content-Length: 5"],
+            ),
+            (
+                StatusCode::OK,
+                BodyFraming::Chunked,
+                vec!["Transfer-Encoding: chunked"],
+            ),
+            (
+                StatusCode::OK,
+                BodyFraming::ContentLength(0),
+                vec!["Content-Length: 0"],
+            ),
+            (StatusCode::OK, BodyFraming::CloseDelimited, vec![]),
+            (
+                StatusCode::NOT_MODIFIED,
+                BodyFraming::ContentLength(0),
+                vec![],
+            ),
+            (
+                StatusCode::NO_CONTENT,
+                BodyFraming::ContentLength(0),
+                vec![],
+            ),
+        ] {
+            let out = rewrite_simple_proxy_headers(
+                raw,
+                ConnectionVersion::Http11,
+                framing.client_action(ConnectionAction::KeepAlive),
+                status,
+                framing,
+            )
+            .expect("rewrite should succeed");
+            assert_eq!(
+                framing_lines(&out),
+                expected,
+                "{framing:?}/{status}:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn close_delimited_framing_closes_the_client_connection() {
+        for (framing, expected) in [
+            (BodyFraming::ContentLength(5), "keep-alive"),
+            (BodyFraming::Chunked, "keep-alive"),
+            (BodyFraming::CloseDelimited, "close"),
+        ] {
+            assert_eq!(
+                framing
+                    .client_action(ConnectionAction::KeepAlive)
+                    .to_string(),
+                expected,
+                "{framing:?}"
+            );
+            assert_eq!(
+                framing.client_action(ConnectionAction::Close).to_string(),
+                "close",
+                "{framing:?}"
+            );
+        }
     }
 
     #[test]
@@ -331,6 +433,7 @@ mod tests {
             ConnectionVersion::Http11,
             ConnectionAction::Close,
             StatusCode::OK,
+            BodyFraming::Chunked,
         )
         .expect("rewrite should succeed");
         assert!(!out.to_ascii_lowercase().contains("content-length:"));
@@ -349,8 +452,9 @@ mod tests {
         let out = rewrite_simple_proxy_headers(
             raw,
             ConnectionVersion::Http11,
-            ConnectionAction::KeepAlive,
+            ConnectionAction::Close,
             StatusCode::OK,
+            BodyFraming::CloseDelimited,
         )
         .expect("rewrite should succeed");
 

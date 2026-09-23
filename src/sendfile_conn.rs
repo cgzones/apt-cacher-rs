@@ -1092,7 +1092,7 @@ async fn try_sendfile_request(
             )
             .await
             {
-                Ok(()) => ZeroCopyResult::Served(conn_action),
+                Ok(conn_action) => ZeroCopyResult::Served(conn_action),
                 Err(err) => splice_error_outcome(
                     err,
                     "simple proxy",
@@ -1280,6 +1280,9 @@ async fn try_sendfile_request(
         .await;
         match outcome {
             Ok(SpliceProxyOutcome::Served) => ZeroCopyResult::Served(conn_action),
+            Ok(SpliceProxyOutcome::ServedClosing) => {
+                ZeroCopyResult::Served(ConnectionAction::Close)
+            }
             Ok(SpliceProxyOutcome::ClientLost) => ZeroCopyResult::AfterHeaderError,
             Ok(SpliceProxyOutcome::Concurrent { status: dl_status }) => {
                 // Race-loser path: another connection registered the

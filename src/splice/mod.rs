@@ -936,6 +936,9 @@ async fn plan_upstream_response(
 /// falling back to hyper (which would open a redundant second connection).
 /// Nothing is cached, so the caller's `InitBarrier` fires on its return.
 /// The body reader consumes the response and releases it only on success.
+///
+/// Returns what becomes of the client connection: `client.action`, unless
+/// the relayed body was close-delimited and the connection has to close.
 async fn relay_passthrough(
     upstream: ResponseBody,
     client: ClientConn<'_>,
@@ -943,7 +946,7 @@ async fn relay_passthrough(
     upstream_resp: &UpstreamResponse,
     header_buf: &[u8],
     header_end: usize,
-) -> Result<(), SpliceProxyError> {
+) -> Result<ConnectionAction, SpliceProxyError> {
     debug!(
         "splice proxy: upstream returned {}, forwarding directly",
         upstream_resp.status_code
@@ -951,7 +954,9 @@ async fn relay_passthrough(
 
     let body_prefix = &header_buf[header_end..];
     if let Err(reason) = upstream_resp.check_relayable(body_prefix.len() as u64) {
-        return reject_upstream_response(client, conn_details, reason).await;
+        return reject_upstream_response(client, conn_details, reason)
+            .await
+            .map(|()| client.action);
     }
 
     metrics::REQUESTS_PASSTHROUGH.increment();
@@ -959,14 +964,17 @@ async fn relay_passthrough(
 
     // Rewrite the response headers before forwarding: strip hop-by-hop
     // headers, emit a single `Connection:` matching our keep-alive
-    // decision, drop `Content-Length` when chunked, and append `Via:`.
+    // decision (a close-delimited body overrides it), announce the framing
+    // the relay applies instead of the upstream's, and append `Via:`.
     // Nothing has been written to the client yet, so a malformed-header
     // error can safely bail to a 502 via the outer arm.
+    let conn_action = upstream_resp.framing.client_action(client.action);
     let passthrough_headers = match rewrite_simple_proxy_headers(
         &header_buf[..header_end],
         client.version,
-        client.action,
+        conn_action,
         upstream_resp.status_code,
+        upstream_resp.framing,
     ) {
         Ok(s) => s,
         Err(err) => {
@@ -1003,7 +1011,7 @@ async fn relay_passthrough(
 
     metrics::SERVED_PASSTHROUGH.increment();
     metrics::SERVED_TOTAL.increment();
-    Ok(())
+    Ok(conn_action)
 }
 
 /// Answer a protocol-violating or unusable upstream response with a 502.
@@ -1533,7 +1541,7 @@ async fn splice_proxy_drive(
             let _settled = ibarrier
                 .decline(Declined::Passthrough(upstream_resp.status_code))
                 .await;
-            relay_passthrough(
+            let conn_action = relay_passthrough(
                 upstream,
                 client,
                 conn_details,
@@ -1542,7 +1550,10 @@ async fn splice_proxy_drive(
                 header_end,
             )
             .await?;
-            return Ok(SpliceProxyOutcome::Served);
+            return Ok(match conn_action {
+                ConnectionAction::KeepAlive => SpliceProxyOutcome::Served,
+                ConnectionAction::Close => SpliceProxyOutcome::ServedClosing,
+            });
         }
         DownloadPlan::Reject(reason) => {
             let _settled = ibarrier.decline(Declined::Rejected(reason)).await;
@@ -1822,6 +1833,10 @@ async fn splice_proxy_drive(
 /// [`crate::active_downloads::ActiveDownloads::originate`].
 pub(crate) enum SpliceProxyOutcome {
     Served,
+    /// Served, but the response's body was delimited by closing the
+    /// connection (a relayed close-delimited body), so the caller closes it
+    /// instead of reading the next request.
+    ServedClosing,
     /// The download ran to completion (cached or not), but the client's
     /// delivery failed after the response headers went out -- the body
     /// prefix write, the splice loop, or the demoted file-serve task -- and
@@ -1950,9 +1965,8 @@ mod tests {
                         Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
                         ETag: \"abc\"\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         let whole = ServeParams::from_parsed(None, 1000).expect("no range");
         let validators = HeadValidators {
             etag: resp.etag.as_deref().map(Arc::from),

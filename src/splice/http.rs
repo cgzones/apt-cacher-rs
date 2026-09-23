@@ -10,11 +10,18 @@
 //! Consumers: `acquire` (request/parse), the drive in
 //! `mod.rs` and `volatile`/`simple_proxy`/`cleanup_bridge` (framing relays).
 
-use std::{future::Future, io::ErrorKind, num::Saturating, ops::Range, time::Duration};
+use std::{
+    future::Future,
+    io::ErrorKind,
+    num::{ParseIntError, Saturating},
+    ops::Range,
+    str::Utf8Error,
+    time::Duration,
+};
 
 use bytes::BytesMut;
 use http::{
-    StatusCode,
+    HeaderName, StatusCode,
     header::{
         CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION,
         TRANSFER_ENCODING,
@@ -26,7 +33,7 @@ use tokio::{
 };
 
 use crate::cache_layout::ConnectionDetails;
-use crate::http_helpers::{OptHeader, find_header, find_header_end};
+use crate::http_helpers::{ConnectionAction, OptHeader, find_header, find_header_end};
 use crate::http_range::parse_content_range;
 use crate::humanfmt::HumanFmt;
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
@@ -212,11 +219,14 @@ async fn read_upstream_response_headers(
 
 /// How an upstream HTTP response body is framed on the wire.
 ///
-/// Resolved once by [`parse_upstream_response`] with chunked-takes-precedence
-/// semantics (RFC 9112 §6.1): when `Transfer-Encoding: chunked` is present its
-/// framing wins and any accompanying `Content-Length` is ignored. Modelling the
-/// two as one sum type means "both at once" is no longer representable, so every
-/// consumer reads a single, already-disambiguated framing.
+/// Resolved once by [`parse_upstream_response`] from every framing header
+/// line (`resolve_body_framing`, which refuses an ambiguous head), with
+/// chunked-takes-precedence semantics (RFC 9112 §6.1): when
+/// `Transfer-Encoding: chunked` is present its framing wins and any
+/// accompanying `Content-Length` is ignored. Modelling the two as one sum type
+/// means "both at once" is no longer representable, so every consumer reads a
+/// single, already-disambiguated framing -- and a relayed head announces
+/// exactly this one ([`Self::header_line`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BodyFraming {
     /// `Content-Length: N` and not chunked. Splice-eligible when `N > 0`.
@@ -228,6 +238,29 @@ pub(super) enum BodyFraming {
 }
 
 impl BodyFraming {
+    /// The client connection's fate after a response relayed with this
+    /// framing: a close-delimited body ends only when the connection closes,
+    /// so the client's keep-alive cannot survive it.
+    pub(super) fn client_action(self, requested: ConnectionAction) -> ConnectionAction {
+        match self {
+            Self::ContentLength(_) | Self::Chunked => requested,
+            Self::CloseDelimited => ConnectionAction::Close,
+        }
+    }
+
+    /// The framing header a relayed head announces, CRLF-terminated; none
+    /// for a close-delimited body or a `status` that never carries one.
+    pub(super) fn header_line(self, status: StatusCode) -> Option<String> {
+        if is_bodyless_status(status) {
+            return None;
+        }
+        match self {
+            Self::ContentLength(len) => Some(format!("Content-Length: {len}\r\n")),
+            Self::Chunked => Some("Transfer-Encoding: chunked\r\n".to_owned()),
+            Self::CloseDelimited => None,
+        }
+    }
+
     /// Relay the response body to the client, framed per `self`, and return
     /// the number of body bytes sent (`body_prefix` included).
     ///
@@ -440,6 +473,99 @@ impl UpstreamResponse {
     }
 }
 
+/// Whether a response with `status` never carries a body, whatever its
+/// framing headers claim (RFC 9112 §6.3: 1xx, 204 and 304).
+pub(super) fn is_bodyless_status(status: StatusCode) -> bool {
+    status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+}
+
+/// Resolve the body framing from *every* `Transfer-Encoding` and
+/// `Content-Length` field line of an upstream head, or refuse the head.
+///
+/// The pass-through relays never forward these lines: they announce the
+/// framing resolved here (`rewrite_simple_proxy_headers`). So a head that
+/// could be framed two ways -- one way by this relay, another by a client
+/// reading a different one of its lines -- is refused rather than resolved,
+/// or the body's tail would become a forged next response on the client's
+/// keep-alive connection:
+///
+/// - `Transfer-Encoding` must name exactly one coding, `chunked`, across all
+///   its lines: a coding the relay cannot frame (`gzip, chunked`) or a
+///   duplicate is refused. Chunked then wins over any `Content-Length`
+///   (RFC 9112 §6.1), which is dropped.
+/// - `Content-Length` values, across lines and comma lists, must all be the
+///   same `1*DIGIT` (RFC 9110 §8.6 allows collapsing identical duplicates);
+///   junk, a sign, or two different values are refused -- not degraded to
+///   close-delimited framing.
+fn resolve_body_framing(headers: &[httparse::Header<'_>]) -> Result<BodyFraming, String> {
+    /// A list element with its surrounding `OWS` trimmed (RFC 9110 §5.6.1).
+    fn trim_ows(element: &str) -> &str {
+        element.trim_matches([' ', '\t'])
+    }
+
+    let field_values = |name: &'static HeaderName| {
+        headers
+            .iter()
+            .filter(move |h| h.name.eq_ignore_ascii_case(name.as_str()))
+            .map(|h| std::str::from_utf8(h.value))
+    };
+
+    let mut codings = Vec::new();
+    let mut has_transfer_encoding = false;
+    for value in field_values(&TRANSFER_ENCODING) {
+        has_transfer_encoding = true;
+        let value = value.map_err(|_err @ Utf8Error { .. }| {
+            "non-UTF-8 Transfer-Encoding from upstream".to_owned()
+        })?;
+        // Empty list elements are legal and carry nothing (RFC 9110 §5.6.1).
+        codings.extend(value.split(',').map(trim_ows).filter(|c| !c.is_empty()));
+    }
+    if has_transfer_encoding {
+        return match codings.as_slice() {
+            [coding] if coding.eq_ignore_ascii_case("chunked") => Ok(BodyFraming::Chunked),
+            _ => Err(format!(
+                "unsupported Transfer-Encoding `{}` from upstream",
+                codings.join(", ").escape_debug()
+            )),
+        };
+    }
+
+    let mut content_length = None;
+    for value in field_values(&CONTENT_LENGTH) {
+        let value = value.map_err(|_err @ Utf8Error { .. }| {
+            "non-UTF-8 Content-Length from upstream".to_owned()
+        })?;
+        let unparsable = || {
+            format!(
+                "unparsable Content-Length `{}` from upstream",
+                value.escape_debug()
+            )
+        };
+        // An empty element (`5,` or an empty value) is junk too: unlike a
+        // list field, `Content-Length` is a single `1*DIGIT`.
+        for element in value.split(',').map(trim_ows) {
+            // `u64::from_str` alone would take a leading `+`.
+            if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(unparsable());
+            }
+            let len = element
+                .parse::<u64>()
+                .map_err(|_err @ ParseIntError { .. }| unparsable())?;
+            match content_length {
+                Some(prev) if prev != len => {
+                    return Err(format!(
+                        "conflicting Content-Length values {prev} and {len} from upstream"
+                    ));
+                }
+                Some(_) | None => content_length = Some(len),
+            }
+        }
+    }
+    Ok(content_length.map_or(BodyFraming::CloseDelimited, BodyFraming::ContentLength))
+}
+
 /// Parse the upstream HTTP response head in `buf[..header_end]`, sent in
 /// answer to the request that went out at `request_sent_at`.
 ///
@@ -450,41 +576,25 @@ impl UpstreamResponse {
 pub(super) fn parse_upstream_response(
     buf: &[u8],
     header_end: usize,
-    host_authority: &str,
     request_sent_at: PreciseInstant,
-) -> Result<UpstreamResponse, &'static str> {
+) -> Result<UpstreamResponse, String> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPSTREAM_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
 
     match resp.parse(&buf[..header_end]) {
         Ok(httparse::Status::Complete(_)) => {}
         _ => {
-            return Err("failed to parse upstream response headers");
+            return Err("failed to parse upstream response headers".to_owned());
         }
     }
 
     let raw_code = resp.code.expect("complete header parsed");
-    let status_code =
-        StatusCode::from_u16(raw_code).map_err(|_err| "invalid HTTP status code from upstream")?;
+    let status_code = StatusCode::from_u16(raw_code)
+        .map_err(|_err| "invalid HTTP status code from upstream".to_owned())?;
 
     let headers = resp.headers;
 
-    // A present-but-unparsable Content-Length (junk, a folded duplicate like
-    // `100, 100`, non-UTF8) silently degrades framing to close-delimited:
-    // permanent files then 502 with "no Content-Length" (reading as if the
-    // header were absent), volatile ones take the buffered path, and
-    // passthrough burns the pooled connection. It is also a response-
-    // smuggling signal, so say the value out loud.
-    let content_length = find_header(headers, &CONTENT_LENGTH).and_then(|v| {
-        let parsed = v.trim().parse::<u64>().ok();
-        if parsed.is_none() {
-            warn_once_or_info!(
-                "splice proxy: upstream {host_authority} sent an unparsable Content-Length `{}`; treating the body as close-delimited",
-                v.escape_debug()
-            );
-        }
-        parsed
-    });
+    let framing = resolve_body_framing(headers)?;
 
     let content_type = find_header(headers, &CONTENT_TYPE).map(String::from);
 
@@ -501,31 +611,11 @@ pub(super) fn parse_upstream_response(
     let connection_close = find_header(headers, &CONNECTION)
         .is_some_and(|s| s.split(',').any(|v| v.trim().eq_ignore_ascii_case("close")));
 
-    let is_chunked = find_header(headers, &TRANSFER_ENCODING).is_some_and(|s| {
-        s.split(',')
-            .any(|v| v.trim().eq_ignore_ascii_case("chunked"))
-    });
-
-    // RFC 9112 §6.1: chunked framing takes precedence; a `Content-Length` sent
-    // alongside `Transfer-Encoding: chunked` must be ignored (defense against
-    // response smuggling). Resolve the precedence once, here, so no consumer
-    // can observe both at the same time.
-    let framing = if is_chunked {
-        BodyFraming::Chunked
-    } else if let Some(len) = content_length {
-        BodyFraming::ContentLength(len)
-    } else {
-        BodyFraming::CloseDelimited
-    };
-
     // RFC 9112 §6.3: 1xx, 204, and 304 responses never carry a message body,
     // regardless of Content-Length / Transfer-Encoding headers. Force
     // zero-length framing so relay/consumer paths do not read-until-EOF
     // (stalling a keep-alive upstream) or mis-frame a bodyless response.
-    let framing = if status_code.is_informational()
-        || status_code == StatusCode::NO_CONTENT
-        || status_code == StatusCode::NOT_MODIFIED
-    {
+    let framing = if is_bodyless_status(status_code) {
         BodyFraming::ContentLength(0)
     } else {
         framing
@@ -575,11 +665,11 @@ pub(super) async fn send_and_read_headers(
 
     let mut hdr_buf = BytesMut::with_capacity(MAX_UPSTREAM_HEADER_SIZE);
     let hdr_end = read_upstream_response_headers(up, &mut hdr_buf).await?;
-    let resp = parse_upstream_response(&hdr_buf, hdr_end, host_authority, request_sent_at)
+    let resp = parse_upstream_response(&hdr_buf, hdr_end, request_sent_at)
         .inspect_err(|_reason| {
             metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
         })
-        .map_err(|reason| HeadError::Protocol(reason.to_owned()))?;
+        .map_err(HeadError::Protocol)?;
     Ok((resp, hdr_buf, hdr_end))
 }
 
@@ -1252,9 +1342,8 @@ mod tests {
                         Content-Type: application/vnd.debian.binary-package\r\n\
                         Last-Modified: Thu, 01 Jan 2025 00:00:00 GMT\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), Some(12345));
         assert_eq!(
@@ -1270,9 +1359,8 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_no_content_length() {
         let headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), None);
         assert_eq!(resp.framing, BodyFraming::Chunked);
@@ -1281,9 +1369,8 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_not_chunked() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::ContentLength(42));
         assert_eq!(resp.content_length(), Some(42));
     }
@@ -1297,9 +1384,8 @@ mod tests {
                         Content-Length: 42\r\n\
                         Transfer-Encoding: chunked\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::Chunked);
         assert_eq!(resp.content_length(), None);
     }
@@ -1307,9 +1393,8 @@ mod tests {
     #[test]
     fn parse_upstream_response_close_delimited_without_framing_headers() {
         let headers = b"HTTP/1.1 200 OK\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::CloseDelimited);
         assert_eq!(resp.content_length(), None);
     }
@@ -1318,9 +1403,8 @@ mod tests {
     fn parse_upstream_response_304_is_bodyless() {
         // RFC 9112 §6.3: a 304 never carries a body even with Content-Length.
         let headers = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 500\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::ContentLength(0));
         assert_eq!(resp.content_length(), Some(0));
     }
@@ -1329,18 +1413,16 @@ mod tests {
     fn parse_upstream_response_204_is_bodyless() {
         // RFC 9112 §6.3: a 204 never carries a body even with chunked framing.
         let headers = b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.framing, BodyFraming::ContentLength(0));
     }
 
     #[test]
     fn test_parse_upstream_response_404() {
         let headers = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.status_code, 404);
     }
 
@@ -1350,9 +1432,8 @@ mod tests {
                         Content-Length: 100\r\n\
                         ETag: \"abc123\"\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.etag.as_deref(), Some("\"abc123\""));
     }
 
@@ -1365,9 +1446,8 @@ mod tests {
                         ETag: not-a-valid-etag\r\n\
                         Last-Modified: not a date\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.etag.as_deref(), Some("not-a-valid-etag"));
         assert_eq!(resp.last_modified.as_deref(), Some("not a date"));
     }
@@ -1378,9 +1458,8 @@ mod tests {
                         Content-Length: 500\r\n\
                         Content-Range: bytes 100-599/1000\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.status_code, 206);
         assert_eq!(resp.content_range.as_deref(), Some("bytes 100-599/1000"));
     }
@@ -1391,9 +1470,8 @@ mod tests {
                         Content-Length: 100\r\n\
                         Connection: close\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert!(resp.connection_close);
     }
 
@@ -1403,18 +1481,16 @@ mod tests {
                         Content-Length: 100\r\n\
                         Connection: keep-alive\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert!(!resp.connection_close);
     }
 
     #[test]
     fn test_parse_upstream_response_no_connection_header() {
         let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert!(!resp.connection_close);
     }
 
@@ -1426,9 +1502,8 @@ mod tests {
                         last-modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
                         etag: \"xyz\"\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.content_length(), Some(42));
         assert_eq!(resp.content_type.as_deref(), Some("text/plain"));
         assert_eq!(
@@ -1450,9 +1525,8 @@ mod tests {
                        etag: \"caffe\u{e9}\"\r\n\
                        \r\n"
             .as_bytes();
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.etag.as_deref(), Some("\"caffe\u{e9}\""), "kept raw");
         assert_eq!(resp.head().etag, None);
         let mut discarded = Vec::new();
@@ -1466,10 +1540,7 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_malformed() {
         let garbage = b"not an http response at all";
-        assert!(
-            parse_upstream_response(garbage, garbage.len(), "test.mirror", PreciseInstant::now())
-                .is_err()
-        );
+        assert!(parse_upstream_response(garbage, garbage.len(), PreciseInstant::now()).is_err());
     }
 
     #[test]
@@ -1482,9 +1553,8 @@ mod tests {
                         Content-Range: bytes 0-998/999\r\n\
                         Connection: close\r\n\
                         \r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), Some(999));
         assert_eq!(
@@ -1503,9 +1573,8 @@ mod tests {
     #[test]
     fn test_parse_upstream_response_no_optional_fields() {
         let headers = b"HTTP/1.1 200 OK\r\n\r\n";
-        let resp =
-            parse_upstream_response(headers, headers.len(), "test.mirror", PreciseInstant::now())
-                .expect("should parse");
+        let resp = parse_upstream_response(headers, headers.len(), PreciseInstant::now())
+            .expect("should parse");
         assert_eq!(resp.status_code, 200);
         assert_eq!(resp.content_length(), None);
         assert_eq!(resp.content_type, None);
@@ -1537,7 +1606,7 @@ mod tests {
         let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len();
         let buf = make_padded_response(pad_len);
         assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE);
-        let result = parse_upstream_response(&buf, buf.len(), "test.mirror", PreciseInstant::now());
+        let result = parse_upstream_response(&buf, buf.len(), PreciseInstant::now());
         assert!(
             result.is_ok(),
             "expected Ok for response at exact cap, got Err"
@@ -1553,16 +1622,16 @@ mod tests {
         let pad_len = MAX_UPSTREAM_HEADER_SIZE - preamble.len() + 1;
         let buf = make_padded_response(pad_len);
         assert_eq!(buf.len(), MAX_UPSTREAM_HEADER_SIZE + 1);
-        let resp = parse_upstream_response(&buf, buf.len(), "test.mirror", PreciseInstant::now())
+        let resp = parse_upstream_response(&buf, buf.len(), PreciseInstant::now())
             .expect("the parser itself applies no size cap");
         assert_eq!(resp.status_code, StatusCode::OK);
     }
 
-    /// Header-value edge cases the parser resolves itself: an unparsable
-    /// `Content-Length` (junk or a folded duplicate) degrades to
-    /// close-delimited framing, a 1xx head is bodyless whatever it claims,
-    /// a `chunked` token anywhere in `Transfer-Encoding` wins, and a `close`
-    /// token anywhere in `Connection` closes.
+    /// Header-value edge cases the parser resolves itself: identical
+    /// `Content-Length` duplicates (folded or on separate lines) collapse to
+    /// one value, a 1xx head is bodyless whatever it claims, a lone
+    /// `chunked` coding (empty list elements aside) wins over
+    /// `Content-Length`, and a `close` token anywhere in `Connection` closes.
     #[test]
     fn parse_upstream_response_header_value_edge_cases() {
         struct Case {
@@ -1572,13 +1641,13 @@ mod tests {
         }
         let cases = [
             Case {
-                head: b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n",
-                framing: BodyFraming::CloseDelimited,
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 100, 100\r\n\r\n",
+                framing: BodyFraming::ContentLength(100),
                 connection_close: false,
             },
             Case {
-                head: b"HTTP/1.1 200 OK\r\nContent-Length: 100, 100\r\n\r\n",
-                framing: BodyFraming::CloseDelimited,
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\ncontent-length:\t100 \r\n\r\n",
+                framing: BodyFraming::ContentLength(100),
                 connection_close: false,
             },
             Case {
@@ -1587,21 +1656,28 @@ mod tests {
                 connection_close: false,
             },
             Case {
-                head: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nContent-Length: 5\r\n\r\n",
+                head:
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: , CHUNKED\r\nContent-Length: 5\r\n\r\n",
                 framing: BodyFraming::Chunked,
                 connection_close: false,
             },
             Case {
-                head: b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive, close\r\n\r\n",
+                head:
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: junk\r\n\r\n",
+                framing: BodyFraming::Chunked,
+                connection_close: false,
+            },
+            Case {
+                head:
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive, close\r\n\r\n",
                 framing: BodyFraming::ContentLength(7),
                 connection_close: true,
             },
         ];
         for case in cases {
             let head = case.head;
-            let resp =
-                parse_upstream_response(head, head.len(), "test.mirror", PreciseInstant::now())
-                    .expect("every case is a syntactically valid head");
+            let resp = parse_upstream_response(head, head.len(), PreciseInstant::now())
+                .expect("every case is a syntactically valid head");
             assert_eq!(
                 resp.framing,
                 case.framing,
@@ -1626,6 +1702,81 @@ mod tests {
         }
     }
 
+    /// A head whose framing headers a client could read differently from
+    /// the relay is refused outright, not resolved: the pass-through relays
+    /// announce only the framing resolved here, so refusing is what keeps a
+    /// forged response from riding in a body's tail.
+    #[test]
+    fn parse_upstream_response_refuses_ambiguous_framing() {
+        for (head, reason) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"[..],
+                "unsupported Transfer-Encoding `gzip, chunked` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+                "unsupported Transfer-Encoding `gzip, chunked` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "unsupported Transfer-Encoding `chunked, chunked` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+                "unsupported Transfer-Encoding `gzip` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\n\r\n",
+                "unsupported Transfer-Encoding `` from upstream",
+            ),
+            (
+                b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: identity\r\n\r\n",
+                "unsupported Transfer-Encoding `identity` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Length: 10\r\n\r\n",
+                "conflicting Content-Length values 100 and 10 from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\n",
+                "conflicting Content-Length values 5 and 6 from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n",
+                "unparsable Content-Length `abc` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n",
+                "unparsable Content-Length `+5` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\n",
+                "unparsable Content-Length `-5` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5,\r\n\r\n",
+                "unparsable Content-Length `5,` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n",
+                "unparsable Content-Length `` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0x10\r\n\r\n",
+                "unparsable Content-Length `0x10` from upstream",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\n",
+                "unparsable Content-Length `99999999999999999999` from upstream",
+            ),
+        ] {
+            let err = parse_upstream_response(head, head.len(), PreciseInstant::now())
+                .err()
+                .expect("an ambiguous framing must be refused");
+            assert_eq!(err, reason, "{:?}", head.escape_ascii().to_string());
+        }
+    }
+
     /// `MAX_UPSTREAM_HEADERS` is the httparse slot count: exactly that many
     /// headers parse, one more is a parse failure.
     #[test]
@@ -1641,21 +1792,15 @@ mod tests {
 
         let at_cap = build(MAX_UPSTREAM_HEADERS);
         assert!(
-            parse_upstream_response(&at_cap, at_cap.len(), "test.mirror", PreciseInstant::now())
-                .is_ok(),
+            parse_upstream_response(&at_cap, at_cap.len(), PreciseInstant::now()).is_ok(),
             "exactly MAX_UPSTREAM_HEADERS headers must parse"
         );
 
         let over_cap = build(MAX_UPSTREAM_HEADERS + 1);
         // `UpstreamResponse` is not `Debug`, so go through `Option`.
-        let err = parse_upstream_response(
-            &over_cap,
-            over_cap.len(),
-            "test.mirror",
-            PreciseInstant::now(),
-        )
-        .err()
-        .expect("one header over the slot count must fail to parse");
+        let err = parse_upstream_response(&over_cap, over_cap.len(), PreciseInstant::now())
+            .err()
+            .expect("one header over the slot count must fail to parse");
         assert_eq!(err, "failed to parse upstream response headers");
     }
 
