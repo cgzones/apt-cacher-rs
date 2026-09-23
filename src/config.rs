@@ -849,6 +849,13 @@ pub(crate) struct Config {
     /// None means setting is inherited from `allowed_proxy_clients`.
     pub(crate) allowed_webif_clients: Option<Vec<IpNetOrAddr>>,
 
+    /// Additional DNS names the web interface answers to.  Besides these it
+    /// only accepts a `Host` naming an IP literal, `localhost` or the system
+    /// hostname; any other name is refused with 421 Misdirected Request so a
+    /// DNS-rebinding page cannot read the web interface through a browser
+    /// (see `web::host_gate`).
+    pub(crate) webif_hostnames: Vec<DomainName>,
+
     /// Whether https tunneling (`CONNECT`) is enabled.  Off by default: a
     /// tunnel is an open TCP relay to every host in
     /// [`Self::https_tunnel_allowed_mirrors`], so it is enabled together
@@ -1028,6 +1035,7 @@ impl Default for Config {
             http_only_mirrors: Vec::new(),
             allowed_proxy_clients: Vec::new(),
             allowed_webif_clients: None,
+            webif_hostnames: Vec::new(),
             https_tunnel_enabled: false,
             https_tunnel_allowed_ports: vec![nonzero!(443)],
             https_tunnel_allowed_mirrors: Vec::new(),

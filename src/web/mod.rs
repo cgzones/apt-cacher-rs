@@ -5,6 +5,7 @@
 //! rendering lives in submodules:
 //!
 //! - [`fmt`]: the `Display` newtypes cells are rendered through.
+//! - [`host_gate`]: the `Host` names the web interface answers to.
 //! - [`table`]: `Table`/`DetailsList`, the `tr!` row macro, section wrappers.
 //! - [`page`]: query options, theme, the `<html>` skeleton and `<nav>`, the
 //!   stylesheet and favicon.
@@ -16,6 +17,7 @@
 
 mod dashboard;
 mod fmt;
+pub(crate) mod host_gate;
 mod logs;
 mod metrics_page;
 mod page;

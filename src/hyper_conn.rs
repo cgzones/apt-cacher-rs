@@ -64,7 +64,7 @@ use crate::{
         CacheAccessFailure, hint_sequential_read, regular_file_metadata, tokio_nofollow_options,
         touch_volatile_mtime,
     },
-    global_cache_quota, global_config, global_verify_throttle,
+    global_cache_quota, global_config, global_verify_throttle, global_webif_hosts,
     guards::{Consequence, DownloadBarrier, InitBarrier, Settled},
     http_range::HttpDate,
     humanfmt::HumanFmt,
@@ -2715,7 +2715,7 @@ async fn pre_process_client_request(
     } else {
         metrics::REQUESTS_TOTAL.increment();
 
-        let acls = ClientAcls::from(global_config());
+        let acls = ClientAcls::new(global_config(), global_webif_hosts());
 
         match preflight_method(req.method().as_str(), &client, &acls) {
             Ok(RequestKind::Connect) => return connect_response(client, req),
@@ -2739,7 +2739,7 @@ async fn pre_process_client_request(
         let (requested_host, requested_port) = match preflight_target(
             req.uri(),
             req.version() == http::Version::HTTP_11,
-            || req.headers().contains_key(HOST),
+            || req.headers().get(HOST).map(HeaderValue::as_bytes),
             &client,
             &acls,
         ) {

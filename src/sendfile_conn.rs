@@ -68,7 +68,7 @@ use crate::{
         CacheAccessFailure, hint_sequential_read, regular_file_metadata,
         regular_file_metadata_typed, tokio_nofollow_options,
     },
-    global_config,
+    global_config, global_webif_hosts,
     http_helpers::{
         ConnectionAction, ConnectionVersion, WritePhase, find_header, find_header_end,
         write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
@@ -608,7 +608,9 @@ fn reject_result(
 ) -> ZeroCopyResult {
     let (status, msg) = reason.response_parts();
     match reason {
-        RejectReason::DiffRequest | RejectReason::UnauthorizedWebUi => ZeroCopyResult::Rejection {
+        RejectReason::DiffRequest
+        | RejectReason::UnauthorizedWebUi
+        | RejectReason::MisdirectedWebUi => ZeroCopyResult::Rejection {
             status,
             conn_action: conn_action(),
             msg,
@@ -963,7 +965,7 @@ async fn try_sendfile_request(
 
     trace!("Parsed client request:\n{req:?}");
 
-    let acls = ClientAcls::from(global_config());
+    let acls = ClientAcls::new(global_config(), global_webif_hosts());
 
     match preflight_method(req.method.expect("complete header parsed"), &client, &acls) {
         Ok(RequestKind::Get) => {}
@@ -1005,7 +1007,12 @@ async fn try_sendfile_request(
     let (requested_host, requested_port) = match preflight_target(
         &uri,
         *conn_version == ConnectionVersion::Http11,
-        || find_header(req.headers, &HOST).is_some(),
+        || {
+            req.headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(HOST.as_str()))
+                .map(|h| h.value)
+        },
         &client,
         &acls,
     ) {

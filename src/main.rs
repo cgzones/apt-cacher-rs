@@ -219,6 +219,7 @@ struct RuntimeDetails {
     cache_quota: cache_quota::CacheQuota,
     checksum_registry: integrity::ChecksumRegistry,
     verify_throttle: verify_throttle::VerifyThrottle,
+    webif_hosts: web::host_gate::WebifHosts,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +373,15 @@ pub(crate) fn global_checksum_registry() -> &'static integrity::ChecksumRegistry
         .get()
         .expect("Global was initialized in main()")
         .checksum_registry
+}
+
+#[must_use]
+#[inline]
+pub(crate) fn global_webif_hosts() -> &'static web::host_gate::WebifHosts {
+    &RUNTIMEDETAILS
+        .get()
+        .expect("Global was initialized in main()")
+        .webif_hosts
 }
 
 #[must_use]
@@ -644,6 +654,8 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
         config.verify_checksums_throttle_cap,
     );
 
+    let webif_hosts = web::host_gate::WebifHosts::from_system(&config.webif_hostnames);
+
     RUNTIMEDETAILS
         .set(RuntimeDetails {
             start_time: time::OffsetDateTime::now_utc(),
@@ -651,6 +663,7 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
             config,
             checksum_registry,
             verify_throttle,
+            webif_hosts,
         })
         .expect("Initial set in main() should succeed");
 
@@ -683,6 +696,10 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error + Send + Sy
     }
 
     debug!("Configuration: {:?}", global_config());
+    debug!(
+        "Web interface answers to IP literals, localhost and: {}",
+        global_webif_hosts().names().collect::<Vec<_>>().join(", ")
+    );
 
     if is_run_as_root {
         assert!(
