@@ -2293,9 +2293,12 @@ async fn serve_new_file_worker(
     let (outfile, outpath) = partial.into_target(filename, resume_offset).await?;
     // Persist the validators (and the expected total, so a resume can detect
     // an upstream change) early, so they survive an interrupted download.
-    let expected_size = match total_content_length {
-        ContentLength::Exact(total) => Some(total.get()),
-        ContentLength::Unknown(_) => None,
+    // Only a permanent `.partial` is ever resumed
+    // (`partial_file::prepare_partial_resume`, the size's one reader); a
+    // volatile temp file is removed on failure, so it skips that write.
+    let expected_size = match (conn_details.cached_flavor(), total_content_length) {
+        (CachedFlavor::Permanent, ContentLength::Exact(total)) => Some(total.get()),
+        (CachedFlavor::Volatile, _) | (CachedFlavor::Permanent, ContentLength::Unknown(_)) => None,
     };
     write_upstream_metadata(
         &outfile,

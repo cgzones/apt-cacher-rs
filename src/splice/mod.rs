@@ -451,8 +451,8 @@ struct HeadValidators {
 
 /// Reserve the cache quota and open the file the body is written into: the
 /// cache directory, the quota reservation, the temp/partial file per
-/// `partial`, the validator and expected-size xattrs, and the `InitBarrier ->
-/// DownloadBarrier` transition. Shared by the streaming drive and the
+/// `partial`, the validator xattrs (plus the expected size on a permanent
+/// file), and the `InitBarrier -> DownloadBarrier` transition. Shared by the streaming drive and the
 /// buffered volatile path (which always passes `PartialDownload::Volatile`).
 ///
 /// `prev_file_size` is the size of the cached copy the commit replaces (the
@@ -597,12 +597,19 @@ async fn prepare_cache_target(
         return Ok(None);
     };
     // Persist the validators and the expected total early, so they survive
-    // an interrupted download for resume.
+    // an interrupted download for resume. Only a permanent `.partial` is ever
+    // resumed (`partial_file::prepare_partial_resume`, the size's one
+    // reader); a volatile temp file is removed on failure, so it skips that
+    // write.
+    let expected_size = match conn_details.cached_flavor() {
+        CachedFlavor::Permanent => Some(total_content_length.get()),
+        CachedFlavor::Volatile => None,
+    };
     write_upstream_metadata(
         &tempfile,
         &temppath,
         &download_meta,
-        Some(total_content_length.get()),
+        expected_size,
         target_file,
     );
     let (_settled, dbarrier) = ibarrier
