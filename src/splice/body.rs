@@ -292,6 +292,10 @@ pub(super) struct CacheWriter {
     /// The userspace loop's read buffer, which is its batch. At most one of
     /// the two sinks is installed: each loop installs its own.
     buffer: Option<CacheBatch<BufferSink>>,
+    /// Some byte of this transfer reached the file (a body prefix, a
+    /// boundary chunk or a batch): the barrier's unbatched first ping went
+    /// out with it, so the batch no longer needs its eager first flush.
+    landed_once: sticky::Bool,
 }
 
 /// Whether every new byte is available in userspace. Resumed downloads cannot
@@ -335,6 +339,7 @@ impl CacheWriter {
             hasher,
             pipes: None,
             buffer: None,
+            landed_once: sticky::Bool::new(),
         })
     }
 
@@ -413,6 +418,7 @@ impl CacheWriter {
         pwrite_buf_to_file(&self.file, buf, 0..got, self.file_offset, &mut self.hasher)
             .await
             .map_err(|err| CacheError::counted_io("splice cache write", &self.path, err))?;
+        self.landed_once.set();
         self.file_offset +=
             i64::try_from(got).expect("a chunk is bounded by its read buffer, which fits in i64");
         Ok(())
@@ -477,6 +483,7 @@ impl CacheWriter {
                 return Ok(());
             }
             batch.mark_flushed();
+            self.landed_once.set();
             return self.land_buffer().await.map_err(|err| {
                 CacheError::counted_io("splice cache write", &self.path, err).into()
             });
@@ -489,6 +496,7 @@ impl CacheWriter {
             return Ok(());
         }
         self.batch_mut().mark_flushed();
+        self.landed_once.set();
         debug_assert!(
             self.hasher.is_none(),
             "tee bytes cannot feed an incremental digest"
@@ -503,12 +511,13 @@ impl CacheWriter {
         Ok(())
     }
 
-    /// Flush once the installed batch is due: at the threshold, or on the
-    /// very first bytes of the transfer.
+    /// Flush once the installed batch is due: at the threshold, or while
+    /// nothing of the transfer is on disk yet.
     async fn flush_if_due(&mut self) -> Result<(), DownloadFailure> {
+        let landed_once = self.landed_once.get();
         let due = match (&self.buffer, &self.pipes) {
-            (Some(batch), _) => batch.is_due(),
-            (None, Some(pipes)) => pipes.cache.is_due(),
+            (Some(batch), _) => batch.is_due(landed_once),
+            (None, Some(pipes)) => pipes.cache.is_due(landed_once),
             (None, None) => false,
         };
         if due {
@@ -1796,7 +1805,10 @@ impl SplicePipes {
 ///   mirroring `DownloadBarrier::ping_batched`'s unbatched first ping: a
 ///   download below the threshold would otherwise put nothing on disk until
 ///   it finished, and a joiner or a demoted client, both of which read the
-///   partial file, would see pure store-and-forward latency;
+///   partial file, would see pure store-and-forward latency. Only while
+///   nothing is on disk yet: a body prefix that landed before the loop
+///   already carried that first ping, and an eager flush behind it would
+///   cost a pool round trip that wakes nobody;
 /// - the sink full: a full `pipe_B` would park the tee on a pipe nothing
 ///   else drains, and a full read buffer has no room for the next read;
 /// - before parking on a back-pressuring client: nothing grows the partial
@@ -1832,7 +1844,6 @@ struct CacheBatch<S> {
     /// When the oldest byte of the current batch was queued; `None` while
     /// the batch is empty.
     queued_at: Option<coarsetime::Instant>,
-    flushed_once: sticky::Bool,
 }
 
 impl<S> CacheBatch<S> {
@@ -1853,7 +1864,6 @@ impl<S> CacheBatch<S> {
             sink,
             pending: 0,
             queued_at: None,
-            flushed_once: sticky::Bool::new(),
         }
     }
 
@@ -1868,17 +1878,16 @@ impl<S> CacheBatch<S> {
         self.queued_at.get_or_insert_with(coarsetime::Instant::now);
     }
 
-    /// Whether the batch is due: at the threshold, or on the very first
-    /// bytes of the transfer.
-    fn is_due(&self) -> bool {
-        self.pending >= Self::FLUSH_THRESHOLD || !self.flushed_once.get()
+    /// Whether the batch is due: at the threshold, or while no byte of the
+    /// transfer has `landed_once` in the file.
+    const fn is_due(&self, landed_once: bool) -> bool {
+        self.pending >= Self::FLUSH_THRESHOLD || (!landed_once && !self.is_empty())
     }
 
     /// Reset the policy for a flush that is about to land every pending byte.
     fn mark_flushed(&mut self) {
         self.pending = 0;
         self.queued_at = None;
-        self.flushed_once.set();
     }
 
     /// Sleep until the current batch reaches [`Self::MAX_BATCH_AGE`]; for
