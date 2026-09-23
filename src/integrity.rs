@@ -34,8 +34,10 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::fs::Metadata;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use hashbrown::{Equivalent, HashMap};
@@ -44,7 +46,7 @@ use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use tracing::{debug, error, warn};
 
 use crate::error::ErrorReport;
-use crate::fs_open::{hint_sequential_read, nofollow_options, tokio_nofollow_options};
+use crate::fs_open::{hint_sequential_read, tokio_nofollow_options};
 use crate::ingest_ledger::{Claim, IngestLedger, Outcome};
 use crate::limits::{self, LimitedReader, PackagesCompression};
 use crate::{
@@ -53,7 +55,9 @@ use crate::{
     deb_mirror::normalize_uri_path,
     guards::DownloadWriteLease,
     index_parser::{self, HashAlgo, IndexFormat, StanzaStream, StreamedDigest},
-    metrics, verified_marker,
+    metrics,
+    partial_file::TempPath,
+    verified_marker,
 };
 use crate::{
     global_checksum_registry, global_config, info_once, warn_once_or_debug, warn_once_or_info,
@@ -72,8 +76,9 @@ pub(crate) enum CommitError {
     /// The downloaded content did not match its expected digest.
     #[error("checksum mismatch")]
     ChecksumMismatch,
-    /// Reading the temp file back for verification failed. Fail-closed: a file
-    /// that cannot be verified does not enter the cache.
+    /// Reading the temp file back for verification, or the `fstat` that ties
+    /// the rename to the verified file, failed. Fail-closed: a file that
+    /// cannot be verified does not enter the cache.
     #[error("verification I/O error")]
     VerifyIo(#[source] std::io::Error),
     /// [`rename_into_cache`] of the verified temp file failed — either the
@@ -86,12 +91,20 @@ pub(crate) enum CommitError {
 /// Input for [`verify_temp_file`]. Holds everything the decision needs as
 /// plain values/borrows so the decision logic is global-free (no `global_config()`, no
 /// process-wide registry) and therefore unit-testable. Note: `verify_temp_file`
-/// performs file I/O (it reads and hashes `temp_path`) - it is not a pure
+/// performs file I/O (it reads and hashes `file`) - it is not a pure
 /// function, but it is free of process-global state.
 struct VerifyInput<'a> {
     /// `config.verify_checksums`.
     verify_enabled: bool,
     kind: VerifyKind,
+    /// The finished temp file, open for reading. Read through its own cursor
+    /// (rewound first), which is safe because every other holder of this open
+    /// file description -- the splice cache writer's `pwrite` and a demoted
+    /// client's `sendfile` -- uses explicit offsets
+    /// (`splice/body.rs::prepare_file_serve`).
+    file: &'a std::fs::File,
+    /// `file`'s path, for log context and the verified marker only; never
+    /// reopened.
     temp_path: &'a Path,
     /// The digest the body loop computed as it wrote the file, when it could
     /// (the splice-only `stream_hash_algo` picked an algorithm, the download
@@ -109,7 +122,7 @@ struct VerifyInput<'a> {
 /// half-resolved combination - a by-hash algorithm whose digest did not
 /// decode, a registry-backed kind carrying no digest - is representable.
 enum VerifyKind {
-    /// The expected digest is known: hash `temp_path` with `algo` and
+    /// The expected digest is known: hash the temp file with `algo` and
     /// compare. For a by-hash resource `algo` is the authoritative algorithm
     /// the parser validated for the `<algo>` URL path segment
     /// (`SHA256`/`SHA512`) and carried on the `ResourceKind`, never inferred
@@ -166,9 +179,9 @@ enum VerifyOutcome {
 ///
 /// Global-free (no `global_config()`, no registry): all inputs arrive via
 /// [`VerifyInput`], making this unit-testable. It performs file I/O (reads
-/// and hashes `temp_path`) only for [`VerifyKind::Expected`] with
+/// and hashes `file`) only for [`VerifyKind::Expected`] with
 /// verification enabled; callers on an async worker must wrap that case in
-/// `spawn_blocking` (see `verify_and_rename`).
+/// `spawn_blocking` (`verify_and_rename` runs it inside its commit job).
 fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     if !input.verify_enabled {
         return VerifyOutcome::Proceed;
@@ -189,13 +202,10 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     };
     let algo = *algo;
 
-    let (computed, hashed_file) = match reuse_streamed_digest(
-        input.streamed.as_ref(),
-        algo,
-        input.temp_path,
-    ) {
+    let reused = reuse_streamed_digest(input.streamed.as_ref(), algo, input.file, input.temp_path);
+    let computed = match reused {
         Some(reused) => reused,
-        None => match hash_file(input.temp_path, algo) {
+        None => match hash_file(input.file, input.temp_path, algo) {
             Ok(c) => c,
             Err(err) => {
                 metrics::CACHE_IO_FAILURE.increment();
@@ -212,7 +222,7 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 
     if computed == *expected {
         metrics::CHECKSUM_VERIFIED.increment();
-        stamp_verified(&hashed_file, input.temp_path, algo, expected);
+        stamp_verified(input.file, input.temp_path, algo, expected);
         VerifyOutcome::Proceed
     } else {
         metrics::CHECKSUM_MISMATCH.increment();
@@ -224,10 +234,9 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
     }
 }
 
-/// The body loop's incremental digest, plus an fd for [`stamp_verified`]'s
-/// xattr, when that digest can be trusted for `algo` — the stream-verified
-/// counterpart of [`hash_file`]: same fd, none of the reading, and no
-/// `hint_sequential_read` because nothing is read.
+/// The body loop's incremental digest, when that digest can be trusted for
+/// `algo` — the stream-verified counterpart of [`hash_file`]: same fd, none
+/// of the reading, and no `hint_sequential_read` because nothing is read.
 ///
 /// Two things have to hold, and neither is checked anywhere else. The
 /// algorithm must be the one the expected digest uses; a mismatch (the stream
@@ -243,20 +252,18 @@ fn verify_temp_file(input: &VerifyInput<'_>) -> VerifyOutcome {
 /// question correctly either way, and rejecting outright would discard a
 /// download that may well be intact.
 ///
-/// A failed open returns `None` unlogged on purpose: [`hash_file`] reopens the
-/// same path a moment later and reports the failure with its full context, so
-/// the error surfaces exactly once. A failed `fstat` on an open fd has no such
-/// second reporter and is logged here.
+/// A failed `fstat` is logged here: the re-read that follows would not
+/// report it, as it never stats the file.
 fn reuse_streamed_digest(
     streamed: Option<&StreamedDigest>,
     algo: HashAlgo,
+    file: &std::fs::File,
     path: &Path,
-) -> Option<(Vec<u8>, std::fs::File)> {
+) -> Option<Vec<u8>> {
     let streamed = streamed?;
     if streamed.algo != algo {
         return None;
     }
-    let file = nofollow_options().read(true).open(path).ok()?;
     let on_disk = match file.metadata() {
         Ok(meta) => meta.len(),
         Err(err) => {
@@ -280,22 +287,25 @@ fn reuse_streamed_digest(
         );
         return None;
     }
-    Some((streamed.digest.clone(), file))
+    Some(streamed.digest.clone())
 }
 
-/// Open `path` with `O_NOFOLLOW`, hint sequential read, and hash it.
-/// Returns the digest together with the still-open file so the caller can
-/// stamp the verified marker on the same fd, without a second open.
-fn hash_file(path: &Path, algo: HashAlgo) -> std::io::Result<(Vec<u8>, std::fs::File)> {
-    let mut file = nofollow_options().read(true).open(path)?;
+/// Rewind the already-open temp file, hint sequential read, and hash it --
+/// the download's own descriptor, so no reopen of `path` (which is for log
+/// context only). The writer's cursor sits wherever its last write left it;
+/// the rewind is what makes the read start at byte 0.
+fn hash_file(file: &std::fs::File, path: &Path, algo: HashAlgo) -> std::io::Result<Vec<u8>> {
+    use std::io::Seek as _;
+
+    let mut reader = file;
+    reader.rewind()?;
     // `u64::MAX`: hashing reads the whole file, and no cheap size is on hand
     // without an extra fstat, so always advise.
-    hint_sequential_read(&file, u64::MAX, path);
-    let digest = match algo {
-        HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut file)?,
-        HashAlgo::Sha512 => index_parser::hash_open_file::<sha2::Sha512>(&mut file)?,
-    };
-    Ok((digest, file))
+    hint_sequential_read(file, u64::MAX, path);
+    match algo {
+        HashAlgo::Sha256 => index_parser::hash_open_file::<sha2::Sha256>(&mut reader),
+        HashAlgo::Sha512 => index_parser::hash_open_file::<sha2::Sha512>(&mut reader),
+    }
 }
 
 /// Stamp the cleanup-verification marker on a temp file whose digest just
@@ -332,10 +342,6 @@ pub(crate) struct RenamePlan {
     pub(crate) temp_path: PathBuf,
     /// The final cache path to rename into.
     pub(crate) dest_path: PathBuf,
-    /// Actual bytes on disk after download; `verify_and_rename` finalises
-    /// the quota reservation with it right after the rename. For resumed
-    /// downloads this includes the pre-existing prefix.
-    pub(crate) bytes_received: u64,
     /// The digest the download computed incrementally over the bytes it
     /// wrote, when it could; spares `verify_temp_file` the re-read. `None`
     /// from every path that cannot produce one -- the zero-copy splice loop
@@ -884,22 +890,87 @@ fn rename_into_cache(temp_path: &Path, dest_path: &Path) -> std::io::Result<()> 
     std::fs::rename(temp_path, dest_path)
 }
 
+/// Whether `path` still names the file `verified` was taken from (same device
+/// and inode, `lstat`, so a symlink planted in its place fails too).
+///
+/// The commit verifies the open descriptor but renames by path, so a
+/// process of the same user that replaced the temp file between the two
+/// would otherwise have its file renamed into the cache unverified. The
+/// check narrows that window from the whole verification (a full hash of
+/// a large download) to the gap between the `lstat` and the `rename(2)`;
+/// closing it outright needs a rename by descriptor, which
+/// Linux does not offer without privileges (`linkat` of `/proc/self/fd`
+/// needs `CAP_DAC_READ_SEARCH`).
+fn check_path_names_file(path: &Path, verified: &Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let at_path = std::fs::symlink_metadata(path)?;
+    if at_path.dev() == verified.dev() && at_path.ino() == verified.ino() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "the temp file's path no longer names the verified file (replaced after verification)",
+        ))
+    }
+}
+
+/// A step the commit job runs on the open temp file before anything else:
+/// splice's `fsync` (`splice/commit.rs::sync_cache_file`). It reports its own
+/// failure; the commit goes on either way.
+pub(crate) type PrepareStep = fn(&std::fs::File, &Path);
+
+/// The finished temp file, handed to the commit job whole: the open
+/// descriptor (the job's `fstat`, and the read the verification may need), the
+/// guard over its path, and the optional [`PrepareStep`].
+pub(crate) struct TempFile {
+    pub(crate) file: std::fs::File,
+    /// Owned by the job, not the awaiting future, so a cancelled commit cannot
+    /// race the job's `rename(2)` with a scratch guard's unlink. The job
+    /// defuses it after the rename and hands it back on every other exit.
+    pub(crate) guard: TempPath,
+    pub(crate) prepare: Option<PrepareStep>,
+}
+
+/// Why [`verify_and_rename`] did not land the file, plus the temp file's guard
+/// for the caller to act on (a checksum mismatch unlinks it). The guard is
+/// `None` only when the commit job itself failed and took it down with it.
+#[derive(Debug)]
+pub(crate) struct CommitFailure {
+    pub(crate) error: CommitError,
+    pub(crate) guard: Option<TempPath>,
+}
+
 /// Verify the finished temp file and rename it into the cache.
 ///
-/// `reservation` is finalised inside the same blocking closure as the
-/// `rename(2)`, right after it succeeds: a `spawn_blocking` closure runs to
-/// completion even when the awaiting future is dropped, so a cancelled
-/// commit can never leave the file in the cache with its reservation
-/// reverted. On every failure path the reservation is dropped, which
-/// reverts it.
-/// Both blocking jobs own the registry lease: cancelling verification cannot
-/// permit a retry to modify the file while it is read, and cancelling rename
-/// cannot let a retry replace the partial before the queued rename runs.
+/// Everything that touches the disk runs as **one** blocking job owning the
+/// descriptor, the write lease and the reservation, in order: the
+/// [`PrepareStep`], an `fstat` for the size the reservation is finalised with,
+/// the verification (on the open descriptor, never a reopen of the path), a
+/// check that the path still names that descriptor's file
+/// ([`check_path_names_file`]), then the `rename(2)`. One blocking-pool round
+/// trip per commit instead of one per step.
+///
+/// `reservation` is finalised inside that job, right after the `rename(2)`
+/// succeeds: a `spawn_blocking` closure runs to completion even when the
+/// awaiting future is dropped, so a cancelled commit can never leave the file
+/// in the cache with its reservation reverted. On every failure path the
+/// reservation is dropped, which reverts it. Because the job starts before
+/// the verification rather than after it, a commit cancelled at any point
+/// after the job was spawned still verifies and lands the file (or rejects
+/// it) -- it never leaves a verified download behind as a `.partial`. What
+/// such a cancellation skips is only the async tail: the checksum-mismatch
+/// warn and the post-commit ingest scheduling (the ledger invalidation that
+/// makes a later touch re-ingest runs in the job).
+///
+/// The job owns the registry lease: cancelling the commit cannot permit a
+/// retry to modify the file while it is read, or to replace the partial before
+/// the queued rename runs.
 pub(crate) async fn verify_and_rename(
     plan: &RenamePlan,
+    temp: TempFile,
     reservation: QuotaReservation,
     lease: Arc<DownloadWriteLease>,
-) -> Result<(), CommitError> {
+) -> Result<(), CommitFailure> {
     let verify_enabled = global_config().verify_checksums;
 
     // Build the verification kind. Layer-B/C registry lookups happen here -
@@ -927,84 +998,107 @@ pub(crate) async fn verify_and_rename(
         VerifyKind::Unverifiable
     };
 
-    // Only an expected digest makes `verify_temp_file` read the file. Every
-    // other kind, and a disabled check, is answered `Proceed` without I/O
-    // (`Unknown` also bumps `CHECKSUM_UNVERIFIED`), so it runs inline rather
-    // than paying a blocking-pool round trip that issues no syscall.
-    let outcome = if matches!(kind, VerifyKind::Expected { .. }) {
-        let temp_path = plan.temp_path.clone();
+    // Set just before the rename, so a job that dies is attributed to the
+    // step it died in: the two keep their distinct messages and variants.
+    let renaming = Arc::new(AtomicBool::new(false));
+    let job = {
+        let dest_path = plan.dest_path.clone();
         let streamed = plan.streamed_digest.clone();
-        match Arc::clone(&lease)
-            .spawn_blocking(move |_lease| {
-                verify_temp_file(&VerifyInput {
-                    verify_enabled,
-                    kind,
-                    temp_path: &temp_path,
-                    streamed,
-                })
-            })
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(join_err) => {
+        let renaming = Arc::clone(&renaming);
+        move |lease: &DownloadWriteLease| -> Result<(), (CommitError, TempPath)> {
+            let TempFile {
+                file,
+                guard,
+                prepare,
+            } = temp;
+            if let Some(prepare) = prepare {
+                prepare(&file, &guard);
+            }
+            // The descriptor's identity for `check_path_names_file`, and the
+            // actual on-disk size the reservation is finalised with. Without
+            // it the rename could not be tied to the verified file, so a
+            // failed `fstat` fails the commit closed, like a failed read.
+            let verified_meta = match file.metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    metrics::CACHE_IO_FAILURE.increment();
+                    error!(
+                        "Failed to stat temp file `{}` before rename; discarding the download, not caching:  {}",
+                        guard.display(),
+                        ErrorReport(&err)
+                    );
+                    return Err((CommitError::VerifyIo(err), guard));
+                }
+            };
+            let bytes_received = verified_meta.len();
+            if let VerifyOutcome::Reject(err) = verify_temp_file(&VerifyInput {
+                verify_enabled,
+                kind,
+                file: &file,
+                temp_path: &guard,
+                streamed,
+            }) {
+                return Err((err, guard));
+            }
+            drop(file);
+            renaming.store(true, Ordering::Relaxed);
+            if let Err(err) = check_path_names_file(&guard, &verified_meta) {
+                return Err((CommitError::Rename(err), guard));
+            }
+            match rename_into_cache(&guard, &dest_path) {
+                Ok(()) => {
+                    // The file no longer exists under its old name, so the
+                    // guard must not try to remove it.
+                    TempPath::defuse(guard);
+                    reservation.finalize(bytes_received);
+                    lease.invalidate_metadata();
+                    // Here, not after the await: a commit future cancelled
+                    // between the rename and the scheduling below would
+                    // otherwise leave the replaced file's mark on the new one.
+                    if verify_enabled {
+                        INGEST_LEDGER.invalidate(&dest_path);
+                    }
+                    Ok(())
+                }
+                Err(err) => Err((CommitError::Rename(err), guard)),
+            }
+        }
+    };
+
+    match lease.spawn_blocking(job).await {
+        Ok(Ok(())) => {}
+        Ok(Err((error, guard))) => {
+            if matches!(error, CommitError::ChecksumMismatch) {
+                warn!(
+                    "Checksum mismatch for {} from host {} mirror {}; discarding the download, not caching",
+                    plan.debname, plan.host, plan.mirror_path,
+                );
+            }
+            return Err(CommitFailure {
+                error,
+                guard: Some(guard),
+            });
+        }
+        Err(join_err) => {
+            metrics::CACHE_IO_FAILURE.increment();
+            let error = if renaming.load(Ordering::Relaxed) {
+                error!(
+                    "Failed to run the rename task for {} from host {}; discarding the download, not caching:  {}",
+                    plan.debname,
+                    plan.host,
+                    ErrorReport(&join_err),
+                );
+                CommitError::Rename(std::io::Error::other(join_err))
+            } else {
                 error!(
                     "Failed to run the verification task for {} from host {}; discarding the download, not caching:  {}",
                     plan.debname,
                     plan.host,
                     ErrorReport(&join_err),
                 );
-                metrics::CACHE_IO_FAILURE.increment();
-                return Err(CommitError::VerifyIo(std::io::Error::other(join_err)));
-            }
-        }
-    } else {
-        verify_temp_file(&VerifyInput {
-            verify_enabled,
-            kind,
-            temp_path: &plan.temp_path,
-            streamed: None,
-        })
-    };
-
-    if let VerifyOutcome::Reject(err) = outcome {
-        if matches!(err, CommitError::ChecksumMismatch) {
-            warn!(
-                "Checksum mismatch for {} from host {} mirror {}; discarding the download, not caching",
-                plan.debname, plan.host, plan.mirror_path,
-            );
-        }
-        return Err(err);
-    }
-
-    let temp_path = plan.temp_path.clone();
-    let dest_path = plan.dest_path.clone();
-    let bytes_received = plan.bytes_received;
-    match lease
-        .spawn_blocking(move |lease| {
-            rename_into_cache(&temp_path, &dest_path).map(|()| {
-                reservation.finalize(bytes_received);
-                lease.invalidate_metadata();
-                // Here, not after the await: a commit future cancelled
-                // between the rename and the scheduling below would
-                // otherwise leave the replaced file's mark on the new one.
-                if verify_enabled {
-                    INGEST_LEDGER.invalidate(&dest_path);
-                }
-            })
-        })
-        .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(CommitError::Rename(err)),
-        Err(join_err) => {
-            error!(
-                "Failed to run the rename task for {} from host {}; discarding the download, not caching:  {}",
-                plan.debname,
-                plan.host,
-                ErrorReport(&join_err),
-            );
-            metrics::CACHE_IO_FAILURE.increment();
-            return Err(CommitError::Rename(std::io::Error::other(join_err)));
+                CommitError::VerifyIo(std::io::Error::other(join_err))
+            };
+            return Err(CommitFailure { error, guard: None });
         }
     }
 
@@ -1336,7 +1430,6 @@ impl<'a> From<&'a RenamePlan> for IndexFile<'a> {
         let RenamePlan {
             temp_path: _,
             dest_path,
-            bytes_received: _,
             streamed_digest: _,
             resource_kind,
             debname,
@@ -1853,6 +1946,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -1980,6 +2074,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
                 algo: HashAlgo::Sha256,
@@ -1997,6 +2092,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
                 algo: HashAlgo::Sha256,
@@ -2019,6 +2115,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             // Right length for SHA-512, wrong algorithm for this resource.
             streamed: Some(StreamedDigest {
@@ -2040,6 +2137,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             // Right algorithm, but it saw more bytes than the file holds.
             streamed: Some(StreamedDigest {
@@ -2057,6 +2155,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2072,6 +2171,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: false,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2084,18 +2184,27 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: VerifyKind::Unverifiable,
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
         assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
     }
 
+    /// A descriptor the hash cannot read from -- here a write-only one --
+    /// rejects the download rather than caching it unverified.
     #[test]
     fn unreadable_temp_file_returns_reject_verifyio() {
+        let f = temp_file_with(b"hello world");
+        let write_only = crate::fs_open::nofollow_options()
+            .write(true)
+            .open(f.path())
+            .expect("open write-only");
         let plan = VerifyInput {
             verify_enabled: true,
             kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
-            temp_path: Path::new("/nonexistent/apt-cacher-rs/x"),
+            file: &write_only,
+            temp_path: f.path(),
             streamed: None,
         };
         assert!(matches!(
@@ -2110,6 +2219,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: expect_sha256(HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2122,6 +2232,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: expect_zero_sha256(),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2137,6 +2248,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: expect_sha256(HELLO_SHA256),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2149,6 +2261,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: expect_zero_sha256(),
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2164,6 +2277,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind: VerifyKind::Unknown,
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2478,6 +2592,7 @@ mod tests {
             let plan = VerifyInput {
                 verify_enabled: true,
                 kind: byhash_verify_kind(algo, &class.debname),
+                file: f.as_file(),
                 temp_path: f.path(),
                 streamed: None,
             };
@@ -2506,6 +2621,7 @@ mod tests {
         let plan = VerifyInput {
             verify_enabled: true,
             kind,
+            file: f.as_file(),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2892,10 +3008,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let temp_path = dir.path().join("pkg.deb.part");
         let payload = b"a small deb body";
-        {
-            let mut f = std::fs::File::create(&temp_path).expect("create");
-            f.write_all(payload).expect("write");
-        }
+        // Read + write, like a download's temp file; the cursor is left at
+        // the end, so verification has to rewind before hashing.
+        let mut temp_file = crate::fs_open::nofollow_options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .expect("create");
+        temp_file.write_all(payload).expect("write");
         let digest: [u8; 32] = {
             use sha2::Digest as _;
             sha2::Sha256::digest(payload).into()
@@ -2907,6 +3028,7 @@ mod tests {
                 algo: HashAlgo::Sha256,
                 digest: digest.to_vec(),
             },
+            file: &temp_file,
             temp_path: &temp_path,
             streamed: None,
         });
@@ -2948,6 +3070,32 @@ mod tests {
         );
         assert_eq!(reg.len(), 1, "map still holds exactly one live entry");
         assert!(reg.lookup("h", "m", "a").is_some());
+    }
+
+    #[test]
+    fn check_path_names_file_accepts_only_the_verified_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("pkg.deb.partial");
+        std::fs::write(&path, b"verified").expect("write temp");
+        let verified = std::fs::symlink_metadata(&path).expect("stat temp");
+        check_path_names_file(&path, &verified).expect("the path still names the file");
+
+        // Replaced by rename: same path, different inode.
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"swapped").expect("write replacement");
+        std::fs::rename(&other, &path).expect("swap the temp file");
+        assert!(check_path_names_file(&path, &verified).is_err());
+
+        // Replaced by a symlink to a file with the right content elsewhere.
+        std::fs::remove_file(&path).expect("remove replacement");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"verified").expect("write target");
+        std::os::unix::fs::symlink(&target, &path).expect("plant symlink");
+        assert!(check_path_names_file(&path, &verified).is_err());
+
+        // Gone.
+        std::fs::remove_file(&path).expect("remove symlink");
+        assert!(check_path_names_file(&path, &verified).is_err());
     }
 
     #[test]

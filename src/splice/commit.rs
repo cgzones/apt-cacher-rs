@@ -35,7 +35,7 @@
 
 use std::fmt;
 use std::num::NonZero;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -312,7 +312,7 @@ impl CommitTail {
             bytes,
             start,
         } = self;
-        let elapsed = commit_target(target, bytes.total, start).await?;
+        let elapsed = commit_target(target, start).await?;
 
         // Record download in database (mirrors download_file() in hyper_conn.rs).
         let cmd = DatabaseCommand::Transfer(DbCmdTransfer {
@@ -383,14 +383,10 @@ async fn await_demoted_client(
     end
 }
 
-/// The on-disk half of the commit: `sync_all`, then the verify + rename
-/// through `RenameBarrier::commit`. Returns the download duration when the
-/// file landed in the cache.
-async fn commit_target(
-    target: Committable,
-    total_content_length: NonZero<u64>,
-    start: PreciseInstant,
-) -> Option<Duration> {
+/// The on-disk half of the commit: `RenameBarrier::commit`, whose single
+/// blocking job runs [`sync_cache_file`], then the verify + rename. Returns
+/// the download duration when the file landed in the cache.
+async fn commit_target(target: Committable, start: PreciseInstant) -> Option<Duration> {
     let Committable {
         tempfile,
         temppath,
@@ -399,23 +395,13 @@ async fn commit_target(
         streamed_digest,
     } = target;
 
-    // Sync cache file to ensure durability
-    if let Err(err) = tempfile.sync_all().await {
-        metrics::CACHE_IO_FAILURE.increment();
-        error!(
-            "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
-            temppath.display(),
-            ErrorReport(&err)
-        );
-    }
-    drop(tempfile);
-
     let cache_committed = rbarrier
         .commit(
+            tempfile,
             temppath,
             dest_path,
-            total_content_length.get(),
             streamed_digest,
+            Some(sync_cache_file),
         )
         .await
         .is_ok();
@@ -423,6 +409,20 @@ async fn commit_target(
     let elapsed = start.elapsed();
 
     cache_committed.then_some(elapsed)
+}
+
+/// Sync the cache file to ensure durability: the commit job's prepare step,
+/// on the job's blocking thread ahead of the verify + rename. A failure is
+/// reported and the commit goes on.
+fn sync_cache_file(file: &std::fs::File, path: &Path) {
+    if let Err(err) = file.sync_all() {
+        metrics::CACHE_IO_FAILURE.increment();
+        error!(
+            "splice proxy: failed to sync cache file `{}`; committing it to the cache anyway:  {}",
+            path.display(),
+            ErrorReport(&err)
+        );
+    }
 }
 
 impl Committed {

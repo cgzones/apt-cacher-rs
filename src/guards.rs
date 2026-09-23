@@ -39,7 +39,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::{
     active_downloads::{
@@ -53,7 +53,7 @@ use crate::{
     global_verify_throttle,
     humanfmt::HumanFmt,
     index_parser::StreamedDigest,
-    integrity::{self, CommitError, RenamePlan},
+    integrity::{self, CommitError, CommitFailure, PrepareStep, RenamePlan, TempFile},
     metrics,
     partial_file::TempPath,
     sticky,
@@ -695,14 +695,21 @@ impl RenameBarrier {
     /// status flip after verification succeeds. The preceding `Download ->
     /// Verifying` flip happens in `DownloadBarrier::begin_rename`.
     ///
-    /// Cancellation window: if the `commit` future is dropped between the
-    /// rename completing and the status-write lock being acquired, the
-    /// renamed file is already in the cache but the `Verifying -> Finished`
-    /// flip never runs; `Drop for RenameBarrier` then flips status to
-    /// `Aborted` and releases its registry lease. Outstanding blocking jobs
-    /// retain their lease until they finish. The quota stays
-    /// right: the reservation is finalised inside the rename's blocking
-    /// closure, which runs to completion regardless of the cancellation.
+    /// All of the commit's disk work -- `prepare` (splice's `fsync`; hyper
+    /// passes none), the `fstat` that sizes the quota finalisation, the
+    /// verification on `temp_file`'s own descriptor and the `rename(2)` -- is
+    /// one blocking job (`verify_and_rename`), owning the descriptor, the
+    /// `TempPath` guard, the reservation and the registry lease.
+    ///
+    /// Cancellation window: once that job is spawned it runs to completion,
+    /// so a `commit` future dropped at any point after that -- even before
+    /// the verification finished -- still ends with a verified file renamed
+    /// into the cache (or a rejected one left behind), never a verified
+    /// `.partial`. The `Verifying -> Finished` flip is then what never runs;
+    /// `Drop for RenameBarrier` flips status to `Aborted` and releases its
+    /// registry lease, while the job retains its own until it finishes. The
+    /// quota stays right: the reservation is finalised inside the job, right
+    /// after the rename, whatever became of the future.
     /// The metadata does *not* take care of itself: on a re-download the
     /// store still holds the previous version's validators, and `resolve`'s
     /// hot path answers from that map without ever stat'ing the file -- so
@@ -718,35 +725,27 @@ impl RenameBarrier {
     /// invalidating there would lose them for the life of the process
     /// (`resolve` negatively caches the resulting `(None, None)`).
     ///
-    /// `temp_path` is the finished `.partial` / temp file; on success its
-    /// guard is defused (the file now lives at `dest_path`), on a checksum
-    /// mismatch the file is unlinked (its bytes are known-bad, resuming them
-    /// cannot succeed), on a transient verify/rename failure the guard's
-    /// `OnDrop::Keep` keeps it for resumption. `declared_bytes` is the fallback for
-    /// quota finalisation when the temp file cannot be stat'ed. Rename
-    /// failures are logged here (with `CACHE_IO_FAILURE`); mismatch and
-    /// verify-IO failures are logged by `verify_and_rename`.
+    /// `temp_file` is the finished `.partial` / temp file, idle (every write
+    /// flushed), and `temp_path` its guard; on success the guard is defused
+    /// (the file now lives at `dest_path`), on a checksum mismatch the file is
+    /// unlinked (its bytes are known-bad, resuming them cannot succeed), on a
+    /// transient verify/rename failure the guard's `OnDrop::Keep` keeps it for
+    /// resumption. Rename failures are logged here (with `CACHE_IO_FAILURE`);
+    /// mismatch and verify-IO failures are logged by `verify_and_rename`.
     pub(crate) async fn commit(
         mut self,
+        temp_file: tokio::fs::File,
         temp_path: TempPath,
         dest_path: PathBuf,
-        declared_bytes: u64,
         streamed_digest: Option<StreamedDigest>,
+        prepare: Option<PrepareStep>,
     ) -> Result<(), CommitError> {
-        // Use the actual on-disk size rather than the declared length.
-        // Earlier validation ensures these match today, but the defensive
-        // stat keeps the quota-finalisation input honest if a future change
-        // weakens an upstream invariant.
-        let bytes_received = match tokio::fs::metadata(temp_path.as_ref()).await {
-            Ok(m) => m.len(),
-            Err(err) => {
-                warn!(
-                    "Failed to stat temp file `{}` before rename; using the declared size:  {}",
-                    temp_path.display(),
-                    ErrorReport(&err)
-                );
-                declared_bytes
-            }
+        // No blocking hop: the file is idle, so this only waits out an
+        // in-flight operation that cannot exist.
+        let temp = TempFile {
+            file: temp_file.into_std().await,
+            guard: temp_path,
+            prepare,
         };
         let plan = {
             let data = self
@@ -754,9 +753,8 @@ impl RenameBarrier {
                 .as_ref()
                 .expect("every sink consumes the instance");
             RenamePlan {
-                temp_path: temp_path.to_path_buf(),
+                temp_path: temp.guard.to_path_buf(),
                 dest_path,
-                bytes_received,
                 resource_kind: data.resource_kind,
                 debname: data.lease.key.debname.clone(),
                 host: data.lease.key.mirror.host().as_str().to_owned(),
@@ -779,7 +777,9 @@ impl RenameBarrier {
                 .expect("every sink consumes the instance")
                 .lease,
         );
-        if let Err(err) = integrity::verify_and_rename(&plan, reservation, lease).await {
+        if let Err(CommitFailure { error: err, guard }) =
+            integrity::verify_and_rename(&plan, temp, reservation, lease).await
+        {
             if let CommitError::Rename(io_err) = &err {
                 metrics::CACHE_IO_FAILURE.increment();
                 error!(
@@ -790,7 +790,7 @@ impl RenameBarrier {
                 );
             }
             // Retire the entry here, not in `Drop` (which runs only after
-            // the `TempPath` parameter is dropped and a blocking write lock
+            // the `TempPath` guard is dropped and a blocking write lock
             // is won): a request arriving while the entry was still
             // joinable in `Verifying` state was served the mismatching
             // partial as a finished file. Ordering, all under the status
@@ -825,8 +825,10 @@ impl RenameBarrier {
             // with a generic abort. Keep the lease until the last mutation
             // of the partial has finished, including a detached unlink.
             let data = self.data.take().expect("every sink consumes the instance");
-            if checksum_mismatch {
-                discard_partial(temp_path, Arc::clone(&data.lease)).await;
+            // A mismatch always hands the guard back; only a job that died
+            // (never a mismatch) loses it.
+            if checksum_mismatch && let Some(guard) = guard {
+                discard_partial(guard, Arc::clone(&data.lease)).await;
             }
             let key = Arc::clone(&data.lease.key);
             drop(data.lease);
@@ -846,11 +848,8 @@ impl RenameBarrier {
             return Err(err);
         }
 
-        // Verified and renamed: the temp file no longer exists under its
-        // old name, so the guard must not try to remove it.
-        TempPath::defuse(temp_path);
-
-        // The quota was finalised in the rename step. Take the write lock
+        // Verified and renamed; the job defused the guard. The quota was
+        // finalised in the rename step too. Take the write lock
         // briefly for the `Verifying -> Finished` status flip.
         //
         // `self.data` stays populated across that `.await` so `Drop` really

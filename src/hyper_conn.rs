@@ -1415,7 +1415,8 @@ async fn download_file(
             return;
         }
     };
-    drop(writer);
+    // Flushed by the worker; the commit takes the idle file whole.
+    let outfile = writer.writer.into_inner();
 
     // Not created here: `integrity::rename_into_cache` creates it at commit
     // time, and only on `ENOENT`. The `warn_on_override` `try_exists` below
@@ -1465,9 +1466,10 @@ async fn download_file(
 
         // No streamed digest: this path writes through a `BufWriter` whose
         // bytes are not funnelled through a single hashable site, so the
-        // commit re-reads and hashes the finished file as before.
+        // commit re-reads and hashes the finished file as before. No
+        // prepare step either: this backend has never `fsync`ed a download.
         if rbarrier
-            .commit(outpath, dest_file_path, total_bytes, None)
+            .commit(outfile, outpath, dest_file_path, None, None)
             .await
             .is_err()
         {

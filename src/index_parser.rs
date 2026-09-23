@@ -770,10 +770,10 @@ impl StreamHasher {
     }
 }
 
-/// Hash the contents of an open file. Synchronous; blocks the current thread.
-pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut std::fs::File) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
-
+/// Hash the contents of an open file from its current position to its end.
+/// Synchronous; blocks the current thread. Generic over the reader so the
+/// commit can hash through a shared `&std::fs::File`.
+pub(crate) fn hash_open_file<D: sha2::Digest>(file: &mut impl io::Read) -> io::Result<Vec<u8>> {
     /// Read granularity for whole-file hashing. 1 MiB rather than the
     /// kernel's default readahead window: cleanup hashes the whole cache and
     /// commit hashes every download, so this is the read-syscall count for
