@@ -316,6 +316,11 @@ fn build_requests_group(g: &mut Groups) {
             "Web-interface requests refused because the source address is outside `allowed_webif_clients`.",
             metrics::AUTHZ_REJECTED_WEBUI.get(),
         );
+        t.row_tip(
+            "Authorization Rejected (web-interface host)",
+            "Web-interface requests refused with 421 because their `Host` names neither an IP address, `localhost`, the system hostname nor a `webif_hostnames` entry. Any value means a client named a foreign host: a browser reached the dashboard under a rebound DNS name, or an admin uses a name missing from `webif_hostnames`.",
+            WarnNonzero(metrics::AUTHZ_REJECTED_WEBUI_HOST.get()),
+        );
     });
 }
 

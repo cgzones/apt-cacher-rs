@@ -616,6 +616,9 @@ pub(crate) static AUTHZ_REJECTED_TUNNEL_MIRROR: Counter = Counter::new();
 /// Authorization rejection: web-interface access denied by the webif-client
 /// allowlist (`allowed_webif_clients`, falling back to `allowed_proxy_clients`).
 pub(crate) static AUTHZ_REJECTED_WEBUI: Counter = Counter::new();
+/// Authorization rejection: web-interface request refused with 421 because
+/// its `Host` names none of the proxy's own names (DNS-rebinding guard).
+pub(crate) static AUTHZ_REJECTED_WEBUI_HOST: Counter = Counter::new();
 
 /// Transfers cancelled because the upstream min-rate threshold was not met.
 pub(crate) static RATE_LIMIT_UPSTREAM: Counter = Counter::new();

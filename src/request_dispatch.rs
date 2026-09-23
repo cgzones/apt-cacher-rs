@@ -297,6 +297,7 @@ pub(crate) fn preflight_target<'a, 'h>(
                 "Web-interface request from client {client} names the unrecognized host `{}`; returning 421",
                 host.escape_ascii()
             );
+            metrics::AUTHZ_REJECTED_WEBUI_HOST.increment();
             return Err(RejectReason::MisdirectedWebUi);
         }
         return Ok(RequestTarget::WebUi);
