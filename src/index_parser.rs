@@ -12,7 +12,7 @@ use tokio::io::AsyncBufRead;
 
 use crate::{
     limits::{CappedLine, MAX_METADATA_LINE_LEN, read_line_capped},
-    sticky, warn_once, warn_once_or_debug,
+    sticky, warn_once, warn_once_or_debug, warn_once_or_info,
 };
 
 /// Extract the `Filename:` field's relative-path value from a Debian
@@ -21,25 +21,31 @@ use crate::{
 /// rejected value against its mirror.
 #[cfg(test)]
 pub(crate) fn parse_filename_field(line: &str) -> Option<&str> {
-    match classify_filename_field(line) {
-        FilenameField::Value(filepath) => Some(filepath),
-        FilenameField::Absent | FilenameField::Unsafe(_) => None,
+    match split_field(line)? {
+        ("Filename", value) => filename_value(value).ok(),
+        _ => None,
     }
 }
 
-/// What one stanza line says about the `Filename:` field. Separating
-/// [`FilenameField::Unsafe`] from [`FilenameField::Absent`] is what lets
-/// [`Stanza::ingest`] log a rejected value: a bare `None` is
-/// indistinguishable from the every-other-line case.
-enum FilenameField<'a> {
-    /// Not a `Filename:` line.
-    Absent,
-    /// A `Filename:` line whose value failed the traversal gate.
-    Unsafe(&'a str),
-    Value(&'a str),
+/// Split one stanza line into its deb822 field name and trimmed value.
+///
+/// **Security**: `None` for a continuation line (leading space or tab) - it
+/// folds into the field above it and is never a field of its own. A package
+/// maintainer writes such lines verbatim into a long `Description:`, so
+/// reading `  SHA256: <hex>` there as a field would let any maintainer
+/// override the digest the registry expects for any deb (a persistent
+/// checksum-mismatch denial of service), and a `Translation-*` blob would
+/// read as a `Packages` index. `None` too for a line without a colon.
+fn split_field(line: &str) -> Option<(&str, &str)> {
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    let (name, value) = line.split_once(':')?;
+    Some((name, value.trim()))
 }
 
-/// Classify one stanza line as a `Filename:` field.
+/// Gate a `Filename:` field value; `Err` carries the rejected value so
+/// [`Stanza::ingest`] can log it.
 ///
 /// Leading `./` segments are stripped ([`strip_leading_dot_segments`]) before
 /// the gate, so the value matches the cache path the key is compared against.
@@ -49,16 +55,13 @@ enum FilenameField<'a> {
 /// An attacker-controlled upstream `Packages` stanza could otherwise inject a
 /// traversal sequence; rejecting here keeps downstream `HashMap` keys and
 /// filesystem joins honest.
-fn classify_filename_field(line: &str) -> FilenameField<'_> {
-    let line = line.trim();
-    let Some(filepath) = line.strip_prefix("Filename: ") else {
-        return FilenameField::Absent;
-    };
-    let filepath = strip_leading_dot_segments(filepath.trim_start());
-    if !is_safe_filename_relpath(filepath) {
-        return FilenameField::Unsafe(filepath);
+fn filename_value(value: &str) -> Result<&str, &str> {
+    let filepath = strip_leading_dot_segments(value);
+    if is_safe_filename_relpath(filepath) {
+        Ok(filepath)
+    } else {
+        Err(filepath)
     }
-    FilenameField::Value(filepath)
 }
 
 /// Strip the leading `./` segments an index generator may prefix onto a
@@ -133,9 +136,11 @@ const fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// Parse a stanza line of the form `"<prefix><hex>"` into `N` bytes.
+/// Parse a stanza line of the form `"<prefix><hex>"` into `N` bytes. Like
+/// [`split_field`], an indented (continuation) line never matches.
+#[cfg(test)]
 pub(crate) fn parse_hex_field<const N: usize>(line: &str, prefix: &str) -> Option<[u8; N]> {
-    let rest = line.trim().strip_prefix(prefix)?.trim_start();
+    let rest = line.trim_end().strip_prefix(prefix)?.trim_start();
     hex_decode_exact::<N>(rest)
 }
 
@@ -176,15 +181,59 @@ impl HashAlgo {
     }
 }
 
+/// The stanza fields [`Stanza`] reads. A stanza may carry each at most once
+/// (see [`Stanza::repeated`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackedField {
+    Filename,
+    Sha256,
+    Sha512,
+}
+
+impl TrackedField {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Filename" => Some(Self::Filename),
+            "SHA256" => Some(Self::Sha256),
+            "SHA512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Filename => "Filename",
+            Self::Sha256 => "SHA256",
+            Self::Sha512 => "SHA512",
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Filename => 1,
+            Self::Sha256 => 2,
+            Self::Sha512 => 4,
+        }
+    }
+}
+
 /// Accumulated state of the current Debian `Packages` stanza.
 #[derive(Debug)]
 pub(crate) struct Stanza {
     pub(crate) filename: Option<String>,
     pub(crate) sha256: Option<[u8; 32]>,
     pub(crate) sha512: Option<[u8; 64]>,
+    /// [`TrackedField::bit`]s of the fields seen so far, valid or not: a
+    /// field is repeated by its name, not by a second value that parsed.
+    seen: u8,
+    /// The first tracked field this stanza carried twice. Such a stanza is
+    /// malformed deb822 and ambiguous about which value is meant, so
+    /// [`StanzaStream`] drops it whole rather than picking one.
+    repeated: Option<TrackedField>,
     /// Whether `ingest` should decode `SHA512:` fields at all — the
     /// registry ingest only ever reads `sha256`, so it skips the 128-char
-    /// hex decode per stanza on mirrors that publish SHA512.
+    /// hex decode per stanza on mirrors that publish SHA512. A repeated
+    /// `SHA512:` still rejects the stanza.
     want_sha512: bool,
     /// Which index these stanzas came from (`<host>/<mirror_path>/<file>`),
     /// used only to make a rejected `Filename:` value actionable. Set via
@@ -198,6 +247,8 @@ impl Stanza {
             filename: None,
             sha256: None,
             sha512: None,
+            seen: 0,
+            repeated: None,
             want_sha512: true,
             source: None,
         }
@@ -209,6 +260,8 @@ impl Stanza {
             filename: None,
             sha256: None,
             sha512: None,
+            seen: 0,
+            repeated: None,
             want_sha512: false,
             source: None,
         }
@@ -230,16 +283,29 @@ impl Stanza {
         self.filename = None;
         self.sha256 = None;
         self.sha512 = None;
+        self.seen = 0;
+        self.repeated = None;
     }
 
+    /// Take one stanza line. Only a line starting in column 0 is a field
+    /// ([`split_field`]); a tracked field seen a second time marks the
+    /// stanza [`Self::repeated`] and keeps nothing of the repeat.
     pub(crate) fn ingest(&mut self, line: &str) {
-        if self.filename.is_none() {
-            match classify_filename_field(line) {
-                FilenameField::Value(name) => {
-                    self.filename = Some(name.to_owned());
-                    return;
-                }
-                FilenameField::Unsafe(bad) => {
+        let Some((name, value)) = split_field(line) else {
+            return;
+        };
+        let Some(field) = TrackedField::from_name(name) else {
+            return;
+        };
+        if self.seen & field.bit() != 0 {
+            self.repeated.get_or_insert(field);
+            return;
+        }
+        self.seen |= field.bit();
+        match field {
+            TrackedField::Filename => match filename_value(value) {
+                Ok(name) => self.filename = Some(name.to_owned()),
+                Err(bad) => {
                     // Dropping the field drops a real entry: integrity loses
                     // this package's expected digest and cleanup loses its
                     // reference, so the cached deb looks unreferenced and is
@@ -250,22 +316,14 @@ impl Stanza {
                         bad.escape_debug(),
                         self.source_label()
                     );
-                    return;
                 }
-                FilenameField::Absent => {}
+            },
+            TrackedField::Sha256 => self.sha256 = hex_decode_exact::<32>(value),
+            TrackedField::Sha512 => {
+                if self.want_sha512 {
+                    self.sha512 = hex_decode_exact::<64>(value);
+                }
             }
-        }
-        if self.sha256.is_none()
-            && let Some(h) = parse_hex_field::<32>(line, "SHA256: ")
-        {
-            self.sha256 = Some(h);
-            return;
-        }
-        if self.want_sha512
-            && self.sha512.is_none()
-            && let Some(h) = parse_hex_field::<64>(line, "SHA512: ")
-        {
-            self.sha512 = Some(h);
         }
     }
 
@@ -315,6 +373,11 @@ impl Stanza {
 /// fields are all absent is still yielded (cleanup retains the file without
 /// verification, ingest has nothing to register) after the once-gated warn
 /// both consumers used to emit, so the warn has one wording and one site.
+/// A stanza repeating `Filename:`, `SHA256:` or `SHA512:` is not yielded at
+/// all (once-gated warn): which of two values a consumer would pick is
+/// exactly what a crafted index relies on, so neither is trusted. Fields
+/// start in column 0 only; see [`split_field`] for why an indented
+/// continuation line never counts.
 /// A line over [`MAX_METADATA_LINE_LEN`] counts as non-blank (multi-kilobyte
 /// `Provides:`/`Depends:` fields are legitimate and never a field the
 /// stanza cares about) so the stanza is not flushed prematurely; a trailing
@@ -359,17 +422,17 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
             match read {
                 Ok(CappedLine::Eof) => {
                     self.done.set();
-                    return Ok(self.complete());
+                    return Ok(self.accept().then_some(&self.stanza));
                 }
                 Ok(CappedLine::Skipped) => {}
                 Ok(CappedLine::Line) => {
                     if !self.line.trim().is_empty() {
                         self.stanza.ingest(&self.line);
-                    } else if self.stanza.filename.is_some() {
-                        return Ok(self.complete());
+                    } else if self.accept() {
+                        return Ok(Some(&self.stanza));
                     } else {
-                        // A blank run, or a stanza without `Filename:`:
-                        // nothing either consumer acts on.
+                        // A blank run, a stanza without `Filename:` or a
+                        // rejected one: nothing either consumer acts on.
                         self.stanza.reset();
                     }
                 }
@@ -381,10 +444,26 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
         }
     }
 
-    /// Hand out the accumulated stanza if it names a file, warning once when
-    /// it advertises none of the digests its consumer can use.
-    fn complete(&self) -> Option<&Stanza> {
-        let filename = self.stanza.filename.as_deref()?;
+    /// Whether to hand out the accumulated stanza: it must name a file and
+    /// repeat none of the tracked fields. Warns once for a rejected repeat,
+    /// and once when an accepted stanza advertises none of the digests its
+    /// consumer can use.
+    fn accept(&self) -> bool {
+        let Some(filename) = self.stanza.filename.as_deref() else {
+            return false;
+        };
+        if let Some(field) = self.stanza.repeated {
+            // Per stanza, like the digest-less warn below, but a repeat is a
+            // malformed (or hostile) index worth correlating, so repeats stay
+            // at info.
+            warn_once_or_info!(
+                "Packages stanza for `{}` from {} repeats its {} field; ignoring the stanza, so the package it names is exempt from checksum verification and loses its cleanup reference",
+                filename.escape_debug(),
+                self.stanza.source_label(),
+                field.as_str()
+            );
+            return false;
+        }
         if self.stanza.chosen().is_none() {
             // Fires per stanza on a digest-less index (a SHA512-only mirror
             // is digest-less to the SHA256-only registry ingest), so degrade
@@ -396,7 +475,7 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
                 self.stanza.usable_digests()
             );
         }
-        Some(&self.stanza)
+        true
     }
 }
 
@@ -895,21 +974,113 @@ mod tests {
         );
     }
 
-    /// Repeated fields keep the first value: a later `Filename:`/`SHA256:`
-    /// line cannot re-point or re-digest a stanza that already has one.
+    /// A deb822 continuation line (leading space or tab) belongs to the
+    /// folded field above it - a long `Description:` a package maintainer
+    /// writes - and is never a field of its own. Treating `  SHA256: ...`
+    /// there as the stanza's digest let a maintainer override the registry
+    /// digest of any deb, making every download of it a checksum mismatch.
+    #[test]
+    fn stanza_ingest_ignores_indented_continuation_lines() {
+        let mut s = Stanza::new();
+        s.ingest(" Filename: pool/evil.deb\n");
+        s.ingest(&format!("\tSHA256: {}\n", hex_encode(&[0xee; 32])));
+        s.ingest(&format!("  SHA512: {}\n", hex_encode(&[0xee; 64])));
+        assert!(s.filename.is_none());
+        assert_eq!(s.chosen(), None);
+    }
+
     #[tokio::test]
-    async fn stanza_stream_keeps_the_first_value_of_a_repeated_field() {
+    async fn stanza_stream_takes_the_real_digest_over_a_continuation_payload() {
         let input = format!(
-            "Filename: pool/first.deb\nSHA256: {}\nFilename: pool/second.deb\nSHA256: {}\n\n",
-            hex_encode(&[0x11; 32]),
-            hex_encode(&[0x22; 32]),
+            "Package: a\nDescription: harmless\n SHA256: {evil}\n .\n\tFilename: pool/evil.deb\n\
+             Filename: pool/a.deb\nSHA256: {real}\n\n",
+            evil = hex_encode(&[0xee; 32]),
+            real = hex_encode(&[0x11; 32]),
         );
         let mut stream = StanzaStream::new(input.as_bytes(), Stanza::new());
         let stanza = stream.next().await.expect("readable").expect("one stanza");
-        assert_eq!(stanza.filename.as_deref(), Some("pool/first.deb"));
+        assert_eq!(stanza.filename.as_deref(), Some("pool/a.deb"));
         assert_eq!(
             stanza.chosen(),
             Some((HashAlgo::Sha256, [0x11u8; 32].as_slice()))
+        );
+        assert!(stream.next().await.expect("readable").is_none());
+    }
+
+    /// A stanza repeating `Filename:` or a digest field is malformed deb822
+    /// and ambiguous about which value is meant, so it is dropped whole
+    /// rather than resolved by first-wins; the stanzas around it survive.
+    #[tokio::test]
+    async fn stanza_stream_rejects_a_stanza_repeating_a_tracked_field() {
+        let h256 = |b| hex_encode(&[b; 32]);
+        let h512 = |b| hex_encode(&[b; 64]);
+        for (label, repeated, stanza) in [
+            (
+                "Filename",
+                format!(
+                    "Filename: pool/x.deb\nSHA256: {}\nFilename: pool/y.deb\n",
+                    h256(0x22)
+                ),
+                Stanza::new(),
+            ),
+            (
+                "SHA256",
+                format!(
+                    "Filename: pool/x.deb\nSHA256: {}\nSHA256: {}\n",
+                    h256(0x22),
+                    h256(0x33)
+                ),
+                Stanza::new(),
+            ),
+            (
+                "SHA512",
+                format!(
+                    "Filename: pool/x.deb\nSHA512: {}\nSHA512: {}\n",
+                    h512(0x22),
+                    h512(0x33)
+                ),
+                Stanza::new(),
+            ),
+            (
+                "SHA512 for a SHA256-only consumer",
+                format!(
+                    "Filename: pool/x.deb\nSHA256: {}\nSHA512: {}\nSHA512: {}\n",
+                    h256(0x22),
+                    h512(0x22),
+                    h512(0x33)
+                ),
+                Stanza::new_sha256_only(),
+            ),
+            (
+                "an unparsable SHA256 followed by a valid one",
+                format!(
+                    "Filename: pool/x.deb\nSHA256: nothex\nSHA256: {}\n",
+                    h256(0x33)
+                ),
+                Stanza::new(),
+            ),
+        ] {
+            let input =
+                format!("Filename: pool/before.deb\n\n{repeated}\nFilename: pool/after.deb\n");
+            let got = collect_stanzas(input.as_bytes(), stanza).await;
+            assert_eq!(
+                got,
+                vec![
+                    ("pool/before.deb".to_owned(), None),
+                    ("pool/after.deb".to_owned(), None),
+                ],
+                "repeated {label}"
+            );
+        }
+        // The same at EOF, without a closing blank line.
+        let input = format!(
+            "Filename: pool/x.deb\nSHA256: {}\nSHA256: {}\n",
+            h256(0x22),
+            h256(0x33)
+        );
+        assert_eq!(
+            collect_stanzas(input.as_bytes(), Stanza::new()).await,
+            [] as [(String, Option<HashAlgo>); 0]
         );
     }
 
