@@ -329,8 +329,8 @@ impl InitBarrier {
     /// The raw client request path this barrier will hand to `RenamePlan`.
     /// Read before [`Self::download`] consumes the barrier, so a download can
     /// decide up front which digest it will be verified against
-    /// (`integrity::stream_hash_algo`) using the very string the verifier
-    /// later reads its by-hash algorithm segment from.
+    /// (`integrity::stream_hash_algo_for_download`) using the very string the
+    /// verifier later derives its registry key from.
     ///
     /// Splice-only: it is the sole backend that hashes as it writes.
     #[cfg(feature = "splice")]

@@ -72,6 +72,7 @@ use crate::{
         ResourceFile, is_binary_arch, is_deb_package, is_flat_deb_filename, valid_architecture,
         valid_component, valid_directory, valid_distribution, valid_filename, valid_mirrorname,
     },
+    index_parser::HashAlgo,
     precise_instant::PreciseInstant,
 };
 
@@ -95,7 +96,10 @@ pub(crate) enum CachedFlavor {
 /// unrepresentable.  The precise kind is still needed on its own - integrity
 /// picks a verification strategy by it and decides whether to ingest the file
 /// as an index, which `(flavor, layout)` cannot tell (`Packages` vs any other
-/// `Dists`/`Volatile` metadata).  Populated by [`classify_request`]'s
+/// `Dists`/`Volatile` metadata).  The two by-hash kinds carry the algorithm
+/// the parser validated for their `by-hash/<ALGO>/` directory, so the
+/// verifier never re-reads it from the request path.  Populated by
+/// [`classify_request`]'s
 /// exhaustive match, so a new `ResourceFile` variant compile-errors the
 /// classifier (the existing safety net) and forces a decision here too.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -115,13 +119,13 @@ pub(crate) enum ResourceKind {
     /// `dists/.../dep11/icons-*` / component metadata.
     Icon,
     /// Structured content-addressed `dists/.../by-hash/SHA*/<hex>`.
-    ByHash,
+    ByHash(HashAlgo),
     /// Flat-repository metadata file (`Packages*`, `Release`, ...).
     FlatMetadata,
     /// Flat-repository `.deb` pool file.
     FlatPool,
     /// Flat-repository content-addressed `by-hash/SHA*/<hex>`.
-    FlatByHash,
+    FlatByHash(HashAlgo),
 }
 
 impl ResourceKind {
@@ -132,7 +136,7 @@ impl ResourceKind {
     #[must_use]
     pub(crate) const fn cached_flavor(self) -> CachedFlavor {
         match self {
-            Self::Pool | Self::ByHash | Self::FlatPool | Self::FlatByHash => {
+            Self::Pool | Self::ByHash(_) | Self::FlatPool | Self::FlatByHash(_) => {
                 CachedFlavor::Permanent
             }
             Self::Release
@@ -157,9 +161,9 @@ impl ResourceKind {
             | Self::Sources
             | Self::Translation
             | Self::Icon => CacheLayout::Dists,
-            Self::ByHash => CacheLayout::DistsByHash,
+            Self::ByHash(_) => CacheLayout::DistsByHash,
             Self::FlatMetadata | Self::FlatPool => CacheLayout::Flat,
-            Self::FlatByHash => CacheLayout::FlatByHash,
+            Self::FlatByHash(_) => CacheLayout::FlatByHash,
         }
     }
 }
@@ -671,6 +675,7 @@ pub(crate) fn classify_request<'a>(
         ResourceFile::ByHash {
             mirror_path,
             dirs,
+            algorithm,
             filename,
             scope,
         } => {
@@ -717,7 +722,7 @@ pub(crate) fn classify_request<'a>(
             Ok(RequestClass {
                 mirror_path: mirror_path.into_owned(),
                 debname: filename.into_owned(),
-                resource_kind: ResourceKind::ByHash,
+                resource_kind: ResourceKind::ByHash(*algorithm),
                 origin_fields,
             })
         }
@@ -854,7 +859,7 @@ pub(crate) fn classify_request<'a>(
                     }
                     ResourceKind::FlatPool
                 }
-                FlatKind::ByHash => ResourceKind::FlatByHash,
+                FlatKind::ByHash(algorithm) => ResourceKind::FlatByHash(*algorithm),
             };
 
             Ok(RequestClass {
@@ -1024,6 +1029,7 @@ mod tests {
         let res = ResourceFile::ByHash {
             mirror_path: "debian",
             dirs: "trixie/main",
+            algorithm: HashAlgo::Sha256,
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
             scope: None,
         };
@@ -1032,7 +1038,7 @@ mod tests {
             class.debname,
             "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
         );
-        assert_eq!(class.resource_kind, ResourceKind::ByHash);
+        assert_eq!(class.resource_kind, ResourceKind::ByHash(HashAlgo::Sha256));
         assert_eq!(class.resource_kind.cached_flavor(), CachedFlavor::Permanent);
         assert_eq!(class.resource_kind.layout(), CacheLayout::DistsByHash);
     }
@@ -1077,7 +1083,11 @@ mod tests {
         ] {
             let res = parse_request_path(path).expect("by-hash path parses");
             let class = classify_request(&res, &local_client()).unwrap();
-            assert_eq!(class.resource_kind, ResourceKind::ByHash, "{path}");
+            assert_eq!(
+                class.resource_kind,
+                ResourceKind::ByHash(HashAlgo::Sha256),
+                "{path}"
+            );
             assert!(class.origin_fields.is_none(), "{path} must mint no origin");
         }
     }
@@ -1093,7 +1103,11 @@ mod tests {
             let path = format!("ubuntu/dists/noble/main/{dir}/by-hash/SHA256/{DIGEST}");
             let res = parse_request_path(&path).expect("by-hash path parses");
             let class = classify_request(&res, &local_client()).unwrap();
-            assert_eq!(class.resource_kind, ResourceKind::ByHash, "{path}");
+            assert_eq!(
+                class.resource_kind,
+                ResourceKind::ByHash(HashAlgo::Sha256),
+                "{path}"
+            );
             assert!(
                 class.origin_fields.is_none(),
                 "`{dir}` is not an architecture and must mint no origin"
@@ -1197,7 +1211,7 @@ mod tests {
     #[test]
     fn classify_flat_byhash() {
         let res = ResourceFile::Flat {
-            kind: FlatKind::ByHash,
+            kind: FlatKind::ByHash(HashAlgo::Sha256),
             mirror_path: "apt",
             filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
         };
@@ -1274,10 +1288,23 @@ mod tests {
             (ResourceKind::Sources, Volatile, Dists),
             (ResourceKind::Translation, Volatile, Dists),
             (ResourceKind::Icon, Volatile, Dists),
-            (ResourceKind::ByHash, Permanent, DistsByHash),
+            (
+                ResourceKind::ByHash(HashAlgo::Sha256),
+                Permanent,
+                DistsByHash,
+            ),
+            (
+                ResourceKind::ByHash(HashAlgo::Sha512),
+                Permanent,
+                DistsByHash,
+            ),
             (ResourceKind::FlatMetadata, Volatile, Flat),
             (ResourceKind::FlatPool, Permanent, Flat),
-            (ResourceKind::FlatByHash, Permanent, FlatByHash),
+            (
+                ResourceKind::FlatByHash(HashAlgo::Sha256),
+                Permanent,
+                FlatByHash,
+            ),
         ] {
             assert_eq!(kind.cached_flavor(), flavor, "{kind:?} flavor");
             assert_eq!(kind.layout(), layout, "{kind:?} layout");

@@ -111,7 +111,8 @@ struct VerifyInput<'a> {
 enum VerifyKind {
     /// The expected digest is known: hash `temp_path` with `algo` and
     /// compare. For a by-hash resource `algo` is the authoritative algorithm
-    /// from the `<algo>` URL path segment (`SHA256`/`SHA512`), never inferred
+    /// the parser validated for the `<algo>` URL path segment
+    /// (`SHA256`/`SHA512`) and carried on the `ResourceKind`, never inferred
     /// from the digest length; for a registry-backed one it is always SHA256.
     Expected { algo: HashAlgo, digest: Vec<u8> },
     /// The resource *could* have been verified but no expected digest is
@@ -127,15 +128,15 @@ enum VerifyKind {
 
 /// Resolve a by-hash URL's `(algo, leaf)` pair into a [`VerifyKind`].
 ///
-/// `algo` is the authoritative algorithm from the URL's `<algo>` segment and
-/// the digest length is cross-checked against it inside
+/// `algo` is the authoritative algorithm the parser took from the URL's
+/// `<algo>` segment (the one directly before the digest, never re-read from
+/// the raw path, where an earlier decoy `by-hash` segment could name another)
+/// and the digest length is cross-checked against it inside
 /// [`index_parser::byhash_digest_for_algo`], so a pair that disagrees
 /// degrades to [`VerifyKind::Unknown`] instead of hashing with a guessed
 /// algorithm.
-fn byhash_verify_kind(algo: Option<HashAlgo>, filename: &str) -> VerifyKind {
-    let Some((algo, digest)) =
-        algo.and_then(|a| index_parser::byhash_digest_for_algo(a, filename).map(|d| (a, d)))
-    else {
+fn byhash_verify_kind(algo: HashAlgo, filename: &str) -> VerifyKind {
+    let Some(digest) = index_parser::byhash_digest_for_algo(algo, filename) else {
         // Defence in depth: the URL parser already rejects anything other
         // than `SHA256/<64-hex>` or `SHA512/<128-hex>` with the algorithm
         // segment cross-checked against the digest length, so reaching this
@@ -906,8 +907,8 @@ pub(crate) async fn verify_and_rename(
     // global-free. Skipped entirely when verification is disabled.
     let kind = if verify_enabled {
         match plan.resource_kind {
-            ResourceKind::ByHash | ResourceKind::FlatByHash => {
-                byhash_verify_kind(byhash_algo_from_uri_path(&plan.raw_uri_path), &plan.debname)
+            ResourceKind::ByHash(algo) | ResourceKind::FlatByHash(algo) => {
+                byhash_verify_kind(algo, &plan.debname)
             }
             kind @ (ResourceKind::Pool | ResourceKind::Packages) => {
                 let key = registry_lookup_key(kind, &plan.debname, &plan.raw_uri_path)
@@ -1383,7 +1384,7 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
         // A by-hash file may be a Packages file. The raw URI path's
         // segment immediately before `by-hash` distinguishes a binary
         // Packages index from Contents/dep11/i18n by-hash content.
-        ResourceKind::ByHash => {
+        ResourceKind::ByHash(_) => {
             if byhash_path_looks_like_packages(file.raw_uri_path) {
                 Some(IngestKind::PackagesSniff {
                     format: IndexFormat::Structured,
@@ -1392,7 +1393,7 @@ fn ingest_kind(file: &IndexFile<'_>) -> Option<IngestKind> {
                 None
             }
         }
-        ResourceKind::FlatByHash => {
+        ResourceKind::FlatByHash(_) => {
             // `byhash_path_looks_like_packages` matches a `binary-*` or
             // `source` segment before `by-hash`, which is a structured-layout
             // signature.  Flat by-hash URLs anchor at the flat repo's base
@@ -1500,8 +1501,8 @@ fn registry_lookup_key<'a>(
             Cow::Borrowed(path) => Cow::Borrowed(path.trim_start_matches('/')),
             Cow::Owned(path) => Cow::Owned(path.trim_start_matches('/').to_owned()),
         }),
-        ResourceKind::ByHash
-        | ResourceKind::FlatByHash
+        ResourceKind::ByHash(_)
+        | ResourceKind::FlatByHash(_)
         | ResourceKind::Release
         | ResourceKind::ComponentRelease
         | ResourceKind::Sources
@@ -1543,7 +1544,6 @@ fn registry_lookup_key<'a>(
 #[must_use]
 pub(crate) fn stream_hash_algo(
     resource_kind: ResourceKind,
-    raw_uri_path: &str,
     registry_hit: bool,
     verify_enabled: bool,
 ) -> Option<HashAlgo> {
@@ -1552,7 +1552,7 @@ pub(crate) fn stream_hash_algo(
     }
     match resource_kind {
         // Self-verifying: the algorithm is named in the URL.
-        ResourceKind::ByHash | ResourceKind::FlatByHash => byhash_algo_from_uri_path(raw_uri_path),
+        ResourceKind::ByHash(algo) | ResourceKind::FlatByHash(algo) => Some(algo),
         // Registry-backed, always SHA-256 (`VerifyKind::Registry`) -- but only
         // worth computing when the registry already holds the digest.
         ResourceKind::Pool | ResourceKind::Packages => registry_hit.then_some(HashAlgo::Sha256),
@@ -1588,31 +1588,9 @@ pub(crate) fn stream_hash_algo_for_download(
         });
     stream_hash_algo(
         resource_kind,
-        raw_uri_path,
         registry_hit,
         global_config().verify_checksums,
     )
-}
-
-/// The hash algorithm of a `.../by-hash/<algo>/<hex>` URL, taken from the
-/// segment immediately after `by-hash`. This is the *authoritative* algorithm
-/// for a by-hash resource; the digest length is only cross-checked against it
-/// (in `index_parser::byhash_digest_for_algo`), never used to infer it.
-/// `None` if `by-hash` is absent or the following segment is not a recognised
-/// algorithm - the resource is then cached unverified rather than hashed with a
-/// guessed algorithm.
-fn byhash_algo_from_uri_path(raw_uri_path: &str) -> Option<HashAlgo> {
-    let mut segs = raw_uri_path.split('/').filter(|s| !s.is_empty());
-    while let Some(seg) = segs.next() {
-        if seg == "by-hash" {
-            return match segs.next()? {
-                "SHA256" => Some(HashAlgo::Sha256),
-                "SHA512" => Some(HashAlgo::Sha512),
-                _ => None,
-            };
-        }
-    }
-    None
 }
 
 /// Detect Packages compression by reading magic bytes from the file. Used for
@@ -1890,7 +1868,7 @@ mod tests {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: f.path(),
             streamed: None,
         };
@@ -1898,52 +1876,35 @@ mod tests {
     }
 
     /// The table must agree with `verify_and_rename`'s: exactly the kinds that
-    /// can produce an expected digest opt in, and the by-hash ones take their
-    /// algorithm from the URL rather than assuming SHA-256.
+    /// can produce an expected digest opt in, and the by-hash ones take the
+    /// algorithm their URL named rather than assuming SHA-256.
     #[cfg(feature = "splice")]
     #[test]
     fn stream_hash_algo_matches_the_verify_table() {
-        const BYHASH_512: &str = "/debian/dists/sid/main/by-hash/SHA512/abc";
-        const BYHASH_256: &str = "/debian/dists/sid/main/by-hash/SHA256/abc";
-        const POOL: &str = "/debian/pool/main/h/hello/hello_1.0_amd64.deb";
-
         // By-hash resources carry their digest in the URL, so the registry is
         // not consulted for them at all.
         assert_eq!(
-            stream_hash_algo(ResourceKind::ByHash, BYHASH_512, false, true),
+            stream_hash_algo(ResourceKind::ByHash(HashAlgo::Sha512), false, true),
             Some(HashAlgo::Sha512)
         );
         assert_eq!(
-            stream_hash_algo(ResourceKind::FlatByHash, BYHASH_256, false, true),
+            stream_hash_algo(ResourceKind::FlatByHash(HashAlgo::Sha256), false, true),
             Some(HashAlgo::Sha256)
         );
         assert_eq!(
-            stream_hash_algo(ResourceKind::Pool, POOL, true, true),
+            stream_hash_algo(ResourceKind::Pool, true, true),
             Some(HashAlgo::Sha256)
         );
         assert_eq!(
-            stream_hash_algo(ResourceKind::Packages, "/debian/x/Packages.xz", true, true),
+            stream_hash_algo(ResourceKind::Packages, true, true),
             Some(HashAlgo::Sha256)
         );
 
         // Registry-backed kinds with no digest on file: `verify_temp_file`
         // would return before hashing anything, so hashing the body as it
         // arrives would buy nothing.
-        assert_eq!(
-            stream_hash_algo(ResourceKind::Pool, POOL, false, true),
-            None
-        );
-        assert_eq!(
-            stream_hash_algo(ResourceKind::Packages, "/debian/x/Packages.xz", false, true),
-            None
-        );
-
-        // A by-hash URL with no recognised algorithm segment is unverifiable,
-        // so there is nothing to hash towards.
-        assert_eq!(
-            stream_hash_algo(ResourceKind::ByHash, POOL, true, true),
-            None
-        );
+        assert_eq!(stream_hash_algo(ResourceKind::Pool, false, true), None);
+        assert_eq!(stream_hash_algo(ResourceKind::Packages, false, true), None);
 
         for kind in [
             ResourceKind::Release,
@@ -1954,16 +1915,13 @@ mod tests {
             ResourceKind::FlatMetadata,
             ResourceKind::FlatPool,
         ] {
-            assert_eq!(stream_hash_algo(kind, POOL, true, true), None, "{kind:?}");
+            assert_eq!(stream_hash_algo(kind, true, true), None, "{kind:?}");
         }
 
         // Verification off: nothing is ever hashed.
+        assert_eq!(stream_hash_algo(ResourceKind::Pool, true, false), None);
         assert_eq!(
-            stream_hash_algo(ResourceKind::Pool, POOL, true, false),
-            None
-        );
-        assert_eq!(
-            stream_hash_algo(ResourceKind::ByHash, BYHASH_512, true, false),
+            stream_hash_algo(ResourceKind::ByHash(HashAlgo::Sha512), true, false),
             None
         );
     }
@@ -1999,8 +1957,8 @@ mod tests {
             Some("debian/dists/sid/main/binary-amd64/Packages.xz")
         );
         for kind in [
-            ResourceKind::ByHash,
-            ResourceKind::FlatByHash,
+            ResourceKind::ByHash(HashAlgo::Sha256),
+            ResourceKind::FlatByHash(HashAlgo::Sha256),
             ResourceKind::Release,
             ResourceKind::ComponentRelease,
             ResourceKind::Sources,
@@ -2025,7 +1983,7 @@ mod tests {
         let f = temp_file_with(b"not hello at all");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
                 algo: HashAlgo::Sha256,
@@ -2042,7 +2000,7 @@ mod tests {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: f.path(),
             streamed: Some(StreamedDigest {
                 algo: HashAlgo::Sha256,
@@ -2064,7 +2022,7 @@ mod tests {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: f.path(),
             // Right length for SHA-512, wrong algorithm for this resource.
             streamed: Some(StreamedDigest {
@@ -2085,7 +2043,7 @@ mod tests {
         let f = temp_file_with(b"hello world");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: f.path(),
             // Right algorithm, but it saw more bytes than the file holds.
             streamed: Some(StreamedDigest {
@@ -2102,7 +2060,7 @@ mod tests {
         let f = temp_file_with(b"tampered");
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2117,7 +2075,7 @@ mod tests {
         let f = temp_file_with(b"tampered");
         let plan = VerifyInput {
             verify_enabled: false,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: f.path(),
             streamed: None,
         };
@@ -2140,7 +2098,7 @@ mod tests {
     fn unreadable_temp_file_returns_reject_verifyio() {
         let plan = VerifyInput {
             verify_enabled: true,
-            kind: byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256),
+            kind: byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256),
             temp_path: Path::new("/nonexistent/apt-cacher-rs/x"),
             streamed: None,
         };
@@ -2446,22 +2404,50 @@ mod tests {
         ));
     }
 
+    /// Regression (verification bypass): the algorithm used to be re-read
+    /// from the raw path after its *first* `by-hash` segment, while the
+    /// parser validated the last one. A decoy `by-hash/X/` in front made
+    /// that read come back empty, and the object was cached unverified. The
+    /// algorithm now travels from the parser, so a body that does not hash
+    /// to the digest in the URL is refused.
     #[test]
-    fn byhash_algo_extraction() {
-        assert_eq!(
-            byhash_algo_from_uri_path("/debian/dists/sid/main/binary-amd64/by-hash/SHA256/abcd"),
-            Some(HashAlgo::Sha256)
-        );
-        assert_eq!(
-            byhash_algo_from_uri_path("/debian/dists/sid/main/binary-amd64/by-hash/SHA512/abcd"),
-            Some(HashAlgo::Sha512)
-        );
-        // Unrecognised algorithm segment, or no by-hash marker at all.
-        assert_eq!(
-            byhash_algo_from_uri_path("/debian/dists/sid/main/binary-amd64/by-hash/MD5Sum/abcd"),
-            None
-        );
-        assert_eq!(byhash_algo_from_uri_path("/debian/pool/x/foo.deb"), None);
+    fn byhash_decoy_segment_does_not_disable_verification() {
+        use crate::{
+            cache_layout::classify_request, deb_mirror::parse_request_path,
+            test_support::local_client,
+        };
+
+        for path in [
+            format!("debian/dists/by-hash/X/by-hash/SHA256/{HELLO_SHA256}"),
+            format!(
+                "debian/dists/sid/main/binary-amd64/by-hash/MD5Sum/by-hash/SHA256/{HELLO_SHA256}"
+            ),
+        ] {
+            let resource = parse_request_path(&path).expect("parses as a by-hash object");
+            let class = classify_request(&resource, &local_client()).expect("classifies");
+            let algo = if let ResourceKind::ByHash(algo) = class.resource_kind {
+                Some(algo)
+            } else {
+                None
+            };
+            assert_eq!(algo, Some(HashAlgo::Sha256), "{path}");
+            let algo = algo.expect("asserted above");
+
+            let f = temp_file_with(b"not hello world");
+            let plan = VerifyInput {
+                verify_enabled: true,
+                kind: byhash_verify_kind(algo, &class.debname),
+                temp_path: f.path(),
+                streamed: None,
+            };
+            assert!(
+                matches!(
+                    verify_temp_file(&plan),
+                    VerifyOutcome::Reject(CommitError::ChecksumMismatch)
+                ),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -2470,7 +2456,7 @@ mod tests {
         // length/algo mismatch: it must NOT be hashed as SHA256. It resolves
         // to `Unknown` -> Proceed (cached unverified), never a spurious
         // mismatch.
-        let kind = byhash_verify_kind(Some(HashAlgo::Sha512), HELLO_SHA256);
+        let kind = byhash_verify_kind(HashAlgo::Sha512, HELLO_SHA256);
         assert!(
             matches!(kind, VerifyKind::Unknown),
             "a digest whose length contradicts its URL algorithm must not become an expectation"
@@ -2486,27 +2472,8 @@ mod tests {
     }
 
     #[test]
-    fn byhash_missing_algo_caches_unverified() {
-        // No algorithm from the URL -> unverifiable, even if the filename would
-        // decode as some digest.
-        let kind = byhash_verify_kind(None, HELLO_SHA256);
-        assert!(
-            matches!(kind, VerifyKind::Unknown),
-            "a by-hash URL with no recognised algorithm segment must not become an expectation"
-        );
-        let f = temp_file_with(b"hello world");
-        let plan = VerifyInput {
-            verify_enabled: true,
-            kind,
-            temp_path: f.path(),
-            streamed: None,
-        };
-        assert!(matches!(verify_temp_file(&plan), VerifyOutcome::Proceed));
-    }
-
-    #[test]
     fn byhash_well_formed_pair_becomes_an_expectation() {
-        let resolved = match byhash_verify_kind(Some(HashAlgo::Sha256), HELLO_SHA256) {
+        let resolved = match byhash_verify_kind(HashAlgo::Sha256, HELLO_SHA256) {
             VerifyKind::Expected { algo, digest } => Some((algo, digest)),
             VerifyKind::Unknown | VerifyKind::Unverifiable => None,
         };
@@ -3077,7 +3044,7 @@ mod tests {
         ));
         assert!(matches!(
             ingest_kind(&file(
-                ResourceKind::ByHash,
+                ResourceKind::ByHash(HashAlgo::Sha256),
                 "abcd",
                 "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/abcd"
             )),
@@ -3085,7 +3052,7 @@ mod tests {
         ));
         assert!(
             ingest_kind(&file(
-                ResourceKind::ByHash,
+                ResourceKind::ByHash(HashAlgo::Sha256),
                 "abcd",
                 "/debian/dists/sid/main/i18n/by-hash/SHA256/abcd"
             ))

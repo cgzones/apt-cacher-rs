@@ -401,7 +401,8 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
 }
 
 /// Decode a `by-hash` URL's digest filename against the algorithm taken from
-/// the URL's `<algo>` path segment (see `integrity::byhash_algo_from_uri_path`).
+/// the URL's `<algo>` path segment (validated by `deb_mirror::parse_request_path`
+/// and carried on `ResourceKind::ByHash` / `FlatByHash`).
 ///
 /// A `/by-hash/SHA256/<hex>` (or `/SHA512/<hex>`) URL embeds the digest in the
 /// path component, so the filename *is* the expected digest -- but the

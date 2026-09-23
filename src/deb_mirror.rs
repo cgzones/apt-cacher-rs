@@ -2,7 +2,7 @@ use std::{borrow::Cow, num::NonZero, sync::OnceLock};
 
 use tracing::debug;
 
-use crate::{config::ClientHost, database};
+use crate::{config::ClientHost, database, index_parser::HashAlgo};
 
 /// On-disk layout family of a mirror.  Stored in the `mirrors_v2.kind`
 /// INTEGER column (added by the `20260512155314_mirror_kind` migration);
@@ -380,8 +380,9 @@ pub(crate) enum FlatKind {
     Metadata,
     /// A binary package (`.deb`, `.udeb`, `.ddeb`) served from the flat tree.
     Pool,
-    /// A by-hash content-addressed file at `<base>/by-hash/SHA*/<hex>`.
-    ByHash,
+    /// A by-hash content-addressed file at `<base>/by-hash/SHA*/<hex>`,
+    /// with the algorithm its `SHA*` directory names.
+    ByHash(HashAlgo),
 }
 
 #[derive(Debug, PartialEq)]
@@ -432,6 +433,10 @@ pub(crate) enum ResourceFile<'a> {
         /// the cache identity but forwarded upstream, so every segment is
         /// decoded and validated by [`crate::cache_layout::classify_request`].
         dirs: &'a str,
+        /// The algorithm the `by-hash/<ALGO>/` directory names, validated
+        /// against the digest's length: the one the download is verified
+        /// with.
+        algorithm: HashAlgo,
         filename: &'a str,
         /// The `dists/<dist>/<comp>/<arch>/` scope the object hangs under,
         /// when the path has exactly that shape; `None` at any other depth
@@ -741,11 +746,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
                 filename,
             });
         } else if is_byhash_digest_shape(filename) {
-            let hash_algorithm = parts.next()?;
-
-            if !is_valid_byhash_pair(hash_algorithm, filename) {
-                return None;
-            }
+            let algorithm = byhash_pair(parts.next()?, filename)?;
 
             if parts.next()? != "by-hash" {
                 return None;
@@ -765,6 +766,7 @@ pub(crate) fn parse_request_path(path: &str) -> Option<ResourceFile<'_>> {
             return Some(ResourceFile::ByHash {
                 mirror_path,
                 dirs,
+                algorithm,
                 filename,
                 scope,
             });
@@ -842,13 +844,13 @@ fn parse_flat_resource(path: &str) -> Option<ResourceFile<'_>> {
     // None rather than reclassifying as a pool file.
     if is_byhash_digest_shape(tail) {
         if let Some((base, hash_algo)) = mirror_path.rsplit_once('/')
-            && is_valid_byhash_pair(hash_algo, tail)
+            && let Some(algorithm) = byhash_pair(hash_algo, tail)
             && let Some((flat_base, by_hash_dir)) = base.rsplit_once('/')
             && by_hash_dir == "by-hash"
             && !flat_base.is_empty()
         {
             return Some(ResourceFile::Flat {
-                kind: FlatKind::ByHash,
+                kind: FlatKind::ByHash(algorithm),
                 mirror_path: flat_base,
                 filename: tail,
             });
@@ -1051,6 +1053,15 @@ impl ByHashAlgorithm {
             .into_iter()
             .find(|algo| algo.matches_digest(digest))
     }
+
+    /// The digest this algorithm names, as the verifier hashes with it.
+    #[must_use]
+    const fn hash_algo(self) -> HashAlgo {
+        match self {
+            Self::Sha256 => HashAlgo::Sha256,
+            Self::Sha512 => HashAlgo::Sha512,
+        }
+    }
 }
 
 /// Whether `s` has the shape of a by-hash digest tail: a hex string of one
@@ -1067,7 +1078,17 @@ fn is_byhash_digest_shape(s: &str) -> bool {
 /// digest length.
 #[must_use]
 fn is_valid_byhash_pair(algo: &str, digest: &str) -> bool {
-    ByHashAlgorithm::from_dir_name(algo).is_some_and(|algo| algo.matches_digest(digest))
+    byhash_pair(algo, digest).is_some()
+}
+
+/// The algorithm of a supported by-hash pair (see [`is_valid_byhash_pair`]):
+/// what the parser hands on, so verification hashes with the algorithm this
+/// check accepted rather than re-reading one from the path.
+#[must_use]
+fn byhash_pair(algo: &str, digest: &str) -> Option<HashAlgo> {
+    ByHashAlgorithm::from_dir_name(algo)
+        .filter(|algo| algo.matches_digest(digest))
+        .map(ByHashAlgorithm::hash_algo)
 }
 
 /// The `Release` family: the archive-level index and its two signature
@@ -1426,6 +1447,7 @@ mod tests {
             ResourceFile::ByHash {
                 mirror_path: "debian",
                 dirs: "sid/main/binary-amd64",
+                algorithm: HashAlgo::Sha256,
                 filename: SHA256,
                 scope: Some(ByHashScope {
                     distribution: "sid",
@@ -1754,6 +1776,7 @@ mod tests {
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
                 dirs: "sid/main/binary-amd64/Packages.diff",
+                algorithm: HashAlgo::Sha256,
                 filename: "491ddac17f4b86d771a457e6b084c499dfeb9ee29004b92d5d05fe79f1f0dede",
                 // Four segments before `by-hash`: not the origin shape.
                 scope: None
@@ -1767,6 +1790,7 @@ mod tests {
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
                 dirs: "sid/main/dep11",
+                algorithm: HashAlgo::Sha256,
                 filename: "cf31e359ca5863e438c1b2d3ddaa1d473519ad26bd71e3dac7803dade82e4482",
                 // A pseudo-arch still yields a scope; the "no origin"
                 // rule is `is_binary_arch`, applied by `classify_request`.
@@ -1785,6 +1809,7 @@ mod tests {
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
                 dirs: "trixie/main",
+                algorithm: HashAlgo::Sha256,
                 filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
                 // Component-scoped (the `Release` sibling): no architecture,
                 // so no origin.
@@ -1898,7 +1923,7 @@ mod tests {
                 "apt/by-hash/SHA256/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
             ),
             Some(ResourceFile::Flat {
-                kind: FlatKind::ByHash,
+                kind: FlatKind::ByHash(HashAlgo::Sha256),
                 mirror_path: "apt",
                 filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
             })
@@ -2063,7 +2088,7 @@ mod tests {
                 "apt/by-hash/SHA512/4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
             ),
             Some(ResourceFile::Flat {
-                kind: FlatKind::ByHash,
+                kind: FlatKind::ByHash(HashAlgo::Sha512),
                 mirror_path: "apt",
                 filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba"
             })
@@ -2075,6 +2100,7 @@ mod tests {
             Some(ResourceFile::ByHash {
                 mirror_path: "debian",
                 dirs: "trixie/main",
+                algorithm: HashAlgo::Sha512,
                 filename: "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba",
                 scope: None
             })
