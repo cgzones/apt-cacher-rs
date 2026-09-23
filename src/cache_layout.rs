@@ -37,7 +37,10 @@
 //! (the URL's `pool/main/<l>/<pkg>/` components are dropped).
 //! Release/Packages/etc. prefix `debname` with `{distribution}_…` to
 //! disambiguate per-distribution copies that share the same on-disk
-//! `mirror_path`.
+//! `mirror_path`.  The joined fields therefore never hold a `_` of their
+//! own: such a request is relayed uncached
+//! ([`ClassifyError::JoinedFieldUnderscore`]), or `sid_main` + `x` and
+//! `sid` + `main_x` would name one file.
 //!
 //! `ByHash` keys on the digest alone, but still carries the
 //! `dists/<dist>/<comp>/<arch>/` scope it was fetched under: an
@@ -527,6 +530,17 @@ impl ValidateKind {
             Self::Filename => valid_filename(decoded),
         }
     }
+
+    /// Whether the `dists/` cache names join this field to its neighbours
+    /// with `_` ([`dists_debname`] and siblings).  Such a field must not hold
+    /// a `_` itself, or two URLs could spell one cache name.
+    #[must_use]
+    const fn joined_with_underscore(self) -> bool {
+        match self {
+            Self::Distribution | Self::Component | Self::Architecture => true,
+            Self::MirrorPath | Self::Directory | Self::Filename => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ValidateKind {
@@ -600,6 +614,18 @@ pub(crate) enum ClassifyError<'a> {
     /// match `<name>_<ver>_<arch>.<ext>`.  Re-checking the decoded form
     /// closes that bypass.
     NonDebPool { filename: Cow<'a, str> },
+    /// A distribution, component or architecture holding a `_`, the
+    /// separator the `dists/` cache names join those fields with:
+    /// `dists/sid_main_binary-amd64/Release` and
+    /// `dists/sid/main/binary-amd64/Release` would share one cache file.  The
+    /// value is valid, just not cacheable, so both dispatchers relay the
+    /// request uncached.  Checked on every such field, the `by-hash` scope
+    /// included, so none of them reaches an `Origin` row either (cleanup
+    /// builds its index fetches' cache names from those rows).
+    JoinedFieldUnderscore {
+        kind: ValidateKind,
+        decoded: Cow<'a, str>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +941,8 @@ fn validate_directories(dirs: &str) -> Result<(), ClassifyError<'_>> {
 }
 
 /// URL-decode `raw` and check the result with the validator selected by
-/// `kind`.  Returns a `Cow` borrowing the input when no percent-escape was
+/// `kind`; a field the cache names join with `_` must additionally be free
+/// of one ([`ClassifyError::JoinedFieldUnderscore`]).  Returns a `Cow` borrowing the input when no percent-escape was
 /// present (the common case for ASCII Debian paths), so callers that feed
 /// the result into `format!` or a `&str`-taking validator pay no extra
 /// allocation; callers needing an owned `String` (e.g. `RequestClass.mirror_path`)
@@ -930,6 +957,10 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
 
     if !kind.accepts(&decoded) {
         return Err(ClassifyError::InvalidValue { kind, decoded });
+    }
+
+    if kind.joined_with_underscore() && decoded.contains('_') {
+        return Err(ClassifyError::JoinedFieldUnderscore { kind, decoded });
     }
 
     Ok(decoded)
@@ -1449,6 +1480,68 @@ mod tests {
             let res = parse_request_path(&path).expect("parses as a by-hash object");
             assert!(classify_request(&res, &local_client()).is_ok(), "{path}");
         }
+    }
+
+    /// Regression (cache-name collision): the `dists/` cache names join
+    /// distribution, component and architecture with `_`, so a `_` inside
+    /// one of them let two different URLs share one cache file. Such a field
+    /// makes the request uncacheable; a `_` in a filename stays legal.
+    #[test]
+    fn classify_refuses_to_cache_an_underscore_in_a_joined_field() {
+        const H: &str = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba";
+        for (path, kind, field) in [
+            // Would be `sid_main_binary-amd64_Release`, the per-component
+            // Release of `dists/sid/main/binary-amd64/`.
+            (
+                "debian/dists/sid_main_binary-amd64/Release".to_owned(),
+                "distribution",
+                "sid_main_binary-amd64",
+            ),
+            // Would be `sid_c_Translation-x_binary-amd64_Packages`, which
+            // a Translation file under component `c` can spell too.
+            (
+                "debian/dists/sid/c_Translation-x/binary-amd64/Packages".to_owned(),
+                "component",
+                "c_Translation-x",
+            ),
+            (
+                "debian/dists/sid/main/binary-amd_64/Release".to_owned(),
+                "architecture",
+                "binary-amd_64",
+            ),
+            (
+                "debian/dists/sid/ma%5Fin/source/Sources.xz".to_owned(),
+                "component",
+                "ma_in",
+            ),
+            (
+                format!("debian/dists/sid/main/i18n_x/by-hash/SHA256/{H}"),
+                "architecture",
+                "i18n_x",
+            ),
+            (
+                "debian/dists/s_id/main/dep11/icons-64x64.tar.gz".to_owned(),
+                "distribution",
+                "s_id",
+            ),
+        ] {
+            let res = parse_request_path(&path).expect("parses");
+            let err = classify_request(&res, &local_client()).expect_err(&path);
+            assert!(
+                matches!(
+                    &err,
+                    ClassifyError::JoinedFieldUnderscore { kind: got, decoded }
+                        if got.to_string() == kind && decoded == field
+                ),
+                "{path}: expected a `{kind}` refusal, got {err:?}"
+            );
+        }
+
+        // A `_` in a filename is part of the name, not a separator.
+        let res =
+            parse_request_path("debian/dists/sid/main/i18n/Translation-en_GB.xz").expect("parses");
+        let class = classify_request(&res, &local_client()).expect("classifies");
+        assert_eq!(class.debname, "sid_main_Translation-en_GB.xz");
     }
 
     /// [`ValidateKind`] carries both a label and the validator to apply; this

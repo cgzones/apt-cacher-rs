@@ -411,6 +411,10 @@ pub(crate) enum PassthroughReason {
     /// forwarded upstream but no part of the cache name, so caching the
     /// answer would serve the query variant to every later plain request.
     QueryString,
+    /// A distribution, component or architecture holding a `_`, which the
+    /// `dists/` cache names use as their field separator (see
+    /// [`ClassifyError::JoinedFieldUnderscore`]).
+    JoinedFieldUnderscore,
 }
 
 impl PassthroughReason {
@@ -422,6 +426,7 @@ impl PassthroughReason {
             Self::NonDebPool => "unsupported pool filename",
             Self::FlatBlocked => "flat host blocked by structured collision",
             Self::QueryString => "query string on a cacheable path",
+            Self::JoinedFieldUnderscore => "`_` in a distribution, component or architecture",
         }
     }
 }
@@ -654,6 +659,13 @@ fn decide_request(
                     decoded.escape_debug()
                 );
                 return Decision::Reject(RejectReason::InvalidValue);
+            }
+            Err(ClassifyError::JoinedFieldUnderscore { kind, decoded }) => {
+                warn_once_or_info!(
+                    "Uncacheable {kind} `{}` from client {client} (`_` separates cache-name fields); forwarding it upstream uncached",
+                    decoded.escape_debug()
+                );
+                PassthroughReason::JoinedFieldUnderscore
             }
             Err(ClassifyError::NonDebPool { filename }) => {
                 warn_once_or_info!(
@@ -1170,6 +1182,30 @@ mod tests {
                 }
             ),
             "expected Unrecognized passthrough, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_underscore_in_a_joined_field() {
+        let decision = decide_request(
+            "/debian/dists/sid_main_binary-amd64/Release",
+            fake_host(),
+            None,
+            &local_client(),
+            &[],
+            true,
+            never_flat_blocked,
+            PreciseInstant::now(),
+        );
+        assert!(
+            matches!(
+                decision,
+                Decision::Passthrough {
+                    reason: PassthroughReason::JoinedFieldUnderscore,
+                    ..
+                }
+            ),
+            "expected JoinedFieldUnderscore passthrough, got {decision:?}"
         );
     }
 

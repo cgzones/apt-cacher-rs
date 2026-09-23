@@ -1194,7 +1194,9 @@ const MAX_SEGMENT_LEN: usize = 128;
 ///
 /// A mirror path containing any of these as a `/`-separated segment would
 /// collide with cache plumbing — `tmp/` is the partial-download scratch
-/// dir, `by-hash/` is the content-addressed subtree under each mirror.
+/// dir, `by-hash/` is the content-addressed subtree under each mirror, and
+/// `dists/` holds each mirror's index files, so a mirror `X/dists` would
+/// nest into `X`'s index directory.
 /// The host-level `flat/` anchor is *not* reserved here: structured
 /// mirrors named `flat` are handled by the per-host collision blocklist
 /// (`flat_blocklist`) so that "structured wins" without permanently
@@ -1202,7 +1204,7 @@ const MAX_SEGMENT_LEN: usize = 128;
 ///
 /// Shared with the startup migration scan in `main.rs`, which warns about
 /// pre-existing `mirrors_v2` rows that would now fail validation.
-pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash"];
+pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash", "dists"];
 
 /// Whether `segment` is one of the [`RESERVED_MIRROR_PATH_SEGMENTS`].
 #[must_use]
@@ -2219,9 +2221,14 @@ mod tests {
         assert!(!valid_mirrorname("by-hash"));
         assert!(!valid_mirrorname("foo/tmp"));
         assert!(!valid_mirrorname("foo/by-hash/bar"));
+        /* `dists` would nest a mirror into its parent's `dists/` tree */
+        assert!(!valid_mirrorname("dists"));
+        assert!(!valid_mirrorname("debian/dists"));
+        assert!(!valid_mirrorname("debian/dists/x"));
         /* but non-segment occurrences are fine */
         assert!(valid_mirrorname("tmpfile"));
         assert!(valid_mirrorname("by-hash-deb"));
+        assert!(valid_mirrorname("dists-archive"));
     }
 
     #[test]
@@ -2230,6 +2237,7 @@ mod tests {
         assert!(mirror_path_has_reserved_segment("by-hash"));
         assert!(mirror_path_has_reserved_segment("foo/tmp"));
         assert!(mirror_path_has_reserved_segment("foo/by-hash/bar"));
+        assert!(mirror_path_has_reserved_segment("foo/dists"));
         assert!(!mirror_path_has_reserved_segment("debian"));
         assert!(!mirror_path_has_reserved_segment("tmpfile"));
         assert!(!mirror_path_has_reserved_segment("foo/by-hash-deb"));
