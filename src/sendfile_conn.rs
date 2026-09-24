@@ -107,6 +107,12 @@ use crate::{
 /// Maximum size for HTTP request headers buffer (matches hyper's default of 8192).
 const MAX_HEADER_SIZE: usize = 8192;
 
+/// A request head that outgrew [`MAX_HEADER_SIZE`], answered 431 (RFC 6585
+/// §5) rather than the generic 400 of an unreadable head.
+#[derive(Debug, thiserror::Error)]
+#[error("request headers larger than {MAX_HEADER_SIZE} bytes")]
+struct HeadersTooLarge;
+
 /// Upper bound for `async_sendfile`'s inline single-syscall fast path.
 ///
 /// The fast path runs `sendfile(2)` on the tokio worker (not the blocking
@@ -268,21 +274,32 @@ pub(crate) async fn handle_sendfile_connection(
                     return;
                 }
                 metrics::REQUEST_READ_PROTOCOL_ERROR.increment();
+                let (status, body) = if let Some(inner) = err.get_ref()
+                    && inner.is::<HeadersTooLarge>()
+                {
+                    (
+                        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                        "Request header fields too large",
+                    )
+                } else {
+                    (StatusCode::BAD_REQUEST, "Error reading request headers")
+                };
                 warn_once_or_info!(
-                    "Failed to read request number {} from client {client}; returning 400 and closing the connection:  {}",
+                    "Failed to read request number {} from client {client}; returning {} and closing the connection:  {}",
                     req_num + 1,
+                    status.as_u16(),
                     ErrorReport(&err),
                 );
                 // Count the attempted request so REQUESTS_TOTAL stays >=
                 // CLIENT_STATUS_*: write_invalid_response below bumps
-                // CLIENT_STATUS_400 even though parsing failed.
+                // CLIENT_STATUS_* even though parsing failed.
                 metrics::REQUESTS_TOTAL.increment();
                 let _ignore = write_invalid_response(
                     &stream,
                     conn_version,
                     ConnectionAction::Close,
-                    StatusCode::BAD_REQUEST,
-                    "Error reading request headers",
+                    status,
+                    body,
                     None,
                 )
                 .await;
@@ -498,7 +515,7 @@ async fn read_request_headers(
                         if buf.len() > MAX_HEADER_SIZE {
                             return Err(std::io::Error::new(
                                 ErrorKind::InvalidInput,
-                                "request headers too large",
+                                HeadersTooLarge,
                             ));
                         }
                         trace!("Read {n} bytes from client, did not find header end");
