@@ -2,8 +2,8 @@
 //! field, hex-encoded `SHA256:` / `SHA512:` digests, and the small helpers
 //! that derive cache lookup keys from a stanza's relative path.
 //!
-//! Used by `integrity.rs` (post-commit registry ingest/verify) and
-//! `task_cleanup`'s 24h sweep (and its tests). Cold-path only; the helpers
+//! Used by `integrity.rs` (post-commit registry ingest/verify) and the
+//! `cleanup` sweep (and its tests). Cold-path only; the helpers
 //! stay free of hot-path-specific coupling.
 
 use std::{io, path::Path};

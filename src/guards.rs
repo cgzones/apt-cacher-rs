@@ -1,3 +1,38 @@
+//! The barrier chain every download is registered, driven and finished
+//! through, shared by all backends.
+//!
+//! One barrier at a time owns a download's `active_downloads` entry, and each
+//! step consumes its predecessor, so an entry is ended exactly once:
+//!
+//! - [`InitBarrier`] (registered, nothing fetched) ends at one sink:
+//!   [`InitBarrier::finished`] (the file on disk stays valid),
+//!   [`InitBarrier::decline`] (answered without downloading; joiners answer
+//!   what the originator answered) or [`InitBarrier::download`] (takes the
+//!   `QuotaReservation` by value). One merely dropped publishes `Cancelled`,
+//!   which joiners report as a failure of unknown cause -- so hyper's
+//!   single-worker setup (`InitBarrier::run_settled`) must return the
+//!   [`Settled`] proof of a sink, and splice's `InitBarrier::run` publishes
+//!   a failing worker's concluded cause itself.
+//! - [`DownloadBarrier`] (bytes flowing, readers ping-woken): its runner
+//!   [`DownloadBarrier::run`] turns a failure into a [`FailedDownload`], which
+//!   can be salvaged (skipped when the cache write is what failed) but never
+//!   run again or renamed, and whose drop publishes the concluded cause.
+//! - [`DownloadBarrier::begin_rename`] drops the `max_upstream_downloads`
+//!   slot (`active_downloads::UpstreamSlot`, which [`InitBarrier::new`] took
+//!   with the whole `Origination`) and the watch sender. Every backend
+//!   reaches it, and nothing else releases a slot.
+//! - [`RenameBarrier::commit`] is the only way a download finishes and the
+//!   only constructor of an `integrity::RenamePlan`, so a new plan field is a
+//!   compile error there and nowhere else. It also arms or clears
+//!   `verify_throttle`.
+//!
+//! No backend commits on its connection task -- hyper spawns
+//! `download_file`, splice spawns `splice/commit.rs::CommitTail`, and
+//! `splice/detached.rs` is already off-connection -- so a completed response
+//! never proves the cache file exists. The one exception is
+//! `splice/volatile.rs`, which commits before serving because its body is
+//! already buffered.
+
 use std::{
     fmt,
     path::PathBuf,

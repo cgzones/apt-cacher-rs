@@ -480,6 +480,9 @@ fn log_splice_completion(
     };
     let upstream = rate_log::upstream_segment(upstream_bytes, rates.upstream_window());
     let (event, client_segment) = match client {
+        // With the `{volatile}file` below this is the test sync point
+        // "Served and cached file" (`tests/integration/`); keep the wording
+        // stable.
         CompletionClient::Served(Served { bytes, partial: _ }) => (
             "Served and cached",
             Some(rate_log::client_segment(*bytes, rates.client_window())),

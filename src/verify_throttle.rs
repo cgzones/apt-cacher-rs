@@ -8,9 +8,10 @@
 //! for an exponentially growing window (doubling per consecutive failure,
 //! capped). A successful commit clears the entry.
 //!
-//! Keyed like `active_downloads`: `(Mirror, debname, CacheLayout)`. Two
-//! aliases of the same physical mirror therefore throttle independently --
-//! the same granularity trade-off `CacheEntryKey` makes.
+//! Keyed like `active_downloads`: `(Mirror, debname, CacheLayout)`, where
+//! `Mirror` is the alias-resolved canonical mirror
+//! (`request_dispatch::decide_request`), so every alias of a mirror shares
+//! one throttle entry.
 //!
 //! Time is tracked on `coarsetime` (the crate-preferred clock); its ~1ms
 //! resolution is irrelevant for second-scale backoff windows. The public
