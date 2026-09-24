@@ -587,6 +587,11 @@ fn build_upstream_group(g: &mut Groups) {
             WarnNonzero(metrics::UPSTREAM_TLS_FAILED.get()),
         );
         t.row_tip(
+            "Pipe Resizes Refused (splice)",
+            "Plain-HTTP download pipes the kernel refused to grow to 1 MiB (two per download): the service user's pipe quota fs.pipe-user-pages-soft is exhausted, or fs.pipe-max-size is below 1 MiB. Those downloads write the cache every few KiB instead of every MiB.",
+            WarnNonzero(metrics::PIPE_RESIZE_REFUSED.get()),
+        );
+        t.row_tip(
             "Timeouts (connect)",
             "Configured-timeout firings while connecting to an upstream mirror.",
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.get(),

@@ -110,10 +110,24 @@ fn create_pipe() -> std::io::Result<(pipe::Sender, pipe::Receiver)> {
     // Try to increase pipe buffer size; ignore failure (non-fatal, just fewer bytes per round-trip)
     static_assert!(PIPE_BUFFER_SIZE > 0);
     if let Err(errno) = fcntl(sender.as_fd(), FcntlArg::F_SETPIPE_SZ(PIPE_BUFFER_SIZE)) {
-        warn_once_or_info!(
-            "splice proxy: failed to increase the pipe buffer size; continuing with the default size:  {}",
-            ErrorReport(&errno)
-        );
+        // `EPERM` is the kernel's quota answer for an unprivileged user: the
+        // pipe keeps its default size, which a user already over the quota
+        // got at creation as just two pages. Each download over the quota
+        // then lands a cache batch every few KiB, so the operator needs the
+        // cause and a count, not a generic resize failure.
+        if errno == nix::errno::Errno::EPERM {
+            metrics::PIPE_RESIZE_REFUSED.increment();
+            warn_once_or_info!(
+                "splice proxy: the kernel refused to grow a download pipe to {size} (the service user's pipe quota fs.pipe-user-pages-soft is exhausted, or fs.pipe-max-size is below {size}); continuing with the default pipe size, which lands cache writes every few KiB instead of every {size}. Each concurrent plain-HTTP download reserves two such pipes: raise fs.pipe-user-pages-soft or lower max_upstream_downloads:  {}",
+                ErrorReport(&errno),
+                size = HumanFmt::Size(PIPE_BUFFER_SIZE.unsigned_abs().into()),
+            );
+        } else {
+            warn_once_or_info!(
+                "splice proxy: failed to increase the pipe buffer size; continuing with the default size:  {}",
+                ErrorReport(&errno)
+            );
+        }
     } else if cfg!(debug_assertions) {
         let receiver_buf_size = fcntl(receiver.as_fd(), FcntlArg::F_GETPIPE_SZ)?;
 

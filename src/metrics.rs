@@ -326,6 +326,14 @@ pub(crate) static UPSTREAM_TLS_FAILED: Counter = Counter::new();
 /// Splice clients demoted to ordinary cached-file delivery.
 pub(crate) static CLIENTS_DEMOTED: Counter = Counter::new();
 
+/// Zero-copy download pipes the kernel refused to grow to 1 MiB (`EPERM`
+/// from `F_SETPIPE_SZ`): the service user's pipe quota
+/// (`fs.pipe-user-pages-soft`) is exhausted, or `fs.pipe-max-size` is below
+/// 1 MiB. Counted per pipe, two per plain-HTTP download; each refused pipe
+/// keeps its small default size, so its download flushes to the cache every
+/// few KiB instead of every MiB.
+pub(crate) static PIPE_RESIZE_REFUSED: Counter = Counter::new();
+
 /// Total body bytes pulled from upstream (sum across all backends).
 pub(crate) static BYTES_DOWNLOADED_UPSTREAM: Accumulator = Accumulator::new();
 
