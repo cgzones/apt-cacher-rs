@@ -76,9 +76,9 @@ use crate::{
     },
     global_config, global_webif_hosts,
     http_helpers::{
-        ConnectionAction, ConnectionVersion, WritePhase, find_header, find_header_end,
-        leading_empty_lines, write_304_response, write_416_response, write_all_to_stream,
-        write_invalid_response, write_response_headers,
+        ConnectionAction, ConnectionVersion, WritePhase, find_header_end, leading_empty_lines,
+        write_304_response, write_416_response, write_all_to_stream, write_invalid_response,
+        write_response_headers,
     },
     http_range::format_http_date,
     humanfmt::HumanFmt,
@@ -715,7 +715,23 @@ fn compute_conn_action(
         return ConnectionAction::Close;
     }
 
-    if let Some(hvalue) = find_header(req.headers, &CONNECTION) {
+    // RFC 9112 section 9.6: a `close` option anywhere in the field -- across
+    // repeated `Connection` lines, after other options -- closes the
+    // connection. That is at least as strict as hyper, which may serve this
+    // request after a handoff: it reads the lines in order, so a later
+    // `keep-alive` line reopens an HTTP/1.1 connection an earlier `close`
+    // line closed. Whenever this keeps the connection alive, hyper does too,
+    // which is what the single-request handoff relies on; the converse
+    // disagreement only means a whole-connection handoff hyper keeps serving.
+    let mut keep_alive = false;
+    for header in req
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case(CONNECTION.as_str()))
+    {
+        let Ok(hvalue) = str::from_utf8(header.value) else {
+            continue;
+        };
         for p in hvalue.split(',') {
             let p = p.trim();
 
@@ -723,13 +739,16 @@ fn compute_conn_action(
                 return ConnectionAction::Close;
             }
             if p.eq_ignore_ascii_case("keep-alive") {
-                return ConnectionAction::KeepAlive;
+                keep_alive = true;
+            } else if !p.is_empty() {
+                warn_once_or_debug!(
+                    "Ignoring unrecognized Connection header value `{p}` from client {client}"
+                );
             }
-
-            warn_once_or_debug!(
-                "Ignoring unrecognized Connection header value `{p}` from client {client}"
-            );
         }
+    }
+    if keep_alive {
+        return ConnectionAction::KeepAlive;
     }
 
     // Use the protocol default
@@ -2843,5 +2862,70 @@ mod transfer_tests {
             "retain the partial delivery progress: {transferred}"
         );
         assert!(!failure.is_peer_disconnect());
+    }
+}
+
+/// `Connection` option precedence. Whenever it keeps the connection alive,
+/// hyper must too, for the single-request handoff; it may close where hyper
+/// would not.
+#[cfg(test)]
+mod conn_action_tests {
+    use super::{ClientInfo, ConnectionAction, ConnectionVersion, compute_conn_action};
+
+    fn action(head: &[u8]) -> ConnectionAction {
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        let mut req = httparse::Request::new(&mut headers);
+        let status = req.parse(head).unwrap();
+        assert!(status.is_complete(), "the test head is complete");
+        let version = if req.version == Some(0) {
+            ConnectionVersion::Http10
+        } else {
+            ConnectionVersion::Http11
+        };
+        compute_conn_action(&req, version, &ClientInfo::new_cleanup())
+    }
+
+    #[test]
+    fn close_wins_over_keep_alive_in_one_field() {
+        assert_eq!(
+            action(b"GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n"),
+            ConnectionAction::Close
+        );
+    }
+
+    #[test]
+    fn close_on_a_later_connection_line_wins() {
+        assert_eq!(
+            action(b"GET / HTTP/1.1\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n"),
+            ConnectionAction::Close
+        );
+    }
+
+    /// A deliberate divergence: hyper lets the later `keep-alive` line reopen
+    /// this HTTP/1.1 connection. Closing is the RFC reading and the safe side
+    /// (the request takes the whole-connection handoff).
+    #[test]
+    fn close_on_an_earlier_connection_line_still_wins() {
+        assert_eq!(
+            action(b"GET / HTTP/1.1\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n"),
+            ConnectionAction::Close
+        );
+    }
+
+    #[test]
+    fn keep_alive_after_other_options_keeps_an_http10_connection() {
+        assert_eq!(
+            action(b"GET / HTTP/1.0\r\nConnection: Upgrade, keep-alive\r\n\r\n"),
+            ConnectionAction::KeepAlive
+        );
+    }
+
+    #[test]
+    fn protocol_defaults_apply_without_a_connection_option() {
+        assert_eq!(
+            action(b"GET / HTTP/1.1\r\nConnection: ,\r\n\r\n"),
+            ConnectionAction::KeepAlive
+        );
+        assert_eq!(action(b"GET / HTTP/1.0\r\n\r\n"), ConnectionAction::Close);
     }
 }

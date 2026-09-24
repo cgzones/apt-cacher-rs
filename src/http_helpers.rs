@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Represents the action to take after sending a response.
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectionAction {
     Close,
     KeepAlive,
