@@ -121,10 +121,13 @@ fn conclude(
         Consequence::CloseConnection => f.write_str("; closing the connection"),
         Consequence::Abandon => f.write_str("; abandoning the download"),
     });
-    failure.conclude(format_args!(
-        "Aborted downloading file {} from mirror {}{consequence}",
-        key.debname, key.mirror,
-    ))
+    failure.conclude(
+        key.mirror,
+        format_args!(
+            "Aborted downloading file {} from mirror {}{consequence}",
+            key.debname, key.mirror,
+        ),
+    )
 }
 
 /// Proof that an [`InitBarrier`] reached a sink: [`InitBarrier::finished`],
@@ -930,9 +933,13 @@ mod tests {
     use crate::{config::ClientHost, deb_mirror::MirrorKind, test_support::levels_during};
 
     fn key(debname: &str) -> CacheEntryKey {
+        key_on("guards.test", debname)
+    }
+
+    fn key_on(host: &str, debname: &str) -> CacheEntryKey {
         CacheEntryKey {
             mirror: crate::deb_mirror::Mirror::new(
-                ClientHost::new(String::from("guards.test")).expect("valid host"),
+                ClientHost::new(String::from(host)).expect("valid host"),
                 std::num::NonZero::new(80),
                 "/debian".into(),
                 MirrorKind::Structured,
@@ -1468,10 +1475,12 @@ mod tests {
     }
 
     #[test]
-    fn connect_failures_are_once_gated_and_body_failures_are_not() {
+    fn connect_failures_are_once_gated_per_host_and_body_failures_are_not() {
         use crate::{transfer_error::UpstreamError, upstream_retry::RetryLimit};
 
-        let key = key("gated.deb");
+        // Hosts no other test uses, so this test owns their gates.
+        let key = key_on("gated-a.guards.test", "gated.deb");
+        let other = key_on("gated-b.guards.test", "gated.deb");
         let connect = || {
             DownloadFailure::Upstream(UpstreamError::connect(
                 "connect upstream",
@@ -1484,18 +1493,20 @@ mod tests {
         let levels = levels_during(|| {
             drop(conclude(connect(), key.as_ref(), Consequence::Respond));
             drop(conclude(connect(), key.as_ref(), Consequence::Respond));
+            drop(conclude(connect(), other.as_ref(), Consequence::Respond));
             drop(conclude(body(), key.as_ref(), Consequence::CloseConnection));
             drop(conclude(body(), key.as_ref(), Consequence::CloseConnection));
         });
-        // The gate is process-global: another test may have fired it first, so
-        // only the relative shape is asserted.
-        assert_eq!(levels.len(), 4, "{levels:?}");
-        assert!(
-            levels[1] == tracing::Level::INFO,
-            "second connect failure demoted: {levels:?}"
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::WARN, // first connect failure of host a
+                tracing::Level::INFO, // its repeat
+                tracing::Level::WARN, // host b's first is not demoted by a's
+                tracing::Level::WARN, // body failures are ungated
+                tracing::Level::WARN,
+            ]
         );
-        assert_eq!(levels[2], tracing::Level::WARN);
-        assert_eq!(levels[3], tracing::Level::WARN);
     }
 
     /// Before rename, the cached file is the one the memoized validators

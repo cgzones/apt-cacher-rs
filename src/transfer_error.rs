@@ -13,21 +13,16 @@
 
 #[cfg(feature = "sendfile")]
 use std::time::Duration;
-use std::{
-    convert::Infallible,
-    error::Error,
-    fmt, io,
-    path::Path,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{convert::Infallible, error::Error, fmt, io, path::Path, sync::Arc};
 
 use http::StatusCode;
 
 #[cfg(feature = "sendfile")]
 use crate::humanfmt::HumanFmt;
 use crate::{
+    deb_mirror::Mirror,
     error::{ErrorReport, is_peer_disconnect},
-    log_once::{Logged, Reported},
+    log_once::{KeyedGate, Logged, Reported},
     metrics::{self, Counter},
     rate_checker::InsufficientRate,
     upstream_retry::RetryStop,
@@ -50,8 +45,8 @@ pub(crate) enum Severity {
 }
 
 /// Where in the upstream exchange a failure happened. Connect and Head failures
-/// are once-gated by [`DownloadFailure::conclude`] (a down mirror must not
-/// flood WARN); Body failures are ungated (each stalling mirror is operator
+/// are once-gated per upstream host by [`DownloadFailure::conclude`] (a down
+/// mirror must not flood WARN); Body failures are ungated (each stalling mirror is operator
 /// signal).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
@@ -488,10 +483,17 @@ impl EndsDelivery for HeaderWriteFailure {
     }
 }
 
-/// One process-wide gate for every connect/head failure of every download: a
-/// mirror that is down fails identically for every request in flight, so the
-/// gate belongs to the condition, not to a call site.
-static UPSTREAM_CONNECT_GATE: AtomicBool = AtomicBool::new(false);
+/// One gate per upstream host (the mirror's authority, `host[:port]`) for the
+/// connect/head failures of every download: a host that is down fails
+/// identically for every request in flight, so the gate belongs to the
+/// condition, not to a call site -- and one host's outage must not demote
+/// another's first failure. Keyed by authority, not by the whole mirror: the
+/// path is the client's choice, reachability is the host's.
+static UPSTREAM_HOST_GATE: KeyedGate = KeyedGate::new(UPSTREAM_HOST_GATE_CAP);
+
+/// Distinct upstream hosts [`UPSTREAM_HOST_GATE`] warns for before every
+/// further host's first failure reads at INFO too.
+const UPSTREAM_HOST_GATE_CAP: usize = 256;
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub(crate) enum DownloadFailure {
@@ -541,16 +543,25 @@ impl DownloadFailure {
         }
     }
 
-    /// End the download: count the cause, log `{context}:  {report}` and
-    /// prove it. A connect or head failure shares one process-wide WARN-once
-    /// gate (then INFO); every other cause logs at [`Self::severity`].
-    pub(crate) fn conclude(self, context: fmt::Arguments<'_>) -> ReportedDownloadFailure {
+    /// End the download from `mirror`: count the cause, log
+    /// `{context}:  {report}` and prove it. A connect or head failure is
+    /// WARN once per upstream host (then INFO); every other cause logs at
+    /// [`Self::severity`].
+    pub(crate) fn conclude(
+        self,
+        mirror: &Mirror,
+        context: fmt::Arguments<'_>,
+    ) -> ReportedDownloadFailure {
         self.record_terminal();
         let line = fmt::from_fn(|f| write!(f, "{context}:  {}", ErrorReport(&self)));
         let logged = if matches!(&self, Self::Upstream(error)
             if matches!(error.phase(), Phase::Connect | Phase::Head))
         {
-            Logged::warn_once_or_info(&UPSTREAM_CONNECT_GATE, format_args!("{line}"))
+            Logged::warn_once_or_info_keyed(
+                &UPSTREAM_HOST_GATE,
+                mirror.format_authority(),
+                format_args!("{line}"),
+            )
         } else {
             Logged::at(self.severity(), format_args!("{line}"))
         };

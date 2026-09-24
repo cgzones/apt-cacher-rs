@@ -3,7 +3,9 @@
 //! plus [`info_or_warn!`](crate::info_or_warn), which carries no gate at all.
 //!
 //! Each `*_once` macro plants its own `static` gate, so "once" means once per
-//! call site, not once per process. `docs/logging.md` is the binding policy
+//! call site, not once per process. A [`KeyedGate`] is the exception: one
+//! gate per key, for a fact that repeats per key (an unreachable upstream
+//! host) rather than per call site. `docs/logging.md` is the binding policy
 //! for which level each variant carries.
 
 use tracing::error;
@@ -25,6 +27,37 @@ pub(crate) fn first_fire(fired: &std::sync::atomic::AtomicBool) -> bool {
         && fired
             .compare_exchange(false, true, Relaxed, Relaxed)
             .is_ok()
+}
+
+/// A once-gate per key: [`KeyedGate::first_fire`] is `true` exactly once for
+/// each key. Bounded: once `cap` distinct keys have fired, every new key reads
+/// as already fired, so a stream of ever-new keys -- host names a client picks
+/// under a wildcard `allowed_mirrors` entry -- cannot turn the gate into one
+/// WARN per request.
+pub(crate) struct KeyedGate {
+    fired: parking_lot::Mutex<Vec<Box<str>>>,
+    cap: usize,
+}
+
+impl KeyedGate {
+    pub(crate) const fn new(cap: usize) -> Self {
+        Self {
+            fired: parking_lot::const_mutex(Vec::new()),
+            cap,
+        }
+    }
+
+    /// `true` on `key`'s first use while fewer than `cap` keys have fired.
+    /// Only failure paths consult it, so a linear scan over at most `cap`
+    /// keys under the lock costs nothing that matters.
+    pub(crate) fn first_fire(&self, key: &str) -> bool {
+        let mut fired = self.fired.lock();
+        if fired.len() >= self.cap || fired.iter().any(|seen| **seen == *key) {
+            return false;
+        }
+        fired.push(key.into());
+        true
+    }
 }
 
 /// Emit one message at INFO when `$expected` holds and at WARN otherwise.
@@ -213,13 +246,30 @@ impl Logged {
     /// WARN on `fired`'s first use, INFO after. The body of
     /// [`crate::warn_once_or_info_logged!`], where `fired` is that call site's
     /// own once-gate, so per-site flood control is unchanged from
-    /// [`crate::warn_once_or_info!`]; a caller handing in a shared gate
-    /// deliberately collapses every site that uses it into one condition.
+    /// [`crate::warn_once_or_info!`].
+    #[cfg_attr(
+        not(any(feature = "splice", test)),
+        expect(dead_code, reason = "only splice's throw sites use the logged macro")
+    )]
     pub(crate) fn warn_once_or_info(
         fired: &'static std::sync::atomic::AtomicBool,
         args: std::fmt::Arguments<'_>,
     ) -> Self {
         warn_once_or_info_gated(fired, args);
+        Self(())
+    }
+
+    /// WARN on `key`'s first use of `gate`, INFO after.
+    pub(crate) fn warn_once_or_info_keyed(
+        gate: &KeyedGate,
+        key: &str,
+        args: std::fmt::Arguments<'_>,
+    ) -> Self {
+        if gate.first_fire(key) {
+            tracing::warn!("{args}");
+        } else {
+            tracing::info!("{args}");
+        }
         Self(())
     }
 }
@@ -253,6 +303,48 @@ mod tests {
     fn a_pre_fired_gate_never_fires() {
         let gate = AtomicBool::new(true);
         assert!(!first_fire(&gate));
+    }
+
+    #[test]
+    fn keyed_gate_fires_once_per_key() {
+        let gate = KeyedGate::new(8);
+        assert!(gate.first_fire("a"));
+        assert!(
+            gate.first_fire("b"),
+            "a spent key does not spend its sibling"
+        );
+        assert!(!gate.first_fire("a"));
+        assert!(!gate.first_fire("b"));
+    }
+
+    #[test]
+    fn keyed_gate_stops_firing_at_its_cap() {
+        let gate = KeyedGate::new(2);
+        assert!(gate.first_fire("a"));
+        assert!(gate.first_fire("b"));
+        assert!(
+            !gate.first_fire("c"),
+            "a full gate treats a new key as fired"
+        );
+        assert!(!gate.first_fire("a"));
+    }
+
+    #[test]
+    fn logged_warn_once_or_info_keyed_demotes_per_key() {
+        static GATE: KeyedGate = KeyedGate::new(8);
+        let levels = levels_during(|| {
+            let _a = Logged::warn_once_or_info_keyed(&GATE, "a", format_args!("x"));
+            let _a2 = Logged::warn_once_or_info_keyed(&GATE, "a", format_args!("x"));
+            let _b = Logged::warn_once_or_info_keyed(&GATE, "b", format_args!("x"));
+        });
+        assert_eq!(
+            levels,
+            [
+                tracing::Level::WARN,
+                tracing::Level::INFO,
+                tracing::Level::WARN
+            ]
+        );
     }
 
     #[test]
