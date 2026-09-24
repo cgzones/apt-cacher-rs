@@ -5,7 +5,9 @@ use std::path::Path;
 use hashbrown::HashMap;
 use tracing::{debug, error, trace};
 
-use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker};
+use crate::cache_walk::{
+    AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
+};
 use crate::cleanup::engine::{CleanupUnitError, SpanClass};
 use crate::cleanup::model::{TreeSpec, Walk};
 use crate::deb_mirror::{NestedMirrorRelation, is_deb_package, nested_mirror_relation};
@@ -62,6 +64,7 @@ static RECONCILE_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Abort("abandoning this cleanup unit"),
     entry_failure: "retaining it and excluding it from cleanup",
     non_regular: "removing it",
+    anomalies: AnomalyLevel::Warn,
 };
 
 /// Unified on-disk candidate scanner, driven by the unit's [`TreeSpec`].

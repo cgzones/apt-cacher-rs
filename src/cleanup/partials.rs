@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use tracing::{debug, error};
 
 use crate::cache_quota::accounted_size;
-use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker};
+use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker};
 use crate::error::ErrorReport;
 use crate::metrics;
 use crate::partial_claim::{FileId, Reap, reap_unclaimed};
@@ -66,6 +66,7 @@ static TMP_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Continue("leaving its unread entries unreaped this cycle"),
     entry_failure: "retaining it this cycle",
     non_regular: FOREIGN_CONSEQUENCE,
+    anomalies: AnomalyLevel::Warn,
 };
 
 /// Remove stale entries from a single `tmp/` directory.

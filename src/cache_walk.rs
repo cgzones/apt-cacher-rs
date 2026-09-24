@@ -10,9 +10,9 @@
 //!   [`DirFailure`] says whether the walk ends or carries on.
 //! - A vanished entry or directory (`NotFound` after it was listed) is a
 //!   concurrent removal, not an I/O failure: `debug!`, no counter.
-//! - A symlink / FIFO / socket / device is reported on sight (`warn!` +
-//!   `CACHE_NON_REGULAR`) and still handed to the caller as
-//!   [`EntryKind::NonRegular`] so cleanup can unlink it.
+//! - A symlink / FIFO / socket / device is reported on sight (at the walk's
+//!   [`AnomalyLevel`] + `CACHE_NON_REGULAR`) and still handed to the caller
+//!   as [`EntryKind::NonRegular`] so cleanup can unlink it.
 //! - A directory or regular file is *classified* by the caller: what is a
 //!   stray entry depends on where the walk is (a `dists/` directory is fine
 //!   in a mirror root, not in a pool).  The caller reports one via
@@ -66,6 +66,23 @@ pub(crate) struct WalkContext {
     /// device, which the walker reports on sight (`"not counting it towards
     /// the cache size"`, `"removing it"`).
     pub(crate) non_regular: &'static str,
+    /// Level of the anomaly lines: a non-regular entry and
+    /// [`Entry::report_unexpected`].
+    pub(crate) anomalies: AnomalyLevel,
+}
+
+/// Level of a walk's anomaly lines (`docs/logging.md`, "Flood control"):
+/// a plain `warn!` per artifact is earned only by a walk whose rate no
+/// client drives.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AnomalyLevel {
+    /// A walk run once per startup scan or cleanup cycle: each line names
+    /// one artifact, bounded by cache contents.
+    Warn,
+    /// A walk a client re-triggers (the dashboard, on every refresh past
+    /// its cache TTL): it restates facts the scan and cleanup already
+    /// warned about.
+    Debug,
 }
 
 /// Policy for a directory that cannot be read or iterated.
@@ -122,7 +139,7 @@ pub(crate) enum EntryKind {
     File,
     Dir,
     /// Symlink, FIFO, socket or device: never legitimate in the cache tree.
-    /// Already reported (`warn!` + `CACHE_NON_REGULAR`) when yielded.
+    /// Already reported (+ `CACHE_NON_REGULAR`) when yielded.
     NonRegular,
 }
 
@@ -310,17 +327,26 @@ async fn classify(ctx: &'static WalkContext, dir_entry: &DirEntry) -> Option<Ent
         Ok(ft) if ft.is_dir() => Some(EntryKind::Dir),
         Ok(ft) => {
             metrics::CACHE_NON_REGULAR.increment();
-            warn!(
-                "Unrecognized {} entry `{}` in {}; {}",
-                if ft.is_symlink() {
-                    "symlink"
-                } else {
-                    "non-regular"
-                },
-                dir_entry.path().display(),
-                ctx.what,
-                ctx.non_regular
-            );
+            let kind = if ft.is_symlink() {
+                "symlink"
+            } else {
+                "non-regular"
+            };
+            let path = dir_entry.path();
+            match ctx.anomalies {
+                AnomalyLevel::Warn => warn!(
+                    "Unrecognized {kind} entry `{}` in {}; {}",
+                    path.display(),
+                    ctx.what,
+                    ctx.non_regular
+                ),
+                AnomalyLevel::Debug => debug!(
+                    "Unrecognized {kind} entry `{}` in {}; {}",
+                    path.display(),
+                    ctx.what,
+                    ctx.non_regular
+                ),
+            }
             Some(EntryKind::NonRegular)
         }
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -403,8 +429,8 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
 
     /// Report a directory or regular file the caller's layout does not
     /// allow here: bumps `CACHE_DIRECTORY_UNEXPECTED` /
-    /// `CACHE_UNEXPECTED_REGULAR` and warns with the caller's consequence
-    /// clause (`"not counting it or its contents towards the cache size"`,
+    /// `CACHE_UNEXPECTED_REGULAR` and logs at the walk's [`AnomalyLevel`]
+    /// with the caller's consequence clause (`"not counting it or its contents towards the cache size"`,
     /// `"retaining it and excluding its contents from cleanup"`).  A
     /// non-regular entry was already reported when it was yielded, so this
     /// is a no-op for one.
@@ -420,11 +446,19 @@ impl<T: Copy + Send + Sync> Entry<'_, T> {
             }
             EntryKind::NonRegular => return,
         };
-        warn!(
-            "Unrecognized {kind} entry `{}` in {}; {consequence}",
-            self.path().display(),
-            self.ctx.what
-        );
+        let path = self.path();
+        match self.ctx.anomalies {
+            AnomalyLevel::Warn => warn!(
+                "Unrecognized {kind} entry `{}` in {}; {consequence}",
+                path.display(),
+                self.ctx.what
+            ),
+            AnomalyLevel::Debug => debug!(
+                "Unrecognized {kind} entry `{}` in {}; {consequence}",
+                path.display(),
+                self.ctx.what
+            ),
+        }
     }
 
     /// `lstat` the entry.  `None` means it dropped out of the walk: it
@@ -485,6 +519,7 @@ mod tests {
         dir_failure: DirFailure::Continue("skipping its unread entries"),
         entry_failure: "skipping it",
         non_regular: "noting it",
+        anomalies: AnomalyLevel::Warn,
     };
 
     static ABORT: WalkContext = WalkContext {
@@ -492,6 +527,7 @@ mod tests {
         dir_failure: DirFailure::Abort("abandoning the test walk"),
         entry_failure: "skipping it",
         non_regular: "noting it",
+        anomalies: AnomalyLevel::Warn,
     };
 
     /// Drive a walk to completion, descending into every directory named in

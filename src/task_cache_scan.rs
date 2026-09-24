@@ -23,7 +23,9 @@ use tracing::{debug, error, trace};
 use crate::{
     cache_paths::{CachePaths, KNOWN_MIRROR_SUBDIRS, SUBDIR_FLAT_BYHASH, SUBDIR_TMP},
     cache_quota::accounted_size,
-    cache_walk::{DirFailure, Entry, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker},
+    cache_walk::{
+        AnomalyLevel, DirFailure, Entry, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
+    },
     config::CacheHost,
     database::{Database, MirrorEntry},
     deb_mirror::{
@@ -107,6 +109,7 @@ static CACHE_ROOT_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Abort("abandoning the cache scan"),
     entry_failure: "excluding it from the cache size",
     non_regular: "not counting it towards the cache size",
+    anomalies: AnomalyLevel::Warn,
 };
 
 static MIRROR_WALK: WalkContext = WalkContext {
@@ -114,6 +117,7 @@ static MIRROR_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Continue("excluding its unread entries from the cache size"),
     entry_failure: "excluding it from the cache size",
     non_regular: "not counting it towards the cache size",
+    anomalies: AnomalyLevel::Warn,
 };
 
 static FLAT_WALK: WalkContext = WalkContext {
@@ -121,6 +125,7 @@ static FLAT_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Continue("excluding its unread entries from the cache size"),
     entry_failure: "excluding it from the cache size",
     non_regular: "not counting it towards the cache size",
+    anomalies: AnomalyLevel::Warn,
 };
 
 /// Returns the size in bytes and the file count of the entire cache.

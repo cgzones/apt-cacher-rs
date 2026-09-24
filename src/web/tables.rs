@@ -15,7 +15,7 @@ use tracing::error;
 
 use crate::{
     cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH},
-    cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker},
+    cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker},
     database::{ClientStatEntry, MirrorStatEntry, OriginEntry, TopPackageEntry},
     deb_mirror::is_deb_package,
     error::ErrorReport,
@@ -184,6 +184,7 @@ static DASHBOARD_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Continue("excluding its unread entries from the reported cache size"),
     entry_failure: "excluding it from the reported cache size",
     non_regular: "excluding it from the reported cache size",
+    anomalies: AnomalyLevel::Debug,
 };
 
 /// Tally every regular file below `path` for the dashboard's Mirrors table.
@@ -191,10 +192,13 @@ static DASHBOARD_WALK: WalkContext = WalkContext {
 /// Unlike the startup scan this walk knows nothing about the layout: every
 /// directory is descended into (`tmp/` and nested mirrors included), and
 /// every regular file counts.  The walker's tag remembers whether the
-/// directory sits under a `by-hash/` subtree.  Anomalies (a symlink, a stat
-/// failure, an unreadable subdirectory) are logged and counted by the walker
-/// like everywhere else and the walk carries on, so one bad entry no longer
-/// drops the whole mirror from the table.
+/// directory sits under a `by-hash/` subtree.  Failures (a stat failure, an
+/// unreadable subdirectory) are logged and counted by the walker like
+/// everywhere else and the walk carries on, so one bad entry no longer drops
+/// the whole mirror from the table.  A symlink or other non-regular entry is
+/// counted but logged at `debug` only ([`AnomalyLevel::Debug`]): a viewer's
+/// refresh re-runs this walk, and the startup scan and cleanup already warn
+/// about the same entry.
 async fn mirror_directory_size(path: &Path) -> DirStats {
     let mut stats = DirStats::default();
     let mut walker = Walker::new(path, &DASHBOARD_WALK, OnMissing::Tolerate, false);

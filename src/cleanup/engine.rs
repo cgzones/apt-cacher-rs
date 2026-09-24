@@ -12,7 +12,9 @@ use crate::{
     AppState,
     cache_layout::CacheLayout,
     cache_quota::accounted_size,
-    cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker},
+    cache_walk::{
+        AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
+    },
     config::Config,
     database::{MirrorEntry, OriginEntry},
     deb_mirror::{Mirror, MirrorKind, UriFormat as _},
@@ -627,6 +629,7 @@ static BYHASH_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Abort("abandoning its cleanup this cycle"),
     entry_failure: "retaining it",
     non_regular: "removing it",
+    anomalies: AnomalyLevel::Warn,
 };
 
 /// Walk one by-hash directory, classify each regular entry against `reference`,

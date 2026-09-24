@@ -6,7 +6,9 @@ use hashbrown::HashSet;
 use tracing::{debug, error, warn};
 
 use crate::cache_layout::CacheLayout;
-use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker};
+use crate::cache_walk::{
+    AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, WalkOutcome, Walker,
+};
 use crate::database::OriginEntry;
 use crate::error::ErrorReport;
 use crate::fs_open::probe_dir;
@@ -74,6 +76,7 @@ static RELEASE_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Abort("falling back to age-based retention for its by-hash tree"),
     entry_failure: "ignoring it for by-hash reconciliation",
     non_regular: "ignoring it for by-hash reconciliation",
+    anomalies: AnomalyLevel::Warn,
 };
 
 /// Build the union by-hash digest set for one by-hash directory from every

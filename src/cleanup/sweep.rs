@@ -7,7 +7,7 @@ use tracing::{debug, error, warn};
 
 use crate::cache_layout::{CacheEntryKeyRef, CacheLayout};
 use crate::cache_quota::accounted_size;
-use crate::cache_walk::{DirFailure, EntryKind, OnMissing, WalkContext, Walker};
+use crate::cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker};
 use crate::deb_mirror::{Mirror, is_deb_package};
 use crate::error::ErrorReport;
 use crate::humanfmt::HumanFmt;
@@ -232,6 +232,7 @@ static METADATA_WALK: WalkContext = WalkContext {
     dir_failure: DirFailure::Continue("leaving its unread entries unswept this cycle"),
     entry_failure: "retaining it",
     non_regular: "removing it",
+    anomalies: AnomalyLevel::Warn,
 };
 
 /// Age out stale top-level index files in a metadata directory, dropping any
