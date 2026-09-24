@@ -180,41 +180,42 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
 
 /// Outcome of a single [`read_line_capped`] call.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum CappedLine {
+pub(crate) enum CappedLine<'a> {
     /// End of stream reached with no data read.
     Eof,
-    /// A line (including any trailing newline) was appended to the caller's
-    /// buffer.
-    Line,
+    /// A line, including any trailing newline, borrowed from the caller's
+    /// `line_buf`.
+    Line(&'a str),
     /// A line longer than `max_len` was drained (its trailing newline, if
-    /// any, was consumed) without appending anything to the buffer. The
+    /// any, was consumed) without keeping any of it. The
     /// `Packages` parser uses this to skip fields it does not care about
     /// (e.g. multi-kilobyte `Provides:` lists) without aborting the file.
     Skipped,
 }
 
-/// Read one line (through the next `\n`, inclusive) from `reader`, appending it
-/// to `buf`. A line longer than `max_len` bytes is drained from the reader and
+/// Read one line (through the next `\n`, inclusive) from `reader` into
+/// `line_buf` and hand it out as [`CappedLine::Line`], borrowed from that
+/// buffer: the line is copied once, out of the reader's buffer, and never
+/// again. A line longer than `max_len` bytes is drained from the reader and
 /// reported as [`CappedLine::Skipped`] — the absolute decompressed-size cap is
 /// enforced separately by [`LimitedReader`], so the per-line cap only exists
 /// to bound the in-memory line buffer. Fails with [`io::ErrorKind::InvalidData`]
 /// if the bytes read are not valid UTF-8.
 ///
 /// `line_buf` is a caller-owned scratch buffer whose capacity is reused across
-/// calls; the body of a real `Packages` file is hundreds of thousands of short
-/// lines, so allocating a fresh `Vec` per call would dominate cleanup-scan
-/// allocator traffic. The buffer is cleared on entry; its prior contents are
-/// not preserved.
+/// calls; the body of a real `Packages` file is millions of short lines, so
+/// allocating a fresh `Vec` per call would dominate cleanup-scan allocator
+/// traffic. The buffer is cleared on entry; its prior contents are not
+/// preserved.
 ///
 /// A bounded replacement for [`tokio::io::AsyncBufReadExt::read_line`], which
 /// allocates without limit when an upstream metadata file contains a line with
 /// no newline terminator.
-pub(crate) async fn read_line_capped<R>(
+pub(crate) async fn read_line_capped<'a, R>(
     reader: &mut R,
-    buf: &mut String,
-    line_buf: &mut Vec<u8>,
+    line_buf: &'a mut Vec<u8>,
     max_len: usize,
-) -> io::Result<CappedLine>
+) -> io::Result<CappedLine<'a>>
 where
     R: AsyncBufRead + Unpin + ?Sized,
 {
@@ -228,7 +229,7 @@ where
         if available.is_empty() {
             break false; // EOF
         }
-        if let Some(idx) = available.iter().position(|&b| b == b'\n') {
+        if let Some(idx) = memchr::memchr(b'\n', available) {
             let take = idx + 1;
             if line_buf.len() + take > max_len {
                 reader.consume(take);
@@ -259,8 +260,7 @@ where
             "metadata line is not valid UTF-8",
         )
     })?;
-    buf.push_str(text);
-    Ok(CappedLine::Line)
+    Ok(CappedLine::Line(text))
 }
 
 /// Compression of a `Packages` file.
@@ -411,7 +411,7 @@ where
         if available.is_empty() {
             return Ok(());
         }
-        if let Some(idx) = available.iter().position(|&b| b == b'\n') {
+        if let Some(idx) = memchr::memchr(b'\n', available) {
             reader.consume(idx + 1);
             return Ok(());
         }
@@ -539,39 +539,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_line_capped_appends_and_keeps_blank_lines() {
+    async fn read_line_capped_keeps_blank_lines() {
         let input = b"first\n\nsecond\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::from("kept: ");
         let mut line_buf = Vec::new();
 
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
-        assert!(matches!(result, CappedLine::Line));
-        assert_eq!(buf, "kept: first\n", "the line is appended, not assigned");
+        assert!(matches!(result, CappedLine::Line("first\n")), "{result:?}");
 
-        buf.clear();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
         // `StanzaStream` flushes its stanza on a blank line, so a blank line
         // must arrive as a `Line` carrying "\n" - never as `Eof`.
-        assert!(matches!(result, CappedLine::Line));
-        assert_eq!(buf, "\n");
+        assert!(matches!(result, CappedLine::Line("\n")), "{result:?}");
     }
 
     #[tokio::test]
     async fn read_line_capped_reads_short_line() {
         let input = b"short line\nnext";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
-        assert!(matches!(result, CappedLine::Line));
-        assert_eq!(buf, "short line\n");
+        assert!(
+            matches!(result, CappedLine::Line("short line\n")),
+            "{result:?}"
+        );
+    }
+
+    /// A line split across several `fill_buf` refills is joined whole.
+    #[tokio::test]
+    async fn read_line_capped_joins_a_line_across_buffer_refills() {
+        let input = b"a line longer than eight bytes\nnext\n";
+        let mut reader = tokio::io::BufReader::with_capacity(8, &input[..]);
+        let mut line_buf = Vec::new();
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
+            .await
+            .expect("ok");
+        assert!(
+            matches!(result, CappedLine::Line("a line longer than eight bytes\n")),
+            "{result:?}"
+        );
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
+            .await
+            .expect("ok");
+        assert!(matches!(result, CappedLine::Line("next\n")), "{result:?}");
     }
 
     #[tokio::test]
@@ -580,21 +596,18 @@ mod tests {
         input.push(b'\n');
         input.extend_from_slice(b"next\n");
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("over-length line must be skipped, not errored");
         assert!(matches!(result, CappedLine::Skipped));
-        assert_eq!(buf, "");
 
         // The drain must consume past the newline so the next call sees the
         // following line.
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("follow-on read");
-        assert!(matches!(result, CappedLine::Line));
-        assert_eq!(buf, "next\n");
+        assert!(matches!(result, CappedLine::Line("next\n")), "{result:?}");
     }
 
     #[tokio::test]
@@ -602,15 +615,13 @@ mod tests {
         // No trailing newline anywhere — the drain reaches EOF.
         let input = vec![b'a'; 1000];
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
         assert!(matches!(result, CappedLine::Skipped));
-        assert_eq!(buf, "");
 
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("follow-on read");
         assert!(matches!(result, CappedLine::Eof));
@@ -620,13 +631,11 @@ mod tests {
     async fn read_line_capped_eof_returns_eof() {
         let input: &[u8] = b"";
         let mut reader = tokio::io::BufReader::new(input);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
         assert!(matches!(result, CappedLine::Eof));
-        assert_eq!(buf, "");
     }
 
     #[tokio::test]
@@ -634,44 +643,38 @@ mod tests {
         // 4 data bytes + '\n' = 5 bytes total == max_len
         let input = b"abcd\nmore";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 5)
+        let result = read_line_capped(&mut reader, &mut line_buf, 5)
             .await
             .expect("exact limit must be accepted");
-        assert!(matches!(result, CappedLine::Line));
-        assert_eq!(buf, "abcd\n");
+        assert!(matches!(result, CappedLine::Line("abcd\n")), "{result:?}");
     }
 
     #[tokio::test]
     async fn read_line_capped_skips_one_past_limit() {
         // 5 data bytes + '\n' = 6 bytes total, one over max_len: the line
-        // (newline included) is consumed and skipped, nothing is appended,
-        // and the reader is left at EOF.
+        // (newline included) is consumed and skipped, and the reader is left
+        // at EOF.
         let input = b"abcde\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 5)
+        let result = read_line_capped(&mut reader, &mut line_buf, 5)
             .await
             .expect("one past the limit must be skipped, not errored");
         assert!(matches!(result, CappedLine::Skipped));
-        assert_eq!(buf, "");
 
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 5)
+        let result = read_line_capped(&mut reader, &mut line_buf, 5)
             .await
             .expect("follow-on read");
         assert!(matches!(result, CappedLine::Eof));
-        assert_eq!(buf, "");
     }
 
     #[tokio::test]
     async fn read_line_capped_rejects_non_utf8() {
         let input = b"\xff\xfe\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let err = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let err = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect_err("non-UTF-8 must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -681,13 +684,14 @@ mod tests {
     async fn read_line_capped_partial_eof() {
         let input = b"no newline";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::new();
-        let result = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("ok");
-        assert!(matches!(result, CappedLine::Line));
-        assert_eq!(buf, "no newline");
+        assert!(
+            matches!(result, CappedLine::Line("no newline")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -698,20 +702,18 @@ mod tests {
         // a previously-grown allocation is reused.
         let input = b"first\nsecond\n";
         let mut reader = tokio::io::BufReader::new(&input[..]);
-        let mut buf = String::new();
         let mut line_buf = Vec::with_capacity(64);
         let cap_before = line_buf.capacity();
 
-        let _: CappedLine = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let _: CappedLine<'_> = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("first line");
-        buf.clear();
-        let _: CappedLine = read_line_capped(&mut reader, &mut buf, &mut line_buf, 64)
+        let result = read_line_capped(&mut reader, &mut line_buf, 64)
             .await
             .expect("second line");
+        assert!(matches!(result, CappedLine::Line("second\n")), "{result:?}");
 
         assert!(line_buf.capacity() >= cap_before);
-        assert_eq!(buf, "second\n");
     }
 
     #[test]

@@ -41,7 +41,7 @@ fn split_field(line: &str) -> Option<(&str, &str)> {
         return None;
     }
     let (name, value) = line.split_once(':')?;
-    Some((name, value.trim()))
+    Some((name, value.trim_ascii()))
 }
 
 /// Gate a `Filename:` field value; `Err` carries the rejected value so
@@ -370,11 +370,12 @@ impl Stanza {
 /// A line over [`MAX_METADATA_LINE_LEN`] counts as non-blank (multi-kilobyte
 /// `Provides:`/`Depends:` fields are legitimate and never a field the
 /// stanza cares about) so the stanza is not flushed prematurely; a trailing
-/// stanza without a closing blank line is flushed at EOF.
+/// stanza without a closing blank line is flushed at EOF. Whitespace is what
+/// `u8::is_ascii_whitespace` accepts -- space, tab, CR, LF and form feed, but
+/// not vertical tab -- a superset of the spaces and tabs deb822 uses.
 pub(crate) struct StanzaStream<R> {
     reader: R,
     stanza: Stanza,
-    line: String,
     line_buf: Vec<u8>,
     done: sticky::Bool,
 }
@@ -384,7 +385,6 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
         Self {
             reader,
             stanza,
-            line: String::with_capacity(128),
             line_buf: Vec::with_capacity(128),
             done: sticky::Bool::new(),
         }
@@ -400,23 +400,17 @@ impl<R: AsyncBufRead + Unpin + Send> StanzaStream<R> {
         // The stanza handed out by the previous call is consumed.
         self.stanza.reset();
         loop {
-            self.line.clear();
-            let read = read_line_capped(
-                &mut self.reader,
-                &mut self.line,
-                &mut self.line_buf,
-                MAX_METADATA_LINE_LEN,
-            )
-            .await;
+            let read =
+                read_line_capped(&mut self.reader, &mut self.line_buf, MAX_METADATA_LINE_LEN).await;
             match read {
                 Ok(CappedLine::Eof) => {
                     self.done.set();
                     return Ok(self.accept().then_some(&self.stanza));
                 }
                 Ok(CappedLine::Skipped) => {}
-                Ok(CappedLine::Line) => {
-                    if !self.line.trim().is_empty() {
-                        self.stanza.ingest(&self.line);
+                Ok(CappedLine::Line(line)) => {
+                    if !line.trim_ascii().is_empty() {
+                        self.stanza.ingest(line);
                     } else if self.accept() {
                         return Ok(Some(&self.stanza));
                     } else {
@@ -970,6 +964,17 @@ mod tests {
                 ("pool/b.deb".to_owned(), None),
             ]
         );
+    }
+
+    /// Vertical tab is not whitespace to `trim_ascii`, so a line holding only
+    /// one is a (field-less) stanza line: the two stanzas around it merge,
+    /// and the repeated `Filename:` rejects the result. No generator writes
+    /// such a line; this pins that the parser does not treat it as blank.
+    #[tokio::test]
+    async fn stanza_stream_vertical_tab_line_does_not_separate() {
+        let input = b"Filename: pool/a.deb\n\x0b\nFilename: pool/b.deb\n";
+        let got = collect_stanzas(&input[..], Stanza::new()).await;
+        assert_eq!(got, vec![]);
     }
 
     /// A deb822 continuation line (leading space or tab) belongs to the
