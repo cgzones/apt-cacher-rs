@@ -214,10 +214,21 @@ pub(crate) enum ParsedRange {
     /// The Range header is syntactically malformed. Per RFC 9110 §14.2, the recipient
     /// should ignore the header and serve the full entity (200).
     Invalid,
-    /// The Range is syntactically valid but unsatisfiable for this file size (416).
+    /// The Range is syntactically valid, any `If-Range` holds, but the range
+    /// is unsatisfiable for this file size (416).
     NotSatisfiable,
-    /// The range is valid but the `If-Range` precondition failed; serve the full entity (200).
+    /// The range is syntactically valid but the `If-Range` precondition failed;
+    /// serve the full entity (200), whether or not the range is satisfiable.
     IfRangeFailed,
+}
+
+/// A syntactically valid byte-range-spec, not yet resolved against the
+/// file size.
+enum RangeSpec {
+    /// `first-byte-pos "-" [ last-byte-pos ]`
+    Span { first: u64, last: Option<u64> },
+    /// `"-" suffix-length`
+    Suffix { length: u64 },
 }
 
 /// Computes the requested bytes range.
@@ -264,45 +275,46 @@ pub(crate) fn http_parse_range(
         Some(e)
     };
 
-    // A zero-length entity admits no satisfiable byte range (RFC 9110
-    // §14.1.2: a valid range requires start < current length, impossible at
-    // length zero); the arms below all yield `NotSatisfiable` for it.
     // Syntactic invalidity is checked first so a malformed range is ignored
     // (served as 200) regardless of file size, per RFC 9110 §14.2.
-    let (start, end) = match (start, end) {
+    let spec = match (start, end) {
         // "bytes=-" is malformed: neither a first-byte-pos nor a suffix-length
         (None, None) => return ParsedRange::Invalid,
-        (Some(s), Some(e)) => {
-            if s > e {
-                // first-byte-pos > last-byte-pos is syntactically invalid
-                return ParsedRange::Invalid;
-            }
-            if s >= file_size {
-                return ParsedRange::NotSatisfiable;
-            }
-            (s, min(e, file_size - 1))
-        }
-        (Some(s), None) => {
-            if s >= file_size {
-                return ParsedRange::NotSatisfiable;
-            }
-            (s, file_size - 1)
-        }
-        (None, Some(e)) => {
-            // A zero suffix-length is unsatisfiable, and so is any suffix
-            // of a zero-length file.
-            if e == 0 || file_size == 0 {
-                return ParsedRange::NotSatisfiable;
-            }
-            (file_size.saturating_sub(e), file_size - 1)
-        }
+        // first-byte-pos > last-byte-pos is syntactically invalid
+        (Some(s), Some(e)) if s > e => return ParsedRange::Invalid,
+        (Some(first), last) => RangeSpec::Span { first, last },
+        (None, Some(length)) => RangeSpec::Suffix { length },
     };
 
+    // A failed `If-Range` ignores the `Range` altogether (RFC 9110 §13.2.2
+    // step 5), so it is evaluated before satisfiability: a stale resume
+    // offset past the new representation's end gets the new entity (200),
+    // not a 416.
     if let Some(if_range) = if_range
         && !if_range_matches(if_range, cache_time, file_etag)
     {
         return ParsedRange::IfRangeFailed;
     }
+
+    // A zero-length entity admits no satisfiable byte range (RFC 9110
+    // §14.1.2: a valid range requires start < current length, impossible at
+    // length zero); both arms yield `NotSatisfiable` for it.
+    let (start, end) = match spec {
+        RangeSpec::Span { first, last } => {
+            if first >= file_size {
+                return ParsedRange::NotSatisfiable;
+            }
+            (first, last.map_or(file_size - 1, |e| min(e, file_size - 1)))
+        }
+        RangeSpec::Suffix { length } => {
+            // A zero suffix-length is unsatisfiable, and so is any suffix
+            // of a zero-length file.
+            if length == 0 || file_size == 0 {
+                return ParsedRange::NotSatisfiable;
+            }
+            (file_size.saturating_sub(length), file_size - 1)
+        }
+    };
 
     debug_assert!(start <= end, "start {start} must not exceed end {end}");
     debug_assert!(
@@ -687,7 +699,7 @@ mod tests {
         assert!(matches!(
             http_parse_range(
                 "bytes=0-1023",
-                Some("Tue, 21 Mar 2361 19:15:09 GMT"),
+                Some("Thu, 01 Jan 1970 00:00:00 GMT"),
                 0,
                 HttpDate::UNIX_EPOCH,
                 None,
@@ -719,12 +731,57 @@ mod tests {
         assert!(matches!(
             http_parse_range(
                 "bytes=9999-99999",
-                Some("Tue, 21 Mar 2361 19:15:09 GMT"),
+                Some("Thu, 01 Jan 1970 00:00:00 GMT"),
                 8192,
                 HttpDate::UNIX_EPOCH,
                 None,
             ),
             ParsedRange::NotSatisfiable
+        ));
+
+        /* a failed If-Range ignores even an unsatisfiable range (RFC 9110
+         * §13.2.2 step 5): 200 with the new entity, not 416 */
+        assert!(matches!(
+            http_parse_range(
+                "bytes=9999-99999",
+                Some("Tue, 21 Mar 2361 19:15:09 GMT"),
+                8192,
+                HttpDate::UNIX_EPOCH,
+                None,
+            ),
+            ParsedRange::IfRangeFailed
+        ));
+        assert!(matches!(
+            http_parse_range(
+                "bytes=5000-",
+                Some("\"old-etag\""),
+                3000,
+                HttpDate::UNIX_EPOCH,
+                Some("\"new-etag\""),
+            ),
+            ParsedRange::IfRangeFailed
+        ));
+        assert!(matches!(
+            http_parse_range(
+                "bytes=-0",
+                Some("NOTADATE"),
+                3000,
+                HttpDate::UNIX_EPOCH,
+                None,
+            ),
+            ParsedRange::IfRangeFailed
+        ));
+
+        /* ...but a malformed range stays Invalid whatever the If-Range */
+        assert!(matches!(
+            http_parse_range(
+                "bytes=9-1",
+                Some("NOTADATE"),
+                3000,
+                HttpDate::UNIX_EPOCH,
+                None,
+            ),
+            ParsedRange::Invalid
         ));
 
         /* end less than start: syntactically invalid, ignore per RFC 9110 §14.2 */
