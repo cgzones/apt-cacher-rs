@@ -64,11 +64,18 @@
 //! filesystem ([`DiskHeadroom`], with or without a `disk_quota`): the quota
 //! bounds what this daemon accounts, but the filesystem is what runs out,
 //! and it may be shared or already fuller than the cache. The decision reads
-//! a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old, minus everything
-//! admitted since it was taken -- the sample cannot see those yet, and a
-//! burst of misses within one sample must not all pass on the same free
-//! figure. Cleanup's index fetches are admitted past this floor for the
-//! reason they are admitted past the quota.
+//! a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old, minus the full
+//! [`disk_needed`] of every reservation still live (`inflight_disk`) or
+//! ended since the sample was taken (`retired_disk`): a download from a slow
+//! mirror writes for minutes, so a sample taken while it runs shows only
+//! what it wrote so far, and one charged only until the next sample would
+//! let each later miss pass on a figure that ignores it. The bytes a live
+//! download already wrote are charged twice -- once by the lowered sample,
+//! once by its full reservation -- which errs on the safe side of a floor;
+//! tracking the written remainder would mean a counter on every backend's
+//! write path. Cleanup's index fetches are admitted past this floor for the
+//! reason they are admitted past the quota, and count against it like any
+//! other reservation.
 
 use std::{
     cmp::Ordering,
@@ -185,10 +192,13 @@ struct Accounting {
     /// may have seen: commits that shrank the cache, partials renamed out of
     /// `tmp/`, removed partials.
     committed_shrunk: u64,
-    /// Monotonic sum of the disk bytes every admitted reservation may still
-    /// write ([`disk_needed`]); what a free-space sample taken earlier cannot
-    /// reflect yet.
-    admitted_total: u64,
+    /// Sum of the disk bytes the live reservations may write
+    /// ([`disk_needed`]); what a free-space sample cannot fully reflect
+    /// while they run.
+    inflight_disk: u64,
+    /// Monotonic sum of [`disk_needed`] over ended reservations: what they
+    /// wrote after a sample was taken, the sample cannot show either.
+    retired_disk: u64,
     /// The latest free-space sample of the cache filesystem; `None` until
     /// the first one (or without a [`DiskHeadroom`]).
     disk: Option<DiskSample>,
@@ -200,17 +210,21 @@ struct DiskSample {
     taken: coarsetime::Instant,
     /// Bytes available; `None` when the probe failed, which admits.
     free: Option<u64>,
-    /// `admitted_total` when the probe started.
-    admitted_at: u64,
+    /// `retired_disk` when the probe started.
+    retired_at: u64,
 }
 
 impl Accounting {
-    /// The free space the admission check works with: the sample minus what
-    /// was admitted since it was taken. `None` without a usable sample.
+    /// The free space the admission check works with: the sample minus
+    /// everything the reservations live now or ended since it was taken may
+    /// write. `None` without a usable sample.
     fn disk_free_now(&self) -> Option<u64> {
         let sample = self.disk?;
         let free = sample.free?;
-        Some(free.saturating_sub(self.admitted_total.wrapping_sub(sample.admitted_at)))
+        Some(
+            free.saturating_sub(self.inflight_disk)
+                .saturating_sub(self.retired_disk.wrapping_sub(sample.retired_at)),
+        )
     }
 
     /// Net of the live reservations (`reserved - replaced`); what the
@@ -252,10 +266,12 @@ impl Accounting {
     }
 
     /// Remove a reservation's contribution from the in-flight tallies.
-    fn retire(&mut self, reserved: u64, replaced: u64, unwritten: u64) {
+    fn retire(&mut self, reserved: u64, replaced: u64, unwritten: u64, disk: u64) {
         self.inflight_reserved = self.inflight_reserved.saturating_sub(reserved);
         self.inflight_replaced = self.inflight_replaced.saturating_sub(replaced);
         self.inflight_unwritten = self.inflight_unwritten.saturating_sub(unwritten);
+        self.inflight_disk = self.inflight_disk.saturating_sub(disk);
+        self.retired_disk = self.retired_disk.wrapping_add(disk);
     }
 
     /// Record an on-disk change from `before` to `after` bytes the scan may
@@ -424,11 +440,11 @@ impl CacheQuota {
     /// keeps it fresh.
     pub(crate) fn record_disk_free(&self, free: Option<u64>) {
         let mut mg = self.inner.accounting.lock();
-        let admitted_at = mg.admitted_total;
+        let retired_at = mg.retired_disk;
         mg.disk = Some(DiskSample {
             taken: coarsetime::Instant::now(),
             free,
-            admitted_at,
+            retired_at,
         });
     }
 
@@ -438,8 +454,8 @@ impl CacheQuota {
     /// synchronous and only reads the sample.
     ///
     /// Single flight: a request arriving while another refreshes goes on
-    /// with the current sample, which still charges everything admitted
-    /// since it was taken. A probe that fails or times out keeps the
+    /// with the current sample, which still charges every download in
+    /// flight or ended since it was taken. A probe that fails or times out keeps the
     /// previous sample (a failed one admits).
     pub(crate) async fn refresh_disk_headroom(&self) {
         /// Clears the single-flight flag even when the refresh is cancelled.
@@ -453,14 +469,14 @@ impl CacheQuota {
         let Some(headroom) = &self.inner.headroom else {
             return;
         };
-        let admitted_at = {
+        let retired_at = {
             let mg = self.inner.accounting.lock();
             if mg.disk.is_some_and(|s| {
                 coarsetime::Instant::now().duration_since(s.taken) < DISK_SAMPLE_TTL
             }) {
                 return;
             }
-            mg.admitted_total
+            mg.retired_disk
         };
         if headroom.refreshing.swap(true, atomic::Ordering::AcqRel) {
             return;
@@ -475,7 +491,7 @@ impl CacheQuota {
         mg.disk = Some(DiskSample {
             taken: coarsetime::Instant::now(),
             free: space.map(|s| s.free_bytes),
-            admitted_at,
+            retired_at,
         });
     }
 
@@ -496,7 +512,8 @@ impl CacheQuota {
     /// With a [`DiskHeadroom`], the download is also refused when the bytes
     /// it may still write (all but the adopted prefix) would leave less than
     /// `min_disk_free` on the cache filesystem, judged from the latest
-    /// sample minus everything admitted since ([`Self::refresh_disk_headroom`]).
+    /// sample minus what every download in flight, or ended since the
+    /// sample, may write ([`Self::refresh_disk_headroom`]).
     /// Both refusals are the same [`QuotaExceeded`]: the client sees one
     /// "Disk quota reached" 503 either way.
     pub(crate) fn try_acquire(
@@ -626,9 +643,9 @@ impl CacheQuota {
         mg.inflight_unwritten = mg
             .inflight_unwritten
             .saturating_add(unwritten_size(reserved, partial.as_ref()));
-        mg.admitted_total = mg
-            .admitted_total
-            .wrapping_add(disk_needed(reserved, partial.as_ref()));
+        mg.inflight_disk = mg
+            .inflight_disk
+            .saturating_add(disk_needed(reserved, partial.as_ref()));
         let new_size = mg.size;
         drop(mg);
 
@@ -829,6 +846,7 @@ impl QuotaReservation {
             reserved,
             replaced_size(prev, partial),
             unwritten_size(self.reserved, partial),
+            disk_needed(self.reserved, partial),
         );
         match reserved.cmp(&bytes_received) {
             Ordering::Equal => {}
@@ -884,6 +902,7 @@ impl Drop for QuotaReservation {
             reserved,
             replaced_size(prev, partial),
             unwritten_size(self.reserved, partial),
+            disk_needed(self.reserved, partial),
         );
         match reserved.cmp(&restored) {
             Ordering::Equal => {}
@@ -1547,6 +1566,63 @@ mod tests {
         // A fresh sample starts over.
         quota.record_disk_free(Some(b(1000)));
         assert!(quota.try_acquire(exact(400), 0, None, "fresh").is_ok());
+    }
+
+    /// Three large misses from a slow mirror, each admitted on a fresh
+    /// sample: the downloads admitted earlier have barely written anything,
+    /// so every sample still shows almost the whole disk free. They must stay
+    /// charged until they end, or all three pass and together hit `ENOSPC`.
+    #[test]
+    fn low_disk_space_charges_downloads_admitted_before_the_sample() {
+        let quota = headroom_quota(512, Some(1536));
+        let first = quota
+            .try_acquire(exact(700), 0, None, "first")
+            .ok()
+            .expect("700 of the 1024 spare blocks");
+        // A second later: the first download has written 10 blocks.
+        quota.record_disk_free(Some(b(1526)));
+        assert!(
+            quota.try_acquire(exact(700), 0, None, "second").is_err(),
+            "the first download's unwritten bytes are not in the new sample"
+        );
+        assert!(
+            quota.try_acquire(exact(300), 0, None, "small").is_ok(),
+            "what the first download leaves still admits"
+        );
+        drop(first);
+    }
+
+    /// A download that ends between two samples wrote bytes the older sample
+    /// cannot show: it stays charged until the next sample.
+    #[test]
+    fn low_disk_space_charges_a_download_ended_since_the_sample() {
+        let quota = headroom_quota(100, Some(1000));
+        let first = quota
+            .try_acquire(exact(500), 0, None, "first")
+            .ok()
+            .expect("fits");
+        first.finalize(b(500));
+        assert!(
+            quota.try_acquire(exact(450), 0, None, "second").is_err(),
+            "the committed 500 blocks are not in the sample yet"
+        );
+        // The next sample shows them.
+        quota.record_disk_free(Some(b(500)));
+        assert!(quota.try_acquire(exact(450), 0, None, "second").is_err());
+        assert!(quota.try_acquire(exact(400), 0, None, "third").is_ok());
+
+        // An abandoned download that wrote nothing no longer counts once a
+        // new sample is taken.
+        let quota = headroom_quota(100, Some(1000));
+        drop(
+            quota
+                .try_acquire(exact(500), 0, None, "abandoned")
+                .ok()
+                .expect("fits"),
+        );
+        assert!(quota.try_acquire(exact(450), 0, None, "next").is_err());
+        quota.record_disk_free(Some(b(1000)));
+        assert!(quota.try_acquire(exact(450), 0, None, "next").is_ok());
     }
 
     #[test]

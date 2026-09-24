@@ -821,8 +821,9 @@ pub(crate) struct Config {
     pub(crate) disk_quota: Option<NonZero<u64>>,
 
     /// Minimum free disk space (in bytes) to keep on the cache filesystem:
-    /// a download that would leave less is refused with 503 "Disk quota
-    /// reached" (like one over `disk_quota`, which it applies without), and
+    /// a download that would leave less, counting what the downloads in
+    /// flight may still write, is refused with 503 "Disk quota reached"
+    /// (like one over `disk_quota`, which it applies without), and
     /// the `/healthcheck` endpoint reports unhealthy below it. `None`
     /// (config value `0`) disables both checks.
     #[serde(deserialize_with = "from_nonzero_u64_with_magnitude")]
