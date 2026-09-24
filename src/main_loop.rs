@@ -239,8 +239,10 @@ pub(crate) async fn main_loop(
     cache_metadata::init().expect("cache metadata store initialized once");
 
     // Migration warning: scan the existing `mirrors_v2` rows for paths
-    // containing a `RESERVED_MIRROR_PATH_SEGMENTS` segment.  Pre-existing
-    // rows still load via `get_mirrors`, but the validator now rejects
+    // containing a segment reserved for their kind
+    // (`RESERVED_MIRROR_PATH_SEGMENTS`, plus
+    // `RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS` for a structured row).
+    // Pre-existing rows still load via `get_mirrors`, but the validator now rejects
     // them on insert — flag them once at startup so an operator can
     // investigate (cleanup walks against e.g. `<host>/by-hash` would
     // otherwise collide with the layout plumbing for that mirror's
@@ -257,12 +259,13 @@ pub(crate) async fn main_loop(
         .map_err(MainLoopError::Database)?;
 
     for mirror in &mirrors {
-        if deb_mirror::mirror_path_has_reserved_segment(&mirror.path) {
+        if deb_mirror::mirror_path_has_reserved_segment(&mirror.path, mirror.kind()) {
             warn!(
-                "Pre-existing mirror row {}/{} uses a reserved path segment (one of {:?}); cleanup walks may collide with cache plumbing, so investigate and consider removing the row",
+                "Pre-existing mirror row {}/{} uses a reserved path segment (one of {:?}, and {:?} for a structured mirror); cleanup walks may collide with cache plumbing, so investigate and consider removing the row",
                 mirror.host,
                 mirror.path,
                 deb_mirror::RESERVED_MIRROR_PATH_SEGMENTS,
+                deb_mirror::RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS,
             );
         }
     }

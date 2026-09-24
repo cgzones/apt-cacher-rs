@@ -541,7 +541,12 @@ impl ConnectionDetails {
 /// validator inside [`classify_request`].
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum ValidateKind {
+    /// A structured mirror's path, which additionally may not pass through
+    /// a `dists` segment (see
+    /// [`crate::deb_mirror::RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS`]).
     MirrorPath,
+    /// A flat repository's base path, anchored under the host's `flat/`.
+    FlatMirrorPath,
     Distribution,
     Component,
     Architecture,
@@ -558,7 +563,8 @@ impl ValidateKind {
     #[must_use]
     fn accepts(self, decoded: &str) -> bool {
         match self {
-            Self::MirrorPath => valid_mirrorname(decoded),
+            Self::MirrorPath => valid_mirrorname(decoded, MirrorKind::Structured),
+            Self::FlatMirrorPath => valid_mirrorname(decoded, MirrorKind::Flat),
             Self::Distribution => valid_distribution(decoded),
             Self::Component => valid_component(decoded),
             Self::Architecture => valid_architecture(decoded),
@@ -574,7 +580,7 @@ impl ValidateKind {
     const fn joined_with_underscore(self) -> bool {
         match self {
             Self::Distribution | Self::Component | Self::Architecture => true,
-            Self::MirrorPath | Self::Directory | Self::Filename => false,
+            Self::MirrorPath | Self::FlatMirrorPath | Self::Directory | Self::Filename => false,
         }
     }
 }
@@ -583,6 +589,7 @@ impl std::fmt::Display for ValidateKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::MirrorPath => "mirror path",
+            Self::FlatMirrorPath => "flat mirror path",
             Self::Distribution => "distribution",
             Self::Component => "component",
             Self::Architecture => "architecture",
@@ -926,7 +933,7 @@ pub(crate) fn classify_request<'a>(
             mirror_path,
             filename,
         } => {
-            let mirror_path = decode_validate(mirror_path, ValidateKind::MirrorPath)?;
+            let mirror_path = decode_validate(mirror_path, ValidateKind::FlatMirrorPath)?;
             let filename = decode_validate(filename, ValidateKind::Filename)?;
 
             trace!(
@@ -1313,6 +1320,37 @@ mod tests {
         assert_eq!(class.resource_kind, ResourceKind::FlatPool);
     }
 
+    /// Regression: `dists` is reserved in a *structured* mirror path only (a
+    /// mirror `X/dists` would nest into `X`'s index directory).  A flat tree
+    /// lives under `{host}/flat/`, so Docker CE's real layout, a flat pool
+    /// below a `dists/` directory, must still cache.
+    #[test]
+    fn classify_flat_pool_below_a_dists_directory() {
+        let res = parse_request_path(
+            "linux/debian/dists/bookworm/pool/stable/amd64/containerd.io_1.7.27-1_amd64.deb",
+        )
+        .expect("parses");
+        let class = classify_request(&res, &local_client()).expect("classifies");
+        assert_eq!(
+            class.mirror_path,
+            "linux/debian/dists/bookworm/pool/stable/amd64"
+        );
+        assert_eq!(class.resource_kind, ResourceKind::FlatPool);
+
+        let res = ResourceFile::Pool {
+            mirror_path: "debian/dists",
+            dirs: "main/f/foo",
+            filename: "foo_1.0_amd64.deb",
+        };
+        assert!(matches!(
+            classify_request(&res, &local_client()),
+            Err(ClassifyError::InvalidValue {
+                kind: ValidateKind::MirrorPath,
+                decoded,
+            }) if decoded == "debian/dists"
+        ));
+    }
+
     #[test]
     fn classify_flat_byhash() {
         let res = ResourceFile::Flat {
@@ -1689,6 +1727,10 @@ mod tests {
         // A reserved layout segment is a mirror-path rule only.
         assert!(!ValidateKind::MirrorPath.accepts("tmp"));
         assert!(ValidateKind::Distribution.accepts("tmp"));
+        assert!(!ValidateKind::FlatMirrorPath.accepts("apt/tmp"));
+        // `dists` is reserved in a structured mirror path only.
+        assert!(!ValidateKind::MirrorPath.accepts("debian/dists"));
+        assert!(ValidateKind::FlatMirrorPath.accepts("debian/dists"));
         // Segment rules: leading `.` is out, inner `-` is in.
         assert!(!ValidateKind::Distribution.accepts("../escape"));
         assert!(ValidateKind::Distribution.accepts("bookworm-security"));

@@ -1169,9 +1169,7 @@ const MAX_SEGMENT_LEN: usize = 128;
 ///
 /// A mirror path containing any of these as a `/`-separated segment would
 /// collide with cache plumbing — `tmp/` is the partial-download scratch
-/// dir, `by-hash/` is the content-addressed subtree under each mirror, and
-/// `dists/` holds each mirror's index files, so a mirror `X/dists` would
-/// nest into `X`'s index directory.
+/// dir, `by-hash/` is the content-addressed subtree under each mirror.
 /// The host-level `flat/` anchor is *not* reserved here: structured
 /// mirrors named `flat` are handled by the per-host collision blocklist
 /// (`flat_blocklist`) so that "structured wins" without permanently
@@ -1179,21 +1177,35 @@ const MAX_SEGMENT_LEN: usize = 128;
 ///
 /// Shared with the startup migration scan in `main.rs`, which warns about
 /// pre-existing `mirrors_v2` rows that would now fail validation.
-pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash", "dists"];
+pub(crate) const RESERVED_MIRROR_PATH_SEGMENTS: &[&str] = &["tmp", "by-hash"];
 
-/// Whether `segment` is one of the [`RESERVED_MIRROR_PATH_SEGMENTS`].
+/// Path-segment names reserved in a *structured* mirror path on top of
+/// [`RESERVED_MIRROR_PATH_SEGMENTS`]: `dists/` holds each structured
+/// mirror's index files, so a mirror `X/dists` would nest into `X`'s index
+/// directory.  A flat tree lives under the host-level `flat/` anchor and
+/// cannot reach it, and real flat repositories keep their pool below a
+/// `dists/` directory (Docker CE's
+/// `linux/debian/dists/<codename>/pool/stable/<arch>/`).
+pub(crate) const RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS: &[&str] = &["dists"];
+
+/// Whether `segment` is reserved in a mirror path of `kind`.
 #[must_use]
-fn is_reserved_mirror_path_segment(segment: &str) -> bool {
+fn is_reserved_mirror_path_segment(segment: &str, kind: MirrorKind) -> bool {
     RESERVED_MIRROR_PATH_SEGMENTS.contains(&segment)
+        || match kind {
+            MirrorKind::Structured => RESERVED_STRUCTURED_MIRROR_PATH_SEGMENTS.contains(&segment),
+            MirrorKind::Flat => false,
+        }
 }
 
-/// Whether `path` is invalid as a mirror path because some `/`-separated
-/// segment is reserved.  Used by the startup migration warning so the
-/// daemon can flag pre-existing DB rows that the validator would now
-/// reject on insertion.
+/// Whether `path` is invalid as a mirror path of `kind` because some
+/// `/`-separated segment is reserved.  Used by the startup migration
+/// warning so the daemon can flag pre-existing DB rows that the validator
+/// would now reject on insertion.
 #[must_use]
-pub(crate) fn mirror_path_has_reserved_segment(path: &str) -> bool {
-    path.split('/').any(is_reserved_mirror_path_segment)
+pub(crate) fn mirror_path_has_reserved_segment(path: &str, kind: MirrorKind) -> bool {
+    path.split('/')
+        .any(|segment| is_reserved_mirror_path_segment(segment, kind))
 }
 
 /// Whether `path` is a strict descendant of `ancestor` in `/`-separated
@@ -1327,13 +1339,13 @@ pub(crate) fn flat_pool_archive_root(mirror_path: &str) -> Option<(&str, String)
     Some((archive_root, prefix))
 }
 
-/// Whether `name` is acceptable as a mirror path: non-empty, at most
-/// [`MAX_SEGMENT_LEN`] bytes overall, at most [`MAX_MIRROR_PATH_SEGMENTS`]
-/// `/`-separated segments, every segment a [`valid_path_segment`] and none
-/// of them reserved by the cache layout
-/// ([`is_reserved_mirror_path_segment`]).
+/// Whether `name` is acceptable as a mirror path of `kind`: non-empty, at
+/// most [`MAX_SEGMENT_LEN`] bytes overall, at most
+/// [`MAX_MIRROR_PATH_SEGMENTS`] `/`-separated segments, every segment a
+/// [`valid_path_segment`] and none of them reserved by that kind's cache
+/// layout ([`is_reserved_mirror_path_segment`]).
 #[must_use]
-pub(crate) fn valid_mirrorname(name: &str) -> bool {
+pub(crate) fn valid_mirrorname(name: &str, kind: MirrorKind) -> bool {
     if name.is_empty() || name.len() > MAX_SEGMENT_LEN {
         return false;
     }
@@ -1346,7 +1358,7 @@ pub(crate) fn valid_mirrorname(name: &str) -> bool {
         if !valid_path_segment(segment) {
             return false;
         }
-        if is_reserved_mirror_path_segment(segment) {
+        if is_reserved_mirror_path_segment(segment, kind) {
             return false;
         }
     }
@@ -2175,53 +2187,95 @@ mod tests {
     #[test]
     fn test_invalid_mirrorname() {
         /* valid */
-        assert!(valid_mirrorname("debian"));
-        assert!(valid_mirrorname("public/ubuntu"));
-        assert!(valid_mirrorname("public/private/kali"));
-        assert!(valid_mirrorname("foo/bar"));
+        assert!(valid_mirrorname("debian", MirrorKind::Structured));
+        assert!(valid_mirrorname("public/ubuntu", MirrorKind::Structured));
+        assert!(valid_mirrorname(
+            "public/private/kali",
+            MirrorKind::Structured
+        ));
+        assert!(valid_mirrorname("foo/bar", MirrorKind::Structured));
 
         /* invalid */
-        assert!(!valid_mirrorname(""));
-        assert!(!valid_mirrorname("."));
-        assert!(!valid_mirrorname(".."));
-        assert!(!valid_mirrorname("-foo"));
-        assert!(!valid_mirrorname(".foo"));
-        assert!(!valid_mirrorname("_foo"));
-        assert!(!valid_mirrorname("foo\nbar"));
-        assert!(!valid_mirrorname("foo/./bar"));
-        assert!(!valid_mirrorname("foo/../bar"));
-        assert!(!valid_mirrorname("foo//bar"));
-        assert!(!valid_mirrorname("/"));
-        assert!(!valid_mirrorname("/debian"));
-        assert!(!valid_mirrorname("~/foo"));
-        assert!(!valid_mirrorname("~foo"));
-        assert!(!valid_mirrorname("public%2Fubuntu"));
+        assert!(!valid_mirrorname("", MirrorKind::Structured));
+        assert!(!valid_mirrorname(".", MirrorKind::Structured));
+        assert!(!valid_mirrorname("..", MirrorKind::Structured));
+        assert!(!valid_mirrorname("-foo", MirrorKind::Structured));
+        assert!(!valid_mirrorname(".foo", MirrorKind::Structured));
+        assert!(!valid_mirrorname("_foo", MirrorKind::Structured));
+        assert!(!valid_mirrorname("foo\nbar", MirrorKind::Structured));
+        assert!(!valid_mirrorname("foo/./bar", MirrorKind::Structured));
+        assert!(!valid_mirrorname("foo/../bar", MirrorKind::Structured));
+        assert!(!valid_mirrorname("foo//bar", MirrorKind::Structured));
+        assert!(!valid_mirrorname("/", MirrorKind::Structured));
+        assert!(!valid_mirrorname("/debian", MirrorKind::Structured));
+        assert!(!valid_mirrorname("~/foo", MirrorKind::Structured));
+        assert!(!valid_mirrorname("~foo", MirrorKind::Structured));
+        assert!(!valid_mirrorname("public%2Fubuntu", MirrorKind::Structured));
 
         /* reserved segments collide with cache-layout plumbing */
-        assert!(!valid_mirrorname("tmp"));
-        assert!(!valid_mirrorname("by-hash"));
-        assert!(!valid_mirrorname("foo/tmp"));
-        assert!(!valid_mirrorname("foo/by-hash/bar"));
+        assert!(!valid_mirrorname("tmp", MirrorKind::Structured));
+        assert!(!valid_mirrorname("by-hash", MirrorKind::Structured));
+        assert!(!valid_mirrorname("foo/tmp", MirrorKind::Structured));
+        assert!(!valid_mirrorname("foo/by-hash/bar", MirrorKind::Structured));
         /* `dists` would nest a mirror into its parent's `dists/` tree */
-        assert!(!valid_mirrorname("dists"));
-        assert!(!valid_mirrorname("debian/dists"));
-        assert!(!valid_mirrorname("debian/dists/x"));
+        assert!(!valid_mirrorname("dists", MirrorKind::Structured));
+        assert!(!valid_mirrorname("debian/dists", MirrorKind::Structured));
+        assert!(!valid_mirrorname("debian/dists/x", MirrorKind::Structured));
+        /* while a flat tree, anchored under `flat/`, may pass through one */
+        assert!(valid_mirrorname(
+            "linux/debian/dists/bookworm/pool/stable/amd64",
+            MirrorKind::Flat
+        ));
+        assert!(!valid_mirrorname("foo/tmp", MirrorKind::Flat));
+        assert!(!valid_mirrorname("foo/by-hash/bar", MirrorKind::Flat));
         /* but non-segment occurrences are fine */
-        assert!(valid_mirrorname("tmpfile"));
-        assert!(valid_mirrorname("by-hash-deb"));
-        assert!(valid_mirrorname("dists-archive"));
+        assert!(valid_mirrorname("tmpfile", MirrorKind::Structured));
+        assert!(valid_mirrorname("by-hash-deb", MirrorKind::Structured));
+        assert!(valid_mirrorname("dists-archive", MirrorKind::Structured));
     }
 
     #[test]
     fn test_mirror_path_has_reserved_segment() {
-        assert!(mirror_path_has_reserved_segment("tmp"));
-        assert!(mirror_path_has_reserved_segment("by-hash"));
-        assert!(mirror_path_has_reserved_segment("foo/tmp"));
-        assert!(mirror_path_has_reserved_segment("foo/by-hash/bar"));
-        assert!(mirror_path_has_reserved_segment("foo/dists"));
-        assert!(!mirror_path_has_reserved_segment("debian"));
-        assert!(!mirror_path_has_reserved_segment("tmpfile"));
-        assert!(!mirror_path_has_reserved_segment("foo/by-hash-deb"));
+        assert!(mirror_path_has_reserved_segment(
+            "tmp",
+            MirrorKind::Structured
+        ));
+        assert!(mirror_path_has_reserved_segment(
+            "by-hash",
+            MirrorKind::Structured
+        ));
+        assert!(mirror_path_has_reserved_segment(
+            "foo/tmp",
+            MirrorKind::Structured
+        ));
+        assert!(mirror_path_has_reserved_segment(
+            "foo/by-hash/bar",
+            MirrorKind::Structured
+        ));
+        assert!(mirror_path_has_reserved_segment(
+            "foo/dists",
+            MirrorKind::Structured
+        ));
+        assert!(!mirror_path_has_reserved_segment(
+            "debian",
+            MirrorKind::Structured
+        ));
+        assert!(!mirror_path_has_reserved_segment(
+            "tmpfile",
+            MirrorKind::Structured
+        ));
+        assert!(!mirror_path_has_reserved_segment(
+            "foo/by-hash-deb",
+            MirrorKind::Structured
+        ));
+        assert!(!mirror_path_has_reserved_segment(
+            "foo/dists",
+            MirrorKind::Flat
+        ));
+        assert!(mirror_path_has_reserved_segment(
+            "foo/tmp",
+            MirrorKind::Flat
+        ));
     }
 
     #[test]
@@ -3039,13 +3093,13 @@ mod tests {
     #[test]
     fn valid_mirrorname_rejects_name_over_length_cap() {
         let oversized = "x".repeat(MAX_SEGMENT_LEN + 1);
-        assert!(!valid_mirrorname(&oversized));
+        assert!(!valid_mirrorname(&oversized, MirrorKind::Structured));
     }
 
     #[test]
     fn valid_mirrorname_accepts_name_at_length_cap() {
         let at_cap = "x".repeat(MAX_SEGMENT_LEN);
-        assert!(valid_mirrorname(&at_cap));
+        assert!(valid_mirrorname(&at_cap, MirrorKind::Structured));
     }
 
     #[test]
@@ -3053,7 +3107,7 @@ mod tests {
         let over_count = std::iter::repeat_n("x", MAX_MIRROR_PATH_SEGMENTS + 1)
             .collect::<Vec<_>>()
             .join("/");
-        assert!(!valid_mirrorname(&over_count));
+        assert!(!valid_mirrorname(&over_count, MirrorKind::Structured));
     }
 
     #[test]
@@ -3061,13 +3115,13 @@ mod tests {
         let at_count = std::iter::repeat_n("x", MAX_MIRROR_PATH_SEGMENTS)
             .collect::<Vec<_>>()
             .join("/");
-        assert!(valid_mirrorname(&at_count));
+        assert!(valid_mirrorname(&at_count, MirrorKind::Structured));
     }
 
     #[test]
     fn valid_mirrorname_rejects_traversal_segments() {
-        assert!(!valid_mirrorname("debian/../etc"));
-        assert!(!valid_mirrorname("./debian"));
+        assert!(!valid_mirrorname("debian/../etc", MirrorKind::Structured));
+        assert!(!valid_mirrorname("./debian", MirrorKind::Structured));
     }
 
     #[test]
