@@ -915,6 +915,11 @@ async fn plan_upstream_response(
                     conn_details.debname,
                     conn_details.mirror
                 ),
+                ResumeAnomaly::NoContentLength => warn_once_or_info!(
+                    "splice proxy: server returned 206 without a Content-Length for resume of {} from mirror {}; discarding the partial and retrying fresh",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
             }
             if anomaly.needs_refetch() {
                 // After a redirect the discard-and-retry talks to the

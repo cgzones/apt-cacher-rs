@@ -2013,6 +2013,11 @@ async fn serve_new_file_worker(
                     conn_details.debname,
                     conn_details.mirror
                 ),
+                ResumeAnomaly::NoContentLength => warn_once_or_info!(
+                    "Server returned 206 without a Content-Length for resume of {} from mirror {}; discarding the partial and retrying fresh",
+                    conn_details.debname,
+                    conn_details.mirror
+                ),
             }
             partial.discard_resume().await;
 

@@ -370,6 +370,12 @@ pub(crate) enum ResumeAnomaly {
     /// `Range`.  A 206 that names no `ETag` (or a malformed one) is not
     /// this anomaly: it answered the `If-Range` it was sent.
     ETagMismatch,
+    /// 206 without a `Content-Length` (a chunked or close-delimited
+    /// remainder).  A permanent download needs its exact length framed, as a
+    /// fresh 200 does ([`RejectReason::NoContentLength`]); splice would
+    /// otherwise copy `Content-Range`'s span of raw chunk framing into the
+    /// cache file.  Re-fetch without `Range`.
+    NoContentLength,
 }
 
 impl ResumeAnomaly {
@@ -379,7 +385,10 @@ impl ResumeAnomaly {
     pub(crate) const fn needs_refetch(self) -> bool {
         match self {
             Self::RangeIgnored => false,
-            Self::RangeNotSatisfiable | Self::ContentRangeMismatch | Self::ETagMismatch => true,
+            Self::RangeNotSatisfiable
+            | Self::ContentRangeMismatch
+            | Self::ETagMismatch
+            | Self::NoContentLength => true,
         }
     }
 }
@@ -678,9 +687,10 @@ fn plan_resumed_206<C>(
     let total = range.total();
     let span = range.span();
 
-    if let Some(content_length) = head.content_length
-        && content_length != span.get()
-    {
+    let Some(content_length) = head.content_length else {
+        return Err(ResumeAnomaly::NoContentLength);
+    };
+    if content_length != span.get() {
         return Ok(DownloadPlan::Reject(
             RejectReason::InconsistentContentRange {
                 content_length,
@@ -1052,16 +1062,6 @@ mod tests {
             resumed(&h, 40, None, NO_CAP),
             Ok(exact_download(100, 60, 40))
         );
-        // Content-Length is optional on a 206.
-        assert_eq!(
-            resumed(
-                &head(206, None, Some("bytes 40-99/100")),
-                40,
-                Some(100),
-                NO_CAP
-            ),
-            Ok(exact_download(100, 60, 40))
-        );
         // Resuming the very last byte.
         assert_eq!(
             resumed(
@@ -1127,6 +1127,23 @@ mod tests {
         }
         assert_eq!(well_formed_etag(Some("not quoted")), None);
         assert_eq!(well_formed_etag(Some(IF_RANGE)), Some(IF_RANGE));
+    }
+
+    /// A 206 whose remainder is chunked or close-delimited carries no usable
+    /// `Content-Length`: the partial is discarded and the file re-fetched,
+    /// never the `Content-Range` span of raw framing appended to it.
+    #[test]
+    fn resume_206_without_content_length_needs_refetch() {
+        assert_eq!(
+            resumed(
+                &head(206, None, Some("bytes 40-99/100")),
+                40,
+                Some(100),
+                NO_CAP
+            ),
+            Err(ResumeAnomaly::NoContentLength)
+        );
+        assert!(ResumeAnomaly::NoContentLength.needs_refetch());
     }
 
     #[test]
