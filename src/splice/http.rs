@@ -24,7 +24,9 @@ use std::{
 use bytes::BytesMut;
 use http::{
     StatusCode,
-    header::{CONNECTION, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION},
+    header::{
+        CONNECTION, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION, TRANSFER_ENCODING,
+    },
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -524,6 +526,16 @@ pub(super) fn parse_upstream_response(
     let http10 = resp.version == Some(0);
 
     let headers = resp.headers;
+
+    // RFC 9112 §6.1: an HTTP/1.0 message carrying `Transfer-Encoding` has
+    // faulty framing whatever else it says; hyper's client refuses it too.
+    if http10
+        && headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str()))
+    {
+        return Err("Transfer-Encoding in an HTTP/1.0 response from upstream".to_owned());
+    }
 
     let framing = resolve_body_framing(headers.iter().map(|h| (h.name, h.value)))?;
 
@@ -1852,6 +1864,14 @@ mod tests {
             (
                 b"HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n",
                 "unparsable Content-Length `` from upstream",
+            ),
+            (
+                b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "Transfer-Encoding in an HTTP/1.0 response from upstream",
+            ),
+            (
+                b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n",
+                "Transfer-Encoding in an HTTP/1.0 response from upstream",
             ),
             (
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0x10\r\n\r\n",
