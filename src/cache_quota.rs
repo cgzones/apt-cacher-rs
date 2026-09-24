@@ -152,15 +152,18 @@ impl ReservedPartial {
     }
 }
 
-/// The size of the regular file at `path`, 0 when there is none (or it is
-/// not a regular file, which the scan does not count either).
+/// The size of the partial at `path` to account: 0 when there is none (or
+/// it is not a regular file, which the scan does not count either). A
+/// failed `lstat(2)` is reported (`CACHE_IO_FAILURE`) and also taken as 0,
+/// leaving the discrepancy to the next cleanup reconcile.
 ///
-/// A direct `lstat(2)` rather than `block_in_place`: it runs from
-/// [`QuotaReservation`]'s `Drop`, which also fires on current-thread
-/// runtimes and inside blocking closures, and it stats a file its own
-/// download has just written, so the inode is cached. The reservation's claim
-/// on the path is still held, so cleanup cannot have reaped it.
-fn partial_len(path: &Path) -> u64 {
+/// For [`QuotaReservation`]'s `Drop` (the bytes a kept partial holds) and a
+/// download's own partial unlink (`partial_file`, the bytes it releases);
+/// the caller's claim on the path is held, so cleanup cannot have reaped
+/// it. A direct `lstat(2)` rather than `block_in_place`: `Drop` also fires
+/// on current-thread runtimes and inside blocking closures, and the file is
+/// one its own download has just written, so the inode is cached.
+pub(crate) fn partial_len(path: &Path) -> u64 {
     match std::fs::symlink_metadata(path) {
         Ok(mdata) if mdata.file_type().is_file() => mdata.len(),
         Ok(_) => 0,
@@ -168,7 +171,7 @@ fn partial_len(path: &Path) -> u64 {
         Err(err) => {
             metrics::CACHE_IO_FAILURE.increment();
             error!(
-                "Failed to stat partial file `{}`; not counting it towards the cache size until the next cleanup reconcile:  {}",
+                "Failed to stat partial file `{}`; taking its size as 0 until the next cleanup reconcile:  {}",
                 path.display(),
                 ErrorReport(&err)
             );

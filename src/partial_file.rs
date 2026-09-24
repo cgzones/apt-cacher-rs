@@ -28,7 +28,7 @@ use crate::{
     Never,
     cache_metadata::{TargetFile, UpstreamMetadata},
     cache_paths::CachePaths,
-    cache_quota::{CacheQuota, ReservedPartial},
+    cache_quota::{CacheQuota, ReservedPartial, partial_len},
     deb_mirror,
     error::ErrorReport,
     fs_open::tokio_nofollow_options,
@@ -458,12 +458,8 @@ impl TempPath {
 /// path keeps every other writer, cleanup's reap included, off it in
 /// between.
 fn unlink_and_release(path: &Path, quota: Option<&CacheQuota>) -> std::io::Result<()> {
-    let len = match std::fs::symlink_metadata(path) {
-        Ok(mdata) if mdata.file_type().is_file() => mdata.len(),
-        // Not a regular file, which the scan does not count either; a
-        // missing one fails the unlink below.
-        Ok(_) | Err(_) => 0,
-    };
+    // A missing partial fails the unlink below.
+    let len = partial_len(path);
     std::fs::remove_file(path)?;
     if let Some(quota) = quota {
         quota.release_removed_partial(len);
@@ -859,6 +855,29 @@ mod tests {
             b"somebody's resume state"
         );
         drop(held);
+    }
+
+    /// A failed `lstat(2)` before the unlink leaves the partial's bytes
+    /// unreleased; that must be reported, not read as an empty file. A path
+    /// below a regular file fails with `ENOTDIR`, standing in for an `EIO`.
+    #[test]
+    fn unlink_and_release_reports_a_failed_stat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").expect("seed");
+        let before = metrics::CACHE_IO_FAILURE.get();
+        assert!(unlink_and_release(&file.join("x.partial"), None).is_err());
+        assert_eq!(
+            metrics::CACHE_IO_FAILURE.get() - before,
+            1,
+            "the failed stat is counted"
+        );
+
+        // A missing partial is nothing to release, not an I/O failure (the
+        // failed unlink is the caller's to report).
+        let before = metrics::CACHE_IO_FAILURE.get();
+        assert!(unlink_and_release(&dir.path().join("gone.partial"), None).is_err());
+        assert_eq!(metrics::CACHE_IO_FAILURE.get(), before);
     }
 
     /// A resumed partial whose length disagrees with the resume offset is a
