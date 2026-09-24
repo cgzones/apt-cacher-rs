@@ -932,26 +932,37 @@ mod tests {
 
     #[test]
     fn preflight_target_absolute_form_yields_host_and_port() {
+        /// The host and port of a `Proxy` target; anything else fails the
+        /// test.
+        fn expect_proxy<'a>(
+            target: &Result<RequestTarget<'a>, RejectReason>,
+        ) -> (&'a str, Option<NonZero<u16>>) {
+            assert!(
+                matches!(target, Ok(RequestTarget::Proxy { .. })),
+                "expected Proxy target, got {target:?}"
+            );
+            let proxy = if let Ok(RequestTarget::Proxy { host, port }) = target {
+                Some((*host, *port))
+            } else {
+                None
+            };
+            proxy.expect("asserted above")
+        }
+
         let client = local_client();
         let uri: Uri = "http://deb.example.com/debian/dists/sid/Release"
             .parse()
             .unwrap();
-        let Ok(RequestTarget::Proxy { host, port }) =
-            preflight_target(&uri, true, || None, &client, &OPEN_ACLS)
-        else {
-            unreachable!("expected Proxy target")
-        };
+        let (host, port) =
+            expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
         assert_eq!(host, "deb.example.com");
         assert_eq!(port, None);
 
         let uri: Uri = "http://deb.example.com:8080/debian/dists/sid/Release"
             .parse()
             .unwrap();
-        let Ok(RequestTarget::Proxy { host, port }) =
-            preflight_target(&uri, true, || None, &client, &OPEN_ACLS)
-        else {
-            unreachable!("expected Proxy target")
-        };
+        let (host, port) =
+            expect_proxy(&preflight_target(&uri, true, || None, &client, &OPEN_ACLS));
         assert_eq!(host, "deb.example.com");
         assert_eq!(port, NonZero::new(8080));
 
@@ -1065,6 +1076,20 @@ mod tests {
         false
     }
 
+    /// The details of a `Cache` decision; any other decision fails the test.
+    fn expect_cache(decision: Decision) -> ConnectionDetails {
+        assert!(
+            matches!(decision, Decision::Cache { .. }),
+            "expected Cache outcome, got {decision:?}"
+        );
+        let conn_details = if let Decision::Cache { conn_details } = decision {
+            Some(conn_details)
+        } else {
+            None
+        };
+        conn_details.expect("asserted above")
+    }
+
     #[test]
     fn cache_outcome_for_pool_deb() {
         let decision = decide_request(
@@ -1077,9 +1102,7 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        let Decision::Cache { conn_details } = decision else {
-            unreachable!("expected Cache outcome")
-        };
+        let conn_details = expect_cache(decision);
         assert_eq!(conn_details.layout(), CacheLayout::StructuredPool);
         assert_eq!(conn_details.debname, "firefox_1.0_amd64.deb");
         assert!(conn_details.origin_fields.is_none());
@@ -1097,9 +1120,7 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        let Decision::Cache { conn_details } = decision else {
-            unreachable!("expected Cache outcome")
-        };
+        let conn_details = expect_cache(decision);
         assert_eq!(conn_details.layout(), CacheLayout::Dists);
         let origin = conn_details
             .origin_fields
@@ -1129,9 +1150,7 @@ mod tests {
             never_flat_blocked,
             PreciseInstant::now(),
         );
-        let Decision::Cache { conn_details } = decision else {
-            unreachable!("expected Cache outcome")
-        };
+        let conn_details = expect_cache(decision);
         // The identity every store keys on is the alias' main host ...
         assert_eq!(conn_details.mirror.host(), &main);
         assert_eq!(conn_details.site().host, main.as_cache_host());
@@ -1162,15 +1181,28 @@ mod tests {
                 never_flat_blocked,
                 PreciseInstant::now(),
             );
-            let Decision::Passthrough {
-                reason: PassthroughReason::QueryString,
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Passthrough {
+                        reason: PassthroughReason::QueryString,
+                        ..
+                    }
+                ),
+                "expected a QueryString passthrough, got {decision:?}"
+            );
+            let hosts = if let Decision::Passthrough {
+                reason: _,
                 requested_host,
                 canonical_host,
                 request_received_at: _,
             } = decision
-            else {
-                unreachable!("expected a QueryString passthrough")
+            {
+                Some((requested_host, canonical_host))
+            } else {
+                None
             };
+            let (requested_host, canonical_host) = hosts.expect("asserted above");
             assert_eq!(&requested_host, host);
             assert_eq!(&canonical_host, canonical);
         }

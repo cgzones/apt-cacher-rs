@@ -795,6 +795,17 @@ mod tests {
         dir.path().join("mirror/tmp/foo_1.0_amd64.deb.partial")
     }
 
+    /// The guard of a fresh download; any other state fails the test with
+    /// `why` it should have been fresh.
+    fn expect_fresh(partial: PartialDownload, why: &str) -> TempPath {
+        let guard = match partial {
+            PartialDownload::Fresh(guard) => Some(guard),
+            PartialDownload::Volatile | PartialDownload::Resumable { .. } => None,
+        };
+        assert!(guard.is_some(), "expected a fresh download: {why}");
+        guard.expect("asserted above")
+    }
+
     /// Claim `path` as a download does before touching it.
     fn claim(path: &Path) -> PartialClaim {
         PartialClaim::acquire(path.to_path_buf()).expect("unclaimed partial")
@@ -815,9 +826,7 @@ mod tests {
                 .await
                 .expect("no partial is a fresh download");
         let reserved = resume.partial.reserved_partial(0).expect("a kept partial");
-        let PartialDownload::Fresh(guard) = resume.partial else {
-            unreachable!("no partial on disk")
-        };
+        let guard = expect_fresh(resume.partial, "no partial on disk");
         assert!(PartialClaim::acquire(path.clone()).is_none(), "claimed");
 
         drop(guard);
@@ -957,11 +966,10 @@ mod tests {
         let path = partial_path(&dir);
 
         let guard = match open_partial_file(claim(&path), None).await {
-            Err(PartialOpenError::NotFound(guard)) => guard,
-            Ok(_) | Err(PartialOpenError::Failed { .. }) => {
-                unreachable!("no partial exists yet")
-            }
-        };
+            Err(PartialOpenError::NotFound(guard)) => Some(guard),
+            Ok(_) | Err(PartialOpenError::Failed { .. }) => None,
+        }
+        .expect("no partial exists yet");
         assert_eq!(&*guard, path.as_path());
 
         // create_partial_file creates the tmp/ parent and hands back a
@@ -1038,11 +1046,10 @@ mod tests {
 
         let before = metrics::CACHE_NON_REGULAR.get();
         let guard = match open_partial_file(claim(&path), None).await {
-            Err(PartialOpenError::Failed { failure: _, guard }) => guard,
-            Ok(_) | Err(PartialOpenError::NotFound(_)) => {
-                unreachable!("a FIFO is not a partial")
-            }
-        };
+            Err(PartialOpenError::Failed { failure: _, guard }) => Some(guard),
+            Ok(_) | Err(PartialOpenError::NotFound(_)) => None,
+        }
+        .expect("a FIFO is not a partial");
         assert!(
             metrics::CACHE_NON_REGULAR.get() > before,
             "the anomaly is counted"
@@ -1069,9 +1076,7 @@ mod tests {
         assert_eq!(resume.offset, 0);
         assert_eq!(resume.expected_total, None);
         assert_eq!(resume.if_range, None);
-        let PartialDownload::Fresh(guard) = resume.partial else {
-            unreachable!("no ETag means no resume")
-        };
+        let guard = expect_fresh(resume.partial, "no ETag means no resume");
         assert!(!path.exists(), "the stale partial is unlinked");
         assert_eq!(&*guard, path.as_path(), "the guard still reserves the path");
     }
@@ -1225,9 +1230,7 @@ mod tests {
         .await
         .expect("a discarded partial is a fresh download");
         assert_eq!(quota.current_size(), 10 * QUOTA_BLOCK_SIZE);
-        let PartialDownload::Fresh(guard) = resume.partial else {
-            unreachable!("no ETag means no resume")
-        };
+        let guard = expect_fresh(resume.partial, "no ETag means no resume");
 
         std::fs::write(&path, b"leftover!").expect("plant leftover");
         let (file, guard) = create_partial_file(guard, 0o640)

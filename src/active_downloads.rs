@@ -872,11 +872,10 @@ impl ActiveDownloads {
     #[cfg(test)]
     pub(crate) fn originate_uncapped(&self, key: CacheEntryKeyRef<'_>) -> Origination {
         match self.lookup_or_insert(key, None) {
-            LookupResult::Originator(origination) => origination,
-            LookupResult::LateJoiner { .. } | LookupResult::AtCapacity { .. } => {
-                unreachable!("test key must be newly registered")
-            }
+            LookupResult::Originator(origination) => Some(origination),
+            LookupResult::LateJoiner { .. } | LookupResult::AtCapacity { .. } => None,
         }
+        .expect("test key must be newly registered")
     }
 
     /// Originate-only variant of `Self::insert`: returns `Concurrent`
@@ -1115,17 +1114,21 @@ mod tests {
         let ad = ActiveDownloads::new();
         let mirror = test_mirror();
         let max = NonZero::new(1).expect("nonzero");
-        let LookupResult::Originator(Origination {
+        let first = ad.lookup_or_insert(
+            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
+            Some(max),
+        );
+        let slot = if let LookupResult::Originator(Origination {
             init_tx: _,
             status: _,
             slot,
-        }) = ad.lookup_or_insert(
-            CacheEntryKeyRef::new(&mirror, "a.deb", CacheLayout::StructuredPool),
-            Some(max),
-        )
-        else {
-            unreachable!("an empty registry originates");
+        }) = first
+        {
+            Some(slot)
+        } else {
+            None
         };
+        let slot = slot.expect("an empty registry originates");
 
         // Slot released, entry still mapped: the download is committing.
         drop(slot);
@@ -1135,14 +1138,18 @@ mod tests {
             CacheEntryKeyRef::new(&mirror, "b.deb", CacheLayout::StructuredPool),
             Some(max),
         );
-        let LookupResult::Originator(Origination {
+        let second_slot = if let LookupResult::Originator(Origination {
             init_tx: _,
             status: _,
-            slot: second_slot,
+            slot,
         }) = second
-        else {
-            unreachable!("a committing entry holds no slot, so the cap admits the origination");
+        {
+            Some(slot)
+        } else {
+            None
         };
+        let second_slot = second_slot
+            .expect("a committing entry holds no slot, so the cap admits the origination");
 
         // Entry retired, slot still held: nothing the cap counts changed.
         ad.remove(CacheEntryKeyRef::new(

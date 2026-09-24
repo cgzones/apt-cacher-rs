@@ -1000,9 +1000,12 @@ mod tests {
         let host = test_host("completed-response.invalid");
         let (conn, _peer, local) = tcp_pair(&listener).await;
         ResponseBody::new(UpstreamConn::Tcp(conn), host.clone(), 80, true).complete();
-        let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) else {
-            unreachable!("completed response should be reusable");
+        let conn = if let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) {
+            Some(conn)
+        } else {
+            None
         };
+        let conn = conn.expect("completed response should be reusable");
         assert_eq!(conn.zero_copy().unwrap().local_addr().unwrap(), local);
         drop(conn);
 
@@ -1036,9 +1039,12 @@ mod tests {
         pool_return(&host, 80, false, UpstreamConn::Tcp(live));
         pool_return(&host, 80, false, UpstreamConn::Tcp(dead));
 
-        let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) else {
-            unreachable!("a live connection was in the pool");
+        let conn = if let PoolCheckout::Live(conn) = pool_checkout(&host, 80, false) {
+            Some(conn)
+        } else {
+            None
         };
+        let conn = conn.expect("a live connection was in the pool");
         assert_eq!(
             conn.zero_copy().unwrap().local_addr().unwrap(),
             live_addr,

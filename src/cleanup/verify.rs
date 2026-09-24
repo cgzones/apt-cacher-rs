@@ -173,9 +173,16 @@ mod tests {
 
         let wrong: Vec<u8> = vec![0u8; 32];
         let v = verify_file_sync(&path, HashAlgo::Sha256, &wrong);
-        let Verdict::Mismatch { computed, size } = v else {
-            unreachable!("expected Mismatch verdict, got {v:?}")
+        assert!(
+            matches!(v, Verdict::Mismatch { .. }),
+            "expected Mismatch verdict, got {v:?}"
+        );
+        let mismatch = if let Verdict::Mismatch { computed, size } = v {
+            Some((computed, size))
+        } else {
+            None
         };
+        let (computed, size) = mismatch.expect("asserted above");
         assert_eq!(computed, expected_sha256);
         assert_eq!(size, payload.len() as u64, "size is billed to the eviction");
 

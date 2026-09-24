@@ -378,9 +378,12 @@ mod tests {
     fn plan_without_headers_serves_full_file() {
         let plan = info(Some(ETAG)).plan(SIZE, &RangeRequestHeaders::default(), &local_client());
         assert_eq!(plan, full());
-        let ServePlan::Serve(params) = plan else {
-            unreachable!("asserted above")
+        let params = if let ServePlan::Serve(params) = plan {
+            Some(params)
+        } else {
+            None
         };
+        let params = params.expect("asserted above");
         assert!(!params.is_partial());
     }
 
@@ -431,9 +434,16 @@ mod tests {
             ..RangeRequestHeaders::default()
         };
         let plan = info(Some(ETAG)).plan(SIZE, &headers, &local_client());
-        let ServePlan::Serve(params) = plan else {
-            unreachable!("expected Serve, got {plan:?}")
+        assert!(
+            matches!(plan, ServePlan::Serve(_)),
+            "expected Serve, got {plan:?}"
+        );
+        let params = if let ServePlan::Serve(params) = plan {
+            Some(params)
+        } else {
+            None
         };
+        let params = params.expect("asserted above");
         assert_eq!(params.http_status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(params.content_start, 100);
         assert_eq!(params.content_length, 100);

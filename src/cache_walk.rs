@@ -681,9 +681,16 @@ mod tests {
         let before = metrics::CACHE_IO_FAILURE.get();
         let (events, outcome) = collect(&absent, &ABORT, OnMissing::Fail, &[]).await;
         assert_eq!(events, Vec::new());
-        let WalkOutcome::Aborted { logged: _, err } = outcome else {
-            unreachable!("expected Aborted, got {outcome:?}")
+        assert!(
+            matches!(outcome, WalkOutcome::Aborted { .. }),
+            "expected Aborted, got {outcome:?}"
+        );
+        let err = if let WalkOutcome::Aborted { logged: _, err } = outcome {
+            Some(err)
+        } else {
+            None
         };
+        let err = err.expect("asserted above");
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(metrics::CACHE_IO_FAILURE.get() > before);
 
