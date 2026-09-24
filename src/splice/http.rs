@@ -6,7 +6,9 @@
 //! to its framing.
 //! [`ChunkDecoder`] is the one chunked transfer-coding state machine;
 //! [`forward_upstream_chunked_body`] and [`read_dechunk_body_to_vec`] are its
-//! I/O wrappers.
+//! I/O wrappers. A relayed chunked body reaches an HTTP/1.1 client in its raw
+//! encoding but an HTTP/1.0 client de-chunked and close-delimited
+//! ([`ChunkedRelay`]).
 //!
 //! Consumers: `acquire` (request/parse), the drive in
 //! `mod.rs` and `volatile`/`simple_proxy`/`cleanup_bridge` (framing relays).
@@ -30,7 +32,9 @@ use tokio::{
 };
 
 use crate::cache_layout::ConnectionDetails;
-use crate::http_helpers::{ConnectionAction, OptHeader, find_header, find_header_end};
+use crate::http_helpers::{
+    ConnectionAction, ConnectionVersion, OptHeader, find_header, find_header_end,
+};
 use crate::http_range::parse_content_range;
 use crate::humanfmt::HumanFmt;
 use crate::limits::{MAX_UPSTREAM_HEADER_SIZE, MAX_UPSTREAM_HEADERS};
@@ -223,30 +227,50 @@ async fn read_upstream_response_headers(
 /// framing line a relayed head announces and the body relays.
 impl BodyFraming {
     /// The client connection's fate after a response relayed with this
-    /// framing: a close-delimited body ends only when the connection closes,
-    /// so the client's keep-alive cannot survive it.
-    pub(super) fn client_action(self, requested: ConnectionAction) -> ConnectionAction {
+    /// framing to a `client` speaking that HTTP version: a body relayed
+    /// close-delimited (a close-delimited upstream body, or a chunked one
+    /// de-chunked for HTTP/1.0) ends only when the connection closes, so the
+    /// client's keep-alive cannot survive it.
+    pub(super) fn client_action(
+        self,
+        requested: ConnectionAction,
+        client: ConnectionVersion,
+    ) -> ConnectionAction {
         match self {
-            Self::ContentLength(_) | Self::Chunked => requested,
+            Self::ContentLength(_) => requested,
+            Self::Chunked => match ChunkedRelay::for_client(client) {
+                ChunkedRelay::Raw => requested,
+                ChunkedRelay::Decoded => ConnectionAction::Close,
+            },
             Self::CloseDelimited => ConnectionAction::Close,
         }
     }
 
-    /// The framing header a relayed head announces, CRLF-terminated; none
-    /// for a close-delimited body or a `status` that never carries one.
-    pub(super) fn header_line(self, status: StatusCode) -> Option<String> {
+    /// The framing header a relayed head announces to a `client` speaking
+    /// that HTTP version, CRLF-terminated; none for a body relayed
+    /// close-delimited or a `status` that never carries one.
+    pub(super) fn header_line(
+        self,
+        status: StatusCode,
+        client: ConnectionVersion,
+    ) -> Option<String> {
         if is_bodyless_status(status) {
             return None;
         }
         match self {
             Self::ContentLength(len) => Some(format!("Content-Length: {len}\r\n")),
-            Self::Chunked => Some("Transfer-Encoding: chunked\r\n".to_owned()),
+            Self::Chunked => match ChunkedRelay::for_client(client) {
+                ChunkedRelay::Raw => Some("Transfer-Encoding: chunked\r\n".to_owned()),
+                ChunkedRelay::Decoded => None,
+            },
             Self::CloseDelimited => None,
         }
     }
 
-    /// Relay the response body to the client, framed per `self`, and return
-    /// the number of body bytes sent (`body_prefix` included).
+    /// Relay the response body to a `client_stream` speaking HTTP version
+    /// `client`, framed per `self` (a chunked body de-chunked for HTTP/1.0,
+    /// see [`Self::client_action`]), and return the number of body bytes
+    /// sent (`body_prefix` included).
     ///
     /// Takes ownership so every error or cancellation closes the connection.
     /// Only a complete length-delimited or chunked body returns it to the pool.
@@ -254,6 +278,7 @@ impl BodyFraming {
         self,
         mut upstream: ResponseBody,
         client_stream: &TcpStream,
+        client: ConnectionVersion,
         body_prefix: &[u8],
         max_bytes: usize,
     ) -> Result<u64, DeliveryFailure> {
@@ -292,12 +317,14 @@ impl BodyFraming {
                 Ok(prefix_len + forwarded)
             }
             Self::Chunked => {
-                // Raw framing is forwarded unchanged; the helper consumes the
-                // closing CRLF after the `0` chunk, so the connection stays
-                // reusable on success.
+                // Raw framing is forwarded unchanged (or decoded, for an
+                // HTTP/1.0 client); the helper consumes the closing CRLF
+                // after the `0` chunk, so the connection stays reusable on
+                // success.
                 let forwarded = forward_upstream_chunked_body(
                     &mut upstream,
                     client_stream,
+                    ChunkedRelay::for_client(client),
                     body_prefix,
                     max_bytes,
                 )
@@ -818,8 +845,9 @@ fn parse_chunk_size_line(line: &[u8]) -> Result<usize, &'static str> {
 ///
 /// The single framing implementation behind both the streaming relay
 /// [`forward_upstream_chunked_body`] (which forwards the raw encoding
-/// unchanged and only needs to know where the body ends) and the buffered
-/// reader [`read_dechunk_body_to_vec`] (which collects the decoded payload).
+/// unchanged and only needs to know where the body ends, or, for an
+/// HTTP/1.0 client, streams the decoded payload) and the buffered reader
+/// [`read_dechunk_body_to_vec`] (which collects the decoded payload).
 /// Chunk-size lines are held to RFC 9112's grammar ([`parse_chunk_size_line`])
 /// and chunk extensions after `;` are ignored; trailer fields between `0\r\n`
 /// and the final `\r\n` are rejected as a framing sanity check rather than
@@ -959,9 +987,31 @@ impl ChunkDecoder {
     }
 }
 
+/// What [`forward_upstream_chunked_body`] hands the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkedRelay {
+    /// The raw encoding, unchanged: an HTTP/1.1 client decodes it itself.
+    Raw,
+    /// The decoded payload only, for an HTTP/1.0 client, which knows no
+    /// transfer coding (RFC 9112 §6.1): the relayed body is close-delimited.
+    Decoded,
+}
+
+impl ChunkedRelay {
+    /// How a chunked body is relayed to a client speaking `client`.
+    fn for_client(client: ConnectionVersion) -> Self {
+        match client {
+            ConnectionVersion::Http11 => Self::Raw,
+            ConnectionVersion::Http10 => Self::Decoded,
+        }
+    }
+}
+
 /// One buffer's worth of [`forward_upstream_chunked_body`]: validate the
-/// framing, then forward the validated raw bytes to the client. Returns
-/// `true` once the terminator has been consumed.
+/// framing, then forward the validated raw bytes -- or, for
+/// [`ChunkedRelay::Decoded`], the payload they carry, collected in
+/// `payload` -- to the client. Returns `true` once the terminator has been
+/// consumed.
 ///
 /// Framing is validated before anything is forwarded, so the client never
 /// receives bytes past a detected framing error: on invalid framing the
@@ -970,15 +1020,28 @@ impl ChunkDecoder {
 /// see the connection drop. When the terminator is consumed only the
 /// validated prefix `data[..raw]` goes out; bytes past the closing `\r\n`
 /// are rejected afterwards by [`Consumed::ensure_no_trailing_bytes`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one per-buffer step of one relay loop; the arguments are that loop's state"
+)]
 async fn forward_chunked_buf(
     decoder: &mut ChunkDecoder,
     data: &[u8],
+    relay: ChunkedRelay,
+    payload: &mut Vec<u8>,
     client: &TcpStream,
     client_rate_checker: &mut Option<RateChecker>,
     client_total: &mut u64,
     http_timeout: Duration,
 ) -> Result<bool, DeliveryFailure> {
-    let consumed = match decoder.feed(data, |_payload| {}) {
+    payload.clear();
+    let fed = match relay {
+        ChunkedRelay::Raw => decoder.feed(data, |_payload| {}),
+        ChunkedRelay::Decoded => {
+            decoder.feed(data, |range| payload.extend_from_slice(&data[range]))
+        }
+    };
+    let consumed = match fed {
         Ok(consumed) => consumed,
         Err(ChunkDecodeError::SizeCap {
             max_bytes,
@@ -992,7 +1055,10 @@ async fn forward_chunked_buf(
             return Err(DeliveryFailure::from(UpstreamError::protocol(reason)));
         }
     };
-    let forward_slice = &data[..consumed.raw];
+    let forward_slice = match relay {
+        ChunkedRelay::Raw => &data[..consumed.raw],
+        ChunkedRelay::Decoded => payload.as_slice(),
+    };
     if !forward_slice.is_empty() {
         write_all_to_stream_rated(client, forward_slice, client_rate_checker, http_timeout).await?;
         metrics::BYTES_SERVED_PASSTHROUGH.increment_by(forward_slice.len() as u64);
@@ -1006,14 +1072,17 @@ async fn forward_chunked_buf(
 
 /// Forward a chunked transfer-encoded body from upstream to client.
 ///
-/// All raw bytes (chunk-size lines, data, CRLFs) are forwarded unchanged.
-/// The [`ChunkDecoder`] only tracks framing to detect the terminating
-/// zero-length chunk, so the connection can be reused afterwards.
+/// For [`ChunkedRelay::Raw`] all raw bytes (chunk-size lines, data, CRLFs)
+/// are forwarded unchanged and the [`ChunkDecoder`] only tracks framing to
+/// detect the terminating zero-length chunk, so the connection can be
+/// reused afterwards. For [`ChunkedRelay::Decoded`] only the payload the
+/// decoder reports goes out, as a close-delimited body.
 ///
 /// Terminator and pool-safety policy: [`ChunkDecoder`].
 async fn forward_upstream_chunked_body(
     upstream: &mut UpstreamConn,
     client: &TcpStream,
+    relay: ChunkedRelay,
     body_prefix: &[u8],
     max_bytes: usize,
 ) -> Result<u64, DeliveryFailure> {
@@ -1022,13 +1091,18 @@ async fn forward_upstream_chunked_body(
     let mut client_rate_checker = RateChecker::from_config(config);
 
     let mut decoder = ChunkDecoder::new(max_bytes);
-    // Tracks raw bytes (framing + data) written to the client.
+    // The decoded payload of the current buffer; stays empty for `Raw`.
+    let mut payload = Vec::new();
+    // Tracks the bytes written to the client: raw framing + data, or the
+    // decoded payload.
     let mut client_total: u64 = 0;
 
     // Bootstrap: process bytes that arrived with the response headers.
     if forward_chunked_buf(
         &mut decoder,
         body_prefix,
+        relay,
+        &mut payload,
         client,
         &mut client_rate_checker,
         &mut client_total,
@@ -1061,6 +1135,8 @@ async fn forward_upstream_chunked_body(
         if forward_chunked_buf(
             &mut decoder,
             &buf[..n],
+            relay,
+            &mut payload,
             client,
             &mut client_rate_checker,
             &mut client_total,
@@ -1253,6 +1329,8 @@ mod tests {
         let err = forward_chunked_buf(
             &mut ChunkDecoder::new(1024),
             b"1\r\nx\r\n0\r\n\r\n",
+            ChunkedRelay::Raw,
+            &mut Vec::new(),
             &client,
             &mut None,
             &mut 0,
@@ -1264,6 +1342,46 @@ mod tests {
             matches!(err, DeliveryFailure::Client(ref error) if error.is_peer_disconnect()),
             "client write must retain its source and disconnect cause"
         );
+    }
+
+    /// For an HTTP/1.0 client only the payload goes out, whatever buffer
+    /// boundaries split the size lines and the chunk data.
+    #[tokio::test]
+    async fn decoded_chunked_relay_forwards_only_the_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+
+        let mut decoder = ChunkDecoder::new(1024);
+        let mut payload = Vec::new();
+        let mut total = 0;
+        for (data, done) in [
+            (&b"5\r\nhel"[..], false),
+            (b"lo\r\n1", false),
+            (b"\r\n!\r\n0\r\n\r\n", true),
+        ] {
+            let finished = forward_chunked_buf(
+                &mut decoder,
+                data,
+                ChunkedRelay::Decoded,
+                &mut payload,
+                &client,
+                &mut None,
+                &mut total,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("valid chunked input");
+            assert_eq!(finished, done, "{:?}", data.escape_ascii().to_string());
+        }
+        assert_eq!(total, 6);
+
+        drop(client);
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"hello!");
     }
 
     #[test]

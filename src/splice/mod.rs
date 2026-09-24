@@ -945,7 +945,9 @@ async fn plan_upstream_response(
 /// The body reader consumes the response and releases it only on success.
 ///
 /// Returns what becomes of the client connection: `client.action`, unless
-/// the relayed body was close-delimited and the connection has to close.
+/// the body was relayed close-delimited (a close-delimited upstream body, or
+/// a chunked one de-chunked for an HTTP/1.0 client) and the connection has
+/// to close.
 async fn relay_passthrough(
     upstream: ResponseBody,
     client: ClientConn<'_>,
@@ -971,11 +973,13 @@ async fn relay_passthrough(
 
     // Rewrite the response headers before forwarding: strip hop-by-hop
     // headers, emit a single `Connection:` matching our keep-alive
-    // decision (a close-delimited body overrides it), announce the framing
-    // the relay applies instead of the upstream's, and append `Via:`.
+    // decision (a body relayed close-delimited overrides it), announce the
+    // framing the relay applies instead of the upstream's, and append `Via:`.
     // Nothing has been written to the client yet, so a malformed-header
     // error can safely bail to a 502 via the outer arm.
-    let conn_action = upstream_resp.framing.client_action(client.action);
+    let conn_action = upstream_resp
+        .framing
+        .client_action(client.action, client.version);
     let passthrough_headers = match rewrite_simple_proxy_headers(
         &header_buf[..header_end],
         client.version,
@@ -1009,7 +1013,13 @@ async fn relay_passthrough(
     // framed per the upstream's (precedence-resolved) framing.
     upstream_resp
         .framing
-        .relay_to_client(upstream, client.stream, body_prefix, VOLATILE_BODY_MAX)
+        .relay_to_client(
+            upstream,
+            client.stream,
+            client.version,
+            body_prefix,
+            VOLATILE_BODY_MAX,
+        )
         .await
         .map_err(|failure| SpliceProxyError::AfterHeader {
             phase: "passthrough body",

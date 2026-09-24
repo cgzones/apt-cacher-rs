@@ -38,8 +38,9 @@ use crate::upstream_head::{BodyFraming, RelayedHeaders};
 /// `Connection:` headers the upstream sent.
 ///
 /// The upstream's `Content-Length` / `Transfer-Encoding` lines are never
-/// forwarded either: the head announces `framing`, the framing the relay
-/// applies (`BodyFraming::header_line`). Forwarding them would let a client
+/// forwarded either: the head announces the framing the relay applies to a
+/// `conn_version` client (`BodyFraming::header_line`; none for a chunked body
+/// de-chunked for HTTP/1.0). Forwarding them would let a client
 /// frame the body by a line the relay ignored (a second `Transfer-Encoding`,
 /// a conflicting `Content-Length`) or lose it to a `Connection:` nomination,
 /// and read the body's tail as a forged next response. `conn_action` must
@@ -66,7 +67,7 @@ pub(super) fn rewrite_simple_proxy_headers(
     let relayed = RelayedHeaders::new(parsed.headers.iter().map(|h| (h.name, h.value)));
 
     let mut buf = format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n");
-    if let Some(line) = framing.header_line(status_code) {
+    if let Some(line) = framing.header_line(status_code, conn_version) {
         buf.push_str(&line);
     }
     for h in parsed.headers.iter() {
@@ -193,8 +194,9 @@ pub(crate) async fn splice_simple_proxy(
 
     // Rewrite response headers: adjust HTTP version and Connection header
     // to match the client's protocol version and keep-alive strategy, which
-    // a close-delimited body overrides.
-    let conn_action = resp.framing.client_action(conn_action);
+    // a body relayed close-delimited overrides (a close-delimited upstream
+    // body, or a chunked one de-chunked for an HTTP/1.0 client).
+    let conn_action = resp.framing.client_action(conn_action, conn_version);
     let rewritten_headers = match rewrite_simple_proxy_headers(
         &hdr_buf[..hdr_end],
         conn_version,
@@ -247,7 +249,13 @@ pub(crate) async fn splice_simple_proxy(
     // exactly that framing, so the headers and the body framing agree.
     let forwarded: u64 = resp
         .framing
-        .relay_to_client(upstream, client_stream, body_prefix, VOLATILE_BODY_MAX)
+        .relay_to_client(
+            upstream,
+            client_stream,
+            conn_version,
+            body_prefix,
+            VOLATILE_BODY_MAX,
+        )
         .await
         .map_err(|failure| SpliceProxyError::AfterHeader {
             phase: "simple-proxy body",
@@ -329,29 +337,50 @@ mod tests {
                 .map(str::to_owned)
                 .collect()
         };
-        for (status, framing, expected) in [
+        let http11 = ConnectionVersion::Http11;
+        for (version, status, framing, expected) in [
             (
+                http11,
                 StatusCode::OK,
                 BodyFraming::ContentLength(5),
                 vec!["Content-Length: 5"],
             ),
             (
+                http11,
                 StatusCode::OK,
                 BodyFraming::Chunked,
                 vec!["Transfer-Encoding: chunked"],
             ),
+            // An HTTP/1.0 client gets a chunked body de-chunked and
+            // close-delimited, and must not be told about a coding it
+            // does not know (RFC 9112 §6.1).
             (
+                ConnectionVersion::Http10,
+                StatusCode::OK,
+                BodyFraming::Chunked,
+                vec![],
+            ),
+            (
+                ConnectionVersion::Http10,
+                StatusCode::OK,
+                BodyFraming::ContentLength(5),
+                vec!["Content-Length: 5"],
+            ),
+            (
+                http11,
                 StatusCode::OK,
                 BodyFraming::ContentLength(0),
                 vec!["Content-Length: 0"],
             ),
-            (StatusCode::OK, BodyFraming::CloseDelimited, vec![]),
+            (http11, StatusCode::OK, BodyFraming::CloseDelimited, vec![]),
             (
+                http11,
                 StatusCode::NOT_MODIFIED,
                 BodyFraming::ContentLength(0),
                 vec![],
             ),
             (
+                http11,
                 StatusCode::NO_CONTENT,
                 BodyFraming::ContentLength(0),
                 vec![],
@@ -359,8 +388,8 @@ mod tests {
         ] {
             let out = rewrite_simple_proxy_headers(
                 raw,
-                ConnectionVersion::Http11,
-                framing.client_action(ConnectionAction::KeepAlive),
+                version,
+                framing.client_action(ConnectionAction::KeepAlive, version),
                 status,
                 framing,
             )
@@ -368,29 +397,57 @@ mod tests {
             assert_eq!(
                 framing_lines(&out),
                 expected,
-                "{framing:?}/{status}:\n{out}"
+                "{version} {framing:?}/{status}:\n{out}"
             );
         }
     }
 
+    /// A body relayed close-delimited closes the client connection: a
+    /// close-delimited upstream body, and a chunked one de-chunked for an
+    /// HTTP/1.0 client.
     #[test]
     fn close_delimited_framing_closes_the_client_connection() {
-        for (framing, expected) in [
-            (BodyFraming::ContentLength(5), "keep-alive"),
-            (BodyFraming::Chunked, "keep-alive"),
-            (BodyFraming::CloseDelimited, "close"),
+        for (version, framing, expected) in [
+            (
+                ConnectionVersion::Http11,
+                BodyFraming::ContentLength(5),
+                "keep-alive",
+            ),
+            (
+                ConnectionVersion::Http11,
+                BodyFraming::Chunked,
+                "keep-alive",
+            ),
+            (
+                ConnectionVersion::Http11,
+                BodyFraming::CloseDelimited,
+                "close",
+            ),
+            (
+                ConnectionVersion::Http10,
+                BodyFraming::ContentLength(5),
+                "keep-alive",
+            ),
+            (ConnectionVersion::Http10, BodyFraming::Chunked, "close"),
+            (
+                ConnectionVersion::Http10,
+                BodyFraming::CloseDelimited,
+                "close",
+            ),
         ] {
             assert_eq!(
                 framing
-                    .client_action(ConnectionAction::KeepAlive)
+                    .client_action(ConnectionAction::KeepAlive, version)
                     .to_string(),
                 expected,
-                "{framing:?}"
+                "{version} {framing:?}"
             );
             assert_eq!(
-                framing.client_action(ConnectionAction::Close).to_string(),
+                framing
+                    .client_action(ConnectionAction::Close, version)
+                    .to_string(),
                 "close",
-                "{framing:?}"
+                "{version} {framing:?}"
             );
         }
     }
