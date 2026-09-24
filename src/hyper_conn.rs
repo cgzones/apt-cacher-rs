@@ -2535,9 +2535,12 @@ fn connect_response(
 
     // Shared with the sendfile/splice backend so tunnel policy stays identical
     // across backends; logs and policy metrics are bumped inside the validator.
+    // Every refusal below closes the connection, as sendfile's
+    // `handle_connect` does: a refused client gets no keep-alive connection
+    // to probe further targets on.
     let (host, port) = match validate_connect_target(config, &client, req.uri()) {
         Ok(hp) => hp,
-        Err(ConnectReject { status, msg }) => return quick_response(status, msg),
+        Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
     };
 
     let tunnel_guard = if let Some(max) = config.https_tunnel_max_connections_per_client {
@@ -2547,7 +2550,7 @@ fn connect_response(
                      concurrent connection limit ({max}) reached"
             );
             metrics::TUNNEL_REJECTED_CAPACITY.increment();
-            return quick_response(
+            return quick_response_closing(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many concurrent HTTPS tunnel connections",
             );
