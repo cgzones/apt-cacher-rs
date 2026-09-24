@@ -86,6 +86,9 @@ impl HeadError {
 /// whether the connection is pooled afterwards is the response's say
 /// (`UpstreamResponse::connection_close`). `Via` names this proxy, so a
 /// request looping back into it is refused by `preflight_via`.
+/// `Accept-Encoding: identity`: a request without the field accepts any
+/// content coding (RFC 9110 §12.5.3), and a coded body would be cached,
+/// and relayed, without its `Content-Encoding`.
 pub(super) fn format_http_request(
     path: &str,
     host_authority: &str,
@@ -116,6 +119,7 @@ pub(super) fn format_http_request(
          Host: {host_authority}\r\n\
          User-Agent: {APP_USER_AGENT}\r\n\
          Via: {APP_VIA}\r\n\
+         Accept-Encoding: identity\r\n\
          Connection: keep-alive\r\n\
          {range_header}\
          {volatile_headers}\

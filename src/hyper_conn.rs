@@ -20,8 +20,9 @@ use futures_util::StreamExt as _;
 use http::{
     HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
     header::{
-        ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ETAG, HOST, IF_MODIFIED_SINCE,
-        IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT, VIA,
+        ACCEPT, ACCEPT_ENCODING, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, ETAG, HOST,
+        IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT,
+        VIA,
     },
     uri::{Authority, PathAndQuery},
 };
@@ -1696,13 +1697,17 @@ async fn serve_new_file_worker(
 
         // `Via` names this proxy so a request looping back into it (an
         // `allowed_mirrors` entry covering the proxy's own name) is refused
-        // by `preflight_via` instead of served.
+        // by `preflight_via` instead of served. `Accept-Encoding: identity`:
+        // a request without the field accepts any content coding (RFC 9110
+        // §12.5.3), and a coded body would be cached without its
+        // `Content-Encoding`.
         let mut request = Request::builder()
             .method(Method::GET)
             .uri(uri)
             .header(USER_AGENT, APP_USER_AGENT)
             .header(HOST, host)
             .header(VIA, APP_VIA)
+            .header(ACCEPT_ENCODING, "identity")
             .body(Empty::new())
             .expect("request should be valid");
 
@@ -2896,13 +2901,17 @@ async fn pre_process_client_request(
     // (`Proxy-Authorization`), hop-by-hop fields and a `Content-Length` for
     // the body `strip_request_body` dropped must never reach the shared
     // upstream pool. The upstream `Host` is the request-target authority,
-    // never the client's own header; `Via` closes proxy loops as in
-    // `build_fwd_request`. The redirect follow below reuses these headers.
+    // never the client's own header; `Via` closes proxy loops and
+    // `Accept-Encoding: identity` keeps the body uncoded as in
+    // `build_fwd_request` (the client's own `Accept-Encoding` is not
+    // forwarded, so a coding the upstream picked could be one it cannot
+    // decode). The redirect follow below reuses these headers.
     let (parts, _body) = req.into_parts();
     let mut fwd_request = Request::builder()
         .method(Method::GET)
         .header(USER_AGENT, APP_USER_AGENT)
-        .header(VIA, APP_VIA);
+        .header(VIA, APP_VIA)
+        .header(ACCEPT_ENCODING, "identity");
     if let Some(authority) = parts.uri.authority() {
         fwd_request = fwd_request.header(HOST, host_header_from_uri(authority));
     }
