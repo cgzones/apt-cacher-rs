@@ -88,8 +88,14 @@ pub(crate) const DEFAULT_RATE_CHECK_TIMEFRAME: NonZero<usize> = nonzero!(30);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) enum HttpsUpgradeMode {
+    /// Try HTTPS first, fall back to HTTP. A rejected certificate falls back
+    /// too, unless HTTPS to the host verified before in this process (trust
+    /// on first use, `scheme_cache::https_verified_before`): then it is
+    /// terminal.
     Auto,
+    /// HTTPS only; a rejected certificate is terminal.
     Always,
+    /// Plain HTTP only.
     Never,
 }
 

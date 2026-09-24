@@ -32,7 +32,7 @@ use crate::deb_mirror::Mirror;
 use crate::error::{ErrorReport, is_peer_disconnect, is_tls_certificate_rejection};
 use crate::humanfmt::HumanFmt;
 use crate::limits::UPSTREAM_POOL_MAX_IDLE_PER_HOST;
-use crate::{Scheme, global_config, metrics, warn_once_or_debug, warn_once_or_info};
+use crate::{Scheme, global_config, metrics, scheme_cache, warn_once_or_debug, warn_once_or_info};
 
 /// Pre-computed TLS client config for use with `tls_rustls`.
 /// Should only be initialized once from main.
@@ -639,8 +639,10 @@ const fn classify_tls_error(kind: ErrorKind) -> Transience {
 /// directly, `None` is the Auto-upgrade case -- try HTTPS first, fall back to HTTP.
 /// Only the error that escapes here is classified for the caller's retry loop;
 /// a permanent TLS failure inside the Auto branch still falls back to HTTP,
-/// except a rejected certificate: that is what an interceptor presents, so it
-/// escapes as the terminal failure instead of downgrading the download.
+/// a rejected certificate included -- unless HTTPS to the host verified
+/// before (`scheme_cache::https_verified_before`): then the rejection is what
+/// an interceptor presents, so it escapes as the terminal failure instead of
+/// downgrading the download.
 ///
 /// Times out after the configured HTTP timeout.
 pub(super) async fn connect_upstream(
@@ -678,10 +680,13 @@ pub(super) async fn connect_upstream(
                         );
                         return Ok((UpstreamConn::Tls(tls), Scheme::Https));
                     }
-                    Err(err) if err.certificate_rejected => {
+                    Err(err)
+                        if err.certificate_rejected
+                            && scheme_cache::https_verified_before(mirror.into()) =>
+                    {
                         metrics::UPSTREAM_TLS_FAILED.increment();
                         debug!(
-                            "splice proxy: TLS certificate of {} rejected; not falling back to HTTP",
+                            "splice proxy: TLS certificate of {} rejected although HTTPS to it verified before; not falling back to HTTP",
                             mirror.format_authority()
                         );
                         return Err(err);
@@ -689,14 +694,22 @@ pub(super) async fn connect_upstream(
                     Err(err) => {
                         // Deliberately not propagated: the HTTP fallback below is
                         // the point of Auto mode, so even a permanent TLS failure
-                        // (no TLS on the port, an unparsable server name) must
-                        // not abort it.
+                        // (no TLS on the port, an unparsable server name, a
+                        // certificate for another host) must not abort it.
                         metrics::UPSTREAM_TLS_FAILED.increment();
-                        debug!(
-                            "splice proxy: TLS handshake failed for {}, trying HTTP:  {}",
-                            mirror.format_authority(),
-                            ErrorReport(&err.err)
-                        );
+                        if err.certificate_rejected {
+                            warn_once_or_info!(
+                                "splice proxy: HTTPS certificate of host {} failed verification; falling back to plain HTTP (list the host in `http_only_mirrors` to silence this, or fix the mirror's certificate):  {}",
+                                mirror.format_authority(),
+                                ErrorReport(&err.err)
+                            );
+                        } else {
+                            debug!(
+                                "splice proxy: TLS handshake failed for {}, trying HTTP:  {}",
+                                mirror.format_authority(),
+                                ErrorReport(&err.err)
+                            );
+                        }
                     }
                 },
                 Err(err) => {

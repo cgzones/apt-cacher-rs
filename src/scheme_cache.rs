@@ -6,7 +6,9 @@
 //! scheme types, the decision (`resolve`/`decide`), and the cache read/insert/evict
 //! (`record_success`/`record_failure`).
 //!
-//! A learned HTTPS scheme is kept until a terminal failure evicts it. A learned
+//! A learned HTTPS scheme is kept until a terminal failure evicts it; a
+//! rejected certificate never does, as the entry is what makes that rejection
+//! terminal under `Auto` ([`https_verified_before`]). A learned
 //! HTTP scheme only lives for [`HTTP_SCHEME_TTL`]: under `Auto` it records a
 //! failed upgrade probe, and a host that could not do TLS once (a transient
 //! outage, an on-path attacker blocking the handshake) must not be dialled in
@@ -215,6 +217,30 @@ fn cached_scheme_at(key: SchemeKeyRef<'_>, now: Instant) -> Option<Scheme> {
         .and_then(|entry| entry.live_at(now))
 }
 
+/// Whether HTTPS to `key` has verified before: a remembered HTTPS scheme.
+/// Decides what a rejected certificate means under `Auto` (trust on first
+/// use): for a host never reached over verified TLS, likely a mirror answering
+/// on 443 with another host's certificate, so the probe falls back to HTTP;
+/// for one that has been, what an interceptor presents, so it is terminal.
+#[must_use]
+pub(crate) fn https_verified_before(key: SchemeKeyRef<'_>) -> bool {
+    cached_scheme_at(key, Instant::now()) == Some(Scheme::Https)
+}
+
+/// Why a rejected certificate was terminal instead of falling back to plain
+/// HTTP, as both backends word it in their operator line: `mode` is the
+/// configured `https_upgrade_mode`. Every other mode got there through a
+/// remembered HTTPS success ([`https_verified_before`]).
+#[must_use]
+pub(crate) const fn no_fallback_reason(mode: HttpsUpgradeMode) -> &'static str {
+    match mode {
+        HttpsUpgradeMode::Always => "`https_upgrade_mode` is `Always`",
+        HttpsUpgradeMode::Auto | HttpsUpgradeMode::Never => {
+            "an earlier HTTPS connection to it verified"
+        }
+    }
+}
+
 /// Resolve the upstream scheme for `key` from the cache and config — the single
 /// entry point both backends use to decide HTTP vs HTTPS.
 pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision {
@@ -326,6 +352,20 @@ mod tests {
         // Vacant-only: an existing entry is never overwritten.
         assert!(!record_success(host, Scheme::Http));
         assert_eq!(cached_scheme_at(host, Instant::now()), Some(Scheme::Https));
+    }
+
+    #[test]
+    fn https_verified_before_only_for_a_remembered_https_scheme() {
+        let https = key("verified-https.test.invalid");
+        let http = key("verified-http.test.invalid");
+        assert!(!https_verified_before(https));
+        assert!(record_success(https, Scheme::Https));
+        assert!(record_success(http, Scheme::Http));
+        assert!(https_verified_before(https));
+        assert!(
+            !https_verified_before(http),
+            "an HTTP fallback proves nothing"
+        );
     }
 
     #[test]

@@ -385,21 +385,34 @@ pub(crate) async fn request_with_retry(
                         metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
                     }
                     let attempt = backoff.attempt();
-                    // A rejected certificate is what an interceptor presents:
-                    // never a reason to revert to plain HTTP, and repeated
-                    // identically by every retry, so it ends the loop at once.
+                    // A rejected certificate is repeated identically by every
+                    // retry, so it never waits for another attempt: an Auto
+                    // probe of a host whose HTTPS never verified reverts at
+                    // once, anything else ends the loop.
                     let certificate_rejected = is_tls_certificate_rejection(&err);
-                    if !certificate_rejected
-                        && attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
-                        && probe == UpgradeProbe::Revertible
-                    {
-                        debug!(
-                            "Https upgrade failed for host {} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}...",
-                            parts
-                                .uri
-                                .authority()
-                                .expect("authority must exist for a https upgrade")
-                        );
+                    let revert = probe == UpgradeProbe::Revertible
+                        && if certificate_rejected {
+                            parts.uri.authority().is_some_and(|auth| {
+                                !scheme_cache::https_verified_before(auth.into())
+                            })
+                        } else {
+                            attempt > HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS
+                        };
+                    if revert {
+                        let auth = parts
+                            .uri
+                            .authority()
+                            .expect("authority must exist for a https upgrade");
+                        if certificate_rejected {
+                            warn_once_or_info!(
+                                "HTTPS certificate of host {auth} failed verification; falling back to plain HTTP (list the host in `http_only_mirrors` to silence this, or fix the mirror's certificate):  {}",
+                                ErrorReport(&err)
+                            );
+                        } else {
+                            debug!(
+                                "Https upgrade failed for host {auth} after {attempt} connection attempts, re-trying with original scheme {orig_scheme:?}..."
+                            );
+                        }
 
                         // reset https upgrade
                         let mut uri_parts = parts.uri.clone().into_parts();
@@ -438,7 +451,22 @@ pub(crate) async fn request_with_retry(
                             // identity.
                             metrics::HTTPS_UPGRADE_FAILED.increment();
                         }
-                        if let Some(auth) = parts.uri.authority()
+                        if certificate_rejected {
+                            // Terminal only where the proxy chose HTTPS (not
+                            // for an `https://` URL the client named); the
+                            // remembered scheme stays, as it is what keeps
+                            // the next request from falling back.
+                            if orig_scheme.as_ref() != Some(&http::uri::Scheme::HTTPS)
+                                && let Some(auth) = parts.uri.authority()
+                            {
+                                warn_once_or_info!(
+                                    "HTTPS certificate of host {auth} failed verification; not falling back to plain HTTP since {} (list the host in `http_only_mirrors` to fetch it over plain HTTP, or fix the mirror's certificate)",
+                                    scheme_cache::no_fallback_reason(
+                                        global_config().https_upgrade_mode
+                                    )
+                                );
+                            }
+                        } else if let Some(auth) = parts.uri.authority()
                             && let Some(scheme) = scheme_cache::record_failure(auth.into())
                         {
                             // A learned scheme is sticky, so losing it silently
@@ -537,10 +565,11 @@ enum UpgradeProbe {
     /// the one the client asked for).
     NotProbing,
     /// `Auto` mode with no cached scheme: revert to the original scheme once
-    /// the connect attempts cross `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS`,
-    /// unless the upstream's certificate was rejected, which is terminal.
-    /// `scheme_cache::decide` only reaches it when no cached scheme exists,
-    /// so nothing is lost by reverting.
+    /// the connect attempts cross `HTTPS_UPGRADE_REVERT_AFTER_ATTEMPTS`, or
+    /// at once on a rejected certificate -- unless HTTPS to the host has
+    /// verified meanwhile (`scheme_cache::https_verified_before`), which makes
+    /// that rejection terminal. `scheme_cache::decide` only reaches it when no
+    /// cached scheme exists, so nothing is lost by reverting.
     Revertible,
     /// `Always` mode: an upgrade attempt with no fallback.
     Committed,
