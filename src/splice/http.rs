@@ -534,8 +534,10 @@ pub(super) fn parse_upstream_response(
 
     let location = find_header(headers, &LOCATION).map(String::from);
 
-    let connection_close = find_header(headers, &CONNECTION)
-        .is_some_and(|s| s.split(',').any(|v| v.trim().eq_ignore_ascii_case("close")));
+    let connection_close = find_header(headers, &CONNECTION).is_some_and(|s| {
+        s.split(',')
+            .any(|v| v.trim_ascii().eq_ignore_ascii_case("close"))
+    });
 
     // RFC 9112 §6.3: 1xx, 204, and 304 responses never carry a message body,
     // regardless of Content-Length / Transfer-Encoding headers. Force

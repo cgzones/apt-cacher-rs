@@ -289,7 +289,7 @@ impl<'a> UpstreamHead<'a> {
         let chunked = headers.get_all(TRANSFER_ENCODING).iter().any(|hv| {
             hv.to_str().is_ok_and(|s| {
                 s.split(',')
-                    .any(|v| v.trim().eq_ignore_ascii_case("chunked"))
+                    .any(|v| v.trim_ascii().eq_ignore_ascii_case("chunked"))
             })
         });
         let content_length = if chunked {
@@ -298,7 +298,7 @@ impl<'a> UpstreamHead<'a> {
             headers
                 .get(CONTENT_LENGTH)
                 .and_then(|hv| hv.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
+                .and_then(|s| s.trim_ascii().parse::<u64>().ok())
         };
         let content_range = headers
             .get(CONTENT_RANGE)
