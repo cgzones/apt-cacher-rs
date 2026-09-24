@@ -706,6 +706,7 @@ fn reject_result(
         | RejectReason::InvalidValue
         | RejectReason::UnsafePath
         | RejectReason::UnsupportedMethod
+        | RejectReason::UnknownMethod
         | RejectReason::UnsupportedScheme
         | RejectReason::MissingHost
         | RejectReason::InvalidPort

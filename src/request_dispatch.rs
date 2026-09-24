@@ -70,8 +70,12 @@ use crate::{
 /// the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RejectReason {
-    /// Request method other than `GET` or `CONNECT`.
+    /// A method HTTP defines (RFC 9110 §9, `PATCH` from RFC 5789) other than
+    /// `GET` or `CONNECT`: 405 with `Allow` (RFC 9110 §15.5.6).
     UnsupportedMethod,
+    /// A method this proxy does not recognize at all: 501 (RFC 9110
+    /// §15.6.2).  Methods are case-sensitive, so `get` is one.
+    UnknownMethod,
     /// A `CONNECT` from a client outside `allowed_proxy_clients`.  (A `GET`
     /// from such a client is refused by `authorize_cache_access` instead.)
     UnauthorizedClient,
@@ -130,6 +134,7 @@ impl RejectReason {
         match self {
             Self::UnauthorizedClient | Self::UnauthorizedWebUi | Self::MisdirectedWebUi => true,
             Self::UnsupportedMethod
+            | Self::UnknownMethod
             | Self::UnsupportedScheme
             | Self::MissingHost
             | Self::InvalidPort
@@ -147,6 +152,7 @@ impl RejectReason {
     pub(crate) const fn response_parts(self) -> (StatusCode, &'static str) {
         match self {
             Self::UnsupportedMethod => (StatusCode::METHOD_NOT_ALLOWED, "Method not supported"),
+            Self::UnknownMethod => (StatusCode::NOT_IMPLEMENTED, "Method not implemented"),
             Self::UnauthorizedClient | Self::UnauthorizedWebUi => {
                 (StatusCode::FORBIDDEN, "Unauthorized client")
             }
@@ -233,7 +239,9 @@ pub(crate) enum RequestKind {
 
 /// Method gate shared by both backends: `GET` and `CONNECT` are the only
 /// methods served, and `CONNECT` additionally passes the proxy-client ACL
-/// here (the `GET` path enforces it inside `authorize_cache_access`).
+/// here (the `GET` path enforces it inside `authorize_cache_access`).  Any
+/// other method HTTP defines is refused with 405, an unrecognized one with
+/// 501 (RFC 9110 §15.5.6, §15.6.2).
 ///
 /// Logs and bumps metrics for every rejection; the caller only maps the
 /// [`RejectReason`] onto its response type.
@@ -252,12 +260,18 @@ pub(crate) fn preflight_method(
             }
             Ok(RequestKind::Connect)
         }
-        m => {
+        m @ ("HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "TRACE" | "PATCH") => {
             warn_once_or_info!(
-                "Unsupported request method `{}` from client {client}; returning 405",
-                m.escape_debug(),
+                "Unsupported request method `{m}` from client {client}; returning 405"
             );
             Err(RejectReason::UnsupportedMethod)
+        }
+        m => {
+            warn_once_or_info!(
+                "Unrecognized request method `{}` from client {client}; returning 501",
+                m.escape_debug(),
+            );
+            Err(RejectReason::UnknownMethod)
         }
     }
 }
@@ -807,10 +821,18 @@ mod tests {
 
     #[test]
     fn preflight_method_rejects_other_methods() {
-        for m in ["POST", "PUT", "HEAD", "get"] {
+        for m in ["HEAD", "POST", "PUT", "DELETE", "OPTIONS", "TRACE", "PATCH"] {
             assert_eq!(
                 preflight_method(m, &local_client(), &OPEN_ACLS),
                 Err(RejectReason::UnsupportedMethod),
+                "{m}"
+            );
+        }
+        // Methods are case-sensitive (RFC 9110 §9.1): `get` is not `GET`.
+        for m in ["get", "PROPFIND", "BREW"] {
+            assert_eq!(
+                preflight_method(m, &local_client(), &OPEN_ACLS),
+                Err(RejectReason::UnknownMethod),
                 "{m}"
             );
         }
@@ -1017,6 +1039,10 @@ mod tests {
         assert_eq!(
             RejectReason::UnsupportedMethod.response_parts(),
             (StatusCode::METHOD_NOT_ALLOWED, "Method not supported")
+        );
+        assert_eq!(
+            RejectReason::UnknownMethod.response_parts(),
+            (StatusCode::NOT_IMPLEMENTED, "Method not implemented")
         );
         assert_eq!(
             RejectReason::UnauthorizedClient.response_parts(),
