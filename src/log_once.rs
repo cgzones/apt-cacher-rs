@@ -63,9 +63,9 @@ impl KeyedGate {
 /// Emit one message at INFO when `$expected` holds and at WARN otherwise.
 ///
 /// For the delivery split `docs/logging.md` mandates: a client that hung up
-/// (or, on the writers whose stall paths surface as `TimedOut`, one that
-/// stalled) is an expected end to a transfer and logs at INFO, while any
-/// other I/O failure is the operator's business. Not gated — these lines are
+/// or stalled (`error::is_expected_client_end`) is an expected end to a
+/// transfer and logs at INFO, while any other I/O failure is the operator's
+/// business. Not gated — these lines are
 /// the per-request narrative, which `docs/logging.md`'s flood-control section
 /// exempts.
 ///

@@ -49,10 +49,11 @@ pub(crate) struct UpstreamFetchError {
 /// is acceptable to log as a warn-level timeout rather than an
 /// info-level "peer disconnect" — the wording stays accurate either way.
 ///
-/// Call sites that want to demote a `TimedOut` to a different severity
-/// (e.g. the header-read idle-timeout debug path, or the splice
-/// boundary-chunk demote-on-stall path) MUST add an explicit
-/// `err.kind() == ErrorKind::TimedOut` branch before this check.
+/// A client write whose timeout should log like a hang-up uses
+/// [`is_expected_client_end`]; other call sites that want to demote a
+/// `TimedOut` to a different severity (e.g. the header-read idle-timeout
+/// debug path) MUST add an explicit `err.kind() == ErrorKind::TimedOut`
+/// branch before this check.
 #[must_use]
 pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
@@ -64,6 +65,17 @@ pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
             | ErrorKind::NotConnected
             | ErrorKind::UnexpectedEof
     )
+}
+
+/// Whether a failed client write is an expected end of the exchange: the
+/// peer hung up ([`is_peer_disconnect`]) or stalled past its deadline
+/// (`TimedOut`, already counted by an `HTTP_TIMEOUT_*` counter). The untyped
+/// half of the client-delivery split in `docs/logging.md`, logged at INFO
+/// like its typed half (`DeliveryFailure::severity`); anything else is WARN.
+#[cfg(feature = "sendfile")]
+#[must_use]
+pub(crate) fn is_expected_client_end(err: &std::io::Error) -> bool {
+    is_peer_disconnect(err) || err.kind() == std::io::ErrorKind::TimedOut
 }
 
 /// Whether any error in `err`'s `source()` chain is a `TimedOut` `io::Error`.
@@ -220,6 +232,20 @@ mod tests {
         assert!(!is_peer_disconnect(&Error::from(ErrorKind::Other)));
         assert!(is_peer_disconnect(&Error::from(ErrorKind::BrokenPipe)));
         assert!(is_peer_disconnect(&Error::from(ErrorKind::UnexpectedEof)));
+    }
+
+    #[cfg(feature = "sendfile")]
+    #[test]
+    fn a_client_timeout_is_an_expected_end_like_a_hang_up() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(is_expected_client_end(&Error::from(ErrorKind::TimedOut)));
+        assert!(is_expected_client_end(&Error::from(ErrorKind::BrokenPipe)));
+        assert!(is_expected_client_end(&Error::from(
+            ErrorKind::ConnectionReset
+        )));
+        assert!(!is_expected_client_end(&Error::from(ErrorKind::Other)));
+        assert!(!is_expected_client_end(&Error::from(ErrorKind::WriteZero)));
     }
 
     #[cfg(feature = "hyper")]

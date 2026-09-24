@@ -65,7 +65,7 @@ use crate::{
     content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
     delivery::{Mechanism, Role, ServeOutcome, finish_cached_serve},
-    error::{ErrorReport, is_peer_disconnect},
+    error::{ErrorReport, is_expected_client_end, is_peer_disconnect},
     fs_open::{
         CacheAccessFailure, hint_sequential_read, regular_file_metadata,
         regular_file_metadata_typed, tokio_nofollow_options,
@@ -482,12 +482,12 @@ async fn read_request_headers(
 }
 
 /// Log a failed write of a proxy-generated response to the client, taking the
-/// mandatory delivery split (`docs/logging.md`): a peer that hung up logs at
-/// INFO, every other I/O error at WARN.  `what` names the response the write
-/// belonged to, e.g. `"304 response"`.
+/// mandatory delivery split (`docs/logging.md`): a peer that hung up or timed
+/// out logs at INFO, every other I/O error at WARN.  `what` names the response
+/// the write belonged to, e.g. `"304 response"`.
 fn log_client_write_failure(client: ClientInfo, what: &str, err: &std::io::Error) {
     info_or_warn!(
-        is_peer_disconnect(err),
+        is_expected_client_end(err),
         "Failed to write {what} to client {client}; closing the connection:  {}",
         ErrorReport(err)
     );
@@ -883,7 +883,7 @@ async fn run_connect_tunnel(
         .await
     {
         info_or_warn!(
-            is_peer_disconnect(&err),
+            is_expected_client_end(&err),
             "Failed to send tunnel established response to client {client}; tearing down the tunnel:  {}",
             ErrorReport(&err)
         );
@@ -2590,7 +2590,7 @@ async fn serve_unfinished_sendfile(
     .await
     {
         info_or_warn!(
-            is_peer_disconnect(&err),
+            is_expected_client_end(&err),
             "Failed to write response headers to joining client {}; closing the connection:  {}",
             conn_details.client,
             ErrorReport(&err)
