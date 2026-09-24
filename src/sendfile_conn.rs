@@ -317,13 +317,16 @@ pub(crate) async fn handle_sendfile_connection(
         // above.
         metrics::REQUESTS_TOTAL.increment();
 
-        #[expect(clippy::match_same_arms, reason = "keep separate for clarity")]
         let _: Never = match result {
             ZeroCopyResult::Served(ConnectionAction::KeepAlive) => {
                 buf.advance(next_header_index);
                 continue;
             }
             ZeroCopyResult::Served(ConnectionAction::Close) => {
+                // A request body `compute_conn_action` left unread would
+                // turn a plain close into an RST that discards the response
+                // tail still queued for the client.
+                graceful_close(&stream).await;
                 return;
             }
             ZeroCopyResult::NotApplicable {
@@ -386,6 +389,7 @@ pub(crate) async fn handle_sendfile_connection(
                         None,
                     )
                     .await;
+                    graceful_close(&stream).await;
                     return;
                 }
             }
