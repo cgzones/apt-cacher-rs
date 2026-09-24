@@ -517,6 +517,7 @@ pub(super) fn parse_upstream_response(
     let raw_code = resp.code.expect("complete header parsed");
     let status_code = StatusCode::from_u16(raw_code)
         .map_err(|_err| "invalid HTTP status code from upstream".to_owned())?;
+    let http10 = resp.version == Some(0);
 
     let headers = resp.headers;
 
@@ -534,10 +535,24 @@ pub(super) fn parse_upstream_response(
 
     let location = find_header(headers, &LOCATION).map(String::from);
 
-    let connection_close = find_header(headers, &CONNECTION).is_some_and(|s| {
-        s.split(',')
-            .any(|v| v.trim_ascii().eq_ignore_ascii_case("close"))
-    });
+    // RFC 9112 section 9.3: a `close` option on any `Connection` line ends the
+    // connection after this response, and an HTTP/1.0 response persists only
+    // with a `keep-alive` option. Pooling such a connection would leave the
+    // next request racing the upstream's FIN, caught only if
+    // `upstream::check_alive`'s probe sees it first.
+    let mut close = false;
+    let mut keep_alive = false;
+    for value in headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case(CONNECTION.as_str()))
+        .filter_map(|h| str::from_utf8(h.value).ok())
+    {
+        for token in value.split(',').map(str::trim_ascii) {
+            close |= token.eq_ignore_ascii_case("close");
+            keep_alive |= token.eq_ignore_ascii_case("keep-alive");
+        }
+    }
+    let connection_close = close || (http10 && !keep_alive);
 
     // RFC 9112 §6.3: 1xx, 204, and 304 responses never carry a message body,
     // regardless of Content-Length / Transfer-Encoding headers. Force
@@ -1682,7 +1697,9 @@ mod tests {
     /// `Content-Length` duplicates (folded or on separate lines) collapse to
     /// one value, a 1xx head is bodyless whatever it claims, a lone
     /// `chunked` coding (empty list elements aside) wins over
-    /// `Content-Length`, and a `close` token anywhere in `Connection` closes.
+    /// `Content-Length`, a `close` token anywhere in `Connection` -- on any
+    /// of its lines -- closes, and an HTTP/1.0 response persists only with
+    /// `keep-alive`.
     #[test]
     fn parse_upstream_response_header_value_edge_cases() {
         struct Case {
@@ -1723,6 +1740,26 @@ mod tests {
                     b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive, close\r\n\r\n",
                 framing: BodyFraming::ContentLength(7),
                 connection_close: true,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+                framing: BodyFraming::ContentLength(7),
+                connection_close: true,
+            },
+            Case {
+                head: b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n",
+                framing: BodyFraming::ContentLength(7),
+                connection_close: true,
+            },
+            Case {
+                head: b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\n",
+                framing: BodyFraming::ContentLength(7),
+                connection_close: true,
+            },
+            Case {
+                head: b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\nConnection: Keep-Alive\r\n\r\n",
+                framing: BodyFraming::ContentLength(7),
+                connection_close: false,
             },
         ];
         for case in cases {
