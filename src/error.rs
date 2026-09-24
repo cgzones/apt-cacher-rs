@@ -50,10 +50,10 @@ pub(crate) struct UpstreamFetchError {
 /// info-level "peer disconnect" — the wording stays accurate either way.
 ///
 /// A client write whose timeout should log like a hang-up uses
-/// [`is_expected_client_end`]; other call sites that want to demote a
-/// `TimedOut` to a different severity (e.g. the header-read idle-timeout
-/// debug path) MUST add an explicit `err.kind() == ErrorKind::TimedOut`
-/// branch before this check.
+/// `is_expected_client_end` (sendfile builds only); other call sites that
+/// want to demote a `TimedOut` to a different severity (e.g. the
+/// header-read idle-timeout debug path) MUST add an explicit
+/// `err.kind() == ErrorKind::TimedOut` branch before this check.
 #[must_use]
 pub(crate) fn is_peer_disconnect(err: &std::io::Error) -> bool {
     use std::io::ErrorKind;
