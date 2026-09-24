@@ -16,6 +16,7 @@
 //! may still use it.
 
 use std::{
+    fmt,
     ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
@@ -230,8 +231,7 @@ impl PartialResume {
 /// `ETag` are therefore discarded rather than risk silent concatenation of
 /// bytes from two different upstream revisions.
 ///
-/// `log_prefix` is prepended to every emitted log line (e.g. `""` for the
-/// hyper path, `"splice proxy: "` for the splice path).
+/// `speaker` renders the start of every emitted log line: see [`ResumeLog`].
 ///
 /// The path is claimed first (see `partial_claim`): the returned guard holds
 /// the claim, so cleanup does not reap a partial this download may still use.
@@ -248,11 +248,47 @@ pub(crate) async fn prepare_partial_resume(
     ibarrier: &InitBarrier,
     debname: &str,
     mirror: &deb_mirror::Mirror,
-    log_prefix: &'static str,
+    speaker: ResumeLog,
 ) -> Result<PartialResume, PartialOpenFailure> {
     let path = partial_path_for_barrier(CachePaths::global(), ibarrier);
     let quota = Some(global_cache_quota().clone());
-    prepare_partial_resume_at(path, quota, debname, mirror, log_prefix).await
+    prepare_partial_resume_at(path, quota, debname, mirror, speaker).await
+}
+
+/// Which backend's voice [`prepare_partial_resume`]'s lines take. The hyper
+/// path logs unprefixed sentences, the splice path its registry prefix
+/// (`docs/logging.md`, "Subsystem prefixes"), and the two capitalize the
+/// first word differently, so the line start is rendered here rather than
+/// by concatenating a prefix.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResumeLog {
+    #[cfg_attr(
+        not(any(feature = "hyper", test)),
+        expect(dead_code, reason = "only the hyper backend logs unprefixed")
+    )]
+    Unprefixed,
+    #[cfg_attr(
+        not(any(feature = "splice", test)),
+        expect(dead_code, reason = "only the splice backend carries a prefix")
+    )]
+    SpliceProxy,
+}
+
+impl ResumeLog {
+    /// `word` as a line's first word: capitalized when unprefixed, lowercase
+    /// after the `splice proxy:` prefix.
+    fn lead(self, word: &'static str) -> impl fmt::Display {
+        fmt::from_fn(move |f| match self {
+            Self::Unprefixed => {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => write!(f, "{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => Ok(()),
+                }
+            }
+            Self::SpliceProxy => write!(f, "splice proxy: {word}"),
+        })
+    }
 }
 
 /// [`prepare_partial_resume`] for an already-derived partial `path` and the
@@ -264,12 +300,13 @@ async fn prepare_partial_resume_at(
     quota: Option<CacheQuota>,
     debname: &str,
     mirror: &deb_mirror::Mirror,
-    log_prefix: &'static str,
+    speaker: ResumeLog,
 ) -> Result<PartialResume, PartialOpenFailure> {
     let Some(claim) = PartialClaim::acquire(path.clone()) else {
         metrics::PARTIAL_CLAIM_CONTENDED.increment();
         warn_once_or_info!(
-            "{log_prefix}partial download `{}` for {debname} from mirror {mirror} is still held by an earlier download of it; downloading into a scratch file without resuming",
+            "{} download `{}` for {debname} from mirror {mirror} is still held by an earlier download of it; downloading into a scratch file without resuming",
+            speaker.lead("partial"),
             path.display()
         );
         return Ok(PartialResume::volatile());
@@ -295,13 +332,15 @@ async fn prepare_partial_resume_at(
                 // placeholdering it.
                 if let Some(total) = expected_total {
                     info!(
-                        "{log_prefix}found partial download ({} out of {}) for {debname} from mirror {mirror}, will attempt resume",
+                        "{} partial download ({} out of {}) for {debname} from mirror {mirror}, will attempt resume",
+                        speaker.lead("found"),
                         HumanFmt::Size(size),
                         HumanFmt::Size(total),
                     );
                 } else {
                     info!(
-                        "{log_prefix}found partial download ({}, total size unknown) for {debname} from mirror {mirror}, will attempt resume",
+                        "{} partial download ({}, total size unknown) for {debname} from mirror {mirror}, will attempt resume",
+                        speaker.lead("found"),
                         HumanFmt::Size(size),
                     );
                 }
@@ -318,7 +357,8 @@ async fn prepare_partial_resume_at(
                 })
             } else {
                 warn!(
-                    "{log_prefix}partial download for {debname} from mirror {mirror} lacks a strong upstream ETag, discarding instead of resuming",
+                    "{} download for {debname} from mirror {mirror} lacks a strong upstream ETag, discarding instead of resuming",
+                    speaker.lead("partial"),
                 );
                 drop(file);
                 Ok(PartialResume::fresh(guard.renew().await))
@@ -490,8 +530,8 @@ fn remove_and_release(path: &Path, quota: Option<&CacheQuota>) {
     }
 }
 
-impl std::fmt::Debug for TempPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TempPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             path,
             on_drop,
@@ -811,6 +851,15 @@ mod tests {
         PartialClaim::acquire(path.to_path_buf()).expect("unclaimed partial")
     }
 
+    #[test]
+    fn resume_log_capitalizes_only_an_unprefixed_line() {
+        assert_eq!(ResumeLog::Unprefixed.lead("found").to_string(), "Found");
+        assert_eq!(
+            ResumeLog::SpliceProxy.lead("found").to_string(),
+            "splice proxy: found"
+        );
+    }
+
     /// The claim `prepare_partial_resume` takes lives in the partial's guard
     /// and in the quota reservation built from it, and ends with the later
     /// of the two: until then no second download (and no cleanup reap) can
@@ -821,10 +870,15 @@ mod tests {
         let path = partial_path(&dir);
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume =
-            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
-                .await
-                .expect("no partial is a fresh download");
+        let resume = prepare_partial_resume_at(
+            path.clone(),
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("no partial is a fresh download");
         let reserved = resume.partial.reserved_partial(0).expect("a kept partial");
         let guard = expect_fresh(resume.partial, "no partial on disk");
         assert!(PartialClaim::acquire(path.clone()).is_none(), "claimed");
@@ -851,10 +905,15 @@ mod tests {
         let held = claim(&path);
 
         let before = metrics::PARTIAL_CLAIM_CONTENDED.get();
-        let resume =
-            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
-                .await
-                .expect("a scratch download, not a failure");
+        let resume = prepare_partial_resume_at(
+            path.clone(),
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("a scratch download, not a failure");
         assert_eq!(resume.offset, 0);
         assert!(matches!(resume.partial, PartialDownload::Volatile));
         assert!(resume.partial.reserved_partial(0).is_none());
@@ -1069,10 +1128,15 @@ mod tests {
         std::fs::write(&path, b"stale").expect("write");
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume =
-            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
-                .await
-                .expect("a discarded partial is a fresh download");
+        let resume = prepare_partial_resume_at(
+            path.clone(),
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert_eq!(resume.expected_total, None);
         assert_eq!(resume.if_range, None);
@@ -1097,10 +1161,15 @@ mod tests {
         drop(std_file);
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume =
-            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
-                .await
-                .expect("a discarded partial is a fresh download");
+        let resume = prepare_partial_resume_at(
+            path.clone(),
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("a discarded partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert_eq!(
             resume.if_range, None,
@@ -1135,10 +1204,15 @@ mod tests {
         drop(std_file);
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let mut resume =
-            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
-                .await
-                .expect("the partial reopens");
+        let mut resume = prepare_partial_resume_at(
+            path.clone(),
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("the partial reopens");
         assert_eq!(resume.offset, 13);
         assert_eq!(resume.expected_total, None, "no expected-size xattr");
         assert_eq!(resume.if_range.as_deref(), Some("\"strong\""));
@@ -1191,9 +1265,15 @@ mod tests {
         drop(std_file);
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume = prepare_partial_resume_at(path, None, "foo_1.0_amd64.deb", &mirror, "")
-            .await
-            .expect("the partial reopens");
+        let resume = prepare_partial_resume_at(
+            path,
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("the partial reopens");
         assert_eq!(resume.offset, 13);
         assert_eq!(
             resume.expected_total,
@@ -1225,7 +1305,7 @@ mod tests {
             Some(quota.clone()),
             "foo_1.0_amd64.deb",
             &mirror,
-            "",
+            ResumeLog::Unprefixed,
         )
         .await
         .expect("a discarded partial is a fresh download");
@@ -1253,10 +1333,15 @@ mod tests {
         std::fs::write(&path, b"").expect("write");
         let mirror = structured_mirror("deb.example.org", "debian");
 
-        let resume =
-            prepare_partial_resume_at(path.clone(), None, "foo_1.0_amd64.deb", &mirror, "")
-                .await
-                .expect("an empty partial is a fresh download");
+        let resume = prepare_partial_resume_at(
+            path.clone(),
+            None,
+            "foo_1.0_amd64.deb",
+            &mirror,
+            ResumeLog::Unprefixed,
+        )
+        .await
+        .expect("an empty partial is a fresh download");
         assert_eq!(resume.offset, 0);
         assert!(matches!(resume.partial, PartialDownload::Fresh(_)));
     }

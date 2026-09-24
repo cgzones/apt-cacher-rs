@@ -1849,7 +1849,7 @@ async fn serve_new_file_worker(
             ibarrier,
             &conn_details.debname,
             &conn_details.mirror,
-            "",
+            partial_file::ResumeLog::Unprefixed,
         )
         .await
         {
@@ -2696,10 +2696,10 @@ fn strip_request_body(client: ClientInfo, req: Request<Incoming>) -> Request<Emp
     if req.body().size_hint().exact() != Some(0) {
         // Also fires for unknown-length bodies, whose lower bound can be 0.
         warn_once_or_info!(
-            "Request from client {client} has a body (at least {} bytes); not forwarding it: {} {}",
-            req.body().size_hint().lower(),
+            "Request {} `{}` from client {client} has a body (at least {}); dropping the body",
             req.method(),
-            req.uri()
+            req.uri(),
+            HumanFmt::Size(req.body().size_hint().lower()),
         );
     }
     let (parts, _body) = req.into_parts();

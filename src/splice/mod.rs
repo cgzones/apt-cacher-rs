@@ -752,7 +752,7 @@ async fn open_partial_resume(
         ibarrier,
         &conn_details.debname,
         &conn_details.mirror,
-        "splice proxy: ",
+        partial_file::ResumeLog::SpliceProxy,
     )
     .await
     {
