@@ -64,7 +64,9 @@
 //! filesystem ([`DiskHeadroom`], with or without a `disk_quota`): the quota
 //! bounds what this daemon accounts, but the filesystem is what runs out,
 //! and it may be shared or already fuller than the cache. The decision reads
-//! a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old, minus the full
+//! a `statvfs(3)` sample at most [`DISK_SAMPLE_TTL`] old (older only while
+//! the one outstanding probe hangs, see
+//! [`CacheQuota::refresh_disk_headroom`]), minus the full
 //! [`disk_needed`] of every reservation still live (`inflight_disk`) or
 //! ended since the sample was taken (`retired_disk`): a download from a slow
 //! mirror writes for minutes, so a sample taken while it runs shows only
@@ -91,7 +93,8 @@ use tracing::{debug, error, info, trace};
 
 use crate::{
     error::ErrorReport, healthcheck::filesystem_space, humanfmt::HumanFmt, metrics,
-    partial_claim::PartialClaim, sticky, upstream_head::ContentLength, warn_once_or_info,
+    partial_claim::PartialClaim, sticky, upstream_head::ContentLength, warn_once_or_debug,
+    warn_once_or_info,
 };
 
 /// Represents a quota violation.
@@ -303,7 +306,9 @@ struct QuotaInner {
 pub(crate) struct DiskHeadroom {
     cache_dir: PathBuf,
     min_free: NonZero<u64>,
-    /// Single flight for [`CacheQuota::refresh_disk_headroom`].
+    /// Single flight for [`CacheQuota::refresh_disk_headroom`]: set while a
+    /// probe is outstanding, cleared by the probe task itself once
+    /// `statvfs(3)` has returned, never by a requester giving up on it.
     refreshing: AtomicBool,
 }
 
@@ -322,8 +327,9 @@ impl DiskHeadroom {
 /// [`CacheQuota::refresh_disk_headroom`] takes a new one.
 const DISK_SAMPLE_TTL: coarsetime::Duration = coarsetime::Duration::from_secs(1);
 
-/// Upper bound for one refresh's `statvfs(3)`: a hung filesystem keeps the
-/// previous sample instead of stalling the request that asked.
+/// How long the request that started a `statvfs(3)` probe waits for it: a
+/// hung filesystem keeps the previous sample instead of stalling the
+/// request. The probe itself runs on until the syscall returns.
 const DISK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether `needed` more bytes on a filesystem with `free` bytes available
@@ -453,16 +459,41 @@ impl CacheQuota {
     /// gates await it right before [`Self::try_acquire`], which is
     /// synchronous and only reads the sample.
     ///
-    /// Single flight: a request arriving while another refreshes goes on
-    /// with the current sample, which still charges every download in
-    /// flight or ended since it was taken. A probe that fails or times out keeps the
-    /// previous sample (a failed one admits).
+    /// Single flight: a request arriving while a probe is outstanding goes
+    /// on with the current sample, which still charges every download in
+    /// flight or ended since it was taken. A failed probe stores a sample
+    /// that admits.
+    ///
+    /// The probe runs in a task of its own that stores its sample and only
+    /// then clears the single-flight flag; the requester waits for it at
+    /// most [`DISK_PROBE_TIMEOUT`]. A `statvfs(3)` hung on a stuck network
+    /// filesystem or a failing disk thus stays the one outstanding probe:
+    /// were the flag cleared on timeout, every later miss would strand one
+    /// more blocking thread and stall for the timeout again, until the
+    /// blocking pool every `tokio::fs` call shares ran dry.
     pub(crate) async fn refresh_disk_headroom(&self) {
-        /// Clears the single-flight flag even when the refresh is cancelled.
-        struct Refreshing<'a>(&'a AtomicBool);
-        impl Drop for Refreshing<'_> {
+        self.refresh_disk_headroom_with(DISK_PROBE_TIMEOUT, |dir| async move {
+            filesystem_space(&dir).await.map(|space| space.free_bytes)
+        })
+        .await;
+    }
+
+    /// [`Self::refresh_disk_headroom`] with the requester's wait and the
+    /// probe (the free bytes of the filesystem holding the given directory)
+    /// injected.
+    async fn refresh_disk_headroom_with<F, Fut>(&self, timeout: std::time::Duration, probe: F)
+    where
+        F: FnOnce(PathBuf) -> Fut,
+        Fut: Future<Output = Option<u64>> + Send + 'static,
+    {
+        /// Clears the single-flight flag when the probe task ends, even when
+        /// the runtime drops it unfinished.
+        struct Refreshing(CacheQuota);
+        impl Drop for Refreshing {
             fn drop(&mut self) {
-                self.0.store(false, atomic::Ordering::Release);
+                if let Some(headroom) = &self.0.inner.headroom {
+                    headroom.refreshing.store(false, atomic::Ordering::Release);
+                }
             }
         }
 
@@ -481,18 +512,39 @@ impl CacheQuota {
         if headroom.refreshing.swap(true, atomic::Ordering::AcqRel) {
             return;
         }
-        let _refreshing = Refreshing(&headroom.refreshing);
-        let Ok(space) =
-            tokio::time::timeout(DISK_PROBE_TIMEOUT, filesystem_space(&headroom.cache_dir)).await
-        else {
-            return;
-        };
-        let mut mg = self.inner.accounting.lock();
-        mg.disk = Some(DiskSample {
-            taken: coarsetime::Instant::now(),
-            free: space.map(|s| s.free_bytes),
-            retired_at,
+        let refreshing = Refreshing(self.clone());
+        let probe = probe(headroom.cache_dir.clone());
+        let task = tokio::spawn(async move {
+            let free = probe.await;
+            let mut mg = refreshing.0.inner.accounting.lock();
+            mg.disk = Some(DiskSample {
+                taken: coarsetime::Instant::now(),
+                free,
+                retired_at,
+            });
+            drop(mg);
+            drop(refreshing);
         });
+        match tokio::time::timeout(timeout, task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn_once_or_debug!(
+                    "Failed to join the free-space probe of the cache filesystem `{}`; admitting downloads by the previous sample:  {}",
+                    headroom.cache_dir.display(),
+                    ErrorReport(&err)
+                );
+            }
+            Err(_timeout @ tokio::time::error::Elapsed { .. }) => {
+                // A filesystem that hangs once tends to hang on every probe;
+                // later requests do not wait, so this fires once per
+                // stranded probe.
+                warn_once_or_info!(
+                    "Failed to sample the free space of the cache filesystem `{}` within {}; admitting downloads by the previous sample until the probe returns",
+                    headroom.cache_dir.display(),
+                    HumanFmt::Time(timeout)
+                );
+            }
+        }
     }
 
     /// Atomically check quota and reserve space for a download.
@@ -1658,6 +1710,67 @@ mod tests {
         assert!(
             quota.try_acquire(exact(5000), 0, None, "unsampled").is_ok(),
             "no sample yet"
+        );
+    }
+
+    /// A `statvfs(3)` hung on a stuck filesystem outlives the request that
+    /// started it. Later misses must neither start another probe, which
+    /// would strand one more blocking thread every few seconds, nor wait for
+    /// one: they go on with the previous sample until the hung probe
+    /// returns, and its sample then lands.
+    #[tokio::test]
+    async fn a_hung_disk_probe_is_never_doubled() {
+        let quota = CacheQuota::with_disk_headroom(
+            0,
+            None,
+            Some(DiskHeadroom::new(PathBuf::from("/nonexistent"), nz(600))),
+        );
+        let refreshing = || {
+            quota
+                .inner
+                .headroom
+                .as_ref()
+                .expect("configured")
+                .refreshing
+                .load(atomic::Ordering::Acquire)
+        };
+        let (release, hung) = tokio::sync::oneshot::channel::<Option<u64>>();
+        let short = std::time::Duration::from_millis(20);
+        quota
+            .refresh_disk_headroom_with(short, |_| async move { hung.await.unwrap_or(None) })
+            .await;
+        assert!(refreshing(), "the timed-out probe still runs");
+
+        let probes = atomic::AtomicUsize::new(0);
+        quota
+            .refresh_disk_headroom_with(std::time::Duration::from_secs(3600), |_| {
+                probes.fetch_add(1, atomic::Ordering::Relaxed);
+                async { Some(0) }
+            })
+            .await;
+        assert_eq!(
+            probes.load(atomic::Ordering::Relaxed),
+            0,
+            "no second probe while the first is stranded"
+        );
+        assert!(
+            quota.try_acquire(exact(5000), 0, None, "unsampled").is_ok(),
+            "the previous (absent) sample still decides"
+        );
+
+        release
+            .send(Some(b(1000)))
+            .expect("the probe still listens");
+        for _ in 0..1000 {
+            if !refreshing() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!refreshing(), "the returned probe clears the flag");
+        assert!(
+            quota.try_acquire(exact(5000), 0, None, "sampled").is_err(),
+            "the late sample landed"
         );
     }
 
