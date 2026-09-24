@@ -61,6 +61,7 @@ mod macros;
 mod main_loop;
 mod metrics;
 mod parallel_hack;
+mod partial_claim;
 mod partial_file;
 mod passthrough_limiter;
 mod per_ip_counter;

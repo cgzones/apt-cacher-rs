@@ -617,6 +617,11 @@ fn build_upstream_group(g: &mut Groups) {
             metrics::DOWNLOADS_ABORTED.get(),
         );
         t.row_tip(
+            "Partials Still In Use",
+            "Downloads that found their `.partial` still held by an earlier download of the same file and fetched into a scratch file instead of resuming it.",
+            metrics::PARTIAL_CLAIM_CONTENDED.get(),
+        );
+        t.row_tip(
             "Rate-Limit Cancellations (upstream)",
             "Transfers cancelled because the configured minimum download rate was not met on the upstream side.",
             metrics::RATE_LIMIT_UPSTREAM.get(),

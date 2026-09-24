@@ -387,7 +387,8 @@ struct DownloadBarrierData {
     /// the quota was checked; `commit` finalises it, `Drop` reverts it.
     /// Declared (so dropped) before `lease`: an unfinalised reservation keeps
     /// what the partial holds, which it reads while the lease still keeps
-    /// every other writer off the path.
+    /// every other writer off the path (and its own share of the partial's
+    /// claim keeps cleanup's reap off it, `partial_claim`).
     quota_reservation: QuotaReservation,
     status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
     lease: Arc<DownloadWriteLease>,

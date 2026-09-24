@@ -24,9 +24,13 @@
 //!   and every removal of a partial releases its bytes exactly once --
 //!   cleanup's `tmp/` reap through the reconcile's `removed`, every other
 //!   unlink (a discarded resume, a checksum mismatch, a replaced leftover)
-//!   through [`CacheQuota::release_removed_partial`]. The random scratch
-//!   files of volatile downloads live in the cache root's `tmp/`, are
-//!   unlinked with their download and purged at startup, and are never
+//!   through [`CacheQuota::release_removed_partial`]. A download claims its
+//!   partial's path before touching it and holds the claim until both its
+//!   partial guard and its [`ReservedPartial`] are gone; cleanup reaps only
+//!   unclaimed partials (`partial_claim`), so a partial is released by the
+//!   reap or by the reservation that adopted it, never by both. The random
+//!   scratch files of volatile downloads live in the cache root's `tmp/`,
+//!   are unlinked with their download and purged at startup, and are never
 //!   counted.
 //! - `inflight_reserved` / `inflight_replaced`: what the live reservations
 //!   added to and subtracted from `size` (`replaced` includes the adopted
@@ -79,8 +83,8 @@ use std::{
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    error::ErrorReport, healthcheck::filesystem_space, humanfmt::HumanFmt, metrics, sticky,
-    upstream_head::ContentLength, warn_once_or_info,
+    error::ErrorReport, healthcheck::filesystem_space, humanfmt::HumanFmt, metrics,
+    partial_claim::PartialClaim, sticky, upstream_head::ContentLength, warn_once_or_info,
 };
 
 /// Represents a quota violation.
@@ -117,7 +121,10 @@ fn accounted_nonzero(len: NonZero<u64>) -> NonZero<u64> {
 /// so the bytes a failed download leaves behind stay accounted.
 #[derive(Debug)]
 pub(crate) struct ReservedPartial {
-    path: PathBuf,
+    /// The download's claim on the partial's path (`partial_claim`), shared
+    /// with its `TempPath` guard: held until the reservation has measured
+    /// what the partial keeps, so cleanup cannot reap it in between.
+    claim: PartialClaim,
     /// What the partial was accounted as when the download took it over (see
     /// [`accounted_size`]): the resume offset, 0 for a fresh download.
     /// Accounted as a kept partial until then, it moves into the reservation.
@@ -127,9 +134,9 @@ pub(crate) struct ReservedPartial {
 impl ReservedPartial {
     /// `adopted` is the partial's length in bytes.
     #[must_use]
-    pub(crate) const fn new(path: PathBuf, adopted: u64) -> Self {
+    pub(crate) const fn new(claim: PartialClaim, adopted: u64) -> Self {
         Self {
-            path,
+            claim,
             adopted: accounted_size(adopted),
         }
     }
@@ -141,7 +148,8 @@ impl ReservedPartial {
 /// A direct `lstat(2)` rather than `block_in_place`: it runs from
 /// [`QuotaReservation`]'s `Drop`, which also fires on current-thread
 /// runtimes and inside blocking closures, and it stats a file its own
-/// download has just written, so the inode is cached.
+/// download has just written, so the inode is cached. The reservation's claim
+/// on the path is still held, so cleanup cannot have reaped it.
 fn partial_len(path: &Path) -> u64 {
     match std::fs::symlink_metadata(path) {
         Ok(mdata) if mdata.file_type().is_file() => mdata.len(),
@@ -787,7 +795,8 @@ pub(crate) struct QuotaReservation {
     prev_file_size: u64,
     /// The partial the download writes into; `None` for a volatile scratch
     /// file. What it holds when the reservation ends unfinalised stays
-    /// accounted.
+    /// accounted; its claim on the path is released only after `Drop` has
+    /// measured that.
     partial: Option<Box<ReservedPartial>>,
     finalized: sticky::Bool,
 }
@@ -864,7 +873,7 @@ impl Drop for QuotaReservation {
         let prev = self.prev_file_size;
         let partial = self.partial.as_deref();
         let adopted = partial.map_or(0, |p| p.adopted);
-        let kept = partial.map_or(0, |p| accounted_size(partial_len(&p.path)));
+        let kept = partial.map_or(0, |p| accounted_size(partial_len(p.claim.path())));
         // `reserved` out, `prev_file_size` and the kept partial back in.
         let restored = prev.saturating_add(kept);
         // Both trace lines below start with "Reverting quota reservation",
@@ -903,7 +912,7 @@ impl Drop for QuotaReservation {
             debug!(
                 "Keeping {} of partial `{}` accounted towards the cache size",
                 HumanFmt::Size(kept),
-                partial.path.display()
+                partial.claim.path().display()
             );
         }
     }
@@ -978,7 +987,7 @@ mod tests {
 
         let (_dir, path) = partial_path();
         let reservation = quota
-            .try_acquire(tiny, 0, Some(ReservedPartial::new(path.clone(), 0)), "kept")
+            .try_acquire(tiny, 0, Some(reserved(&path, 0)), "kept")
             .ok()
             .expect("fits");
         std::fs::write(&path, b"x").expect("write partial");
@@ -1292,17 +1301,67 @@ mod tests {
         std::fs::write(path, vec![0u8; len]).expect("write partial");
     }
 
+    /// The partial at `path`, claimed as its download would, adopting
+    /// `adopted` bytes.
+    fn reserved(path: &Path, adopted: u64) -> ReservedPartial {
+        let claim = PartialClaim::acquire(path.to_path_buf()).expect("unclaimed partial");
+        ReservedPartial::new(claim, adopted)
+    }
+
+    /// Cleanup trying to reap a partial a resume has adopted leaves it to
+    /// the reservation: the bytes are released once, when the reservation
+    /// ends, and a reap after that counts nothing twice. Reaping it under the
+    /// download released them from both sides.
+    #[test]
+    fn a_partial_adopted_by_a_resume_is_released_once() {
+        use crate::partial_claim::{FileId, Reap, reap_unclaimed};
+
+        let (_dir, path) = partial_path();
+        write_len(&path, 40);
+        let walked = FileId::of(&std::fs::symlink_metadata(&path).expect("stat"));
+        // 50 blocks of cached files plus the kept 40-block partial.
+        let quota = CacheQuota::new(b(90), Some(nz(1000)));
+        let window = quota.begin_reconcile_window();
+        let reservation = quota
+            .try_acquire(exact(100), 0, Some(reserved(&path, b(40))), "resume")
+            .ok()
+            .expect("must accept");
+        assert_eq!(quota.current_size(), b(150));
+
+        // The walk found it stale, but the reservation's claim wins.
+        assert!(matches!(
+            reap_unclaimed(&path, walked, |_| true),
+            Reap::Claimed
+        ));
+        write_len(&path, 45);
+        drop(reservation);
+        assert_eq!(
+            quota.current_size(),
+            b(95),
+            "the reservation keeps what the partial holds"
+        );
+
+        // The next reap may take it, and counts it once.
+        let walked = FileId::of(&std::fs::symlink_metadata(&path).expect("stat"));
+        let reaped = match reap_unclaimed(&path, walked, |_| true) {
+            Reap::Removed { len } => Ok(len),
+            other @ (Reap::Claimed
+            | Reap::Changed
+            | Reap::StatFailed(_)
+            | Reap::RemoveFailed(_)) => Err(other),
+        };
+        let tmp_bytes_removed = accounted_size(reaped.expect("an unclaimed partial is reaped"));
+        let r = quota.subtract_and_reconcile(tmp_bytes_removed, b(50), window);
+        assert_eq!(r.stored, b(50), "released once");
+        assert_eq!(r.difference, b(0), "nothing to repair");
+    }
+
     #[test]
     fn failed_download_keeps_what_its_partial_holds() {
         let (_dir, path) = partial_path();
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
-            .try_acquire(
-                exact(100),
-                0,
-                Some(ReservedPartial::new(path.clone(), b(0))),
-                "kept",
-            )
+            .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "kept")
             .ok()
             .expect("must accept");
         assert_eq!(quota.current_size(), b(150));
@@ -1320,12 +1379,7 @@ mod tests {
         let (_dir, path) = partial_path();
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
-            .try_acquire(
-                exact(100),
-                0,
-                Some(ReservedPartial::new(path, b(0))),
-                "none",
-            )
+            .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "none")
             .ok()
             .expect("must accept");
         drop(reservation);
@@ -1340,12 +1394,7 @@ mod tests {
         write_len(&path, 40);
         let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
-            .try_acquire(
-                exact(50),
-                0,
-                Some(ReservedPartial::new(path.clone(), b(40))),
-                "resume",
-            )
+            .try_acquire(exact(50), 0, Some(reserved(&path, b(40))), "resume")
             .ok()
             .expect("a resume adding 10 bytes fits");
         assert_eq!(quota.current_size(), b(100));
@@ -1359,12 +1408,7 @@ mod tests {
         // The same resume failing after 5 more bytes keeps the 45-byte partial.
         let quota = CacheQuota::new(b(90), Some(nz(100)));
         let reservation = quota
-            .try_acquire(
-                exact(50),
-                0,
-                Some(ReservedPartial::new(path.clone(), b(40))),
-                "resume",
-            )
+            .try_acquire(exact(50), 0, Some(reserved(&path, b(40))), "resume")
             .ok()
             .expect("must accept");
         write_len(&path, 45);
@@ -1397,12 +1441,7 @@ mod tests {
         let (_dir, path) = partial_path();
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let reservation = quota
-            .try_acquire(
-                exact(100),
-                0,
-                Some(ReservedPartial::new(path, b(0))),
-                "live",
-            )
+            .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "live")
             .ok()
             .expect("must accept");
         let window = quota.begin_reconcile_window();
@@ -1425,12 +1464,7 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
-            .try_acquire(
-                exact(100),
-                0,
-                Some(ReservedPartial::new(path.clone(), b(0))),
-                "kept",
-            )
+            .try_acquire(exact(100), 0, Some(reserved(&path, b(0))), "kept")
             .ok()
             .expect("must accept");
         write_len(&path, 30);
@@ -1449,12 +1483,7 @@ mod tests {
         let quota = CacheQuota::new(b(50), Some(nz(1000)));
         let window = quota.begin_reconcile_window();
         let reservation = quota
-            .try_acquire(
-                exact(30),
-                0,
-                Some(ReservedPartial::new(path, b(0))),
-                "moved",
-            )
+            .try_acquire(exact(30), 0, Some(reserved(&path, b(0))), "moved")
             .ok()
             .expect("must accept");
         reservation.finalize(b(30));
@@ -1528,12 +1557,7 @@ mod tests {
         // 500 bytes in total, 300 already on disk.
         assert!(
             quota
-                .try_acquire(
-                    exact(500),
-                    0,
-                    Some(ReservedPartial::new(path, b(300))),
-                    "resume"
-                )
+                .try_acquire(exact(500), 0, Some(reserved(&path, b(300))), "resume")
                 .is_ok()
         );
     }

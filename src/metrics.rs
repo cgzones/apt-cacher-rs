@@ -604,6 +604,10 @@ pub(crate) static DB_OPERATION_FAILED: Counter = Counter::new();
 
 /// Active downloads that finished in `Aborted` state (rate-limit / failure).
 pub(crate) static DOWNLOADS_ABORTED: Counter = Counter::new();
+/// Downloads that found their `.partial` path still claimed by an earlier
+/// download of the same file (`partial_claim`) and wrote into a scratch file
+/// instead of resuming it.
+pub(crate) static PARTIAL_CLAIM_CONTENDED: Counter = Counter::new();
 
 /// Cache-size reconciliation events with a non-zero on-disk delta.
 pub(crate) static RECONCILE_EVENTS: Counter = Counter::new();
