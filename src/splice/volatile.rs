@@ -33,13 +33,14 @@ use crate::rate_checker::RateChecker;
 use crate::sendfile_conn::write_all_to_stream_rated_counted;
 use crate::tcp_cork_guard::CorkGuard;
 use crate::transfer_error::{DeliveryFailure, EndsDelivery, ReportedDelivery};
+use crate::upstream_head::BodyFraming;
 use crate::{
     client_counter, global_config, limits::VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER, metrics,
     warn_once,
 };
 
 use super::commit::{CommitTail, Committed, CompletionBytes, CompletionClient, Served};
-use super::http::{BodyFraming, UpstreamResponse};
+use super::http::UpstreamResponse;
 use super::upstream::{ConnLabel, ResponseBody};
 use super::{
     ClientConn, HeadValidators, RateTimestamps, SpliceProxyError, SpliceProxyOutcome,

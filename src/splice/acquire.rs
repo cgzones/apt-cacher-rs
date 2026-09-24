@@ -21,7 +21,7 @@ use crate::error::ErrorReport;
 use crate::log_once::Logged;
 use crate::partial_file;
 use crate::scheme_cache::SchemeDecision;
-use crate::upstream_head::{RejectGates, RejectReason};
+use crate::upstream_head::{BodyFraming, RejectGates, RejectReason};
 use crate::upstream_retry::RetryStop;
 use crate::{
     Scheme, global_config, log_once, metrics, permitted_host_cache::is_host_allowed_cached,
@@ -29,9 +29,7 @@ use crate::{
 };
 
 use super::VolatileCondHeaders;
-use super::http::{
-    BodyFraming, HeadError, MAX_ERROR_BODY_DRAIN, UpstreamResponse, send_and_read_headers,
-};
+use super::http::{HeadError, MAX_ERROR_BODY_DRAIN, UpstreamResponse, send_and_read_headers};
 use super::upstream::{
     ConnLabel, PoolCheckout, ResponseBody, Transience, UpstreamConn, connect_upstream, mirror_port,
     pool_checkout,

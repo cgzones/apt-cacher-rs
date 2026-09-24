@@ -26,32 +26,16 @@ use crate::{
 };
 
 use super::acquire::{UpstreamExchange, standard_upstream_connect};
-use super::http::BodyFraming;
 use super::{SpliceProxyError, VOLATILE_BODY_MAX};
 use crate::transfer_error::UpstreamError;
-
-/// Hop-by-hop headers per RFC 9110 §7.6.1 — must not be forwarded to the client.
-const HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "proxy-connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "upgrade",
-    "proxy-authenticate",
-    "proxy-authorization",
-];
-
-/// Body-framing headers: replaced by the framing the relay applies, never
-/// forwarded (see [`rewrite_simple_proxy_headers`]).
-const FRAMING: &[&str] = &["content-length", "transfer-encoding"];
+use crate::upstream_head::{BodyFraming, RelayedHeaders};
 
 /// Rewrite upstream response headers for the simple-proxy pass-through.
 ///
-/// Strips hop-by-hop headers and emits exactly one `Connection:` header
+/// Drops every line [`RelayedHeaders`] drops (hop-by-hop, `Connection:`
+/// nominations, framing) and emits exactly one `Connection:` header
 /// matching the client's keep-alive decision regardless of how many
-/// `Connection:` headers the upstream sent (they're hop-by-hop and therefore
-/// all dropped during the filter pass).
+/// `Connection:` headers the upstream sent.
 ///
 /// The upstream's `Content-Length` / `Transfer-Encoding` lines are never
 /// forwarded either: the head announces `framing`, the framing the relay
@@ -79,35 +63,14 @@ pub(super) fn rewrite_simple_proxy_headers(
         ));
     }
 
-    // RFC 9110 §7.6.1: the Connection header nominates further connection-specific
-    // field names that an intermediary must remove before forwarding.
-    // Borrowed from `raw_headers`, and compared case-insensitively below, so
-    // no owned lowercase copy of each token is needed.
-    let mut connection_nominated: Vec<&str> = Vec::new();
-    for h in parsed.headers.iter() {
-        if h.name.eq_ignore_ascii_case("connection")
-            && let Ok(v) = std::str::from_utf8(h.value)
-        {
-            connection_nominated.extend(v.split(',').map(str::trim).filter(|tok| !tok.is_empty()));
-        }
-    }
+    let relayed = RelayedHeaders::new(parsed.headers.iter().map(|h| (h.name, h.value)));
 
     let mut buf = format!("{conn_version} {status_code}\r\nConnection: {conn_action}\r\n");
     if let Some(line) = framing.header_line(status_code) {
         buf.push_str(&line);
     }
     for h in parsed.headers.iter() {
-        if HOP_BY_HOP
-            .iter()
-            .chain(FRAMING)
-            .any(|n| h.name.eq_ignore_ascii_case(n))
-        {
-            continue;
-        }
-        if connection_nominated
-            .iter()
-            .any(|n| h.name.eq_ignore_ascii_case(n))
-        {
+        if !relayed.keeps(h.name) {
             continue;
         }
         // Reject non-ASCII header values: HTTP headers are ASCII per RFC

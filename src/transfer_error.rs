@@ -313,13 +313,6 @@ impl UpstreamError {
 
     /// A head the transport delivered intact but HTTP could not accept: the
     /// reason is the whole failure, so there is no source error under it.
-    #[cfg_attr(
-        not(any(feature = "splice", test)),
-        expect(
-            dead_code,
-            reason = "the splice backend is the only head-phase protocol caller"
-        )
-    )]
     pub(crate) fn head_protocol(reason: impl Into<String>) -> Self {
         Self::new(
             "upstream response head",

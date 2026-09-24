@@ -87,8 +87,8 @@ use crate::{
     transfer_error::{CacheError, DeliveryFailure, DownloadFailure, InternalError, UpstreamError},
     tunnel_limiter,
     upstream_head::{
-        ContentLength, DownloadPlan, RejectGates, ResumeAnomaly, ResumeState, UpstreamHead,
-        plan_download, plan_fresh_download,
+        ContentLength, DownloadPlan, RejectGates, RelayedHeaders, ResumeAnomaly, ResumeState,
+        UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
     warn_once_or_debug, warn_once_or_info,
@@ -128,6 +128,10 @@ enum RequestError {
     /// A scheme rewrite produced parts `Uri::from_parts` refuses.
     #[error("failed to rebuild the request URI for a scheme change")]
     InvalidUri(#[source] http::uri::InvalidUriParts),
+    /// A response head hyper's client accepted but whose body framing
+    /// [`resolve_body_framing`] refuses: the reason is the whole failure.
+    #[error("{0}")]
+    Framing(String),
 }
 
 /// The fields of a [`RequestFailure`], separated only so the payload can be
@@ -209,7 +213,9 @@ impl RequestFailure {
 
     /// An exhausted connect budget is a connect-phase failure; anything else
     /// happened once a connection was up, so it is a head-phase transport
-    /// failure. Both phases are once-gated by the download runner.
+    /// failure -- or a head-phase protocol failure for a refused framing,
+    /// as splice reports the same head. Both phases are once-gated by the
+    /// download runner.
     pub(crate) fn into_upstream(self, operation: &'static str) -> UpstreamError {
         let FailedRequest {
             error,
@@ -217,11 +223,12 @@ impl RequestFailure {
             attempts,
             limit,
         } = *self.0;
-        match limit {
-            Some(limit) => {
+        match (error, limit) {
+            (RequestError::Framing(reason), _) => UpstreamError::head_protocol(reason),
+            (error, Some(limit)) => {
                 UpstreamError::connect(operation, std::io::Error::other(error), attempts, limit)
             }
-            None => UpstreamError::head_transport(operation, error),
+            (error, None) => UpstreamError::head_transport(operation, error),
         }
         .with_target(uri.to_string())
     }
@@ -356,6 +363,23 @@ pub(crate) async fn request_with_retry(
                                 parts.uri.scheme()
                             );
                         }
+                    }
+                    // Hyper's client frames a head splice refuses (it takes
+                    // the last `Transfer-Encoding` coding and ignores the
+                    // rest); refuse it here too, for every consumer, so no
+                    // relay, download or index fetch reads such a body.
+                    let fields = response
+                        .headers()
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_bytes()));
+                    if let Err(reason) = resolve_body_framing(fields) {
+                        metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();
+                        return Err(RequestFailure::new(FailedRequest {
+                            error: RequestError::Framing(reason),
+                            uri: parts.uri,
+                            attempts: backoff.attempt(),
+                            limit: None,
+                        }));
                     }
                     metrics::record_upstream_status(response.status());
                     return Ok((response, parts));
@@ -686,16 +710,39 @@ fn upstream_body_error(error: hyper::Error) -> UpstreamError {
     UpstreamError::transport("read upstream response body", error)
 }
 
-/// Finish an uncached passthrough: account the upstream body, apply the
-/// client rate check and append our `Via`.  The three passthrough sites (a
-/// fetch the cache pipeline declined, and the simple proxy with and without a
-/// followed redirect) differ only in the [`Subject`].
+/// Finish an uncached passthrough: drop the upstream lines a relay must not
+/// forward ([`RelayedHeaders`]), account the upstream body, apply the client
+/// rate check and append our `Via`.  The three passthrough sites (a fetch the
+/// cache pipeline declined, and the simple proxy with and without a followed
+/// redirect) differ only in the [`Subject`].
+///
+/// The upstream's framing lines go too: hyper's server frames the body
+/// itself from its size hint (`Content-Length` for a known length, chunked
+/// or close-delimited otherwise, per the client's version), and it refuses
+/// to write a head whose own framing lines contradict each other -- the
+/// client would get a closed connection instead of a response.
 #[must_use]
 fn passthrough_response(
     response: Response<Incoming>,
     subject: Subject,
 ) -> Response<ProxyCacheBody> {
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
+
+    let relayed = RelayedHeaders::new(
+        parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    );
+    let dropped: Vec<HeaderName> = parts
+        .headers
+        .keys()
+        .filter(|name| !relayed.keeps(name.as_str()))
+        .cloned()
+        .collect();
+    for name in &dropped {
+        parts.headers.remove(name);
+    }
 
     let body = rated_client_body(
         body.map_err(|error| DeliveryFailure::Upstream(upstream_body_error(error))),

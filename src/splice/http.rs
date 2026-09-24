@@ -1,8 +1,9 @@
 //! HTTP/1.1 wire handling between the splice proxy and upstream:
 //! [`format_http_request`]/[`send_and_read_headers`] on the request side,
 //! [`parse_upstream_response`] into [`UpstreamResponse`] on the response
-//! side, and the body relays hanging off [`BodyFraming`] (`relay_to_client`,
-//! `read_to_vec`) that stream or buffer a body according to its framing.
+//! side, and the body relays hanging off the shared [`BodyFraming`]
+//! (`relay_to_client`, `read_to_vec`) that stream or buffer a body according
+//! to its framing.
 //! [`ChunkDecoder`] is the one chunked transfer-coding state machine;
 //! [`forward_upstream_chunked_body`] and [`read_dechunk_body_to_vec`] are its
 //! I/O wrappers.
@@ -15,17 +16,13 @@ use std::{
     io::ErrorKind,
     num::{ParseIntError, Saturating},
     ops::Range,
-    str::Utf8Error,
     time::Duration,
 };
 
 use bytes::BytesMut;
 use http::{
-    HeaderName, StatusCode,
-    header::{
-        CONNECTION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION,
-        TRANSFER_ENCODING,
-    },
+    StatusCode,
+    header::{CONNECTION, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION},
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -41,7 +38,9 @@ use crate::precise_instant::PreciseInstant;
 use crate::rate_checker::RateChecker;
 use crate::sendfile_conn::write_all_to_stream_rated;
 use crate::transfer_error::{ClientError, DeliveryFailure, UpstreamError};
-use crate::upstream_head::{RejectReason, UpstreamHead, well_formed_etag};
+use crate::upstream_head::{
+    BodyFraming, RejectReason, UpstreamHead, resolve_body_framing, well_formed_etag,
+};
 use crate::{
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_metadata::{self, InvalidValidator},
@@ -219,26 +218,9 @@ async fn read_upstream_response_headers(
     }
 }
 
-/// How an upstream HTTP response body is framed on the wire.
-///
-/// Resolved once by [`parse_upstream_response`] from every framing header
-/// line (`resolve_body_framing`, which refuses an ambiguous head), with
-/// chunked-takes-precedence semantics (RFC 9112 §6.1): when
-/// `Transfer-Encoding: chunked` is present its framing wins and any
-/// accompanying `Content-Length` is ignored. Modelling the two as one sum type
-/// means "both at once" is no longer representable, so every consumer reads a
-/// single, already-disambiguated framing -- and a relayed head announces
-/// exactly this one ([`Self::header_line`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BodyFraming {
-    /// `Content-Length: N` and not chunked. Splice-eligible when `N > 0`.
-    ContentLength(u64),
-    /// `Transfer-Encoding: chunked`.
-    Chunked,
-    /// Neither header present: the body runs until the connection closes.
-    CloseDelimited,
-}
-
+/// The splice side of [`BodyFraming`], whose type and resolution rule
+/// (`resolve_body_framing`) live in `upstream_head`, shared with hyper: the
+/// framing line a relayed head announces and the body relays.
 impl BodyFraming {
     /// The client connection's fate after a response relayed with this
     /// framing: a close-delimited body ends only when the connection closes,
@@ -483,91 +465,6 @@ pub(super) fn is_bodyless_status(status: StatusCode) -> bool {
         || status == StatusCode::NOT_MODIFIED
 }
 
-/// Resolve the body framing from *every* `Transfer-Encoding` and
-/// `Content-Length` field line of an upstream head, or refuse the head.
-///
-/// The pass-through relays never forward these lines: they announce the
-/// framing resolved here (`rewrite_simple_proxy_headers`). So a head that
-/// could be framed two ways -- one way by this relay, another by a client
-/// reading a different one of its lines -- is refused rather than resolved,
-/// or the body's tail would become a forged next response on the client's
-/// keep-alive connection:
-///
-/// - `Transfer-Encoding` must name exactly one coding, `chunked`, across all
-///   its lines: a coding the relay cannot frame (`gzip, chunked`) or a
-///   duplicate is refused. Chunked then wins over any `Content-Length`
-///   (RFC 9112 §6.1), which is dropped.
-/// - `Content-Length` values, across lines and comma lists, must all be the
-///   same `1*DIGIT` (RFC 9110 §8.6 allows collapsing identical duplicates);
-///   junk, a sign, or two different values are refused -- not degraded to
-///   close-delimited framing.
-fn resolve_body_framing(headers: &[httparse::Header<'_>]) -> Result<BodyFraming, String> {
-    /// A list element with its surrounding `OWS` trimmed (RFC 9110 §5.6.1).
-    fn trim_ows(element: &str) -> &str {
-        element.trim_matches([' ', '\t'])
-    }
-
-    let field_values = |name: &'static HeaderName| {
-        headers
-            .iter()
-            .filter(move |h| h.name.eq_ignore_ascii_case(name.as_str()))
-            .map(|h| std::str::from_utf8(h.value))
-    };
-
-    let mut codings = Vec::new();
-    let mut has_transfer_encoding = false;
-    for value in field_values(&TRANSFER_ENCODING) {
-        has_transfer_encoding = true;
-        let value = value.map_err(|_err @ Utf8Error { .. }| {
-            "non-UTF-8 Transfer-Encoding from upstream".to_owned()
-        })?;
-        // Empty list elements are legal and carry nothing (RFC 9110 §5.6.1).
-        codings.extend(value.split(',').map(trim_ows).filter(|c| !c.is_empty()));
-    }
-    if has_transfer_encoding {
-        return match codings.as_slice() {
-            [coding] if coding.eq_ignore_ascii_case("chunked") => Ok(BodyFraming::Chunked),
-            _ => Err(format!(
-                "unsupported Transfer-Encoding `{}` from upstream",
-                codings.join(", ").escape_debug()
-            )),
-        };
-    }
-
-    let mut content_length = None;
-    for value in field_values(&CONTENT_LENGTH) {
-        let value = value.map_err(|_err @ Utf8Error { .. }| {
-            "non-UTF-8 Content-Length from upstream".to_owned()
-        })?;
-        let unparsable = || {
-            format!(
-                "unparsable Content-Length `{}` from upstream",
-                value.escape_debug()
-            )
-        };
-        // An empty element (`5,` or an empty value) is junk too: unlike a
-        // list field, `Content-Length` is a single `1*DIGIT`.
-        for element in value.split(',').map(trim_ows) {
-            // `u64::from_str` alone would take a leading `+`.
-            if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(unparsable());
-            }
-            let len = element
-                .parse::<u64>()
-                .map_err(|_err @ ParseIntError { .. }| unparsable())?;
-            match content_length {
-                Some(prev) if prev != len => {
-                    return Err(format!(
-                        "conflicting Content-Length values {prev} and {len} from upstream"
-                    ));
-                }
-                Some(_) | None => content_length = Some(len),
-            }
-        }
-    }
-    Ok(content_length.map_or(BodyFraming::CloseDelimited, BodyFraming::ContentLength))
-}
-
 /// Parse the upstream HTTP response head in `buf[..header_end]`, sent in
 /// answer to the request that went out at `request_sent_at`.
 ///
@@ -596,7 +493,7 @@ pub(super) fn parse_upstream_response(
 
     let headers = resp.headers;
 
-    let framing = resolve_body_framing(headers)?;
+    let framing = resolve_body_framing(headers.iter().map(|h| (h.name, h.value)))?;
 
     let content_type = find_header(headers, &CONTENT_TYPE).map(String::from);
 

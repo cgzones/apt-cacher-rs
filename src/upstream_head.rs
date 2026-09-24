@@ -24,6 +24,13 @@
 //!   discard a partial, how to re-fetch, how to write the 502 and the log
 //!   line, and bump metrics through [`RejectReason::record_metrics`].
 //! - The 502 bodies are consts behind [`RejectReason::body`].
+//! - [`resolve_body_framing`] is the one rule for which upstream heads are
+//!   framed unambiguously enough to relay, and [`RelayedHeaders`] the one
+//!   rule for which upstream header lines a relay drops. Both backends apply
+//!   them to every upstream head (`splice::http::parse_upstream_response`,
+//!   `hyper_conn.rs::request_with_retry`) and every relayed one
+//!   (`splice::simple_proxy::rewrite_simple_proxy_headers`,
+//!   `hyper_conn.rs::passthrough_response`), so they refuse and strip alike.
 //!
 //! Backend contract: call [`plan_download`] once with the resume state.
 //! <code>Err([ResumeAnomaly])</code> means "discard the partial file"; then either
@@ -36,7 +43,8 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    num::NonZero,
+    num::{NonZero, ParseIntError},
+    str::Utf8Error,
     sync::atomic::AtomicBool,
 };
 
@@ -100,6 +108,172 @@ pub(crate) struct UpstreamHead<'a> {
 #[must_use]
 pub(crate) fn well_formed_etag(etag: Option<&str>) -> Option<&str> {
     etag.filter(|etag| is_valid_etag(etag))
+}
+
+/// How an upstream HTTP response body is framed on the wire.
+///
+/// Resolved once per head by [`resolve_body_framing`], which refuses an
+/// ambiguous head, with chunked-takes-precedence semantics (RFC 9112 §6.1):
+/// when `Transfer-Encoding: chunked` is present its framing wins and any
+/// accompanying `Content-Length` is ignored. Modelling the two as one sum
+/// type means "both at once" is no longer representable, so every consumer
+/// reads a single, already-disambiguated framing -- and a splice-relayed head
+/// announces exactly this one (`BodyFraming::header_line`, `splice/http.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyFraming {
+    /// `Content-Length: N` and not chunked. Splice-eligible when `N > 0`.
+    ContentLength(u64),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// Neither header present: the body runs until the connection closes.
+    CloseDelimited,
+}
+
+/// Resolve the body framing from *every* `Transfer-Encoding` and
+/// `Content-Length` field line (`fields` yields each line's name and value)
+/// of an upstream head, or refuse the head.
+///
+/// The relays never forward these lines: splice announces the framing
+/// resolved here and hyper frames the body itself. So a head that could be
+/// framed two ways -- one way by this proxy, another by a client reading a
+/// different one of its lines -- is refused rather than resolved, or the
+/// body's tail would become a forged next response on the client's
+/// keep-alive connection:
+///
+/// - `Transfer-Encoding` must name exactly one coding, `chunked`, across all
+///   its lines: a coding the relay cannot frame (`gzip, chunked`) or a
+///   duplicate is refused. Chunked then wins over any `Content-Length`
+///   (RFC 9112 §6.1), which is dropped.
+/// - `Content-Length` values, across lines and comma lists, must all be the
+///   same `1*DIGIT` (RFC 9110 §8.6 allows collapsing identical duplicates);
+///   junk, a sign, or two different values are refused -- not degraded to
+///   close-delimited framing.
+pub(crate) fn resolve_body_framing<'a>(
+    fields: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> Result<BodyFraming, String> {
+    use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+
+    /// A list element with its surrounding `OWS` trimmed (RFC 9110 §5.6.1).
+    fn trim_ows(element: &str) -> &str {
+        element.trim_matches([' ', '\t'])
+    }
+
+    let mut transfer_encodings = Vec::new();
+    let mut content_lengths = Vec::new();
+    for (name, value) in fields {
+        if name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str()) {
+            transfer_encodings.push(value);
+        } else if name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str()) {
+            content_lengths.push(value);
+        }
+    }
+
+    let mut codings = Vec::new();
+    for value in &transfer_encodings {
+        let value = std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
+            "non-UTF-8 Transfer-Encoding from upstream".to_owned()
+        })?;
+        // Empty list elements are legal and carry nothing (RFC 9110 §5.6.1).
+        codings.extend(value.split(',').map(trim_ows).filter(|c| !c.is_empty()));
+    }
+    if !transfer_encodings.is_empty() {
+        return match codings.as_slice() {
+            [coding] if coding.eq_ignore_ascii_case("chunked") => Ok(BodyFraming::Chunked),
+            _ => Err(format!(
+                "unsupported Transfer-Encoding `{}` from upstream",
+                codings.join(", ").escape_debug()
+            )),
+        };
+    }
+
+    let mut content_length = None;
+    for value in content_lengths {
+        let value = std::str::from_utf8(value).map_err(|_err @ Utf8Error { .. }| {
+            "non-UTF-8 Content-Length from upstream".to_owned()
+        })?;
+        let unparsable = || {
+            format!(
+                "unparsable Content-Length `{}` from upstream",
+                value.escape_debug()
+            )
+        };
+        // An empty element (`5,` or an empty value) is junk too: unlike a
+        // list field, `Content-Length` is a single `1*DIGIT`.
+        for element in value.split(',').map(trim_ows) {
+            // `u64::from_str` alone would take a leading `+`.
+            if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(unparsable());
+            }
+            let len = element
+                .parse::<u64>()
+                .map_err(|_err @ ParseIntError { .. }| unparsable())?;
+            match content_length {
+                Some(prev) if prev != len => {
+                    return Err(format!(
+                        "conflicting Content-Length values {prev} and {len} from upstream"
+                    ));
+                }
+                Some(_) | None => content_length = Some(len),
+            }
+        }
+    }
+    Ok(content_length.map_or(BodyFraming::CloseDelimited, BodyFraming::ContentLength))
+}
+
+/// Which upstream header lines a relay drops: the hop-by-hop headers of RFC
+/// 9110 §7.6.1, every name the upstream's `Connection:` lines nominate, and
+/// the body-framing lines -- the relay frames the body itself, so forwarding
+/// them would let a client frame it by a line the relay ignored (a second
+/// `Transfer-Encoding`, a conflicting `Content-Length`).
+pub(crate) struct RelayedHeaders<'a> {
+    nominated: Vec<&'a str>,
+}
+
+impl<'a> RelayedHeaders<'a> {
+    /// Hop-by-hop headers per RFC 9110 §7.6.1.
+    const HOP_BY_HOP: [&'static str; 8] = [
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "upgrade",
+        "proxy-authenticate",
+        "proxy-authorization",
+    ];
+
+    /// Body-framing headers: replaced by the framing the relay applies.
+    const FRAMING: [&'static str; 2] = ["content-length", "transfer-encoding"];
+
+    /// Collect the `Connection:` nominations of a head whose lines `fields`
+    /// yields as name and value.
+    pub(crate) fn new(fields: impl Iterator<Item = (&'a str, &'a [u8])>) -> Self {
+        let mut nominated = Vec::new();
+        for (name, value) in fields {
+            if name.eq_ignore_ascii_case("connection")
+                && let Ok(value) = std::str::from_utf8(value)
+            {
+                nominated.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|tok| !tok.is_empty()),
+                );
+            }
+        }
+        Self { nominated }
+    }
+
+    /// Whether the upstream header `name` is forwarded to the client.
+    pub(crate) fn keeps(&self, name: &str) -> bool {
+        let Self { nominated } = self;
+        !Self::HOP_BY_HOP
+            .iter()
+            .chain(&Self::FRAMING)
+            .copied()
+            .chain(nominated.iter().copied())
+            .any(|dropped| name.eq_ignore_ascii_case(dropped))
+    }
 }
 
 #[cfg(feature = "hyper")]
@@ -589,6 +763,75 @@ mod tests {
     struct Cached;
 
     const NO_CAP: Option<NonZero<u64>> = None;
+
+    /// The rule reads every line of a hyper `HeaderMap` (the splice parser's
+    /// tests in `splice/http.rs` cover the refusal table line by line):
+    /// hyper's client frames `gzip` + `chunked` by the last coding, the rule
+    /// refuses it.
+    #[test]
+    fn resolve_body_framing_reads_every_header_map_line() {
+        let resolve = |lines: &[(&'static str, &'static str)]| {
+            let mut headers = http::HeaderMap::new();
+            for &(name, value) in lines {
+                headers.append(name, http::HeaderValue::from_static(value));
+            }
+            resolve_body_framing(
+                headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            )
+        };
+
+        assert_eq!(
+            resolve(&[
+                ("transfer-encoding", "gzip"),
+                ("transfer-encoding", "chunked"),
+                ("content-length", "5"),
+            ]),
+            Err("unsupported Transfer-Encoding `gzip, chunked` from upstream".to_owned())
+        );
+        assert_eq!(
+            resolve(&[("content-length", "5"), ("content-length", "6")]),
+            Err("conflicting Content-Length values 5 and 6 from upstream".to_owned())
+        );
+        assert_eq!(
+            resolve(&[("transfer-encoding", "chunked"), ("content-length", "5")]),
+            Ok(BodyFraming::Chunked)
+        );
+        assert_eq!(
+            resolve(&[("content-length", "5"), ("content-length", "5")]),
+            Ok(BodyFraming::ContentLength(5))
+        );
+        assert_eq!(resolve(&[]), Ok(BodyFraming::CloseDelimited));
+    }
+
+    #[test]
+    fn relayed_headers_drop_hop_by_hop_nominated_and_framing_lines() {
+        let fields = [
+            ("Connection", &b"X-Foo, keep-alive"[..]),
+            ("connection", b"x-bar"),
+        ];
+        let relayed = RelayedHeaders::new(fields.into_iter());
+        for dropped in [
+            "Connection",
+            "Keep-Alive",
+            "Proxy-Connection",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "Content-Length",
+            "Transfer-Encoding",
+            "x-foo",
+            "X-Bar",
+        ] {
+            assert!(!relayed.keeps(dropped), "{dropped} must be dropped");
+        }
+        for kept in ["Content-Type", "ETag", "X-Baz"] {
+            assert!(relayed.keeps(kept), "{kept} must be relayed");
+        }
+    }
 
     fn head(
         status: u16,
