@@ -282,23 +282,20 @@ impl<'a> UpstreamHead<'a> {
     /// status and headers are read.
     #[must_use]
     pub(crate) fn from_response<B>(response: &'a http::Response<B>) -> Self {
-        use http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, TRANSFER_ENCODING};
+        use http::header::{CONTENT_RANGE, ETAG};
 
         let headers = response.headers();
 
-        let chunked = headers.get_all(TRANSFER_ENCODING).iter().any(|hv| {
-            hv.to_str().is_ok_and(|s| {
-                s.split(',')
-                    .any(|v| v.trim_ascii().eq_ignore_ascii_case("chunked"))
-            })
-        });
-        let content_length = if chunked {
-            None
-        } else {
-            headers
-                .get(CONTENT_LENGTH)
-                .and_then(|hv| hv.to_str().ok())
-                .and_then(|s| s.trim_ascii().parse::<u64>().ok())
+        // The same resolution splice's parser applies, so a head both
+        // backends accept (`Content-Length: 5, 5`, a repeated line) projects
+        // the same length.  `request_with_retry` already refused a head
+        // whose framing does not resolve.
+        let fields = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()));
+        let content_length = match resolve_body_framing(fields) {
+            Ok(BodyFraming::ContentLength(len)) => Some(len),
+            Ok(BodyFraming::Chunked | BodyFraming::CloseDelimited) | Err(_) => None,
         };
         let content_range = headers
             .get(CONTENT_RANGE)
@@ -1391,6 +1388,33 @@ mod tests {
             .unwrap();
         assert_eq!(UpstreamHead::from_response(&response).etag, None);
         assert_eq!(well_formed_etag(Some("\"caffe\u{e9}\"")), None);
+    }
+
+    /// Identical `Content-Length` duplicates, in one comma list or across
+    /// lines, collapse to the one length (RFC 9110 §8.6), as splice's parser
+    /// collapses them.
+    #[cfg(feature = "hyper")]
+    #[test]
+    fn from_response_collapses_identical_content_lengths() {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "60, 60")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            UpstreamHead::from_response(&response),
+            head(200, Some(60), None)
+        );
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-length", "60")
+            .header("content-length", "60")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            UpstreamHead::from_response(&response),
+            head(200, Some(60), None)
+        );
     }
 
     #[cfg(feature = "hyper")]
