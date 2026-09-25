@@ -42,11 +42,13 @@ use super::{
         as_size, now_epoch,
     },
     metrics_page::build_metrics_html,
-    page::{Heading, Page, PageTitle, QueryOptions, SetupHint, build_nav_html, build_page},
+    page::{
+        Heading, Page, PageTitle, PinLink, QueryOptions, SetupHint, build_nav_html, build_page,
+    },
     response::WebResponse,
     table::{
-        DetailsList, Highlights, Kind, write_collapsible_details, write_collapsible_details_badged,
-        write_collapsible_section, write_section,
+        DetailsList, Highlights, Kind, Rows, write_collapsible_details,
+        write_collapsible_details_badged, write_collapsible_section, write_section,
     },
     tables::{
         DirStats, Section, TOP_PACKAGES_LIMIT, TopPackagesView, build_mirror_table,
@@ -937,8 +939,11 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &mut body,
         "Mirrors",
         "mirrors-head",
-        data.mirror.rows,
-        None,
+        Rows {
+            shown: data.mirror.rows,
+            total: None,
+        },
+        options.open.contains("mirrors"),
         "No mirror has served a request yet.",
         &data.mirror.html,
     );
@@ -946,8 +951,11 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &mut body,
         "Origins",
         "origins-head",
-        data.origin.rows,
-        None,
+        Rows {
+            shown: data.origin.rows,
+            total: None,
+        },
+        options.open.contains("origins"),
         "No Packages index has been fetched yet, so no distribution, component or architecture is known.",
         &data.origin.html,
     );
@@ -955,8 +963,11 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &mut body,
         "Clients",
         "clients-head",
-        data.client.rows,
-        None,
+        Rows {
+            shown: data.client.rows,
+            total: None,
+        },
+        options.open.contains("clients"),
         "No client has fetched anything through this proxy yet.",
         &data.client.html,
     );
@@ -989,8 +1000,11 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &mut body,
         "Top Packages",
         "packages-head",
-        total_package_rows,
-        None,
+        Rows {
+            shown: total_package_rows,
+            total: None,
+        },
+        options.open.contains("packages"),
         "No package has been delivered yet.",
         &top_packages_body,
     );
@@ -999,8 +1013,11 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         &mut body,
         "Uncacheables",
         "uncacheables-head",
-        data.uncacheable.rows,
-        Some(UNCACHEABLES_MAX.get()),
+        Rows {
+            shown: data.uncacheable.rows,
+            total: Some(UNCACHEABLES_MAX.get()),
+        },
+        options.open.contains("uncacheables"),
         "Nothing has been requested that the cache had to pass through untouched.",
         &data.uncacheable.html,
     );
@@ -1008,29 +1025,45 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     // Reference and diagnostics last: read once at setup, or when something
     // is wrong. Configuration in particular used to sit second, above the
     // figures anyone actually opens this page for.
-    write_section(&mut body, "Cache Statistics", &data.cache_stats_html);
-    write_section(&mut body, "Capacity", &data.capacity_html);
-    write_section(&mut body, "Daemon Status", &data.daemon_status_html);
+    write_section(
+        &mut body,
+        "Cache Statistics",
+        "cache-statistics-head",
+        &data.cache_stats_html,
+    );
+    write_section(&mut body, "Capacity", "capacity-head", &data.capacity_html);
+    write_section(
+        &mut body,
+        "Daemon Status",
+        "daemon-status-head",
+        &data.daemon_status_html,
+    );
+    // Collapsed by default, so each carries a keep-open link: a section the
+    // reader opened would otherwise close on every auto-refresh.
+    let pin = |key| PinLink { key, options };
     write_collapsible_details(
         &mut body,
         "Maintenance",
         "maintenance-head",
-        false,
+        options.open.contains("maintenance"),
+        pin("maintenance"),
         &data.maintenance_html,
     );
     write_collapsible_details(
         &mut body,
         "Configuration",
         "configuration-head",
-        false,
+        options.open.contains("configuration"),
+        pin("configuration"),
         &data.configuration_html,
     );
     write_collapsible_details_badged(
         &mut body,
         "Metrics",
         "metrics-head",
-        false,
+        options.open.contains("metrics"),
         data.metrics_highlights,
+        pin("metrics"),
         &data.metrics_html,
     );
 

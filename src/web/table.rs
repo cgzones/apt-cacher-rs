@@ -435,9 +435,13 @@ impl Entry<'_> {
     }
 }
 
-/// Append a `<div class="section">` wrapping a titled HTML body.
-pub(super) fn write_section(out: &mut String, title: &'static str, body: &str) {
-    swrite!(out, "<div class=\"section\"><h2>{title}</h2>{body}</div>");
+/// Append a `<div class="section">` wrapping a titled HTML body; `id` is
+/// the heading's anchor.
+pub(super) fn write_section(out: &mut String, title: &'static str, id: &'static str, body: &str) {
+    swrite!(
+        out,
+        "<div class=\"section\"><h2 id=\"{id}\">{title}</h2>{body}</div>"
+    );
 }
 
 /// Append a titled `<details>` section around an already-rendered body.
@@ -446,14 +450,18 @@ pub(super) fn write_section(out: &mut String, title: &'static str, body: &str) {
 /// derives `open` from the row count and needs an empty-state note; this is
 /// for the key/value sections, whose disclosure state is an editorial call
 /// about how much the reader needs them.
+///
+/// `pin` is the header's keep-open link (`page::PinLink`), rendered after
+/// the title.
 pub(super) fn write_collapsible_details(
     out: &mut String,
     title: &'static str,
     id: &'static str,
     open: bool,
+    pin: impl Display,
     body: &str,
 ) {
-    write_collapsible_details_badged(out, title, id, open, "", body);
+    write_collapsible_details_badged(out, title, id, open, "", pin, body);
 }
 
 /// [`write_collapsible_details`] with `badge` beside the title, readable
@@ -464,6 +472,7 @@ pub(super) fn write_collapsible_details_badged(
     id: &'static str,
     open: bool,
     badge: impl Display,
+    pin: impl Display,
     body: &str,
 ) {
     let open_attr = if open { " open" } else { "" };
@@ -477,12 +486,21 @@ pub(super) fn write_collapsible_details_badged(
     swrite!(
         out,
         "<div class=\"section\"><details{open_attr}>\
-         <summary><h2 id=\"{id}\">{title}</h2>{badge_wrapped}</summary>\
+         <summary><h2 id=\"{id}\">{title}</h2>{badge_wrapped} {pin}</summary>\
          {body}</details></div>"
     );
 }
 
-/// Append a collapsible `<details>` section. Expanded by default unless empty.
+/// A row table's count chip: the rows shown, and the most it can hold when
+/// it is capped (`3 / 20`).
+#[derive(Clone, Copy)]
+pub(super) struct Rows {
+    pub(super) shown: usize,
+    pub(super) total: Option<usize>,
+}
+
+/// Append a collapsible `<details>` section. Expanded when it has rows, or
+/// when the reader pinned it open (`pinned`, from `open=`).
 ///
 /// `empty_note` is what the section says when it has no rows. A section that
 /// renders nothing at all leaves a first run looking broken rather than
@@ -491,12 +509,16 @@ pub(super) fn write_collapsible_section(
     out: &mut String,
     title: &'static str,
     id: &'static str,
-    row_count: usize,
-    total_count: Option<usize>,
+    rows: Rows,
+    pinned: bool,
     empty_note: &'static str,
     body: &str,
 ) {
-    let open_attr = if row_count > 0 { " open" } else { "" };
+    let Rows {
+        shown: row_count,
+        total: total_count,
+    } = rows;
+    let open_attr = if row_count > 0 || pinned { " open" } else { "" };
     let total_count_fmt = match total_count {
         Some(total) => format!(" / {total}"),
         None => String::new(),
@@ -544,7 +566,7 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailsList, Highlights, Kind, Table, write_collapsible_section};
+    use super::{DetailsList, Highlights, Kind, Rows, Table, write_collapsible_section};
     use crate::web::fmt::{Level, Nonzero};
 
     #[test]
@@ -743,7 +765,18 @@ mod tests {
     #[test]
     fn collapsible_section_notes_an_empty_body() {
         let mut out = String::new();
-        write_collapsible_section(&mut out, "T", "t-head", 0, None, "nothing yet", "");
+        write_collapsible_section(
+            &mut out,
+            "T",
+            "t-head",
+            Rows {
+                shown: 0,
+                total: None,
+            },
+            false,
+            "nothing yet",
+            "",
+        );
         assert!(out.contains("<p class=\"empty\">nothing yet</p>"), "{out}");
         // Nothing to read: the section starts collapsed, with a 0 count.
         assert!(!out.contains("<details open>"), "{out}");
@@ -757,8 +790,11 @@ mod tests {
             &mut out,
             "T",
             "t-head",
-            2,
-            Some(5),
+            Rows {
+                shown: 2,
+                total: Some(5),
+            },
+            false,
             "nothing yet",
             "<p>b</p>",
         );
@@ -777,12 +813,33 @@ mod tests {
             &mut out,
             "T",
             "t-head",
-            0,
-            None,
+            Rows {
+                shown: 0,
+                total: None,
+            },
+            false,
             "nothing yet",
             "<p>boom</p>",
         );
         assert!(out.contains("<p>boom</p>"), "{out}");
         assert!(!out.contains("nothing yet"), "{out}");
+    }
+
+    #[test]
+    fn a_pinned_section_opens_even_empty() {
+        let mut out = String::new();
+        write_collapsible_section(
+            &mut out,
+            "T",
+            "t-head",
+            Rows {
+                shown: 0,
+                total: None,
+            },
+            true,
+            "nothing yet",
+            "",
+        );
+        assert!(out.contains("<details open>"), "{out}");
     }
 }

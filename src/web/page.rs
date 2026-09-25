@@ -100,10 +100,111 @@ impl Theme {
     }
 }
 
+/// The dashboard's collapsible sections, by the stem of their heading id
+/// (`{key}-head`): the names `open=` accepts.
+const SECTIONS: [&str; 8] = [
+    "mirrors",
+    "origins",
+    "clients",
+    "packages",
+    "uncacheables",
+    "maintenance",
+    "configuration",
+    "metrics",
+];
+
+/// The sections `open=mirrors,metrics,...` asks to render expanded.
+///
+/// A `<details>` a reader opened closes again on every auto-refresh, since
+/// the page is rebuilt from scratch and there is no script to remember it.
+/// The set rides in the URL instead: the refresh meta tag reloads the same
+/// URL, and every link the page emits carries it along with `refresh` and
+/// `theme`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct OpenSections(u8);
+
+impl OpenSections {
+    fn bit(key: &str) -> Option<u8> {
+        SECTIONS
+            .iter()
+            .position(|section| *section == key)
+            .map(|index| 1 << index)
+    }
+
+    /// Unknown names are ignored, like every other malformed parameter.
+    fn parse(value: &str) -> Self {
+        Self(
+            value
+                .split(',')
+                .filter_map(Self::bit)
+                .fold(0, |bits, bit| bits | bit),
+        )
+    }
+
+    pub(super) fn contains(self, key: &str) -> bool {
+        Self::bit(key).is_some_and(|bit| self.0 & bit != 0)
+    }
+
+    /// `self` with `key` added if absent, removed if present.
+    fn toggled(self, key: &str) -> Self {
+        Self(self.0 ^ Self::bit(key).unwrap_or(0))
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Display for OpenSections {
+    /// The comma-separated names, in page order.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut sep = "";
+        for key in SECTIONS {
+            if self.contains(key) {
+                write!(f, "{sep}{key}")?;
+                sep = ",";
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct QueryOptions {
     pub(super) theme: Theme,
     pub(super) refresh_secs: Option<u32>,
+    pub(super) open: OpenSections,
+}
+
+/// The link in a collapsible section's header that keeps it open across
+/// refreshes (or stops doing so): the current page's URL with the section
+/// toggled in `open=`, anchored at the section.
+pub(super) struct PinLink {
+    pub(super) key: &'static str,
+    pub(super) options: QueryOptions,
+}
+
+impl Display for PinLink {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { key, options } = *self;
+        let pinned = options.open.contains(key);
+        let target = QueryUrl {
+            path: "/",
+            options: QueryOptions {
+                open: options.open.toggled(key),
+                ..options
+            },
+        };
+        let (label, title) = if pinned {
+            ("unpin", "Stop keeping this section open across refreshes")
+        } else {
+            ("keep open", "Keep this section open across refreshes")
+        };
+        write!(
+            f,
+            "<a class=\"pin\" href=\"{target}#{key}-head\" title=\"{title}\">{label}</a>"
+        )
+    }
 }
 
 /// `title` renders the page name and the instance identity; see
@@ -168,6 +269,7 @@ pub(super) fn parse_query(query: Option<&str>) -> QueryOptions {
                 "dark" => options.theme = Theme::Dark,
                 _ => {}
             },
+            "open" => options.open = OpenSections::parse(v),
             "refresh" => {
                 const MIN_REFRESH_SECS: u32 = 1;
                 const MAX_REFRESH_SECS: u32 = 3600;
@@ -201,6 +303,10 @@ impl Display for QueryUrl<'_> {
         }
         if let Some(p) = self.options.theme.query_param() {
             write!(f, "{sep}{p}")?;
+            sep = '&';
+        }
+        if !self.options.open.is_empty() {
+            write!(f, "{sep}open={}", self.options.open)?;
         }
         Ok(())
     }
@@ -258,12 +364,12 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
             let target = QueryUrl {
                 path: "/",
                 options: QueryOptions {
-                    theme: options.theme,
                     refresh_secs: if options.refresh_secs.is_some() {
                         None
                     } else {
                         Some(AUTO_REFRESH_SECS)
                     },
+                    ..options
                 },
             };
             if let Some(secs) = options.refresh_secs {
@@ -297,7 +403,7 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
             path: page.path(),
             options: QueryOptions {
                 theme: next_theme,
-                refresh_secs: options.refresh_secs,
+                ..options
             },
         },
     );
@@ -358,6 +464,9 @@ nav { background: var(--nav-bg); border-bottom: 1px solid var(--nav-border); pad
 nav .spacer { flex: 1; }
 nav a { color: var(--link); text-decoration: none; font-weight: 500; }
 nav a:hover { text-decoration: underline; }
+/* A collapsed section's keep-open link, quiet beside its title. */
+a.pin { font-size: 0.75em; color: var(--link); margin-left: 8px; text-decoration: none; }
+a.pin:hover { text-decoration: underline; }
 .count { display: inline-block; background: var(--count-bg); border-radius: 10px;
          padding: 1px 8px; font-size: 0.72em; font-weight: 600; vertical-align: middle;
          margin-left: 6px; min-width: 18px; text-align: center; line-height: 1.6;
@@ -535,7 +644,7 @@ const FAVICON_LINK: &str = "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/fa
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_QUERY_LEN, Theme, parse_query};
+    use super::{MAX_QUERY_LEN, PinLink, QueryUrl, Theme, parse_query};
 
     #[test]
     fn parse_query_none() {
@@ -610,6 +719,48 @@ mod tests {
         let parsed = parse_query(Some(&q));
         assert!(parsed.theme == Theme::Auto);
         assert!(parsed.refresh_secs.is_none());
+    }
+
+    #[test]
+    fn parse_query_open_sections() {
+        let q = parse_query(Some("open=metrics,bogus,mirrors&theme=dark"));
+        assert!(q.open.contains("metrics"));
+        assert!(q.open.contains("mirrors"));
+        assert!(!q.open.contains("clients"));
+        assert!(!q.open.contains("bogus"));
+        // Rendered back in page order, whatever order it came in.
+        assert_eq!(q.open.to_string(), "mirrors,metrics");
+        assert!(parse_query(Some("open=")).open.is_empty());
+    }
+
+    #[test]
+    fn links_carry_the_open_sections_and_pins_toggle_them() {
+        let options = parse_query(Some("refresh=30&open=metrics"));
+        let url = QueryUrl {
+            path: "/logs",
+            options,
+        }
+        .to_string();
+        assert_eq!(url, "/logs?refresh=30&open=metrics");
+        let unpin = PinLink {
+            key: "metrics",
+            options,
+        }
+        .to_string();
+        assert!(
+            unpin.contains("href=\"/?refresh=30#metrics-head\"") && unpin.contains(">unpin</a>"),
+            "{unpin}"
+        );
+        let pin = PinLink {
+            key: "maintenance",
+            options,
+        }
+        .to_string();
+        assert!(
+            pin.contains("href=\"/?refresh=30&open=maintenance,metrics#maintenance-head\"")
+                && pin.contains(">keep open</a>"),
+            "{pin}"
+        );
     }
 
     #[test]

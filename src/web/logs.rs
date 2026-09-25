@@ -64,8 +64,8 @@ pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
         PageTitle("apt-cacher-rs logs"),
         body_html,
         QueryOptions {
-            theme: options.theme,
             refresh_secs: None,
+            ..options
         },
     );
     WebResponse::html(html)
