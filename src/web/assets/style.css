@@ -221,6 +221,14 @@ footer hr { border: none; border-top: 1px solid var(--nav-border); margin-bottom
     .grid-2 { grid-template-columns: 1fr; }
 }
 
+/* ---- Optional scripts (app.js sets html.js) ----------------------------
+   The background refresh keeps the reader's place itself: the browser's own
+   scroll anchoring loses its anchor when the block holding it is replaced. */
+html.js { overflow-anchor: none; }
+nav .refresh-status { color: var(--details-key-fg); font-size: 0.85em; font-family: var(--mono); }
+nav .refresh-failure { color: var(--alert); font-size: 0.85em; font-weight: 600; }
+nav .refresh-status:empty, nav .refresh-failure:empty { display: none; }
+
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     details > summary::before { transition: none; }

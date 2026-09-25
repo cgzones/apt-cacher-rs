@@ -100,6 +100,32 @@ const ACR = (function () {
     return node && node.closest ? node.closest("[data-section]") : null;
   }
 
+  /* Run `change`, which may grow or shrink blocks above the reader, and
+   * scroll so the first block on screen stays where it was. The page opts
+   * out of the browser's own scroll anchoring (style.css), which loses its
+   * anchor when the block holding it is replaced. */
+  function keepScroll(change) {
+    let anchor = null;
+    for (const node of all(document, "body > [data-section]")) {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom > 0) {
+        anchor = { key: node.getAttribute("data-section"), top: rect.top };
+        break;
+      }
+    }
+    const result = change();
+    if (anchor) {
+      const now = document.querySelector("body > [data-section=" + anchor.key + "]");
+      if (now) {
+        const delta = now.getBoundingClientRect().top - anchor.top;
+        if (delta !== 0) {
+          window.scrollBy({ top: delta, left: 0, behavior: "instant" });
+        }
+      }
+    }
+    return result;
+  }
+
   /* ---- URL state -------------------------------------------------------
    * The page's state lives in its query string exactly as the server reads
    * it (page.rs `parse_query`): refresh=1..3600, theme=light|dark|auto,
@@ -299,6 +325,7 @@ const ACR = (function () {
     svg: svg,
     all: all,
     sectionOf: sectionOf,
+    keepScroll: keepScroll,
     state: state,
     parseState: parseState,
     href: href,

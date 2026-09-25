@@ -98,7 +98,10 @@ pub(super) static STYLESHEET: Asset = Asset::new(
 pub(super) static SCRIPT: Asset = Asset::new(
     "/app.js",
     "text/javascript; charset=utf-8",
-    concat!(include_str!("assets/js/core.js")),
+    concat!(
+        include_str!("assets/js/core.js"),
+        include_str!("assets/js/refresh.js"),
+    ),
 );
 
 /// Every asset, for the route handler.

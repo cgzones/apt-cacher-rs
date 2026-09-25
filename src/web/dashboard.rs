@@ -1112,8 +1112,10 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         "daemon-status",
         &data.daemon_status_html,
     );
-    // Collapsed by default, so each carries a keep-open link: a section the
-    // reader opened would otherwise close on every auto-refresh.
+    // Collapsed by default, so each carries a keep-open link: without script
+    // a section the reader opened would otherwise close on every
+    // auto-refresh. The script hides the links; it keeps sections open
+    // itself.
     let pin = |key| PinLink { key, options };
     write_collapsible_details(
         &mut body,

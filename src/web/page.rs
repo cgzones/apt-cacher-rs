@@ -118,11 +118,15 @@ const SECTIONS: [&str; 8] = [
 
 /// The sections `open=mirrors,metrics,...` asks to render expanded.
 ///
-/// A `<details>` a reader opened closes again on every auto-refresh, since
-/// the page is rebuilt from scratch and there is no script to remember it.
-/// The set rides in the URL instead: the refresh meta tag reloads the same
-/// URL, and every link the page emits carries it along with `refresh` and
-/// `theme`.
+/// Without script a `<details>` a reader opened closes again on every
+/// auto-refresh, since the page is rebuilt from scratch. The set rides in
+/// the URL instead: the refresh meta tag reloads the same URL, and every
+/// link the page emits carries it along with `refresh` and `theme`. With
+/// script the refresh swaps sections in place and keeps each as the reader
+/// left it, and `open=` follows every opening and closing
+/// (`history.replaceState`), so a reload or a shared link opens the same
+/// sections. It cannot say "closed": a row section with rows renders open
+/// on a reload whatever the reader did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct OpenSections(u8);
 
@@ -246,13 +250,22 @@ pub(super) fn build_page(
     )
 }
 
+/// `refresh=`'s reload, for browsers without script only: with script the
+/// page refreshes its sections in place (`assets/js/refresh.js`), and a
+/// reload would throw away what that keeps (scroll, sort, filters, a
+/// selection). A browser whose script fails to run gets no auto-refresh at
+/// all, an accepted trade.
 struct RefreshMeta(u32);
 impl Display for RefreshMeta {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if self.0 == 0 {
             Ok(())
         } else {
-            write!(f, "<meta http-equiv=\"refresh\" content=\"{}\">", self.0)
+            write!(
+                f,
+                "<noscript><meta http-equiv=\"refresh\" content=\"{}\"></noscript>",
+                self.0
+            )
         }
     }
 }
@@ -454,7 +467,16 @@ const FAVICON_LINK: &str = "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/fa
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_QUERY_LEN, PinLink, QueryUrl, Theme, parse_query};
+    use super::{MAX_QUERY_LEN, PinLink, QueryUrl, RefreshMeta, Theme, parse_query};
+
+    #[test]
+    fn the_refresh_reload_is_for_browsers_without_script() {
+        assert_eq!(RefreshMeta(0).to_string(), "");
+        assert_eq!(
+            RefreshMeta(30).to_string(),
+            "<noscript><meta http-equiv=\"refresh\" content=\"30\"></noscript>"
+        );
+    }
 
     #[test]
     fn parse_query_none() {
