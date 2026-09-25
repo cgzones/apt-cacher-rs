@@ -24,7 +24,7 @@ use crate::{
     humanfmt::HumanFmt,
     metrics,
     mirror_health::MirrorHealth,
-    mirror_indexes::MirrorIndexes,
+    mirror_indexes::{self, MirrorIndexes},
     mirror_perf::MirrorPerf,
     scheme_cache::{self, SchemeKeyRef, SchemeVerdict},
     swrite,
@@ -36,7 +36,7 @@ use super::{
         Count, FmtLastSeenHealth, Freshness, HtmlEscape, HtmlEscaped, Level, Nonzero, RelTime,
         as_size,
     },
-    table::{Table, tr, write_section_error},
+    table::{Table, tr, when, write_section_error},
 };
 
 /// A rendered dashboard table together with its row count, which the page
@@ -755,6 +755,12 @@ pub(super) async fn build_mirror_table(
         let mirror_health = health.get(key.as_str()).copied().unwrap_or_default();
         unmatched.retain(|(k, _)| *k != key);
         let (verdict, aliases) = scheme_verdicts(mirror, config);
+        let mirror_perf = perf.get(key.as_str()).copied();
+        let suites = indexes.get(key.as_str());
+        let index_lag = suites
+            .filter(|_| config.verify_checksums)
+            .and_then(mirror_indexes::assess)
+            .and_then(|age| age.freshest_lag);
 
         tr!(
             marked Freshness::of(mirror.last_seen, now_epoch).row_class(),
@@ -770,64 +776,64 @@ pub(super) async fn build_mirror_table(
                     aliases: &aliases,
                 },
                 uri = HtmlEscaped(mirror.uri())
-            ),
+            ) => Some(key.as_str()),
             FmtLastSeenHealth {
                 last_seen: mirror.last_seen,
                 now_epoch
-            },
+            } => when(mirror.last_seen),
             RelTime {
                 epoch: mirror.first_seen,
                 now: now_epoch
-            },
+            } => when(mirror.first_seen),
             RelTime {
                 epoch: mirror.last_cleanup,
                 now: now_epoch
-            },
+            } => when(mirror.last_cleanup),
             format_args!(
                 "{} ({})",
                 HumanFmt::Size(downloaded_bytes),
                 Count::db(mirror.download_count)
-            ),
+            ) => Some(downloaded_bytes),
             format_args!(
                 "{} ({})",
                 HumanFmt::Size(delivered_bytes),
                 Count::db(mirror.delivery_count)
-            ),
+            ) => Some(delivered_bytes),
             EfficiencyCell {
                 downloaded: mirror.total_download_size,
                 delivered: mirror.total_delivery_size,
-            },
+            } => efficiency_key(downloaded_bytes, delivered_bytes),
             DirSizeCell {
                 size: stats.size,
                 total: aggregate.size,
-            },
-            Count::len(stats.files),
+            } => Some(stats.size),
+            Count::len(stats.files) => Some(stats.files),
             AvgMaxCell {
                 files: stats.files,
                 size: stats.size,
                 max_file: stats.max_file_size,
-            },
+            } => (stats.files > 0).then(|| stats.size / stats.files as u64),
             format_args!(
                 "{} / {}",
                 Count::len(stats.deb_files),
                 Count::len(stats.metadata_files)
-            ),
-            health_cell(mirror_health.unreachable, Level::Warn),
-            health_cell(mirror_health.protocol, Level::Warn),
-            health_cell(mirror_health.checksum, Level::Alert),
-            health_cell(mirror_health.slow, Level::Warn),
+            ) => Some(stats.deb_files),
+            health_cell(mirror_health.unreachable, Level::Warn) => Some(mirror_health.unreachable),
+            health_cell(mirror_health.protocol, Level::Warn) => Some(mirror_health.protocol),
+            health_cell(mirror_health.checksum, Level::Alert) => Some(mirror_health.checksum),
+            health_cell(mirror_health.slow, Level::Warn) => Some(mirror_health.slow),
             TtfbCell {
-                perf: perf.get(key.as_str()).copied(),
+                perf: mirror_perf,
                 warn_above: ttfb_warn_above,
-            },
+            } => mirror_perf.and_then(|p| p.ttfb).map(|latest| latest.value.as_micros()),
             ThroughputCell {
-                perf: perf.get(key.as_str()).copied(),
+                perf: mirror_perf,
                 warn_below: rate_warn_below,
-            },
+            } => mirror_perf.and_then(|p| p.rate).map(|latest| latest.value),
             IndexAgeCell {
-                indexes: indexes.get(key.as_str()),
+                indexes: suites,
                 enabled: config.verify_checksums,
-            },
+            } => index_lag,
         );
     }
 
@@ -842,7 +848,7 @@ pub(super) async fn build_mirror_table(
                 "{}<span title=\"{key}\">{key}</span>",
                 HealthDot(**mirror_health),
                 key = HtmlEscape(key)
-            ),
+            ) => Some(*key),
             "N/A",
             "N/A",
             "N/A",
@@ -853,10 +859,10 @@ pub(super) async fn build_mirror_table(
             "N/A",
             "N/A",
             "N/A",
-            health_cell(mirror_health.unreachable, Level::Warn),
-            health_cell(mirror_health.protocol, Level::Warn),
-            health_cell(mirror_health.checksum, Level::Alert),
-            health_cell(mirror_health.slow, Level::Warn),
+            health_cell(mirror_health.unreachable, Level::Warn) => Some(mirror_health.unreachable),
+            health_cell(mirror_health.protocol, Level::Warn) => Some(mirror_health.protocol),
+            health_cell(mirror_health.checksum, Level::Alert) => Some(mirror_health.checksum),
+            health_cell(mirror_health.slow, Level::Warn) => Some(mirror_health.slow),
             // Never answered, so never measured.
             "N/A",
             "N/A",
@@ -872,6 +878,14 @@ pub(super) async fn build_mirror_table(
         },
         aggregate,
     )
+}
+
+/// The Cache Efficiency column's sort key: the saved share in tenths of a
+/// percent (negative when more was fetched than delivered), `None` before
+/// anything was delivered, as the cell's `N/A`.
+fn efficiency_key(downloaded: u64, delivered: u64) -> Option<i128> {
+    (delivered > 0)
+        .then(|| (i128::from(delivered) - i128::from(downloaded)) * 1000 / i128::from(delivered))
 }
 
 /// Log a failed dashboard query and render its section's error notice.
@@ -940,11 +954,11 @@ pub(super) fn render_origin_table(
             FmtLastSeenHealth {
                 last_seen: origin.last_seen,
                 now_epoch
-            },
+            } => when(origin.last_seen),
             RelTime {
                 epoch: index_date.unwrap_or(0),
                 now: now_epoch
-            },
+            } => index_date.and_then(when),
         );
     }
 
@@ -1013,18 +1027,19 @@ pub(super) fn render_client_table(
         tr!(
             marked Freshness::of(client.last_seen, now_epoch).row_class(),
             table,
+            // Unkeyed: the address sorts as its text.
             client.client_ip,
             FmtLastSeenHealth {
                 last_seen: client.last_seen,
                 now_epoch
-            },
-            HumanFmt::Size(downloaded),
-            HumanFmt::Size(delivered),
-            Count::db(client.request_count),
-            warn(counts.slow),
-            Count(counts.disconnect),
-            warn(counts.cap_refused),
-            warn(counts.unauthorized),
+            } => when(client.last_seen),
+            HumanFmt::Size(downloaded) => Some(downloaded),
+            HumanFmt::Size(delivered) => Some(delivered),
+            Count::db(client.request_count) => Some(as_size(client.request_count)),
+            warn(counts.slow) => Some(counts.slow),
+            Count(counts.disconnect) => Some(counts.disconnect),
+            warn(counts.cap_refused) => Some(counts.cap_refused),
+            warn(counts.unauthorized) => Some(counts.unauthorized),
         );
     }
     // Heaviest first, as the snapshot came.
@@ -1036,10 +1051,10 @@ pub(super) fn render_client_table(
             "N/A",
             "N/A",
             "N/A",
-            warn(counts.slow),
-            Count(counts.disconnect),
-            warn(counts.cap_refused),
-            warn(counts.unauthorized),
+            warn(counts.slow) => Some(counts.slow),
+            Count(counts.disconnect) => Some(counts.disconnect),
+            warn(counts.cap_refused) => Some(counts.cap_refused),
+            warn(counts.unauthorized) => Some(counts.unauthorized),
         );
     }
 
@@ -1121,17 +1136,17 @@ pub(super) fn render_top_packages_table(
             TopPackagesView::ByCount => tr!(
                 table,
                 HtmlEscape(&pkg.debname),
-                Count::db(pkg.delivery_count),
-                HumanFmt::Size(pkg_size),
+                Count::db(pkg.delivery_count) => Some(as_size(pkg.delivery_count)),
+                HumanFmt::Size(pkg_size) => Some(pkg_size),
             ),
             TopPackagesView::BySize => {
                 let total = as_size(pkg.total_delivered);
                 tr!(
                     table,
                     HtmlEscape(&pkg.debname),
-                    HumanFmt::Size(total),
-                    Count::db(pkg.delivery_count),
-                    HumanFmt::Size(pkg_size),
+                    HumanFmt::Size(total) => Some(total),
+                    Count::db(pkg.delivery_count) => Some(as_size(pkg.delivery_count)),
+                    HumanFmt::Size(pkg_size) => Some(pkg_size),
                 );
             }
         }
@@ -1213,6 +1228,15 @@ mod tests {
             "the cancelled walk was kept"
         );
         DIR_STATS_CACHE.lock().remove(dir.path());
+    }
+
+    #[test]
+    fn efficiency_sorts_by_the_saved_share() {
+        assert_eq!(efficiency_key(0, 0), None);
+        assert_eq!(efficiency_key(100, 1000), Some(900));
+        assert_eq!(efficiency_key(1000, 1000), Some(0));
+        assert_eq!(efficiency_key(1500, 1000), Some(-500));
+        assert_eq!(efficiency_key(0, u64::MAX), Some(1000));
     }
 
     #[test]

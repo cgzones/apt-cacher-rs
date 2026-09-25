@@ -107,6 +107,19 @@ impl Table {
     /// `<span>`) cannot be reused verbatim in an attribute, so they are
     /// emitted bare.
     pub(super) fn cell(&mut self, value: impl Display) {
+        self.cell_keyed(value, None::<SortKey<'_>>);
+    }
+
+    /// [`Self::cell`] with the value the optional table sorting orders the
+    /// column by, as `data-sort`: the figure behind a rendering that does
+    /// not sort as text (a size, a relative time, a grouped count, a
+    /// composite like `1.2GB (345)`). `None` marks a cell without a value
+    /// (rendered `N/A`), which sorts last.
+    pub(super) fn cell_keyed<'k>(
+        &mut self,
+        value: impl Display,
+        key: Option<impl Into<SortKey<'k>>>,
+    ) {
         let Self {
             out,
             scratch,
@@ -122,11 +135,14 @@ impl Table {
         };
         *column += 1;
 
-        if scratch.len() > Self::TITLE_THRESHOLD && !scratch.contains('<') {
-            swrite!(out, "<td{class} title=\"{scratch}\">{scratch}</td>");
-        } else {
-            swrite!(out, "<td{class}>{scratch}</td>");
+        swrite!(out, "<td{class}");
+        if let Some(key) = key {
+            swrite!(out, " data-sort=\"{}\"", key.into());
         }
+        if scratch.len() > Self::TITLE_THRESHOLD && !scratch.contains('<') {
+            swrite!(out, " title=\"{scratch}\"");
+        }
+        swrite!(out, ">{scratch}</td>");
     }
 
     pub(super) fn end_row(&mut self) {
@@ -140,22 +156,89 @@ impl Table {
 }
 
 /// Append a row of cells, each formatted via `format_args!`. The `marked`
-/// form carries a state class on the `<tr>`.
+/// form carries a state class on the `<tr>`. A cell written
+/// `value => key` carries its sort key (an `Option`, see
+/// [`Table::cell_keyed`]).
 macro_rules! tr {
-    ($table:expr, $($cell:expr),* $(,)?) => {{
+    (@cell $t:ident, $cell:expr => $key:expr) => {
+        $t.cell_keyed(format_args!("{}", $cell), $key)
+    };
+    (@cell $t:ident, $cell:expr) => {
+        $t.cell(format_args!("{}", $cell))
+    };
+    ($table:expr, $($cell:expr $(=> $key:expr)?),* $(,)?) => {{
         let t = &mut $table;
         t.start_row();
-        $( t.cell(format_args!("{}", $cell)); )*
+        $( tr!(@cell t, $cell $(=> $key)?); )*
         t.end_row();
     }};
-    (marked $attr:expr, $table:expr, $($cell:expr),* $(,)?) => {{
+    (marked $attr:expr, $table:expr, $($cell:expr $(=> $key:expr)?),* $(,)?) => {{
         let t = &mut $table;
         t.start_row_marked($attr);
-        $( t.cell(format_args!("{}", $cell)); )*
+        $( tr!(@cell t, $cell $(=> $key)?); )*
         t.end_row();
     }};
 }
 pub(super) use tr;
+
+/// A table cell's sort value ([`Table::cell_keyed`]): a figure, or text,
+/// which is HTML-escaped on output, so no caller can forget to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SortKey<'a> {
+    Number(i128),
+    Text(&'a str),
+}
+
+impl Display for SortKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Number(number) => Display::fmt(&number, f),
+            Self::Text(text) => Display::fmt(&HtmlEscaped(text), f),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for SortKey<'a> {
+    fn from(text: &'a str) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<i128> for SortKey<'_> {
+    fn from(number: i128) -> Self {
+        Self::Number(number)
+    }
+}
+
+impl From<u128> for SortKey<'_> {
+    fn from(number: u128) -> Self {
+        Self::Number(i128::try_from(number).unwrap_or(i128::MAX))
+    }
+}
+
+impl From<i64> for SortKey<'_> {
+    fn from(number: i64) -> Self {
+        Self::Number(number.into())
+    }
+}
+
+impl From<u64> for SortKey<'_> {
+    fn from(number: u64) -> Self {
+        Self::Number(number.into())
+    }
+}
+
+impl From<usize> for SortKey<'_> {
+    fn from(number: usize) -> Self {
+        Self::Number(i128::try_from(number).unwrap_or(i128::MAX))
+    }
+}
+
+/// A timestamp column's sort key: the epoch, `None` for the `0` the
+/// dashboard renders as `N/A`.
+pub(super) fn when(epoch: i64) -> Option<i64> {
+    (epoch > 0).then_some(epoch)
+}
 
 /// Key-value list with grid layout.
 ///
@@ -583,7 +666,7 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
 #[cfg(test)]
 mod tests {
     use super::{
-        DetailsList, Highlights, Kind, Rows, Table, write_collapsible_details_badged,
+        DetailsList, Highlights, Kind, Rows, Table, when, write_collapsible_details_badged,
         write_collapsible_section, write_section,
     };
     use crate::web::fmt::{Level, Nonzero};
@@ -641,6 +724,29 @@ mod tests {
             2,
             "{html}"
         );
+    }
+
+    #[test]
+    fn keyed_cells_carry_their_sort_value() {
+        let mut table = Table::numeric("t", &["Name", "Size", "Seen", "Plain"], &[1]);
+        let long = "a value well past the title threshold";
+        tr!(
+            table,
+            long => Some("sortable <name>"),
+            "1.23kB (4)" => Some(1234_u64),
+            "N/A" => when(0),
+            7,
+        );
+        let html = table.finish();
+        assert!(
+            html.contains(&format!(
+                "<tr><td data-sort=\"sortable &lt;name&gt;\" title=\"{long}\">{long}</td>\
+                 <td class=\"num\" data-sort=\"1234\">1.23kB (4)</td>\
+                 <td>N/A</td><td>7</td></tr>"
+            )),
+            "{html}"
+        );
+        assert_eq!(when(1_700_000_000), Some(1_700_000_000));
     }
 
     #[test]

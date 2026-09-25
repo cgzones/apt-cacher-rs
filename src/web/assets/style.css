@@ -228,6 +228,13 @@ html.js { overflow-anchor: none; }
 nav .refresh-status { color: var(--details-key-fg); font-size: 0.85em; font-family: var(--mono); }
 nav .refresh-failure { color: var(--alert); font-size: 0.85em; font-weight: 600; }
 nav .refresh-status:empty, nav .refresh-failure:empty { display: none; }
+/* A sortable column's header is a button that still reads as a header. */
+th button.sort { font: inherit; color: inherit; background: none; border: 0; padding: 0;
+                 margin: 0; text-align: inherit; cursor: pointer; letter-spacing: inherit; }
+th button.sort:hover { text-decoration: underline; }
+th button.sort:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+th[aria-sort="ascending"] button.sort::after { content: " \25B2"; font-size: 0.8em; }
+th[aria-sort="descending"] button.sort::after { content: " \25BC"; font-size: 0.8em; }
 
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
