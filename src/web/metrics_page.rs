@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::{
-    fmt::{Colorize, Level, RatioClass, WarnNonzero, alert_if, warn_if},
+    fmt::{Colorize, Level, Nonzero, RatioClass, WarnNonzero, alert_if, warn_if},
     table::DetailsList,
 };
 
@@ -674,10 +674,58 @@ fn build_upstream_group(g: &mut Groups) {
             Level::Warn,
             &metrics::PASSTHROUGH_REJECTED_CAP,
         );
+        // The causes before their total, which is bumped first.
+        let abort_causes = [
+            (
+                "Aborted (upstream failure)",
+                "The mirror failed the transfer: connect, head, body, rate or protocol. The Mirrors table names the mirror.",
+                Level::Warn,
+                &metrics::DOWNLOADS_ABORTED_UPSTREAM,
+            ),
+            (
+                "Aborted (cache I/O failure)",
+                "A cache file could not be written, read back or renamed. Check the cache filesystem (space, permissions, errors) and the Storage Errors rows.",
+                Level::Alert,
+                &metrics::DOWNLOADS_ABORTED_CACHE,
+            ),
+            (
+                "Aborted (checksum mismatch)",
+                "The whole body arrived but did not match the digest its index promised, so it was discarded: the mirror serves content its own index disagrees with. Same event as Integrity's Mismatch (rejected).",
+                Level::Alert,
+                &metrics::DOWNLOADS_ABORTED_CHECKSUM,
+            ),
+            (
+                "Aborted (internal failure)",
+                "A transfer broke on this side (a pipe, a task): a bug to report.",
+                Level::Alert,
+                &metrics::DOWNLOADS_ABORTED_INTERNAL,
+            ),
+        ];
+        let cancelled = &metrics::DOWNLOADS_ABORTED_CANCELLED;
+        let cause_rows = abort_causes.map(|(label, tip, level, signal)| {
+            (label, tip, level, signal.get(), signal.last())
+        });
+        let (cancelled_count, cancelled_last) = (cancelled.get(), cancelled.last());
         t.entry("Downloads Aborted")
-            .tip("Upstream downloads that ended without being cached: failed (upstream, cache or internal), cancelled, or discarded by the commit (checksum mismatch, verify or rename failure).")
-            .last(metrics::DOWNLOADS_ABORTED.last())
-            .value(metrics::DOWNLOADS_ABORTED.get());
+            .tip("Registered upstream downloads that ended without being cached; the causes beneath split them and sum to this.")
+            .parts(|p| {
+                for (label, tip, level, value, last) in cause_rows {
+                    p.entry(label)
+                        .tip(tip)
+                        .last(last)
+                        .value(Nonzero { value, level });
+                }
+                p.entry("Aborted (cancelled)")
+                    .tip("The download was dropped without a verdict, typically because every client it served went away. No alarm on its own; a climb together with client disconnects points at the clients.")
+                    .last(cancelled_last)
+                    .value(cancelled_count);
+            })
+            .signal(Level::Warn, &metrics::DOWNLOADS_ABORTED);
+        t.row_tip(
+            "Downloads Declined",
+            "Registered downloads answered without fetching a body, so not aborts: the upstream status was relayed uncached (a 404, say), the answer was refused (oversize, bad framing), or the disk quota, min_disk_free, the checksum verify throttle or max_passthrough_relays refused it. A max_upstream_downloads refusal never registers and counts in Downloads Rejected (cap) instead.",
+            metrics::DOWNLOADS_DECLINED.get(),
+        );
         t.row_tip(
             "Partials Still In Use",
             "Downloads that found their `.partial` still held by an earlier download of the same file and fetched into a scratch file instead of resuming it.",

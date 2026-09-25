@@ -104,9 +104,22 @@ fn publish_abort(
     failure: Arc<DownloadFailure>,
 ) {
     tokio::task::block_in_place(|| {
+        let cause = match failure.as_ref() {
+            DownloadFailure::Upstream(_) => &metrics::DOWNLOADS_ABORTED_UPSTREAM,
+            DownloadFailure::Cache(_) => &metrics::DOWNLOADS_ABORTED_CACHE,
+            DownloadFailure::Internal(_) => &metrics::DOWNLOADS_ABORTED_INTERNAL,
+            DownloadFailure::Cancelled => &metrics::DOWNLOADS_ABORTED_CANCELLED,
+        };
         *status.blocking_write() = ActiveDownloadStatus::Aborted(AbortReason::Failed(failure));
-        metrics::DOWNLOADS_ABORTED.increment();
+        count_abort(cause);
     });
+}
+
+/// The one bump pair for an aborted download: `DOWNLOADS_ABORTED` and its
+/// cause, so the causes always sum to the total.
+fn count_abort(cause: &metrics::Signal) {
+    metrics::DOWNLOADS_ABORTED.increment();
+    cause.increment();
 }
 
 /// Conclude a download's terminal failure under the one abort wording; the
@@ -294,8 +307,10 @@ impl InitBarrier {
     /// End the entry without a download: the upstream answered with nothing
     /// to cache, or this proxy refused to fetch it. Joiners answer from
     /// `why` what the originator answered (`active_downloads::JoinFailure`);
-    /// nothing failed, so `DOWNLOADS_ABORTED` stays untouched.
+    /// nothing failed, so `DOWNLOADS_ABORTED` stays untouched and
+    /// `DOWNLOADS_DECLINED` counts it instead.
     pub(crate) async fn decline(&mut self, why: Declined) -> Settled {
+        metrics::DOWNLOADS_DECLINED.increment();
         self.settle(ActiveDownloadStatus::Aborted(AbortReason::Declined(why)))
             .await
     }
@@ -827,7 +842,13 @@ impl RenameBarrier {
                     ActiveDownloadStatus::Aborted(AbortReason::Discarded { checksum_mismatch });
                 throttle
             };
-            metrics::DOWNLOADS_ABORTED.increment();
+            // A mismatch is the mirror's content; a verify read or rename
+            // failure is this disk's.
+            count_abort(if checksum_mismatch {
+                &metrics::DOWNLOADS_ABORTED_CHECKSUM
+            } else {
+                &metrics::DOWNLOADS_ABORTED_CACHE
+            });
             // Publication is complete, so Drop must not replace Discarded
             // with a generic abort. Keep the lease until the last mutation
             // of the partial has finished, including a detached unlink.
@@ -1100,24 +1121,33 @@ mod tests {
         use crate::transfer_error::{CacheError, InternalError};
         let active = ActiveDownloads::new();
         let key = key("salvage.deb");
-        for (failure, salvages) in [
+        for (failure, salvages, cause) in [
             (
                 DownloadFailure::from(CacheError::io(
                     "write download cache file",
                     std::io::ErrorKind::StorageFull.into(),
                 )),
                 false,
+                &metrics::DOWNLOADS_ABORTED_CACHE,
             ),
-            (InternalError::invalid("pipe", "broken").into(), true),
+            (
+                InternalError::invalid("pipe", "broken").into(),
+                true,
+                &metrics::DOWNLOADS_ABORTED_INTERNAL,
+            ),
         ] {
             let barrier = downloading(&active, &key).await;
             let status = Arc::clone(&barrier.data.as_ref().expect("live barrier").status);
+            let (aborted, caused) = (metrics::DOWNLOADS_ABORTED.get(), cause.get());
             let failed = barrier
                 .run(Consequence::Abandon, async |_barrier| Err::<(), _>(failure))
                 .await
                 .expect_err("worker failed");
             let mut ran = false;
             let reported = failed.salvage(async || ran = true).await;
+            // Published (and counted) once the salvage settled the failure.
+            assert!(metrics::DOWNLOADS_ABORTED.get() > aborted);
+            assert!(cause.get() > caused, "the abort names its cause");
             assert_eq!(ran, salvages, "{:?}", reported.failure());
             assert!(matches!(&*status.read().await,
                 ActiveDownloadStatus::Aborted(AbortReason::Failed(published))
@@ -1137,11 +1167,13 @@ mod tests {
         let status = Arc::clone(&origination.status);
         let mut barrier = InitBarrier::new(origination, active.clone(), &details, "/declined.deb");
         let aborted = metrics::DOWNLOADS_ABORTED.get();
+        let declined = metrics::DOWNLOADS_DECLINED.get();
         let _settled = barrier
             .decline(Declined::Passthrough(http::StatusCode::NOT_FOUND))
             .await;
         drop(barrier);
         assert_eq!(metrics::DOWNLOADS_ABORTED.get(), aborted);
+        assert!(metrics::DOWNLOADS_DECLINED.get() > declined);
         assert_eq!(active.len(), 0, "the declined entry is retired");
         let failure = await_serveable(&status, &details).await.err();
         assert!(

@@ -125,8 +125,12 @@ impl DetailsList {
 
     /// A list whose relative times are measured against `now`: tests pin it.
     pub(super) fn with_now(now: i64) -> Self {
+        Self::open("details", now)
+    }
+
+    fn open(class: &'static str, now: i64) -> Self {
         let mut out = String::with_capacity(1024);
-        out.push_str("<dl class=\"details\">");
+        swrite!(out, "<dl class=\"{class}\">");
         Self { out, now }
     }
 
@@ -154,11 +158,7 @@ impl DetailsList {
         level: Level,
         signal: &Signal,
     ) {
-        let value = signal.get();
-        self.entry(label)
-            .tip(tooltip)
-            .last(signal.last())
-            .value(Nonzero { value, level });
+        self.entry(label).tip(tooltip).signal(level, signal);
     }
 
     /// Start a row whose shape the returned [`Entry`] refines; nothing is
@@ -168,6 +168,7 @@ impl DetailsList {
             list: self,
             label,
             tip: None,
+            parts: None,
             last: None,
         }
     }
@@ -184,6 +185,9 @@ pub(super) struct Entry<'a> {
     list: &'a mut DetailsList,
     label: &'static str,
     tip: Option<&'static str>,
+    /// The rows this one is the total of, already rendered (see
+    /// [`Entry::parts`]).
+    parts: Option<String>,
     last: Option<u64>,
 }
 
@@ -194,6 +198,25 @@ impl Entry<'_> {
     pub(super) fn tip(mut self, tip: &'static str) -> Self {
         self.tip = Some(tip);
         self
+    }
+
+    /// The rows this one is the total of -- the codes of a status class,
+    /// the causes of an abort count -- rendered indented beneath its value,
+    /// inside its own cell. A nested list, not rows of the enclosing grid:
+    /// the grid flows left to right, so a "part" placed after its total
+    /// would land beside it, or on the next line under an unrelated cell.
+    pub(super) fn parts(mut self, build: impl FnOnce(&mut DetailsList)) -> Self {
+        let mut parts = DetailsList::open("parts", self.list.now);
+        build(&mut parts);
+        self.parts = Some(parts.finish());
+        self
+    }
+
+    /// Render a bad-sign counter: its value painted at `level` once non-zero,
+    /// with the time it last moved.
+    pub(super) fn signal(self, level: Level, signal: &Signal) {
+        let value = signal.get();
+        self.last(signal.last()).value(Nonzero { value, level });
     }
 
     /// When the counter this row shows last moved (Unix seconds), rendered
@@ -209,10 +232,15 @@ impl Entry<'_> {
             list,
             label,
             tip,
+            parts,
             last,
         } = self;
         let DetailsList { out, now } = list;
-        out.push_str("<div><dt");
+        out.push_str(if parts.is_some() {
+            "<div class=\"whole\"><dt"
+        } else {
+            "<div><dt"
+        });
         if let Some(tip) = tip {
             swrite!(out, " title=\"{tip}\"");
         }
@@ -226,6 +254,9 @@ impl Entry<'_> {
                     now: *now,
                 }
             );
+        }
+        if let Some(parts) = parts {
+            swrite!(out, "<dd class=\"parts\">{parts}</dd>");
         }
         out.push_str("</div>");
     }
@@ -409,6 +440,24 @@ mod tests {
         assert!(
             html.contains("<div><dt>Never</dt><dd>0</dd></div>"),
             "{html}"
+        );
+    }
+
+    #[test]
+    fn a_total_renders_its_parts_nested_in_its_own_cell() {
+        let mut list = DetailsList::with_now(0);
+        list.entry("Total")
+            .parts(|p| {
+                p.row("Part A", 1);
+                p.row("Part B", 2);
+            })
+            .value(3);
+        assert_eq!(
+            list.finish(),
+            "<dl class=\"details\"><div class=\"whole\"><dt>Total</dt><dd>3</dd>\
+             <dd class=\"parts\"><dl class=\"parts\">\
+             <div><dt>Part A</dt><dd>1</dd></div><div><dt>Part B</dt><dd>2</dd></div>\
+             </dl></dd></div></dl>",
         );
     }
 

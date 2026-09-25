@@ -420,6 +420,15 @@ dl.details > div:hover { border-left-color: var(--h-accent); background: var(--d
 dl.details dt { font-size: 0.78em; color: var(--details-key-fg); font-weight: 600; }
 dl.details dd { color: var(--details-val-fg); font-weight: 500; font-size: 0.95em;
                 font-family: var(--mono); font-variant-numeric: tabular-nums; }
+/* A total with its parts (status codes under their class, causes under an
+   abort count): the cell spans the row, the parts are indented beneath the
+   total, laid out side by side. */
+dl.details > div.whole { grid-column: 1 / -1; }
+dl.parts { display: flex; flex-wrap: wrap; gap: 2px 22px; margin: 3px 0 2px 14px; }
+dl.parts > div { display: flex; flex-direction: column; padding-left: 8px;
+                 border-left: 2px solid var(--section-border); }
+dl.parts dt { font-size: 0.72em; }
+dl.parts dd { font-size: 0.9em; }
 /* When a bad-sign counter last moved: context for the figure above it. */
 dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 0.75em;
                      font-family: inherit; }

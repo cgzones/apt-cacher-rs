@@ -778,6 +778,29 @@ pub(crate) static DB_OPERATION_FAILED: Signal = Signal::new();
 /// originator declined (relayed status, quota, throttle, ...) is not an
 /// abort.
 pub(crate) static DOWNLOADS_ABORTED: Signal = Signal::new();
+/// `DOWNLOADS_ABORTED` split by cause; every abort bumps the parent and
+/// exactly one of these (`guards::count_abort`), so they sum to it.
+/// The mirror failed the transfer (`DownloadFailure::Upstream`).
+pub(crate) static DOWNLOADS_ABORTED_UPSTREAM: Signal = Signal::new();
+/// A local cache syscall failed (`DownloadFailure::Cache`), or the commit
+/// could not read back or rename the finished file.
+pub(crate) static DOWNLOADS_ABORTED_CACHE: Signal = Signal::new();
+/// The commit discarded a complete body whose digest did not match.
+pub(crate) static DOWNLOADS_ABORTED_CHECKSUM: Signal = Signal::new();
+/// An internal transfer failure (`DownloadFailure::Internal`): a pipe or
+/// task broke on this side.
+pub(crate) static DOWNLOADS_ABORTED_INTERNAL: Signal = Signal::new();
+/// The download's barrier was dropped without a verdict
+/// (`DownloadFailure::Cancelled`): its task was cancelled, typically
+/// because every client it served went away.
+pub(crate) static DOWNLOADS_ABORTED_CANCELLED: Signal = Signal::new();
+/// Registered downloads the originator ended without fetching a body
+/// (`InitBarrier::decline`): the upstream status is relayed uncached, the
+/// planner refused the answer, the disk quota or the verify throttle
+/// refused it, the passthrough cap refused the relay. Not an abort: nothing
+/// failed. A refusal by `max_upstream_downloads` never registers a download
+/// and counts only in `UPSTREAM_DOWNLOAD_REJECTED_CAP`.
+pub(crate) static DOWNLOADS_DECLINED: Counter = Counter::new();
 /// Downloads that found their `.partial` path still claimed by an earlier
 /// download of the same file (`partial_claim`) and wrote into a scratch file
 /// instead of resuming it.
