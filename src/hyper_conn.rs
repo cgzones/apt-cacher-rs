@@ -2000,10 +2000,11 @@ async fn serve_new_file_worker(
     }
     // RFC 3986 §3.2.2: IPv6 addresses must be bracketed in Host headers.
     // The upstream authority, not the canonical mirror: an aliased request
-    // dials the host the client named.
-    let host = HeaderValue::from_str(&conn_details.upstream_authority())
+    // dials the host the client named. Replaced together with `req_uri`
+    // when a redirect is followed, so every later request (a refetch after
+    // a resume anomaly) names the host it is sent to.
+    let mut host = HeaderValue::from_str(&conn_details.upstream_authority())
         .expect("connection host should be valid");
-    let host = &host;
 
     let mut req_uri = Cow::Borrowed(req.uri());
 
@@ -2080,7 +2081,7 @@ async fn serve_new_file_worker(
 
     let fwd_request = build_fwd_request(
         &req_uri,
-        host,
+        &host,
         revalidate,
         resume_offset,
         resume_if_range.as_deref(),
@@ -2120,13 +2121,12 @@ async fn serve_new_file_worker(
         {
             // Derive the Host header from the redirect target so it matches
             // the URI we're actually sending the request to.
-            let redirected_host = host_header_from_uri(moved_auth);
-
+            host = host_header_from_uri(moved_auth);
             req_uri = Cow::Owned(moved_uri);
 
             let redirected_request = build_fwd_request(
                 &req_uri,
-                &redirected_host,
+                &host,
                 revalidate,
                 resume_offset,
                 resume_if_range.as_deref(),
@@ -2241,7 +2241,7 @@ async fn serve_new_file_worker(
                 // discarded, so from the upstream's perspective this is a
                 // fresh unconditional fetch (no If-Modified-Since, no
                 // If-None-Match, no Range).
-                let retry_request = build_fwd_request(&req_uri, host, None, 0, None);
+                let retry_request = build_fwd_request(&req_uri, &host, None, 0, None);
 
                 upstream_request_sent = PreciseInstant::now();
                 (fwd_response, head_timing) =
