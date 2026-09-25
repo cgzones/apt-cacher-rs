@@ -39,11 +39,38 @@ use tracing::{error, info};
 use crate::{
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
-    config::Config,
+    config::{Config, DomainName},
     error::{ErrorReport, is_peer_disconnect},
     humanfmt::HumanFmt,
-    limits, metrics, warn_once_or_info,
+    limits, metrics, uri_authority, warn_once_or_info,
 };
+
+/// A CONNECT target that passed [`validate_connect_target`]: a permitted
+/// host, parsed like every other host (an IPv6 target arrives bracketed,
+/// `[2001:db8::1]:443`), and its port.
+#[derive(Clone, Debug)]
+pub(crate) struct TunnelTarget {
+    pub(crate) host: DomainName,
+    pub(crate) port: NonZero<u16>,
+}
+
+impl TunnelTarget {
+    /// What `TcpStream::connect` dials: the bare host text (an IPv6 address
+    /// without brackets, which a resolver would read as a name) and the port.
+    #[must_use]
+    pub(crate) fn dial_addr(&self) -> (&str, u16) {
+        let Self { host, port } = self;
+        (host.as_str(), port.get())
+    }
+}
+
+impl std::fmt::Display for TunnelTarget {
+    /// The URI authority, `host:port` or `[v6]:port`, for log lines.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { host, port } = self;
+        f.write_str(&host.format_authority(Some(*port)))
+    }
+}
 
 /// A rejected CONNECT target: the status/body the backend should return to the
 /// client. All logging and metric bumping already happened inside
@@ -55,14 +82,14 @@ pub(crate) struct ConnectReject {
 
 /// Validate a CONNECT request's authority against tunnel policy.
 ///
-/// On success returns the parsed `(host, port)`. On rejection returns a
+/// On success returns the parsed [`TunnelTarget`]. On rejection returns a
 /// [`ConnectReject`] and has already emitted the matching log line and bumped
 /// the relevant metric, so both backends behave identically.
 pub(crate) fn validate_connect_target(
     config: &Config,
     client: &ClientInfo,
     uri: &Uri,
-) -> Result<(String, NonZero<u16>), ConnectReject> {
+) -> Result<TunnelTarget, ConnectReject> {
     if !config.https_tunnel_enabled {
         info!(
             "Rejecting https tunnel request for client {client} to {uri}: https tunneling is disabled (`https_tunnel_enabled`)"
@@ -90,11 +117,10 @@ pub(crate) fn validate_connect_target(
         });
     }
 
-    let Some((host, port)) = uri.authority().and_then(|a| {
-        a.port_u16()
-            .and_then(NonZero::new)
-            .map(|p| (a.host().to_string(), p))
-    }) else {
+    let Some((raw_host, port)) = uri
+        .authority()
+        .and_then(|a| uri_authority::port(a).ok().flatten().map(|p| (a.host(), p)))
+    else {
         warn_once_or_info!(
             "Invalid CONNECT address `{uri}` from client {client}; rejecting the tunnel request with 400"
         );
@@ -102,6 +128,21 @@ pub(crate) fn validate_connect_target(
             status: StatusCode::BAD_REQUEST,
             msg: "Invalid CONNECT address",
         });
+    };
+    // The same parser as a proxied request's host: an IPv6 target is
+    // bracketed in the authority, and matches the list entry it names in
+    // any spelling.
+    let host = match DomainName::new(raw_host) {
+        Ok(host) => host,
+        Err(err) => {
+            warn_once_or_info!(
+                "Invalid CONNECT address `{uri}` from client {client} ({err}); rejecting the tunnel request with 400"
+            );
+            return Err(ConnectReject {
+                status: StatusCode::BAD_REQUEST,
+                msg: "Invalid CONNECT address",
+            });
+        }
     };
 
     // Fail-open, unlike the mirror ACL below: an empty list narrows nothing.
@@ -120,13 +161,17 @@ pub(crate) fn validate_connect_target(
         });
     }
 
-    // Fail-closed: an empty list permits nothing (see the module doc).
+    // Fail-closed: an empty list permits nothing (see the module doc). The
+    // list is sorted at config load by the same `Ord` searched here.
     if config
         .https_tunnel_allowed_mirrors
-        .binary_search_by(|d| str::cmp(d, host.as_str()))
+        .binary_search(&host)
         .is_err()
     {
-        info!("Rejecting https tunnel request for client {client} due to disallowed host {host}");
+        info!(
+            "Rejecting https tunnel request for client {client} due to disallowed host {}",
+            host.format_authority(None)
+        );
         metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
         client_trouble::record(client, Trouble::Unauthorized);
         return Err(ConnectReject {
@@ -135,7 +180,7 @@ pub(crate) fn validate_connect_target(
         });
     }
 
-    Ok((host, port))
+    Ok(TunnelTarget { host, port })
 }
 
 /// Why [`copy_bidirectional_idle`] stopped relaying.
@@ -217,8 +262,7 @@ where
 pub(crate) fn report_tunnel_outcome(
     outcome: &TunnelOutcome,
     client: &ClientInfo,
-    host: &str,
-    port: NonZero<u16>,
+    target: &TunnelTarget,
     elapsed: Duration,
 ) {
     let TunnelOutcome {
@@ -231,7 +275,7 @@ pub(crate) fn report_tunnel_outcome(
     match end {
         Ok(()) => {
             info!(
-                "Tunneled client {client} wrote {} and received {} from {host}:{port} in {}",
+                "Tunneled client {client} wrote {} and received {} from {target} in {}",
                 HumanFmt::Size(*from_client),
                 HumanFmt::Size(*from_server),
                 HumanFmt::Time(elapsed)
@@ -240,7 +284,7 @@ pub(crate) fn report_tunnel_outcome(
         Err(TunnelCopyError::Idle(idle)) => {
             metrics::TUNNEL_IDLE_CLOSED.increment();
             info!(
-                "Closing idle tunnel for client {client} to {host}:{port} after {} without traffic (client_idle_timeout)",
+                "Closing idle tunnel for client {client} to {target} after {} without traffic (client_idle_timeout)",
                 HumanFmt::Time(*idle)
             );
         }
@@ -250,17 +294,17 @@ pub(crate) fn report_tunnel_outcome(
             // network condition, not a code error; log at info.
             if err.kind() == ErrorKind::TimedOut {
                 info!(
-                    "Tunnel for client {client} to {host}:{port} timed out:  {}",
+                    "Tunnel for client {client} to {target} timed out:  {}",
                     ErrorReport(err)
                 );
             } else if is_peer_disconnect(err) {
                 info!(
-                    "Tunnel for client {client} to {host}:{port} closed by peer:  {}",
+                    "Tunnel for client {client} to {target} closed by peer:  {}",
                     ErrorReport(err)
                 );
             } else {
                 error!(
-                    "Failed to tunnel the connection for client {client} to {host}:{port}; closing the tunnel:  {}",
+                    "Failed to tunnel the connection for client {client} to {target}; closing the tunnel:  {}",
                     ErrorReport(err)
                 );
             }
@@ -348,5 +392,75 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTracked<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::local_client;
+
+    fn tunnel_config(allowed: &[&str]) -> Config {
+        let mut mirrors: Vec<DomainName> = allowed
+            .iter()
+            .map(|host| DomainName::new(host).expect("valid host"))
+            .collect();
+        mirrors.sort_unstable();
+        let mut config = Config::default();
+        config.https_tunnel_enabled = true;
+        config.https_tunnel_allowed_mirrors = mirrors;
+        config.https_tunnel_allowed_ports = Vec::new();
+        config
+    }
+
+    fn validate(config: &Config, target: &str) -> Result<TunnelTarget, StatusCode> {
+        let uri: Uri = target.parse().expect("authority-form URI");
+        validate_connect_target(config, &local_client(), &uri).map_err(|reject| reject.status)
+    }
+
+    /// An IPv6 target arrives bracketed, matches the listed address in any
+    /// spelling, is dialled bare and logged in authority form.
+    #[test]
+    fn an_ipv6_target_matches_its_listed_address() {
+        let config = tunnel_config(&["2001:db8::1", "deb.debian.org"]);
+        for spelling in ["[2001:db8::1]:443", "[2001:DB8:0::1]:443"] {
+            let target = validate(&config, spelling).expect("permitted");
+            assert_eq!(target.dial_addr(), ("2001:db8::1", 443), "{spelling}");
+            assert_eq!(target.to_string(), "[2001:db8::1]:443", "{spelling}");
+        }
+        assert_eq!(
+            validate(&config, "DEB.Debian.ORG:443")
+                .expect("permitted")
+                .to_string(),
+            "deb.debian.org:443"
+        );
+        assert_eq!(
+            validate(&config, "[2001:db8::2]:443").err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn a_zone_identifier_target_is_a_bad_request() {
+        let config = tunnel_config(&["fe80::1"]);
+        assert_eq!(
+            validate(&config, "[fe80::1%25eth0]:443").err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn a_connect_target_requires_a_valid_nonzero_port() {
+        let config = tunnel_config(&["::1", "deb.debian.org"]);
+        for host in ["[::1]", "deb.debian.org"] {
+            for port in ["", "0", "65536", "nonsense", "+443"] {
+                let target = format!("{host}:{port}");
+                assert_eq!(
+                    validate(&config, &target).err(),
+                    Some(StatusCode::BAD_REQUEST),
+                    "{target}"
+                );
+            }
+        }
     }
 }

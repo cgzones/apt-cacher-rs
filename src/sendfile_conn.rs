@@ -18,7 +18,6 @@
 
 use std::{
     io::ErrorKind,
-    num::NonZero,
     os::{fd::AsFd as _, unix::fs::MetadataExt as _},
     path::Path,
     sync::Arc,
@@ -65,7 +64,8 @@ use crate::{
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
     connect_tunnel::{
-        ConnectReject, copy_bidirectional_idle, report_tunnel_outcome, validate_connect_target,
+        ConnectReject, TunnelTarget, copy_bidirectional_idle, report_tunnel_outcome,
+        validate_connect_target,
     },
     content_type::content_type_for_cached_file,
     database_task::{DatabaseCommand, send_db_command},
@@ -190,8 +190,7 @@ pub(crate) enum ZeroCopyResult {
     /// [`run_connect_tunnel`], which sends `200` and relays bytes bidirectionally.
     /// The guards are held for the tunnel's lifetime.
     Tunnel {
-        host: String,
-        port: NonZero<u16>,
+        target: TunnelTarget,
         tunnel_guard: Option<tunnel_limiter::TunnelGuard>,
         active_guard: tunnel_limiter::ActiveTunnelGuard,
     },
@@ -436,8 +435,7 @@ pub(crate) async fn handle_sendfile_connection(
                 }
             }
             ZeroCopyResult::Tunnel {
-                host,
-                port,
+                target,
                 tunnel_guard,
                 active_guard,
             } => {
@@ -448,8 +446,7 @@ pub(crate) async fn handle_sendfile_connection(
                     next_header_index,
                     conn_version,
                     client,
-                    host,
-                    port,
+                    target,
                     tunnel_guard,
                     active_guard,
                 )
@@ -811,8 +808,8 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
         }
     };
 
-    let (host, port) = match validate_connect_target(config, &client, &uri) {
-        Ok(hp) => hp,
+    let target = match validate_connect_target(config, &client, &uri) {
+        Ok(target) => target,
         Err(ConnectReject { status, msg }) => {
             return ZeroCopyResult::Rejection {
                 status,
@@ -846,8 +843,7 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
     let active_guard = tunnel_limiter::ActiveTunnelGuard::new();
 
     ZeroCopyResult::Tunnel {
-        host,
-        port,
+        target,
         tunnel_guard,
         active_guard,
     }
@@ -905,8 +901,7 @@ async fn run_connect_tunnel(
     next_header_index: usize,
     conn_version: ConnectionVersion,
     client: ClientInfo,
-    host: String,
-    port: NonZero<u16>,
+    target: TunnelTarget,
     tunnel_guard: Option<tunnel_limiter::TunnelGuard>,
     active_guard: tunnel_limiter::ActiveTunnelGuard,
 ) {
@@ -921,7 +916,7 @@ async fn run_connect_tunnel(
     // connect surface as a real 502 (see the fn doc-comment).
     let mut upstream = match tokio::time::timeout(
         config.http_timeout,
-        TcpStream::connect((host.as_str(), port.get())),
+        TcpStream::connect(target.dial_addr()),
     )
     .await
     {
@@ -929,7 +924,7 @@ async fn run_connect_tunnel(
         Ok(Err(err)) => {
             metrics::TUNNEL_TRANSFER_FAILED.increment();
             warn_once_or_info!(
-                "Failed to connect the tunnel to {host}:{port} for client {client}; returning 502:  {}",
+                "Failed to connect the tunnel to {target} for client {client}; returning 502:  {}",
                 ErrorReport(&err)
             );
             write_tunnel_upstream_error(&stream, conn_version, client).await;
@@ -939,7 +934,7 @@ async fn run_connect_tunnel(
             metrics::HTTP_TIMEOUT_UPSTREAM_CONNECT.increment();
             metrics::TUNNEL_TRANSFER_FAILED.increment();
             info!(
-                "Tunnel connect to {host}:{port} for client {client} timed out after {}; returning 502",
+                "Tunnel connect to {target} for client {client} timed out after {}; returning 502",
                 HumanFmt::Time(config.http_timeout)
             );
             write_tunnel_upstream_error(&stream, conn_version, client).await;
@@ -953,7 +948,7 @@ async fn run_connect_tunnel(
         && let Err(err) = upstream.set_nodelay(true)
     {
         warn_once_or_debug!(
-            "Failed to set TCP_NODELAY on the upstream tunnel to {host}:{port}; continuing with Nagle enabled:  {}",
+            "Failed to set TCP_NODELAY on the upstream tunnel to {target}; continuing with Nagle enabled:  {}",
             ErrorReport(&err)
         );
     }
@@ -982,7 +977,7 @@ async fn run_connect_tunnel(
         return;
     }
 
-    info!("Using uncached tunnel for client {client} to {host}:{port}");
+    info!("Using uncached tunnel for client {client} to {target}");
 
     // Flush any client bytes already buffered past the CONNECT header (a
     // pipelined TLS ClientHello); dropping them would stall the handshake.
@@ -992,7 +987,7 @@ async fn run_connect_tunnel(
     {
         metrics::TUNNEL_TRANSFER_FAILED.increment();
         warn_once_or_info!(
-            "Failed to forward buffered tunnel bytes to {host}:{port} for client {client}; closing the tunnel:  {}",
+            "Failed to forward buffered tunnel bytes to {target} for client {client}; closing the tunnel:  {}",
             ErrorReport(&err)
         );
         return;
@@ -1008,7 +1003,7 @@ async fn run_connect_tunnel(
     .await;
     // The pipelined bytes crossed the tunnel too, ahead of the relay.
     outcome.from_client += pipelined.len() as u64;
-    report_tunnel_outcome(&outcome, &client, &host, port, start.elapsed());
+    report_tunnel_outcome(&outcome, &client, &target, start.elapsed());
 }
 
 /// Try to serve a request using sendfile(2).

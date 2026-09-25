@@ -53,7 +53,8 @@ use crate::{
     client_trouble::{self, Trouble},
     config::ClientHost,
     connect_tunnel::{
-        ConnectReject, copy_bidirectional_idle, report_tunnel_outcome, validate_connect_target,
+        ConnectReject, TunnelTarget, copy_bidirectional_idle, report_tunnel_outcome,
+        validate_connect_target,
     },
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
     database_task::{DatabaseCommand, DbCmdTransfer, TransferKind, send_db_command},
@@ -2604,13 +2605,12 @@ async fn serve_new_file_worker(
     ))
 }
 
-/// Create a TCP connection to host:port, build a tunnel between the connection and
+/// Create a TCP connection to `target`, build a tunnel between the connection and
 /// the upgraded connection.
 async fn tunnel(
     client: ClientInfo,
     upgraded: hyper::upgrade::Upgraded,
-    host: &str,
-    port: NonZero<u16>,
+    target: &TunnelTarget,
 ) -> std::io::Result<()> {
     let start = PreciseInstant::now();
     let config = global_config();
@@ -2618,7 +2618,7 @@ async fn tunnel(
     /* Connect to remote server */
     let mut server = match tokio::time::timeout(
         config.http_timeout,
-        tokio::net::TcpStream::connect((host, port.get())),
+        tokio::net::TcpStream::connect(target.dial_addr()),
     )
     .await
     {
@@ -2640,7 +2640,7 @@ async fn tunnel(
         && let Err(err) = server.set_nodelay(true)
     {
         warn_once_or_debug!(
-            "Failed to set TCP_NODELAY on the upstream tunnel to {host}:{port}; continuing with Nagle enabled:  {}",
+            "Failed to set TCP_NODELAY on the upstream tunnel to {target}; continuing with Nagle enabled:  {}",
             ErrorReport(&err)
         );
     }
@@ -2655,7 +2655,7 @@ async fn tunnel(
         config.client_idle_timeout,
     )
     .await;
-    report_tunnel_outcome(&outcome, &client, host, port, start.elapsed());
+    report_tunnel_outcome(&outcome, &client, target, start.elapsed());
 
     Ok(())
 }
@@ -2766,8 +2766,8 @@ fn connect_response(
     // Every refusal below closes the connection, as sendfile's
     // `handle_connect` does: a refused client gets no keep-alive connection
     // to probe further targets on.
-    let (host, port) = match validate_connect_target(config, &client, req.uri()) {
-        Ok(hp) => hp,
+    let target = match validate_connect_target(config, &client, req.uri()) {
+        Ok(target) => target,
         Err(ConnectReject { status, msg }) => return quick_response_closing(status, msg),
     };
 
@@ -2795,7 +2795,7 @@ fn connect_response(
     let active_tunnel_guard = tunnel_limiter::ActiveTunnelGuard::new();
 
     metrics::TUNNEL_CONNECTS_TOTAL.increment();
-    info!("Using uncached tunnel for client {client} to {host}:{port}");
+    info!("Using uncached tunnel for client {client} to {target}");
 
     tokio::task::spawn(async move {
         let _tunnel_guard = tunnel_guard;
@@ -2805,16 +2805,16 @@ fn connect_response(
             Ok(upgraded) => {
                 // The relay outcome is reported inside `tunnel`; only the
                 // upstream connect can still fail here.
-                if let Err(err) = tunnel(client, upgraded, &host, port).await {
+                if let Err(err) = tunnel(client, upgraded, &target).await {
                     metrics::TUNNEL_TRANSFER_FAILED.increment();
                     if err.kind() == std::io::ErrorKind::TimedOut {
                         info!(
-                            "Tunnel for client {client} to {host}:{port} timed out:  {}",
+                            "Tunnel for client {client} to {target} timed out:  {}",
                             ErrorReport(&err)
                         );
                     } else {
                         error!(
-                            "Failed to tunnel the connection for client {client} to {host}:{port}; closing the tunnel:  {}",
+                            "Failed to tunnel the connection for client {client} to {target}; closing the tunnel:  {}",
                             ErrorReport(&err)
                         );
                     }
@@ -2823,7 +2823,7 @@ fn connect_response(
             Err(err) => {
                 metrics::TUNNEL_TRANSFER_FAILED.increment();
                 error!(
-                    "Failed to upgrade connection for client {client} to {host}:{port}; abandoning the tunnel:  {}",
+                    "Failed to upgrade connection for client {client} to {target}; abandoning the tunnel:  {}",
                     ErrorReport(&err)
                 );
             }
