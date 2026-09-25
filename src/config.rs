@@ -119,6 +119,11 @@ pub(crate) enum HostError {
     /// where only a host belongs.
     #[error("a host must not carry a port")]
     Port,
+    /// A DNS name whose last label is numeric (`1.2.3`, `0x7f.1`,
+    /// `2130706433`): resolvers read it as an IPv4 address, so it would be
+    /// a second name for an address host.
+    #[error("a DNS name must not end in a numeric label")]
+    NumericName,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -262,15 +267,17 @@ impl DomainName {
         // At this point we've already proven there's no `:` and the string
         // is not a valid IPv4 address, so skip those branches in the
         // validator.
-        if is_valid_dns_label_string(domain) {
-            // DNS names are case-insensitive: one cache tree, mirror row and
-            // registry scope per host, whatever case the client typed.
-            Ok(Self(DomainNameInner::Dns(
-                domain.to_ascii_lowercase().into(),
-            )))
-        } else {
-            Err(HostError::Invalid)
+        if !is_valid_dns_label_string(domain) {
+            return Err(HostError::Invalid);
         }
+        if ends_in_a_number(domain) {
+            return Err(HostError::NumericName);
+        }
+        // DNS names are case-insensitive: one cache tree, mirror row and
+        // registry scope per host, whatever case the client typed.
+        Ok(Self(DomainNameInner::Dns(
+            domain.to_ascii_lowercase().into(),
+        )))
     }
 
     /// An IPv6 address without brackets. An IPv4-mapped address
@@ -1429,9 +1436,24 @@ fn is_valid_wildcard(domain: &str) -> bool {
         return false;
     };
 
-    suffix.contains('.')
-        && is_valid_dns_label_string(suffix)
-        && !suffix.split('.').all(|part| part.parse::<u8>().is_ok())
+    suffix.contains('.') && is_valid_dns_label_string(suffix) && !ends_in_a_number(suffix)
+}
+
+/// Whether a DNS label string's last label is numeric: all decimal digits,
+/// or `0x`/`0X` and hex digits (the WHATWG URL "ends in a number" rule).
+/// No top-level domain is numeric (RFC 3696 §2), and `inet_aton`-style
+/// resolvers read such a name as an IPv4 address in another notation
+/// (`2130706433`, `0x7f.1`, `127.1`, `01.2.3.4`): a second spelling of an
+/// address host, with its own cache tree and allow-list identity.
+#[must_use]
+fn ends_in_a_number(domain: &str) -> bool {
+    let last = domain.rsplit('.').next().unwrap_or(domain);
+    if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    last.strip_prefix("0x")
+        .or_else(|| last.strip_prefix("0X"))
+        .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A URI port: ASCII digits, at least one.
@@ -2446,6 +2468,40 @@ mod test {
             ("deb.debian.org:http", HostError::Invalid),
         ] {
             assert_eq!(DomainName::new(input), Err(reason), "{input}");
+        }
+    }
+
+    /// A name whose last label is numeric is an IPv4 address in another
+    /// notation to a resolver, so it is refused with its own reason; a
+    /// numeric label elsewhere, or a hex-looking one that is no number, is
+    /// an ordinary name.
+    #[test]
+    fn a_name_ending_in_a_number_is_refused() {
+        for numeric in [
+            "2130706433",
+            "1.2.3",
+            "127.1",
+            "01.2.3.4",
+            "0x7f.0.0.1",
+            "deb.0x7F",
+            "example.0x",
+            "192.168.1.256",
+        ] {
+            assert_eq!(
+                DomainName::new(numeric),
+                Err(HostError::NumericName),
+                "{numeric}"
+            );
+            assert!(ConfigDomainName::new(numeric).is_err(), "{numeric}");
+        }
+        assert!(ConfigDomainName::new("*.example.123").is_err());
+        for name in [
+            "1.example.org",
+            "deb9.debian.org",
+            "0xdeb.example",
+            "example.0xg",
+        ] {
+            assert!(DomainName::new(name).is_ok(), "{name}");
         }
     }
 
