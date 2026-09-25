@@ -48,6 +48,7 @@ use crate::{
     build_info::APP_VIA_PSEUDONYM,
     cache_layout::{self, ClassifyError, ConnectionDetails, MAX_DEBNAME_LEN},
     client_info::ClientInfo,
+    client_trouble::{self, Trouble},
     config::{Alias, CacheHost, ClientHost, Config, IpNetOrAddr, resolve_alias},
     deb_mirror::{
         Mirror, is_diff_request_path, is_unsafe_cache_path, is_unsafe_proxy_path,
@@ -256,6 +257,7 @@ pub(crate) fn preflight_method(
             if !client_permitted(acls.proxy_clients, client) {
                 warn_once_or_info!("Unauthorized proxy client {client}; returning 403");
                 metrics::AUTHZ_REJECTED_CLIENT.increment();
+                client_trouble::record(client, Trouble::Unauthorized);
                 return Err(RejectReason::UnauthorizedClient);
             }
             Ok(RequestKind::Connect)
@@ -366,6 +368,7 @@ pub(crate) fn preflight_target<'a, 'h>(
                 "Unauthorized web-interface access by client {client}; returning 403"
             );
             metrics::AUTHZ_REJECTED_WEBUI.increment();
+            client_trouble::record(client, Trouble::Unauthorized);
             return Err(RejectReason::UnauthorizedWebUi);
         }
 
@@ -380,6 +383,7 @@ pub(crate) fn preflight_target<'a, 'h>(
                 host.escape_ascii()
             );
             metrics::AUTHZ_REJECTED_WEBUI_HOST.increment();
+            client_trouble::record(client, Trouble::Unauthorized);
             return Err(RejectReason::MisdirectedWebUi);
         }
         return Ok(RequestTarget::WebUi);

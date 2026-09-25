@@ -18,6 +18,7 @@ use crate::{
     cache_metadata,
     cleanup::{CLEANUP_INTERVAL_SECS, next_cleanup_epoch},
     client_counter::{active_client_downloads, connected_clients},
+    client_trouble,
     config::HttpsUpgradeMode,
     database::{
         BandwidthWindows, ClientStatEntry, Database, MirrorStatEntry, OriginEntry, TopPackages,
@@ -271,7 +272,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         Err(err) => db_error_section("origins", err),
     };
     let client = match clients {
-        Ok(rows) => render_client_table(rows, now_epoch),
+        Ok(rows) => render_client_table(rows, &client_trouble::snapshot(), now_epoch),
         Err(err) => db_error_section("clients", err),
     };
     // Both tables come from one query, so one failure is one log line and one

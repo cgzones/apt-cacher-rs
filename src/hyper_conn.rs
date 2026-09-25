@@ -50,6 +50,7 @@ use crate::{
     cache_quota::QuotaExceeded,
     channel_body::{ChannelBody, ChannelEvent},
     client_info::ClientInfo,
+    client_trouble::{self, Trouble},
     config::ClientHost,
     connect_tunnel::{
         ConnectReject, copy_bidirectional_idle, report_tunnel_outcome, validate_connect_target,
@@ -2740,6 +2741,7 @@ fn connect_response(
                      concurrent connection limit ({max}) reached"
             );
             metrics::TUNNEL_REJECTED_CAPACITY.increment();
+            client_trouble::record(&client, Trouble::CapRefused);
             return quick_response_closing(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many concurrent HTTPS tunnel connections",

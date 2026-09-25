@@ -51,8 +51,8 @@ use crate::sendfile_conn::{
     wait_readable_rated, wait_writable_rated,
 };
 use crate::{
-    Never, active_downloads::ActiveDownloadStatus, client_counter, global_config, metrics,
-    static_assert, sticky, warn_once_or_debug, warn_once_or_info,
+    Never, active_downloads::ActiveDownloadStatus, client_counter, client_info::ClientInfo,
+    global_config, metrics, static_assert, sticky, warn_once_or_debug, warn_once_or_info,
 };
 
 use super::upstream::UpstreamConn;
@@ -236,8 +236,9 @@ fn internal_io(err: std::io::Error) -> DownloadFailure {
 /// end ([`ClientEnd`]).
 #[derive(Clone)]
 pub(super) enum BodyClient<'a> {
-    /// The connection's client, still receiving.
-    Attached(&'a TcpStream),
+    /// The connection's client, still receiving, and who it is (a
+    /// client-side failure counts against it, `client_trouble`).
+    Attached(&'a TcpStream, ClientInfo),
     /// There never was one: the parallel-hack nudge answered the request
     /// and the download runs detached.
     Absent,
@@ -253,7 +254,7 @@ impl BodyClient<'_> {
     /// was in the prefix): whatever this client was, it still is.
     pub(super) fn settled(self) -> ClientEnd {
         match self {
-            Self::Attached(_) => ClientEnd::Served,
+            Self::Attached(_, _) => ClientEnd::Served,
             Self::Absent => ClientEnd::Absent,
             Self::Aborted(failure) => ClientEnd::Aborted(failure),
         }
@@ -634,6 +635,10 @@ pub(super) struct BodyTransfer<'a> {
     client_remaining: u64,
     range_filter: &'a SpliceRangeFilter,
     cache_path: &'a Path,
+    /// Who the delivery is for: a client-side failure counts against it
+    /// (`client_trouble`), here and in a demoted file-serve task. `None`
+    /// for a client-less transfer.
+    peer: Option<ClientInfo>,
 }
 
 /// What a body loop hands back to `splice_proxy_drive`.
@@ -664,14 +669,15 @@ impl<'a> BodyTransfer<'a> {
         // body prefix and we still need to count it. A transfer that ships
         // no bytes to any client has nothing to account for and must not
         // bump `ACTIVE_CLIENT_DOWNLOADS`.
-        let (counter, client_rate_checker, client_status) = match client {
-            BodyClient::Attached(stream) => (
+        let (counter, client_rate_checker, client_status, peer) = match client {
+            BodyClient::Attached(stream, peer) => (
                 Some(client_counter::ClientDownload::new()),
                 RateChecker::from_config(config),
                 ClientStatus::Active(stream),
+                Some(peer),
             ),
-            BodyClient::Absent => (None, None, ClientStatus::Absent),
-            BodyClient::Aborted(failure) => (None, None, ClientStatus::Aborted(failure)),
+            BodyClient::Absent => (None, None, ClientStatus::Absent, None),
+            BodyClient::Aborted(failure) => (None, None, ClientStatus::Aborted(failure), None),
         };
 
         Self {
@@ -687,6 +693,7 @@ impl<'a> BodyTransfer<'a> {
             client_remaining: range_filter.send,
             range_filter,
             cache_path,
+            peer,
         }
     }
 
@@ -808,7 +815,7 @@ impl<'a> BodyTransfer<'a> {
     fn conclude_delivery(&self, failure: DeliveryFailure) -> ReportedDelivery {
         let client_total = self.range_filter.send;
         let client_sent = client_total - self.client_remaining;
-        failure.conclude(format_args!(
+        failure.conclude(self.peer.as_ref(), format_args!(
             "splice proxy: delivery of `{}` stopped after {} of the {} streamed past the body prefix; continuing cache-only",
             self.cache_path.display(),
             HumanFmt::Size(client_sent),
@@ -859,7 +866,7 @@ impl<'a> BodyTransfer<'a> {
             Arc::clone(self.barrier.status()),
         );
         match prepared {
-            Ok(prepared) => self.client_status = ClientStatus::Demoted(prepared.spawn()),
+            Ok(prepared) => self.client_status = ClientStatus::Demoted(prepared.spawn(self.peer)),
             Err(err) => {
                 self.abort_client(InternalError::io("prepare demoted delivery", err).into());
             }
@@ -907,6 +914,7 @@ impl<'a> BodyTransfer<'a> {
             client_remaining,
             range_filter,
             cache_path: _,
+            peer: _,
         } = self;
         debug_assert_eq!(
             remaining, 0,
@@ -1599,16 +1607,9 @@ struct PreparedFileServe {
 }
 
 impl PreparedFileServe {
-    fn spawn(self) -> DemotedDelivery {
-        tokio::task::spawn(serve_remaining_from_file(
-            self.client,
-            self.file,
-            self.cache_path,
-            self.content_start,
-            self.content_length,
-            self.receiver,
-            self.status,
-        ))
+    /// `peer` is who the demoted delivery is for (see `BodyTransfer::peer`).
+    fn spawn(self, peer: Option<ClientInfo>) -> DemotedDelivery {
+        tokio::task::spawn(serve_remaining_from_file(self, peer))
     }
 }
 
@@ -1622,14 +1623,18 @@ impl PreparedFileServe {
 /// flow through `BYTES_SERVED_SENDFILE` (incremented inside
 /// `sendfile_chunk_loop`).
 async fn serve_remaining_from_file(
-    client: TcpStream,
-    file: tokio::fs::File,
-    cache_path: PathBuf,
-    content_start: u64,
-    content_length: u64,
-    receiver: tokio::sync::watch::Receiver<()>,
-    status: Arc<tokio::sync::RwLock<ActiveDownloadStatus>>,
+    prepared: PreparedFileServe,
+    peer: Option<ClientInfo>,
 ) -> TransferOutcome<ReportedDelivery> {
+    let PreparedFileServe {
+        client,
+        file,
+        cache_path,
+        content_start,
+        content_length,
+        receiver,
+        status,
+    } = prepared;
     debug!(
         "splice proxy: starting to serve remaining bytes of `{}` from the cache file for the demoted client at offset {content_start} ({content_length} bytes remaining)",
         cache_path.display()
@@ -1664,7 +1669,7 @@ async fn serve_remaining_from_file(
             // The connection task still owns the original descriptor while
             // it fills the cache. Dropping this task's dup alone sends no FIN.
             shutdown_client_write(&client);
-            DeliveryEnd::Aborted(failure.conclude(format_args!(
+            DeliveryEnd::Aborted(failure.conclude(peer.as_ref(), format_args!(
                 "splice proxy: demoted client delivery of `{}` stopped at cache offset {}; the client did not get the full body",
                 cache_path.display(),
                 content_start + transferred,
@@ -2364,6 +2369,7 @@ async fn drain_pipe_to_file(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::local_client;
     use std::{
         os::fd::AsRawFd as _,
         task::{Context, Waker},
@@ -2396,7 +2402,7 @@ mod tests {
         assert!(matches!(failure, DeliveryFailure::Internal(_)));
         assert!(!failure.is_peer_disconnect());
         let before = metrics::CLIENT_DISCONNECTED_MID_BODY.get();
-        let _reported = failure.conclude(format_args!("zero-length client splice"));
+        let _reported = failure.conclude(None, format_args!("zero-length client splice"));
         assert_eq!(metrics::CLIENT_DISCONNECTED_MID_BODY.get(), before);
     }
 
@@ -2720,7 +2726,7 @@ mod tests {
         let active = ActiveDownloads::new();
         let mirror = crate::test_support::structured_mirror("writer.test", "/debian");
         let details = ConnectionDetails {
-            client: crate::test_support::local_client(),
+            client: local_client(),
             request_received_at: crate::precise_instant::PreciseInstant::now(),
             upstream_host: mirror.host().clone(),
             mirror,
@@ -2857,7 +2863,7 @@ mod tests {
         config.rate_check_timeframe = nonzero!(1);
         let filter = SpliceRangeFilter { skip: 0, send: 1 };
         let mut xfer = BodyTransfer::new(
-            BodyClient::Attached(&client),
+            BodyClient::Attached(&client, local_client()),
             &mut writer,
             &mut barrier,
             &filter,

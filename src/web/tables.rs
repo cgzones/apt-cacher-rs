@@ -16,6 +16,7 @@ use tracing::error;
 use crate::{
     cache_paths::{CachePaths, SUBDIR_FLAT_BYHASH},
     cache_walk::{AnomalyLevel, DirFailure, EntryKind, OnMissing, WalkContext, Walker},
+    client_trouble::ClientTrouble,
     database::{ClientStatEntry, MirrorStatEntry, OriginEntry, TopPackageEntry},
     deb_mirror::is_deb_package,
     error::ErrorReport,
@@ -606,27 +607,58 @@ pub(super) fn render_origin_table(origins: &[OriginEntry], now_epoch: i64) -> Se
     }
 }
 
-/// See [`render_origin_table`] on why the rows are borrowed.
-pub(super) fn render_client_table(clients: &[ClientStatEntry], now_epoch: i64) -> Section {
-    if clients.is_empty() {
+/// The Clients table's trouble columns: in-memory counts since the daemon
+/// started for the heaviest offenders (`client_trouble`), unlike the
+/// persisted columns beside them, hence the scope chip.
+const CLIENT_TROUBLE_HEADERS: [&str; 4] = [
+    "<span title=\"Deliveries aborted because this client read below min_download_rate over rate_check_timeframe, or stalled a body write for http_timeout.\">Slow / Timed Out</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Deliveries this client hung up on before the body was complete.\">Disconnects</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Connections refused by max_connections_per_client_ip and CONNECT tunnels refused by https_tunnel_max_connections_per_client.\">Cap Refusals</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Connections and requests refused by allowed_proxy_clients, allowed_webif_clients, webif_hostnames, allowed_mirrors or https_tunnel_allowed_mirrors.\">Refused (ACL)</span> <span class=\"scope\">since start</span>",
+];
+
+/// See [`render_origin_table`] on why the rows are borrowed. `trouble` is
+/// the heavy-hitter snapshot; a tracked client without a persisted row (one
+/// that was only ever refused, say) is appended with N/A in the persisted
+/// columns.
+pub(super) fn render_client_table(
+    clients: &[ClientStatEntry],
+    trouble: &[ClientTrouble],
+    now_epoch: i64,
+) -> Section {
+    if clients.is_empty() && trouble.is_empty() {
         return Section::EMPTY;
     }
 
     let mut sorted: Vec<&ClientStatEntry> = clients.iter().collect();
     sorted.sort_unstable_by_key(|c| Reverse(c.last_seen));
 
-    let rows = sorted.len();
     let mut table = Table::new(&[
         "IP",
         "Last Seen",
         "Upstream Fetched",
         "Served to Client",
         "Requests",
+        CLIENT_TROUBLE_HEADERS[0],
+        CLIENT_TROUBLE_HEADERS[1],
+        CLIENT_TROUBLE_HEADERS[2],
+        CLIENT_TROUBLE_HEADERS[3],
     ]);
 
-    for client in sorted {
+    let warn = |value| Nonzero {
+        value,
+        level: Level::Warn,
+    };
+    let mut unmatched: Vec<&ClientTrouble> = trouble.iter().collect();
+    for client in &sorted {
         let downloaded = as_size(client.total_downloaded);
         let delivered = as_size(client.total_delivered);
+        let counts = trouble
+            .iter()
+            .find(|t| t.ip == client.client_ip)
+            .copied()
+            .unwrap_or_else(|| ClientTrouble::none(client.client_ip));
+        unmatched.retain(|t| t.ip != client.client_ip);
         tr!(
             marked Freshness::of(client.last_seen, now_epoch).row_class(),
             table,
@@ -638,12 +670,31 @@ pub(super) fn render_client_table(clients: &[ClientStatEntry], now_epoch: i64) -
             HumanFmt::Size(downloaded),
             HumanFmt::Size(delivered),
             client.request_count,
+            warn(counts.slow),
+            counts.disconnect,
+            warn(counts.cap_refused),
+            warn(counts.unauthorized),
+        );
+    }
+    // Heaviest first, as the snapshot came.
+    for counts in &unmatched {
+        tr!(
+            table,
+            counts.ip,
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            warn(counts.slow),
+            counts.disconnect,
+            warn(counts.cap_refused),
+            warn(counts.unauthorized),
         );
     }
 
     Section {
         html: table.finish(),
-        rows,
+        rows: sorted.len() + unmatched.len(),
     }
 }
 

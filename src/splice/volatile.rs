@@ -277,7 +277,7 @@ fn conclude_write(
     phase: &'static str,
     failure: impl EndsDelivery,
 ) -> ReportedDelivery {
-    failure.conclude(format_args!(
+    failure.conclude(Some(&conn_details.client), format_args!(
         "splice proxy: failed to write {phase} to client {} for {} from mirror {}; closing the connection",
         conn_details.client, conn_details.debname, conn_details.mirror,
     ))

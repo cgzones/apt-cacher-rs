@@ -44,6 +44,7 @@ use crate::{
     },
     client_counter,
     client_info::ClientInfo,
+    client_trouble::{self, Trouble},
     database::Database,
     database_task::{self, db_loop},
     deb_mirror,
@@ -636,6 +637,7 @@ pub(crate) async fn main_loop(
         // head.
         if !ClientAcls::new(config, global_webif_hosts()).admits(&client) {
             metrics::CONNECTION_REJECTED_ACL.increment();
+            client_trouble::record(&client, Trouble::Unauthorized);
             // Unlike the per-request authorization refusals, repeats drop to
             // debug: nothing but the connect reaches the daemon, so a connect
             // flood would be one info line per connection, and the counter

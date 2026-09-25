@@ -1164,7 +1164,7 @@ fn lost_prefix_client(
     // cache-only: release the peer now instead of leaving it waiting for the
     // promised length until the connection task drops the socket.
     shutdown_client_write(client);
-    BodyClient::Aborted(failure.conclude(format_args!(
+    BodyClient::Aborted(failure.conclude(Some(&conn_details.client), format_args!(
         "splice proxy: failed to write {phase} to client {} for {} from mirror {}; continuing cache-only",
         conn_details.client, conn_details.debname, conn_details.mirror,
     )))
@@ -1181,7 +1181,7 @@ async fn send_resumed_prefix<'a>(
     range_plan: &ServeParams,
     resume_offset: u64,
 ) -> (BodyClient<'a>, u64) {
-    let BodyClient::Attached(client_stream) = client else {
+    let BodyClient::Attached(client_stream, _peer) = client else {
         return (client, 0);
     };
     let send_start = range_plan.content_start.min(resume_offset);
@@ -1203,7 +1203,7 @@ async fn send_resumed_prefix<'a>(
             let failure: DeliveryFailure =
                 CacheError::counted_io("reopen resumed prefix", temppath, err).into();
             shutdown_client_write(client_stream);
-            let reported = failure.conclude(format_args!(
+            let reported = failure.conclude(Some(&conn_details.client), format_args!(
                 "splice proxy: failed to reopen partial file for the resumed prefix of {} from mirror {}; continuing cache-only",
                 conn_details.debname, conn_details.mirror,
             ));
@@ -1315,7 +1315,7 @@ async fn write_body_prefix<'a>(
     let target = write_body_prefix_to_cache(target, body_prefix, Consequence::CloseConnection)
         .await
         .map_err(SpliceProxyError::ReportedAfterHeader)?;
-    let BodyClient::Attached(client_stream) = client else {
+    let BodyClient::Attached(client_stream, _peer) = client else {
         return Ok((target, client));
     };
     let client_slice = range_slice(
@@ -1803,7 +1803,7 @@ async fn splice_proxy_drive(
     {
         Ok(first) => {
             rates.t_client_first = first;
-            BodyClient::Attached(client.stream)
+            BodyClient::Attached(client.stream, conn_details.client)
         }
         Err(err) => lost_prefix_client(conn_details, client.stream, head_phase, err),
     };

@@ -63,6 +63,7 @@ use crate::{
     cache_metadata::{self},
     client_counter,
     client_info::ClientInfo,
+    client_trouble::{self, Trouble},
     connect_tunnel::{
         ConnectReject, copy_bidirectional_idle, report_tunnel_outcome, validate_connect_target,
     },
@@ -828,6 +829,7 @@ fn handle_connect(client: ClientInfo, target: &str) -> ZeroCopyResult {
                  concurrent connection limit ({max}) reached"
             );
             metrics::TUNNEL_REJECTED_CAPACITY.increment();
+            client_trouble::record(&client, Trouble::CapRefused);
             return ZeroCopyResult::Rejection {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 conn_action: ConnectionAction::Close,
@@ -1208,6 +1210,7 @@ async fn try_sendfile_request(
                     Ok(conn_action) => ZeroCopyResult::Served(conn_action),
                     Err(err) => splice_error_outcome(
                         err,
+                        &client,
                         "simple proxy",
                         format_args!("{uri_path} from host {}", mirror.format_authority()),
                     ),
@@ -1441,6 +1444,7 @@ async fn try_sendfile_request(
             }
             Err(err) => splice_error_outcome(
                 err,
+                &client,
                 "splice proxy",
                 format_args!(
                     "{} from mirror {}{}",
@@ -1481,6 +1485,7 @@ async fn try_sendfile_request(
 #[cfg(feature = "splice")]
 fn splice_error_outcome(
     err: SpliceProxyError,
+    client: &ClientInfo,
     prefix: &str,
     subject: std::fmt::Arguments<'_>,
 ) -> ZeroCopyResult {
@@ -1494,13 +1499,16 @@ fn splice_error_outcome(
         SpliceProxyError::Client { phase, err } => {
             // A header or error-response write: its type counts nothing, so
             // `CLIENT_DISCONNECTED_MID_BODY` keeps its mid-body scope.
-            let _reported = err.conclude(format_args!(
-                "{prefix}: client error writing {phase} for {subject}; closing the connection"
-            ));
+            let _reported = err.conclude(
+                Some(client),
+                format_args!(
+                    "{prefix}: client error writing {phase} for {subject}; closing the connection"
+                ),
+            );
             ZeroCopyResult::ClientError
         }
         SpliceProxyError::AfterHeader { phase, failure } => {
-            let _reported = failure.conclude(format_args!(
+            let _reported = failure.conclude(Some(client), format_args!(
                 "{prefix}: response delivery stopped in {phase} for {subject}; closing the connection"
             ));
             ZeroCopyResult::AfterHeaderError

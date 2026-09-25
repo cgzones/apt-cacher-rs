@@ -252,7 +252,7 @@ impl<B: Body<Error = DeliveryFailure>> PinnedDrop for AccountedBody<B> {
                         rate_log::client_segment(transferred, elapsed),
                     );
                 } else {
-                    let _reported = error.unwrap_or(DeliveryFailure::Cancelled).conclude(format_args!(
+                    let _reported = error.unwrap_or(DeliveryFailure::Cancelled).conclude(Some(&client), format_args!(
                         "simple proxy: aborted passthrough of {path} from host {host} for client {client} in {} ({})",
                         HumanFmt::Time(in_time),
                         rate_log::client_abort_segment(transferred, elapsed),

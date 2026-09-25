@@ -186,7 +186,7 @@ pub(crate) fn finish_cached_serve(
     } else {
         rate_log::client_abort_segment(transferred, elapsed)
     };
-    let _reported = abort.conclude(format_args!(
+    let _reported = abort.conclude(Some(&cd.client), format_args!(
         "Aborted serving {what} {volatile}file {} from mirror {}{aliased} for {who} {} in {} via {via} ({segment})",
         cd.debname,
         cd.mirror,

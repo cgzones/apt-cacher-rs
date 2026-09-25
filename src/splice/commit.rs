@@ -240,7 +240,7 @@ async fn receive_client_report(
         rates.t_client_done = PreciseInstant::now();
         ClientReport {
             rates,
-            client: CompletionClient::Aborted(DeliveryFailure::Cancelled.conclude(format_args!(
+            client: CompletionClient::Aborted(DeliveryFailure::Cancelled.conclude(None, format_args!(
                 "splice proxy: the connection was cancelled before settling its client; reporting the delivery as lost"
             ))),
         }
@@ -388,7 +388,7 @@ async fn await_demoted_client(
             end
         }
         Err(err) if err.is_cancelled() => {
-            DeliveryEnd::Aborted(DeliveryFailure::Cancelled.conclude(format_args!(
+            DeliveryEnd::Aborted(DeliveryFailure::Cancelled.conclude(None, format_args!(
                 "splice proxy: demoted client file-serve task was cancelled; closing the connection"
             )))
         }
@@ -397,7 +397,7 @@ async fn await_demoted_client(
                 "demoted client file-serve task panicked",
                 err,
             ))
-            .conclude(format_args!(
+            .conclude(None, format_args!(
                 "splice proxy: demoted client file-serve task panicked; treating the delivery as failed and closing the connection"
             )),
         ),
@@ -577,7 +577,7 @@ mod tests {
     }
 
     fn cancelled() -> ReportedDelivery {
-        DeliveryFailure::Cancelled.conclude(format_args!("test delivery cancelled"))
+        DeliveryFailure::Cancelled.conclude(None, format_args!("test delivery cancelled"))
     }
 
     /// The demoted task's own epilogue, `serve_remaining_from_file`,
@@ -588,7 +588,9 @@ mod tests {
     ) -> TransferOutcome<ReportedDelivery> {
         TransferOutcome {
             transferred,
-            end: DeliveryEnd::Aborted(failure.conclude(format_args!("test demoted delivery"))),
+            end: DeliveryEnd::Aborted(
+                failure.conclude(None, format_args!("test demoted delivery")),
+            ),
         }
     }
 
@@ -724,7 +726,7 @@ mod tests {
         assert_eq!(ErrorReport(observed).to_string(), expected);
         assert!(!observed.is_peer_disconnect());
         assert_eq!(rates.client_bytes_sent, 7);
-        let reported = failure.conclude(format_args!("test prefix delivery"));
+        let reported = failure.conclude(None, format_args!("test prefix delivery"));
         let outcome = settle(ClientEnd::Aborted(reported), SERVED, &mut rates).await;
         let observed = aborted_failure(&outcome);
         assert_eq!(ErrorReport(observed).to_string(), expected);

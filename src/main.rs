@@ -31,6 +31,7 @@ mod channel_body;
 mod cleanup;
 mod client_counter;
 mod client_info;
+mod client_trouble;
 mod config;
 mod connect_tunnel;
 mod content_type;

@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    client_trouble::{self, Trouble},
     metrics,
     per_ip_counter::{PerIpCounter, PerIpPermit},
 };
@@ -91,6 +92,7 @@ impl ClientCounter {
                 let Some(permit) = CONNECTIONS_PER_IP.try_acquire(client_ip, max) else {
                     CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                     metrics::CONNECTION_REJECTED_PER_IP_CAP.increment();
+                    client_trouble::record_ip(client_ip, Trouble::CapRefused);
                     return Err(ConnectionCap::PerIp(max));
                 };
                 Some(permit)

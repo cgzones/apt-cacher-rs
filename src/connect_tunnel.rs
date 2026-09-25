@@ -38,6 +38,7 @@ use tracing::{error, info};
 
 use crate::{
     client_info::ClientInfo,
+    client_trouble::{self, Trouble},
     config::Config,
     error::{ErrorReport, is_peer_disconnect},
     humanfmt::HumanFmt,
@@ -127,6 +128,7 @@ pub(crate) fn validate_connect_target(
     {
         info!("Rejecting https tunnel request for client {client} due to disallowed host {host}");
         metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.increment();
+        client_trouble::record(client, Trouble::Unauthorized);
         return Err(ConnectReject {
             status: StatusCode::FORBIDDEN,
             msg: "HTTPS tunnel target not permitted",

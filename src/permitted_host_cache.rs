@@ -4,8 +4,12 @@ use hashbrown::HashMap;
 use http::StatusCode;
 
 use crate::{
-    client_info::ClientInfo, config::ClientHost, global_config, metrics,
-    request_dispatch::client_permitted, warn_once_or_info,
+    client_info::ClientInfo,
+    client_trouble::{self, Trouble},
+    config::ClientHost,
+    global_config, metrics,
+    request_dispatch::client_permitted,
+    warn_once_or_info,
 };
 
 #[must_use]
@@ -88,13 +92,14 @@ pub(crate) fn authorize_cache_access(
             "Unauthorized proxy client {client}: not permitted by `allowed_proxy_clients`; rejecting with 403"
         );
         metrics::AUTHZ_REJECTED_CLIENT.increment();
+        client_trouble::record(client, Trouble::Unauthorized);
         return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
     }
 
     // Hot path: cache hit returns a cloned ClientHost without
     // re-validating or rescanning allowed_mirrors.
     if let Some(cached) = PERMITTED_HOST_CACHE.lookup(requested_host) {
-        return finalize_host_result(cached, requested_host);
+        return finalize_host_result(cached, requested_host, client);
     }
 
     // Miss: validate the host and check allowed_mirrors, then cache
@@ -107,12 +112,13 @@ pub(crate) fn authorize_cache_access(
         Err(_) => Err(HostReject::Unsupported),
     };
     PERMITTED_HOST_CACHE.insert(requested_host.into(), result.clone());
-    finalize_host_result(result, requested_host)
+    finalize_host_result(result, requested_host, client)
 }
 
 fn finalize_host_result(
     result: Result<ClientHost, HostReject>,
     raw_host: &str,
+    client: &ClientInfo,
 ) -> Result<ClientHost, (StatusCode, &'static str)> {
     match result {
         Ok(d) => Ok(d),
@@ -129,6 +135,7 @@ fn finalize_host_result(
                 raw_host.escape_debug()
             );
             metrics::AUTHZ_REJECTED_MIRROR.increment();
+            client_trouble::record(client, Trouble::Unauthorized);
             Err((StatusCode::FORBIDDEN, "Unauthorized host"))
         }
     }

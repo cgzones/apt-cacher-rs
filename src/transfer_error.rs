@@ -20,6 +20,8 @@ use http::StatusCode;
 #[cfg(feature = "sendfile")]
 use crate::humanfmt::HumanFmt;
 use crate::{
+    client_info::ClientInfo,
+    client_trouble::{self, Trouble},
     deb_mirror::Mirror,
     error::{ErrorReport, is_io_timed_out_in_chain, is_peer_disconnect},
     fs_open::count_cache_failure,
@@ -535,16 +537,30 @@ impl HeaderWriteFailure {
 /// logs `{context}:  {report}` at [`DeliveryFailure::severity`] and proves
 /// it. Lets a sink shared by header and body writes take either without
 /// re-deciding at runtime which of them counts.
+///
+/// `client` is the peer the delivery was for, so a client-side cause is
+/// also counted against it (`client_trouble`); `None` only where no
+/// client-side cause can reach the sink (a cancellation, a task panic).
 pub(crate) trait EndsDelivery {
-    fn conclude(self, context: fmt::Arguments<'_>) -> ReportedDelivery;
+    fn conclude(self, client: Option<&ClientInfo>, context: fmt::Arguments<'_>)
+    -> ReportedDelivery;
 }
 
 /// The one sink every owner that ends a delivery calls, once: it bumps the
 /// cause's terminal counters and logs `{context}:  {report}` at
 /// [`DeliveryFailure::severity`].
 impl EndsDelivery for DeliveryFailure {
-    fn conclude(self, context: fmt::Arguments<'_>) -> ReportedDelivery {
+    fn conclude(
+        self,
+        client: Option<&ClientInfo>,
+        context: fmt::Arguments<'_>,
+    ) -> ReportedDelivery {
         self.record_terminal();
+        if let Some(client) = client
+            && let Some(trouble) = self.client_trouble()
+        {
+            client_trouble::record(client, trouble);
+        }
         self.report(context)
     }
 }
@@ -552,7 +568,11 @@ impl EndsDelivery for DeliveryFailure {
 /// Counts nothing: a header write lost no body byte.
 #[cfg(feature = "splice")]
 impl EndsDelivery for HeaderWriteFailure {
-    fn conclude(self, context: fmt::Arguments<'_>) -> ReportedDelivery {
+    fn conclude(
+        self,
+        _client: Option<&ClientInfo>,
+        context: fmt::Arguments<'_>,
+    ) -> ReportedDelivery {
         let Self(error) = self;
         DeliveryFailure::Client(error).report(context)
     }
@@ -723,6 +743,24 @@ impl DeliveryFailure {
             }
             Self::Upstream(error) => error.record_terminal(),
             Self::Download(_) | Self::Cache(_) | Self::Internal(_) | Self::Cancelled => {}
+        }
+    }
+
+    /// What this terminal failure says about the client, for the per-client
+    /// counts: the same events `record_terminal` counts globally, plus a body
+    /// write that timed out (`HTTP_TIMEOUT_CLIENT_BODY`, counted where the
+    /// deadline fired). A header write never gets here: its type counts
+    /// nothing.
+    fn client_trouble(&self) -> Option<Trouble> {
+        match self {
+            Self::Client(error) if error.is_timeout() => Some(Trouble::Slow),
+            Self::Client(error) if error.is_peer_disconnect() => Some(Trouble::Disconnect),
+            Self::Client(_)
+            | Self::Upstream(_)
+            | Self::Download(_)
+            | Self::Cache(_)
+            | Self::Internal(_)
+            | Self::Cancelled => None,
         }
     }
 
