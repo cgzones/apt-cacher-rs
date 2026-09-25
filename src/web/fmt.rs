@@ -166,10 +166,11 @@ impl Display for Gauge {
     }
 }
 
-/// A short wall time: whole milliseconds under a second, seconds with one
-/// decimal under a minute, then a [`Span`]. A value under one millisecond,
-/// or one the clock that measured it cannot tell from zero, renders as the
-/// floor it is: `<1 ms`, or one tick of a coarser clock -- never "0 ms".
+/// A short wall time: rounded milliseconds under a second, seconds with one
+/// decimal under a minute, then a [`Span`]. A value that rounds to no
+/// millisecond, or one the clock that measured it cannot tell from zero,
+/// renders as the floor it is: `<1 ms`, or one tick of a coarser clock --
+/// never "0 ms".
 pub(super) struct Latency {
     pub(super) value: std::time::Duration,
     /// The measuring clock's resolution (see [`Self::PRECISE`]).
@@ -182,7 +183,10 @@ impl Latency {
 impl Display for Latency {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let Self { value, resolution } = *self;
-        let millis = value.as_millis();
+        // Rounded, not truncated: a coarse sample of one tick reads a hair
+        // short of it (coarsetime truncates twice), and must not render
+        // under its own floor.
+        let millis = value.as_micros().saturating_add(500) / 1000;
         if millis == 0 {
             // The tick rounded up to whole milliseconds, at least one.
             let floor = resolution.as_micros().div_ceil(1000).max(1);
@@ -1118,8 +1122,13 @@ mod tests {
             "&lt;1 ms"
         );
         assert_eq!(
-            latency(std::time::Duration::from_micros(999_999), ms(1)),
-            "999 ms"
+            latency(std::time::Duration::from_micros(998_400), ms(1)),
+            "998 ms"
+        );
+        // A coarse tick read just short of itself still reads as the tick.
+        assert_eq!(
+            latency(std::time::Duration::from_micros(3_999), ms(4)),
+            "4 ms"
         );
         assert_eq!(latency(ms(2_345), ms(1)), "2.3 s");
         assert_eq!(latency(ms(125_000), ms(1)), "2 min 5 s");

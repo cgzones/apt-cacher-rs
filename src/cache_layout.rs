@@ -1133,6 +1133,24 @@ mod tests {
     use super::*;
     use crate::{deb_mirror::parse_request_path, test_support::local_client};
 
+    /// Fails to compile for a new `ResourceKind` variant, so it cannot
+    /// escape [`ALL_KINDS`] (add it there too).
+    const fn listed_in_all_kinds(kind: ResourceKind) {
+        match kind {
+            ResourceKind::Pool
+            | ResourceKind::Release
+            | ResourceKind::ComponentRelease
+            | ResourceKind::Packages
+            | ResourceKind::Sources
+            | ResourceKind::Translation
+            | ResourceKind::Icon
+            | ResourceKind::ByHash(..)
+            | ResourceKind::FlatMetadata
+            | ResourceKind::FlatPool
+            | ResourceKind::FlatByHash(..) => {}
+        }
+    }
+
     /// Every kind, one per variant (the by-hash payloads do not matter).
     const ALL_KINDS: [ResourceKind; 11] = [
         ResourceKind::Pool,
@@ -1154,6 +1172,7 @@ mod tests {
     #[test]
     fn lookup_buckets_agree_with_flavor_and_layout() {
         for kind in ALL_KINDS {
+            listed_in_all_kinds(kind);
             // No permanent kind lives under `dists/` itself: `None` fails.
             let expected = match (kind.cached_flavor(), kind.layout()) {
                 (CachedFlavor::Volatile, _) => Some(LookupBucket::Index),

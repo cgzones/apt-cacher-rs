@@ -213,17 +213,13 @@ pub(crate) async fn invalidate_aggregates() {
 /// lifetime auto-trait inference at the spawn site.
 async fn build_mirror_fs_section(
     mirrors: &[MirrorStatEntry],
+    snapshots: &MirrorSnapshots,
     now_epoch: i64,
 ) -> (Section, DirStats, Option<u64>) {
     let config = global_config();
-    let snapshots = MirrorSnapshots {
-        health: mirror_health::snapshot(),
-        perf: mirror_perf::snapshot(),
-        indexes: mirror_indexes::snapshot(),
-    };
 
     let ((section, aggregate), free_disk_bytes) = tokio::join!(
-        build_mirror_table(mirrors, &snapshots, now_epoch, config),
+        build_mirror_table(mirrors, snapshots, now_epoch, config),
         // statvfs() can stall on slow/hung filesystems (NFS, FUSE, dying
         // disks); run it on the blocking pool so it cannot wedge the tokio
         // worker.
@@ -283,8 +279,14 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         ),
     };
 
+    // One snapshot of the in-memory per-mirror figures for both tables.
+    let snapshots = MirrorSnapshots {
+        health: mirror_health::snapshot(),
+        perf: mirror_perf::snapshot(),
+        indexes: mirror_indexes::snapshot(),
+    };
     let origin = match origins {
-        Ok(rows) => render_origin_table(rows, &mirror_indexes::snapshot(), now_epoch),
+        Ok(rows) => render_origin_table(rows, &snapshots.indexes, now_epoch),
         Err(err) => db_error_section("origins", err),
     };
     let client = match clients {
@@ -331,7 +333,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
     // `docs/perf-review-2026-09-02.md`) is the bigger lever there.
     let fs_start = Instant::now();
     let (mirror_table, aggregate_dir_stats, free_disk_bytes) =
-        build_mirror_fs_section(mirror_rows, now_epoch).await;
+        build_mirror_fs_section(mirror_rows, &snapshots, now_epoch).await;
     let fs_elapsed: std::time::Duration = fs_start.elapsed().into();
     let mirror = match mirrors {
         Ok(_rows) => mirror_table,
@@ -929,7 +931,6 @@ fn build_cache_stats_html(
     let scanned_at = metrics::ORPHANED_PARTIALS_SCANNED_AT.get();
     let orphans = t
         .entry("Orphaned Partials")
-        .kind(Kind::Live)
         .tip("Kept .partial downloads no running download holds, found by the last cache scan (at startup and after every cleanup): the resume state of downloads that failed or were abandoned, counted against disk_quota until cleanup removes them after 24 h. Warns above a tenth of disk_quota. A large figure means downloads keep dying mid-body: see Downloads Aborted and the Mirrors table for the mirror.");
     if scanned_at == 0 {
         orphans.value("no cache scan yet");

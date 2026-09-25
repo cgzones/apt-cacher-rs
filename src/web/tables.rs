@@ -366,11 +366,11 @@ mod mirror_cells {
                 }
                 SchemeVerdict::HttpFallback { reprobe_in } => write!(
                     f,
-                    "Plain HTTP: the HTTPS probe failed (no TLS or a certificate that did not verify). Fix the mirror's TLS, or list it in http_only_mirrors to stop probing; HTTPS is probed again in {}.",
+                    "Plain HTTP: the HTTPS probe failed (port 443 unreachable, no TLS, or a certificate that did not verify). Fix the mirror's TLS, or list it in http_only_mirrors to stop probing; HTTPS is probed again in {}.",
                     Age(reprobe_in.as_secs().max(1))
                 ),
                 SchemeVerdict::Undecided => f.write_str(
-                    "Not dialled since start: the next request probes HTTPS and falls back to plain HTTP (https_upgrade_mode Auto).",
+                    "No scheme decided right now (not dialled since start, or an earlier HTTP fallback expired or was evicted): the next request probes HTTPS and falls back to plain HTTP (https_upgrade_mode Auto).",
                 ),
             }
         }
@@ -592,13 +592,13 @@ const MIRROR_HEALTH_HEADERS: [&str; 4] = [
 ];
 
 /// The Mirrors table's index-age column (`mirror_indexes`).
-const MIRROR_INDEX_HEADER: &str = "<span title=\"Age of this mirror's freshest Release/InRelease when the mirror last served or confirmed it, judged by its freshest suite (a frozen release pocket beside a syncing -updates is fine). Over two weeks is a notice: the mirror has likely stopped syncing; report it to the mirror's operator or switch to another mirror. A suite served past its Valid-Until warns: apt refuses that index. Hover a cell for every suite. Needs verify_checksums, whose ingest reads the index.\">Newest Index</span> <span class=\"scope\">since start</span>";
+const MIRROR_INDEX_HEADER: &str = "<span title=\"Age of this mirror's freshest Release/InRelease when the mirror last served or confirmed it, judged by its freshest suite (a frozen release pocket beside a syncing -updates is fine). Over two weeks is a notice: the mirror has likely stopped syncing; report it to the mirror's operator or switch to another mirror (a vendor repository that rarely publishes reads this way too). A suite served past its Valid-Until warns: apt refuses that index. Hover a cell for every suite. Needs verify_checksums, whose ingest reads the index.\">Newest Index</span> <span class=\"scope\">since start</span>";
 
 /// The Mirrors table's latency and throughput columns (`mirror_perf`),
 /// in-memory figures since the daemon started like the failure counts.
 const MIRROR_PERF_HEADERS: [&str; 2] = [
     "<span title=\"From the start of the upstream attempt that answered (its TCP and TLS connect included when no pooled connection was reused) to its parsed response head, for cached fetches answered with a body or a 304: the latest, and the longest since start. Warns when the longest passed half of http_timeout: the mirror came close to timing out; compare mirrors and switch to a closer or less loaded one.\">Time to First Byte</span> <span class=\"scope\">since start</span>",
-    "<span title=\"Body bytes per second of the latest committed download of 1 MiB or more from this mirror, and the fastest since start. A lower bound while a client is attached (a download is paced to its client). Warns while the latest is under twice min_download_rate: downloads from this mirror are close to being cancelled; switch to a faster mirror, or lower min_download_rate.\">Throughput</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Body bytes per second of the latest committed download of 1 MiB or more from this mirror, and the fastest since start. A lower bound while a client is attached: splice builds pace a download to its client until it is demoted, so a slow client (see the Clients table) reads here too. Warns while the latest is under twice min_download_rate: downloads from this mirror are close to being cancelled; if no client is slow, switch to a faster mirror, or lower min_download_rate.\">Throughput</span> <span class=\"scope\">since start</span>",
 ];
 
 /// One failure-count cell of the Mirrors table.

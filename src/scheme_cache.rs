@@ -317,9 +317,11 @@ impl SchemeVerdict {
 }
 
 /// The verdict for a host from the configuration and its live cache entry.
-/// Pure, like [`decide`], whose precedence it follows: the configured HTTP
-/// cases first (a live entry cannot contradict them, as no upgrade is
-/// attempted for such a host), then the mode.
+/// Pure, like [`decide`], but the configured HTTP cases come first where
+/// `decide` puts a live entry first: the two agree because a live entry
+/// never contradicts them (no upgrade is attempted for such a host, and no
+/// scheme is recorded for one the mode fixes), and naming the option is
+/// what the dashboard needs. Then the mode.
 #[must_use]
 fn verdict(mode: HttpsUpgradeMode, is_http_only: bool, live: Option<LiveScheme>) -> SchemeVerdict {
     if is_http_only {

@@ -6,8 +6,8 @@
 //! window and render as `???B/s`. This newtype is the single blessed
 //! exception: it wraps the std clock for the handful of *per-request*
 //! measurements (request lifetime, client- and upstream-rate windows, the
-//! upstream time to first byte), each read only twice per request, where ns resolution matters and the ~15ns
-//! extra read cost is irrelevant. Hot per-frame paths (`rate_checker`,
+//! upstream time to first byte), each read only twice per request, where ns
+//! resolution matters and the ~15ns extra read cost is irrelevant. Hot per-frame paths (`rate_checker`,
 //! pool GC) stay on `coarsetime::Instant`. The module-level `expect`
 //! below is that single, contained exception.
 #![expect(

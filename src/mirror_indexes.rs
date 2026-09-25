@@ -106,7 +106,11 @@ impl MirrorIndexes {
             .map(|&(_, index)| index)
     }
 
-    /// Replace (or add, below [`MAX_SUITES`]) the suite's entry.
+    /// Replace (or add, below [`MAX_SUITES`]) the suite's entry. A re-read
+    /// of the same index (same dates) never moves its confirmation back:
+    /// a touch ingest can read the file's mtime before a 304 that already
+    /// confirmed the suite has touched it (or on a filesystem where the
+    /// touch cannot land at all).
     ///
     /// A confirmation that arrived before the suite was recorded (see
     /// [`Self::confirm`]) is applied here, the later of the two winning.
@@ -116,7 +120,16 @@ impl MirrorIndexes {
             index.confirmed_at = index.confirmed_at.max(at);
         }
         if let Some((_, slot)) = self.suites.iter_mut().find(|(name, _)| **name == *suite) {
-            *slot = index;
+            let same_index = slot.date == index.date && slot.valid_until == index.valid_until;
+            let confirmed_at = if same_index {
+                slot.confirmed_at.max(index.confirmed_at)
+            } else {
+                index.confirmed_at
+            };
+            *slot = SuiteIndex {
+                confirmed_at,
+                ..index
+            };
         } else if self.suites.len() < MAX_SUITES {
             self.suites.push((Box::from(suite), index));
         }
@@ -395,6 +408,16 @@ mod tests {
         indexes.record("sid", index(Some(NOW), None, NOW + 10));
         indexes.record("sid", index(Some(NOW + 20), None, NOW + 5));
         assert_eq!(indexes.suite("sid").map(|i| i.confirmed_at), Some(NOW + 5));
+    }
+
+    /// A re-read of the same index (a touch ingest reading an mtime from
+    /// before the 304 that confirmed it) keeps the later confirmation.
+    #[test]
+    fn a_reread_of_the_same_index_keeps_its_later_confirmation() {
+        let mut indexes = indexes(&[("sid", index(Some(NOW - DAY), Some(NOW + DAY), NOW - 100))]);
+        indexes.confirm("sid", NOW);
+        indexes.record("sid", index(Some(NOW - DAY), Some(NOW + DAY), NOW - 100));
+        assert_eq!(indexes.suite("sid").map(|i| i.confirmed_at), Some(NOW));
     }
 
     #[test]
