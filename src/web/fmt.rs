@@ -135,6 +135,10 @@ impl Display for Span {
 /// cap renders `unlimited` and no bar. The meter's `low`/`high` marks sit at
 /// the same 50 % / 80 % thresholds as [`RatioClass`], so the browser paints
 /// the bar green, amber or red with no inline style (the CSP forbids one).
+/// Browsers count a value equal to `low` as below it (and one equal to
+/// `high` as below that), so the marks sit half a step under the first
+/// integer at each threshold: with a cap of 20, 10 is amber and 16 red, and
+/// a cap of 1 turns red when full.
 pub(super) struct Gauge {
     pub(super) current: u64,
     pub(super) cap: Option<u64>,
@@ -149,8 +153,8 @@ impl Display for Gauge {
                 "{} / {}<meter class=\"gauge\" min=\"0\" max=\"{cap}\" low=\"{}\" high=\"{}\" optimum=\"0\" value=\"{}\"></meter>",
                 Count(current),
                 Count(cap),
-                cap.div_ceil(2),
-                (cap.saturating_mul(4)).div_ceil(5),
+                HalfBelow(cap.div_ceil(2)),
+                HalfBelow(cap.saturating_mul(4).div_ceil(5)),
                 current.min(cap),
             )?,
             Some(_) | None => write!(f, "{} / unlimited", Count(current))?,
@@ -159,6 +163,17 @@ impl Display for Gauge {
             write!(f, " <span class=\"peak\">peak {}</span>", Count(peak))?;
         }
         Ok(())
+    }
+}
+
+/// `n - 0.5`, rendered exactly: a meter mark half a step under `n`.
+struct HalfBelow(u64);
+impl Display for HalfBelow {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0.checked_sub(1) {
+            Some(below) => write!(f, "{below}.5"),
+            None => f.write_str("0"),
+        }
     }
 }
 
@@ -183,6 +198,8 @@ impl Display for Saturation {
         } = *self;
         if at_cap.is_zero() {
             f.write_str("never at cap")?;
+        } else if at_cap.as_secs() == 0 {
+            f.write_str("at cap under 1 s")?;
         } else {
             write!(f, "at cap {}", Span(at_cap.as_secs()))?;
         }
@@ -1000,7 +1017,16 @@ mod tests {
                 cap: Some(20),
                 peak: Some(20),
             }),
-            "3 / 20<meter class=\"gauge\" min=\"0\" max=\"20\" low=\"10\" high=\"16\" optimum=\"0\" value=\"3\"></meter> <span class=\"peak\">peak 20</span>",
+            "3 / 20<meter class=\"gauge\" min=\"0\" max=\"20\" low=\"9.5\" high=\"15.5\" optimum=\"0\" value=\"3\"></meter> <span class=\"peak\">peak 20</span>",
+        );
+        // A cap of 1 is red when full: both marks sit under it.
+        assert!(
+            render(Gauge {
+                current: 1,
+                cap: Some(1),
+                peak: None,
+            })
+            .contains("low=\"0.5\" high=\"0.5\"")
         );
         // Over the cap (a lowered cap on reload): the bar is full, never past it.
         assert!(

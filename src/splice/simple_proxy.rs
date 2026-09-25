@@ -174,7 +174,8 @@ pub(crate) async fn splice_simple_proxy(
     // the unread remainder, so the connection must not be pooled.
     let body_prefix = &hdr_buf[hdr_end..];
     if let Err(reason) = resp.check_relayable(body_prefix.len() as u64) {
-        reason.record_metrics();
+        // A passthrough's path names no mirror: no per-mirror attribution.
+        reason.record_metrics(None);
         warn_once_or_info!(
             "simple proxy: unrelayable upstream response {} for {upstream_path} from {host_authority} ({}); returning 502",
             resp.status_code,

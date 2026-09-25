@@ -52,11 +52,13 @@ use http::StatusCode;
 
 use crate::{
     cache_layout::CachedFlavor,
+    deb_mirror::Mirror,
     http_etag::{etag_strong_match, is_valid_etag},
     http_range::ContentRange,
     humanfmt::HumanFmt,
     limits::{self, VOLATILE_UNKNOWN_CONTENT_LENGTH_UPPER},
     metrics,
+    mirror_health::{self, MirrorFault},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,8 +463,16 @@ impl RejectReason {
     }
 
     /// Bump the counters this rejection is accounted under.  Called once by
-    /// the backend when it emits the 502.
-    pub(crate) fn record_metrics(self) {
+    /// the backend when it emits the 502. `mirror` is the canonical mirror a
+    /// cached route fetched from, so a protocol violation also counts in its
+    /// per-mirror health (`mirror_health`); `None` for a passthrough, whose
+    /// path names no mirror.
+    pub(crate) fn record_metrics(self, mirror: Option<&Mirror>) {
+        if let Some(mirror) = mirror
+            && !matches!(self, Self::Oversize { .. })
+        {
+            mirror_health::record(mirror, MirrorFault::Protocol);
+        }
         match self {
             Self::Unsolicited206 => {
                 metrics::UPSTREAM_PROTOCOL_VIOLATION.increment();

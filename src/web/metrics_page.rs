@@ -283,8 +283,8 @@ fn build_requests_group(g: &mut Groups) {
             .parts(|p| {
                 p.signal(
                     "Client 500 Internal Server Error",
-                    "The proxy itself failed: a cache read or write broke (Cache Access Failure) or a download aborted for an internal reason. See Storage Errors and the log.",
-                    Level::Alert,
+                    "The proxy itself failed -- a cache read or write broke (Cache Access Failure), a download aborted for an internal reason (see Storage Errors and the log) -- or a mirror answered 500 and it was relayed. Only warns: the relayed case is the mirror's.",
+                    Level::Warn,
                     &metrics::CLIENT_STATUS_500,
                 );
                 p.signal(
@@ -471,7 +471,7 @@ fn build_admission_group(g: &mut Groups) {
             });
         t.row_tip(
             "Downloads Declined",
-            "Registered downloads answered without fetching a body, so not aborts: the upstream status was relayed uncached (a 404, say), the answer was refused (oversize, bad framing), or disk_quota, min_disk_free, the checksum verify throttle or max_passthrough_relays refused it. A max_upstream_downloads refusal never registers and counts in Downloads Rejected (cap) instead.",
+            "Registered downloads answered without fetching a body, so not aborts: the upstream status was relayed uncached (a 404, say), the answer was refused (oversize, bad framing, an empty index body), or disk_quota, min_disk_free, the checksum verify throttle or max_passthrough_relays refused it. A max_upstream_downloads refusal never registers and counts in Downloads Rejected (cap) instead.",
             Count(metrics::DOWNLOADS_DECLINED.get()),
         );
     });
@@ -756,6 +756,11 @@ fn build_upstream_group(g: &mut Groups) {
     .map(|(label, tip, level, signal)| (label, tip, level, signal.get(), signal.last()));
     let cancelled = &metrics::DOWNLOADS_ABORTED_CANCELLED;
     let (cancelled_count, cancelled_last) = (cancelled.get(), cancelled.last());
+    // The total warns only for a failure: cancellations alone (clients that
+    // walked away) are no alarm, like their own row.
+    let failed = abort_causes.iter().any(|(_, _, _, value, _)| *value > 0);
+    let aborted = &metrics::DOWNLOADS_ABORTED;
+    let (aborted_count, aborted_last) = (aborted.get(), aborted.last());
 
     g.group("Upstream", |t| {
         t.row_tip(
@@ -805,7 +810,8 @@ fn build_upstream_group(g: &mut Groups) {
             &metrics::UPSTREAM_STATUS_OTHER,
         );
         t.entry("Downloads Aborted")
-            .tip("Registered upstream downloads that ended without being cached; the causes beneath split them and sum to this.")
+            .tip("Registered upstream downloads that ended without being cached; the causes beneath split them and sum to this. Warns once a failure cause moved, not for cancellations alone.")
+            .last(aborted_last)
             .parts(|p| {
                 for (label, tip, level, value, last) in abort_causes {
                     p.entry(label)
@@ -818,7 +824,7 @@ fn build_upstream_group(g: &mut Groups) {
                     .last(cancelled_last)
                     .value(Count(cancelled_count));
             })
-            .signal(Level::Warn, &metrics::DOWNLOADS_ABORTED);
+            .value(warn_if(Count(aborted_count), failed));
         t.row_tip(
             "Retries",
             "Upstream connect attempts past a request's first: backoff retries after a failed connect, bounded by upstream_retry_budget, and Auto-mode dials of plain HTTP after a failed HTTPS probe. Not highlighted: a retry that connects is the mechanism working.",

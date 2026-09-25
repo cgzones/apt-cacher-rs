@@ -10,10 +10,14 @@
 //! transfer's failure is concluded with its canonical mirror in scope:
 //! `DownloadFailure::conclude` for every registered download (both
 //! backends, cleanup's hyper index fetches included), `UpstreamError::conclude`
-//! for splice's cleanup fetches and a cached route's relay, and the commit
-//! (`guards::RenameBarrier::commit`) and cleanup verify for checksum
-//! mismatches. Passthrough relays have no mirror identity (the path is not
-//! split into mirror and resource) and are not attributed.
+//! for splice's cleanup fetches, `RejectReason::record_metrics` for an
+//! upstream answer the planner refuses (an unsolicited 206, missing
+//! framing), and the commit (`guards::RenameBarrier::commit`) and cleanup
+//! verify for checksum mismatches. Passthrough relays -- and the body of a
+//! cached route's answer relayed uncached -- are not attributed: a
+//! passthrough's path is not split into mirror and resource, and hyper's
+//! relay has no mirror at all, so attributing splice's alone would make the
+//! backends disagree.
 //!
 //! The key is the mirror's `host[:port]/path`, the same rendering as the
 //! Mirrors table's `MirrorUri`, so rows join by string. The map only grows on

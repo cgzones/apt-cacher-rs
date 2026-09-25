@@ -40,9 +40,9 @@ impl Counter {
 /// the page can say whether a lifetime count is history or is happening now
 /// ("last: 3 h ago") -- the highlight alone reads the same for a single
 /// failure at startup and a mirror failing every minute. The stamp is one
-/// relaxed store of a coarse wall-clock second per bump
-/// (`CLOCK_REALTIME_COARSE`), cheap enough for any site: these counters sit
-/// on failure and refusal paths, never on a per-byte one. Request-granular
+/// wall-clock read (`coarsetime::Clock::now_since_epoch`) and one relaxed
+/// store per bump, cheap enough for any site: these counters sit on
+/// failure and refusal paths, never on a per-byte one. Request-granular
 /// counters that are no alarm stay plain [`Counter`]s.
 #[derive(Debug)]
 pub(crate) struct Signal {
@@ -88,8 +88,8 @@ impl Signal {
 
 /// The coarse wall clock every [`Signal`] stamp is taken from.
 fn now_epoch_secs() -> u64 {
-    // A clock read before 1970 plus one second would be the only way to
-    // store the "never" sentinel; clamp so a bump always reads as a bump.
+    // Only a clock set to the epoch's first second could store the "never"
+    // sentinel; clamp so a bump always reads as a bump.
     coarsetime::Clock::now_since_epoch().as_secs().max(1)
 }
 
@@ -314,7 +314,7 @@ pub(crate) static CLIENT_STATUS_304: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_410: Counter = Counter::new();
 pub(crate) static CLIENT_STATUS_416: Counter = Counter::new();
 /// `500`: a cache access failure or an aborted download (internal failure,
-/// cancellation) -- the local side broke.
+/// cancellation) -- the local side broke -- or a relayed upstream 500.
 pub(crate) static CLIENT_STATUS_500: Signal = Signal::new();
 /// `502`: an upstream fetch failed or its answer was refused
 /// (`"Upstream Error"`, `RejectReason`), or a relayed upstream 502.
@@ -909,8 +909,8 @@ pub(crate) static DOWNLOADS_ABORTED_CANCELLED: Signal = Signal::new();
 /// Registered downloads the originator ended without fetching a body
 /// (`InitBarrier::decline`): the upstream status is relayed uncached, the
 /// planner refused the answer, the disk quota or the verify throttle
-/// refused it, the passthrough cap refused the relay. Not an abort: nothing
-/// failed. A refusal by `max_upstream_downloads` never registers a download
+/// refused it, the passthrough cap refused the relay, a buffered volatile
+/// body came back empty. Not an abort: no transfer broke mid-way. A refusal by `max_upstream_downloads` never registers a download
 /// and counts only in `UPSTREAM_DOWNLOAD_REJECTED_CAP`.
 pub(crate) static DOWNLOADS_DECLINED: Counter = Counter::new();
 /// Downloads that found their `.partial` path still claimed by an earlier

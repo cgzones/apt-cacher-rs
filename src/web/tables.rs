@@ -480,7 +480,13 @@ pub(super) async fn build_mirror_table(
         tr!(
             marked Freshness::of(mirror.last_seen, now_epoch).row_class(),
             table,
-            format_args!("{}{}", HealthDot(mirror_health), HtmlEscaped(mirror.uri())),
+            // The dot makes the cell markup, which `Table::cell` never titles,
+            // so the name carries its own title for when it is cut off.
+            format_args!(
+                "{}<span title=\"{uri}\">{uri}</span>",
+                HealthDot(mirror_health),
+                uri = HtmlEscaped(mirror.uri())
+            ),
             FmtLastSeenHealth {
                 last_seen: mirror.last_seen,
                 now_epoch
@@ -535,7 +541,11 @@ pub(super) async fn build_mirror_table(
     for (key, mirror_health) in &unmatched {
         tr!(
             table,
-            format_args!("{}{}", HealthDot(**mirror_health), HtmlEscape(key)),
+            format_args!(
+                "{}<span title=\"{key}\">{key}</span>",
+                HealthDot(**mirror_health),
+                key = HtmlEscape(key)
+            ),
             "N/A",
             "N/A",
             "N/A",

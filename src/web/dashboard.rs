@@ -566,36 +566,41 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
     );
 
     let refused = metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.get();
-    t.entry("Upstream Download Slots")
-.kind(Kind::Live)
-        .tip("Downloads with an upstream connection open, against max_upstream_downloads; a new download past it is refused with 503. Long at cap with a real refusal share means the cap is below the load (or a slow mirror holds slots: see the Mirrors table).")
-        .note(Saturation {
+    let mut slots = t.entry("Upstream Download Slots")
+        .kind(Kind::Live)
+        .tip("Downloads with an upstream connection open, against max_upstream_downloads; a new download past it is refused with 503. Long at cap with a real refusal share means the cap is below the load (or a slow mirror holds slots: see the Mirrors table).");
+    // No cap, nothing to saturate.
+    if config.max_upstream_downloads.is_some() {
+        slots = slots.note(Saturation {
             at_cap: metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.total(),
             refused,
             attempts: metrics::UPSTREAM_DOWNLOADS_ADMITTED.get() + refused,
             verb: "refused",
-        })
-        .value(Gauge {
-            current: active_mirror_downloads as u64,
-            cap: cap_of(config.max_upstream_downloads),
-            peak: Some(metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.get()),
         });
+    }
+    slots.value(Gauge {
+        current: active_mirror_downloads as u64,
+        cap: cap_of(config.max_upstream_downloads),
+        peak: Some(metrics::ACTIVE_UPSTREAM_DOWNLOADS_PEAK.get()),
+    });
 
     let refused = metrics::PASSTHROUGH_REJECTED_CAP.get();
-    t.entry("Passthrough Relays")
-.kind(Kind::Live)
-        .tip("Uncached requests currently relayed to an upstream, against max_passthrough_relays; a relay past it is refused with 503.")
-        .note(Saturation {
+    let mut relays = t.entry("Passthrough Relays")
+        .kind(Kind::Live)
+        .tip("Uncached requests currently relayed to an upstream, against max_passthrough_relays; a relay past it is refused with 503.");
+    if config.max_passthrough_relays.is_some() {
+        relays = relays.note(Saturation {
             at_cap: metrics::PASSTHROUGH_CAP_CLOCK.total(),
             refused,
             attempts: metrics::PASSTHROUGH_ADMITTED.get() + refused,
             verb: "refused",
-        })
-        .value(Gauge {
-            current: active_relays() as u64,
-            cap: cap_of(config.max_passthrough_relays),
-            peak: Some(metrics::PASSTHROUGH_ACTIVE_PEAK.get()),
         });
+    }
+    relays.value(Gauge {
+        current: active_relays() as u64,
+        cap: cap_of(config.max_passthrough_relays),
+        peak: Some(metrics::PASSTHROUGH_ACTIVE_PEAK.get()),
+    });
 
     let accepted = metrics::CONNECTIONS_ACCEPTED.get();
     let mut connected = t
@@ -605,7 +610,9 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
     if config.max_connections.is_some() {
         let refused = metrics::CONNECTION_REJECTED_GLOBAL_CAP.get();
         connected = connected.note(format_args!(
-            "refused {refused} of {accepted} accepted connections"
+            "refused {} of {} accepted connections",
+            Count(refused),
+            Count(accepted)
         ));
     }
     connected.value(Gauge {
@@ -616,7 +623,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
 
     if let Some(cap) = config.max_connections_per_client_ip {
         t.entry("Connections per Client IP")
-.kind(Kind::Live)
+        .kind(Kind::Live)
             .tip("Connections held by the busiest single source IP, against max_connections_per_client_ip; its next connection is closed at accept time. The peak is the most any IP held since start: deploy generously, watch it settle, then lower the cap to a margin above it. The Clients table names refused clients.")
             .note(Saturation {
                 at_cap: metrics::CONNECTION_PER_IP_CAP_CLOCK.total(),
@@ -633,17 +640,17 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
 
     if config.https_tunnel_enabled {
         t.entry("HTTPS Tunnels")
-.kind(Kind::Live)
+        .kind(Kind::Live)
             .tip("CONNECT tunnels open across all clients. There is no global tunnel cap; the per-client one is the row beside it.")
             .value(format_args!(
                 "{} <span class=\"peak\">peak {}</span>",
-                active_tunnels(),
-                metrics::CONNECT_TUNNEL_ACTIVE_PEAK.get()
+                Count::len(active_tunnels()),
+                Count(metrics::CONNECT_TUNNEL_ACTIVE_PEAK.get())
             ));
         if let Some(cap) = config.https_tunnel_max_connections_per_client {
             let refused = metrics::TUNNEL_REJECTED_CAPACITY.get();
             t.entry("HTTPS Tunnels per Client")
-.kind(Kind::Live)
+        .kind(Kind::Live)
                 .tip("Tunnels held by the busiest single source IP, against https_tunnel_max_connections_per_client; its next CONNECT is refused with 429. The Clients table names refused clients.")
                 .note(Saturation {
                     at_cap: metrics::TUNNEL_PER_CLIENT_CAP_CLOCK.total(),
@@ -664,7 +671,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
         .expect("Sender initialized in main_loop()");
     let channel_max = database_tx.max_capacity();
     t.entry("DB Command Queue")
-.kind(Kind::Live)
+        .kind(Kind::Live)
         .tip("Commands queued for the database task, against db_channel_capacity. While it is full, request paths wait on database writes: raise db_channel_capacity, or flush sooner with db_batch_flush_max_count / db_batch_flush_interval_secs.")
         .note(Saturation {
             at_cap: metrics::DB_QUEUE_CAP_CLOCK.total(),
@@ -680,11 +687,11 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
 
     let logstore = LOGSTORE.get().expect("initialized in main()");
     t.entry("Log Ring")
-.kind(Kind::Live)
+        .kind(Kind::Live)
         .tip("Entries held for the /logs page, against logstore_capacity. A full ring is normal: the oldest entry makes room for the newest. Raise logstore_capacity to reach further back.")
         .note(format_args!(
             "{} evicted since start",
-            metrics::LOGSTORE_EVICTIONS.get()
+            Count(metrics::LOGSTORE_EVICTIONS.get())
         ))
         .value(Gauge {
             current: logstore.entries().len() as u64,

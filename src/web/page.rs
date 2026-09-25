@@ -123,6 +123,12 @@ const SECTIONS: [&str; 8] = [
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct OpenSections(u8);
 
+// One bit per section: a ninth would shift past the `u8`.
+const _: () = assert!(
+    SECTIONS.len() <= u8::BITS as usize,
+    "one bit per section in OpenSections"
+);
+
 impl OpenSections {
     fn bit(key: &str) -> Option<u8> {
         SECTIONS
@@ -243,8 +249,9 @@ impl Display for RefreshMeta {
     }
 }
 
-/// Hard cap on query-string length. The known parameters fit in well under 64
-/// bytes; anything longer is junk and we ignore the whole query.
+/// Hard cap on query-string length. The known parameters fit in about 120
+/// bytes (a full `open=` list is ~85); anything longer is junk and we ignore
+/// the whole query.
 const MAX_QUERY_LEN: usize = 256;
 
 pub(super) fn parse_query(query: Option<&str>) -> QueryOptions {

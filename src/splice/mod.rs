@@ -1074,7 +1074,7 @@ async fn reject_upstream_response(
     conn_details: &ConnectionDetails,
     reason: RejectReason,
 ) -> Result<(), SpliceProxyError> {
-    reason.record_metrics();
+    reason.record_metrics(Some(&conn_details.mirror));
     warn_upstream_reject(reason, conn_details);
     client
         .write_invalid(
@@ -1572,7 +1572,7 @@ async fn splice_proxy_drive(
             // revalidation itself stands and the cached copy is served.
             let stray = header_buf.len() - header_end;
             if let Err(reason) = upstream_resp.check_relayable(stray as u64) {
-                reason.record_metrics();
+                reason.record_metrics(Some(&conn_details.mirror));
                 warn_once_or_info!(
                     "splice proxy: upstream mirror {} sent {stray} bytes after a 304 head for {}; not reusing the connection ({})",
                     conn_details.mirror,

@@ -31,6 +31,10 @@ impl Table {
     /// shares -- which are right-aligned (headers included) so the digits of
     /// consecutive rows line up in the tabular numerals the stylesheet sets.
     pub(super) fn numeric(headers: &[&'static str], columns: &[usize]) -> Self {
+        assert!(
+            headers.len() <= u64::BITS as usize,
+            "one bit per column in the numeric mask"
+        );
         let numeric = columns.iter().fold(0_u64, |bits, &col| bits | (1 << col));
         Self::build(headers, numeric)
     }

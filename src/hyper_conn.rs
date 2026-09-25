@@ -2323,7 +2323,7 @@ async fn serve_new_file_worker(
             /// not mute the first genuine protocol violation.
             static GATES: RejectGates = RejectGates::new();
 
-            reason.record_metrics();
+            reason.record_metrics(Some(&conn_details.mirror));
             log_once::warn_once_or_info_gated(
                 GATES.for_reason(reason),
                 format_args!(
@@ -3474,6 +3474,7 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
         // a worse signal. See the docstring on
         // CLIENT_DISCONNECTED_MID_BODY for the scope caveat.
         metrics::CLIENT_DISCONNECTED_MID_BODY.increment();
+        client_trouble::record(&client, Trouble::Disconnect);
         info!(
             "Connection to client {client} disconnected:  {}",
             ErrorReport(err)
