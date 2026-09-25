@@ -106,7 +106,7 @@ pub(super) async fn handle_volatile_buffered_download(
         .await
         .map_err(SpliceProxyError::ReportedBeforeHeader)?;
 
-    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at);
+    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at, upstream_resp.head_at);
 
     let Some(total_content_length) = NonZero::new(body.len() as u64) else {
         debug!(

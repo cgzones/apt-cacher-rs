@@ -150,6 +150,8 @@ pub(crate) async fn splice_simple_proxy(
         header_buf: hdr_buf,
         header_end: hdr_end,
         reused: _,
+        // A passthrough records no time to first byte (`mirror_perf`).
+        attempt_started: _,
     } = standard_upstream_connect(mirror, host_authority, upstream_path, 0, None, None, None)
         .await
         .map_err(|err| {

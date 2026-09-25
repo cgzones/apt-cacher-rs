@@ -18,7 +18,9 @@ use crate::cache_layout::ConnectionDetails;
 use crate::config::ClientHost;
 use crate::deb_mirror::{Mirror, MirrorKind};
 use crate::error::ErrorReport;
+use crate::mirror_perf::HeadTiming;
 use crate::partial_file;
+use crate::precise_instant::PreciseInstant;
 use crate::scheme_cache::SchemeDecision;
 use crate::upstream_head::{BodyFraming, RejectGates, RejectReason};
 use crate::upstream_retry::RetryStop;
@@ -48,6 +50,10 @@ pub(super) struct UpstreamExchange {
     pub(super) header_end: usize,
     /// Whether `conn` came out of the pool rather than a fresh connect.
     pub(super) reused: bool,
+    /// When the attempt that produced this exchange started: the request
+    /// write on a pooled connection, the connect of a fresh one. With the
+    /// head's `head_at`, the time to first byte (`mirror_perf`).
+    pub(super) attempt_started: PreciseInstant,
 }
 
 impl UpstreamExchange {
@@ -58,7 +64,7 @@ impl UpstreamExchange {
         mirror: &Mirror,
         port: u16,
         (response, header_buf, header_end): (UpstreamResponse, BytesMut, usize),
-        reused: bool,
+        (reused, attempt_started): (bool, PreciseInstant),
     ) -> Self {
         let poolable = !response.connection_close;
         Self {
@@ -67,6 +73,16 @@ impl UpstreamExchange {
             header_buf,
             header_end,
             reused,
+            attempt_started,
+        }
+    }
+
+    /// The time-to-first-byte ends of this exchange.
+    #[must_use]
+    pub(super) const fn head_timing(&self) -> HeadTiming {
+        HeadTiming {
+            attempt_started: self.attempt_started,
+            head_at: self.response.head_at,
         }
     }
 
@@ -87,6 +103,7 @@ impl UpstreamExchange {
             header_buf,
             header_end,
             reused: _,
+            attempt_started: _,
         } = self;
         if !conn.permits_reuse() || response.framing == BodyFraming::CloseDelimited {
             return;
@@ -135,6 +152,7 @@ impl UpstreamExchange {
             header_buf: _,
             header_end: _,
             reused,
+            attempt_started: _,
         } = self;
         ConnLabel {
             tls: conn.is_tls(),
@@ -188,6 +206,7 @@ pub(super) async fn standard_upstream_connect(
         let port = mirror_port(mirror, is_tls);
         match pool_checkout(mirror.host(), port, is_tls) {
             PoolCheckout::Live(mut pooled) => {
+                let attempt_started = PreciseInstant::now();
                 match send_and_read_headers(
                     &mut pooled,
                     host_authority,
@@ -200,7 +219,13 @@ pub(super) async fn standard_upstream_connect(
                 {
                     Ok(head) => {
                         metrics::POOL_REUSED.increment();
-                        return Ok(UpstreamExchange::new(pooled, mirror, port, head, true));
+                        return Ok(UpstreamExchange::new(
+                            pooled,
+                            mirror,
+                            port,
+                            head,
+                            (true, attempt_started),
+                        ));
                     }
                     Err(HeadError::Transport(err)) => {
                         // The pooled socket's fault (the peer hung up between
@@ -250,7 +275,11 @@ pub(super) async fn standard_upstream_connect(
         global_config().upstream_retry_budget,
         coarsetime::Instant::now(),
     );
+    // Restarted with every connect attempt: the one that connects is the
+    // attempt the exchange's time to first byte counts from.
+    let mut attempt_started;
     let (mut up, scheme) = loop {
+        attempt_started = PreciseInstant::now();
         let err = match connect_upstream(mirror, resolved_scheme).await {
             Ok(conn) => break conn,
             Err(err) => err,
@@ -354,7 +383,13 @@ pub(super) async fn standard_upstream_connect(
     })?;
 
     let port = mirror_port(mirror, up.is_tls());
-    Ok(UpstreamExchange::new(up, mirror, port, head, false))
+    Ok(UpstreamExchange::new(
+        up,
+        mirror,
+        port,
+        head,
+        (false, attempt_started),
+    ))
 }
 
 /// Where a followed redirect landed: the mirror the retry/resume logic must

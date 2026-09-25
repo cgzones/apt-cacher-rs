@@ -62,6 +62,8 @@ pub(super) struct DetachedDownload {
     pub(super) splice_count: u64,
     /// Start of the upstream-rate window: when the upstream request went out.
     pub(super) request_sent_at: PreciseInstant,
+    /// When its response head was parsed: the throughput window's start.
+    pub(super) head_at: PreciseInstant,
 }
 
 /// The serve plan of a client-less transfer: a zero `content_length` makes
@@ -90,10 +92,11 @@ impl DetachedDownload {
             resume_offset,
             splice_count,
             request_sent_at,
+            head_at,
         } = self;
 
         let start = PreciseInstant::now();
-        let mut rates = RateTimestamps::new(request_sent_at);
+        let mut rates = RateTimestamps::new(request_sent_at, head_at);
 
         log_download_start(
             &conn_details,

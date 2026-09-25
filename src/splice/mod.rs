@@ -101,7 +101,7 @@ use crate::{
     cache_metadata::{self, write_upstream_metadata},
     client_counter,
     content_type::{content_type_for_cached_file, warn_on_content_type_mismatch},
-    global_cache_quota, global_config, global_verify_throttle, metrics, static_assert,
+    global_cache_quota, global_config, global_verify_throttle, metrics, mirror_perf, static_assert,
     warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
 };
 
@@ -654,6 +654,9 @@ struct RateTimestamps {
     /// Start of the upstream-rate window: the instant the upstream request
     /// was sent.
     t_req_sent: PreciseInstant,
+    /// When the response head was parsed: the start of the throughput
+    /// window `mirror_perf` records (the body only, no round trip).
+    t_head: PreciseInstant,
     /// End of the upstream-rate window. Initialised at construction so the
     /// case where the splice loop never runs (whole body arrived with the
     /// headers) still has a sane figure; reassigned right after the splice
@@ -672,13 +675,14 @@ struct RateTimestamps {
 }
 
 impl RateTimestamps {
-    /// Open the upstream-rate window at `t_req_sent` and close it now; the
-    /// client-window instants start as this same instant and are reassigned
-    /// as that window opens and closes.
-    fn new(t_req_sent: PreciseInstant) -> Self {
+    /// Open the upstream-rate window at `t_req_sent` (its head parsed at
+    /// `t_head`) and close it now; the client-window instants start as this
+    /// same instant and are reassigned as that window opens and closes.
+    fn new(t_req_sent: PreciseInstant, t_head: PreciseInstant) -> Self {
         let t_upstream_done = PreciseInstant::now();
         Self {
             t_req_sent,
+            t_head,
             t_upstream_done,
             t_client_first: t_upstream_done,
             t_client_done: t_upstream_done,
@@ -688,6 +692,11 @@ impl RateTimestamps {
 
     fn upstream_window(&self) -> Duration {
         self.t_upstream_done.duration_since(self.t_req_sent)
+    }
+
+    /// From the parsed head to the last body byte: the throughput window.
+    fn body_window(&self) -> Duration {
+        self.t_upstream_done.duration_since(self.t_head)
     }
 
     fn client_window(&self) -> Duration {
@@ -1541,18 +1550,24 @@ async fn splice_proxy_drive(
     // The exchange is final: split it into the locals the rest of the
     // download uses.
     let conn_label = exchange.label();
+    let head_timing = exchange.head_timing();
     let UpstreamExchange {
         conn: mut upstream,
         response: upstream_resp,
         header_buf,
         header_end,
         reused: _,
+        attempt_started: _,
     } = exchange;
 
     // Answered by the upstream (fresh body or a 304): this is the point the
-    // request's Origin row is earned.
+    // request's Origin row is earned, and the mirror's time to first byte
+    // measured (hyper records it at the same point).
     if plan.is_answered() {
         conn_details.record_origin();
+        if !conn_details.client.is_cleanup_synthetic() {
+            mirror_perf::record_ttfb(&conn_details.mirror, head_timing);
+        }
     }
 
     let (total_content_length, body_content_length, resume_offset) = match plan {
@@ -1757,6 +1772,7 @@ async fn splice_proxy_drive(
             resume_offset,
             splice_count,
             request_sent_at: upstream_resp.request_sent_at,
+            head_at: upstream_resp.head_at,
         }
         .spawn();
         // `REQUESTS_SPLICE` stays unbumped -- no splice response was served;
@@ -1777,7 +1793,7 @@ async fn splice_proxy_drive(
 
     // Per-request rate-logging timestamps; the upstream-rate window ends
     // here in case the splice loop never runs.
-    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at);
+    let mut rates = RateTimestamps::new(upstream_resp.request_sent_at, upstream_resp.head_at);
 
     log_download_start(
         conn_details,

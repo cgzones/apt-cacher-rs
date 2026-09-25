@@ -398,6 +398,9 @@ pub(super) struct UpstreamResponse {
     /// Instant the upstream request was sent - start of the upstream-rate
     /// window.
     pub(super) request_sent_at: PreciseInstant,
+    /// Instant the head was parsed: the end of the time to first byte and
+    /// the start of the throughput window (`mirror_perf`).
+    pub(super) head_at: PreciseInstant,
 }
 
 impl UpstreamResponse {
@@ -600,6 +603,7 @@ pub(super) fn parse_upstream_response(
         location,
         connection_close,
         request_sent_at,
+        head_at: PreciseInstant::now(),
     })
 }
 

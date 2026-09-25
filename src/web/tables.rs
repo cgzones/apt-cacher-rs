@@ -24,6 +24,7 @@ use crate::{
     humanfmt::HumanFmt,
     metrics,
     mirror_health::MirrorHealth,
+    mirror_perf::MirrorPerf,
     scheme_cache::{self, SchemeKeyRef, SchemeVerdict},
     swrite,
     uncacheables::get_uncacheables,
@@ -257,12 +258,15 @@ mod mirror_cells {
 
     use crate::humanfmt::HumanFmt;
 
+    use std::time::Duration;
+
     use crate::{
         mirror_health::MirrorHealth,
+        mirror_perf::MirrorPerf,
         scheme_cache::{Scheme, SchemeVerdict},
     };
 
-    use super::super::fmt::{Age, HtmlEscape, Meter};
+    use super::super::fmt::{Age, HtmlEscape, Latency, Meter, warn_if};
 
     /// The coloured dot in front of a mirror's name: green without a failure
     /// since start, red once one of its files failed checksum verification
@@ -370,6 +374,75 @@ mod mirror_cells {
         }
     }
 
+    /// A mirror's time to first byte: the latest, the longest since start
+    /// beside it. Warns once the longest passed `warn_above`, half of
+    /// `http_timeout`: the mirror came close to timing out.
+    pub(super) struct TtfbCell {
+        pub perf: Option<MirrorPerf>,
+        pub warn_above: Duration,
+    }
+    impl Display for TtfbCell {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            let Some(MirrorPerf {
+                ttfb: Some(latest),
+                ttfb_peak,
+                rate: _,
+                rate_peak: _,
+            }) = self.perf
+            else {
+                return f.write_str("N/A");
+            };
+            let latency = |value| Latency {
+                value,
+                resolution: Latency::PRECISE,
+            };
+            Display::fmt(
+                &warn_if(
+                    format_args!(
+                        "{} <span class=\"peak\">peak {}</span>",
+                        latency(latest.value),
+                        latency(ttfb_peak)
+                    ),
+                    ttfb_peak > self.warn_above,
+                ),
+                f,
+            )
+        }
+    }
+
+    /// A mirror's download throughput: the latest committed download of at
+    /// least 1 MiB, the fastest since start beside it. Warns while the
+    /// latest is under `warn_below`, twice `min_download_rate`: downloads
+    /// from it are close to being cancelled.
+    pub(super) struct ThroughputCell {
+        pub perf: Option<MirrorPerf>,
+        pub warn_below: Option<u64>,
+    }
+    impl Display for ThroughputCell {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            let Some(MirrorPerf {
+                ttfb: _,
+                ttfb_peak: _,
+                rate: Some(latest),
+                rate_peak,
+            }) = self.perf
+            else {
+                return f.write_str("N/A");
+            };
+            Display::fmt(
+                &warn_if(
+                    format_args!(
+                        "{} <span class=\"peak\">peak {}</span>",
+                        HumanFmt::RatePerSec(latest.value),
+                        HumanFmt::RatePerSec(rate_peak)
+                    ),
+                    self.warn_below.is_some_and(|floor| latest.value < floor),
+                ),
+                f,
+            )
+        }
+    }
+
     pub(super) struct DirSizeCell {
         pub size: u64,
         pub total: u64,
@@ -455,6 +528,13 @@ const MIRROR_HEALTH_HEADERS: [&str; 4] = [
     "<span title=\"Downloads aborted because a body read timed out (http_timeout) or the mirror fell below min_download_rate over rate_check_timeframe.\">Timeouts / Slow</span> <span class=\"scope\">since start</span>",
 ];
 
+/// The Mirrors table's latency and throughput columns (`mirror_perf`),
+/// in-memory figures since the daemon started like the failure counts.
+const MIRROR_PERF_HEADERS: [&str; 2] = [
+    "<span title=\"From the start of the upstream attempt that answered (its TCP and TLS connect included when no pooled connection was reused) to its parsed response head, for cached fetches answered with a body or a 304: the latest, and the longest since start. Warns when the longest passed half of http_timeout: the mirror came close to timing out; compare mirrors and switch to a closer or less loaded one.\">Time to First Byte</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Body bytes per second of the latest committed download of 1 MiB or more from this mirror, and the fastest since start. A lower bound while a client is attached (a download is paced to its client). Warns while the latest is under twice min_download_rate: downloads from this mirror are close to being cancelled; switch to a faster mirror, or lower min_download_rate.\">Throughput</span> <span class=\"scope\">since start</span>",
+];
+
 /// One failure-count cell of the Mirrors table.
 fn health_cell(value: u64, level: Level) -> Nonzero {
     Nonzero { value, level }
@@ -494,13 +574,28 @@ fn scheme_verdicts<'a>(
     (verdict, aliases)
 }
 
+/// The in-memory per-mirror figures the Mirrors table joins onto the
+/// persisted rows, each keyed by the `MirrorUri` rendering.
+pub(super) struct MirrorSnapshots {
+    pub(super) health: HashMap<Box<str>, MirrorHealth>,
+    pub(super) perf: HashMap<Box<str>, MirrorPerf>,
+}
+
 pub(super) async fn build_mirror_table(
     mirrors: &[MirrorStatEntry],
-    health: &HashMap<Box<str>, MirrorHealth>,
+    snapshots: &MirrorSnapshots,
     now_epoch: i64,
     config: &Config,
 ) -> (Section, DirStats) {
-    use mirror_cells::{AvgMaxCell, DirSizeCell, EfficiencyCell, HealthDot, SchemeChip};
+    use mirror_cells::{
+        AvgMaxCell, DirSizeCell, EfficiencyCell, HealthDot, SchemeChip, ThroughputCell, TtfbCell,
+    };
+
+    let MirrorSnapshots { health, perf } = snapshots;
+    let ttfb_warn_above = config.http_timeout / 2;
+    let rate_warn_below = config
+        .min_download_rate
+        .map(|rate| (rate.get() as u64).saturating_mul(2));
 
     if mirrors.is_empty() && health.is_empty() {
         return (Section::EMPTY, DirStats::default());
@@ -561,8 +656,10 @@ pub(super) async fn build_mirror_table(
             MIRROR_HEALTH_HEADERS[1],
             MIRROR_HEALTH_HEADERS[2],
             MIRROR_HEALTH_HEADERS[3],
+            MIRROR_PERF_HEADERS[0],
+            MIRROR_PERF_HEADERS[1],
         ],
-        &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        &[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     );
 
     // The per-mirror failure counts join by the `MirrorUri` rendering
@@ -640,6 +737,14 @@ pub(super) async fn build_mirror_table(
             health_cell(mirror_health.protocol, Level::Warn),
             health_cell(mirror_health.checksum, Level::Alert),
             health_cell(mirror_health.slow, Level::Warn),
+            TtfbCell {
+                perf: perf.get(key.as_str()).copied(),
+                warn_above: ttfb_warn_above,
+            },
+            ThroughputCell {
+                perf: perf.get(key.as_str()).copied(),
+                warn_below: rate_warn_below,
+            },
         );
     }
 
@@ -669,6 +774,9 @@ pub(super) async fn build_mirror_table(
             health_cell(mirror_health.protocol, Level::Warn),
             health_cell(mirror_health.checksum, Level::Alert),
             health_cell(mirror_health.slow, Level::Warn),
+            // Never answered, so never measured.
+            "N/A",
+            "N/A",
         );
     }
 

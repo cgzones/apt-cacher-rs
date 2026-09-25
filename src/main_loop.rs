@@ -446,7 +446,7 @@ pub(crate) async fn main_loop(
                             .expect("Valid request");
 
                         match request_with_retry(&client, request).await {
-                            Ok((response, _parts)) => {
+                            Ok((response, _parts, _timing)) => {
                                 if response.status().is_server_error() {
                                     warn!(
                                         "Scheme-cache warm-up request to host {authority} returned server error {}; ignoring the response, only the connection outcome seeds the scheme cache",

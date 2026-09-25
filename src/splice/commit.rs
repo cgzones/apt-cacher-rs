@@ -49,7 +49,7 @@ use crate::humanfmt::HumanFmt;
 use crate::index_parser::StreamedDigest;
 use crate::partial_file::TempPath;
 use crate::precise_instant::PreciseInstant;
-use crate::{metrics, rate_log};
+use crate::{metrics, mirror_perf, rate_log};
 
 use super::CacheTarget;
 use super::RateTimestamps;
@@ -463,6 +463,16 @@ impl Committed {
             bytes,
             elapsed,
         } = self;
+        // The wire body of this transfer, a resumed prefix excluded, as
+        // hyper's `download_file` records it. Paced to the client until a
+        // demotion, so a lower bound while one is attached.
+        if !conn_details.client.is_cleanup_synthetic() {
+            mirror_perf::record_throughput(
+                &conn_details.mirror,
+                bytes.upstream,
+                rates.body_window(),
+            );
+        }
         log_splice_completion(&conn_details, conn_label, rates, bytes, &client);
 
         if let CompletionClient::Served(Served { bytes: _, partial }) = client {
@@ -600,7 +610,8 @@ mod tests {
     };
 
     fn rates() -> RateTimestamps {
-        RateTimestamps::new(PreciseInstant::now())
+        let now = PreciseInstant::now();
+        RateTimestamps::new(now, now)
     }
 
     #[tokio::test]

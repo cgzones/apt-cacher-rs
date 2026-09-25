@@ -232,6 +232,8 @@ async fn cleanup_upstream_fetch(
         header_buf: hdr_buf,
         header_end: hdr_end,
         reused: _,
+        // Cleanup's own fetches record no time to first byte (`mirror_perf`).
+        attempt_started: _,
     } = exchange;
     let body = resp
         .framing

@@ -166,6 +166,37 @@ impl Display for Gauge {
     }
 }
 
+/// A short wall time: whole milliseconds under a second, seconds with one
+/// decimal under a minute, then a [`Span`]. A value under one millisecond,
+/// or one the clock that measured it cannot tell from zero, renders as the
+/// floor it is: `<1 ms`, or one tick of a coarser clock -- never "0 ms".
+pub(super) struct Latency {
+    pub(super) value: std::time::Duration,
+    /// The measuring clock's resolution (see [`Self::PRECISE`]).
+    pub(super) resolution: std::time::Duration,
+}
+impl Latency {
+    /// The resolution to pass for a `PreciseInstant` measurement.
+    pub(super) const PRECISE: std::time::Duration = std::time::Duration::from_nanos(1);
+}
+impl Display for Latency {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { value, resolution } = *self;
+        let millis = value.as_millis();
+        if millis == 0 {
+            // The tick rounded up to whole milliseconds, at least one.
+            let floor = resolution.as_micros().div_ceil(1000).max(1);
+            write!(f, "&lt;{floor} ms")
+        } else if millis < 1000 {
+            write!(f, "{millis} ms")
+        } else if value.as_secs() < 60 {
+            write!(f, "{:.1} s", value.as_secs_f64())
+        } else {
+            Display::fmt(&Span(value.as_secs()), f)
+        }
+    }
+}
+
 /// `n - 0.5`, rendered exactly: a meter mark half a step under `n`.
 struct HalfBelow(u64);
 impl Display for HalfBelow {
@@ -751,7 +782,7 @@ mod tests {
 
     use super::{
         Age, CacheHitRatio, Count, FmtLastSeenHealth, FmtMTimeAge, Freshness, Gauge, HtmlEscape,
-        Meter, Pct, RatioClass, RelTime, Saturation, Span,
+        Latency, Meter, Pct, RatioClass, RelTime, Saturation, Span,
     };
 
     /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
@@ -1045,6 +1076,36 @@ mod tests {
             }),
             "4 / unlimited <span class=\"peak\">peak 9</span>",
         );
+    }
+
+    #[test]
+    fn a_latency_under_one_clock_tick_renders_as_its_floor() {
+        let ms = std::time::Duration::from_millis;
+        let latency = |value, resolution| render(Latency { value, resolution });
+        assert_eq!(latency(ms(0), ms(1)), "&lt;1 ms");
+        assert_eq!(latency(ms(0), ms(4)), "&lt;4 ms");
+        // A resolution that is no whole number of milliseconds rounds up,
+        // and one below a millisecond still floors at 1 ms.
+        assert_eq!(
+            latency(ms(0), std::time::Duration::from_micros(3_333)),
+            "&lt;4 ms"
+        );
+        assert_eq!(
+            latency(ms(0), std::time::Duration::from_micros(10)),
+            "&lt;1 ms"
+        );
+        assert_eq!(latency(ms(4), ms(4)), "4 ms");
+        // A precise sub-millisecond value is under the millisecond floor.
+        assert_eq!(
+            latency(std::time::Duration::from_micros(300), Latency::PRECISE),
+            "&lt;1 ms"
+        );
+        assert_eq!(
+            latency(std::time::Duration::from_micros(999_999), ms(1)),
+            "999 ms"
+        );
+        assert_eq!(latency(ms(2_345), ms(1)), "2.3 s");
+        assert_eq!(latency(ms(125_000), ms(1)), "2 min 5 s");
     }
 
     #[test]

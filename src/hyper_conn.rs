@@ -73,6 +73,7 @@ use crate::{
     integrity::note_cached_index_touch,
     limits::VOLATILE_CACHE_MAX_AGE,
     log_once, metrics,
+    mirror_perf::{self, HeadTiming},
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
     partial_file::{self, TempPath},
     passthrough_limiter,
@@ -269,11 +270,12 @@ fn is_head_parse_error(err: &hyper_util::client::legacy::Error) -> bool {
 /// On success the request `Parts` are handed back alongside the response —
 /// they were consumed by the request anyway, and returning them lets the
 /// rare redirect-follow path rebuild a request without the caller cloning
-/// the whole `HeaderMap` up front.
+/// the whole `HeaderMap` up front — together with the [`HeadTiming`] of the
+/// attempt that answered (`mirror_perf`'s time to first byte).
 pub(crate) async fn request_with_retry(
     client: &HttpClient,
     request: Request<Empty<bytes::Bytes>>,
-) -> Result<(Response<Incoming>, http::request::Parts), RequestFailure> {
+) -> Result<(Response<Incoming>, http::request::Parts, HeadTiming), RequestFailure> {
     // Auto-mode's HTTPS-upgrade revert branch only fires once `attempt`
     // has crossed this threshold; below it, transient connect errors
     // retry without reverting the scheme.
@@ -373,7 +375,7 @@ pub(crate) async fn request_with_retry(
         orig_scheme: Option<http::uri::Scheme>,
         mut probe: UpgradeProbe,
         scheme_decided: bool,
-    ) -> Result<(Response<Incoming>, http::request::Parts), RequestFailure> {
+    ) -> Result<(Response<Incoming>, http::request::Parts, HeadTiming), RequestFailure> {
         let mut backoff = upstream_retry::Backoff::new(
             global_config().upstream_retry_budget,
             coarsetime::Instant::now(),
@@ -382,8 +384,15 @@ pub(crate) async fn request_with_retry(
         loop {
             let req_clone = Request::from_parts(parts.clone(), Empty::new());
 
+            // The client resolves once the response head is parsed; a
+            // connect it needs (no pooled connection) is part of the wait.
+            let attempt_started = PreciseInstant::now();
             let _: Never = match client.request(req_clone).await {
                 Ok(response) => {
+                    let timing = HeadTiming {
+                        attempt_started,
+                        head_at: PreciseInstant::now(),
+                    };
                     if probe.is_probing() {
                         metrics::HTTPS_UPGRADE_SUCCEEDED.increment();
                     }
@@ -419,7 +428,7 @@ pub(crate) async fn request_with_retry(
                         }));
                     }
                     metrics::record_upstream_status(response.status());
-                    return Ok((response, parts));
+                    return Ok((response, parts, timing));
                 }
                 Err(err) if !err.is_connect() => {
                     if is_io_timed_out_in_chain(&err) {
@@ -1542,7 +1551,9 @@ async fn download_file(
     (outfile, outpath): (tokio::fs::File, TempPath),
     dbarrier: DownloadBarrier,
     resume_offset: u64,
-    request_sent: PreciseInstant,
+    // When the answering request went out (the rate log's window), and when
+    // its head was parsed (the throughput window's start).
+    (request_sent, head_at): (PreciseInstant, PreciseInstant),
 ) {
     let config = global_config();
 
@@ -1640,6 +1651,15 @@ async fn download_file(
             // already served from the live stream.
             return;
         }
+    }
+    // The body bytes of this transfer, a resumed prefix excluded; splice's
+    // commit tail records the same.
+    if !conn_details.client.is_cleanup_synthetic() {
+        mirror_perf::record_throughput(
+            &conn_details.mirror,
+            bytes,
+            t_upstream_done.duration_since(head_at),
+        );
     }
 
     let elapsed = start.elapsed();
@@ -2043,12 +2063,15 @@ async fn serve_new_file_worker(
     trace!("Forwarded request: {fwd_request:?}");
 
     let mut upstream_request_sent = PreciseInstant::now();
-    let mut fwd_response = match request_with_retry(&appstate.https_client, fwd_request).await {
-        Ok((r, _parts)) => r,
-        Err(error) => {
-            return Err(error.into_failure("request upstream response"));
-        }
-    };
+    // The timing of the exchange whose answer is used: replaced below with
+    // every followed redirect and refetch, like the response.
+    let (mut fwd_response, mut head_timing) =
+        match request_with_retry(&appstate.https_client, fwd_request).await {
+            Ok((r, _parts, timing)) => (r, timing),
+            Err(error) => {
+                return Err(error.into_failure("request upstream response"));
+            }
+        };
 
     trace!("Forwarded response: {fwd_response:?}");
 
@@ -2087,9 +2110,9 @@ async fn serve_new_file_worker(
             trace!("Forwarded redirected request: {redirected_request:?}");
 
             upstream_request_sent = PreciseInstant::now();
-            let redirected_response =
+            let (redirected_response, redirected_timing) =
                 match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok((r, _parts)) => r,
+                    Ok((r, _parts, timing)) => (r, timing),
                     Err(error) => {
                         return Err(error.into_failure("request upstream response"));
                     }
@@ -2098,6 +2121,7 @@ async fn serve_new_file_worker(
             trace!("Forwarded redirected response: {redirected_response:?}");
 
             fwd_response = redirected_response;
+            head_timing = redirected_timing;
         } else {
             log_unfollowed_redirect(&moved_uri);
         }
@@ -2195,13 +2219,13 @@ async fn serve_new_file_worker(
                 let retry_request = build_fwd_request(&req_uri, host, None, 0, None);
 
                 upstream_request_sent = PreciseInstant::now();
-                fwd_response = match request_with_retry(&appstate.https_client, retry_request).await
-                {
-                    Ok((r, _parts)) => r,
-                    Err(error) => {
-                        return Err(error.into_failure("request upstream response"));
-                    }
-                };
+                (fwd_response, head_timing) =
+                    match request_with_retry(&appstate.https_client, retry_request).await {
+                        Ok((r, _parts, timing)) => (r, timing),
+                        Err(error) => {
+                            return Err(error.into_failure("request upstream response"));
+                        }
+                    };
                 head = UpstreamHead::from_response(&fwd_response);
             }
 
@@ -2214,6 +2238,11 @@ async fn serve_new_file_worker(
             )
         }
     };
+    // The final exchange answered with a body or a 304: its time to first
+    // byte is the mirror's (splice records it at the same point).
+    if plan.is_answered() && !conn_details.client.is_cleanup_synthetic() {
+        mirror_perf::record_ttfb(&conn_details.mirror, head_timing);
+    }
 
     let (total_content_length, body_content_length, resume_offset) = match plan {
         DownloadPlan::NotModified((file, file_path)) => {
@@ -2515,7 +2544,7 @@ async fn serve_new_file_worker(
                 (outfile, outpath),
                 dbarrier,
                 resume_offset,
-                upstream_request_sent,
+                (upstream_request_sent, head_timing.head_at),
             )
             .await;
         });
@@ -3084,9 +3113,10 @@ async fn pre_process_client_request(
     let fwd_request_sent = PreciseInstant::now();
     // The returned parts serve the origin extraction and the rare
     // redirect-follow below — no up-front HeaderMap clone per request.
+    // A passthrough records no time to first byte (`mirror_perf`).
     let (fwd_response, mut parts) =
         match request_with_retry(&appstate.https_client, fwd_request).await {
-            Ok(rp) => rp,
+            Ok((response, parts, _timing)) => (response, parts),
             Err(err) => return upstream_error_response(err),
         };
     let request_path = parts.uri.path().to_owned();
@@ -3136,7 +3166,7 @@ async fn pre_process_client_request(
             let redirected_request_sent = PreciseInstant::now();
             let redirected_response =
                 match request_with_retry(&appstate.https_client, redirected_request).await {
-                    Ok((r, _parts)) => r,
+                    Ok((r, _parts, _timing)) => r,
                     Err(err) => return upstream_error_response(err),
                 };
 

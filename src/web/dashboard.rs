@@ -27,7 +27,7 @@ use crate::{
     error::ErrorReport,
     fd_usage, global_cache_quota, global_config,
     humanfmt::HumanFmt,
-    metrics, mirror_health,
+    metrics, mirror_health, mirror_perf,
     passthrough_limiter::active_relays,
     swrite,
     tunnel_limiter::{active_tunnels, busiest_client_tunnels},
@@ -51,9 +51,9 @@ use super::{
         write_collapsible_details_badged, write_collapsible_section, write_section,
     },
     tables::{
-        DirStats, Section, TOP_PACKAGES_LIMIT, TopPackagesView, build_mirror_table,
-        build_uncacheable_table, db_error_section, render_client_table, render_origin_table,
-        render_top_packages_table,
+        DirStats, MirrorSnapshots, Section, TOP_PACKAGES_LIMIT, TopPackagesView,
+        build_mirror_table, build_uncacheable_table, db_error_section, render_client_table,
+        render_origin_table, render_top_packages_table,
     },
 };
 
@@ -216,10 +216,13 @@ async fn build_mirror_fs_section(
     now_epoch: i64,
 ) -> (Section, DirStats, Option<u64>) {
     let config = global_config();
-    let health = mirror_health::snapshot();
+    let snapshots = MirrorSnapshots {
+        health: mirror_health::snapshot(),
+        perf: mirror_perf::snapshot(),
+    };
 
     let ((section, aggregate), free_disk_bytes) = tokio::join!(
-        build_mirror_table(mirrors, &health, now_epoch, config),
+        build_mirror_table(mirrors, &snapshots, now_epoch, config),
         // statvfs() can stall on slow/hung filesystems (NFS, FUSE, dying
         // disks); run it on the blocking pool so it cannot wedge the tokio
         // worker.
