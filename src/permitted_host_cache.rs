@@ -6,14 +6,14 @@ use http::StatusCode;
 use crate::{
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
-    config::{ClientHost, HostError},
+    config::{ClientHost, DomainName, HostError},
     global_config, metrics,
     request_dispatch::client_permitted,
     warn_once_or_info,
 };
 
 #[must_use]
-fn is_host_allowed(requested_host: &str) -> bool {
+fn is_host_allowed(requested_host: &DomainName) -> bool {
     global_config()
         .allowed_mirrors
         .iter()
@@ -26,21 +26,19 @@ fn is_host_allowed(requested_host: &str) -> bool {
 /// `Host:` spam.
 const PERMITTED_HOST_CACHE_MAX_ENTRIES: usize = 256;
 
-/// Reason a `Host:` header was rejected by [`authorize_cache_access`];
-/// cached so repeat-spam of the same bad host doesn't re-validate or
-/// re-scan `allowed_mirrors`.
+/// Reason [`permitted_host`] rejected a host; cached so repeat-spam of the
+/// same bad host doesn't re-validate or re-scan `allowed_mirrors`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostReject {
-    /// Failed `ClientHost::new` — malformed `Host:` header, and why.
+pub(crate) enum HostReject {
+    /// Failed `ClientHost::new` — a malformed host, and why.
     Unsupported(HostError),
     /// Validated, but not permitted by `allowed_mirrors`.
     Forbidden,
 }
 
-/// Caches the full validation + allow-list check result per raw `Host:`
-/// string.  On hit, [`authorize_cache_access`] returns a cloned
-/// `ClientHost` without re-running `ClientHost::new` or scanning
-/// `allowed_mirrors`.
+/// Caches the full validation + allow-list check result per raw host
+/// string.  On hit, [`permitted_host`] returns a cloned `ClientHost` without
+/// re-running `ClientHost::new` or scanning `allowed_mirrors`.
 #[derive(Default)]
 struct PermittedHostCache {
     entries: parking_lot::RwLock<HashMap<Box<str>, Result<ClientHost, HostReject>>>,
@@ -67,18 +65,32 @@ impl PermittedHostCache {
 static PERMITTED_HOST_CACHE: LazyLock<PermittedHostCache> =
     LazyLock::new(PermittedHostCache::default);
 
-/// Cache-aware companion to [`is_host_allowed`] for the moved-host /
-/// redirect-destination call sites.  On a hit, returns the cached
-/// allow/deny result without re-scanning `allowed_mirrors`.  On a
-/// miss, falls through to the uncached scan (these call sites don't
-/// have a `ClientHost` to store, so we don't populate the cache here
-/// — only [`authorize_cache_access`] does).
-#[must_use]
-pub(crate) fn is_host_allowed_cached(requested_host: &str) -> bool {
-    if let Some(cached) = PERMITTED_HOST_CACHE.lookup(requested_host) {
-        return cached.is_ok();
+/// Validate a raw host (an authority's `host()`, brackets and all) and
+/// check it against `allowed_mirrors`, through the cache: the raw spelling
+/// is the key, `ClientHost::new` folds it to the canonical host (a
+/// bracketed IPv6 authority to its bare address, a DNS name to lowercase).
+///
+/// The one gate for every host the proxy may fetch from: a request's own
+/// ([`authorize_cache_access`]) and a redirect `Location`'s, so a redirect
+/// to `[2001:db8::1]` or to `DEB.debian.org` is judged as the canonical
+/// host it names. Nothing is logged or counted here: each caller words its
+/// own refusal.
+pub(crate) fn permitted_host(raw_host: &str) -> Result<ClientHost, HostReject> {
+    // Hot path: cache hit returns a cloned ClientHost without
+    // re-validating or rescanning allowed_mirrors.
+    if let Some(cached) = PERMITTED_HOST_CACHE.lookup(raw_host) {
+        return cached;
     }
-    is_host_allowed(requested_host)
+
+    // Miss: validate the host and check allowed_mirrors, then cache
+    // whatever the outcome was (success, malformed, or not-allowed).
+    let result = match ClientHost::new(raw_host) {
+        Ok(c) if is_host_allowed(&c) => Ok(c),
+        Ok(_) => Err(HostReject::Forbidden),
+        Err(err) => Err(HostReject::Unsupported(err)),
+    };
+    PERMITTED_HOST_CACHE.insert(raw_host.into(), result.clone());
+    result
 }
 
 pub(crate) fn authorize_cache_access(
@@ -96,23 +108,7 @@ pub(crate) fn authorize_cache_access(
         return Err((StatusCode::FORBIDDEN, "Unauthorized client"));
     }
 
-    // Hot path: cache hit returns a cloned ClientHost without
-    // re-validating or rescanning allowed_mirrors.
-    if let Some(cached) = PERMITTED_HOST_CACHE.lookup(requested_host) {
-        return finalize_host_result(cached, requested_host, client);
-    }
-
-    // Miss: validate the host and check allowed_mirrors, then cache
-    // whatever the outcome was (success, malformed, or not-allowed).
-    // The raw spelling is the cache key; `ClientHost::new` folds it to the
-    // canonical host (a bracketed IPv6 authority to its bare address).
-    let result = match ClientHost::new(requested_host) {
-        Ok(c) if is_host_allowed(&c) => Ok(c),
-        Ok(_) => Err(HostReject::Forbidden),
-        Err(err) => Err(HostReject::Unsupported(err)),
-    };
-    PERMITTED_HOST_CACHE.insert(requested_host.into(), result.clone());
-    finalize_host_result(result, requested_host, client)
+    finalize_host_result(permitted_host(requested_host), requested_host, client)
 }
 
 fn finalize_host_result(

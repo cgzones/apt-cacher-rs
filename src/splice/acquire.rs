@@ -15,7 +15,6 @@ use bytes::BytesMut;
 use tracing::debug;
 
 use crate::cache_layout::ConnectionDetails;
-use crate::config::ClientHost;
 use crate::deb_mirror::{Mirror, MirrorKind};
 use crate::error::ErrorReport;
 use crate::mirror_perf::HeadTiming;
@@ -24,8 +23,10 @@ use crate::precise_instant::PreciseInstant;
 use crate::scheme_cache::SchemeDecision;
 use crate::upstream_head::{BodyFraming, RejectGates, RejectReason};
 use crate::upstream_retry::RetryStop;
+use crate::uri_authority;
 use crate::{
-    Scheme, global_config, log_once, metrics, permitted_host_cache::is_host_allowed_cached,
+    Scheme, global_config, log_once, metrics,
+    permitted_host_cache::{HostReject, permitted_host},
     scheme_cache, upstream_retry, warn_once_or_info,
 };
 
@@ -454,25 +455,40 @@ pub(super) async fn follow_redirect(
         debug!("splice proxy: {status} redirect to non-HTTP scheme `{moved_uri}`, not following");
         return Ok((exchange, None));
     };
-    let Some(moved_host) = moved_uri.host() else {
+    let Some(moved_authority) = moved_uri.authority() else {
         debug!("splice proxy: {status} redirect target `{moved_uri}` has no host, not following");
         return Ok((exchange, None));
     };
-    if !is_host_allowed_cached(moved_host) {
-        debug!(
-            "splice proxy: {status} redirect host `{moved_host}` not in allowed_mirrors, not following"
-        );
-        return Ok((exchange, None));
-    }
-    let Ok(moved_domain) = ClientHost::new(moved_host) else {
-        // Upstream-controlled and per request, like its sibling branches.
-        warn_once_or_info!(
-            "splice proxy: upstream {} sent {status} for {} with an invalid redirect host `{}`; not following the redirect and not caching the response",
-            conn_details.mirror,
-            conn_details.debname,
-            moved_host.escape_debug()
-        );
-        return Ok((exchange, None));
+    let moved_port = match uri_authority::port(moved_authority) {
+        Ok(port) => port,
+        Err(err) => {
+            warn_once_or_info!(
+                "splice proxy: upstream {} sent an invalid redirect port in `{moved_authority}` ({err}) on {status} for {}; not following the redirect",
+                conn_details.mirror,
+                conn_details.debname
+            );
+            return Ok((exchange, None));
+        }
+    };
+    let moved_host = moved_authority.host();
+    let moved_domain = match permitted_host(moved_host) {
+        Ok(host) => host,
+        Err(HostReject::Forbidden) => {
+            debug!(
+                "splice proxy: {status} redirect host `{moved_host}` not in allowed_mirrors, not following"
+            );
+            return Ok((exchange, None));
+        }
+        Err(HostReject::Unsupported(err)) => {
+            // Upstream-controlled and per request, like its sibling branches.
+            warn_once_or_info!(
+                "splice proxy: upstream {} sent {status} for {} with an invalid redirect host `{}` ({err}); not following the redirect and not caching the response",
+                conn_details.mirror,
+                conn_details.debname,
+                moved_host.escape_debug()
+            );
+            return Ok((exchange, None));
+        }
     };
 
     // Reject self-redirects: if the target (host, port, path) matches the request
@@ -481,16 +497,19 @@ pub(super) async fn follow_redirect(
     let moved_path = moved_uri
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::as_str);
-    let moved_port_effective = moved_uri.port_u16().unwrap_or_else(|| {
-        if moved_uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
-            443
-        } else {
-            80
-        }
-    });
+    let moved_port_effective = moved_port.map_or_else(
+        || {
+            if moved_uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
+                443
+            } else {
+                80
+            }
+        },
+        NonZero::get,
+    );
     let dial_mirror = conn_details.upstream_mirror();
     let original_port_effective = mirror_port(&dial_mirror, exchange.conn.is_tls());
-    if moved_host == dial_mirror.host()
+    if moved_domain == *dial_mirror.host()
         && moved_port_effective == original_port_effective
         && moved_path == original_path
     {
@@ -509,7 +528,6 @@ pub(super) async fn follow_redirect(
     // stays on this host (a path rewrite, a `by-hash` bounce) then reuses it.
     exchange.dispose("splice proxy:").await;
 
-    let moved_port = moved_uri.port_u16().and_then(NonZero::new);
     // Redirect Mirror: used only for upstream dispatch/formatting; never persisted.
     let redirect_mirror = Mirror::new(
         moved_domain,

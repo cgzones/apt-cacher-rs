@@ -26,6 +26,7 @@ use parking_lot::RwLock;
 use crate::config::{Config, DomainName, HttpsUpgradeMode};
 use crate::deb_mirror::Mirror;
 use crate::metrics;
+use crate::uri_authority;
 
 /// Upstream URI scheme we support proxying.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -109,13 +110,15 @@ impl<'a> From<&'a Authority> for SchemeKeyRef<'a> {
             .unwrap_or(host);
         Self {
             host,
-            port: auth.port_u16(),
+            port: uri_authority::port(auth)
+                .expect("validated upstream authority")
+                .map(NonZero::get),
         }
     }
 }
 
 /// The canonical spelling of `auth`, or `None` when it already is canonical
-/// (or its host is no valid mirror host, which the callers' own gates
+/// (or its host or port is invalid, which the callers' own gates
 /// reject): a DNS name lowercased, an IPv6 literal in its RFC 5952 text
 /// (`[0:0::1]` and `[::1]` are one host), the port kept as its number
 /// (`:080` is `:80`).
@@ -126,23 +129,14 @@ impl<'a> From<&'a Authority> for SchemeKeyRef<'a> {
 /// `http_only_mirrors`, under a name no `Mirror` carries.
 #[must_use]
 pub(crate) fn canonical_authority(auth: &Authority) -> Option<Authority> {
+    let port = uri_authority::port(auth).ok()?;
     let host = auth.host();
     // Fast path, no allocation: a lowercase DNS name or an IPv4 address
     // (whose parser admits only the canonical dotted quad) is canonical.
     if !host.starts_with('[') && !host.bytes().any(|b| b.is_ascii_uppercase()) {
         return None;
     }
-    let bare = match host.strip_prefix('[') {
-        Some(inner) => inner.strip_suffix(']')?,
-        None => host,
-    };
-    let canonical = DomainName::new(bare).ok()?;
-    // Port 0 is left alone (`None`): no mirror listens there, and the edge
-    // refuses it, while dropping it would silently dial the default port.
-    let port = match auth.port_u16() {
-        Some(port) => Some(NonZero::new(port)?),
-        None => None,
-    };
+    let canonical = DomainName::new(host).ok()?;
     let rendered = canonical.format_authority(port);
     if rendered == auth.as_str() {
         return None;
@@ -298,8 +292,7 @@ pub(crate) fn resolve(key: SchemeKeyRef<'_>, config: &Config) -> SchemeDecision 
     let cached = cached_scheme_at(key, Instant::now());
     // `decide` returns on `cached` before reading `is_http_only`; skip the
     // `http_only_mirrors` scan on a cache hit.
-    let is_http_only =
-        cached.is_none() && config.http_only_mirrors.iter().any(|m| m.permits(key.host));
+    let is_http_only = cached.is_none() && is_http_only(key, config);
     decide(cached, is_http_only, config.https_upgrade_mode)
 }
 
@@ -400,8 +393,20 @@ fn verdict(mode: HttpsUpgradeMode, is_http_only: bool, live: Option<LiveScheme>)
 /// [`verdict`] for `key` from the global cache and `config`.
 #[must_use]
 pub(crate) fn verdict_for(key: SchemeKeyRef<'_>, config: &Config) -> SchemeVerdict {
-    let is_http_only = config.http_only_mirrors.iter().any(|m| m.permits(key.host));
-    verdict(config.https_upgrade_mode, is_http_only, live_entry(key))
+    verdict(
+        config.https_upgrade_mode,
+        is_http_only(key, config),
+        live_entry(key),
+    )
+}
+
+/// Whether `http_only_mirrors` lists the host of `key`. The key carries the
+/// canonical text, which parses back to the host it was rendered from; a
+/// text that does not parse names no host any entry could list.
+fn is_http_only(key: SchemeKeyRef<'_>, config: &Config) -> bool {
+    !config.http_only_mirrors.is_empty()
+        && DomainName::new(key.host)
+            .is_ok_and(|host| config.http_only_mirrors.iter().any(|m| m.permits(&host)))
 }
 
 /// Cache the scheme a successful upstream connection used. Vacant-only: a
@@ -535,6 +540,10 @@ mod tests {
             "[2001:db8::1]:8080",
             // Port 0 is left alone rather than dropped to the default port.
             "[0:0::1]:0",
+            // Invalid explicit ports must never be rewritten to no port.
+            "[0:0::1]:65536",
+            "[::ffff:192.0.2.1]:nonsense",
+            "DEB.Debian.ORG:65536",
         ] {
             let auth = Authority::try_from(already).expect("valid authority");
             assert_eq!(canonical_authority(&auth), None, "{already}");

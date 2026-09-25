@@ -78,7 +78,7 @@ use crate::{
     parallel_hack::{NUDGE_BODY, log_nudge, nudge_head, should_nudge},
     partial_file::{self, TempPath},
     passthrough_limiter,
-    permitted_host_cache::{authorize_cache_access, is_host_allowed_cached},
+    permitted_host_cache::{HostReject, authorize_cache_access, permitted_host},
     precise_instant::PreciseInstant,
     proxy_body::{ProxyCacheBody, full_body, quick_response, quick_response_closing},
     rate_checked_body::{ClientBody, MaybeRated, RateCheckedBodyErr},
@@ -97,7 +97,7 @@ use crate::{
         UpstreamHead, plan_download, plan_fresh_download, resolve_body_framing,
     },
     upstream_retry::{self, RetryStop},
-    warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
+    uri_authority, warn_once_or_debug, warn_once_or_info, warn_once_or_info_logged,
     web::serve_web_interface,
 };
 #[cfg(feature = "tls_rustls")]
@@ -1723,6 +1723,14 @@ fn parse_redirect_location<B>(response: &Response<B>, source: &str, what: &str) 
             "Upstream mirror {source} sent an unparsable Location header {location:?} on {status} for {what}; forwarding the response to the client"
         );
     }
+    if let Some(authority) = parsed.as_ref().and_then(Uri::authority)
+        && let Err(err) = uri_authority::port(authority)
+    {
+        warn_once_or_info!(
+            "Upstream mirror {source} sent an invalid redirect port in `{authority}` ({err}) on {status} for {what}; not following the redirect"
+        );
+        return None;
+    }
     parsed
 }
 
@@ -1741,7 +1749,19 @@ fn log_unfollowed_redirect(moved_uri: &Uri) {
     }) {
         debug!("Scheme of moved URI `{moved_uri}` not supported");
     } else if let Some(moved_host) = moved_uri.host() {
-        debug!("Host `{moved_host}` of moved URI not permitted");
+        // Cached by the gate that refused it, so the reason costs a lookup.
+        match permitted_host(moved_host) {
+            Err(HostReject::Unsupported(err)) => {
+                // Upstream-controlled, like splice's twin in `follow_redirect`.
+                warn_once_or_info!(
+                    "Upstream sent a redirect to the invalid host `{}` ({err}); not following the redirect",
+                    moved_host.escape_debug()
+                );
+            }
+            Ok(_) | Err(HostReject::Forbidden) => {
+                debug!("Host `{moved_host}` of moved URI not permitted");
+            }
+        }
     } else {
         debug!("Moved URI has no host; not following the redirect");
     }
@@ -2095,7 +2115,7 @@ async fn serve_new_file_worker(
         if moved_uri.scheme().is_some_and(|scheme| {
             *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
         }) && let Some(moved_auth) = moved_uri.authority()
-            && is_host_allowed_cached(moved_auth.host())
+            && permitted_host(moved_auth.host()).is_ok()
         {
             // Derive the Host header from the redirect target so it matches
             // the URI we're actually sending the request to.
@@ -3156,7 +3176,7 @@ async fn pre_process_client_request(
         if moved_uri.scheme().is_some_and(|scheme| {
             *scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS
         }) && let Some(moved_auth) = moved_uri.authority()
-            && is_host_allowed_cached(moved_auth.host())
+            && permitted_host(moved_auth.host()).is_ok()
         {
             // Update the Host header so it matches the redirect target,
             // otherwise the header from the original request would be
@@ -3216,7 +3236,7 @@ fn host_header_from_uri(auth: &Authority) -> HeaderValue {
     let canonical = canonical_authority(auth);
     let auth = canonical.as_ref().unwrap_or(auth);
     let host = auth.host();
-    let value = match auth.port_u16() {
+    let value = match uri_authority::port(auth).expect("validated upstream authority") {
         Some(port) => format!("{host}:{port}"),
         None => host.to_owned(),
     };
@@ -3519,6 +3539,37 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 #[cfg(test)]
 mod tests {
     use super::{SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+
+    #[test]
+    fn redirects_with_invalid_ports_are_left_for_the_client() {
+        for host in ["mirror.example", "192.0.2.1", "[::1]"] {
+            for port in ["0", "65536", "nonsense", "+80"] {
+                let target = format!("http://{host}:{port}/package.deb");
+                let response = http::Response::builder()
+                    .status(302)
+                    .header(http::header::LOCATION, &target)
+                    .body(())
+                    .expect("redirect response");
+                assert!(
+                    super::parse_redirect_location(&response, "mirror.example", "package.deb")
+                        .is_none(),
+                    "{target}"
+                );
+                assert_eq!(response.headers()[http::header::LOCATION], target);
+            }
+        }
+        let response = http::Response::builder()
+            .status(302)
+            .header(http::header::LOCATION, "http://[0:0::1]:00080/package.deb")
+            .body(())
+            .expect("redirect response");
+        let target = super::parse_redirect_location(&response, "mirror.example", "package.deb")
+            .expect("valid redirect port");
+        assert_eq!(
+            host_header_from_uri(target.authority().expect("absolute URI")),
+            "[::1]:80"
+        );
+    }
 
     /// Feed actual wire bytes through Hyper, with the same transport marker
     /// as the production connector. A transport failure follows the bytes.

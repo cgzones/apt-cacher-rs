@@ -157,22 +157,27 @@ impl ConfigDomainName {
         DomainName::new(domain).map(|host| Self(ConfigDomainNameInner::Exact(host)))
     }
 
+    /// The one host an exact entry names; `None` for a wildcard.
     #[must_use]
     #[inline]
-    pub(crate) fn as_str(&self) -> Option<&str> {
+    pub(crate) const fn host(&self) -> Option<&DomainName> {
         match self {
-            Self(ConfigDomainNameInner::Exact(host)) => Some(host.as_str()),
+            Self(ConfigDomainNameInner::Exact(host)) => Some(host),
             Self(ConfigDomainNameInner::Wildcard(_)) => None,
         }
     }
 
-    /// Whether the entry admits `domain`, the canonical text of a
-    /// [`DomainName`] (its `as_str`).
+    /// Whether the entry admits `domain`. Typed, so an entry and a host
+    /// compare as the one canonical value each spelling parses to. A
+    /// wildcard admits DNS names only: its suffix is DNS labels, which an
+    /// address never ends in.
     #[must_use]
-    pub(crate) fn permits(&self, domain: &str) -> bool {
+    pub(crate) fn permits(&self, domain: &DomainName) -> bool {
         match self {
-            Self(ConfigDomainNameInner::Wildcard(d)) => domain.ends_with(d),
-            Self(ConfigDomainNameInner::Exact(host)) => host.as_str() == domain,
+            Self(ConfigDomainNameInner::Wildcard(suffix)) => {
+                domain.is_dns() && domain.as_str().ends_with(suffix.as_str())
+            }
+            Self(ConfigDomainNameInner::Exact(host)) => host == domain,
         }
     }
 }
@@ -284,6 +289,16 @@ impl DomainName {
                     Err(HostError::Invalid)
                 }
             }
+        }
+    }
+
+    /// Return `true` if this domain name is a DNS name, not an address.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn is_dns(&self) -> bool {
+        match self {
+            Self(DomainNameInner::Dns(_)) => true,
+            Self(DomainNameInner::Ipv4(..) | DomainNameInner::Ipv6(..)) => false,
         }
     }
 
@@ -1682,13 +1697,13 @@ impl Config {
 
         if !self.allowed_mirrors.is_empty() {
             for mirror in &self.http_only_mirrors {
-                let Some(mirror_str) = mirror.as_str() else {
+                let Some(mirror) = mirror.host() else {
                     continue;
                 };
 
-                if !self.allowed_mirrors.iter().any(|a| a.permits(mirror_str)) {
+                if !self.allowed_mirrors.iter().any(|a| a.permits(mirror)) {
                     warnings.push(format!(
-                        "http_only_mirrors entry `{mirror_str}` is not permitted by allowed_mirrors"
+                        "http_only_mirrors entry `{mirror}` is not permitted by allowed_mirrors"
                     ));
                 }
             }
@@ -1696,11 +1711,7 @@ impl Config {
 
         if !self.allowed_mirrors.is_empty() {
             for alias in &self.aliases {
-                if !self
-                    .allowed_mirrors
-                    .iter()
-                    .any(|a| a.permits(alias.main.as_str()))
-                {
+                if !self.allowed_mirrors.iter().any(|a| a.permits(&alias.main)) {
                     warnings.push(format!(
                         "alias target `{}` is not permitted by allowed_mirrors",
                         alias.main
@@ -2260,9 +2271,12 @@ mod test {
         let allowed: Vec<_> = cfg
             .allowed_mirrors
             .iter()
-            .map(ConfigDomainName::as_str)
+            .map(ConfigDomainName::host)
             .collect();
-        assert_eq!(allowed, [Some("2001:db8::1"), Some("2001:db8::2")]);
+        assert_eq!(
+            allowed,
+            [Some(&dn("2001:db8::1")), Some(&dn("2001:db8::2"))]
+        );
         assert_eq!(cfg.https_tunnel_allowed_mirrors, [dn("2001:db8::3")]);
         assert!(
             resolve_alias(&cfg.aliases, &clh("2001:db8::4"))
@@ -2418,10 +2432,26 @@ mod test {
         let host = DomainName::new("DEB.Debian.ORG").expect("valid");
         assert_eq!(host.as_str(), "deb.debian.org");
         let exact = ConfigDomainName::new("Deb.debian.org").expect("valid");
-        assert!(exact.permits("deb.debian.org"));
-        assert_eq!(exact.as_str(), Some("deb.debian.org"));
+        assert!(exact.permits(&host));
+        assert_eq!(exact.host(), Some(&host));
         let wildcard = ConfigDomainName::new("*.Debian.ORG").expect("valid");
-        assert!(wildcard.permits("deb.debian.org"));
+        assert!(wildcard.permits(&host));
+    }
+
+    /// An entry and a host compare as parsed values: every spelling of an
+    /// address is the one host, and a wildcard never admits an address.
+    #[test]
+    fn an_entry_permits_every_spelling_of_its_host() {
+        let entry = ConfigDomainName::new("[2001:db8::1]").expect("valid");
+        for spelling in ["2001:db8::1", "[2001:DB8::1]", "[2001:db8:0:0::1]"] {
+            assert!(entry.permits(&dn(spelling)), "{spelling}");
+        }
+        assert!(!entry.permits(&dn("2001:db8::2")));
+
+        let wildcard = ConfigDomainName::new("*.example.org").expect("valid");
+        assert!(wildcard.permits(&dn("deb.example.org")));
+        assert!(!wildcard.permits(&dn("example.org")));
+        assert!(!wildcard.permits(&dn("192.0.2.1")));
     }
 
     #[test]
