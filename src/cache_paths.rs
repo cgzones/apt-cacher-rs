@@ -366,9 +366,7 @@ mod tests {
     use crate::config::ClientHost;
 
     fn cache_host(s: &str) -> CacheHost {
-        ClientHost::new(s.to_owned())
-            .expect("valid host")
-            .into_cache_host()
+        ClientHost::new(s).expect("valid host").into_cache_host()
     }
 
     /// Every test derives below `/cache`.

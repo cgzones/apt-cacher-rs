@@ -967,7 +967,7 @@ mod tests {
     fn key_on(host: &str, debname: &str) -> CacheEntryKey {
         CacheEntryKey {
             mirror: crate::deb_mirror::Mirror::new(
-                ClientHost::new(String::from(host)).expect("valid host"),
+                ClientHost::new(host).expect("valid host"),
                 std::num::NonZero::new(80),
                 "/debian".into(),
                 MirrorKind::Structured,

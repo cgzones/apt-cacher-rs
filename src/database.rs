@@ -985,12 +985,12 @@ impl Database {
                 // hit on either guard below would mean on-disk corruption
                 // that bypassed cleanup.
                 let row_id = r.id;
-                let host = match DomainName::new(r.host) {
+                let host = match DomainName::new(&r.host) {
                     Ok(h) => h,
-                    Err(invalid) => {
+                    Err(err) => {
                         warn_once_or_info!(
-                            "Dropping mirror row id={row_id} with invalid host `{}` while hydrating the mirror-id cache",
-                            invalid.escape_debug()
+                            "Dropping mirror row id={row_id} with invalid host `{}` ({err}) while hydrating the mirror-id cache",
+                            r.host.escape_debug()
                         );
                         return None;
                     }
@@ -1216,7 +1216,7 @@ impl Database {
     /// `DomainName::new` or whose `kind` is outside the [`MirrorKind`]
     /// invariant.  Cascade to origins/downloads/deliveries.
     ///
-    /// The host check uses `DomainName::new` (not `is_valid_config_domain`) so
+    /// The host check uses `DomainName::new` (not `ConfigDomainName::new`) so
     /// the row set this function purges is exactly the set of rows
     /// downstream code — notably `flat_blocklist::init` — relies on
     /// being absent.  Any future tightening of `DomainName::new` then
@@ -1261,7 +1261,7 @@ impl Database {
         .await?;
 
         for mirror in mirrors {
-            let bad_host = DomainName::new(mirror.host.clone()).is_err();
+            let bad_host = DomainName::new(&mirror.host).is_err();
             let bad_kind = MirrorKind::from_db_int(mirror.kind).is_none();
 
             if !bad_host && !bad_kind {
@@ -1564,7 +1564,7 @@ mod retention_tests {
     fn origin_activity_tolerates_an_out_of_range_last_seen() {
         let entry = |last_seen| {
             OriginEntry::new_for_test(
-                ClientHost::new("deb.example.org".to_owned()).expect("valid host"),
+                ClientHost::new("deb.example.org").expect("valid host"),
                 "debian".to_owned(),
                 "sid".to_owned(),
                 last_seen,
@@ -1631,10 +1631,10 @@ mod retention_tests {
         .expect("upsert origins");
 
         let aliases = [Alias {
-            main: ClientHost::new("deb.example.org".to_owned())
+            main: ClientHost::new("deb.example.org")
                 .expect("host")
                 .into_cache_host(),
-            aliases: vec![ClientHost::new("ftp.example.org".to_owned()).expect("host")],
+            aliases: vec![ClientHost::new("ftp.example.org").expect("host")],
         }];
         let merged = db.merge_alias_rows(&aliases).await.expect("merge");
         assert_eq!(merged, 2);

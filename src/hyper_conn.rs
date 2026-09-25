@@ -3206,11 +3206,15 @@ async fn pre_process_client_request(
     )
 }
 
-/// Build a `Host` header value matching the given authority.
+/// Build a `Host` header value matching the given authority, in its
+/// canonical spelling (`scheme_cache::canonical_authority`), the one
+/// `request_with_retry` dials and the splice backend sends.
 ///
 /// IPv6 hosts are kept bracketed per RFC 3986 §3.2.2, and any explicit
 /// port is appended.
 fn host_header_from_uri(auth: &Authority) -> HeaderValue {
+    let canonical = canonical_authority(auth);
+    let auth = canonical.as_ref().unwrap_or(auth);
     let host = auth.host();
     let value = match auth.port_u16() {
         Some(port) => format!("{host}:{port}"),

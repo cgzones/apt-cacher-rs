@@ -596,7 +596,7 @@ mod tests {
         use crate::config::ClientHost;
         CacheEntryKey {
             mirror: Mirror::new(
-                ClientHost::new(String::from("example.test")).unwrap(),
+                ClientHost::new("example.test").unwrap(),
                 std::num::NonZero::new(80),
                 "/debian".into(),
                 MirrorKind::Structured,

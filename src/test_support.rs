@@ -13,7 +13,7 @@ use crate::{
 /// A structured mirror on the default port.
 pub(crate) fn structured_mirror(host: &str, path: &str) -> Mirror {
     Mirror::new(
-        ClientHost::new(host.to_owned()).expect("valid host"),
+        ClientHost::new(host).expect("valid host"),
         None,
         path.to_owned(),
         MirrorKind::Structured,

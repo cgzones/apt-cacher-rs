@@ -464,7 +464,7 @@ pub(super) async fn follow_redirect(
         );
         return Ok((exchange, None));
     }
-    let Ok(moved_domain) = ClientHost::new(moved_host.to_owned()) else {
+    let Ok(moved_domain) = ClientHost::new(moved_host) else {
         // Upstream-controlled and per request, like its sibling branches.
         warn_once_or_info!(
             "splice proxy: upstream {} sent {status} for {} with an invalid redirect host `{}`; not following the redirect and not caching the response",

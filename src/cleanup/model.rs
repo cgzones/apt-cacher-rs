@@ -852,7 +852,7 @@ mod tests {
 
     fn test_entry(host: &str, path: &str, kind: MirrorKind) -> MirrorEntry {
         MirrorEntry::new_for_test(
-            ClientHost::new(host.to_owned()).expect("valid host"),
+            ClientHost::new(host).expect("valid host"),
             None,
             path.to_owned(),
             kind,
@@ -981,7 +981,7 @@ mod tests {
         let entry = test_entry("deb.debian.org", "debian", MirrorKind::Structured);
         let config = test_config("/cache");
         let paths = CachePaths::new(&config.cache_directory);
-        let main = ClientHost::new("deb.debian.org".to_owned())
+        let main = ClientHost::new("deb.debian.org")
             .expect("valid host")
             .into_cache_host();
         let site = MirrorSite {

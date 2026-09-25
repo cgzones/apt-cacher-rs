@@ -48,6 +48,10 @@ jobs:
         run: cargo hack $HACK clippy --all-targets --locked -- -D warnings -D clippy::pedantic
 
       - name: Test
+        env:
+          # The IPv6 integration tests skip where the host has no IPv6
+          # loopback; here that would be a silent pass, so make it a failure.
+          APT_CACHER_RS_REQUIRE_IPV6: "1"
         run: cargo hack $HACK nextest run --all-targets --locked
 
       # Over the powerset, not one config: an intra-doc link to a cfg-gated

@@ -101,6 +101,7 @@ mod tunnel_limiter;
 mod uncacheables;
 mod upstream_head;
 mod upstream_retry;
+mod uri_authority;
 mod verified_marker;
 mod verify_throttle;
 mod web;

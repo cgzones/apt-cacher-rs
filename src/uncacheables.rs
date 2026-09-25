@@ -51,7 +51,7 @@ mod tests {
     use super::*;
 
     fn host(name: &str) -> ClientHost {
-        ClientHost::new(name.to_owned()).expect("valid host")
+        ClientHost::new(name).expect("valid host")
     }
 
     fn snapshot() -> Vec<(String, String)> {

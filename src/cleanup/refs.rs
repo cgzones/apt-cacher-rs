@@ -262,7 +262,7 @@ mod tests {
     fn origin(distribution: &str, age: Duration) -> OriginEntry {
         let now = Clock::now_since_epoch().as_secs();
         OriginEntry::new_for_test(
-            ClientHost::new("deb.example.org".to_owned()).expect("valid host"),
+            ClientHost::new("deb.example.org").expect("valid host"),
             "debian".to_owned(),
             distribution.to_owned(),
             i64::try_from(now.saturating_sub(age.as_secs())).expect("in range"),

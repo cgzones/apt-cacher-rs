@@ -6,7 +6,7 @@ use http::StatusCode;
 use crate::{
     client_info::ClientInfo,
     client_trouble::{self, Trouble},
-    config::ClientHost,
+    config::{ClientHost, HostError},
     global_config, metrics,
     request_dispatch::client_permitted,
     warn_once_or_info,
@@ -31,8 +31,8 @@ const PERMITTED_HOST_CACHE_MAX_ENTRIES: usize = 256;
 /// re-scan `allowed_mirrors`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostReject {
-    /// Failed `ClientHost::new` — malformed `Host:` header.
-    Unsupported,
+    /// Failed `ClientHost::new` — malformed `Host:` header, and why.
+    Unsupported(HostError),
     /// Validated, but not permitted by `allowed_mirrors`.
     Forbidden,
 }
@@ -104,12 +104,12 @@ pub(crate) fn authorize_cache_access(
 
     // Miss: validate the host and check allowed_mirrors, then cache
     // whatever the outcome was (success, malformed, or not-allowed).
-    // `ClientHost::new` consumes its argument, so we hand it an owned
-    // copy and reuse the original `&str` for the cache key.
-    let result = match ClientHost::new(requested_host.to_owned()) {
+    // The raw spelling is the cache key; `ClientHost::new` folds it to the
+    // canonical host (a bracketed IPv6 authority to its bare address).
+    let result = match ClientHost::new(requested_host) {
         Ok(c) if is_host_allowed(&c) => Ok(c),
         Ok(_) => Err(HostReject::Forbidden),
-        Err(_) => Err(HostReject::Unsupported),
+        Err(err) => Err(HostReject::Unsupported(err)),
     };
     PERMITTED_HOST_CACHE.insert(requested_host.into(), result.clone());
     finalize_host_result(result, requested_host, client)
@@ -122,9 +122,9 @@ fn finalize_host_result(
 ) -> Result<ClientHost, (StatusCode, &'static str)> {
     match result {
         Ok(d) => Ok(d),
-        Err(HostReject::Unsupported) => {
+        Err(HostReject::Unsupported(err)) => {
             warn_once_or_info!(
-                "Unsupported host `{}`; rejecting with 400",
+                "Unsupported host `{}` ({err}); rejecting with 400",
                 raw_host.escape_debug()
             );
             Err((StatusCode::BAD_REQUEST, "Unsupported host"))
@@ -156,11 +156,14 @@ mod tests {
         }
         assert_eq!(cache.entries.read().len(), PERMITTED_HOST_CACHE_MAX_ENTRIES);
 
-        cache.insert("h0.invalid".into(), Err(HostReject::Unsupported));
+        cache.insert(
+            "h0.invalid".into(),
+            Err(HostReject::Unsupported(HostError::Invalid)),
+        );
         assert_eq!(cache.entries.read().len(), PERMITTED_HOST_CACHE_MAX_ENTRIES);
         assert_eq!(
             cache.lookup("h0.invalid"),
-            Some(Err(HostReject::Unsupported)),
+            Some(Err(HostReject::Unsupported(HostError::Invalid))),
             "an existing key is overwritten in place"
         );
 

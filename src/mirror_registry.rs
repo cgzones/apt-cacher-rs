@@ -101,7 +101,7 @@ mod tests {
 
     fn mirror(host: &str, path: &str, kind: MirrorKind) -> Mirror {
         Mirror::new(
-            ClientHost::new(host.to_owned()).expect("valid host"),
+            ClientHost::new(host).expect("valid host"),
             None,
             path.to_owned(),
             kind,

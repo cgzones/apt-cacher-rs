@@ -58,7 +58,7 @@ use crate::{
     flat_blocklist, global_config, info_once, metrics,
     precise_instant::PreciseInstant,
     uncacheables::record_uncacheable,
-    warn_once_or_debug, warn_once_or_info,
+    uri_authority, warn_once_or_debug, warn_once_or_info,
     web::host_gate::WebifHosts,
 };
 
@@ -93,7 +93,7 @@ pub(crate) enum RejectReason {
     /// entry: a DNS-rebinding page addressing the daemon under its own name
     /// (see [`crate::web::host_gate`]).
     MisdirectedWebUi,
-    /// Absolute-form `GET` naming port 0.
+    /// Absolute-form `GET` naming an invalid or zero port.
     InvalidPort,
     /// A `GET` whose request target carries no absolute path: the
     /// authority-form (`host:port`, the shape of a `CONNECT` target) or the
@@ -389,17 +389,14 @@ pub(crate) fn preflight_target<'a, 'h>(
         return Ok(RequestTarget::WebUi);
     };
 
-    let port = match authority.port_u16() {
-        Some(port) => {
-            let Some(port) = NonZero::new(port) else {
-                warn_once_or_info!(
-                    "Unsupported request port 0 from client {client}; returning 400"
-                );
-                return Err(RejectReason::InvalidPort);
-            };
-            Some(port)
+    let port = match uri_authority::port(authority) {
+        Ok(port) => port,
+        Err(err) => {
+            warn_once_or_info!(
+                "Unsupported request port in `{authority}` from client {client} ({err}); returning 400"
+            );
+            return Err(RejectReason::InvalidPort);
         }
-        None => None,
     };
 
     Ok(RequestTarget::Proxy {
@@ -1033,14 +1030,19 @@ mod tests {
     }
 
     #[test]
-    fn preflight_target_rejects_port_zero() {
-        let uri: Uri = "http://deb.example.com:0/debian/dists/sid/Release"
-            .parse()
-            .unwrap();
-        assert_eq!(
-            preflight_target(&uri, true, || None, &local_client(), &OPEN_ACLS).unwrap_err(),
-            RejectReason::InvalidPort
-        );
+    fn preflight_target_rejects_invalid_explicit_ports() {
+        for host in ["deb.example.com", "192.0.2.1", "[::1]"] {
+            for port in ["0", "65536", "nonsense", "+80"] {
+                let uri: Uri = format!("http://{host}:{port}/debian/dists/sid/Release")
+                    .parse()
+                    .expect("authority syntax");
+                assert_eq!(
+                    preflight_target(&uri, true, || None, &local_client(), &OPEN_ACLS).unwrap_err(),
+                    RejectReason::InvalidPort,
+                    "{uri}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1104,7 +1106,7 @@ mod tests {
     }
 
     fn fake_host() -> ClientHost {
-        ClientHost::new("deb.example.com".to_string()).unwrap()
+        ClientHost::new("deb.example.com").unwrap()
     }
 
     fn never_flat_blocked(_: &CacheHost, _: Option<NonZero<u16>>) -> bool {
@@ -1169,8 +1171,8 @@ mod tests {
     #[test]
     fn cache_outcome_resolves_alias_once_and_keeps_the_upstream_host() {
         use crate::config::Alias;
-        let main = ClientHost::new("deb.debian.org".to_owned()).expect("valid host");
-        let alias = ClientHost::new("ftp.ca.debian.org".to_owned()).expect("valid host");
+        let main = ClientHost::new("deb.debian.org").expect("valid host");
+        let alias = ClientHost::new("ftp.ca.debian.org").expect("valid host");
         let aliases = [Alias {
             main: main.clone().into_cache_host(),
             aliases: vec![alias.clone()],
@@ -1199,8 +1201,8 @@ mod tests {
     #[test]
     fn passthrough_outcome_resolves_alias_once_and_keeps_the_upstream_host() {
         use crate::config::Alias;
-        let main = ClientHost::new("deb.debian.org".to_owned()).expect("valid host");
-        let alias = ClientHost::new("ftp.ca.debian.org".to_owned()).expect("valid host");
+        let main = ClientHost::new("deb.debian.org").expect("valid host");
+        let alias = ClientHost::new("ftp.ca.debian.org").expect("valid host");
         let aliases = [Alias {
             main: main.clone().into_cache_host(),
             aliases: vec![alias.clone()],

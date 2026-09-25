@@ -955,7 +955,7 @@ mod tests {
     }
 
     fn test_host(name: &str) -> ClientHost {
-        ClientHost::new(name.to_owned()).unwrap()
+        ClientHost::new(name).unwrap()
     }
 
     /// Dropping an unpolled future models cancellation of a detached download
@@ -1145,7 +1145,7 @@ mod tests {
     #[test]
     fn test_mirror_port_defaults() {
         let mirror = Mirror::new(
-            ClientHost::new("example.com".into()).unwrap(),
+            ClientHost::new("example.com").unwrap(),
             None,
             String::new(),
             MirrorKind::Structured,
@@ -1157,7 +1157,7 @@ mod tests {
     #[test]
     fn test_mirror_port_explicit() {
         let mirror = Mirror::new(
-            ClientHost::new("example.com".into()).unwrap(),
+            ClientHost::new("example.com").unwrap(),
             Some(NonZero::new(8080).unwrap()),
             String::new(),
             MirrorKind::Structured,

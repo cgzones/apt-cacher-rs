@@ -169,10 +169,10 @@ mod tests {
     /// miss silently instead of failing loudly.
     #[test]
     fn borrowed_key_matches_owned_entry() {
-        let host = ClientHost::new("apt.example.org".to_owned())
+        let host = ClientHost::new("apt.example.org")
             .expect("valid host")
             .into_cache_host();
-        let other = ClientHost::new("apt.example.net".to_owned())
+        let other = ClientHost::new("apt.example.net")
             .expect("valid host")
             .into_cache_host();
         let port = NonZero::new(8080);

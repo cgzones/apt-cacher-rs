@@ -136,7 +136,7 @@ pub(crate) fn canonical_authority(auth: &Authority) -> Option<Authority> {
         Some(inner) => inner.strip_suffix(']')?,
         None => host,
     };
-    let canonical = DomainName::new(bare.to_owned()).ok()?;
+    let canonical = DomainName::new(bare).ok()?;
     // Port 0 is left alone (`None`): no mirror listens there, and the edge
     // refuses it, while dropping it would silently dial the default port.
     let port = match auth.port_u16() {
@@ -491,7 +491,7 @@ mod tests {
         let auth = Authority::try_from("[2001:db8::1]:8080").expect("valid authority");
         let from_auth = SchemeKeyRef::from(&auth);
         let mirror = Mirror::new(
-            ClientHost::new("2001:db8::1".to_owned()).expect("valid host"),
+            ClientHost::new("2001:db8::1").expect("valid host"),
             NonZero::new(8080),
             "debian".to_owned(),
             MirrorKind::Structured,

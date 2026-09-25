@@ -544,7 +544,7 @@ mod tests {
         std::fs::write(dir.path().join("hello_1.0_amd64.deb"), b"d").expect("write deb");
 
         let mirror = Mirror::new(
-            ClientHost::new("deb.example.org".to_owned()).expect("valid host"),
+            ClientHost::new("deb.example.org").expect("valid host"),
             None,
             "apt".to_owned(),
             MirrorKind::Flat,

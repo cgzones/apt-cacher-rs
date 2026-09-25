@@ -1435,7 +1435,7 @@ mod tests {
         // includes path + kind, so a root-keyed invalidation could never match
         // the stored entry and would leak it.
         let owner = Mirror::new(
-            ClientHost::new("deb.example.com".to_owned()).expect("valid host"),
+            ClientHost::new("deb.example.com").expect("valid host"),
             None,
             "apt/amd64".to_owned(),
             MirrorKind::Flat,

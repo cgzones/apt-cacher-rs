@@ -484,7 +484,7 @@ mod tests {
         let t = throttle();
         let mirror = test_mirror();
         let other_mirror = Mirror::new(
-            ClientHost::new("archive.ubuntu.com".to_string()).expect("valid host"),
+            ClientHost::new("archive.ubuntu.com").expect("valid host"),
             None,
             String::new(),
             MirrorKind::Structured,

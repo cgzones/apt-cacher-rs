@@ -99,11 +99,33 @@ pub(crate) enum HttpsUpgradeMode {
     Never,
 }
 
+/// Why a host string is no [`DomainName`] (or no [`ConfigDomainName`]).
+///
+/// `Display` is the reason clause every rejection interpolates: the
+/// request edge's 400 line, the configuration error and the database row
+/// warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum HostError {
+    /// Neither a DNS name nor an IP address (nor, in the configuration, a
+    /// `*.` wildcard).
+    #[error("not a valid DNS name or IP address")]
+    Invalid,
+    /// An IPv6 address with a zone identifier (`fe80::1%eth0`, in a URI
+    /// `[fe80::1%25eth0]`). A zone names an interface of the host that
+    /// reads it, so it cannot name a mirror every client shares.
+    #[error("IPv6 zone identifiers are not supported")]
+    ZoneId,
+    /// A host followed by a port (`[2001:db8::1]:8080`, `example.org:80`),
+    /// where only a host belongs.
+    #[error("a host must not carry a port")]
+    Port,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigDomainNameInner {
-    Dns(String),
-    Ipv4(String, Ipv4Addr),
-    Ipv6(String, Ipv6Addr),
+    /// One host, parsed by [`DomainName::new`].
+    Exact(DomainName),
+    /// The suffix after `*`, including its leading dot, lowercase.
     Wildcard(String),
 }
 
@@ -114,60 +136,43 @@ enum ConfigDomainNameInner {
 pub(crate) struct ConfigDomainName(ConfigDomainNameInner);
 
 impl ConfigDomainName {
-    pub(crate) fn new(domain: String) -> Result<Self, String> {
-        if !is_valid_config_domain(&domain) {
-            return Err(domain);
-        }
+    /// A `*.`-prefixed wildcard, or any host [`DomainName::new`] accepts
+    /// (an IPv6 address bare or bracketed), so an entry and the host a
+    /// request names are parsed by one parser.
+    pub(crate) fn new(domain: impl AsRef<str>) -> Result<Self, HostError> {
+        let domain = domain.as_ref();
 
         // DNS names are case-insensitive: normalise so `DEB.debian.org` and
         // `deb.debian.org` are one allow-list entry, one cache tree and one
         // mirror row.
-        if let Some(d) = domain.strip_prefix('*') {
+        if let Some(suffix) = domain.strip_prefix('*') {
+            if !is_valid_wildcard(domain) {
+                return Err(HostError::Invalid);
+            }
             return Ok(Self(ConfigDomainNameInner::Wildcard(
-                d.to_ascii_lowercase(),
+                suffix.to_ascii_lowercase(),
             )));
         }
 
-        if domain.contains(':') {
-            return domain
-                .parse::<Ipv6Addr>()
-                .map(|addr| Self(ConfigDomainNameInner::Ipv6(addr.to_string(), addr)))
-                .map_err(|_parse_err| domain);
-        }
-
-        if let Ok(addr) = domain.parse::<Ipv4Addr>() {
-            return Ok(Self(ConfigDomainNameInner::Ipv4(addr.to_string(), addr)));
-        }
-
-        Ok(Self(ConfigDomainNameInner::Dns(
-            domain.to_ascii_lowercase(),
-        )))
+        DomainName::new(domain).map(|host| Self(ConfigDomainNameInner::Exact(host)))
     }
 
     #[must_use]
     #[inline]
-    pub(crate) const fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
-            Self(
-                ConfigDomainNameInner::Dns(s)
-                | ConfigDomainNameInner::Ipv4(s, _)
-                | ConfigDomainNameInner::Ipv6(s, _),
-            ) => Some(s.as_str()),
+            Self(ConfigDomainNameInner::Exact(host)) => Some(host.as_str()),
             Self(ConfigDomainNameInner::Wildcard(_)) => None,
         }
     }
 
+    /// Whether the entry admits `domain`, the canonical text of a
+    /// [`DomainName`] (its `as_str`).
     #[must_use]
     pub(crate) fn permits(&self, domain: &str) -> bool {
         match self {
             Self(ConfigDomainNameInner::Wildcard(d)) => domain.ends_with(d),
-            Self(ConfigDomainNameInner::Dns(d)) => domain == d,
-            Self(ConfigDomainNameInner::Ipv4(s, a)) => {
-                domain == s || domain.parse::<Ipv4Addr>().is_ok_and(|d| d == *a)
-            }
-            Self(ConfigDomainNameInner::Ipv6(s, a)) => {
-                domain == s || domain.parse::<Ipv6Addr>().is_ok_and(|d| d == *a)
-            }
+            Self(ConfigDomainNameInner::Exact(host)) => host.as_str() == domain,
         }
     }
 }
@@ -180,7 +185,12 @@ impl<'de> Deserialize<'de> for ConfigDomainName {
         use serde::de::Error as _;
         let s: String = Deserialize::deserialize(deserializer)?;
 
-        Self::new(s).map_err(|s| D::Error::custom(format!("Invalid configuration domain `{s}`")))
+        Self::new(&s).map_err(|err| {
+            D::Error::custom(format!(
+                "Invalid configuration domain `{}`: {err}",
+                s.escape_debug()
+            ))
+        })
     }
 }
 
@@ -197,16 +207,47 @@ enum DomainNameInner {
     Ipv6(std::sync::Arc<str>, Ipv6Addr),
 }
 
+/// A validated mirror host: a DNS name, an IPv4 or an IPv6 address.
+///
+/// The one parser for every host the proxy reads - a request's authority,
+/// a CONNECT target, a redirect `Location`, the configuration and a
+/// database row - so each spelling of a host maps to one value. The text it
+/// keeps ([`Self::as_str`]) is canonical and bare: a DNS name lowercased, an
+/// IPv6 address in its RFC 5952 form without brackets. That text keys every
+/// store and table; [`Self::format_authority`] is its URI form, for URIs,
+/// the `Host` header, cache directory names and log lines.
+/// `DomainName::new(h.as_str()) == Ok(h)` for every value.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct DomainName(DomainNameInner);
 
 impl DomainName {
-    pub(crate) fn new(domain: String) -> Result<Self, String> {
+    /// Parse a host. An IPv6 address may be bare (`2001:db8::1`, the
+    /// configuration's form) or bracketed (`[2001:db8::1]`, the URI form);
+    /// a zone identifier or a trailing port is rejected with its own
+    /// [`HostError`].
+    pub(crate) fn new(domain: impl AsRef<str>) -> Result<Self, HostError> {
+        let domain = domain.as_ref();
+
+        if let Some(rest) = domain.strip_prefix('[') {
+            let Some((inner, suffix)) = rest.split_once(']') else {
+                return Err(HostError::Invalid);
+            };
+            if !suffix.is_empty() {
+                return Err(if suffix.strip_prefix(':').is_some_and(is_port) {
+                    HostError::Port
+                } else {
+                    HostError::Invalid
+                });
+            }
+            return Self::ipv6(inner);
+        }
+
         if domain.contains(':') {
-            return domain
-                .parse::<Ipv6Addr>()
-                .map(|addr| Self(DomainNameInner::Ipv6(addr.to_string().into(), addr)))
-                .map_err(|_parse_err| domain);
+            return Self::ipv6(domain).map_err(|err| match domain.rsplit_once(':') {
+                // `example.org:80`, `192.0.2.1:80`: one colon, digits after it.
+                Some((host, port)) if !host.contains(':') && is_port(port) => HostError::Port,
+                Some(_) | None => err,
+            });
         }
 
         if let Ok(addr) = domain.parse::<Ipv4Addr>() {
@@ -216,14 +257,33 @@ impl DomainName {
         // At this point we've already proven there's no `:` and the string
         // is not a valid IPv4 address, so skip those branches in the
         // validator.
-        if is_valid_dns_label_string(&domain) {
+        if is_valid_dns_label_string(domain) {
             // DNS names are case-insensitive: one cache tree, mirror row and
             // registry scope per host, whatever case the client typed.
             Ok(Self(DomainNameInner::Dns(
                 domain.to_ascii_lowercase().into(),
             )))
         } else {
-            Err(domain)
+            Err(HostError::Invalid)
+        }
+    }
+
+    /// An IPv6 address without brackets.
+    fn ipv6(text: &str) -> Result<Self, HostError> {
+        match text.parse::<Ipv6Addr>() {
+            Ok(addr) => Ok(Self(DomainNameInner::Ipv6(addr.to_string().into(), addr))),
+            Err(_err @ std::net::AddrParseError { .. }) => {
+                // `%` never occurs in an address, so an address before it is
+                // a zone (`fe80::1%eth0`, percent-encoded `fe80::1%25eth0`).
+                if text
+                    .split_once('%')
+                    .is_some_and(|(addr, _zone)| addr.parse::<Ipv6Addr>().is_ok())
+                {
+                    Err(HostError::ZoneId)
+                } else {
+                    Err(HostError::Invalid)
+                }
+            }
         }
     }
 
@@ -313,7 +373,9 @@ impl<'de> Deserialize<'de> for DomainName {
         use serde::de::Error as _;
         let s: String = Deserialize::deserialize(deserializer)?;
 
-        Self::new(s).map_err(|s| D::Error::custom(format!("Invalid domain `{s}`")))
+        Self::new(&s).map_err(|err| {
+            D::Error::custom(format!("Invalid domain `{}`: {err}", s.escape_debug()))
+        })
     }
 }
 
@@ -354,7 +416,9 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for DomainName {
         value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
     ) -> Result<Self, sqlx::error::BoxDynError> {
         let s = <String as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value)?;
-        Self::new(s).map_err(|s| format!("Invalid domain in database: {s}").into())
+        Self::new(&s).map_err(|err| {
+            format!("Invalid domain in database `{}`: {err}", s.escape_debug()).into()
+        })
     }
 }
 
@@ -411,9 +475,9 @@ pub(crate) struct CacheHost(DomainName);
 impl ClientHost {
     /// Parse a [`ClientHost`] from a string.
     ///
-    /// Returns an error if the string is not a valid domain name.
-    pub(crate) fn new(host: String) -> Result<Self, String> {
-        Ok(Self(DomainName::new(host)?))
+    /// Returns why if the string is no valid host ([`DomainName::new`]).
+    pub(crate) fn new(host: impl AsRef<str>) -> Result<Self, HostError> {
+        DomainName::new(host).map(Self)
     }
 
     /// The host name as a string slice: what `Display` renders, without the
@@ -1277,9 +1341,8 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
     true
 }
 
-/// Validator for an allow-list entry: a bare IPv6 address, a DNS name (or
-/// IPv4 address, which is a valid label string), or a name carrying a
-/// leading `*.` wildcard label.
+/// Validator for a `*.` wildcard allow-list entry (the whole entry, `*`
+/// included); every other entry is a host [`DomainName::new`] parses.
 ///
 /// A wildcard must cover at least two further labels — `*.org` would hand
 /// a whole TLD to the proxy — and must not look like a partial IPv4
@@ -1287,25 +1350,22 @@ fn is_valid_dns_label_string(domain: &str) -> bool {
 /// match.  Everything past the wildcard is the plain DNS label rule, so it
 /// is checked by [`is_valid_dns_label_string`].
 #[must_use]
-fn is_valid_config_domain(domain: &str) -> bool {
+fn is_valid_wildcard(domain: &str) -> bool {
     /* No unicode characters allowed for now */
 
-    if domain.is_empty() || domain.len() > 253 {
-        return false;
-    }
-
-    // IPv6 addresses contain colons; wildcards don't apply to them
-    if domain.contains(':') {
-        return domain.parse::<Ipv6Addr>().is_ok();
-    }
-
     let Some(suffix) = domain.strip_prefix("*.") else {
-        return is_valid_dns_label_string(domain);
+        return false;
     };
 
     suffix.contains('.')
         && is_valid_dns_label_string(suffix)
         && !suffix.split('.').all(|part| part.parse::<u8>().is_ok())
+}
+
+/// A URI port: ASCII digits, at least one.
+#[must_use]
+fn is_port(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Warn about a path option that is not absolute.  Such a path still
@@ -1846,6 +1906,7 @@ impl Config {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::error::ErrorReport;
 
     fn bind(s: &str) -> BindOverride {
         let parsed = s.parse::<BindOverride>();
@@ -2064,7 +2125,7 @@ mod test {
         // which is the same set `cleanup_invalid_rows` uses to purge bad
         // mirror rows before `flat_blocklist::init` runs.
         fn accepts(s: &str) -> bool {
-            DomainName::new(s.to_owned()).is_ok()
+            DomainName::new(s).is_ok()
         }
 
         assert!(accepts("debian.org"));
@@ -2130,97 +2191,197 @@ mod test {
         assert!(!accepts("2001:db8::1::2"));
     }
 
+    /// Every spelling of an IPv6 host parses to one value whose text is the
+    /// bare RFC 5952 form; that text parses back to the same value.
     #[test]
-    fn test_is_valid_config_domain() {
-        assert!(is_valid_config_domain("debian.org"));
+    fn an_ipv6_host_parses_bare_or_bracketed_to_one_canonical_value() {
+        let canonical = dn("2001:db8::1");
+        for spelling in [
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "[2001:DB8::1]",
+            "2001:0db8:0:0:0:0:0:1",
+            "[2001:0db8:0000:0000:0000:0000:0000:0001]",
+        ] {
+            assert_eq!(
+                DomainName::new(spelling),
+                Ok(canonical.clone()),
+                "{spelling}"
+            );
+        }
+        assert_eq!(canonical.as_str(), "2001:db8::1");
+        assert_eq!(canonical.format_authority(None), "[2001:db8::1]");
+        assert_eq!(dn("[0:0::1]").as_str(), "::1");
 
-        assert!(is_valid_config_domain("salsa.debian.org"));
+        for host in [
+            "deb.debian.org",
+            "DEB.debian.ORG",
+            "192.0.2.1",
+            "::1",
+            "[::1]",
+        ] {
+            let parsed = dn(host);
+            assert_eq!(DomainName::new(parsed.as_str()), Ok(parsed), "{host}");
+        }
+    }
 
-        assert!(is_valid_config_domain("metadata.ftp-master.debian.org"));
+    #[test]
+    fn a_host_rejection_names_its_reason() {
+        for (input, reason) in [
+            ("fe80::1%eth0", HostError::ZoneId),
+            ("[fe80::1%eth0]", HostError::ZoneId),
+            ("[fe80::1%25eth0]", HostError::ZoneId),
+            ("[2001:db8::1]:8080", HostError::Port),
+            ("deb.debian.org:80", HostError::Port),
+            ("192.0.2.1:80", HostError::Port),
+            ("[2001:db8::1", HostError::Invalid),
+            ("[2001:db8::1]x", HostError::Invalid),
+            ("[2001:db8::1]:", HostError::Invalid),
+            ("[deb.debian.org]", HostError::Invalid),
+            ("[192.0.2.1]", HostError::Invalid),
+            ("[]", HostError::Invalid),
+            ("foo%bar", HostError::Invalid),
+            ("deb.debian.org:http", HostError::Invalid),
+        ] {
+            assert_eq!(DomainName::new(input), Err(reason), "{input}");
+        }
+    }
+
+    /// The configuration takes the parser's hosts, IPv6 bare or bracketed,
+    /// and the error names the reason.
+    #[test]
+    fn a_config_entry_takes_a_bracketed_ipv6_host() {
+        let cfg = Config::from_toml(
+            "allowed_mirrors = ['[2001:db8::1]', '2001:db8::2']\n\
+             https_tunnel_allowed_mirrors = ['[2001:DB8::3]']\n\
+             aliases = [ ['[2001:db8::1]', ['[2001:db8::4]']] ]\n",
+        )
+        .expect("bracketed IPv6 hosts are valid configuration");
+        let allowed: Vec<_> = cfg
+            .allowed_mirrors
+            .iter()
+            .map(ConfigDomainName::as_str)
+            .collect();
+        assert_eq!(allowed, [Some("2001:db8::1"), Some("2001:db8::2")]);
+        assert_eq!(cfg.https_tunnel_allowed_mirrors, [dn("2001:db8::3")]);
+        assert!(
+            resolve_alias(&cfg.aliases, &clh("2001:db8::4"))
+                .is_some_and(|main| main.as_str() == "2001:db8::1")
+        );
+
+        for (entry, reason) in [
+            ("[2001:db8::1]:8080", "a host must not carry a port"),
+            ("[fe80::1%eth0]", "IPv6 zone identifiers are not supported"),
+            ("deb_ian.org", "not a valid DNS name or IP address"),
+        ] {
+            let err = Config::from_toml(&format!("allowed_mirrors = ['{entry}']\n"))
+                .expect_err("invalid entry");
+            let rendered = format!("{}", ErrorReport(&err));
+            assert!(
+                rendered.contains(&format!("Invalid configuration domain `{entry}`: {reason}")),
+                "{entry}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_accepts_config() {
+        fn accepts_config(s: &str) -> bool {
+            ConfigDomainName::new(s).is_ok()
+        }
+
+        assert!(accepts_config("debian.org"));
+
+        assert!(accepts_config("salsa.debian.org"));
+
+        assert!(accepts_config("metadata.ftp-master.debian.org"));
 
         // empty
-        assert!(!is_valid_config_domain(""));
+        assert!(!accepts_config(""));
 
         // double dots
-        assert!(!is_valid_config_domain("debian..org"));
+        assert!(!accepts_config("debian..org"));
 
         // short part
-        assert!(is_valid_config_domain("debian.f.org"));
+        assert!(accepts_config("debian.f.org"));
 
         // too long part
-        assert!(!is_valid_config_domain(
+        assert!(!accepts_config(
             "debian.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789AAA.org"
         ));
 
         // starting dash
-        assert!(!is_valid_config_domain("-debian.org"));
+        assert!(!accepts_config("-debian.org"));
 
         // ending dash
-        assert!(!is_valid_config_domain("debian-.org"));
+        assert!(!accepts_config("debian-.org"));
 
         // dash in position 2
-        assert!(is_valid_config_domain("d-ebian.org"));
+        assert!(accepts_config("d-ebian.org"));
 
         // dash in position 3
-        assert!(is_valid_config_domain("de-bian.org"));
+        assert!(accepts_config("de-bian.org"));
 
         // dash in position 4
-        assert!(is_valid_config_domain("deb-ian.org"));
+        assert!(accepts_config("deb-ian.org"));
 
         // dash in position 5
-        assert!(is_valid_config_domain("debi-an.org"));
+        assert!(accepts_config("debi-an.org"));
 
         // invalid char
-        assert!(!is_valid_config_domain("deb_ian.org"));
+        assert!(!accepts_config("deb_ian.org"));
 
         // special directory entry
-        assert!(!is_valid_config_domain("."));
-        assert!(!is_valid_config_domain(".."));
-        assert!(!is_valid_config_domain("foo/bar"));
+        assert!(!accepts_config("."));
+        assert!(!accepts_config(".."));
+        assert!(!accepts_config("foo/bar"));
 
         // wild card
-        assert!(is_valid_config_domain("*.debian.org"));
-        assert!(!is_valid_config_domain("*e.debian.org"));
-        assert!(!is_valid_config_domain("deb.*.debian.org"));
-        assert!(!is_valid_config_domain("debian.*"));
+        assert!(accepts_config("*.debian.org"));
+        assert!(!accepts_config("*e.debian.org"));
+        assert!(!accepts_config("deb.*.debian.org"));
+        assert!(!accepts_config("debian.*"));
 
         // wildcard minimum depth (must have at least 3 parts)
-        assert!(!is_valid_config_domain("*.org"));
-        assert!(!is_valid_config_domain("*.com"));
-        assert!(is_valid_config_domain("*.debian.org"));
-        assert!(is_valid_config_domain("*.ftp.debian.org"));
+        assert!(!accepts_config("*.org"));
+        assert!(!accepts_config("*.com"));
+        assert!(accepts_config("*.debian.org"));
+        assert!(accepts_config("*.ftp.debian.org"));
 
         // a wildcard is the whole first label and nothing else
-        assert!(!is_valid_config_domain("*"));
-        assert!(!is_valid_config_domain("*."));
-        assert!(!is_valid_config_domain("**.debian.org"));
-        assert!(!is_valid_config_domain("*-.debian.org"));
-        assert!(!is_valid_config_domain("*.debian.org."));
+        assert!(!accepts_config("*"));
+        assert!(!accepts_config("*."));
+        assert!(!accepts_config("**.debian.org"));
+        assert!(!accepts_config("*-.debian.org"));
+        assert!(!accepts_config("*.debian.org."));
 
         // IPv4 addresses
-        assert!(is_valid_config_domain("192.168.1.1"));
-        assert!(is_valid_config_domain("10.0.0.1"));
-        assert!(is_valid_config_domain("127.0.0.1"));
-        assert!(is_valid_config_domain("255.255.255.255"));
+        assert!(accepts_config("192.168.1.1"));
+        assert!(accepts_config("10.0.0.1"));
+        assert!(accepts_config("127.0.0.1"));
+        assert!(accepts_config("255.255.255.255"));
 
         // IPv6 addresses
-        assert!(is_valid_config_domain("::1"));
-        assert!(is_valid_config_domain("2001:db8::1"));
-        assert!(is_valid_config_domain("fe80::1"));
-        assert!(is_valid_config_domain("::ffff:192.168.1.1"));
-        assert!(is_valid_config_domain(
-            "2001:0db8:0000:0000:0000:0000:0000:0001"
-        ));
+        assert!(accepts_config("::1"));
+        assert!(accepts_config("2001:db8::1"));
+        assert!(accepts_config("fe80::1"));
+        assert!(accepts_config("::ffff:192.168.1.1"));
+        assert!(accepts_config("2001:0db8:0000:0000:0000:0000:0000:0001"));
 
         // invalid IPv6
-        assert!(!is_valid_config_domain(":::1"));
-        assert!(!is_valid_config_domain("2001:db8::xyz"));
-        assert!(!is_valid_config_domain("2001:db8::1::2"));
+        assert!(!accepts_config(":::1"));
+        assert!(!accepts_config("2001:db8::xyz"));
+        assert!(!accepts_config("2001:db8::1::2"));
+
+        // bracketed IPv6, but no port and no wildcard around an address
+        assert!(accepts_config("[2001:db8::1]"));
+        assert!(!accepts_config("[2001:db8::1]:8080"));
+        assert!(!accepts_config("*.[2001:db8::1]"));
 
         // Wildcards that look like partial IPv4 addresses
-        assert!(!is_valid_config_domain("*.1.1"));
-        assert!(!is_valid_config_domain("*.168.1.1"));
-        assert!(!is_valid_config_domain("*.0.0.1"));
+        assert!(!accepts_config("*.1.1"));
+        assert!(!accepts_config("*.168.1.1"));
+        assert!(!accepts_config("*.0.0.1"));
     }
 
     // -----------------------------------------------------------------
@@ -2228,11 +2389,11 @@ mod test {
     // -----------------------------------------------------------------
 
     fn dn(s: &str) -> DomainName {
-        DomainName::new(s.to_owned()).expect("test input must be a valid domain")
+        DomainName::new(s).expect("test input must be a valid domain")
     }
 
     fn clh(s: &str) -> ClientHost {
-        ClientHost::new(s.to_owned()).expect("test input must be a valid domain")
+        ClientHost::new(s).expect("test input must be a valid domain")
     }
 
     fn cah(s: &str) -> CacheHost {
@@ -2254,12 +2415,12 @@ mod test {
     fn domain_names_are_case_insensitive() {
         // DNS is case-insensitive; a mixed-case request host must map onto
         // the same cache tree, mirror row and allow-list entry.
-        let host = DomainName::new("DEB.Debian.ORG".to_owned()).expect("valid");
+        let host = DomainName::new("DEB.Debian.ORG").expect("valid");
         assert_eq!(host.as_str(), "deb.debian.org");
-        let exact = ConfigDomainName::new("Deb.debian.org".to_owned()).expect("valid");
+        let exact = ConfigDomainName::new("Deb.debian.org").expect("valid");
         assert!(exact.permits("deb.debian.org"));
         assert_eq!(exact.as_str(), Some("deb.debian.org"));
-        let wildcard = ConfigDomainName::new("*.Debian.ORG".to_owned()).expect("valid");
+        let wildcard = ConfigDomainName::new("*.Debian.ORG").expect("valid");
         assert!(wildcard.permits("deb.debian.org"));
     }
 

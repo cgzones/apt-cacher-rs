@@ -1452,7 +1452,7 @@ mod tests {
         // URL.
         let origin = Origin::from_path(
             PATH,
-            ClientHost::new("deb.debian.org".to_string()).unwrap(),
+            ClientHost::new("deb.debian.org").unwrap(),
             None,
             &local_client(),
         )
@@ -1466,7 +1466,7 @@ mod tests {
     fn test_parse_1() {
         let result = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/Packages",
-            ClientHost::new("deb.debian.org".to_string()).unwrap(),
+            ClientHost::new("deb.debian.org").unwrap(),
             None,
             &local_client(),
         )
@@ -1475,7 +1475,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    ClientHost::new("deb.debian.org".to_string()).unwrap(),
+                    ClientHost::new("deb.debian.org").unwrap(),
                     None,
                     "debian".to_string(),
                     MirrorKind::Structured,
@@ -1498,7 +1498,7 @@ mod tests {
         let result = Origin::from_path(
             "/private/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
         84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
-            ClientHost::new("site.example.com".to_string()).unwrap(),
+            ClientHost::new("site.example.com").unwrap(),
             Some(nonzero!(80)),
             &local_client(),
         )
@@ -1507,7 +1507,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    ClientHost::new("site.example.com".to_string()).unwrap(),
+                    ClientHost::new("site.example.com").unwrap(),
                     Some(nonzero!(80)),
                     "private/debian".to_string(),
                     MirrorKind::Structured,
@@ -1529,7 +1529,7 @@ mod tests {
     fn test_parse_3() {
         let result = Origin::from_path(
             "/unstable/dists/llvm-toolchain-19/main/binary-amd64/Packages.gz",
-            ClientHost::new("apt.llvm.org".to_string()).unwrap(),
+            ClientHost::new("apt.llvm.org").unwrap(),
             Some(nonzero!(443)),
             &local_client(),
         )
@@ -1538,7 +1538,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    ClientHost::new("apt.llvm.org".to_string()).unwrap(),
+                    ClientHost::new("apt.llvm.org").unwrap(),
                     Some(nonzero!(443)),
                     "unstable".to_string(),
                     MirrorKind::Structured,
@@ -1560,7 +1560,7 @@ mod tests {
     fn test_parse_ipv6() {
         let result = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/Packages",
-            ClientHost::new("2001:db8::1".to_string()).unwrap(),
+            ClientHost::new("2001:db8::1").unwrap(),
             None,
             &local_client(),
         )
@@ -1569,7 +1569,7 @@ mod tests {
             result,
             Origin {
                 mirror: Mirror::new(
-                    ClientHost::new("2001:db8::1".to_string()).unwrap(),
+                    ClientHost::new("2001:db8::1").unwrap(),
                     None,
                     "debian".to_string(),
                     MirrorKind::Structured,
@@ -1589,7 +1589,7 @@ mod tests {
         // IPv6 with port
         let result = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/Packages",
-            ClientHost::new("::1".to_string()).unwrap(),
+            ClientHost::new("::1").unwrap(),
             Some(nonzero!(8080)),
             &local_client(),
         )
@@ -2522,7 +2522,7 @@ mod tests {
 
     #[test]
     fn test_origin_from_path_double_slash() {
-        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let host = || ClientHost::new("deb.debian.org").unwrap();
 
         // `//` in the mirror path resolves to the same Origin as the
         // un-doubled form thanks to internal normalisation.
@@ -2561,7 +2561,7 @@ mod tests {
     #[test]
     fn pseudo_architectures_mint_no_origin() {
         const DIGEST: &str = "84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83";
-        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let host = || ClientHost::new("deb.debian.org").unwrap();
         for arch in ["dep11", "i18n", "source"] {
             let path = format!("/debian/dists/sid/main/{arch}/by-hash/SHA256/{DIGEST}");
             assert_eq!(
@@ -2584,7 +2584,7 @@ mod tests {
     #[test]
     fn non_binary_directories_mint_no_origin() {
         const DIGEST: &str = "84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83";
-        let host = || ClientHost::new("archive.ubuntu.com".to_string()).unwrap();
+        let host = || ClientHost::new("archive.ubuntu.com").unwrap();
         // `binary-` with an empty suffix names no architecture either; the
         // per-component `Release` parser has always rejected it.
         for dir in ["cnf", "uefi", "signed", "binary-"] {
@@ -2603,7 +2603,7 @@ mod tests {
         // with unconsumed/unvalidated `SHA*/<hex>` segments.  The architecture
         // segment is the canonical apt arch (`binary-amd64`), not the literal
         // string `"by-hash"`.
-        let host = ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let host = ClientHost::new("deb.debian.org").unwrap();
         let parsed = Origin::from_path(
             "/debian/dists/sid/main/binary-amd64/by-hash/SHA256/\
              84b902c50d12a499fb2156ca2190ddaa9bb9dd8c7354aaccfc56590318bc0b83",
@@ -2621,7 +2621,7 @@ mod tests {
 
     #[test]
     fn test_origin_from_path_byhash_validates_algo_and_digest() {
-        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let host = || ClientHost::new("deb.debian.org").unwrap();
 
         // SHA512 with a 128-char hex digest: accepted.
         let sha512_digest = "4f8878062744fae5ff91f1ad0f3efecc760514381bf029d06bdf7023cfc379ba\
@@ -2707,7 +2707,7 @@ mod tests {
 
     #[test]
     fn test_origin_from_path_rejects_trailing_junk() {
-        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let host = || ClientHost::new("deb.debian.org").unwrap();
 
         // Trailing non-empty segment after `Packages`: rejected.  Previously
         // silently accepted, masking unrecognised URL shapes as valid origins.
@@ -2773,7 +2773,7 @@ mod tests {
     /// `from_path` now accepts exactly what `classify_request` caches.
     #[test]
     fn test_origin_from_path_validates_like_the_classifier() {
-        let host = || ClientHost::new("deb.debian.org".to_string()).unwrap();
+        let host = || ClientHost::new("deb.debian.org").unwrap();
         let from = |path: &str| Origin::from_path(path, host(), None, &local_client());
 
         for path in [

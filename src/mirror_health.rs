@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn the_snapshot_key_is_the_mirror_uri_rendering() {
         let mirror = Mirror::new(
-            ClientHost::new(String::from("health-key.example")).expect("valid host"),
+            ClientHost::new("health-key.example").expect("valid host"),
             std::num::NonZero::new(8080),
             String::from("debian"),
             MirrorKind::Structured,

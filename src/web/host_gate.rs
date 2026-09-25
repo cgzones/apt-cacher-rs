@@ -120,10 +120,7 @@ mod tests {
     use super::*;
 
     fn configured(names: &[&str]) -> Vec<DomainName> {
-        names
-            .iter()
-            .map(|n| DomainName::new((*n).to_owned()).unwrap())
-            .collect()
+        names.iter().map(|n| DomainName::new(*n).unwrap()).collect()
     }
 
     #[test]

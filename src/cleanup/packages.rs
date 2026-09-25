@@ -960,7 +960,7 @@ mod tests {
         let mut file_list = cands(&["pkg.deb", "other.deb"]);
 
         let mirror = Mirror::new(
-            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
             "apt/amd64".to_owned(),
             MirrorKind::Flat,
@@ -1031,7 +1031,7 @@ mod tests {
         // existing process_stanza_flat_prefix_strips_in_subtree_and_drops_siblings
         // test in this module.
         let mirror = Mirror::new(
-            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
             "apt/amd64".to_owned(),
             MirrorKind::Flat,
@@ -1083,7 +1083,7 @@ mod tests {
 
         let config: Config = toml::from_str("").expect("default config");
         let mirror = Mirror::new(
-            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
             "apt/amd64".to_owned(),
             MirrorKind::Flat,
@@ -1130,7 +1130,7 @@ mod tests {
 
         let config: Config = toml::from_str("").expect("default config");
         let mirror = Mirror::new(
-            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
             "debian".to_owned(),
             MirrorKind::Structured,
@@ -1202,7 +1202,7 @@ mod tests {
 
         let config: Config = toml::from_str("").expect("default config");
         let mirror = Mirror::new(
-            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
             "debian".to_owned(),
             MirrorKind::Structured,
@@ -1260,7 +1260,7 @@ mod tests {
 
         let config: Config = toml::from_str("").expect("default config");
         let mirror = Mirror::new(
-            ClientHost::new("example.com".to_owned()).expect("valid host"),
+            ClientHost::new("example.com").expect("valid host"),
             None::<NonZero<u16>>,
             "debian".to_owned(),
             MirrorKind::Structured,
