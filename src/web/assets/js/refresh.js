@@ -15,6 +15,13 @@
 
   const MAX_BACKOFF_MS = 5 * 60 * 1000;
   const FETCH_TIMEOUT_MS = 30 * 1000;
+  /* Pages fetched and swapped in since load: each is a web-interface
+   * request the Metrics counters count (series.js discounts them). */
+  let polls = 0;
+  /* Section -> `polls` when it was swapped in: the page's own fetches its
+   * figures count. A section still from the load (or left alone since,
+   * see `busy`) has no entry, or its older one. */
+  const snapshots = new WeakMap();
 
   let timer = null;
   let inFlight = false;
@@ -147,6 +154,7 @@
       window.location.reload();
       return;
     }
+    polls += 1;
     ACR.keepScroll(function () {
       const current = topSections(document);
       const fresh = topSections(doc);
@@ -173,6 +181,7 @@
         } else {
           document.body.prepend(node);
         }
+        snapshots.set(node, polls);
         swapped.push(node);
         previous = node;
       }
@@ -357,5 +366,14 @@
     }
   });
 
-  ACR.expose("refresh", { fetchPage: fetchPage, swap: swap, now: refreshNow });
+  ACR.expose("refresh", {
+    fetchPage: fetchPage,
+    swap: swap,
+    now: refreshNow,
+    /* The page's own fetches counted in `section`'s figures: 0 for a
+     * section still from the load. */
+    polls: function (section) {
+      return snapshots.get(section) || 0;
+    }
+  });
 })();

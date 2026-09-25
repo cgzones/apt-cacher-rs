@@ -13,7 +13,11 @@ use std::fmt::Display;
 
 use crate::{metrics::Signal, swrite};
 
-use super::fmt::{HtmlEscaped, Level, Nonzero, RelTime, StackBar, now_epoch};
+use crate::humanfmt::HumanFmt;
+
+use super::fmt::{
+    Count, HtmlEscape, HtmlEscaped, Level, Nonzero, RelTime, StackBar, Unit, now_epoch,
+};
 
 // ---------------------------------------------------------------------------
 // Table builders — append rows directly via `swrite!`. `Table::cell` needs to
@@ -347,6 +351,29 @@ impl DetailsList {
         self.entry(label).tip(tooltip).value(value);
     }
 
+    /// A counter row: the count as its value, and as its figure for the
+    /// scripts (see [`Entry::figure`]).
+    pub(super) fn count(&mut self, label: &'static str, value: u64) {
+        self.entry(label).figure(value).value(Count(value));
+    }
+
+    /// [`Self::count`] with a tooltip.
+    pub(super) fn count_tip(&mut self, label: &'static str, tooltip: &'static str, value: u64) {
+        self.entry(label)
+            .tip(tooltip)
+            .figure(value)
+            .value(Count(value));
+    }
+
+    /// A byte-counter row with a tooltip: the size as its value, the bytes
+    /// as its figure.
+    pub(super) fn bytes_tip(&mut self, label: &'static str, tooltip: &'static str, value: u64) {
+        self.entry(label)
+            .tip(tooltip)
+            .bytes(value)
+            .value(HumanFmt::Size(value));
+    }
+
     /// A bad-sign counter: its value painted at `level` once non-zero, with
     /// the time it last moved beside it.
     pub(super) fn signal(
@@ -384,6 +411,8 @@ impl DetailsList {
             last: None,
             note: None,
             kind: Kind::Plain,
+            figure: None,
+            polled: false,
         }
     }
 
@@ -439,6 +468,11 @@ pub(super) struct Entry<'a> {
     /// A line of context under the value (see [`Entry::note`]).
     note: Option<String>,
     kind: Kind,
+    /// The counter behind the value (see [`Entry::figure`]).
+    figure: Option<(u64, Unit)>,
+    /// Whether the page's own background refresh moves the figure (see
+    /// [`Entry::polled`]).
+    polled: bool,
 }
 
 impl Entry<'_> {
@@ -467,7 +501,35 @@ impl Entry<'_> {
     /// with the time it last moved.
     pub(super) fn signal(self, level: Level, signal: &Signal) {
         let value = signal.get();
-        self.last(signal.last()).value(Nonzero { value, level });
+        self.last(signal.last())
+            .figure(value)
+            .value(Nonzero { value, level });
+    }
+
+    /// The counter this row shows, which only ever grows while the daemon
+    /// runs, as `data-series="{label}" data-v="{value}"` on the row: the
+    /// optional scripts sample it across refreshes to show what moved since
+    /// the page was opened. On the row's `<div>`, never the value's `<dd>`,
+    /// which stays the bare figure. Gauges, peaks and per-run figures carry
+    /// none: their movement is not an event count.
+    pub(super) fn figure(mut self, value: u64) -> Self {
+        self.figure = Some((value, Unit::Count));
+        self
+    }
+
+    /// [`Self::figure`] for a byte counter (`data-unit="B"`).
+    pub(super) fn bytes(mut self, value: u64) -> Self {
+        self.figure = Some((value, Unit::Bytes));
+        self
+    }
+
+    /// Marks a figure every web-interface request moves by one, the
+    /// page's own background refresh included (`data-polled`): the script
+    /// subtracts its own fetches before calling it moved, or an idle daemon
+    /// would read as busy.
+    pub(super) fn polled(mut self) -> Self {
+        self.polled = true;
+        self
     }
 
     /// When the counter this row shows last moved (Unix seconds), rendered
@@ -502,6 +564,8 @@ impl Entry<'_> {
             last,
             note,
             kind,
+            figure,
+            polled,
         } = self;
         let DetailsList {
             out,
@@ -509,12 +573,27 @@ impl Entry<'_> {
             highlights,
         } = list;
         let row_start = out.len();
+        out.push_str("<div");
         match (parts.is_some(), kind.class()) {
-            (false, None) => out.push_str("<div><dt"),
-            (true, None) => out.push_str("<div class=\"whole\"><dt"),
-            (false, Some(kind)) => swrite!(out, "<div class=\"{kind}\"><dt"),
-            (true, Some(kind)) => swrite!(out, "<div class=\"whole {kind}\"><dt"),
+            (false, None) => {}
+            (true, None) => out.push_str(" class=\"whole\""),
+            (false, Some(kind)) => swrite!(out, " class=\"{kind}\""),
+            (true, Some(kind)) => swrite!(out, " class=\"whole {kind}\""),
         }
+        if let Some((value, unit)) = figure {
+            swrite!(
+                out,
+                " data-series=\"{}\" data-v=\"{value}\"",
+                HtmlEscape(label)
+            );
+            if unit == Unit::Bytes {
+                out.push_str(" data-unit=\"B\"");
+            }
+            if polled {
+                out.push_str(" data-polled");
+            }
+        }
+        out.push_str("><dt");
         if let Some(tip) = tip {
             swrite!(out, " title=\"{tip}\"");
         }
@@ -683,7 +762,7 @@ mod tests {
         DetailsList, Highlights, Kind, Rows, Table, when, write_collapsible_details_badged,
         write_collapsible_section, write_section,
     };
-    use crate::web::fmt::{Level, Nonzero};
+    use crate::web::fmt::{Count, Level, Nonzero};
 
     #[test]
     fn table_wraps_header_row() {
@@ -820,6 +899,26 @@ mod tests {
             html.contains("<div><dt>Never</dt><dd>0</dd></div>"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn counters_carry_their_figure_on_the_row_not_the_value() {
+        let mut list = DetailsList::with_now(0);
+        list.count("Plain", 12_345);
+        list.count_tip("Tipped", "why", 0);
+        list.bytes_tip("Bytes", "size", 2_000_000);
+        list.entry("Gauge").kind(Kind::Live).value(Count(3));
+        list.entry("Polled").polled().figure(4).value(Count(4));
+        let html = list.finish();
+        for needle in [
+            "<div data-series=\"Plain\" data-v=\"12345\"><dt>Plain</dt><dd>12\u{202f}345</dd></div>",
+            "<div data-series=\"Tipped\" data-v=\"0\"><dt title=\"why\">Tipped</dt><dd>0</dd>",
+            "<div data-series=\"Bytes\" data-v=\"2000000\" data-unit=\"B\"><dt title=\"size\">Bytes</dt><dd>2.00MB</dd>",
+            "<div class=\"k-live\"><dt>Gauge</dt><dd>3</dd></div>",
+            "<div data-series=\"Polled\" data-v=\"4\" data-polled><dt>Polled</dt><dd>4</dd></div>",
+        ] {
+            assert!(html.contains(needle), "{needle}: {html}");
+        }
     }
 
     #[test]

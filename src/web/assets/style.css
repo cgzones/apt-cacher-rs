@@ -273,6 +273,14 @@ th[aria-sort="descending"] button.sort::after { content: " \25BC"; font-size: 0.
 .filter input[type="search"] { min-width: 14em; }
 .filter-check { color: var(--details-key-fg); cursor: pointer; }
 .filter-shown { color: var(--details-key-fg); font-family: var(--mono); font-size: 0.9em; }
+/* A counter that moved while the page was open (series.js). */
+dl.details dd.delta { color: var(--link); font-weight: 600; font-size: 0.75em; font-family: var(--mono); }
+/* Moved in the latest refresh: marked without motion too. */
+dl.details dd.delta.moved { text-decoration: underline; }
+@media (prefers-reduced-motion: no-preference) {
+    dl.details dd.delta.moved { animation: moved 1.6s ease-out; }
+}
+@keyframes moved { from { background: var(--count-bg); } to { background: transparent; } }
 
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }

@@ -187,8 +187,12 @@ fn delivery_path(
     let [requests_label, bytes_label] = labels;
     let [requests_tip, bytes_tip] = tips;
     let [requests, served] = counters;
-    t.row_tip(requests_label, requests_tip, Funnel::load(requests, served));
-    t.row_tip(bytes_label, bytes_tip, HumanFmt::Size(bytes));
+    let funnel = Funnel::load(requests, served);
+    t.entry(requests_label)
+        .tip(requests_tip)
+        .figure(funnel.requests)
+        .value(funnel);
+    t.bytes_tip(bytes_label, bytes_tip, bytes);
 }
 
 /// The section's markup and how many of its rows are highlighted, for the
@@ -200,7 +204,7 @@ pub(super) fn build_metrics_html(start_epoch: i64) -> (String, Highlights) {
     let mut g = Groups::new();
     swrite!(
         g.out,
-        "<p class=\"scope-note\">Counts since the daemon started, {}: a restart resets them. A highlighted row says when it last moved; live and peak values are marked.</p>",
+        "<p class=\"scope-note\" data-started=\"{start_epoch}\">Counts since the daemon started, {}: a restart resets them. A highlighted row says when it last moved; live and peak values are marked.</p>",
         RelTime {
             epoch: start_epoch,
             now: now_epoch(),
@@ -276,36 +280,45 @@ fn build_requests_group(g: &mut Groups) {
             ],
             unit: Unit::Count,
         });
-        t.row_tip(
-            "Requests \u{2192} Served",
-            "Total HTTP requests handled \u{2192} requests whose response body was fully delivered to the client.",
-            all,
-        );
-        t.row_tip(
-            "Web UI Requests \u{2192} Served",
-            "The same split for the local web interface.",
-            webui,
-        );
+        // Every web-interface request moves these four rows, a script's
+        // background refresh included; `polled` lets it discount its own.
+        t.entry("Requests \u{2192} Served")
+            .tip("Total HTTP requests handled \u{2192} requests whose response body was fully delivered to the client.")
+            .polled()
+            .figure(all.requests)
+            .value(all);
+        t.entry("Web UI Requests \u{2192} Served")
+            .tip("The same split for the local web interface.")
+            .polled()
+            .figure(webui.requests)
+            .value(webui);
         t.entry("Client 2xx")
             .tip("Successful responses returned to clients. A relayed 203 or 204 counts here without a code row of its own, so the class may exceed 200 + 206; it warns only if the code rows exceed the class, which is a counting bug.")
             .parts(|p| {
-                p.row("Client 200 OK", Count(status_200));
-                p.row("Client 206 Partial Content", Count(status_206));
+                p.entry("Client 200 OK")
+                    .polled()
+                    .figure(status_200)
+                    .value(Count(status_200));
+                p.count("Client 206 Partial Content", status_206);
             })
+            .polled()
+            .figure(status_2xx)
             .value(warn_if(Count(status_2xx), status_200 + status_206 > status_2xx));
         t.entry("Client 3xx")
             .tip("Redirect and not-modified responses returned to clients. A relayed upstream redirect counts here without a code row of its own, so the class may exceed 304; it warns only if 304 exceeds the class, which is a counting bug.")
-            .parts(|p| p.row("Client 304 Not Modified", Count(status_304)))
+            .parts(|p| p.count("Client 304 Not Modified", status_304))
+            .figure(status_3xx)
             .value(warn_if(Count(status_3xx), status_304 > status_3xx));
         t.entry("Client 4xx")
             .tip("Client-error responses. Not highlighted: pdiff rejections, missing packages relayed from a mirror and web-interface 404 probes land here routinely.")
             .parts(|p| {
-                p.row("Client 410 Gone", Count(metrics::CLIENT_STATUS_410.get()));
-                p.row(
+                p.count("Client 410 Gone", metrics::CLIENT_STATUS_410.get());
+                p.count(
                     "Client 416 Range Not Satisfiable",
-                    Count(metrics::CLIENT_STATUS_416.get()),
+                    metrics::CLIENT_STATUS_416.get(),
                 );
             })
+            .figure(status_4xx)
             .value(Count(status_4xx));
         t.entry("Client 5xx")
             .tip("Server-error responses returned to clients, relayed upstream errors included. A mix of causes with different remedies, so the class only warns; the code rows say which one moved.")
@@ -337,10 +350,10 @@ fn build_requests_group(g: &mut Groups) {
             &metrics::CLIENT_STATUS_OTHER,
         );
         if SENDFILE {
-            t.row_tip(
+            t.count_tip(
                 "Read Failures (peer disconnect)",
                 "Request-header reads the client reset or closed in the middle of a header. A clean close between keep-alive requests is not counted. Not highlighted: flaky client links.",
-                Count(metrics::REQUEST_READ_PEER_DISCONNECT.get()),
+                metrics::REQUEST_READ_PEER_DISCONNECT.get(),
             );
             t.signal(
                 "Read Failures (protocol error)",
@@ -348,17 +361,17 @@ fn build_requests_group(g: &mut Groups) {
                 Level::Warn,
                 &metrics::REQUEST_READ_PROTOCOL_ERROR,
             );
-            t.row_tip(
+            t.count_tip(
                 "Timeouts (client header read)",
                 "Clients that sent no complete request header within client_idle_timeout (slow-loris shaped, or idle between keep-alive requests). Not highlighted: idle keep-alive connections end this way.",
-                Count(metrics::HTTP_TIMEOUT_CLIENT_HEADER.get()),
+                metrics::HTTP_TIMEOUT_CLIENT_HEADER.get(),
             );
         }
         if HYPER {
-            t.row_tip(
+            t.count_tip(
                 "Unhandled Request Headers",
                 "HTTP request headers outside the daemon's known set, counted per header, on requests that start a download in the hyper backend. A developer's discovery signal, not an operator alarm; the log names the header.",
-                Count(metrics::UNHANDLED_REQUEST_HEADERS.get()),
+                metrics::UNHANDLED_REQUEST_HEADERS.get(),
             );
         }
     });
@@ -409,10 +422,10 @@ fn build_connections_group(g: &mut Groups) {
 
 fn build_refusals_group(g: &mut Groups, shown: Shown) {
     g.group("Request Refusals", |t| {
-        t.row_tip(
+        t.count_tip(
             "Rejected (pdiff)",
             "Client requests for pdiff resources, refused because reject_pdiff_requests is set. Not highlighted: apt falls back to the full index.",
-            Count(metrics::PDIFF_REJECTED.get()),
+            metrics::PDIFF_REJECTED.get(),
         );
         t.signal(
             "Rejected (unsafe path)",
@@ -426,20 +439,20 @@ fn build_refusals_group(g: &mut Groups, shown: Shown) {
             Level::Warn,
             &metrics::PROXY_LOOP_REJECTED,
         );
-        t.row_tip(
+        t.count_tip(
             "Authorization Rejected (mirror)",
             "Requests refused because the requested mirror is outside allowed_mirrors. The Clients table names the client; add the mirror, or fix the client's sources.",
-            Count(metrics::AUTHZ_REJECTED_MIRROR.get()),
+            metrics::AUTHZ_REJECTED_MIRROR.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Authorization Rejected (client)",
             "Requests refused because the source address is outside allowed_proxy_clients. The Clients table names the client.",
-            Count(metrics::AUTHZ_REJECTED_CLIENT.get()),
+            metrics::AUTHZ_REJECTED_CLIENT.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Authorization Rejected (web interface)",
             "Web-interface requests refused because the source address is outside allowed_webif_clients (falling back to allowed_proxy_clients).",
-            Count(metrics::AUTHZ_REJECTED_WEBUI.get()),
+            metrics::AUTHZ_REJECTED_WEBUI.get(),
         );
         t.signal(
             "Authorization Rejected (web-interface host)",
@@ -450,10 +463,10 @@ fn build_refusals_group(g: &mut Groups, shown: Shown) {
         if !shown.tunnels {
             // The tunnel group is hidden while tunnels are off, and this is
             // the one tunnel counter that still moves then.
-            t.row_tip(
+            t.count_tip(
                 "CONNECT Refused (tunnels disabled)",
                 "CONNECT requests refused because https_tunnel_enabled is off. Enable it (with https_tunnel_allowed_mirrors) if clients need HTTPS repositories through this proxy.",
-                Count(metrics::TUNNEL_REJECTED_POLICY.get()),
+                metrics::TUNNEL_REJECTED_POLICY.get(),
             );
         }
     });
@@ -498,20 +511,20 @@ fn build_admission_group(g: &mut Groups) {
                 value: global_verify_throttle().active_len() as u64,
                 level: Level::Warn,
             });
-        t.row_tip(
+        t.count_tip(
             "Downloads Declined",
             "Registered downloads answered without fetching a body, so not aborts: the upstream status was relayed uncached (a 404, say), the answer was refused (oversize, bad framing, an empty index body), or disk_quota, min_disk_free, the checksum verify throttle or max_passthrough_relays refused it. A max_upstream_downloads refusal never registers and counts in Downloads Rejected (cap) instead.",
-            Count(metrics::DOWNLOADS_DECLINED.get()),
+            metrics::DOWNLOADS_DECLINED.get(),
         );
     });
 }
 
 fn build_client_delivery_group(g: &mut Groups) {
     g.group("Client Delivery", |t| {
-        t.row_tip(
+        t.count_tip(
             "Client Disconnected Mid-Body",
             "Clients that hung up before the response body was complete. Not highlighted: apt closes connections it no longer needs. In the hyper backend any peer disconnect during a request counts. The Clients table names the clients.",
-            Count(metrics::CLIENT_DISCONNECTED_MID_BODY.get()),
+            metrics::CLIENT_DISCONNECTED_MID_BODY.get(),
         );
         t.signal(
             "Timeouts (client body write)",
@@ -519,10 +532,10 @@ fn build_client_delivery_group(g: &mut Groups) {
             Level::Warn,
             &metrics::HTTP_TIMEOUT_CLIENT_BODY,
         );
-        t.row_tip(
+        t.count_tip(
             "Timeouts (client header write)",
             "Response heads or small proxy-generated responses the client did not accept within http_timeout.",
-            Count(metrics::HTTP_TIMEOUT_CLIENT_HEADER_WRITE.get()),
+            metrics::HTTP_TIMEOUT_CLIENT_HEADER_WRITE.get(),
         );
         t.signal(
             "Rate-Limit Cancellations (client)",
@@ -531,10 +544,10 @@ fn build_client_delivery_group(g: &mut Groups) {
             &metrics::RATE_LIMIT_CLIENT,
         );
         if SPLICE {
-            t.row_tip(
+            t.count_tip(
                 "Clients Demoted (splice \u{2192} file-serve)",
                 "Splice deliveries whose client fell below min_download_rate while the upstream kept pace: instead of cancelling, the client was handed to a task serving the growing cache file, so the download itself goes on at the upstream's speed. A climb points at slow clients (the Clients table) or a min_download_rate set too high.",
-                Count(metrics::CLIENTS_DEMOTED.get()),
+                metrics::CLIENTS_DEMOTED.get(),
             );
         }
     });
@@ -724,51 +737,49 @@ fn build_cache_group(g: &mut Groups) {
                 );
             })
             .value(warn_if(all, parts_exceed));
-        t.row_tip(
+        t.count_tip(
             "Volatile Hits",
             "Index (Release/Packages/Translation/...) lookups served from the cache inside the freshness window.",
-            Count(metrics::VOLATILE_HIT.get()),
+            metrics::VOLATILE_HIT.get(),
         );
         t.entry("Volatile Refetches")
             .tip("Volatile requests (indexes) that found no fresh cached copy and needed upstream, whether they fetched it or joined an in-flight fetch. The two outcomes beneath cover the stale-but-present case only; it warns only if they exceed it, which is a counting bug.")
             .parts(|p| {
-                p.row_tip(
+                p.count_tip(
                     "Refetch Up-to-Date (304)",
                     "Revalidations where upstream confirmed the cached copy was still current.",
-                    Count(refetched_uptodate),
+                    refetched_uptodate,
                 );
-                p.row_tip(
+                p.count_tip(
                     "Refetch Out-of-Date (200)",
                     "Revalidations where upstream returned changed content.",
-                    Count(refetched_outofdate),
+                    refetched_outofdate,
                 );
             })
-            .value(warn_if(
-                Count(refetched),
+            .figure(refetched)
+            .value(warn_if(Count(refetched),
                 refetched < refetched_uptodate + refetched_outofdate,
             ));
-        t.row_tip(
+        t.count_tip(
             "Late Joiners (coalesced)",
             "Requests that joined an already in-progress download and shared its data instead of fetching again.",
-            Count(metrics::LATE_JOINERS_TOTAL.get()),
+            metrics::LATE_JOINERS_TOTAL.get(),
         );
         t.entry("Most Late Joiners on One Download")
             .kind(Kind::Peak)
             .tip("The most late joiners any single download has had since startup, counting every client that joined it, including those that left before it finished.")
             .value(Count(metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.get()));
-        t.row_tip(
+        t.count_tip(
             "Partials Still In Use",
             "Downloads that found their .partial still held by an earlier download of the same file and fetched into a scratch file instead of resuming it.",
-            Count(metrics::PARTIAL_CLAIM_CONTENDED.get()),
+            metrics::PARTIAL_CLAIM_CONTENDED.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Uncacheable Evictions",
             "Recent uncacheable (host, path) entries dropped from the in-memory list the Uncacheables section shows, which keeps a fixed number of the latest. Not highlighted: the list is a sample, not a limit.",
-            Count(
-                metrics::UNCACHEABLE
+            metrics::UNCACHEABLE
                     .get()
                     .saturating_sub(UNCACHEABLES_MAX.get() as u64),
-            ),
         );
         t.signal(
             "Reconcile Events",
@@ -776,10 +787,10 @@ fn build_cache_group(g: &mut Groups) {
             Level::Warn,
             &metrics::RECONCILE_EVENTS,
         );
-        t.row_tip(
+        t.bytes_tip(
             "Reconcile Bytes Repaired",
             "Total size-accounting error corrected by those reconciliation events.",
-            HumanFmt::Size(metrics::RECONCILE_BYTES_REPAIRED.get()),
+            metrics::RECONCILE_BYTES_REPAIRED.get(),
         );
         t.signal(
             "Size Accounting Corruption",
@@ -792,10 +803,10 @@ fn build_cache_group(g: &mut Groups) {
 
 fn build_integrity_group(g: &mut Groups) {
     g.group("Integrity", |t| {
-        t.row_tip(
+        t.count_tip(
             "Verified",
             "Downloaded resources (pool .debs, by-hash files, Packages indices) whose content hash matched a known digest.",
-            Count(metrics::CHECKSUM_VERIFIED.get()),
+            metrics::CHECKSUM_VERIFIED.get(),
         );
         t.signal(
             "Mismatch (rejected)",
@@ -803,19 +814,19 @@ fn build_integrity_group(g: &mut Groups) {
             Level::Alert,
             &metrics::CHECKSUM_MISMATCH,
         );
-        t.row_tip(
+        t.count_tip(
             "Unverified (no known digest)",
             "Resources for which no expected digest was available in the registry; cached unverified (best-effort).",
-            Count(metrics::CHECKSUM_UNVERIFIED.get()),
+            metrics::CHECKSUM_UNVERIFIED.get(),
         );
         t.entry("Registry Entries")
             .kind(Kind::Live)
             .tip("In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart), capped by verify_checksums_max_entries.")
             .value(Count::len(global_checksum_registry().len()));
-        t.row_tip(
+        t.count_tip(
             "Re-ingests (touch)",
             "Cached indexes re-ingested because a request answered from cache found their digests missing (restart, eviction, an earlier skip). Climbing on every apt update means verify_checksums_max_entries is below the live working set.",
-            Count(metrics::INGEST_TOUCH_TRIGGERED.get()),
+            metrics::INGEST_TOUCH_TRIGGERED.get(),
         );
         t.signal(
             "Ingests Skipped (queue full)",
@@ -882,39 +893,40 @@ fn build_upstream_group(g: &mut Groups) {
     let (aborted_count, aborted_last) = (aborted.get(), aborted.last());
 
     g.group("Upstream", |t| {
-        t.row_tip(
+        t.bytes_tip(
             "Bytes Downloaded",
             "Total bytes fetched from upstream mirrors.",
-            HumanFmt::Size(metrics::BYTES_DOWNLOADED_UPSTREAM.get()),
+            metrics::BYTES_DOWNLOADED_UPSTREAM.get(),
         );
         t.entry("2xx")
             .tip("Successful responses received from upstream mirrors. Warns only if the 200 and 206 rows exceed it, which is a counting bug; another 2xx code counts here without a row of its own.")
             .parts(|p| {
-                p.row("200 OK", Count(status_200));
-                p.row_tip(
+                p.count("200 OK", status_200);
+                p.count_tip(
                     "206 Partial Content",
                     "Answers to a resumed download's Range request.",
-                    Count(status_206),
+                    status_206,
                 );
             })
+            .figure(status_2xx)
             .value(warn_if(Count(status_2xx), status_200 + status_206 > status_2xx));
         t.entry("3xx")
             .tip("Redirect and not-modified responses from upstream. Warns only if the individual 3xx rows exceed it, which is a counting bug; another 3xx code counts here without a row of its own.")
             .parts(|p| {
-                p.row("301 Moved Permanently", Count(status_301));
-                p.row("302 Found", Count(status_302));
-                p.row("304 Not Modified", Count(status_304));
-                p.row("307 Temporary Redirect", Count(status_307));
-                p.row("308 Permanent Redirect", Count(status_308));
+                p.count("301 Moved Permanently", status_301);
+                p.count("302 Found", status_302);
+                p.count("304 Not Modified", status_304);
+                p.count("307 Temporary Redirect", status_307);
+                p.count("308 Permanent Redirect", status_308);
             })
-            .value(warn_if(
-                Count(status_3xx),
+            .figure(status_3xx)
+            .value(warn_if(Count(status_3xx),
                 status_301 + status_302 + status_304 + status_307 + status_308 > status_3xx,
             ));
-        t.row_tip(
+        t.count_tip(
             "4xx",
             "Client-error responses received from upstream mirrors. Not highlighted: a package missing from a mirror is a 404.",
-            Count(metrics::UPSTREAM_STATUS_4XX.get()),
+            metrics::UPSTREAM_STATUS_4XX.get(),
         );
         t.signal(
             "5xx",
@@ -936,18 +948,21 @@ fn build_upstream_group(g: &mut Groups) {
                     p.entry(label)
                         .tip(tip)
                         .last(last)
+                        .figure(value)
                         .value(Nonzero { value, level });
                 }
                 p.entry("Aborted (cancelled)")
                     .tip("The download was dropped without a verdict, typically because every client it served went away. No alarm on its own; a climb together with client disconnects points at the clients.")
                     .last(cancelled_last)
+                    .figure(cancelled_count)
                     .value(Count(cancelled_count));
             })
+            .figure(aborted_count)
             .value(warn_if(Count(aborted_count), failed));
-        t.row_tip(
+        t.count_tip(
             "Retries",
             "Upstream connect attempts past a request's first: backoff retries after a failed connect, bounded by upstream_retry_budget, and Auto-mode dials of plain HTTP after a failed HTTPS probe. Not highlighted: a retry that connects is the mechanism working.",
-            Count(metrics::UPSTREAM_RETRIES.get()),
+            metrics::UPSTREAM_RETRIES.get(),
         );
         t.signal(
             "Connect Failures",
@@ -1012,10 +1027,10 @@ fn build_upstream_group(g: &mut Groups) {
                 &metrics::PIPE_RESIZE_REFUSED,
             );
         }
-        t.row_tip(
+        t.count_tip(
             "Scheme-Cache Removals",
             "Entries dropped from the per-host scheme cache after the connect-retry budget (upstream_retry_budget) ran out, so the next request probes the scheme again.",
-            Count(metrics::SCHEME_CACHE_REMOVED.get()),
+            metrics::SCHEME_CACHE_REMOVED.get(),
         );
     });
 }
@@ -1031,24 +1046,24 @@ fn build_https_upgrade_group(g: &mut Groups) {
         t.entry("HTTPS Upgrade Attempted")
             .tip("Plain-HTTP requests the daemon tried to upgrade to HTTPS (https_upgrade_mode). Each resolves to exactly one of the outcomes beneath, which trail it while an upgrade is in flight; it warns only if they exceed it, which is a counting bug.")
             .parts(|p| {
-                p.row_tip(
+                p.count_tip(
                     "HTTPS Upgrade Succeeded",
                     "Upgrade attempts that completed over HTTPS.",
-                    Count(upgrade_succeeded),
+                    upgrade_succeeded,
                 );
-                p.row_tip(
+                p.count_tip(
                     "HTTPS Upgrade Reverted",
                     "Auto-mode soft give-ups that fell back to plain HTTP. A mirror that keeps reverting has no working HTTPS: list it in http_only_mirrors.",
-                    Count(upgrade_reverted),
+                    upgrade_reverted,
                 );
-                p.row_tip(
+                p.count_tip(
                     "HTTPS Upgrade Failed",
                     "Terminal upgrade failures: Always-mode exhaustion, or a non-connect transport error in any mode.",
-                    Count(upgrade_failed),
+                    upgrade_failed,
                 );
             })
-            .value(warn_if(
-                Count(upgrade_attempted),
+            .figure(upgrade_attempted)
+            .value(warn_if(Count(upgrade_attempted),
                 upgrade_succeeded + upgrade_reverted + upgrade_failed > upgrade_attempted,
             ));
     });
@@ -1064,73 +1079,73 @@ fn build_pool_group(g: &mut Groups) {
     let miss_no_scheme = metrics::POOL_MISS_NO_SCHEME.get();
 
     g.group("Upstream Connection Pool", |t| {
-        t.row_tip(
+        t.count_tip(
             "Pool Reused",
             "Upstream requests served from an already-open pooled connection.",
-            Count(metrics::POOL_REUSED.get()),
+            metrics::POOL_REUSED.get(),
         );
         t.entry("Pool New")
             .tip("Newly opened upstream connections. Every new connection falls through from exactly one miss arm, but a miss whose connect then fails opens none, so the misses beneath may exceed it; it warns only if it exceeds their sum, which is a counting bug.")
             .parts(|p| {
-                p.row_tip(
+                p.count_tip(
                     "Pool Miss (empty)",
                     "No pooled connection was available for the host.",
-                    Count(miss_empty),
+                    miss_empty,
                 );
-                p.row_tip(
+                p.count_tip(
                     "Pool Miss (dead)",
                     "The pooled connection had been closed by the peer.",
-                    Count(miss_dead),
+                    miss_dead,
                 );
-                p.row_tip(
+                p.count_tip(
                     "Pool Miss (failed)",
                     "The in-flight request on a pooled connection failed and was retried on a fresh one.",
-                    Count(miss_failed),
+                    miss_failed,
                 );
-                p.row_tip(
+                p.count_tip(
                     "Pool Miss (no scheme)",
                     "No cached scheme for the host, so the pool was bypassed.",
-                    Count(miss_no_scheme),
+                    miss_no_scheme,
                 );
             })
-            .value(warn_if(
-                Count(pool_new),
+            .figure(pool_new)
+            .value(warn_if(Count(pool_new),
                 pool_new > miss_empty + miss_dead + miss_failed + miss_no_scheme,
             ));
-        t.row_tip(
+        t.count_tip(
             "Pool Return-Evicted",
             "Connections evicted at the point they were returned to a full per-host slot.",
-            Count(metrics::POOL_RETURN_EVICTED.get()),
+            metrics::POOL_RETURN_EVICTED.get(),
         );
     });
 }
 
 fn build_tunnels_group(g: &mut Groups) {
     g.group("HTTPS Tunnels", |t| {
-        t.row_tip(
+        t.count_tip(
             "Connects (total)",
             "HTTPS-tunnel CONNECT requests accepted since the daemon started. The live count and peak are in the Capacity section.",
-            Count(metrics::TUNNEL_CONNECTS_TOTAL.get()),
+            metrics::TUNNEL_CONNECTS_TOTAL.get(),
         );
-        t.row_tip(
+        t.bytes_tip(
             "Bytes (client \u{2192} upstream)",
             "Bytes copied client-to-upstream through tunnels, however the tunnel ended (cleanly, idle-closed or failed), including bytes pipelined behind the CONNECT request.",
-            HumanFmt::Size(metrics::BYTES_TUNNELED_CLIENT_TO_UPSTREAM.get()),
+            metrics::BYTES_TUNNELED_CLIENT_TO_UPSTREAM.get(),
         );
-        t.row_tip(
+        t.bytes_tip(
             "Bytes (upstream \u{2192} client)",
             "Bytes copied upstream-to-client through tunnels, however the tunnel ended (cleanly, idle-closed or failed).",
-            HumanFmt::Size(metrics::BYTES_TUNNELED_UPSTREAM_TO_CLIENT.get()),
+            metrics::BYTES_TUNNELED_UPSTREAM_TO_CLIENT.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Rejected (policy)",
             "CONNECT requests refused because their port is outside https_tunnel_allowed_ports.",
-            Count(metrics::TUNNEL_REJECTED_POLICY.get()),
+            metrics::TUNNEL_REJECTED_POLICY.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Authorization Rejected (tunnel mirror)",
             "CONNECT requests refused because the target is outside https_tunnel_allowed_mirrors. The Clients table names the client.",
-            Count(metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.get()),
+            metrics::AUTHZ_REJECTED_TUNNEL_MIRROR.get(),
         );
         t.signal(
             "Rejected (capacity)",
@@ -1144,30 +1159,30 @@ fn build_tunnels_group(g: &mut Groups) {
             Level::Warn,
             &metrics::TUNNEL_TRANSFER_FAILED,
         );
-        t.row_tip(
+        t.count_tip(
             "Closed (idle)",
             "Established tunnels torn down after client_idle_timeout without a byte in either direction. Informational: idle sockets reclaimed, not failures.",
-            Count(metrics::TUNNEL_IDLE_CLOSED.get()),
+            metrics::TUNNEL_IDLE_CLOSED.get(),
         );
     });
 }
 
 fn build_cleanup_group(g: &mut Groups) {
     g.group("Cleanup", |t| {
-        t.row_tip(
+        t.count_tip(
             "Evictions (total)",
             "Cache files removed by the background cleanup across all runs since the daemon started.",
-            Count(metrics::CLEANUP_EVICTIONS.get()),
+            metrics::CLEANUP_EVICTIONS.get(),
         );
-        t.row_tip(
+        t.bytes_tip(
             "Bytes Reclaimed (total)",
             "Disk space reclaimed by the background cleanup across all runs since the daemon started.",
-            HumanFmt::Size(metrics::CLEANUP_BYTES_RECLAIMED.get()),
+            metrics::CLEANUP_BYTES_RECLAIMED.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "By-Hash Unreferenced (total)",
             "By-hash index files reclaimed because their digest was absent from the mirror's current Release set (a subset of total evictions). The rest age out via byhash_retention_days when no current Release can be read.",
-            Count(metrics::CLEANUP_BYHASH_UNREFERENCED.get()),
+            metrics::CLEANUP_BYHASH_UNREFERENCED.get(),
         );
         t.signal(
             "Checksum Mismatches",
@@ -1175,10 +1190,10 @@ fn build_cleanup_group(g: &mut Groups) {
             Level::Alert,
             &metrics::CLEANUP_CHECKSUM_MISMATCHES,
         );
-        t.row_tip(
+        t.count_tip(
             "Checksum Skips",
             "Digest verifications skipped because the file was already verified in an earlier cleanup cycle and is unchanged (same inode, size and expected digest).",
-            Count(metrics::CLEANUP_CHECKSUM_SKIPS.get()),
+            metrics::CLEANUP_CHECKSUM_SKIPS.get(),
         );
         // Loaded first: it is set after the trio, so finding it set means
         // the trio is this run's.
@@ -1219,10 +1234,10 @@ fn build_cleanup_group(g: &mut Groups) {
 
 fn build_database_group(g: &mut Groups) {
     g.group("Database", |t| {
-        t.row_tip(
+        t.count_tip(
             "Commands Sent",
             "Commands handed to the database task since the daemon started. Its queue is a gauge in the Capacity section.",
-            Count(metrics::DB_COMMANDS_SENT.get()),
+            metrics::DB_COMMANDS_SENT.get(),
         );
         t.signal(
             "Queue Full-Waits",
@@ -1236,25 +1251,25 @@ fn build_database_group(g: &mut Groups) {
             Level::Warn,
             &metrics::DB_QUEUE_FULL_TRANSITIONS,
         );
-        t.row_tip(
+        t.count_tip(
             "Commands Dropped (shutdown)",
             "Commands discarded because the database task had already stopped. Not highlighted: a graceful shutdown drops the tail of the telemetry.",
-            Count(metrics::DB_COMMANDS_DROPPED_SHUTDOWN.get()),
+            metrics::DB_COMMANDS_DROPPED_SHUTDOWN.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Batch Flushes (by size)",
             "Batches flushed because they reached db_batch_flush_max_count. Under load this should dominate the by-time counter.",
-            Count(metrics::DB_BATCH_FLUSHES_BY_SIZE.get()),
+            metrics::DB_BATCH_FLUSHES_BY_SIZE.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Batch Flushes (by time)",
             "Batches flushed because db_batch_flush_interval_secs expired. Idle periods favour this over the by-size counter.",
-            Count(metrics::DB_BATCH_FLUSHES_BY_TIME.get()),
+            metrics::DB_BATCH_FLUSHES_BY_TIME.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Batch Flushes (on shutdown)",
             "Batches flushed as part of the shutdown drain.",
-            Count(metrics::DB_BATCH_FLUSHES_ON_SHUTDOWN.get()),
+            metrics::DB_BATCH_FLUSHES_ON_SHUTDOWN.get(),
         );
         t.entry("Peak Batch Size")
             .kind(Kind::Peak)
@@ -1264,20 +1279,20 @@ fn build_database_group(g: &mut Groups) {
             .kind(Kind::Live)
             .tip("Process-local mirror-id cache: hydrated at startup, grows on each newly observed mirror, never evicted.")
             .value(Count(metrics::DB_MIRROR_CACHE_ENTRIES.get()));
-        t.row_tip(
+        t.count_tip(
             "Mirror Cache Hits",
             "Mirror-id lookups served from the process-local cache.",
-            Count(metrics::DB_MIRROR_CACHE_HITS.get()),
+            metrics::DB_MIRROR_CACHE_HITS.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "Mirror Cache Misses",
             "Mirror-id lookups that had to reach the database.",
-            Count(metrics::DB_MIRROR_CACHE_MISSES.get()),
+            metrics::DB_MIRROR_CACHE_MISSES.get(),
         );
-        t.row_tip(
+        t.count_tip(
             "last_seen Rows Flushed",
             "Cumulative mirrors_v2.last_seen rows the periodic task has written back to disk.",
-            Count(metrics::DB_MIRROR_LAST_SEEN_FLUSHED.get()),
+            metrics::DB_MIRROR_LAST_SEEN_FLUSHED.get(),
         );
         t.signal(
             "Operation Failures",
