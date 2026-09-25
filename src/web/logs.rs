@@ -52,16 +52,17 @@ pub(super) async fn serve_logs(options: QueryOptions) -> WebResponse {
     let generated_at = Utc::now();
     let body_html = format_args!(
         "{nav}{heading}\
-         <div class=\"section\">\
+         <div class=\"section\" data-section=\"logs\">\
          <h2>Log Entries <span class=\"count\">{entry_count} / {capacity}</span></h2>\
          <pre class=\"log\">{escaped_logs}</pre>\
          </div>\
-         <footer><hr><p>All dates are in UTC. Page generated at {generated_at}.</p></footer>"
+         <footer data-section=\"footer\"><hr><p>All dates are in UTC. Page generated at {generated_at}.</p></footer>"
     );
 
     // The logs page is a tailing view; auto-refresh would fight the reader.
     let html = build_page(
         PageTitle("apt-cacher-rs logs"),
+        Page::Logs,
         body_html,
         QueryOptions {
             refresh_secs: None,

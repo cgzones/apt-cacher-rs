@@ -49,7 +49,7 @@ impl Display for SetupHint {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "<div class=\"section setup\"><h2>Getting Started</h2>\
+            "<div class=\"section setup\" data-section=\"setup\"><h2>Getting Started</h2>\
              <p>No mirror has been contacted yet. Point apt at this proxy by writing \
              <code>Acquire::http::Proxy \"http://{}:{}\";</code> into \
              <code>/etc/apt/apt.conf.d/01proxy</code> on a client.</p></div>",
@@ -220,9 +220,11 @@ impl Display for PinLink {
 /// [`PageTitle`] for why each half is safe to interpolate.
 pub(super) fn build_page(
     title: PageTitle,
+    page: Page,
     body_html: impl Display,
     options: QueryOptions,
 ) -> String {
+    let page = page.key();
     let theme_attr = options.theme.html_attr();
     let refresh = RefreshMeta(options.refresh_secs.unwrap_or(0));
     let stylesheet = STYLESHEET.url();
@@ -239,7 +241,7 @@ pub(super) fn build_page(
          <script defer src=\"{script}\"></script>\
          {refresh}\
          </head>\
-         <body>{body_html}</body>\
+         <body data-page=\"{page}\">{body_html}</body>\
          </html>"
     )
 }
@@ -342,17 +344,29 @@ impl Page {
             Self::Logs => "/logs",
         }
     }
+
+    /// The `<body data-page>` value, which tells the scripts where they
+    /// run.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Dashboard { .. } => "dashboard",
+            Self::Logs => "logs",
+        }
+    }
 }
 
 pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
     let mut html = String::with_capacity(512);
-    html.push_str("<nav>");
+    // The links that carry the page state (`data-carry`) and the two
+    // toggles (`data-action`) are marked for the scripts, which keep their
+    // hrefs current as they change that state in place.
+    html.push_str("<nav data-section=\"nav\">");
 
     match page {
         Page::Dashboard { log_count } => {
             swrite!(
                 html,
-                "<a href=\"{}\">Logs <span class=\"count\">{log_count}</span></a>",
+                "<a data-carry href=\"{}\">Logs <span class=\"count\">{log_count}</span></a>",
                 QueryUrl {
                     path: "/logs",
                     options
@@ -385,19 +399,19 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
                     ..options
                 },
             };
-            if let Some(secs) = options.refresh_secs {
-                swrite!(html, "<a href=\"{target}\">Stop auto-refresh ({secs}s)</a>");
-            } else {
-                swrite!(
-                    html,
-                    "<a href=\"{target}\">Auto-refresh ({AUTO_REFRESH_SECS}s)</a>"
-                );
-            }
+            let label = match options.refresh_secs {
+                Some(secs) => format!("Stop auto-refresh ({secs}s)"),
+                None => format!("Auto-refresh ({AUTO_REFRESH_SECS}s)"),
+            };
+            swrite!(
+                html,
+                "<a data-action=\"refresh-toggle\" data-secs=\"{AUTO_REFRESH_SECS}\" href=\"{target}\">{label}</a>"
+            );
         }
         Page::Logs => {
             swrite!(
                 html,
-                "<a href=\"{}\">Dashboard</a>",
+                "<a data-carry href=\"{}\">Dashboard</a>",
                 QueryUrl { path: "/", options },
             );
         }
@@ -411,7 +425,7 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
     };
     swrite!(
         html,
-        "<a href=\"{}\">{label}</a>",
+        "<a data-action=\"theme-cycle\" href=\"{}\">{label}</a>",
         QueryUrl {
             path: page.path(),
             options: QueryOptions {

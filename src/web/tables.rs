@@ -717,6 +717,7 @@ pub(super) async fn build_mirror_table(
     }
 
     let mut table = Table::numeric(
+        "mirrors",
         &[
             MIRROR_HEADER,
             "Last Seen",
@@ -909,14 +910,17 @@ pub(super) fn render_origin_table(
     sorted.sort_unstable_by_key(|o| Reverse(o.last_seen));
 
     let rows = sorted.len();
-    let mut table = Table::new(&[
-        "Mirror",
-        "Distribution",
-        "Component",
-        "Architecture",
-        "Last Seen",
-        ORIGIN_INDEX_HEADER,
-    ]);
+    let mut table = Table::new(
+        "origins",
+        &[
+            "Mirror",
+            "Distribution",
+            "Component",
+            "Architecture",
+            "Last Seen",
+            ORIGIN_INDEX_HEADER,
+        ],
+    );
 
     let mut key = String::new();
     for origin in sorted {
@@ -977,6 +981,7 @@ pub(super) fn render_client_table(
     sorted.sort_unstable_by_key(|c| Reverse(c.last_seen));
 
     let mut table = Table::numeric(
+        "clients",
         &[
             "IP",
             "Last Seen",
@@ -1053,7 +1058,7 @@ pub(super) fn build_uncacheable_table() -> Section {
     }
 
     let rows = uncacheables.len();
-    let mut table = Table::new(&["Requested Host", "Requested Path"]);
+    let mut table = Table::new("uncacheables", &["Requested Host", "Requested Path"]);
 
     for entry in uncacheables.iter() {
         tr!(
@@ -1094,16 +1099,21 @@ pub(super) fn render_top_packages_table(
     }
 
     let rows = packages.len();
-    let (headers, numeric): (&[&str], &[usize]) = match view {
+    let (key, headers, numeric): (&str, &[&str], &[usize]) = match view {
         // "Package Size" meant the size of one copy in one table and the
         // cumulative bytes in the other; name each for what it counts.
-        TopPackagesView::ByCount => (&["Package", "Deliveries", "Size Each"], &[1, 2]),
+        TopPackagesView::ByCount => (
+            "packages-count",
+            &["Package", "Deliveries", "Size Each"],
+            &[1, 2],
+        ),
         TopPackagesView::BySize => (
+            "packages-size",
             &["Package", "Delivered Total", "Deliveries", "Size Each"],
             &[1, 2, 3],
         ),
     };
-    let mut table = Table::numeric(headers, numeric);
+    let mut table = Table::numeric(key, headers, numeric);
 
     for pkg in packages {
         let pkg_size = as_size(pkg.package_size);

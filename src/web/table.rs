@@ -1,6 +1,13 @@
 //! HTML table builders: [`Table`] for column tables, [`DetailsList`] for
 //! key/value grids, the [`tr!`] row macro and the `<div class="section">`
 //! wrappers the dashboard page assembles sections with.
+//!
+//! Every section wrapper takes a `key`: the block renders as
+//! `<div class="section" data-section="{key}">` with its heading anchored at
+//! `{key}-head`, and every table as `<table data-table="{key}">`. The keys
+//! are what the optional scripts address (the background refresh swaps
+//! sections by `data-section`; sorting remembers its order per
+//! `data-table`), so a key is stable once shipped.
 
 use std::fmt::Display;
 
@@ -30,26 +37,31 @@ impl Table {
     /// A table whose columns at `columns` hold figures -- counts, sizes,
     /// shares -- which are right-aligned (headers included) so the digits of
     /// consecutive rows line up in the tabular numerals the stylesheet sets.
-    pub(super) fn numeric(headers: &[&'static str], columns: &[usize]) -> Self {
+    pub(super) fn numeric(key: &'static str, headers: &[&'static str], columns: &[usize]) -> Self {
         assert!(
             headers.len() <= u64::BITS as usize,
             "one bit per column in the numeric mask"
         );
         let numeric = columns.iter().fold(0_u64, |bits, &col| bits | (1 << col));
-        Self::build(headers, numeric)
+        Self::build(key, headers, numeric)
     }
 
-    pub(super) fn new(headers: &[&'static str]) -> Self {
-        Self::build(headers, 0)
+    pub(super) fn new(key: &'static str, headers: &[&'static str]) -> Self {
+        Self::build(key, headers, 0)
     }
 
-    fn build(headers: &[&'static str], numeric: u64) -> Self {
+    /// `key` names the table for the scripts (`data-table`); see the module
+    /// docs.
+    fn build(key: &'static str, headers: &[&'static str], numeric: u64) -> Self {
         // Realistic dashboard tables (Mirrors, Origins) easily exceed 10 KB.
         // Pre-size to skip the reallocation chain.
         let mut out = String::with_capacity(16 * 1024);
         // The wrapper is what scrolls when the table is wider than its
         // section; without it a wide table forces a page-wide scrollbar.
-        out.push_str("<div class=\"tablewrap\"><table><thead><tr>");
+        swrite!(
+            out,
+            "<div class=\"tablewrap\"><table data-table=\"{key}\"><thead><tr>"
+        );
         for (col, h) in headers.iter().enumerate() {
             out.push_str(if numeric & (1 << col) == 0 {
                 "<th scope=\"col\">"
@@ -439,12 +451,12 @@ impl Entry<'_> {
     }
 }
 
-/// Append a `<div class="section">` wrapping a titled HTML body; `id` is
-/// the heading's anchor.
-pub(super) fn write_section(out: &mut String, title: &'static str, id: &'static str, body: &str) {
+/// Append a `<div class="section">` wrapping a titled HTML body; `key`
+/// names the section (see the module docs).
+pub(super) fn write_section(out: &mut String, title: &'static str, key: &'static str, body: &str) {
     swrite!(
         out,
-        "<div class=\"section\"><h2 id=\"{id}\">{title}</h2>{body}</div>"
+        "<div class=\"section\" data-section=\"{key}\"><h2 id=\"{key}-head\">{title}</h2>{body}</div>"
     );
 }
 
@@ -460,12 +472,12 @@ pub(super) fn write_section(out: &mut String, title: &'static str, id: &'static 
 pub(super) fn write_collapsible_details(
     out: &mut String,
     title: &'static str,
-    id: &'static str,
+    key: &'static str,
     open: bool,
     pin: impl Display,
     body: &str,
 ) {
-    write_collapsible_details_badged(out, title, id, open, "", pin, body);
+    write_collapsible_details_badged(out, title, key, open, "", pin, body);
 }
 
 /// [`write_collapsible_details`] with `badge` beside the title, readable
@@ -473,7 +485,7 @@ pub(super) fn write_collapsible_details(
 pub(super) fn write_collapsible_details_badged(
     out: &mut String,
     title: &'static str,
-    id: &'static str,
+    key: &'static str,
     open: bool,
     badge: impl Display,
     pin: impl Display,
@@ -489,8 +501,8 @@ pub(super) fn write_collapsible_details_badged(
     };
     swrite!(
         out,
-        "<div class=\"section\"><details{open_attr}>\
-         <summary><h2 id=\"{id}\">{title}</h2>{badge_wrapped} {pin}</summary>\
+        "<div class=\"section\" data-section=\"{key}\"><details{open_attr}>\
+         <summary><h2 id=\"{key}-head\">{title}</h2>{badge_wrapped} {pin}</summary>\
          {body}</details></div>"
     );
 }
@@ -512,7 +524,7 @@ pub(super) struct Rows {
 pub(super) fn write_collapsible_section(
     out: &mut String,
     title: &'static str,
-    id: &'static str,
+    key: &'static str,
     rows: Rows,
     pinned: bool,
     empty_note: &'static str,
@@ -529,8 +541,8 @@ pub(super) fn write_collapsible_section(
     };
     swrite!(
         out,
-        "<div class=\"section\"><details{open_attr}>\
-         <summary><h2 id=\"{id}\">{title}</h2>\
+        "<div class=\"section\" data-section=\"{key}\"><details{open_attr}>\
+         <summary><h2 id=\"{key}-head\">{title}</h2>\
          <span class=\"count\">{row_count}{total_count_fmt}</span></summary>\
          {}</details></div>",
         EmptyOr {
@@ -570,15 +582,18 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailsList, Highlights, Kind, Rows, Table, write_collapsible_section};
+    use super::{
+        DetailsList, Highlights, Kind, Rows, Table, write_collapsible_details_badged,
+        write_collapsible_section, write_section,
+    };
     use crate::web::fmt::{Level, Nonzero};
 
     #[test]
     fn table_wraps_header_row() {
-        let html = Table::new(&["A", "B"]).finish();
+        let html = Table::new("t", &["A", "B"]).finish();
         assert_eq!(
             html,
-            "<div class=\"tablewrap\"><table><thead><tr>\
+            "<div class=\"tablewrap\"><table data-table=\"t\"><thead><tr>\
              <th scope=\"col\">A</th><th scope=\"col\">B</th>\
              </tr></thead><tbody></tbody></table></div>",
         );
@@ -587,7 +602,7 @@ mod tests {
     #[test]
     fn cell_titles_only_long_plain_values() {
         let long = "a value well past the title threshold";
-        let mut table = Table::new(&["H"]);
+        let mut table = Table::new("t", &["H"]);
         table.start_row();
         table.cell("short");
         table.cell(long);
@@ -607,7 +622,7 @@ mod tests {
 
     #[test]
     fn numeric_columns_are_marked_in_header_and_cells() {
-        let mut table = Table::numeric(&["Name", "Count"], &[1]);
+        let mut table = Table::numeric("t", &["Name", "Count"], &[1]);
         for _ in 0..2 {
             table.start_row();
             table.cell("a");
@@ -630,7 +645,7 @@ mod tests {
 
     #[test]
     fn marked_row_carries_its_state_class() {
-        let mut table = Table::new(&["H"]);
+        let mut table = Table::new("t", &["H"]);
         table.start_row_marked(" class=\"row-stale\"");
         table.cell("x");
         table.end_row();
@@ -766,13 +781,52 @@ mod tests {
         }
     }
 
+    /// Every wrapper names its block for the scripts and anchors its
+    /// heading at `{key}-head`, which the nav links and `open=` rely on.
+    #[test]
+    fn sections_carry_their_key_and_heading_anchor() {
+        let mut out = String::new();
+        write_section(&mut out, "Plain", "plain", "<p>b</p>");
+        assert_eq!(
+            out,
+            "<div class=\"section\" data-section=\"plain\"><h2 id=\"plain-head\">Plain</h2><p>b</p></div>"
+        );
+        let mut out = String::new();
+        write_collapsible_details_badged(&mut out, "Folded", "folded", false, "3", "", "<p>b</p>");
+        assert!(
+            out.starts_with(
+                "<div class=\"section\" data-section=\"folded\"><details><summary><h2 id=\"folded-head\">Folded</h2>"
+            ),
+            "{out}"
+        );
+        let mut out = String::new();
+        write_collapsible_section(
+            &mut out,
+            "Rows",
+            "rows",
+            Rows {
+                shown: 1,
+                total: None,
+            },
+            false,
+            "none",
+            "<p>b</p>",
+        );
+        assert!(
+            out.starts_with(
+                "<div class=\"section\" data-section=\"rows\"><details open><summary><h2 id=\"rows-head\">Rows</h2>"
+            ),
+            "{out}"
+        );
+    }
+
     #[test]
     fn collapsible_section_notes_an_empty_body() {
         let mut out = String::new();
         write_collapsible_section(
             &mut out,
             "T",
-            "t-head",
+            "t",
             Rows {
                 shown: 0,
                 total: None,
@@ -793,7 +847,7 @@ mod tests {
         write_collapsible_section(
             &mut out,
             "T",
-            "t-head",
+            "t",
             Rows {
                 shown: 2,
                 total: Some(5),
@@ -816,7 +870,7 @@ mod tests {
         write_collapsible_section(
             &mut out,
             "T",
-            "t-head",
+            "t",
             Rows {
                 shown: 0,
                 total: None,
@@ -835,7 +889,7 @@ mod tests {
         write_collapsible_section(
             &mut out,
             "T",
-            "t-head",
+            "t",
             Rows {
                 shown: 0,
                 total: None,

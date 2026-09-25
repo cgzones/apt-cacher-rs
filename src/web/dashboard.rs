@@ -472,7 +472,7 @@ fn build_hero_html(mirrors: &[MirrorStatEntry], cache_size: u64, quota: Option<u
     let mut html = String::with_capacity(1024);
     swrite!(
         html,
-        "<div class=\"hero\">\
+        "<div class=\"hero\" data-section=\"hero\">\
          <div class=\"flow\">\
          <span><span class=\"k\">fetched upstream</span><span class=\"v\">{}</span></span>\
          <span class=\"arrow\">\u{2192}</span>\
@@ -994,7 +994,8 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
         .entries()
         .len();
     let mut body = String::with_capacity(8 * 1024);
-    body.push_str(&build_nav_html(Page::Dashboard { log_count }, options));
+    let page = Page::Dashboard { log_count };
+    body.push_str(&build_nav_html(page, options));
     swrite!(body, "{}", Heading);
 
     if !data.seen_traffic {
@@ -1011,7 +1012,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_section(
         &mut body,
         "Mirrors",
-        "mirrors-head",
+        "mirrors",
         Rows {
             shown: data.mirror.rows,
             total: None,
@@ -1023,7 +1024,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_section(
         &mut body,
         "Origins",
-        "origins-head",
+        "origins",
         Rows {
             shown: data.origin.rows,
             total: None,
@@ -1035,7 +1036,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_section(
         &mut body,
         "Clients",
-        "clients-head",
+        "clients",
         Rows {
             shown: data.client.rows,
             total: None,
@@ -1072,7 +1073,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_section(
         &mut body,
         "Top Packages",
-        "packages-head",
+        "packages",
         Rows {
             shown: total_package_rows,
             total: None,
@@ -1085,7 +1086,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_section(
         &mut body,
         "Uncacheables",
-        "uncacheables-head",
+        "uncacheables",
         Rows {
             shown: data.uncacheable.rows,
             total: Some(UNCACHEABLES_MAX.get()),
@@ -1101,14 +1102,14 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_section(
         &mut body,
         "Cache Statistics",
-        "cache-statistics-head",
+        "cache-statistics",
         &data.cache_stats_html,
     );
-    write_section(&mut body, "Capacity", "capacity-head", &data.capacity_html);
+    write_section(&mut body, "Capacity", "capacity", &data.capacity_html);
     write_section(
         &mut body,
         "Daemon Status",
-        "daemon-status-head",
+        "daemon-status",
         &data.daemon_status_html,
     );
     // Collapsed by default, so each carries a keep-open link: a section the
@@ -1117,7 +1118,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_details(
         &mut body,
         "Maintenance",
-        "maintenance-head",
+        "maintenance",
         options.open.contains("maintenance"),
         pin("maintenance"),
         &data.maintenance_html,
@@ -1125,7 +1126,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_details(
         &mut body,
         "Configuration",
-        "configuration-head",
+        "configuration",
         options.open.contains("configuration"),
         pin("configuration"),
         &data.configuration_html,
@@ -1133,7 +1134,7 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
     write_collapsible_details_badged(
         &mut body,
         "Metrics",
-        "metrics-head",
+        "metrics",
         options.open.contains("metrics"),
         data.metrics_highlights,
         pin("metrics"),
@@ -1142,14 +1143,14 @@ fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
 
     swrite!(
         body,
-        "<footer><hr><p>All dates are in UTC. Page generated at {}. Generated in {} (db {}, disk {}).</p></footer>",
+        "<footer data-section=\"footer\"><hr><p>All dates are in UTC. Page generated at {}. Generated in {} (db {}, disk {}).</p></footer>",
         Utc::now(),
         Millis(data.generation_start.elapsed().into()),
         Millis(data.db_elapsed),
         Millis(data.fs_elapsed),
     );
 
-    build_page(PageTitle("apt-cacher-rs"), body, options)
+    build_page(PageTitle("apt-cacher-rs"), page, body, options)
 }
 
 pub(super) async fn serve_dashboard(appstate: &AppState, options: QueryOptions) -> WebResponse {
