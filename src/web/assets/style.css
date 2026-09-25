@@ -289,6 +289,11 @@ svg.spark polyline { fill: none; stroke: var(--series-1); stroke-width: 1.5px; }
 .logtools { margin: 0 0 8px; }
 pre.log .entry.error { color: var(--alert); }
 pre.log .entry.warn { color: var(--warn); }
+/* The setup hint's Copy / Select button (misc.js). */
+.setup button.copy { font: inherit; font-size: 0.85em; padding: 0 8px; cursor: pointer;
+                     border: 1px solid var(--section-border); border-radius: 3px;
+                     background: var(--count-bg); color: var(--fg); }
+.setup .copy-note { color: var(--details-key-fg); font-size: 0.85em; }
 
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }

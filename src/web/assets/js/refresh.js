@@ -29,6 +29,11 @@
   let failures = 0;
   let status = null;
   let failure = null;
+  /* When the page's figures were last fetched: the load, then every
+   * successful refresh. */
+  let updatedAt = Date.now();
+  /* How many sections the latest swap left alone (see `busy`). */
+  let paused = 0;
 
   /* ---- Fetching and swapping ------------------------------------------- */
 
@@ -159,6 +164,7 @@
       const current = topSections(document);
       const fresh = topSections(doc);
       const swapped = [];
+      paused = 0;
       for (const [key, node] of current) {
         if (!fresh.has(key)) {
           node.remove();
@@ -168,6 +174,7 @@
       for (const [key, incoming] of fresh) {
         const old = current.get(key);
         if (old && busy(old)) {
+          paused += 1;
           previous = old;
           continue;
         }
@@ -234,15 +241,23 @@
     overdue = false;
     fetchPage(window.location.pathname + window.location.search, function (err, doc) {
       inFlight = false;
-      if (err === null) {
-        failures = 0;
-        swap(doc);
-        showStatus(null);
-      } else {
-        failures += 1;
-        showStatus(err);
+      // Whatever a swap throws, the loop goes on and says what happened.
+      try {
+        if (err === null) {
+          failures = 0;
+          updatedAt = Date.now();
+          swap(doc);
+          showStatus(null);
+        } else {
+          failures += 1;
+          showStatus(err);
+        }
+      } catch (thrown) {
+        showStatus("page update failed");
+        window.console.error("apt-cacher-rs: refresh swap failed", thrown);
+      } finally {
+        schedule();
       }
-      schedule();
     });
   }
 
@@ -264,18 +279,39 @@
     }
   }
 
+  /* "updated 40 s ago", kept counting: how old the figures on screen are,
+   * refreshing or not, and how many sections the latest round left alone
+   * while the reader was busy in them. The instant is in the title. */
+  function showAge() {
+    if (!status) {
+      return;
+    }
+    let text = "updated " + ACR.age((Date.now() - updatedAt) / 1000) + " ago";
+    if (paused > 0) {
+      text += paused === 1 ? ", 1 section paused while in use" : ", " + paused + " sections paused while in use";
+    }
+    status.textContent = text;
+    status.setAttribute("title", "Figures fetched at " + ACR.clock(new Date(updatedAt)));
+  }
+
+  /* The failure note is a live region: its text changes only when the
+   * failure does, so a retry loop is announced once, not every round. The
+   * time of the latest attempt goes in its title. */
   function showStatus(err) {
     ensureStatus();
     if (!status) {
       return;
     }
-    const now = ACR.clock(new Date());
-    if (err === null) {
-      status.textContent = interval() ? "updated " + now : "";
-      failure.textContent = "";
-    } else {
-      failure.textContent = "update failed " + now + " (" + err + "), retrying";
+    const text = err === null ? "" : "update failed (" + err + "), retrying";
+    if (failure.textContent !== text) {
+      failure.textContent = text;
     }
+    if (err === null) {
+      failure.removeAttribute("title");
+    } else {
+      failure.setAttribute("title", "Latest attempt at " + ACR.clock(new Date()));
+    }
+    showAge();
   }
 
   function refreshLabel(st, secs) {
@@ -357,11 +393,13 @@
       });
       keepsSections = true;
       schedule();
+      window.setInterval(showAge, 5000);
     },
     enhance: dropPins,
     refreshed: function () {
       if (ACR.page() === "dashboard") {
         ensureStatus();
+        showAge();
         syncLinks();
       }
     }
