@@ -310,6 +310,8 @@
 
   ACR.feature("refresh", {
     init: function () {
+      // On either page: /logs changes its state too (the theme).
+      ACR.onState(syncLinks);
       if (ACR.page() !== "dashboard") {
         return;
       }
@@ -353,7 +355,6 @@
         }
         ACR.setState(st);
       });
-      ACR.onState(syncLinks);
       keepsSections = true;
       schedule();
     },

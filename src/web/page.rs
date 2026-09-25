@@ -76,10 +76,18 @@ impl Display for Heading {
 // Page chrome
 // ---------------------------------------------------------------------------
 
-/// User-selected colour theme. `Auto` defers to `prefers-color-scheme`.
-#[derive(Copy, Clone, Default, Eq, PartialEq)]
+/// User-selected colour theme.
+///
+/// `Unset` (no `theme=`) and `Auto` (`theme=auto`) render alike, deferring
+/// to `prefers-color-scheme`. They differ for the optional script, which
+/// remembers the reader's last choice in browser storage and applies it to
+/// a URL without `theme=` only: an explicit `theme=auto` has to win over a
+/// stored `dark`, so the dark theme's link cycles to it rather than to a
+/// bare URL.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) enum Theme {
     #[default]
+    Unset,
     Auto,
     Light,
     Dark,
@@ -88,7 +96,7 @@ pub(super) enum Theme {
 impl Theme {
     const fn html_attr(self) -> &'static str {
         match self {
-            Self::Auto => "",
+            Self::Unset | Self::Auto => "",
             Self::Light => " data-theme=\"light\"",
             Self::Dark => " data-theme=\"dark\"",
         }
@@ -96,7 +104,8 @@ impl Theme {
 
     const fn query_param(self) -> Option<&'static str> {
         match self {
-            Self::Auto => None,
+            Self::Unset => None,
+            Self::Auto => Some("theme=auto"),
             Self::Light => Some("theme=light"),
             Self::Dark => Some("theme=dark"),
         }
@@ -293,6 +302,7 @@ pub(super) fn parse_query(query: Option<&str>) -> QueryOptions {
         };
         match k {
             "theme" => match v {
+                "auto" => options.theme = Theme::Auto,
                 "light" => options.theme = Theme::Light,
                 "dark" => options.theme = Theme::Dark,
                 _ => {}
@@ -432,7 +442,7 @@ pub(super) fn build_nav_html(page: Page, options: QueryOptions) -> String {
 
     html.push_str("<span class=\"spacer\"></span>");
     let (next_theme, label) = match options.theme {
-        Theme::Auto => (Theme::Light, "Theme: auto \u{2192} light"),
+        Theme::Unset | Theme::Auto => (Theme::Light, "Theme: auto \u{2192} light"),
         Theme::Light => (Theme::Dark, "Theme: light \u{2192} dark"),
         Theme::Dark => (Theme::Auto, "Theme: dark \u{2192} auto"),
     };
@@ -467,7 +477,9 @@ const FAVICON_LINK: &str = "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/fa
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_QUERY_LEN, PinLink, QueryUrl, RefreshMeta, Theme, parse_query};
+    use super::{
+        MAX_QUERY_LEN, Page, PinLink, QueryUrl, RefreshMeta, Theme, build_nav_html, parse_query,
+    };
 
     #[test]
     fn the_refresh_reload_is_for_browsers_without_script() {
@@ -481,26 +493,55 @@ mod tests {
     #[test]
     fn parse_query_none() {
         let q = parse_query(None);
-        assert!(q.theme == Theme::Auto);
+        assert_eq!(q.theme, Theme::Unset);
         assert!(q.refresh_secs.is_none());
     }
 
     #[test]
     fn parse_query_empty_string() {
         let q = parse_query(Some(""));
-        assert!(q.theme == Theme::Auto);
+        assert_eq!(q.theme, Theme::Unset);
         assert!(q.refresh_secs.is_none());
     }
 
     #[test]
     fn parse_query_theme_light_dark() {
-        assert!(parse_query(Some("theme=light")).theme == Theme::Light);
-        assert!(parse_query(Some("theme=dark")).theme == Theme::Dark);
+        assert_eq!(parse_query(Some("theme=light")).theme, Theme::Light);
+        assert_eq!(parse_query(Some("theme=dark")).theme, Theme::Dark);
+        assert_eq!(parse_query(Some("theme=auto")).theme, Theme::Auto);
+    }
+
+    /// An explicit `theme=auto` renders like no theme, but survives in the
+    /// links, and the dark theme cycles to it.
+    #[test]
+    fn an_explicit_auto_theme_rides_in_the_links() {
+        let auto = parse_query(Some("theme=auto"));
+        assert_eq!(auto.theme.html_attr(), "");
+        assert_eq!(
+            QueryUrl {
+                path: "/logs",
+                options: auto,
+            }
+            .to_string(),
+            "/logs?theme=auto"
+        );
+        let nav = build_nav_html(Page::Logs, parse_query(Some("theme=dark")));
+        assert!(
+            nav.contains(
+                "<a data-action=\"theme-cycle\" href=\"/logs?theme=auto\">Theme: dark \u{2192} auto</a>"
+            ),
+            "{nav}"
+        );
+        let nav = build_nav_html(Page::Logs, auto);
+        assert!(
+            nav.contains("href=\"/logs?theme=light\">Theme: auto \u{2192} light</a>"),
+            "{nav}"
+        );
     }
 
     #[test]
     fn parse_query_theme_unknown_value_keeps_default() {
-        assert!(parse_query(Some("theme=neon")).theme == Theme::Auto);
+        assert_eq!(parse_query(Some("theme=neon")).theme, Theme::Unset);
     }
 
     #[test]
@@ -527,7 +568,7 @@ mod tests {
     #[test]
     fn parse_query_combined_pairs() {
         let q = parse_query(Some("theme=dark&refresh=30"));
-        assert!(q.theme == Theme::Dark);
+        assert_eq!(q.theme, Theme::Dark);
         assert_eq!(q.refresh_secs, Some(30));
     }
 
@@ -536,7 +577,7 @@ mod tests {
         // Bare keys, malformed pairs, and unknown keys must not poison later
         // valid pairs.
         let q = parse_query(Some("noeq&also&theme=light&missing=&refresh=15"));
-        assert!(q.theme == Theme::Light);
+        assert_eq!(q.theme, Theme::Light);
         assert_eq!(q.refresh_secs, Some(15));
     }
 
@@ -549,7 +590,7 @@ mod tests {
             q.push_str("pad=x&");
         }
         let parsed = parse_query(Some(&q));
-        assert!(parsed.theme == Theme::Auto);
+        assert_eq!(parsed.theme, Theme::Unset);
         assert!(parsed.refresh_secs.is_none());
     }
 
@@ -598,7 +639,7 @@ mod tests {
     #[test]
     fn parse_query_unknown_keys_ignored() {
         let q = parse_query(Some("foo=bar&baz=qux"));
-        assert!(q.theme == Theme::Auto);
+        assert_eq!(q.theme, Theme::Unset);
         assert!(q.refresh_secs.is_none());
     }
 }
