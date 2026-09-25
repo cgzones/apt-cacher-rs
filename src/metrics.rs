@@ -563,7 +563,10 @@ pub(crate) static UPSTREAM_BODY_LIMIT: Signal = Signal::new();
 pub(crate) static UPSTREAM_UNSOLICITED_206: Signal = Signal::new();
 
 /// Hyper-backend upstream errors observed *after* response headers were
-/// received, while streaming the body (peer aborted / framing error).
+/// received, while streaming the body: a reset, a read or TLS failure, a
+/// framing error. A body the upstream ended before its announced length is
+/// an `UPSTREAM_PROTOCOL_VIOLATION` instead, as in splice, and not counted
+/// here.
 pub(crate) static UPSTREAM_HYPER_BODY_ERR: Signal = Signal::new();
 
 /// Local cache I/O failures: any cached-file syscall (write/flush/read/

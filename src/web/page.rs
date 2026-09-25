@@ -441,6 +441,16 @@ dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 
 .ok { color: var(--ok); font-weight: 600; }
 .warn { color: var(--warn); font-weight: 600; }
 .alert { color: var(--alert); font-weight: 700; }
+/* A mirror's upstream health at a glance, in front of its name. */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+       margin-right: 6px; vertical-align: middle; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.alert { background: var(--alert); }
+/* The time scope of a column or row that differs from its neighbours'. */
+.scope { display: inline-block; font-size: 0.72em; font-weight: 600; padding: 0 5px;
+         border-radius: 8px; background: var(--count-bg); color: var(--details-key-fg);
+         vertical-align: middle; white-space: nowrap; }
 time { border-bottom: 1px dotted transparent; transition: border-color 0.15s; }
 time:hover { border-bottom-color: currentColor; }
 

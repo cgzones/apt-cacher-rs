@@ -154,7 +154,8 @@ pub(crate) async fn splice_simple_proxy(
         .await
         .map_err(|err| {
             // The report names the attempted target itself.
-            SpliceProxyError::Upstream(err.conclude(|err| {
+            // A passthrough's path names no mirror: no per-mirror attribution.
+            SpliceProxyError::Upstream(err.conclude(None, |err| {
                 warn_once_or_info_logged!(
                     "simple proxy: failed to fetch the pass-through for client {client}; returning 502:  {}",
                     ErrorReport(err)
@@ -206,7 +207,7 @@ pub(crate) async fn splice_simple_proxy(
     ) {
         Ok(s) => s,
         Err(err) => {
-            let reported = UpstreamError::io("passthrough headers", err).conclude(|err| {
+            let reported = UpstreamError::io("passthrough headers", err).conclude(None, |err| {
                 warn_once_or_info_logged!(
                     "simple proxy: failed to rewrite headers for {upstream_path} from {host_authority}; returning 502:  {}",
                     ErrorReport(err)

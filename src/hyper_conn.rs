@@ -633,7 +633,7 @@ fn upstream_error_response(err: RequestFailure) -> Response<ProxyCacheBody> {
             return quick_response(status, body);
         }
     };
-    let reported = err.conclude(|err| {
+    let reported = err.conclude(None, |err| {
         warn_once_or_info_logged!(
             "Upstream request failed; returning 502:  {}",
             ErrorReport(err)
@@ -770,6 +770,14 @@ impl Body for CachedFileBody {
 /// Hyper is the only source of these erased transport errors. Restore upstream
 /// provenance here; library error-chain inspection never reaches a delivery logger.
 fn upstream_body_error(error: hyper::Error) -> UpstreamError {
+    // Hyper's body decoder wraps a short read in an UnexpectedEof I/O
+    // source; is_incomplete_message() only covers the response head here.
+    if std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .is_some_and(|source| source.kind() == std::io::ErrorKind::UnexpectedEof)
+    {
+        return UpstreamError::protocol(ErrorReport(&error).to_string());
+    }
     if is_io_timed_out_in_chain(&error) {
         metrics::HTTP_TIMEOUT_UPSTREAM_READ.increment();
     }
@@ -3486,6 +3494,87 @@ fn log_client_connection_error(client: ClientInfo, err: &hyper::Error) {
 #[cfg(test)]
 mod tests {
     use super::{SchemeDecision, UpgradeProbe, Uri, host_header_from_uri};
+
+    /// Exercise real hyper body errors: a decoder-detected short body and
+    /// an EOF from the transport are protocol failures, while a reset,
+    /// timeout or TLS-style `InvalidData` error keeps its transport accounting.
+    #[tokio::test]
+    async fn upstream_body_errors_distinguish_eof_from_transport_failures() {
+        use std::io::ErrorKind;
+
+        use bytes::Bytes;
+        use futures_util::StreamExt as _;
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper_util::rt::TokioIo;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio_util::io::{ReaderStream, StreamReader};
+
+        use super::{metrics, upstream_body_error};
+        use crate::mirror_health::MirrorFault;
+
+        for (kind, fault, transport, timeout) in [
+            (None, Some(MirrorFault::Protocol), false, false),
+            (
+                Some(ErrorKind::UnexpectedEof),
+                Some(MirrorFault::Protocol),
+                false,
+                false,
+            ),
+            (Some(ErrorKind::ConnectionReset), None, true, false),
+            (
+                Some(ErrorKind::TimedOut),
+                Some(MirrorFault::Slow),
+                true,
+                true,
+            ),
+            (Some(ErrorKind::InvalidData), None, true, false),
+        ] {
+            let (client, mut upstream) = tokio::io::duplex(4096);
+            let server = tokio::spawn(async move {
+                let mut request = [0; 4096];
+                assert!(upstream.read(&mut request).await.expect("request") > 0);
+                upstream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
+                    .await
+                    .expect("response");
+            });
+            let (reader, writer) = tokio::io::split(client);
+            let chunks = ReaderStream::new(reader).chain(futures_util::stream::iter(
+                kind.map(|kind| Err(std::io::Error::from(kind))),
+            ));
+            let io = TokioIo::new(tokio::io::join(StreamReader::new(chunks), writer));
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+                .await
+                .expect("client handshake");
+            let driver = tokio::spawn(connection);
+            let response = sender
+                .send_request(http::Request::new(Empty::<Bytes>::new()))
+                .await
+                .expect("response head");
+            let error = response
+                .into_body()
+                .collect()
+                .await
+                .expect_err("short or failed body");
+            drop(driver.await.expect("connection task"));
+            server.await.expect("upstream task");
+
+            let body_errors = metrics::UPSTREAM_HYPER_BODY_ERR.get();
+            let timeouts = metrics::HTTP_TIMEOUT_UPSTREAM_READ.get();
+            let failure = upstream_body_error(error);
+            assert_eq!(failure.mirror_fault(), fault, "{kind:?}: {failure}");
+            assert_eq!(
+                metrics::UPSTREAM_HYPER_BODY_ERR.get() - body_errors,
+                u64::from(transport),
+                "{kind:?}"
+            );
+            assert_eq!(
+                metrics::HTTP_TIMEOUT_UPSTREAM_READ.get() - timeouts,
+                u64::from(timeout),
+                "{kind:?}"
+            );
+        }
+    }
 
     /// Hyper erases a body error through `Into<Box<dyn Error + Send + Sync>>`
     /// and exposes the box as its own `source()`. The connection handler must

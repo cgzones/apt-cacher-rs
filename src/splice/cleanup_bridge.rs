@@ -200,7 +200,7 @@ async fn cleanup_upstream_fetch(
                 // Cleanup fetches run without a download runner: conclude the
                 // upstream failure here; cleanup's decision log reports the
                 // cause from the extension.
-                let reported = err.conclude(|_err| {
+                let reported = err.conclude(Some(mirror), |_err| {
                     Logged::debug(format_args!(
                         "splice cleanup request to {upstream_path} failed to connect/read headers"
                     ))
@@ -246,7 +246,7 @@ async fn cleanup_upstream_fetch(
         Err(err) => {
             // No download runner owns this fetch either, so the body failure
             // is concluded here as well (a rate abort is the common one).
-            let reported = err.conclude(|err| {
+            let reported = err.conclude(Some(mirror), |err| {
                 Logged::debug(format_args!(
                     "splice cleanup request to {host_authority}{upstream_path} failed to read the body:  {}",
                     ErrorReport(err)

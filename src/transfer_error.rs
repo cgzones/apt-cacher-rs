@@ -21,10 +21,11 @@ use http::StatusCode;
 use crate::humanfmt::HumanFmt;
 use crate::{
     deb_mirror::Mirror,
-    error::{ErrorReport, is_peer_disconnect},
+    error::{ErrorReport, is_io_timed_out_in_chain, is_peer_disconnect},
     fs_open::count_cache_failure,
     log_once::{KeyedGate, Logged, Reported},
     metrics::{self, Signal},
+    mirror_health::{self, MirrorFault},
     rate_checker::InsufficientRate,
     upstream_retry::RetryStop,
 };
@@ -86,6 +87,22 @@ impl fmt::Display for OperationFailure {
             }
             Cause::Rate(rate) => rate.fmt_with_context(f, format_args!(" for {operation}")),
             Cause::Invalid(reason) => write!(f, "{operation}: {reason}"),
+        }
+    }
+}
+
+impl OperationFailure {
+    /// Whether the operation ended because a deadline fired: a timeout of our
+    /// own, or an I/O or transport error whose source chain carries
+    /// `io::ErrorKind::TimedOut` (hyper surfaces `hyper-timeout`'s deadline
+    /// that way).
+    fn is_timeout(&self) -> bool {
+        match &self.cause {
+            #[cfg(feature = "sendfile")]
+            Cause::Timeout(_) => true,
+            Cause::Io(error) => error.kind() == io::ErrorKind::TimedOut,
+            Cause::Transport(error) => is_io_timed_out_in_chain(error.as_ref()),
+            Cause::Rate(_) | Cause::Invalid(_) => false,
         }
     }
 }
@@ -346,12 +363,57 @@ impl UpstreamError {
         }
     }
 
+    /// What this terminal failure says about its mirror, for the per-mirror
+    /// health counts (`mirror_health`); `None` for a failure that is not the
+    /// mirror's fault or names no class (a local body limit, a reset in the
+    /// middle of a body).
+    ///
+    /// A connect failure and a head failure (reset, EOF or read timeout
+    /// before the head) are both "unreachable"; a head the transport
+    /// delivered but HTTP refused is a protocol violation, like a body
+    /// counted in `UPSTREAM_PROTOCOL_VIOLATION`; a body read that timed out
+    /// and a `min_download_rate` abort are "slow".
+    pub(crate) fn mirror_fault(&self) -> Option<MirrorFault> {
+        let UpstreamFailure {
+            failure,
+            phase,
+            counter,
+        } = self.failure.as_ref();
+        let counts = |signal: &'static Signal| counter.is_some_and(|c| std::ptr::eq(c, signal));
+        match phase {
+            // `head_protocol` is the one head constructor without a counter.
+            UpstreamPhase::Head if counter.is_none() => Some(MirrorFault::Protocol),
+            UpstreamPhase::Connect {
+                attempts: _,
+                stop: _,
+            }
+            | UpstreamPhase::Head => Some(MirrorFault::Unreachable),
+            UpstreamPhase::Body if counts(&metrics::UPSTREAM_PROTOCOL_VIOLATION) => {
+                Some(MirrorFault::Protocol)
+            }
+            UpstreamPhase::Body if counts(&metrics::RATE_LIMIT_UPSTREAM) => Some(MirrorFault::Slow),
+            UpstreamPhase::Body if counts(&metrics::UPSTREAM_BODY_LIMIT) => None,
+            UpstreamPhase::Body => failure.is_timeout().then_some(MirrorFault::Slow),
+        }
+    }
+
     /// End the transfer this failure stops outside any download runner or
     /// delivery sink (a pass-through relay's connect, a cleanup fetch):
-    /// count it, then log it through `log`, whose
+    /// count it -- against `mirror`'s health too,
+    /// where the transfer has a canonical mirror (`None` for a passthrough,
+    /// whose path names no mirror) -- then log it through `log`, whose
     /// [`Logged`] proves the line was written.
-    pub(crate) fn conclude(self, log: impl FnOnce(&Self) -> Logged) -> Reported<Self> {
+    pub(crate) fn conclude(
+        self,
+        mirror: Option<&Mirror>,
+        log: impl FnOnce(&Self) -> Logged,
+    ) -> Reported<Self> {
         self.record_terminal();
+        if let Some(mirror) = mirror
+            && let Some(fault) = self.mirror_fault()
+        {
+            mirror_health::record(mirror, fault);
+        }
         log(&self).with(self)
     }
 }
@@ -566,6 +628,11 @@ impl DownloadFailure {
         context: fmt::Arguments<'_>,
     ) -> ReportedDownloadFailure {
         self.record_terminal();
+        if let Self::Upstream(error) = &self
+            && let Some(fault) = error.mirror_fault()
+        {
+            mirror_health::record(mirror, fault);
+        }
         let line = fmt::from_fn(|f| write!(f, "{context}:  {}", ErrorReport(&self)));
         let logged = if matches!(&self, Self::Upstream(error)
             if matches!(error.phase(), Phase::Connect | Phase::Head))
@@ -1017,7 +1084,9 @@ mod tests {
         assert_eq!(metrics::UPSTREAM_CONNECT_FAILED.get(), connect_before);
         assert_eq!(metrics::UPSTREAM_HEAD_FAILED.get(), head_before);
 
-        let _reported = connect.conclude(|_| Logged::at(Severity::Info, format_args!("connect")));
+        let _reported = connect.conclude(None, |_| {
+            Logged::at(Severity::Info, format_args!("connect"))
+        });
         assert_eq!(metrics::UPSTREAM_CONNECT_FAILED.get(), connect_before + 1);
         assert_eq!(metrics::UPSTREAM_HEAD_FAILED.get(), head_before);
 
@@ -1026,10 +1095,70 @@ mod tests {
         assert_eq!(metrics::UPSTREAM_CONNECT_FAILED.get(), connect_before + 1);
 
         // Counted where the head was parsed, never again at conclude.
-        let _reported = UpstreamError::head_protocol("bad head")
-            .conclude(|_| Logged::at(Severity::Info, format_args!("protocol")));
+        let _reported = UpstreamError::head_protocol("bad head").conclude(None, |_| {
+            Logged::at(Severity::Info, format_args!("protocol"))
+        });
         assert_eq!(metrics::UPSTREAM_PROTOCOL_VIOLATION.get(), protocol_before);
         assert_eq!(metrics::UPSTREAM_HEAD_FAILED.get(), head_before + 1);
+    }
+
+    /// Each terminal upstream failure names at most one per-mirror class.
+    #[test]
+    fn mirror_faults_follow_the_phase_and_cause() {
+        let mut rc = RateChecker::with_timeframe(nonzero!(1000), nonzero!(1));
+        rc.add(1);
+        let rate = rc.check_fail().expect("1 B/s breaches 1000 B/s");
+        let connect = UpstreamError::connect(
+            "connect upstream",
+            io::ErrorKind::ConnectionRefused.into(),
+            3,
+            RetryLimit::Attempts.into(),
+        );
+        for (error, fault) in [
+            (connect, Some(MirrorFault::Unreachable)),
+            (
+                UpstreamError::head_io("read upstream head", io::ErrorKind::TimedOut.into()),
+                Some(MirrorFault::Unreachable),
+            ),
+            (
+                UpstreamError::head_protocol("bad head"),
+                Some(MirrorFault::Protocol),
+            ),
+            (
+                UpstreamError::protocol("short body"),
+                Some(MirrorFault::Protocol),
+            ),
+            (UpstreamError::rate(rate), Some(MirrorFault::Slow)),
+            (UpstreamError::body_limit("too big"), None),
+            (
+                UpstreamError::transport(
+                    "read upstream body",
+                    io::Error::new(io::ErrorKind::TimedOut, "deadline"),
+                ),
+                Some(MirrorFault::Slow),
+            ),
+            (
+                UpstreamError::transport(
+                    "read upstream body",
+                    io::Error::new(io::ErrorKind::ConnectionReset, "reset"),
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(error.mirror_fault(), fault, "{error}");
+        }
+        #[cfg(feature = "splice")]
+        {
+            assert_eq!(
+                UpstreamError::timeout("read upstream body", Duration::from_secs(1)).mirror_fault(),
+                Some(MirrorFault::Slow)
+            );
+            assert_eq!(
+                UpstreamError::io("read upstream body", io::ErrorKind::ConnectionReset.into())
+                    .mirror_fault(),
+                None
+            );
+        }
     }
 
     #[test]

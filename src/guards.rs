@@ -57,6 +57,7 @@ use crate::{
     index_parser::StreamedDigest,
     integrity::{self, CommitError, CommitFailure, PrepareStep, RenamePlan, TempFile},
     metrics,
+    mirror_health::{self, MirrorFault},
     partial_file::TempPath,
     sticky,
     transfer_error::{DownloadFailure, ReportedDownloadFailure},
@@ -844,11 +845,12 @@ impl RenameBarrier {
             };
             // A mismatch is the mirror's content; a verify read or rename
             // failure is this disk's.
-            count_abort(if checksum_mismatch {
-                &metrics::DOWNLOADS_ABORTED_CHECKSUM
+            if checksum_mismatch {
+                count_abort(&metrics::DOWNLOADS_ABORTED_CHECKSUM);
+                mirror_health::record(&data.lease.key.mirror, MirrorFault::Checksum);
             } else {
-                &metrics::DOWNLOADS_ABORTED_CACHE
-            });
+                count_abort(&metrics::DOWNLOADS_ABORTED_CACHE);
+            }
             // Publication is complete, so Drop must not replace Discarded
             // with a generic abort. Keep the lease until the last mutation
             // of the partial has finished, including a detached unlink.

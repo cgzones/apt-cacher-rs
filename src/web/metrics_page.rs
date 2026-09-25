@@ -821,7 +821,7 @@ fn build_upstream_group(g: &mut Groups) {
         );
         t.signal(
             "hyper Failures (body)",
-            "Hyper-backend post-response body-stream errors.",
+            "Hyper-backend post-response body-stream errors (a reset, a read or TLS failure, a framing error). A body that ended before its announced length counts as a Protocol Violation instead, as in splice.",
             Level::Warn,
             &metrics::UPSTREAM_HYPER_BODY_ERR,
         );

@@ -80,8 +80,8 @@ pub(crate) fn is_expected_client_end(err: &std::io::Error) -> bool {
 
 /// Whether any error in `err`'s `source()` chain is a `TimedOut` `io::Error`.
 /// Hyper wraps the connector's timeout several layers deep; this is what the
-/// hyper backend's 502/504 split reads.
-#[cfg(feature = "hyper")]
+/// hyper backend's 502/504 split reads, and what classifies an upstream
+/// transport failure as a timeout for the per-mirror health counts.
 #[must_use]
 pub(crate) fn is_io_timed_out_in_chain(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);

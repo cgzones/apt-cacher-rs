@@ -25,6 +25,7 @@ use crate::{
         packages_reader,
     },
     metrics,
+    mirror_health::{self, MirrorFault},
     precise_instant::PreciseInstant,
     proxy_body::ProxyCacheBody,
     transfer_error::DeliveryFailure,
@@ -254,6 +255,7 @@ async fn process_stanza(
             } else {
                 invalidate_metadata_for(&path, ctx.mirror, ctx.layout);
                 metrics::CLEANUP_CHECKSUM_MISMATCHES.increment();
+                mirror_health::record(ctx.mirror, MirrorFault::Checksum);
                 ctx.tally.record_mismatch(pre_size);
             }
         }

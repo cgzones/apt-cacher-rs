@@ -1014,14 +1014,17 @@ async fn relay_passthrough(
         Ok(s) => s,
         Err(err) => {
             let reported =
-                UpstreamError::io("passthrough response headers", err).conclude(|err| {
+                UpstreamError::io("passthrough response headers", err).conclude(
+                    Some(&conn_details.mirror),
+                    |err| {
                     warn_once_or_info_logged!(
                         "splice proxy: failed to rewrite passthrough headers for {} from mirror {}; returning 502:  {}",
                         conn_details.debname,
                         conn_details.mirror,
                         ErrorReport(err)
                     )
-                });
+                    },
+                );
             return Err(SpliceProxyError::Upstream(reported));
         }
     };

@@ -21,11 +21,16 @@ use crate::{
     error::ErrorReport,
     humanfmt::HumanFmt,
     metrics,
+    mirror_health::MirrorHealth,
+    swrite,
     uncacheables::get_uncacheables,
 };
 
 use super::{
-    fmt::{FmtLastSeenHealth, FmtTimestamp, Freshness, HtmlEscape, HtmlEscaped, as_size},
+    fmt::{
+        FmtLastSeenHealth, FmtTimestamp, Freshness, HtmlEscape, HtmlEscaped, Level, Nonzero,
+        as_size,
+    },
     table::{Table, tr, write_section_error},
 };
 
@@ -249,7 +254,52 @@ mod mirror_cells {
 
     use crate::humanfmt::HumanFmt;
 
+    use crate::mirror_health::MirrorHealth;
+
     use super::super::fmt::Meter;
+
+    /// The coloured dot in front of a mirror's name: green without a failure
+    /// since start, red once one of its files failed checksum verification
+    /// (the mirror serves content its index disagrees with), amber for any
+    /// other failure class. Its title spells the counts out.
+    #[derive(Clone, Copy)]
+    pub(super) struct HealthDot(pub MirrorHealth);
+    impl Display for HealthDot {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            let MirrorHealth {
+                unreachable,
+                protocol,
+                checksum,
+                slow,
+            } = self.0;
+            let class = if checksum > 0 {
+                "alert"
+            } else if unreachable + protocol + slow > 0 {
+                "warn"
+            } else {
+                "ok"
+            };
+            write!(f, "<span class=\"dot {class}\" title=\"")?;
+            if class == "ok" {
+                f.write_str("No upstream failure since start")?;
+            } else {
+                f.write_str("Upstream failures since start:")?;
+                let mut sep = " ";
+                for (count, what) in [
+                    (unreachable, "unreachable"),
+                    (protocol, "protocol error"),
+                    (checksum, "checksum mismatch"),
+                    (slow, "timeout / slow"),
+                ] {
+                    if count > 0 {
+                        write!(f, "{sep}{count} {what}")?;
+                        sep = ", ";
+                    }
+                }
+            }
+            f.write_str("\"></span>")
+        }
+    }
 
     pub(super) struct DirSizeCell {
         pub size: u64,
@@ -327,14 +377,29 @@ mod mirror_cells {
     }
 }
 
+/// The Mirrors table's failure columns. In-memory counts since the daemon
+/// started, unlike the persisted columns beside them, hence the scope chip.
+const MIRROR_HEALTH_HEADERS: [&str; 4] = [
+    "<span title=\"Downloads whose connect, or the exchange before the response head, failed: the mirror is down or unreachable from here.\">Unreachable</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Responses that broke the HTTP contract (malformed head, body disagreeing with its framing, unsolicited 206): a mirror bug to report.\">Protocol Errors</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Files whose content did not match the digest in the mirror's own index, at download or at cleanup's re-verification.\">Checksum Mismatches</span> <span class=\"scope\">since start</span>",
+    "<span title=\"Downloads aborted because a body read timed out (http_timeout) or the mirror fell below min_download_rate over rate_check_timeframe.\">Timeouts / Slow</span> <span class=\"scope\">since start</span>",
+];
+
+/// One failure-count cell of the Mirrors table.
+fn health_cell(value: u64, level: Level) -> Nonzero {
+    Nonzero { value, level }
+}
+
 pub(super) async fn build_mirror_table(
     mirrors: &[MirrorStatEntry],
+    health: &HashMap<Box<str>, MirrorHealth>,
     now_epoch: i64,
     cache_path: &Path,
 ) -> (Section, DirStats) {
-    use mirror_cells::{AvgMaxCell, DirSizeCell, EfficiencyCell};
+    use mirror_cells::{AvgMaxCell, DirSizeCell, EfficiencyCell, HealthDot};
 
-    if mirrors.is_empty() {
+    if mirrors.is_empty() && health.is_empty() {
         return (Section::EMPTY, DirStats::default());
     }
 
@@ -388,16 +453,30 @@ pub(super) async fn build_mirror_table(
         "File Count",
         "Avg / Max Size",
         "Debs / Metadata",
+        MIRROR_HEALTH_HEADERS[0],
+        MIRROR_HEALTH_HEADERS[1],
+        MIRROR_HEALTH_HEADERS[2],
+        MIRROR_HEALTH_HEADERS[3],
     ]);
 
+    // The per-mirror failure counts join by the `MirrorUri` rendering
+    // (`mirror_health::key`); a failing mirror without a row of its own is
+    // appended below the persisted ones.
+    let mut unmatched: Vec<(&str, &MirrorHealth)> =
+        health.iter().map(|(key, h)| (key.as_ref(), h)).collect();
+    let mut key = String::new();
     for (mirror, stats) in sorted.iter().zip(&dir_stats) {
         let downloaded_bytes = as_size(mirror.total_download_size);
         let delivered_bytes = as_size(mirror.total_delivery_size);
+        key.clear();
+        swrite!(key, "{}", mirror.uri());
+        let mirror_health = health.get(key.as_str()).copied().unwrap_or_default();
+        unmatched.retain(|(k, _)| *k != key);
 
         tr!(
             marked Freshness::of(mirror.last_seen, now_epoch).row_class(),
             table,
-            HtmlEscaped(mirror.uri()),
+            format_args!("{}{}", HealthDot(mirror_health), HtmlEscaped(mirror.uri())),
             FmtLastSeenHealth {
                 last_seen: mirror.last_seen,
                 now_epoch
@@ -429,10 +508,38 @@ pub(super) async fn build_mirror_table(
                 max_file: stats.max_file_size,
             },
             format_args!("{} / {}", stats.deb_files, stats.metadata_files),
+            health_cell(mirror_health.unreachable, Level::Warn),
+            health_cell(mirror_health.protocol, Level::Warn),
+            health_cell(mirror_health.checksum, Level::Alert),
+            health_cell(mirror_health.slow, Level::Warn),
         );
     }
 
-    let rows = sorted.len();
+    // A mirror that failed before it ever answered has no persisted row:
+    // everything but its failure counts is unknown.
+    unmatched.sort_unstable_by_key(|(key, _)| *key);
+    for (key, mirror_health) in &unmatched {
+        tr!(
+            table,
+            format_args!("{}{}", HealthDot(**mirror_health), HtmlEscape(key)),
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            health_cell(mirror_health.unreachable, Level::Warn),
+            health_cell(mirror_health.protocol, Level::Warn),
+            health_cell(mirror_health.checksum, Level::Alert),
+            health_cell(mirror_health.slow, Level::Warn),
+        );
+    }
+
+    let rows = sorted.len() + unmatched.len();
     (
         Section {
             html: table.finish(),

@@ -25,7 +25,7 @@ use crate::{
     error::ErrorReport,
     global_cache_quota, global_config,
     humanfmt::HumanFmt,
-    metrics,
+    metrics, mirror_health,
     passthrough_limiter::active_relays,
     swrite,
     tunnel_limiter::active_tunnels,
@@ -203,9 +203,10 @@ async fn build_mirror_fs_section(
     now_epoch: i64,
 ) -> (Section, DirStats, Option<u64>) {
     let config = global_config();
+    let health = mirror_health::snapshot();
 
     let ((section, aggregate), free_disk_bytes) = tokio::join!(
-        build_mirror_table(mirrors, now_epoch, &config.cache_directory),
+        build_mirror_table(mirrors, &health, now_epoch, &config.cache_directory),
         // statvfs() can stall on slow/hung filesystems (NFS, FUSE, dying
         // disks); run it on the blocking pool so it cannot wedge the tokio
         // worker.

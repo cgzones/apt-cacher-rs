@@ -60,6 +60,7 @@ mod logstore;
 mod macros;
 mod main_loop;
 mod metrics;
+mod mirror_health;
 mod parallel_hack;
 mod partial_claim;
 mod partial_file;
