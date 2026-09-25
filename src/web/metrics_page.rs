@@ -371,7 +371,7 @@ fn build_connections_group(g: &mut Groups) {
         );
         t.signal(
             "Accept Failures (retried)",
-            "accept(2) failures retried after a short pause instead of stopping the daemon: descriptor exhaustion (EMFILE/ENFILE), ENOBUFS/ENOMEM, ECONNABORTED. The process is at its file-descriptor budget: raise LimitNOFILE, or lower max_connections below it.",
+            "accept(2) failures retried after a short pause instead of stopping the daemon: descriptor exhaustion (EMFILE/ENFILE), ENOBUFS/ENOMEM, ECONNABORTED. The process is at its file-descriptor budget (Capacity: Open File Descriptors): raise LimitNOFILE, or lower max_connections below it.",
             Level::Warn,
             &metrics::ACCEPT_TRANSIENT_FAILURES,
         );

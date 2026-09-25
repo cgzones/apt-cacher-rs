@@ -478,6 +478,12 @@ pub(crate) static UNHANDLED_REQUEST_HEADERS: Counter = Counter::new();
 pub(crate) static REQUEST_READ_PEER_DISCONNECT: Counter = Counter::new();
 pub(crate) static REQUEST_READ_PROTOCOL_ERROR: Signal = Signal::new();
 
+/// Most file descriptors this process held at once since start, against
+/// its soft `RLIMIT_NOFILE`: sampled every few seconds and on each
+/// dashboard render (`fd_usage`), and set to the soft limit itself when
+/// `accept(2)` fails with `EMFILE`, a spike the samples can miss.
+pub(crate) static OPEN_FDS_PEAK: Peak = Peak::new();
+
 /// Peak concurrency: connected clients, in-flight upstream downloads,
 /// in-flight client-side downloads.
 pub(crate) static CONNECTED_CLIENTS_PEAK: Peak = Peak::new();

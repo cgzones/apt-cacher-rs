@@ -40,6 +40,7 @@ mod database_task;
 mod deb_mirror;
 mod delivery;
 mod error;
+mod fd_usage;
 mod flat_blocklist;
 mod fs_open;
 mod guards;

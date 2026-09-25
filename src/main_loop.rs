@@ -49,7 +49,7 @@ use crate::{
     database_task::{self, db_loop},
     deb_mirror,
     error::ErrorReport,
-    flat_blocklist, global_config, global_webif_hosts,
+    fd_usage, flat_blocklist, global_config, global_webif_hosts,
     healthcheck::{self, filesystem_space},
     humanfmt::HumanFmt,
     metrics,
@@ -501,6 +501,10 @@ pub(crate) async fn main_loop(
                 .expect("FIRST_CLEANUP_DELAY_SECS fits in i64"),
     );
 
+    // The open-descriptor peak for the dashboard's Capacity section, sampled
+    // here rather than per accept.
+    tokio::task::spawn(fd_usage::sampler());
+
     // The splice upstream pool's idle sweep, so sockets of a host that sees
     // no more traffic do not wait for the next return to some host.
     #[cfg(feature = "splice")]
@@ -612,6 +616,9 @@ pub(crate) async fn main_loop(
             // Back off briefly so a saturated loop does not spin.
             Err(err) if is_transient_accept_error(&err) => {
                 metrics::ACCEPT_TRANSIENT_FAILURES.increment();
+                if err.raw_os_error() == Some(nix::libc::EMFILE) {
+                    fd_usage::note_exhausted();
+                }
                 warn_once_or_info!(
                     "Failed to accept a client connection; retrying after {}:  {}",
                     HumanFmt::Time(ACCEPT_RETRY_DELAY),

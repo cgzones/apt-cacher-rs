@@ -25,7 +25,7 @@ use crate::{
     },
     database_task::DB_TASK_QUEUE_SENDER,
     error::ErrorReport,
-    global_cache_quota, global_config,
+    fd_usage, global_cache_quota, global_config,
     humanfmt::HumanFmt,
     metrics, mirror_health,
     passthrough_limiter::active_relays,
@@ -564,6 +564,29 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
             now: Utc::now().inner().unix_timestamp(),
         }
     );
+
+    let open_fds = t
+        .entry("Open File Descriptors")
+        .kind(Kind::Live)
+        .tip("Sockets, cache files, splice pipes and the database this process holds, against its soft RLIMIT_NOFILE. At the cap accept(2) fails with EMFILE (Metrics: Accept Failures) and new downloads cannot open their files. Raise LimitNOFILE= in the service unit, or lower max_connections, which by default takes three quarters of the limit.");
+    // Sampled now too, so the peak is never below the figure beside it.
+    match fd_usage::sample() {
+        Some(current) => {
+            let (soft, hard) = fd_usage::nofile_limit();
+            open_fds
+                .note(format_args!(
+                    "hard limit {}; peak sampled every {} s",
+                    OptOrUnlimited(hard.map(Count)),
+                    fd_usage::SAMPLE_INTERVAL.as_secs()
+                ))
+                .value(Gauge {
+                    current,
+                    cap: soft,
+                    peak: Some(metrics::OPEN_FDS_PEAK.get()),
+                });
+        }
+        None => open_fds.value("N/A"),
+    }
 
     let refused = metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.get();
     let mut slots = t.entry("Upstream Download Slots")
