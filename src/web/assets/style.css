@@ -294,6 +294,9 @@ pre.log .entry.warn { color: var(--warn); }
                      border: 1px solid var(--section-border); border-radius: 3px;
                      background: var(--count-bg); color: var(--fg); }
 .setup .copy-note { color: var(--details-key-fg); font-size: 0.85em; }
+/* The footer's keyboard-shortcut note and switch (keys.js). */
+.keys-note button { font: inherit; padding: 0 6px; cursor: pointer; color: var(--link);
+                    background: none; border: 1px solid var(--section-border); border-radius: 3px; }
 
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
