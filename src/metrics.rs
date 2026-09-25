@@ -1019,6 +1019,11 @@ pub(crate) static CLEANUP_CHECKSUM_MISMATCHES: Signal = Signal::new();
 /// of total cache size.
 pub(crate) static CLEANUP_CHECKSUM_SKIPS: Counter = Counter::new();
 
+/// Last cleanup run of this process: when it finished (Unix seconds; 0
+/// before the first run since start). Set last, after the trio below, so a
+/// reader that finds it set finds them set too. The persisted counterpart
+/// is the mirrors' `last_cleanup` column, which survives restarts.
+pub(crate) static LAST_CLEANUP_FINISHED_AT: StateU64 = StateU64::new();
 /// Last cleanup run: duration in seconds (atomically updated; readers may
 /// observe a transient mix across the trio between updates).
 pub(crate) static LAST_CLEANUP_DURATION_SECS: StateU64 = StateU64::new();

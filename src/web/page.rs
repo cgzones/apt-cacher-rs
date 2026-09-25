@@ -443,6 +443,17 @@ meter.gauge:-moz-meter-sub-sub-optimum::-moz-meter-bar { background: var(--alert
 /* Context under a value (time at cap, refusal share). */
 dl.details dd.note { color: var(--details-key-fg); font-weight: 400; font-size: 0.75em;
                      font-family: inherit; }
+/* What kind of figure a row shows: read now, a maximum since start, or from
+   the database. Counters since start carry no chip. */
+dl.details div.k-live > dt::after, dl.details div.k-peak > dt::after,
+dl.details div.k-db > dt::after {
+    display: inline-block; margin-left: 5px; padding: 0 5px; border-radius: 7px;
+    font-size: 0.85em; font-weight: 600; line-height: 1.4; vertical-align: 1px;
+    background: var(--count-bg); }
+dl.details div.k-live > dt::after { content: "live"; color: var(--ok); }
+dl.details div.k-peak > dt::after { content: "peak"; color: var(--details-key-fg); }
+dl.details div.k-db > dt::after { content: "persisted"; color: var(--link); }
+.scope-note { color: var(--details-key-fg); font-size: 0.8em; margin: 2px 0 4px; }
 /* When a bad-sign counter last moved: context for the figure above it. */
 dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 0.75em;
                      font-family: inherit; }

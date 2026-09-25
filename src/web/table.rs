@@ -234,6 +234,7 @@ impl DetailsList {
             parts: None,
             last: None,
             note: None,
+            kind: Kind::Plain,
         }
     }
 
@@ -245,6 +246,34 @@ impl DetailsList {
     pub(super) fn finish_counted(mut self) -> (String, Highlights) {
         self.out.push_str("</dl>");
         (self.out, self.highlights)
+    }
+}
+
+/// What kind of figure a row shows, so values of different time scopes
+/// cannot be read as one another. Rendered as a class on the row, which the
+/// stylesheet turns into a small chip after the label.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum Kind {
+    /// A counter since the daemon started (the Metrics section's default),
+    /// or a value that needs no chip (a version, a config value).
+    #[default]
+    Plain,
+    /// Read now: a gauge, a live count.
+    Live,
+    /// The maximum since the daemon started.
+    Peak,
+    /// From the database, surviving restarts.
+    Persisted,
+}
+
+impl Kind {
+    const fn class(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Live => Some("k-live"),
+            Self::Peak => Some("k-peak"),
+            Self::Persisted => Some("k-db"),
+        }
     }
 }
 
@@ -260,6 +289,7 @@ pub(super) struct Entry<'a> {
     last: Option<u64>,
     /// A line of context under the value (see [`Entry::note`]).
     note: Option<String>,
+    kind: Kind,
 }
 
 impl Entry<'_> {
@@ -298,6 +328,12 @@ impl Entry<'_> {
         self
     }
 
+    /// What kind of figure this is (live, peak, persisted); see [`Kind`].
+    pub(super) fn kind(mut self, kind: Kind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     /// A line of context under the value, e.g. how long a limiter spent at
     /// its cap: a second `<dd>`, so the value cell stays the bare figure.
     pub(super) fn note(mut self, note: impl Display) -> Self {
@@ -315,6 +351,7 @@ impl Entry<'_> {
             parts,
             last,
             note,
+            kind,
         } = self;
         let DetailsList {
             out,
@@ -322,11 +359,12 @@ impl Entry<'_> {
             highlights,
         } = list;
         let row_start = out.len();
-        out.push_str(if parts.is_some() {
-            "<div class=\"whole\"><dt"
-        } else {
-            "<div><dt"
-        });
+        match (parts.is_some(), kind.class()) {
+            (false, None) => out.push_str("<div><dt"),
+            (true, None) => out.push_str("<div class=\"whole\"><dt"),
+            (false, Some(kind)) => swrite!(out, "<div class=\"{kind}\"><dt"),
+            (true, Some(kind)) => swrite!(out, "<div class=\"whole {kind}\"><dt"),
+        }
         if let Some(tip) = tip {
             swrite!(out, " title=\"{tip}\"");
         }
@@ -461,7 +499,7 @@ pub(super) fn write_section_error(out: &mut String, what: &'static str, err: &sq
 
 #[cfg(test)]
 mod tests {
-    use super::{DetailsList, Highlights, Table, write_collapsible_section};
+    use super::{DetailsList, Highlights, Kind, Table, write_collapsible_section};
     use crate::web::fmt::{Level, Nonzero};
 
     #[test]
@@ -612,6 +650,24 @@ mod tests {
             .to_string(),
             "<span class=\"alert\">1 alert</span> / <span class=\"warn\">3 warnings</span>",
         );
+    }
+
+    #[test]
+    fn a_row_carries_its_kind_as_a_class() {
+        let mut list = DetailsList::with_now(0);
+        list.entry("Now").kind(Kind::Live).value(1);
+        list.entry("Max").kind(Kind::Peak).value(2);
+        list.entry("Stored").kind(Kind::Persisted).value(3);
+        list.entry("Count").kind(Kind::Plain).value(4);
+        let html = list.finish();
+        for needle in [
+            "<div class=\"k-live\"><dt>Now</dt>",
+            "<div class=\"k-peak\"><dt>Max</dt>",
+            "<div class=\"k-db\"><dt>Stored</dt>",
+            "<div><dt>Count</dt>",
+        ] {
+            assert!(html.contains(needle), "{needle}: {html}");
+        }
     }
 
     #[test]

@@ -253,6 +253,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
             metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
             metrics::LAST_CLEANUP_FILES_REMOVED.set(0);
             metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(0);
+            metrics::LAST_CLEANUP_FINISHED_AT.set(coarsetime::Clock::now_since_epoch().as_secs());
             return;
         }
     };
@@ -414,6 +415,7 @@ async fn task_cleanup_impl(appstate: &AppState) {
     metrics::LAST_CLEANUP_DURATION_SECS.set(elapsed.as_secs());
     metrics::LAST_CLEANUP_FILES_REMOVED.set(files_removed);
     metrics::LAST_CLEANUP_BYTES_RECLAIMED.set(bytes_removed);
+    metrics::LAST_CLEANUP_FINISHED_AT.set(coarsetime::Clock::now_since_epoch().as_secs());
 
     // Second invalidation: the per-mirror units above removed rows of their
     // own, and the pre-pass one is long stale by now. Cleanup is the only

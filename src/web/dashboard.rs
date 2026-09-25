@@ -38,14 +38,14 @@ use crate::{
 use super::{
     fmt::{
         CacheHitRatio, Colorize, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp, Gauge,
-        HtmlEscape, MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, Saturation, Utc, Window,
-        YesNo, as_size,
+        HtmlEscape, MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation, Utc,
+        Window, YesNo, as_size,
     },
     metrics_page::build_metrics_html,
     page::{Heading, Page, PageTitle, QueryOptions, SetupHint, build_nav_html, build_page},
     response::WebResponse,
     table::{
-        DetailsList, Highlights, write_collapsible_details, write_collapsible_details_badged,
+        DetailsList, Highlights, Kind, write_collapsible_details, write_collapsible_details_badged,
         write_collapsible_section, write_section,
     },
     tables::{
@@ -375,7 +375,7 @@ async fn gather_dashboard_data(appstate: &AppState) -> DashboardData {
         rd,
     );
 
-    let (metrics_html, metrics_highlights) = build_metrics_html();
+    let (metrics_html, metrics_highlights) = build_metrics_html(rd.start_time.unix_timestamp());
     let hero_html = build_hero_html(
         mirror_rows,
         cache_size,
@@ -470,7 +470,7 @@ fn build_hero_html(mirrors: &[MirrorStatEntry], cache_size: u64, quota: Option<u
          <span class=\"arrow\">\u{2192}</span>\
          <span><span class=\"k\">served to clients</span><span class=\"v\">{}</span></span>\
          </div>\
-         <div class=\"saved\"><span class=\"k\">bandwidth saved{}</span>\
+         <div class=\"saved\"><span class=\"k\">bandwidth saved{} <span class=\"scope\" title=\"Totals from the database: they survive restarts.\">persisted</span></span>\
          <span class=\"big\">{}</span></div>",
         HumanFmt::Size(downloaded),
         HumanFmt::Size(delivered),
@@ -511,40 +511,32 @@ fn build_daemon_status_html(
         ),
     );
     t.row("Current Time", now);
-    t.row(
-        "Memory Usage",
-        format_args!(
-            "{} ({} virtual)",
-            OptSize {
-                bytes: memory_stats.map(|m| m.physical_mem as u64),
-                fallback: "N/A",
-            },
-            OptSize {
-                bytes: memory_stats.map(|m| m.virtual_mem as u64),
-                fallback: "N/A",
-            },
-        ),
-    );
-    t.row(
-        "Database Size",
+    t.entry("Memory Usage").kind(Kind::Live).value(format_args!(
+        "{} ({} virtual)",
         OptSize {
-            bytes: database_size,
+            bytes: memory_stats.map(|m| m.physical_mem as u64),
             fallback: "N/A",
         },
-    );
-    t.row(
-        "Active Client Downloads",
-        format_args!(
+        OptSize {
+            bytes: memory_stats.map(|m| m.virtual_mem as u64),
+            fallback: "N/A",
+        },
+    ));
+    t.entry("Database Size").kind(Kind::Live).value(OptSize {
+        bytes: database_size,
+        fallback: "N/A",
+    });
+    t.entry("Active Client Downloads")
+        .kind(Kind::Live)
+        .value(format_args!(
             "{} (peak {})",
             active_client_downloads(),
             metrics::ACTIVE_CLIENT_DOWNLOADS_PEAK.get(),
-        ),
-    );
-    t.row_tip(
-        "Metadata Cache Entries",
-        "Process-local entries cached from per-file ETag and Last-Modified xattrs. Skips fgetxattr(2) on subsequent conditional-request hits; rebuilt lazily after restart.",
-        cache_metadata::store().len(),
-    );
+        ));
+    t.entry("Metadata Cache Entries")
+        .kind(Kind::Live)
+        .tip("Process-local entries cached from per-file ETag and Last-Modified xattrs. Skips fgetxattr(2) on subsequent conditional-request hits; rebuilt lazily after restart.")
+        .value(cache_metadata::store().len());
     t.finish()
 }
 
@@ -560,9 +552,19 @@ fn cap_of(cap: Option<std::num::NonZero<usize>>) -> Option<u64> {
 fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> String {
     let config = &rd.config;
     let mut t = DetailsList::new();
+    let mut html = String::with_capacity(4096);
+    swrite!(
+        html,
+        "<p class=\"scope-note\">Live values against their caps. Peaks, time at cap and refusal shares count since the daemon started, {}.</p>",
+        RelTime {
+            epoch: rd.start_time.unix_timestamp(),
+            now: Utc::now().inner().unix_timestamp(),
+        }
+    );
 
     let refused = metrics::UPSTREAM_DOWNLOAD_REJECTED_CAP.get();
     t.entry("Upstream Download Slots")
+.kind(Kind::Live)
         .tip("Downloads with an upstream connection open, against max_upstream_downloads; a new download past it is refused with 503. Long at cap with a real refusal share means the cap is below the load (or a slow mirror holds slots: see the Mirrors table).")
         .note(Saturation {
             at_cap: metrics::UPSTREAM_DOWNLOAD_CAP_CLOCK.total(),
@@ -578,6 +580,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
 
     let refused = metrics::PASSTHROUGH_REJECTED_CAP.get();
     t.entry("Passthrough Relays")
+.kind(Kind::Live)
         .tip("Uncached requests currently relayed to an upstream, against max_passthrough_relays; a relay past it is refused with 503.")
         .note(Saturation {
             at_cap: metrics::PASSTHROUGH_CAP_CLOCK.total(),
@@ -594,6 +597,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
     let accepted = metrics::CONNECTIONS_ACCEPTED.get();
     let mut connected = t
         .entry("Connected Clients")
+        .kind(Kind::Live)
         .tip("Open client connections, against max_connections (by default three quarters of the soft RLIMIT_NOFILE); a connection past it is closed at accept time. Raise max_connections and LimitNOFILE together.");
     if config.max_connections.is_some() {
         let refused = metrics::CONNECTION_REJECTED_GLOBAL_CAP.get();
@@ -609,6 +613,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
 
     if let Some(cap) = config.max_connections_per_client_ip {
         t.entry("Connections per Client IP")
+.kind(Kind::Live)
             .tip("Connections held by the busiest single source IP, against max_connections_per_client_ip; its next connection is closed at accept time. The peak is the most any IP held since start: deploy generously, watch it settle, then lower the cap to a margin above it. The Clients table names refused clients.")
             .note(Saturation {
                 at_cap: metrics::CONNECTION_PER_IP_CAP_CLOCK.total(),
@@ -625,6 +630,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
 
     if config.https_tunnel_enabled {
         t.entry("HTTPS Tunnels")
+.kind(Kind::Live)
             .tip("CONNECT tunnels open across all clients. There is no global tunnel cap; the per-client one is the row beside it.")
             .value(format_args!(
                 "{} <span class=\"peak\">peak {}</span>",
@@ -634,6 +640,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
         if let Some(cap) = config.https_tunnel_max_connections_per_client {
             let refused = metrics::TUNNEL_REJECTED_CAPACITY.get();
             t.entry("HTTPS Tunnels per Client")
+.kind(Kind::Live)
                 .tip("Tunnels held by the busiest single source IP, against https_tunnel_max_connections_per_client; its next CONNECT is refused with 429. The Clients table names refused clients.")
                 .note(Saturation {
                     at_cap: metrics::TUNNEL_PER_CLIENT_CAP_CLOCK.total(),
@@ -654,6 +661,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
         .expect("Sender initialized in main_loop()");
     let channel_max = database_tx.max_capacity();
     t.entry("DB Command Queue")
+.kind(Kind::Live)
         .tip("Commands queued for the database task, against db_channel_capacity. While it is full, request paths wait on database writes: raise db_channel_capacity, or flush sooner with db_batch_flush_max_count / db_batch_flush_interval_secs.")
         .note(Saturation {
             at_cap: metrics::DB_QUEUE_CAP_CLOCK.total(),
@@ -669,6 +677,7 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
 
     let logstore = LOGSTORE.get().expect("initialized in main()");
     t.entry("Log Ring")
+.kind(Kind::Live)
         .tip("Entries held for the /logs page, against logstore_capacity. A full ring is normal: the oldest entry makes room for the newest. Raise logstore_capacity to reach further back.")
         .note(format_args!(
             "{} evicted since start",
@@ -680,7 +689,8 @@ fn build_capacity_html(rd: &RuntimeDetails, active_mirror_downloads: usize) -> S
             peak: None,
         });
 
-    t.finish()
+    html.push_str(&t.finish());
+    html
 }
 
 /// A retention window in days, or `"forever"` when it is unlimited.
@@ -809,9 +819,10 @@ fn build_maintenance_html(
     let last_cleanup_epoch = mirrors.iter().map(|m| m.last_cleanup).max().unwrap_or(0);
 
     let mut t = DetailsList::new();
-    t.row(
-        "Last Cleanup",
-        EpochAndRel {
+    t.entry("Last Cleanup")
+        .kind(Kind::Persisted)
+        .tip("The newest cleanup recorded for any mirror in the database, so it survives restarts. The Metrics section's Cleanup rows cover this process's own runs.")
+        .value(EpochAndRel {
             epoch: last_cleanup_epoch,
             now_epoch,
             rel: Rel::Ago,
@@ -862,28 +873,41 @@ fn build_cache_stats_html(
     // The lifetime fetched/served/saved triple lives in the hero; repeating
     // it here would be the same three numbers twice on one screen.
     let mut t = DetailsList::new();
-    t.row(
-        "Cache Hit Ratio (persisted)",
-        CacheHitRatio {
+    t.entry("Cache Hit Ratio")
+        .kind(Kind::Persisted)
+        .tip("Client deliveries not preceded by an upstream fetch, over all deliveries: from the database, so it spans restarts (and usage_retention_days).")
+        .value(CacheHitRatio {
             hits: cache_hits,
             total: total_delivery_count,
         },
     );
-    t.row("Bandwidth (last 24h)", Window(bandwidth_day));
-    t.row("Bandwidth (last 7d)", Window(bandwidth_week));
-    t.row("Uncacheable Resources", uncacheable_count);
-    t.row(
-        "Cached Files",
-        format_args!(
+    t.entry("Bandwidth (last 24h)")
+        .kind(Kind::Persisted)
+        .value(Window(bandwidth_day));
+    t.entry("Bandwidth (last 7d)")
+        .kind(Kind::Persisted)
+        .value(Window(bandwidth_week));
+    t.entry("Uncacheable Resources")
+        .kind(Kind::Live)
+        .value(uncacheable_count);
+    t.entry("Cached Files")
+        .kind(Kind::Live)
+        .tip("From a walk of the mirror directories, cached for up to a minute.")
+        .value(format_args!(
             "{} debs / {} metadata / {} by-hash",
             aggregate.deb_files, aggregate.metadata_files, aggregate.byhash_files
-        ),
-    );
-    t.row("Oldest Cached File", FmtMTimeAge(aggregate.oldest_mtime));
-    t.row("Newest Cached File", FmtMTimeAge(aggregate.newest_mtime));
+        ));
+    t.entry("Oldest Cached File")
+        .kind(Kind::Live)
+        .value(FmtMTimeAge(aggregate.oldest_mtime));
+    t.entry("Newest Cached File")
+        .kind(Kind::Live)
+        .value(FmtMTimeAge(aggregate.newest_mtime));
 
     let quota = rd.config.disk_quota.map(std::num::NonZero::get);
-    t.row("Total Disk Usage", DiskUsage { cache_size, quota });
+    t.entry("Total Disk Usage")
+        .kind(Kind::Live)
+        .value(DiskUsage { cache_size, quota });
 
     let free_disk_space = if let Some(free) = free_disk_bytes {
         let remaining_quota = quota.map(|q| q.saturating_sub(cache_size));
@@ -902,7 +926,9 @@ fn build_cache_stats_html(
         }
     };
 
-    t.row("Free Disk Space", free_disk_space);
+    t.entry("Free Disk Space")
+        .kind(Kind::Live)
+        .value(free_disk_space);
 
     t.finish()
 }

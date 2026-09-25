@@ -41,8 +41,8 @@ use crate::{
 };
 
 use super::{
-    fmt::{Level, Nonzero, alert_if, warn_if},
-    table::{DetailsList, Highlights},
+    fmt::{Level, Nonzero, RelTime, alert_if, now_epoch, warn_if},
+    table::{DetailsList, Highlights, Kind},
 };
 
 /// Percentage suffix rendered only when the total is non-zero.
@@ -191,11 +191,20 @@ fn delivery_path(
 }
 
 /// The section's markup and how many of its rows are highlighted, for the
-/// badge its collapsed header carries.
-pub(super) fn build_metrics_html() -> (String, Highlights) {
+/// badge its collapsed header carries. `start_epoch` is when the daemon
+/// started, which every counter here counts from.
+pub(super) fn build_metrics_html(start_epoch: i64) -> (String, Highlights) {
     let config = global_config();
     let shown = Shown::new(config.https_upgrade_mode, config.https_tunnel_enabled);
     let mut g = Groups::new();
+    swrite!(
+        g.out,
+        "<p class=\"scope-note\">Counts since the daemon started, {}: a restart resets them. A highlighted row says when it last moved; live and peak values are marked.</p>",
+        RelTime {
+            epoch: start_epoch,
+            now: now_epoch(),
+        }
+    );
 
     build_requests_group(&mut g);
     build_connections_group(&mut g);
@@ -452,6 +461,7 @@ fn build_admission_group(g: &mut Groups) {
             &metrics::UPSTREAM_DOWNLOAD_CAP_TRANSITIONS,
         );
         t.entry("Throttled Resources")
+            .kind(Kind::Live)
             .tip("Resources currently refused with 503 because a recent download failed checksum verification (backoff from verify_checksums_throttle_base up to verify_checksums_throttle_cap; cleared by a verified download). A live count, not a total.")
             .value(Nonzero {
                 value: global_verify_throttle().active_len() as u64,
@@ -619,11 +629,10 @@ fn build_cache_group(g: &mut Groups) {
             "Requests that joined an already in-progress download and shared its data instead of fetching again.",
             metrics::LATE_JOINERS_TOTAL.get(),
         );
-        t.row_tip(
-            "Most Late Joiners on One Download",
-            "The most late joiners any single download has had since startup, counting every client that joined it, including those that left before it finished.",
-            metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.get(),
-        );
+        t.entry("Most Late Joiners on One Download")
+            .kind(Kind::Peak)
+            .tip("The most late joiners any single download has had since startup, counting every client that joined it, including those that left before it finished.")
+            .value(metrics::LATE_JOINER_PEAK_PER_DOWNLOAD.get());
         t.row_tip(
             "Partials Still In Use",
             "Downloads that found their .partial still held by an earlier download of the same file and fetched into a scratch file instead of resuming it.",
@@ -674,11 +683,10 @@ fn build_integrity_group(g: &mut Groups) {
             "Resources for which no expected digest was available in the registry; cached unverified (best-effort).",
             metrics::CHECKSUM_UNVERIFIED.get(),
         );
-        t.row_tip(
-            "Registry Entries",
-            "In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart), a live count capped by verify_checksums_max_entries.",
-            global_checksum_registry().len(),
-        );
+        t.entry("Registry Entries")
+            .kind(Kind::Live)
+            .tip("In-memory checksum-registry entries (expected digests parsed from Packages/Release indices; lost on restart), capped by verify_checksums_max_entries.")
+            .value(global_checksum_registry().len());
         t.row_tip(
             "Re-ingests (touch)",
             "Cached indexes re-ingested because a request answered from cache found their digests missing (restart, eviction, an earlier skip). Climbing on every apt update means verify_checksums_max_entries is below the live working set.",
@@ -1041,21 +1049,40 @@ fn build_cleanup_group(g: &mut Groups) {
             "Digest verifications skipped because the file was already verified in an earlier cleanup cycle and is unchanged (same inode, size and expected digest).",
             metrics::CLEANUP_CHECKSUM_SKIPS.get(),
         );
-        t.row_tip(
-            "Last Run Duration",
-            "Wall-clock time the most recent cleanup run took.",
-            format_args!("{}s", metrics::LAST_CLEANUP_DURATION_SECS.get()),
-        );
-        t.row_tip(
-            "Last Run Files Removed",
-            "Cache files removed by the most recent cleanup run.",
-            metrics::LAST_CLEANUP_FILES_REMOVED.get(),
-        );
-        t.row_tip(
-            "Last Run Bytes Reclaimed",
-            "Disk space reclaimed by the most recent cleanup run.",
-            HumanFmt::Size(metrics::LAST_CLEANUP_BYTES_RECLAIMED.get()),
-        );
+        // Loaded first: it is set after the trio, so finding it set means
+        // the trio is this run's.
+        let finished_at = metrics::LAST_CLEANUP_FINISHED_AT.get();
+        if finished_at == 0 {
+            t.row_tip(
+                "Last Run",
+                "No cleanup has run since the daemon started. Maintenance shows the last run recorded in the database, which survives restarts.",
+                "none since start",
+            );
+        } else {
+            t.entry("Last Run")
+                .tip("When this process's most recent cleanup run finished. Maintenance shows the same from the database.")
+                .value(RelTime {
+                    epoch: i64::try_from(finished_at).unwrap_or(i64::MAX),
+                    now: now_epoch(),
+                });
+            t.row_tip(
+                "Last Run Duration",
+                "Wall-clock time the most recent cleanup run took.",
+                HumanFmt::Time(std::time::Duration::from_secs(
+                    metrics::LAST_CLEANUP_DURATION_SECS.get(),
+                )),
+            );
+            t.row_tip(
+                "Last Run Files Removed",
+                "Cache files removed by the most recent cleanup run.",
+                metrics::LAST_CLEANUP_FILES_REMOVED.get(),
+            );
+            t.row_tip(
+                "Last Run Bytes Reclaimed",
+                "Disk space reclaimed by the most recent cleanup run.",
+                HumanFmt::Size(metrics::LAST_CLEANUP_BYTES_RECLAIMED.get()),
+            );
+        }
     });
 }
 
@@ -1098,16 +1125,14 @@ fn build_database_group(g: &mut Groups) {
             "Batches flushed as part of the shutdown drain.",
             metrics::DB_BATCH_FLUSHES_ON_SHUTDOWN.get(),
         );
-        t.row_tip(
-            "Peak Batch Size",
-            "Most commands ever coalesced into a single flush.",
-            metrics::DB_BATCH_SIZE_PEAK.get(),
-        );
-        t.row_tip(
-            "Mirror Cache Entries",
-            "Process-local mirror-id cache: hydrated at startup, grows on each newly observed mirror, never evicted.",
-            metrics::DB_MIRROR_CACHE_ENTRIES.get(),
-        );
+        t.entry("Peak Batch Size")
+            .kind(Kind::Peak)
+            .tip("Most commands coalesced into a single flush since startup, against db_batch_flush_max_count.")
+            .value(metrics::DB_BATCH_SIZE_PEAK.get());
+        t.entry("Mirror Cache Entries")
+            .kind(Kind::Live)
+            .tip("Process-local mirror-id cache: hydrated at startup, grows on each newly observed mirror, never evicted.")
+            .value(metrics::DB_MIRROR_CACHE_ENTRIES.get());
         t.row_tip(
             "Mirror Cache Hits",
             "Mirror-id lookups served from the process-local cache.",
