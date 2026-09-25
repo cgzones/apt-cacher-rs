@@ -1,5 +1,5 @@
 //! Local web interface: the dashboard (`/`), the log tail (`/logs`), the
-//! healthcheck JSON (`/healthcheck`) and the two static assets. This file
+//! healthcheck JSON (`/healthcheck`) and the static assets. This file
 //! owns the route handler ([`serve_web_interface`]) both backends call and
 //! re-exports the response type they render ([`WebResponse`]). The
 //! rendering lives in submodules:
@@ -20,14 +20,56 @@
 //! # Scripts are optional
 //!
 //! Both pages are complete without JavaScript: curl, a text browser or a
-//! browser with scripts off sees every figure as server-rendered text,
-//! opens sections through `open=`, keeps them open with the keep-open
-//! links, and auto-refreshes through `refresh=`. The script bundle
-//! (`/app.js`, `assets/js/`) only enhances that markup and must keep it
-//! that way: a feature whose script fails leaves the page as the server
-//! rendered it. Its constraints are the HTML pages' Content-Security-Policy
+//! browser with scripts off sees every figure as server-rendered text (the
+//! breakdown bars are server-rendered SVG), opens sections through `open=`,
+//! keeps them open with the keep-open links, and auto-refreshes through
+//! `refresh=` (a `<noscript>` meta refresh). The script bundle (`/app.js`,
+//! `assets/js/`) only enhances that markup and must keep it that way: a
+//! feature whose script fails leaves the page as the server rendered it.
+//! Its constraints are the HTML pages' Content-Security-Policy
 //! (`response.rs`): no inline script or style, no HTML-parsing DOM sink
 //! (Trusted Types), no CSSOM writes, no third-party origin.
+//!
+//! # The markup the scripts rely on
+//!
+//! No test runs the scripts, so renaming one of these hooks breaks a
+//! feature silently; treat them as an interface. The integration test
+//! `the_markup_carries_every_script_hook` renders them all.
+//!
+//! - `<body data-page="dashboard|logs">`: which page the script runs on.
+//! - `<link rel="stylesheet">` and `<script src>` in `<head>`: compared
+//!   with a refreshed page's to spot an upgraded daemon.
+//! - `data-section="{key}"` on every top-level block (the [`table`]
+//!   wrappers, the nav, the setup hint, the hero, the logs, the footer):
+//!   the unit the background refresh swaps, matched by key, so a key is
+//!   unique and stable. A collapsible section is `div > details >
+//!   summary > h2[id="{key}-head"]`; `dd.help details` is the "?"
+//!   explanation a refresh must not close.
+//! - `nav .spacer`: where the refresh status goes.
+//! - `<table data-table="{key}">` inside `.tablewrap`, with its header row
+//!   in `<thead>` (`th.num` for figure columns) and its rows in the one
+//!   `<tbody>`: sort order and filters are kept per key.
+//! - `td[data-sort]`: a cell's sort value where its text does not sort
+//!   (`Table::cell_keyed`).
+//! - The Metrics section: `h3.group` right before its `dl.details`, rows as
+//!   `dl.details > div` with the label in `dt` (its explanation in
+//!   `dt[title]`) and the value in the first `dd`; `.warn`/`.alert`
+//!   inside a row mark it highlighted.
+//! - `div[data-series][data-v]` (`data-unit="B"` for bytes, `data-polled`
+//!   for figures web-interface requests move) on the Metrics counter
+//!   rows, never on the value's `<dd>` (`Entry::figure`), and
+//!   `[data-started]` on the Metrics scope note.
+//! - `a[data-carry]`, `a[data-action="refresh-toggle"][data-secs]` and
+//!   `a[data-action="theme-cycle"]` in the nav; `a.pin`, which the script
+//!   removes.
+//! - `<time datetime title>` around every relative time; the footer's
+//!   `<time datetime>` is the server's clock.
+//! - The setup hint's `<code>` (the apt line) and `/logs`' `pre.log`, one
+//!   entry per line.
+//!
+//! The URL (`refresh=`, `theme=`, `open=`) stays the page's shareable
+//! state; browser storage (`apt-cacher-rs.theme`, `apt-cacher-rs.sort.*`,
+//! `apt-cacher-rs.keys`) only holds a viewer's conveniences.
 
 mod assets;
 mod dashboard;
