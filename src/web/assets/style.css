@@ -281,6 +281,10 @@ dl.details dd.delta.moved { text-decoration: underline; }
     dl.details dd.delta.moved { animation: moved 1.6s ease-out; }
 }
 @keyframes moved { from { background: var(--count-bg); } to { background: transparent; } }
+/* The "Activity since page open" panel (series.js). */
+dl.activity-list dd.spark { line-height: 0; }
+svg.spark { width: 140px; max-width: 100%; height: 20px; }
+svg.spark polyline { fill: none; stroke: var(--series-1); stroke-width: 1.5px; }
 
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }

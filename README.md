@@ -69,7 +69,7 @@ Note that connections from the client to the proxy are unencrypted (but all pack
 ## Web interface
 
 `apt-cacher-rs` contains a minimal web interface for some statistics at *`http://<proxy-ip>:3142/`*, important logs can be viewed at *`http://<proxy-ip>:3142/logs`*, and readiness checks are available at *`http://<proxy-ip>:3142/healthcheck`* (returns 200 if healthy, 503 with a JSON body describing any failures).
-The pages are complete without JavaScript (`?refresh=N` reloads the page every *N* seconds, `?open=` keeps collapsed sections open, `?theme=light|dark|auto` picks the colours); with it, auto-refresh updates the figures in place and keeps open sections, scroll position and selection, the tables sort by any column and filter by text, and the Metrics section filters by name, highlight or non-zero value and marks every counter that moved since the page was opened.
+The pages are complete without JavaScript (`?refresh=N` reloads the page every *N* seconds, `?open=` keeps collapsed sections open, `?theme=light|dark|auto` picks the colours); with it, auto-refresh updates the figures in place and keeps open sections, scroll position and selection, the tables sort by any column and filter by text, and the Metrics section filters by name, highlight or non-zero value and marks every counter that moved since the page was opened, which an "Activity since page open" panel collects with a sparkline each.
 As a defence against DNS rebinding the web interface only answers requests addressed to an IP address, `localhost` or the system hostname; list any other DNS name it is reached by in the `webif_hostnames` configuration option, other names are answered with *421 Misdirected Request*.
 
 ## Cleanup

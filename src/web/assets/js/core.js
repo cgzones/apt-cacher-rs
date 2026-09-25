@@ -104,18 +104,35 @@ const ACR = (function () {
    * scroll so the first block on screen stays where it was. The page opts
    * out of the browser's own scroll anchoring (style.css), which loses its
    * anchor when the block holding it is replaced. */
+  /* A block the reader can keep their place on: a server section, or a
+   * script-built block marked data-anchor (the activity panel). */
+  const ANCHORS = "body > [data-section], body > [data-anchor]";
+
+  function anchorKey(node) {
+    return node.getAttribute("data-section") || "anchor-" + node.getAttribute("data-anchor");
+  }
+
+  function findAnchor(key) {
+    for (const node of all(document, ANCHORS)) {
+      if (anchorKey(node) === key) {
+        return node;
+      }
+    }
+    return null;
+  }
+
   function keepScroll(change) {
     let anchor = null;
-    for (const node of all(document, "body > [data-section]")) {
+    for (const node of all(document, ANCHORS)) {
       const rect = node.getBoundingClientRect();
       if (rect.bottom > 0) {
-        anchor = { key: node.getAttribute("data-section"), top: rect.top };
+        anchor = { key: anchorKey(node), top: rect.top };
         break;
       }
     }
     const result = change();
     if (anchor) {
-      const now = document.querySelector("body > [data-section=" + anchor.key + "]");
+      const now = findAnchor(anchor.key);
       if (now) {
         const delta = now.getBoundingClientRect().top - anchor.top;
         if (delta !== 0) {
