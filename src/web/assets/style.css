@@ -221,6 +221,35 @@ footer hr { border: none; border-top: 1px solid var(--nav-border); margin-bottom
     .grid-2 { grid-template-columns: 1fr; }
 }
 
+/* How a total splits (fmt::StackBar): one row, segments in the categorical
+   palette (the dataviz reference's first five slots, stepped per theme),
+   parted by a 2px gap in the surface colour; the legend repeats every
+   share as text. */
+:root {
+    --series-1: light-dark(#2a78d6, #3987e5);
+    --series-2: light-dark(#eb6834, #d95926);
+    --series-3: light-dark(#1baf7a, #199e70);
+    --series-4: light-dark(#eda100, #c98500);
+    --series-5: light-dark(#e87ba4, #d55181);
+}
+dl.details > div.chart dd { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 14px; }
+svg.stack { width: 100%; max-width: 640px; height: 12px; display: block; }
+svg.stack rect { stroke: var(--section-bg); stroke-width: 2px; vector-effect: non-scaling-stroke; }
+.s1 { fill: var(--series-1); }
+.s2 { fill: var(--series-2); }
+.s3 { fill: var(--series-3); }
+.s4 { fill: var(--series-4); }
+.s5 { fill: var(--series-5); }
+dl.details dd.legend { font-family: inherit; font-weight: 400; font-size: 0.8em; }
+.legend .key { white-space: nowrap; }
+.legend .key::before { content: ""; display: inline-block; width: 9px; height: 9px;
+                       border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.legend .key.s1::before { background: var(--series-1); }
+.legend .key.s2::before { background: var(--series-2); }
+.legend .key.s3::before { background: var(--series-3); }
+.legend .key.s4::before { background: var(--series-4); }
+.legend .key.s5::before { background: var(--series-5); }
+
 /* ---- Optional scripts (app.js sets html.js) ----------------------------
    The background refresh keeps the reader's place itself: the browser's own
    scroll anchoring loses its anchor when the block holding it is replaced. */

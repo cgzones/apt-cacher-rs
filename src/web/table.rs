@@ -13,7 +13,7 @@ use std::fmt::Display;
 
 use crate::{metrics::Signal, swrite};
 
-use super::fmt::{HtmlEscaped, Level, Nonzero, RelTime, now_epoch};
+use super::fmt::{HtmlEscaped, Level, Nonzero, RelTime, StackBar, now_epoch};
 
 // ---------------------------------------------------------------------------
 // Table builders — append rows directly via `swrite!`. `Table::cell` needs to
@@ -357,6 +357,20 @@ impl DetailsList {
         signal: &Signal,
     ) {
         self.entry(label).tip(tooltip).signal(level, signal);
+    }
+
+    /// A full-width row showing how a total splits: the label, then the bar
+    /// and its legend (see [`StackBar`]). Nothing while the total is zero.
+    pub(super) fn bar(&mut self, bar: &StackBar<'_>) {
+        if let Some(drawn) = bar.draw() {
+            swrite!(
+                self.out,
+                "<div class=\"whole chart\"><dt>{}</dt><dd>{}</dd><dd class=\"legend\">{}</dd></div>",
+                bar.label,
+                drawn.svg(),
+                drawn.legend(),
+            );
+        }
     }
 
     /// Start a row whose shape the returned [`Entry`] refines; nothing is

@@ -41,7 +41,7 @@ use crate::{
 };
 
 use super::{
-    fmt::{Count, Level, Nonzero, RelTime, alert_if, now_epoch, warn_if},
+    fmt::{Count, Level, Nonzero, RelTime, Segment, StackBar, Unit, alert_if, now_epoch, warn_if},
     table::{DetailsList, Highlights, Kind},
 };
 
@@ -245,8 +245,37 @@ fn build_requests_group(g: &mut Groups) {
     let status_2xx = metrics::CLIENT_STATUS_2XX.get();
     let status_304 = metrics::CLIENT_STATUS_304.get();
     let status_3xx = metrics::CLIENT_STATUS_3XX.get();
+    let status_4xx = metrics::CLIENT_STATUS_4XX.get();
+    let status_5xx = metrics::CLIENT_STATUS_5XX.get();
+    let status_other = metrics::CLIENT_STATUS_OTHER.get();
 
     g.group("Requests", |t| {
+        t.bar(&StackBar {
+            label: "Responses by Class",
+            segments: &[
+                Segment {
+                    name: "2xx",
+                    value: status_2xx,
+                },
+                Segment {
+                    name: "3xx",
+                    value: status_3xx,
+                },
+                Segment {
+                    name: "4xx",
+                    value: status_4xx,
+                },
+                Segment {
+                    name: "5xx",
+                    value: status_5xx,
+                },
+                Segment {
+                    name: "other",
+                    value: status_other,
+                },
+            ],
+            unit: Unit::Count,
+        });
         t.row_tip(
             "Requests \u{2192} Served",
             "Total HTTP requests handled \u{2192} requests whose response body was fully delivered to the client.",
@@ -277,7 +306,7 @@ fn build_requests_group(g: &mut Groups) {
                     Count(metrics::CLIENT_STATUS_416.get()),
                 );
             })
-            .value(Count(metrics::CLIENT_STATUS_4XX.get()));
+            .value(Count(status_4xx));
         t.entry("Client 5xx")
             .tip("Server-error responses returned to clients, relayed upstream errors included. A mix of causes with different remedies, so the class only warns; the code rows say which one moved.")
             .parts(|p| {
@@ -511,8 +540,47 @@ fn build_client_delivery_group(g: &mut Groups) {
     });
 }
 
+/// The bytes each compiled-in delivery path moved, passthrough relays
+/// included, for the Delivery Paths group's bar.
+fn delivery_bytes() -> Vec<Segment> {
+    let mut segments = Vec::with_capacity(5);
+    if SENDFILE {
+        segments.push(Segment {
+            name: "sendfile",
+            value: metrics::BYTES_SERVED_SENDFILE.get(),
+        });
+    }
+    if SPLICE {
+        segments.push(Segment {
+            name: "splice",
+            value: metrics::BYTES_SERVED_SPLICE.get(),
+        });
+    }
+    if HYPER {
+        segments.push(Segment {
+            name: "copy",
+            value: metrics::BYTES_SERVED_COPY.get(),
+        });
+        segments.push(Segment {
+            name: "channel",
+            value: metrics::BYTES_SERVED_CHANNEL.get(),
+        });
+    }
+    segments.push(Segment {
+        name: "passthrough",
+        value: metrics::BYTES_SERVED_PASSTHROUGH.get(),
+    });
+    segments
+}
+
 fn build_delivery_group(g: &mut Groups) {
+    let bytes = delivery_bytes();
     g.group("Delivery Paths", |t| {
+        t.bar(&StackBar {
+            label: "Bytes by Delivery Path",
+            segments: &bytes,
+            unit: Unit::Bytes,
+        });
         if SENDFILE {
             delivery_path(
                 t,
@@ -625,6 +693,22 @@ fn build_cache_group(g: &mut Groups) {
     let refetched = metrics::VOLATILE_REFETCHED.get();
 
     g.group("Cache", |t| {
+        for (label, lookups) in [("Package Lookups", packages), ("By-Hash Lookups", byhash)] {
+            t.bar(&StackBar {
+                label,
+                segments: &[
+                    Segment {
+                        name: "hits",
+                        value: lookups.hits,
+                    },
+                    Segment {
+                        name: "misses",
+                        value: lookups.misses,
+                    },
+                ],
+                unit: Unit::Count,
+            });
+        }
         t.entry("Hits / Misses")
             .tip("Cache lookups for permanent resources (packages and by-hash indexes) that found a usable file vs. those that did not, late joiners of an in-flight download counted as misses. The kinds beneath sum to it; it warns only if they exceed it, which is a counting bug.")
             .parts(|p| {

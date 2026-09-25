@@ -391,6 +391,238 @@ impl Display for Meter {
     }
 }
 
+/// One part of a [`StackBar`]: its name in the legend and its figure.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Segment {
+    pub(super) name: &'static str,
+    pub(super) value: u64,
+}
+
+/// What a figure counts, which decides how it is rendered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Unit {
+    Count,
+    Bytes,
+}
+
+/// The palette's length (`s1`..`s5` in the stylesheet).
+const STACK_SEGMENTS_MAX: usize = 5;
+
+/// A 100%-stacked bar: how a total splits into its parts, drawn as inline
+/// SVG so it needs no script and no style attribute. Each segment is a
+/// `<rect>` whose width is its share of 100 (tenths of a percent, summing
+/// to exactly 100) and whose colour comes from its class; the stylesheet
+/// maps `s1`..`s5` onto the categorical palette in both themes. The shares
+/// are also text: the `aria-label`, a `<title>` per segment (the hover
+/// tooltip) and the legend beside it, so no figure is carried by colour
+/// alone. Nothing is drawn while the total is zero.
+pub(super) struct StackBar<'a> {
+    /// What the bar splits, e.g. "Responses by class".
+    pub(super) label: &'static str,
+    /// At most [`STACK_SEGMENTS_MAX`], the palette's length.
+    pub(super) segments: &'a [Segment],
+    pub(super) unit: Unit,
+}
+
+impl StackBar<'_> {
+    /// The bar's shares, ready to render as [`Drawn::svg`] and
+    /// [`Drawn::legend`]; `None` while the total is zero.
+    pub(super) fn draw(&self) -> Option<Drawn<'_>> {
+        debug_assert!(
+            self.segments.len() <= STACK_SEGMENTS_MAX,
+            "one palette colour per segment"
+        );
+        self.tenths().map(|tenths| Drawn { bar: self, tenths })
+    }
+
+    /// Each segment's share in tenths of a percent, summing to exactly 1000:
+    /// the largest-remainder rounding, ties to the earlier segment. `None`
+    /// while the total is zero.
+    fn tenths(&self) -> Option<Vec<u64>> {
+        let Self {
+            label: _,
+            segments,
+            unit: _,
+        } = self;
+        let values: Vec<u128> = segments
+            .iter()
+            .map(|segment| u128::from(segment.value))
+            .collect();
+        let total: u128 = values.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let mut shares: Vec<(u128, u128)> = values
+            .iter()
+            .map(|value| (value * 1000 / total, value * 1000 % total))
+            .collect();
+        let floor: u128 = shares.iter().map(|(share, _)| share).sum();
+        let mut order: Vec<usize> = (0..shares.len()).collect();
+        order.sort_by(|&a, &b| shares[b].1.cmp(&shares[a].1).then(a.cmp(&b)));
+        for &index in order
+            .iter()
+            .take(usize::try_from(1000 - floor).unwrap_or(0))
+        {
+            shares[index].0 += 1;
+        }
+        Some(
+            shares
+                .into_iter()
+                .map(|(share, _)| u64::try_from(share).unwrap_or(1000))
+                .collect(),
+        )
+    }
+}
+
+/// A [`StackBar`] with its shares computed.
+pub(super) struct Drawn<'a> {
+    bar: &'a StackBar<'a>,
+    /// Per segment, in tenths of a percent (see [`StackBar::tenths`]).
+    tenths: Vec<u64>,
+}
+
+impl Drawn<'_> {
+    /// The `<svg>` element.
+    pub(super) fn svg(&self) -> DrawnSvg<'_> {
+        DrawnSvg(self)
+    }
+
+    /// The legend entries, one per segment, zero ones included so the
+    /// legend reads the same from one refresh to the next.
+    pub(super) fn legend(&self) -> DrawnLegend<'_> {
+        DrawnLegend(self)
+    }
+
+    /// Each segment with its share.
+    fn parts(&self) -> impl Iterator<Item = (usize, &Segment, Share)> {
+        let Self { bar, tenths } = self;
+        bar.segments
+            .iter()
+            .zip(tenths)
+            .enumerate()
+            .map(|(index, (segment, &tenths))| {
+                (
+                    index,
+                    segment,
+                    Share {
+                        tenths,
+                        value: segment.value,
+                    },
+                )
+            })
+    }
+}
+
+/// See [`Drawn::svg`].
+pub(super) struct DrawnSvg<'a>(&'a Drawn<'a>);
+
+impl Display for DrawnSvg<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self(drawn) = self;
+        let StackBar {
+            label,
+            segments: _,
+            unit,
+        } = *drawn.bar;
+        write!(
+            f,
+            "<svg class=\"stack\" viewBox=\"0 0 100 10\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\"{label}:"
+        )?;
+        let mut sep = " ";
+        for (_, segment, share) in drawn.parts() {
+            write!(f, "{sep}{} {share}", segment.name)?;
+            sep = ", ";
+        }
+        f.write_str("\">")?;
+        let mut x = 0;
+        for (index, segment, share) in drawn.parts() {
+            if share.tenths > 0 {
+                write!(
+                    f,
+                    "<rect class=\"s{}\" x=\"{}\" y=\"0\" width=\"{}\" height=\"10\"><title>{}: {} ({share})</title></rect>",
+                    index + 1,
+                    TenthsPlain(x),
+                    TenthsPlain(share.tenths),
+                    segment.name,
+                    Figure {
+                        value: segment.value,
+                        unit
+                    },
+                )?;
+            }
+            x += share.tenths;
+        }
+        f.write_str("</svg>")
+    }
+}
+
+/// See [`Drawn::legend`].
+pub(super) struct DrawnLegend<'a>(&'a Drawn<'a>);
+
+impl Display for DrawnLegend<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self(drawn) = self;
+        for (index, segment, share) in drawn.parts() {
+            write!(
+                f,
+                "<span class=\"key s{}\">{} {share} <span class=\"muted\">({})</span></span>",
+                index + 1,
+                segment.name,
+                Figure {
+                    value: segment.value,
+                    unit: drawn.bar.unit
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A [`StackBar`] figure in its unit.
+struct Figure {
+    value: u64,
+    unit: Unit,
+}
+
+impl Display for Figure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { value, unit } = *self;
+        match unit {
+            Unit::Count => Display::fmt(&Count(value), f),
+            Unit::Bytes => Display::fmt(&HumanFmt::Size(value), f),
+        }
+    }
+}
+
+/// A segment's share as `12.3%`; a part too small for a tenth of a percent
+/// reads `<0.1%`, never `0.0%` beside a figure that is not zero.
+#[derive(Clone, Copy)]
+struct Share {
+    tenths: u64,
+    value: u64,
+}
+
+impl Display for Share {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { tenths, value } = *self;
+        if tenths == 0 && value > 0 {
+            f.write_str("&lt;0.1%")
+        } else {
+            write!(f, "{}.{}%", tenths / 10, tenths % 10)
+        }
+    }
+}
+
+/// Tenths as an SVG length: `12.3`.
+struct TenthsPlain(u64);
+
+impl Display for TenthsPlain {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self(tenths) = *self;
+        write!(f, "{}.{}", tenths / 10, tenths % 10)
+    }
+}
+
 /// How recently a mirror, origin or client was last seen.
 ///
 /// The one place the staleness thresholds live: [`FmtLastSeenHealth`] paints
@@ -798,8 +1030,149 @@ mod tests {
 
     use super::{
         Age, CacheHitRatio, Count, FmtLastSeenHealth, FmtMTimeAge, Freshness, Gauge, HtmlEscape,
-        Latency, Meter, Pct, RatioClass, RelTime, Saturation, Span, UtcText,
+        Latency, Meter, Pct, RatioClass, RelTime, Saturation, Segment, Span, StackBar, Unit,
+        UtcText,
     };
+
+    /// A bar as `DetailsList::bar` places it: the svg, then the legend.
+    fn render_bar(bar: &StackBar<'_>) -> String {
+        bar.draw().map_or_else(String::new, |drawn| {
+            format!(
+                "{}<span class=\"legend\">{}</span>",
+                drawn.svg(),
+                drawn.legend()
+            )
+        })
+    }
+
+    fn segments(values: &[u64]) -> Vec<Segment> {
+        const NAMES: [&str; 5] = ["a", "b", "c", "d", "e"];
+        values
+            .iter()
+            .zip(NAMES)
+            .map(|(&value, name)| Segment { name, value })
+            .collect()
+    }
+
+    /// The `width` attributes of a rendered bar, in tenths.
+    fn widths(svg: &str) -> Vec<u64> {
+        svg.split(" width=\"")
+            .skip(1)
+            .map(|rest| {
+                let (width, _) = rest.split_once('"').expect("quoted");
+                let (whole, tenth) = width.split_once('.').expect("one decimal");
+                whole.parse::<u64>().expect("whole") * 10 + tenth.parse::<u64>().expect("tenth")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stack_bar_widths_sum_to_exactly_100() {
+        for values in [
+            &[1, 1, 1][..],
+            &[2, 1],
+            &[1, 0, 0, 0, 0],
+            &[997, 1, 1, 1],
+            &[u64::MAX, u64::MAX, 3],
+            &[123_456, 7, 89, 1_000_000, 42],
+        ] {
+            let segments = segments(values);
+            let svg = render_bar(&StackBar {
+                label: "Split",
+                segments: &segments,
+                unit: Unit::Count,
+            });
+            assert_eq!(widths(&svg).iter().sum::<u64>(), 1000, "{values:?}: {svg}");
+        }
+        // Largest remainder: a third each rounds one of them up.
+        let segments = segments(&[1, 1, 1]);
+        let svg = render_bar(&StackBar {
+            label: "Thirds",
+            segments: &segments,
+            unit: Unit::Count,
+        });
+        assert_eq!(widths(&svg), [334, 333, 333]);
+    }
+
+    #[test]
+    fn stack_bar_is_labelled_and_legended() {
+        let segments = [
+            Segment {
+                name: "hits",
+                value: 3,
+            },
+            Segment {
+                name: "misses",
+                value: 1,
+            },
+            Segment {
+                name: "never",
+                value: 0,
+            },
+        ];
+        let html = render_bar(&StackBar {
+            label: "Package lookups",
+            segments: &segments,
+            unit: Unit::Count,
+        });
+        assert!(
+            html.starts_with(
+                "<svg class=\"stack\" viewBox=\"0 0 100 10\" preserveAspectRatio=\"none\" \
+                 role=\"img\" aria-label=\"Package lookups: hits 75.0%, misses 25.0%, never 0.0%\">\
+                 <rect class=\"s1\" x=\"0.0\" y=\"0\" width=\"75.0\" height=\"10\"><title>hits: 3 (75.0%)</title></rect>\
+                 <rect class=\"s2\" x=\"75.0\" y=\"0\" width=\"25.0\" height=\"10\"><title>misses: 1 (25.0%)</title></rect></svg>"
+            ),
+            "{html}"
+        );
+        // A zero part draws nothing but keeps its legend entry, so the
+        // legend reads the same from one refresh to the next.
+        assert!(
+            html.ends_with(
+                "<span class=\"key s3\">never 0.0% <span class=\"muted\">(0)</span></span></span>"
+            ),
+            "{html}"
+        );
+        let bytes = [Segment {
+            name: "sendfile",
+            value: 2_000_000,
+        }];
+        assert!(
+            render_bar(&StackBar {
+                label: "Bytes",
+                segments: &bytes,
+                unit: Unit::Bytes,
+            })
+            .contains("<title>sendfile: 2.00MB (100.0%)</title>")
+        );
+    }
+
+    #[test]
+    fn a_sliver_reads_below_a_tenth_not_zero() {
+        let segments = segments(&[1_000_000, 1]);
+        let html = render_bar(&StackBar {
+            label: "Sliver",
+            segments: &segments,
+            unit: Unit::Count,
+        });
+        assert!(
+            html.contains("aria-label=\"Sliver: a 100.0%, b &lt;0.1%\""),
+            "{html}"
+        );
+        assert!(html.contains(">b &lt;0.1% <span"), "{html}");
+    }
+
+    #[test]
+    fn an_empty_stack_bar_renders_nothing() {
+        let segments = segments(&[0, 0]);
+        assert_eq!(
+            render_bar(&StackBar {
+                label: "Nothing",
+                segments: &segments,
+                unit: Unit::Count,
+            }),
+            ""
+        );
+    }
 
     /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
     const NOW: i64 = 1_700_000_000;
