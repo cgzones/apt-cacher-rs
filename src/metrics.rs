@@ -941,6 +941,16 @@ pub(crate) static DOWNLOADS_DECLINED: Counter = Counter::new();
 /// instead of resuming it.
 pub(crate) static PARTIAL_CLAIM_CONTENDED: Counter = Counter::new();
 
+/// Orphaned partials at the last completed cache scan (startup, then after
+/// every cleanup): `.partial`s in a `tmp/` no running download claimed --
+/// the resume state of downloads that failed or were abandoned, counted in
+/// `disk_quota` until cleanup reaps them. Their accounted bytes, and when
+/// the scan finished (Unix seconds, 0 before the first; set last, like
+/// `LAST_CLEANUP_FINISHED_AT`).
+pub(crate) static ORPHANED_PARTIAL_FILES: StateU64 = StateU64::new();
+pub(crate) static ORPHANED_PARTIAL_BYTES: StateU64 = StateU64::new();
+pub(crate) static ORPHANED_PARTIALS_SCANNED_AT: StateU64 = StateU64::new();
+
 /// Cache-size reconciliation events with a non-zero on-disk delta.
 pub(crate) static RECONCILE_EVENTS: Signal = Signal::new();
 /// Total absolute bytes corrected by reconciliation events.

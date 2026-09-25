@@ -39,7 +39,7 @@ use super::{
     fmt::{
         CacheHitRatio, Colorize, Count, DiskUsage, EnabledDisabled, FmtMTimeAge, Gauge, HtmlEscape,
         MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation, Utc, Window, YesNo,
-        as_size, now_epoch,
+        as_size, now_epoch, warn_if,
     },
     metrics_page::build_metrics_html,
     page::{
@@ -924,6 +924,37 @@ fn build_cache_stats_html(
         .kind(Kind::Live)
         .value(DiskUsage { cache_size, quota });
 
+    // The timestamp first: it is set after the pair, so finding it set
+    // means the pair is that scan's.
+    let scanned_at = metrics::ORPHANED_PARTIALS_SCANNED_AT.get();
+    let orphans = t
+        .entry("Orphaned Partials")
+        .kind(Kind::Live)
+        .tip("Kept .partial downloads no running download holds, found by the last cache scan (at startup and after every cleanup): the resume state of downloads that failed or were abandoned, counted against disk_quota until cleanup removes them after 24 h. Warns above a tenth of disk_quota. A large figure means downloads keep dying mid-body: see Downloads Aborted and the Mirrors table for the mirror.");
+    if scanned_at == 0 {
+        orphans.value("no cache scan yet");
+    } else {
+        let files = metrics::ORPHANED_PARTIAL_FILES.get();
+        let bytes = metrics::ORPHANED_PARTIAL_BYTES.get();
+        orphans
+            .note(format_args!(
+                "at the last cache scan, {}",
+                RelTime {
+                    epoch: i64::try_from(scanned_at).unwrap_or(i64::MAX),
+                    now,
+                }
+            ))
+            .value(warn_if(
+                format_args!(
+                    "{} file{}, {}",
+                    Count(files),
+                    if files == 1 { "" } else { "s" },
+                    HumanFmt::Size(bytes)
+                ),
+                orphans_over_quota_share(bytes, quota),
+            ));
+    }
+
     let free_disk_space = if let Some(free) = free_disk_bytes {
         let remaining_quota = quota.map(|q| q.saturating_sub(cache_size));
         let class = match remaining_quota {
@@ -946,6 +977,13 @@ fn build_cache_stats_html(
         .value(free_disk_space);
 
     t.finish()
+}
+
+/// Whether orphaned partials take more than a tenth of `disk_quota`: a
+/// share of the cache that failed downloads, not packages, occupy. Without
+/// a quota there is no share to exceed.
+fn orphans_over_quota_share(orphaned_bytes: u64, quota: Option<u64>) -> bool {
+    quota.is_some_and(|quota| orphaned_bytes.saturating_mul(10) > quota)
 }
 
 fn build_dashboard_page(data: &DashboardData, options: QueryOptions) -> String {
@@ -1117,4 +1155,20 @@ pub(super) async fn serve_dashboard(appstate: &AppState, options: QueryOptions) 
     let data = gather_dashboard_data(appstate).await;
     let html = build_dashboard_page(&data, options);
     WebResponse::html(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::orphans_over_quota_share;
+
+    #[test]
+    fn orphans_warn_above_a_tenth_of_the_quota() {
+        assert!(
+            !orphans_over_quota_share(u64::MAX, None),
+            "no quota, no share"
+        );
+        assert!(!orphans_over_quota_share(100, Some(1000)));
+        assert!(orphans_over_quota_share(101, Some(1000)));
+        assert!(orphans_over_quota_share(u64::MAX, Some(1)), "saturates");
+    }
 }

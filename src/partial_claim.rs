@@ -93,6 +93,14 @@ impl Drop for Claimed {
     }
 }
 
+/// Whether a download owns `path` now: the cache scan's test for an orphaned
+/// partial, one lookup under the claim-set lock. The answer can be stale by
+/// the time it is read; the scan only counts with it, never unlinks.
+#[must_use]
+pub(crate) fn is_claimed(path: &Path) -> bool {
+    CLAIMED.lock().contains(path)
+}
+
 /// The identity of the file a walk judged: an unlink by path must hit that
 /// inode, not one created at the same path since.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +201,17 @@ mod tests {
             Reap::Removed { len: 12 }
         ));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_claim_is_visible_until_released() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("e.partial");
+        assert!(!is_claimed(&path));
+        let claim = PartialClaim::acquire(path.clone()).expect("unclaimed");
+        assert!(is_claimed(&path));
+        drop(claim);
+        assert!(!is_claimed(&path));
     }
 
     #[test]

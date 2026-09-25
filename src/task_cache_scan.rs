@@ -14,6 +14,12 @@
 //!
 //! The scan only counts.  Anything the layout does not allow is reported
 //! through `Entry::report_unexpected` and left on disk.
+//!
+//! Among the `tmp/` partials it also counts the *orphaned* ones, those no
+//! running download claims (`partial_claim`): resume state of downloads
+//! that failed or were abandoned, which occupies quota until cleanup reaps
+//! it.  A successful scan publishes that figure for the dashboard
+//! (`metrics::ORPHANED_PARTIAL_*`).
 
 use std::{borrow::Cow, num::NonZero, path::Path};
 
@@ -34,7 +40,10 @@ use crate::{
     },
     error::ErrorReport,
     fs_open::probe_dir,
-    global_config, healthcheck, metrics, task_setup, warn_once_or_info,
+    global_config, healthcheck, metrics,
+    partial_claim::is_claimed,
+    partial_file::PARTIAL_SUFFIX,
+    task_setup, warn_once_or_info,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +63,10 @@ pub(crate) struct ScanTotals {
     /// Each file's `cache_quota::accounted_size`, the unit the quota counts in.
     pub(crate) bytes: u64,
     pub(crate) files: u64,
+    /// The `.partial`s in a `tmp/` no download claimed when the scan reached
+    /// them; a subset of `files`, their accounted sizes a subset of `bytes`.
+    pub(crate) orphaned_files: u64,
+    pub(crate) orphaned_bytes: u64,
 }
 
 impl ScanTotals {
@@ -61,12 +74,35 @@ impl ScanTotals {
         self.bytes = self.bytes.saturating_add(size);
         self.files = self.files.saturating_add(1);
     }
+
+    /// Count a file [`Self::add_file`] already counted as an orphaned partial.
+    fn add_orphan(&mut self, size: u64) {
+        self.orphaned_bytes = self.orphaned_bytes.saturating_add(size);
+        self.orphaned_files = self.orphaned_files.saturating_add(1);
+    }
+
+    /// Publish the orphaned-partial figures of a completed scan, the
+    /// timestamp last so a reader finding it set finds the pair set too.
+    fn publish_orphans(self) {
+        metrics::ORPHANED_PARTIAL_FILES.set(self.orphaned_files);
+        metrics::ORPHANED_PARTIAL_BYTES.set(self.orphaned_bytes);
+        metrics::ORPHANED_PARTIALS_SCANNED_AT
+            .set(coarsetime::Clock::now_since_epoch().as_secs().max(1));
+    }
 }
 
 impl std::ops::AddAssign for ScanTotals {
     fn add_assign(&mut self, rhs: Self) {
-        self.bytes = self.bytes.saturating_add(rhs.bytes);
-        self.files = self.files.saturating_add(rhs.files);
+        let Self {
+            bytes,
+            files,
+            orphaned_files,
+            orphaned_bytes,
+        } = rhs;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.files = self.files.saturating_add(files);
+        self.orphaned_files = self.orphaned_files.saturating_add(orphaned_files);
+        self.orphaned_bytes = self.orphaned_bytes.saturating_add(orphaned_bytes);
     }
 }
 
@@ -257,7 +293,10 @@ pub(crate) async fn task_cache_scan(database: &Database) -> Result<ScanTotals, C
     }
 
     match walker.finish() {
-        WalkOutcome::Complete | WalkOutcome::RootMissing => Ok(totals),
+        WalkOutcome::Complete | WalkOutcome::RootMissing => {
+            totals.publish_orphans();
+            Ok(totals)
+        }
         WalkOutcome::Aborted { logged: _, err } => Err(CacheScanError::Io(err)),
     }
 }
@@ -343,7 +382,19 @@ async fn scan_tree(
                 let Some(mdata) = entry.metadata().await else {
                     continue;
                 };
-                totals.add_file(accounted_size(mdata.len()));
+                let size = accounted_size(mdata.len());
+                totals.add_file(size);
+                // A partial no running download holds: its download failed
+                // or was abandoned, and cleanup reaps it once it ages out.
+                if entry.tag() == Level::Tmp
+                    && entry
+                        .name()
+                        .as_encoded_bytes()
+                        .ends_with(PARTIAL_SUFFIX.as_bytes())
+                    && !is_claimed(&entry.path())
+                {
+                    totals.add_orphan(size);
+                }
                 // A mirror directory holds the pool (`.deb`/`.udeb`/`.ddeb`)
                 // directly; any other regular file there is an operator
                 // artefact cleanup will never touch.  Deeper levels take
@@ -428,7 +479,7 @@ fn classify_mirror_subdir(entry: &Entry<'_, Level>, mirror_path: &str, nested: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_quota::QUOTA_BLOCK_SIZE;
+    use crate::{cache_quota::QUOTA_BLOCK_SIZE, partial_claim::PartialClaim};
 
     /// Kept partials are disk usage the quota counts, so the scan tallies
     /// the `tmp/` below a mirror and the ones inside the flat tree.
@@ -449,5 +500,38 @@ mod tests {
         std::fs::write(flat.join("repo/tmp/x_1_all.deb.partial"), b"1234").expect("partial");
         let (_outcome, totals) = scan_tree(&flat, &FLAT_WALK, Level::Flat, "", &[]).await;
         assert_eq!((totals.bytes, totals.files), (2 * QUOTA_BLOCK_SIZE, 2));
+        assert_eq!(
+            (totals.orphaned_files, totals.orphaned_bytes),
+            (1, QUOTA_BLOCK_SIZE)
+        );
+    }
+
+    /// A partial a running download claims is live resume state, not an
+    /// orphan; both count towards the cache size alike. A file in `tmp/`
+    /// that is no partial, and a `.partial` outside `tmp/`, are no orphans.
+    #[tokio::test]
+    async fn only_unclaimed_partials_in_tmp_are_orphans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mirror = dir.path().join("debian");
+        std::fs::create_dir_all(mirror.join("tmp")).expect("mkdir");
+        let held = mirror.join("tmp/held_1.0_amd64.deb.partial");
+        std::fs::write(&held, b"123").expect("partial");
+        std::fs::write(mirror.join("tmp/left_1.0_amd64.deb.partial"), b"12345").expect("partial");
+        std::fs::write(mirror.join("tmp/stray.txt"), b"1").expect("foreign");
+        std::fs::write(mirror.join("pool_1.0_amd64.deb.partial"), b"1").expect("misplaced");
+        let claim = PartialClaim::acquire(held).expect("unclaimed");
+
+        let (_outcome, totals) =
+            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
+        assert_eq!(totals.files, 4);
+        assert_eq!(
+            (totals.orphaned_files, totals.orphaned_bytes),
+            (1, QUOTA_BLOCK_SIZE)
+        );
+        drop(claim);
+
+        let (_outcome, totals) =
+            scan_tree(&mirror, &MIRROR_WALK, Level::Mirror, "debian", &[]).await;
+        assert_eq!(totals.orphaned_files, 2, "released, it is left behind too");
     }
 }
