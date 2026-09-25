@@ -281,40 +281,25 @@ impl<D: Display> Display for HtmlEscaped<D> {
     }
 }
 
-/// Renders a Unix timestamp as a `<time datetime="…">…</time>` element.
-/// `0` renders as `"N/A"` — we use it as a sentinel for "no value".
-pub(super) struct FmtTimestamp(pub(super) i64);
-impl Display for FmtTimestamp {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 {
-            return f.write_str("N/A");
-        }
-        let Ok(ts) = OffsetDateTime::from_unix_timestamp(self.0) else {
-            return f.write_str("N/A");
-        };
-        Display::fmt(&Utc::from_offset(ts), f)
-    }
+/// A file's modification time as a [`RelTime`] ("5 d ago", the instant in
+/// its title), or "N/A" when missing.
+pub(super) struct FmtMTimeAge {
+    pub(super) mtime: Option<SystemTime>,
+    pub(super) now: i64,
 }
-
-/// Renders the age of a `SystemTime` as a duration followed by the absolute
-/// instant in a `<time>` (e.g. `5d 3h ago (<time ...>03 Sep 2026 ...</time>)`),
-/// or "N/A" when missing.
-///
-/// The age is the useful figure at a glance and the absolute timestamp is
-/// what you need to correlate against a log; every other timestamp on the
-/// page shows the absolute value, so this one carries both rather than
-/// leaving the reader to do the arithmetic.
-pub(super) struct FmtMTimeAge(pub(super) Option<SystemTime>);
 impl Display for FmtMTimeAge {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let Some(mt) = self.0 else {
+        let Some(mtime) = self.mtime else {
             return f.write_str("N/A");
         };
-        let Ok(dur) = mt.elapsed() else {
-            return f.write_str("in future");
-        };
-        let stamp = Utc::from_offset(OffsetDateTime::from(mt));
-        write!(f, "{} ago ({stamp})", HumanFmt::Time(dur))
+        let epoch = OffsetDateTime::from(mtime).unix_timestamp();
+        Display::fmt(
+            &RelTime {
+                epoch,
+                now: self.now,
+            },
+            f,
+        )
     }
 }
 
@@ -391,7 +376,13 @@ pub(super) struct FmtLastSeenHealth {
 }
 impl Display for FmtLastSeenHealth {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Display::fmt(&FmtTimestamp(self.last_seen), f)?;
+        Display::fmt(
+            &RelTime {
+                epoch: self.last_seen,
+                now: self.now_epoch,
+            },
+            f,
+        )?;
         match Freshness::of(self.last_seen, self.now_epoch) {
             Freshness::Unknown | Freshness::Fresh => Ok(()),
             Freshness::Aging(days) => write!(
@@ -742,8 +733,8 @@ mod tests {
     use std::fmt::Display;
 
     use super::{
-        Age, CacheHitRatio, Count, FmtTimestamp, Freshness, Gauge, HtmlEscape, Meter, Pct,
-        RatioClass, RelTime, Saturation, Span,
+        Age, CacheHitRatio, Count, FmtLastSeenHealth, FmtMTimeAge, Freshness, Gauge, HtmlEscape,
+        Meter, Pct, RatioClass, RelTime, Saturation, Span,
     };
 
     /// 2023-11-14T22:13:20Z, so every rendered timestamp below is fixed.
@@ -893,16 +884,41 @@ mod tests {
     }
 
     #[test]
-    fn fmt_timestamp_renders_iso_and_human_halves() {
+    fn a_file_age_is_a_relative_time() {
+        let mtime = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(NOW.unsigned_abs() - 5 * DAY.unsigned_abs());
         assert_eq!(
-            render(FmtTimestamp(NOW)),
-            "<time datetime=\"2023-11-14T22:13:20Z\">14 Nov 2023 22:13:20</time>",
+            render(FmtMTimeAge {
+                mtime: Some(mtime),
+                now: NOW,
+            }),
+            "<time datetime=\"2023-11-09T22:13:20Z\" title=\"09 Nov 2023 22:13:20 UTC\">5 d ago</time>",
+        );
+        assert_eq!(
+            render(FmtMTimeAge {
+                mtime: None,
+                now: NOW
+            }),
+            "N/A"
         );
     }
 
     #[test]
-    fn fmt_timestamp_zero_is_na() {
-        assert_eq!(render(FmtTimestamp(0)), "N/A");
+    fn a_last_seen_is_a_relative_time_with_its_staleness() {
+        let rendered = render(FmtLastSeenHealth {
+            last_seen: NOW - 31 * DAY,
+            now_epoch: NOW,
+        });
+        assert!(rendered.starts_with("<time datetime="), "{rendered}");
+        assert!(rendered.contains(">31 d ago</time>"), "{rendered}");
+        assert!(rendered.ends_with(">stale</span>"), "{rendered}");
+        assert_eq!(
+            render(FmtLastSeenHealth {
+                last_seen: 0,
+                now_epoch: NOW,
+            }),
+            "N/A"
+        );
     }
 
     #[test]

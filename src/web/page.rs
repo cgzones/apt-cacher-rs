@@ -478,7 +478,9 @@ dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 
 .scope { display: inline-block; font-size: 0.72em; font-weight: 600; padding: 0 5px;
          border-radius: 8px; background: var(--count-bg); color: var(--details-key-fg);
          vertical-align: middle; white-space: nowrap; }
+/* A relative time carries its absolute instant in the title. */
 time { border-bottom: 1px dotted transparent; transition: border-color 0.15s; }
+time[title] { cursor: help; }
 time:hover { border-bottom-color: currentColor; }
 
 meter.bar { width: 42px; height: 7px; vertical-align: middle; margin-left: 5px; }

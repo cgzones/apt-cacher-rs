@@ -29,7 +29,7 @@ use crate::{
 
 use super::{
     fmt::{
-        Count, FmtLastSeenHealth, FmtTimestamp, Freshness, HtmlEscape, HtmlEscaped, Level, Nonzero,
+        Count, FmtLastSeenHealth, Freshness, HtmlEscape, HtmlEscaped, Level, Nonzero, RelTime,
         as_size,
     },
     table::{Table, tr, write_section_error},
@@ -485,8 +485,14 @@ pub(super) async fn build_mirror_table(
                 last_seen: mirror.last_seen,
                 now_epoch
             },
-            FmtTimestamp(mirror.first_seen),
-            FmtTimestamp(mirror.last_cleanup),
+            RelTime {
+                epoch: mirror.first_seen,
+                now: now_epoch
+            },
+            RelTime {
+                epoch: mirror.last_cleanup,
+                now: now_epoch
+            },
             format_args!(
                 "{} ({})",
                 HumanFmt::Size(downloaded_bytes),

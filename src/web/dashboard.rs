@@ -37,9 +37,9 @@ use crate::{
 
 use super::{
     fmt::{
-        CacheHitRatio, Colorize, Count, DiskUsage, EnabledDisabled, FmtMTimeAge, FmtTimestamp,
-        Gauge, HtmlEscape, MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation,
-        Utc, Window, YesNo, as_size,
+        CacheHitRatio, Colorize, Count, DiskUsage, EnabledDisabled, FmtMTimeAge, Gauge, HtmlEscape,
+        MinRate, OptOrUnlimited, OptSize, Pct, RatioClass, RelTime, Saturation, Utc, Window, YesNo,
+        as_size, now_epoch,
     },
     metrics_page::build_metrics_html,
     page::{Heading, Page, PageTitle, QueryOptions, SetupHint, build_nav_html, build_page},
@@ -498,19 +498,20 @@ fn build_daemon_status_html(
     memory_stats: Option<memory_stats::MemoryStats>,
     database_size: Option<u64>,
 ) -> String {
-    let start = Utc::from_offset(rd.start_time);
-
     let mut t = DetailsList::new();
     t.row("Version", APP_VERSION);
     t.row("Features", FEATURES_ONE_LINE);
     t.row(
         "Start Time",
         format_args!(
-            "{start} (up {})",
+            "{} (up {})",
+            RelTime {
+                epoch: rd.start_time.unix_timestamp(),
+                now: now.inner().unix_timestamp(),
+            },
             HumanFmt::Time((now.inner() - rd.start_time).unsigned_abs())
         ),
     );
-    t.row("Current Time", now);
     t.entry("Memory Usage").kind(Kind::Live).value(format_args!(
         "{} ({} virtual)",
         OptSize {
@@ -784,60 +785,25 @@ fn build_maintenance_html(
     now_epoch: i64,
     next_cleanup_epoch: i64,
 ) -> String {
-    /// Which side of `now` the timestamp sits on, and so which way the
-    /// relative figure is subtracted.
-    #[derive(Clone, Copy)]
-    enum Rel {
-        Ago,
-        FromNow,
-    }
-
-    /// Renders `<timestamp> (<rel> ago|from now)`, or just `FmtTimestamp`
-    /// (= "N/A") for the `0` "never" sentinel. The relative figure is
-    /// derived here rather than passed in, so it cannot be computed against
-    /// a different epoch than the one printed beside it.
-    struct EpochAndRel {
-        epoch: i64,
-        now_epoch: i64,
-        rel: Rel,
-    }
-    impl Display for EpochAndRel {
-        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            Display::fmt(&FmtTimestamp(self.epoch), f)?;
-            if self.epoch == 0 {
-                return Ok(());
-            }
-            let (secs, label) = match self.rel {
-                Rel::Ago => (self.now_epoch.saturating_sub(self.epoch), "ago"),
-                Rel::FromNow => (self.epoch.saturating_sub(self.now_epoch), "from now"),
-            };
-            let elapsed = std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0));
-            write!(f, " ({} {label})", HumanFmt::Time(elapsed))
-        }
-    }
-
     let last_cleanup_epoch = mirrors.iter().map(|m| m.last_cleanup).max().unwrap_or(0);
 
     let mut t = DetailsList::new();
     t.entry("Last Cleanup")
         .kind(Kind::Persisted)
         .tip("The newest cleanup recorded for any mirror in the database, so it survives restarts. The Metrics section's Cleanup rows cover this process's own runs.")
-        .value(EpochAndRel {
+        .value(RelTime {
             epoch: last_cleanup_epoch,
-            now_epoch,
-            rel: Rel::Ago,
-        },
-    );
+            now: now_epoch,
+        });
     t.row(
         "Cleanup Interval",
         HumanFmt::Time(std::time::Duration::from_secs(CLEANUP_INTERVAL_SECS)),
     );
     t.row(
         "Next Cleanup",
-        EpochAndRel {
+        RelTime {
             epoch: next_cleanup_epoch,
-            now_epoch,
-            rel: Rel::FromNow,
+            now: now_epoch,
         },
     );
     t.finish()
@@ -851,6 +817,7 @@ fn build_cache_stats_html(
     free_disk_bytes: Option<u64>,
     rd: &RuntimeDetails,
 ) -> String {
+    let now = now_epoch();
     let total_download_count: i64 = mirrors.iter().map(|m| m.download_count).sum();
     let total_delivery_count: i64 = mirrors.iter().map(|m| m.delivery_count).sum();
     // Floored at 0: the two counts are pruned independently, so more
@@ -905,10 +872,16 @@ fn build_cache_stats_html(
         ));
     t.entry("Oldest Cached File")
         .kind(Kind::Live)
-        .value(FmtMTimeAge(aggregate.oldest_mtime));
+        .value(FmtMTimeAge {
+            mtime: aggregate.oldest_mtime,
+            now,
+        });
     t.entry("Newest Cached File")
         .kind(Kind::Live)
-        .value(FmtMTimeAge(aggregate.newest_mtime));
+        .value(FmtMTimeAge {
+            mtime: aggregate.newest_mtime,
+            now,
+        });
 
     let quota = rd.config.disk_quota.map(std::num::NonZero::get);
     t.entry("Total Disk Usage")
