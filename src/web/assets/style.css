@@ -235,6 +235,15 @@ th button.sort:hover { text-decoration: underline; }
 th button.sort:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
 th[aria-sort="ascending"] button.sort::after { content: " \25B2"; font-size: 0.8em; }
 th[aria-sort="descending"] button.sort::after { content: " \25BC"; font-size: 0.8em; }
+/* What a filter hides stays hidden whatever display the element has. */
+.js [hidden] { display: none !important; }
+.filter { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; margin: 6px 0 2px;
+          font-size: 0.9em; }
+.filter input[type="search"], .filter select { font: inherit; padding: 2px 6px; border-radius: 3px;
+    border: 1px solid var(--section-border); background: var(--bg); color: var(--fg); }
+.filter input[type="search"] { min-width: 14em; }
+.filter-check { color: var(--details-key-fg); cursor: pointer; }
+.filter-shown { color: var(--details-key-fg); font-family: var(--mono); font-size: 0.9em; }
 
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }

@@ -102,6 +102,7 @@ pub(super) static SCRIPT: Asset = Asset::new(
         include_str!("assets/js/core.js"),
         include_str!("assets/js/refresh.js"),
         include_str!("assets/js/sort.js"),
+        include_str!("assets/js/filter.js"),
     ),
 );
 
