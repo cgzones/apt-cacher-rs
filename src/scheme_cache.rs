@@ -522,6 +522,7 @@ mod tests {
             ("[2001:DB8::1]", "[2001:db8::1]"),
             ("[2001:db8:0:0:0:0:0:1]:3142", "[2001:db8::1]:3142"),
             ("[0:0::1]", "[::1]"),
+            ("[::ffff:192.0.2.1]:8080", "192.0.2.1:8080"),
         ] {
             let auth = Authority::try_from(raw).expect("valid authority");
             let folded = canonical_authority(&auth).expect("non-canonical input");

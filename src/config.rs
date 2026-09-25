@@ -273,10 +273,17 @@ impl DomainName {
         }
     }
 
-    /// An IPv6 address without brackets.
+    /// An IPv6 address without brackets. An IPv4-mapped address
+    /// (`::ffff:192.0.2.1`) is the IPv4 host it maps: the dial reaches the
+    /// same peer, and client addresses are folded the same way
+    /// (`to_canonical`), so it must not be a second mirror, cache tree and
+    /// allow-list identity.
     fn ipv6(text: &str) -> Result<Self, HostError> {
         match text.parse::<Ipv6Addr>() {
-            Ok(addr) => Ok(Self(DomainNameInner::Ipv6(addr.to_string().into(), addr))),
+            Ok(addr) => Ok(match addr.to_ipv4_mapped() {
+                Some(v4) => Self(DomainNameInner::Ipv4(v4.to_string().into(), v4)),
+                None => Self(DomainNameInner::Ipv6(addr.to_string().into(), addr)),
+            }),
             Err(_err @ std::net::AddrParseError { .. }) => {
                 // `%` never occurs in an address, so an address before it is
                 // a zone (`fe80::1%eth0`, percent-encoded `fe80::1%25eth0`).
@@ -299,6 +306,17 @@ impl DomainName {
         match self {
             Self(DomainNameInner::Dns(_)) => true,
             Self(DomainNameInner::Ipv4(..) | DomainNameInner::Ipv6(..)) => false,
+        }
+    }
+
+    /// Return `true` if this is a link-local IPv6 address (`fe80::/10`),
+    /// which is only reachable through a zone identifier naming the
+    /// interface, and the parser refuses zones.
+    #[must_use]
+    pub(crate) const fn is_ipv6_link_local(&self) -> bool {
+        match self {
+            Self(DomainNameInner::Ipv6(_, addr)) => addr.is_unicast_link_local(),
+            Self(DomainNameInner::Dns(_) | DomainNameInner::Ipv4(..)) => false,
         }
     }
 
@@ -728,12 +746,25 @@ impl<'de> Deserialize<'de> for IpNetOrAddr {
         let s: String = Deserialize::deserialize(deserializer)?;
 
         if let Ok(ip) = s.parse::<IpAddr>() {
-            return Ok(Self::Addr(ip));
+            // ClientInfo::ip() folds mapped peers to IPv4, so their ACL
+            // entries must use that same identity.
+            return Ok(Self::Addr(ip.to_canonical()));
         }
 
-        s.parse::<IpNet>()
-            .map(IpNetOrAddr::Net)
-            .map_err(D::Error::custom)
+        let net = s.parse::<IpNet>().map_err(D::Error::custom)?.trunc();
+        // Only a subnet wholly inside ::ffff:0:0/96 is an IPv4 subnet.
+        // Broader IPv6 networks retain their address-family semantics;
+        // folding those would unexpectedly admit additional IPv4 clients.
+        let net = if let IpNet::V6(v6) = net
+            && v6.prefix_len() >= 96
+            && let Some(v4) = v6.addr().to_ipv4_mapped()
+        {
+            IpNet::new(IpAddr::V4(v4), v6.prefix_len() - 96)
+                .expect("mapped IPv6 prefix translates to an IPv4 prefix in 0..=32")
+        } else {
+            net
+        };
+        Ok(Self::Net(net))
     }
 }
 
@@ -1746,6 +1777,48 @@ impl Config {
             }
         }
 
+        // A link-local address is only reachable through a zone identifier,
+        // which the host parser refuses (a zone names an interface of this
+        // machine, not a mirror). The entry parses, so say why every dial
+        // of it will fail.
+        let link_local = [
+            (
+                "allowed_mirrors",
+                self.allowed_mirrors
+                    .iter()
+                    .filter_map(ConfigDomainName::host)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "http_only_mirrors",
+                self.http_only_mirrors
+                    .iter()
+                    .filter_map(ConfigDomainName::host)
+                    .collect(),
+            ),
+            (
+                "aliases",
+                self.aliases
+                    .iter()
+                    .flat_map(|alias| {
+                        std::iter::once::<&DomainName>(&alias.main)
+                            .chain(alias.aliases.iter().map(|a| &**a))
+                    })
+                    .collect(),
+            ),
+            (
+                "https_tunnel_allowed_mirrors",
+                self.https_tunnel_allowed_mirrors.iter().collect(),
+            ),
+        ];
+        for (key, hosts) in link_local {
+            for host in hosts.into_iter().filter(|h| h.is_ipv6_link_local()) {
+                warnings.push(format!(
+                    "{key} entry `{host}` is a link-local IPv6 address, reachable only through a zone identifier, which is not supported; every connection to it fails (list a global or unique-local address of the mirror)"
+                ));
+            }
+        }
+
         if !self.https_tunnel_enabled {
             for key in [
                 "https_tunnel_allowed_ports",
@@ -1944,6 +2017,89 @@ impl Config {
 mod test {
     use super::*;
     use crate::error::ErrorReport;
+
+    fn client_acls(entry: &str) -> Config {
+        Config::from_toml(&format!(
+            "allowed_proxy_clients = ['{entry}']\nallowed_webif_clients = ['{entry}']"
+        ))
+        .expect("valid client ACLs")
+    }
+
+    #[test]
+    fn mapped_client_acls_match_their_ipv4_address_or_subnet() {
+        use crate::{client_info::ClientInfo, request_dispatch::client_permitted};
+
+        for (mapped, plain, inside, outside) in [
+            ("::ffff:192.0.2.1", "192.0.2.1", "192.0.2.1", "192.0.2.2"),
+            ("::FFFF:c000:201", "192.0.2.1", "192.0.2.1", "192.0.2.2"),
+            (
+                "::ffff:192.0.2.129/120",
+                "192.0.2.0/24",
+                "192.0.2.255",
+                "192.0.3.1",
+            ),
+            (
+                "::ffff:192.0.2.1/128",
+                "192.0.2.1/32",
+                "192.0.2.1",
+                "192.0.2.2",
+            ),
+            ("::ffff:0:0/96", "0.0.0.0/0", "203.0.113.1", "::1"),
+        ] {
+            let config = client_acls(mapped);
+            let canonical = client_acls(plain);
+            assert_eq!(
+                config.allowed_proxy_clients, canonical.allowed_proxy_clients,
+                "{mapped}"
+            );
+            assert_eq!(
+                config.allowed_webif_clients, canonical.allowed_webif_clients,
+                "{mapped}"
+            );
+            let v4: Ipv4Addr = inside.parse().expect("IPv4 test client");
+            for (ip, permitted) in [
+                (IpAddr::V4(v4), true),
+                (IpAddr::V6(v4.to_ipv6_mapped()), true),
+                (outside.parse().expect("excluded test client"), false),
+            ] {
+                let client = ClientInfo::new(std::net::SocketAddr::new(ip, 1234));
+                for acl in [
+                    config.allowed_proxy_clients.as_slice(),
+                    config.allowed_webif_clients.as_deref().expect("web ACL"),
+                ] {
+                    assert_eq!(client_permitted(acl, &client), permitted, "{mapped}, {ip}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_and_broad_ipv6_client_acls_keep_their_address_family() {
+        for (entry, inside) in [
+            ("::192.0.2.1", "::192.0.2.1"),
+            ("2001:db8::1234/64", "2001:db8::1"),
+            ("::ffff:192.0.2.1/95", "::fffe:192.0.2.1"),
+            ("::/0", "::1"),
+        ] {
+            let config = client_acls(entry);
+            let acl = &config.allowed_proxy_clients[0];
+            assert!(
+                matches!(
+                    acl,
+                    IpNetOrAddr::Addr(IpAddr::V6(_)) | IpNetOrAddr::Net(IpNet::V6(_))
+                ),
+                "{entry}"
+            );
+            assert!(
+                acl.contains(&inside.parse().expect("IPv6 client")),
+                "{entry}"
+            );
+            assert!(
+                !acl.contains(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+                "{entry}"
+            );
+        }
+    }
 
     fn bind(s: &str) -> BindOverride {
         let parsed = s.parse::<BindOverride>();
@@ -2699,6 +2855,61 @@ mod test {
     fn warnings_for(toml_input: &str) -> Vec<String> {
         let mut cfg = Config::from_toml(toml_input).expect("config parses");
         cfg.validate().expect("config validates")
+    }
+
+    /// A link-local address parses (without its zone) but can never be
+    /// dialled, so every list naming one warns, once per entry; a global
+    /// address does not.
+    #[test]
+    fn a_link_local_entry_warns_in_every_host_list() {
+        let warnings = warnings_for(
+            "allowed_mirrors = ['fe80::1', '2001:db8::1', '[fe80::2]']\n\
+             http_only_mirrors = ['fe80::1']\n\
+             aliases = [ ['fe80::1', ['fe80::3', 'deb.example.org']] ]\n\
+             https_tunnel_enabled = true\n\
+             https_tunnel_allowed_mirrors = ['fe80::4']\n",
+        );
+        let link_local: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("is a link-local IPv6 address"))
+            .collect();
+        for expected in [
+            "allowed_mirrors entry `[fe80::1]`",
+            "allowed_mirrors entry `[fe80::2]`",
+            "http_only_mirrors entry `[fe80::1]`",
+            "aliases entry `[fe80::1]`",
+            "aliases entry `[fe80::3]`",
+            "https_tunnel_allowed_mirrors entry `[fe80::4]`",
+        ] {
+            assert!(
+                link_local.iter().any(|w| w.starts_with(expected)),
+                "{expected}: {link_local:?}"
+            );
+        }
+        assert_eq!(link_local.len(), 6, "{link_local:?}");
+    }
+
+    /// An IPv4-mapped IPv6 address is the IPv4 host it maps, as a client
+    /// address is: one mirror, one cache tree, one allow-list entry.
+    #[test]
+    fn an_ipv4_mapped_address_is_its_ipv4_host() {
+        let v4 = dn("192.0.2.1");
+        for spelling in [
+            "::ffff:192.0.2.1",
+            "[::ffff:192.0.2.1]",
+            "[::FFFF:c000:201]",
+        ] {
+            assert_eq!(dn(spelling), v4, "{spelling}");
+        }
+        assert!(!dn("[::ffff:192.0.2.1]").is_ipv6());
+        assert!(
+            ConfigDomainName::new("192.0.2.1")
+                .expect("valid")
+                .permits(&dn("[::ffff:192.0.2.1]"))
+        );
+        // Only the mapped block folds: the deprecated IPv4-compatible form
+        // stays an IPv6 address.
+        assert!(dn("::192.0.2.1").is_ipv6());
     }
 
     /// The two tunnel ACLs have opposite empty-list semantics: an empty
