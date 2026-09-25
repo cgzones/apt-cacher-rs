@@ -59,7 +59,7 @@ use crate::{
     },
     build_info::APP_NAME,
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
+    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails, LookupOutcome},
     cache_metadata::{self},
     client_counter,
     client_info::ClientInfo,
@@ -1252,10 +1252,7 @@ async fn try_sendfile_request(
         // fetched upstream if not for the in-flight originator.
         // `LATE_JOINERS_TOTAL` is the subset that attached; `attach()`
         // already bumped that counter.
-        match conn_details.cached_flavor() {
-            CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
-            CachedFlavor::Volatile => metrics::VOLATILE_REFETCHED.increment(),
-        }
+        conn_details.count_lookup(LookupOutcome::Miss);
 
         return serve_unfinished_sendfile(
             stream,
@@ -1333,7 +1330,6 @@ async fn try_sendfile_request(
                         HumanFmt::Time(elapsed),
                         HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
                     );
-                    metrics::VOLATILE_HIT.increment();
                     break 'cache_lookup Ok((file, Some(md)));
                 }
                 Err(CacheAccessFailure(_)) => {
@@ -1350,11 +1346,8 @@ async fn try_sendfile_request(
 
     let miss = match cached_file {
         Ok((file, mdata)) => {
-            // CACHE_HITS only counts permanent-file hits; fresh volatile hits
-            // were already bumped as VOLATILE_HIT in the cache_lookup block.
-            if conn_details.cached_flavor() == CachedFlavor::Permanent {
-                metrics::CACHE_HITS.increment();
-            }
+            // A permanent file, or a volatile one inside its freshness window.
+            conn_details.count_lookup(LookupOutcome::Hit);
             conn_details.refresh_origin();
             note_cached_index_touch(&conn_details, uri_path, &cache_path);
 
@@ -1375,13 +1368,7 @@ async fn try_sendfile_request(
 
     // Cache miss or stale volatile file: a permanent file not found is a real
     // cache miss; a volatile file not found or stale is a refetch.
-    match &miss {
-        CacheMiss::NotFound => match conn_details.cached_flavor() {
-            CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
-            CachedFlavor::Volatile => metrics::VOLATILE_REFETCHED.increment(),
-        },
-        CacheMiss::StaleVolatile { .. } => metrics::VOLATILE_REFETCHED.increment(),
-    }
+    conn_details.count_lookup(LookupOutcome::Miss);
 
     #[cfg(feature = "splice")]
     {
@@ -1413,9 +1400,8 @@ async fn try_sendfile_request(
                 // existing download's status was handed back by
                 // `originate()` and is held alive by the Arc, so we can
                 // serve from the partial via sendfile directly - no
-                // re-attach, no race-of-races fall-back. `CACHE_MISSES`
-                // (permanent) or `VOLATILE_REFETCHED` (volatile) was bumped
-                // above when the cache lookup found no usable file;
+                // re-attach, no race-of-races fall-back. The miss was
+                // counted above when the cache lookup found no usable file;
                 // `LATE_JOINERS_TOTAL` was bumped inside `originate()`.
                 serve_unfinished_sendfile(
                     stream,

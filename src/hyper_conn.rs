@@ -42,7 +42,7 @@ use crate::{
     },
     build_info::{APP_USER_AGENT, APP_VIA},
     cache_conditional::{CacheInfo, RangeRequestHeaders, ServeParams, ServePlan},
-    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails},
+    cache_layout::{CacheMiss, CachedFlavor, ConnectionDetails, LookupOutcome},
     cache_metadata::{
         self, InvalidValidator, UpstreamMetadata, check_upstream_validators,
         write_upstream_metadata,
@@ -1350,12 +1350,10 @@ async fn serve_volatile_file(
                 HumanFmt::Time(VOLATILE_CACHE_MAX_AGE)
             );
 
-            // Lookup-site accounting (see `process_cache_request`).
-            // Cleanup-synthetic probes (task_cleanup's `.xz -> .gz -> raw`
-            // walk) would inflate the user-facing counter - exclude them.
-            if !conn_details.client.is_cleanup_synthetic() {
-                metrics::VOLATILE_HIT.increment();
-            }
+            // Lookup-site accounting (see `process_cache_request`);
+            // cleanup-synthetic probes (task_cleanup's `.xz -> .gz -> raw`
+            // walk) count nothing.
+            conn_details.count_lookup(LookupOutcome::Hit);
 
             note_cached_index_touch(&conn_details, req.uri().path(), &file_path);
             return serve_cached_file(conn_details, &req, file, file_path, None, Some(mdata)).await;
@@ -1369,11 +1367,8 @@ async fn serve_volatile_file(
 
     // Lookup-site parent refetch bump; dominates the VOLATILE_REFETCHED_*
     // subset bumps in `serve_new_file`. Cleanup-synthetic probes are
-    // operator bookkeeping, not user traffic - exclude them so the
-    // dashboard ratio reflects real client behavior only.
-    if !conn_details.client.is_cleanup_synthetic() {
-        metrics::VOLATILE_REFETCHED.increment();
-    }
+    // operator bookkeeping, not user traffic, and count nothing.
+    conn_details.count_lookup(LookupOutcome::Miss);
 
     serve_cache_miss(
         conn_details,
@@ -2614,9 +2609,9 @@ async fn tunnel(
 /// Cache lookup plus hit/miss accounting for a request hyper classified
 /// itself (or cleanup's synthetic index fetches), then serve or fetch.
 ///
-/// This is the lookup site: `CACHE_HITS` / `CACHE_MISSES` /
-/// `VOLATILE_REFETCHED` (and `VOLATILE_HIT` in [`serve_volatile_file`]) are
-/// bumped exactly where the lookup decides.  Requests the sendfile backend
+/// This is the lookup site: `ConnectionDetails::count_lookup` counts a
+/// permanent hit or any miss here (a volatile hit or refetch in
+/// [`serve_volatile_file`]), exactly where the lookup decides.  Requests the sendfile backend
 /// already looked up never come here - their `HandoffPlan::CacheMiss`
 /// enters [`serve_cache_miss`] directly, so no bump can repeat.
 #[must_use]
@@ -2629,11 +2624,6 @@ pub(crate) async fn process_cache_request(
 
     match tokio_nofollow_options().read(true).open(&cache_path).await {
         Ok(file) => {
-            // CACHE_HITS only counts permanent-file hits; volatile hits live
-            // in VOLATILE_HIT / VOLATILE_REFETCHED.
-            if conn_details.cached_flavor() == CachedFlavor::Permanent {
-                metrics::CACHE_HITS.increment();
-            }
             conn_details.refresh_origin();
 
             trace!(
@@ -2649,23 +2639,16 @@ pub(crate) async fn process_cache_request(
                     serve_volatile_file(conn_details, req, file, cache_path, appstate).await
                 }
                 CachedFlavor::Permanent => {
+                    // A volatile file's hit or refetch is decided by its
+                    // freshness, in `serve_volatile_file`.
+                    conn_details.count_lookup(LookupOutcome::Hit);
                     note_cached_index_touch(&conn_details, req.uri().path(), &cache_path);
                     serve_cached_file(conn_details, &req, file, cache_path, None, None).await
                 }
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            match conn_details.cached_flavor() {
-                CachedFlavor::Permanent => metrics::CACHE_MISSES.increment(),
-                CachedFlavor::Volatile => {
-                    // Cleanup-synthetic probes are operator bookkeeping, not
-                    // user traffic - exclude them so the dashboard ratio
-                    // reflects real client behavior only.
-                    if !conn_details.client.is_cleanup_synthetic() {
-                        metrics::VOLATILE_REFETCHED.increment();
-                    }
-                }
-            }
+            conn_details.count_lookup(LookupOutcome::Miss);
 
             serve_cache_miss(conn_details, req, cache_path, CacheMiss::NotFound, appstate).await
         }

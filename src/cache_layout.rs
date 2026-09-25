@@ -81,6 +81,7 @@ use crate::{
         valid_mirrorname,
     },
     index_parser::HashAlgo,
+    metrics,
     partial_file::PARTIAL_SUFFIX,
     precise_instant::PreciseInstant,
 };
@@ -207,6 +208,53 @@ impl ResourceKind {
             Self::FlatByHash(..) => CacheLayout::FlatByHash,
         }
     }
+
+    /// Which hit/miss counters a cache lookup of this kind lands in
+    /// ([`ConnectionDetails::count_lookup`]).  Derived from the same split as
+    /// [`Self::cached_flavor`] and [`Self::layout`]: `Index` is exactly the
+    /// `Volatile` kinds, `Package` the permanent pool layouts and `ByHash` the
+    /// permanent by-hash ones (a unit test pins the agreement).
+    #[must_use]
+    pub(crate) const fn lookup_bucket(self) -> LookupBucket {
+        match self {
+            Self::Pool | Self::FlatPool => LookupBucket::Package,
+            Self::ByHash(..) | Self::FlatByHash(..) => LookupBucket::ByHash,
+            Self::Release
+            | Self::ComponentRelease
+            | Self::Packages
+            | Self::Sources
+            | Self::Translation
+            | Self::Icon
+            | Self::FlatMetadata => LookupBucket::Index,
+        }
+    }
+}
+
+/// The hit/miss counter family a cache lookup is counted in; see
+/// [`ResourceKind::lookup_bucket`].  The two permanent buckets split
+/// `CACHE_HITS` / `CACHE_MISSES`, because their remedies differ: a package
+/// miss rate points at clients naming one archive under different mirrors
+/// (`aliases`), a by-hash one at index churn.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LookupBucket {
+    /// A `.deb` from a structured or flat pool: `PACKAGE_HITS` /
+    /// `PACKAGE_MISSES` under `CACHE_HITS` / `CACHE_MISSES`.
+    Package,
+    /// A content-addressed by-hash index: `BYHASH_HITS` / `BYHASH_MISSES`
+    /// under `CACHE_HITS` / `CACHE_MISSES`.
+    ByHash,
+    /// A refresh-checked index: `VOLATILE_HIT` / `VOLATILE_REFETCHED`.
+    Index,
+}
+
+/// What a cache lookup decided, for [`ConnectionDetails::count_lookup`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LookupOutcome {
+    /// A usable file was served from the cache (for an index: a fresh one).
+    Hit,
+    /// No usable file: the request fetched upstream or joined an in-flight
+    /// fetch (for an index: absent or stale).
+    Miss,
 }
 
 /// On-disk cache layout for a request.  Doubles as the discriminator on
@@ -351,9 +399,9 @@ impl Equivalent<CacheEntryKey> for CacheEntryKeyRef<'_> {
 /// [`ConnectionDetails`], produced by whichever backend ran the lookup and
 /// consumed by the backend that fetches.
 ///
-/// Hit/miss/refetch accounting belongs to the lookup site: the producer bumps
-/// `CACHE_MISSES` / `VOLATILE_REFETCHED` when it builds one of these, so a
-/// consumer must never bump them again.  The stale copy travels with the
+/// Hit/miss/refetch accounting belongs to the lookup site: the producer
+/// counts the miss ([`ConnectionDetails::count_lookup`]) when it builds one of
+/// these, so a consumer must never count it again.  The stale copy travels with the
 /// verdict so the fetcher can revalidate against it without a second
 /// open/stat.
 #[derive(Debug)]
@@ -450,6 +498,44 @@ impl ConnectionDetails {
             fields: (**fields).clone(),
         };
         send_db_command_nonblocking(DatabaseCommand::Origin(origin, sighting));
+    }
+
+    /// Count one cache lookup of this request: the permanent buckets bump
+    /// their parent (`CACHE_HITS` / `CACHE_MISSES`) first, then their part,
+    /// so a reader loading the parts before the parent never sees them
+    /// exceed it; an index bumps `VOLATILE_HIT` / `VOLATILE_REFETCHED`.
+    ///
+    /// Called only at the lookup sites (`src/CLAUDE.md`, `metrics.rs`), once
+    /// per request.  Cleanup's synthetic index fetches are bookkeeping, not
+    /// client demand, and count nothing.
+    pub(crate) fn count_lookup(&self, outcome: LookupOutcome) {
+        if self.client.is_cleanup_synthetic() {
+            return;
+        }
+        let (parent, part) = match (self.resource_kind.lookup_bucket(), outcome) {
+            (LookupBucket::Package, LookupOutcome::Hit) => {
+                (&metrics::CACHE_HITS, &metrics::PACKAGE_HITS)
+            }
+            (LookupBucket::Package, LookupOutcome::Miss) => {
+                (&metrics::CACHE_MISSES, &metrics::PACKAGE_MISSES)
+            }
+            (LookupBucket::ByHash, LookupOutcome::Hit) => {
+                (&metrics::CACHE_HITS, &metrics::BYHASH_HITS)
+            }
+            (LookupBucket::ByHash, LookupOutcome::Miss) => {
+                (&metrics::CACHE_MISSES, &metrics::BYHASH_MISSES)
+            }
+            (LookupBucket::Index, LookupOutcome::Hit) => {
+                metrics::VOLATILE_HIT.increment();
+                return;
+            }
+            (LookupBucket::Index, LookupOutcome::Miss) => {
+                metrics::VOLATILE_REFETCHED.increment();
+                return;
+            }
+        };
+        parent.increment();
+        part.increment();
     }
 
     /// [`ResourceKind::cached_flavor`] of this request's resource.
@@ -1046,6 +1132,42 @@ fn decode_validate(raw: &str, kind: ValidateKind) -> Result<Cow<'_, str>, Classi
 mod tests {
     use super::*;
     use crate::{deb_mirror::parse_request_path, test_support::local_client};
+
+    /// Every kind, one per variant (the by-hash payloads do not matter).
+    const ALL_KINDS: [ResourceKind; 11] = [
+        ResourceKind::Pool,
+        ResourceKind::Release,
+        ResourceKind::ComponentRelease,
+        ResourceKind::Packages,
+        ResourceKind::Sources,
+        ResourceKind::Translation,
+        ResourceKind::Icon,
+        ResourceKind::ByHash(HashAlgo::Sha256, ByHashContent::Other),
+        ResourceKind::FlatMetadata,
+        ResourceKind::FlatPool,
+        ResourceKind::FlatByHash(HashAlgo::Sha256, ByHashContent::MaybePackages),
+    ];
+
+    /// The lookup buckets are the flavor/layout split, not a second opinion:
+    /// an index is exactly a volatile kind, a package a permanent pool file,
+    /// a by-hash object a permanent by-hash file.
+    #[test]
+    fn lookup_buckets_agree_with_flavor_and_layout() {
+        for kind in ALL_KINDS {
+            // No permanent kind lives under `dists/` itself: `None` fails.
+            let expected = match (kind.cached_flavor(), kind.layout()) {
+                (CachedFlavor::Volatile, _) => Some(LookupBucket::Index),
+                (CachedFlavor::Permanent, CacheLayout::StructuredPool | CacheLayout::Flat) => {
+                    Some(LookupBucket::Package)
+                }
+                (CachedFlavor::Permanent, CacheLayout::DistsByHash | CacheLayout::FlatByHash) => {
+                    Some(LookupBucket::ByHash)
+                }
+                (CachedFlavor::Permanent, CacheLayout::Dists) => None,
+            };
+            assert_eq!(Some(kind.lookup_bucket()), expected, "{kind:?}");
+        }
+    }
 
     #[test]
     fn classify_pool() {

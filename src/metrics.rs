@@ -600,10 +600,27 @@ pub(crate) static DOWNLOAD_REJECTED_OVERSIZE: Signal = Signal::new();
 /// verification and is inside its backoff window (upstream not contacted).
 pub(crate) static DOWNLOAD_REJECTED_VERIFY_THROTTLE: Signal = Signal::new();
 
-/// Permanent-file cache lookup found a usable file.
+/// Permanent-file cache lookup found a usable file. The sum of its parts:
+/// `CACHE_HITS == PACKAGE_HITS + BYHASH_HITS` (the parent is bumped first,
+/// both by `ConnectionDetails::count_lookup`, the one lookup-site helper).
 pub(crate) static CACHE_HITS: Counter = Counter::new();
-/// Permanent-file cache lookup needed a fetch (volatile cases use VOLATILE_*).
+/// Permanent-file cache lookup needed a fetch (volatile cases use
+/// VOLATILE_*). `CACHE_MISSES == PACKAGE_MISSES + BYHASH_MISSES`, bumped like
+/// `CACHE_HITS`.
 pub(crate) static CACHE_MISSES: Counter = Counter::new();
+/// Part of `CACHE_HITS`: a `.deb` (structured or flat pool) served from the
+/// cache.
+pub(crate) static PACKAGE_HITS: Counter = Counter::new();
+/// Part of `CACHE_MISSES`: a `.deb` fetched upstream or joined in flight.
+/// Clients naming one archive under different mirror names miss each
+/// other's copies; `aliases` maps them onto one.
+pub(crate) static PACKAGE_MISSES: Counter = Counter::new();
+/// Part of `CACHE_HITS`: a content-addressed by-hash index served from the
+/// cache.
+pub(crate) static BYHASH_HITS: Counter = Counter::new();
+/// Part of `CACHE_MISSES`: a by-hash index fetched upstream or joined in
+/// flight.
+pub(crate) static BYHASH_MISSES: Counter = Counter::new();
 
 /// Per-delivery-mechanism triples. For each mechanism `X`, `REQUESTS_X`
 /// counts responses that started down that path (bumped before the

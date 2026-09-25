@@ -583,31 +583,66 @@ fn build_passthrough_group(g: &mut Groups) {
     });
 }
 
+/// A lookup split, `hits / misses (hit share)`.
+#[derive(Clone, Copy)]
+struct HitsMisses {
+    hits: u64,
+    misses: u64,
+}
+impl HitsMisses {
+    fn load(hits: &Counter, misses: &Counter) -> Self {
+        Self {
+            hits: hits.get(),
+            misses: misses.get(),
+        }
+    }
+}
+impl Display for HitsMisses {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let Self { hits, misses } = *self;
+        write!(
+            f,
+            "{} / {}{}",
+            Count(hits),
+            Count(misses),
+            OptPctSuffix {
+                num: hits,
+                total: hits + misses,
+            },
+        )
+    }
+}
+
 fn build_cache_group(g: &mut Groups) {
-    let hits = metrics::CACHE_HITS.get();
-    let misses = metrics::CACHE_MISSES.get();
-    let lookups = hits + misses;
+    // The parts before their total, which is bumped first.
+    let packages = HitsMisses::load(&metrics::PACKAGE_HITS, &metrics::PACKAGE_MISSES);
+    let byhash = HitsMisses::load(&metrics::BYHASH_HITS, &metrics::BYHASH_MISSES);
+    let all = HitsMisses::load(&metrics::CACHE_HITS, &metrics::CACHE_MISSES);
+    let parts_exceed =
+        packages.hits + byhash.hits > all.hits || packages.misses + byhash.misses > all.misses;
     let refetched_uptodate = metrics::VOLATILE_REFETCHED_UPTODATE.get();
     let refetched_outofdate = metrics::VOLATILE_REFETCHED_OUTOFDATE.get();
     let refetched = metrics::VOLATILE_REFETCHED.get();
 
     g.group("Cache", |t| {
-        t.row_tip(
-            "Hits / Misses",
-            "Cache lookups for permanent (non-volatile) resources that found a usable file vs. those that did not.",
-            format_args!(
-                "{} / {}{}",
-                Count(hits),
-                Count(misses),
-                OptPctSuffix {
-                    num: hits,
-                    total: lookups,
-                },
-            ),
-        );
+        t.entry("Hits / Misses")
+            .tip("Cache lookups for permanent resources (packages and by-hash indexes) that found a usable file vs. those that did not, late joiners of an in-flight download counted as misses. The kinds beneath sum to it; it warns only if they exceed it, which is a counting bug.")
+            .parts(|p| {
+                p.row_tip(
+                    "Packages (.deb)",
+                    "Package lookups. A low hit share with several clients means they fetch different packages, or name one archive under different mirror hosts and so miss each other's copies: map those hosts onto one with aliases.",
+                    packages,
+                );
+                p.row_tip(
+                    "By-Hash Indexes",
+                    "Content-addressed index lookups (Acquire-By-Hash). Every index change is a new name and so a miss; hits come from clients updating after one another.",
+                    byhash,
+                );
+            })
+            .value(warn_if(all, parts_exceed));
         t.row_tip(
             "Volatile Hits",
-            "Volatile-resource (Release/Packages/Translation/...) cache hits within the freshness window.",
+            "Index (Release/Packages/Translation/...) lookups served from the cache inside the freshness window.",
             Count(metrics::VOLATILE_HIT.get()),
         );
         t.entry("Volatile Refetches")
