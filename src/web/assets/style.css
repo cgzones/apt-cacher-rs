@@ -285,6 +285,10 @@ dl.details dd.delta.moved { text-decoration: underline; }
 dl.activity-list dd.spark { line-height: 0; }
 svg.spark { width: 140px; max-width: 100%; height: 20px; }
 svg.spark polyline { fill: none; stroke: var(--series-1); stroke-width: 1.5px; }
+/* The /logs toolbar and entries (logs.js). */
+.logtools { margin: 0 0 8px; }
+pre.log .entry.error { color: var(--alert); }
+pre.log .entry.warn { color: var(--warn); }
 
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
