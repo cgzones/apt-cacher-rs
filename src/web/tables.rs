@@ -566,8 +566,8 @@ pub(super) async fn build_mirror_table(
     );
 
     // The per-mirror failure counts join by the `MirrorUri` rendering
-    // (`mirror_health::key`); a failing mirror without a row of its own is
-    // appended below the persisted ones.
+    // (`mirror_registry`'s snapshot key); a failing mirror without a row of
+    // its own is appended below the persisted ones.
     let mut unmatched: Vec<(&str, &MirrorHealth)> =
         health.iter().map(|(key, h)| (key.as_ref(), h)).collect();
     let mut key = String::new();
