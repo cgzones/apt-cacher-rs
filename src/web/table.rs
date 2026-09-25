@@ -329,9 +329,10 @@ pub(super) struct Entry<'a> {
 }
 
 impl Entry<'_> {
-    /// The label's `title` tooltip. Interpolated directly into the
-    /// attribute without HTML-escaping; the `&'static str` bound keeps
-    /// user-controlled values out.
+    /// The label's `title` tooltip, marked by a dotted underline, and the
+    /// same text behind a `?` disclosure for touch screens, which have no
+    /// hover. Interpolated without HTML-escaping; the `&'static str` bound
+    /// keeps user-controlled values out.
     pub(super) fn tip(mut self, tip: &'static str) -> Self {
         self.tip = Some(tip);
         self
@@ -405,6 +406,14 @@ impl Entry<'_> {
             swrite!(out, " title=\"{tip}\"");
         }
         swrite!(out, ">{label}</dt><dd>{value}</dd>");
+        if let Some(tip) = tip {
+            // The title only shows on hover, which a touch screen has not:
+            // the same text behind a disclosure the stylesheet shows there.
+            swrite!(
+                out,
+                "<dd class=\"help\"><details><summary title=\"What is this?\">?</summary>{tip}</details></dd>"
+            );
+        }
         if let Some(last) = last {
             swrite!(
                 out,
@@ -616,7 +625,8 @@ mod tests {
             list.finish(),
             "<dl class=\"details\">\
              <div><dt>Label</dt><dd>7</dd></div>\
-             <div><dt title=\"why\">Tipped</dt><dd>v</dd></div>\
+             <div><dt title=\"why\">Tipped</dt><dd>v</dd>\
+             <dd class=\"help\"><details><summary title=\"What is this?\">?</summary>why</details></dd></div>\
              </dl>",
         );
     }
@@ -639,6 +649,7 @@ mod tests {
         assert!(
             html.contains(
                 "<div><dt title=\"why\">Moved</dt><dd><span class=\"warn\">3</span></dd>\
+                 <dd class=\"help\"><details><summary title=\"What is this?\">?</summary>why</details></dd>\
                  <dd class=\"last\">last: <time datetime=\"2023-11-14T22:11:20Z\" \
                  title=\"14 Nov 2023 22:11:20 UTC\">2 min ago</time></dd></div>"
             ),

@@ -456,6 +456,20 @@ dl.details div.k-live > dt::after { content: "live"; color: var(--ok); }
 dl.details div.k-peak > dt::after { content: "peak"; color: var(--details-key-fg); }
 dl.details div.k-db > dt::after { content: "persisted"; color: var(--link); }
 .scope-note { color: var(--details-key-fg); font-size: 0.8em; margin: 2px 0 4px; }
+/* A label with an explanation: dotted underline, the text in its title on
+   hover. Touch screens have no hover, so there the same text sits behind a
+   small "?" disclosure; with a mouse the disclosure stays out of the way. */
+dl.details dt[title] { text-decoration: underline dotted var(--details-key-fg);
+                       text-underline-offset: 2px; cursor: help; }
+dl.details dd.help { font-family: inherit; font-weight: 400; font-size: 0.78em;
+                     color: var(--details-key-fg); }
+dl.details dd.help summary { display: inline-block; width: 1.3em; height: 1.3em;
+    line-height: 1.3em; text-align: center; border-radius: 50%; background: var(--count-bg);
+    font-weight: 700; }
+dl.details dd.help summary::before { content: none; }
+@media (hover: hover) and (pointer: fine) {
+    dl.details dd.help { display: none; }
+}
 /* When a bad-sign counter last moved: context for the figure above it. */
 dl.details dd.last { color: var(--details-key-fg); font-weight: 400; font-size: 0.75em;
                      font-family: inherit; }
